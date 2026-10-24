@@ -149,6 +149,10 @@ fn version_verbose_reports_version_target_and_backend() {
         assert!(stdout.contains(&target), "stdout: {stdout}");
         assert!(stdout.contains("Cranelift"), "stdout: {stdout}");
         assert!(stdout.contains("runtime: workspace"), "stdout: {stdout}");
+        assert!(
+            stdout.contains("python: 3.14.9 compatibility target (ABI cpython-314)"),
+            "stdout: {stdout}"
+        );
     }
 }
 

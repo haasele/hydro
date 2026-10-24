@@ -16,6 +16,7 @@
 //!   the current values of enclosing locals. Classes are limited to a single
 //!   optional base and plain methods.
 
+pub mod compat;
 mod ir;
 mod model;
 pub mod stdlib;
@@ -23,6 +24,7 @@ pub mod stdlib;
 #[cfg(test)]
 mod tests;
 
+pub use crate::compat::{PYTHON_ABI_TAG, PYTHON_VERSION, PYTHON_VERSION_STRING};
 pub use crate::ir::{
     ClassMethod, CompClause, CompTarget, Expr, ExprKind, Function, Handler, LocalInfo, Param,
     Program, Stmt, StmtKind,

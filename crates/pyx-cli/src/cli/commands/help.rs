@@ -42,6 +42,10 @@ pub(crate) fn cmd_version(args: &[OsString]) -> CliResult {
     println!("target: {}-{}", env::consts::ARCH, env::consts::OS);
     println!("backend: Cranelift");
     println!("runtime: workspace {version}");
-    println!("python: subset of Python 3 (see README, \"Language and Stdlib Scope\")");
+    println!(
+        "python: {} compatibility target (ABI {})",
+        pyx_ir::PYTHON_VERSION_STRING,
+        pyx_ir::PYTHON_ABI_TAG
+    );
     Ok(ExitCode::SUCCESS)
 }

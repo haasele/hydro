@@ -9,7 +9,7 @@ echo "== fmt =="
 cargo fmt --all -- --check
 
 echo "== clippy =="
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 
 echo "== build =="
 cargo build -p pyx-cli -p pyx-runtime
@@ -387,5 +387,7 @@ for name in threading event_queue rlock pickle multiprocessing spawn pool pool_s
     diff -u "examples/expected/$name.txt" "$tmp/$name.aot.out"
     echo "ok: aot $name"
 done
+
+python3 scripts/cpython_compat.py --check-manifest
 
 echo "ALL GREEN"

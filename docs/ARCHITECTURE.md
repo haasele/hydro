@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
-implemented (875 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (877 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -453,7 +453,7 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
   `seed`/`random`/`randint`/`randrange`/`choice`/`uniform`/`shuffle`;
   deterministic per seed, but **not CPython-reproducible**.
 - `platform`: `system`/`machine`/`release`/`version`/`node`/`platform`/
-  `python_version`, `python_implementation = "PyX"`.
+  `python_version`, `python_implementation() == "PyX"`.
 - `statistics`: `mean`/`fmean`/`median`/`pstdev`/`stdev` including error paths.
 - `pathlib`: native `Path` (`Path()`, `cwd()`, `home()`) with
   `exists`/`is_file`/`is_dir`, `read_text`/`write_text`, `read_bytes`/
@@ -816,10 +816,10 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 
 ## 10. Verification and Documented Limits
 
-- `scripts/verify.sh`: fmt-check, clippy (zero warnings), build,
+- `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-24: **875 tests** (269 frontend, 403 runtime incl. 173
+- As of 2026-10-24: **877 tests** (269 frontend, 404 runtime incl. 173
   ABI integration tests, 17 codegen, 3 IR, 154 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `argparse`/`defaultdict`/`re`, socket echo,

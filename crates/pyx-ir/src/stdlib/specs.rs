@@ -121,8 +121,9 @@ pub static PLATFORM: ModuleSpec = ModuleSpec {
         f("node", 0, 0, Type::Str),
         f("platform", 0, 0, Type::Str),
         f("python_version", 0, 0, Type::Str),
+        f("python_implementation", 0, 0, Type::Str),
     ],
-    constants: &[c("python_implementation", Type::Str)],
+    constants: &[],
 };
 
 pub static STATISTICS: ModuleSpec = ModuleSpec {
@@ -238,6 +239,8 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("platform", Type::Str),
         c("version", Type::Str),
         c("version_info", Type::Tuple),
+        c("pyx_version", Type::Str),
+        c("pyx_version_info", Type::Tuple),
         c("maxsize", Type::Int),
     ],
 };

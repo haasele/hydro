@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use pyx_ir::stdlib::{self, ConstantSpec, FunctionSpec, ModuleSpec};
 use pyx_ir::{BinOp, Builtin, Callee, Const, ExcKind, FunctionId, LocalId, Type};
+use pyx_ir::{PYTHON_ABI_TAG, PYTHON_VERSION_STRING};
 use rustpython_parser::ast::{self, Ranged};
 use rustpython_parser::text_size::TextRange;
 
@@ -426,9 +427,9 @@ pub(crate) enum ExtensionLookup {
 /// Looks up a compiled extension for `name` in `dir`.
 ///
 /// `name` may be dotted: `pkg.sub_ext` searches `<dir>/pkg/sub_ext...so`. Only
-/// `<leaf>.so`, `<leaf>.abi3.so` and `<leaf>.cpython-314-<platform>.so` are
-/// loadable; any other `<leaf>.*.so` is reported as incompatible instead of
-/// being silently preferred.
+/// `<leaf>.so`, `<leaf>.abi3.so` and `<leaf>.cpython-314-<platform>.so` (the
+/// `PYTHON_ABI_TAG` target) are loadable; any other `<leaf>.*.so` is
+/// reported as incompatible instead of being silently preferred.
 fn extension_lookup_in(dir: &Path, name: &str) -> ExtensionLookup {
     let mut relative = PathBuf::new();
     for segment in name.split('.') {
@@ -571,9 +572,9 @@ fn prefix_site_packages(prefix: &Path) -> Vec<PathBuf> {
 /// Picks the shared object for `name` (a relative path without `.so`) in `dir`.
 ///
 /// A plain `<name>.so` wins over `<name>.abi3.so`, which wins over any
-/// `<name>.cpython-314-<platform>.so` (first in sorted order). Every other
-/// `<name>.*.so` tag is incompatible: PyX cannot load it and reports the
-/// offending file instead of falling back to it.
+/// `<name>.cpython-314-<platform>.so` (the `PYTHON_ABI_TAG` target; first in
+/// sorted order). Every other `<name>.*.so` tag is incompatible: PyX cannot
+/// load it and reports the offending file instead of falling back to it.
 fn extension_candidate(dir: &Path, name: &Path) -> ExtensionLookup {
     let stem = dir.join(name);
     let direct = stem.with_extension("so");
@@ -615,7 +616,10 @@ fn extension_candidate(dir: &Path, name: &Path) -> ExtensionLookup {
         if !path.is_file() {
             continue;
         }
-        match tag.strip_prefix("cpython-314-") {
+        let abi_platform = tag
+            .strip_prefix(PYTHON_ABI_TAG)
+            .and_then(|rest| rest.strip_prefix('-'));
+        match abi_platform {
             Some(platform) if !platform.is_empty() => compatible.push((tag.to_string(), path)),
             _ => incompatible.push((tag.to_string(), path)),
         }
@@ -629,7 +633,7 @@ fn extension_candidate(dir: &Path, name: &Path) -> ExtensionLookup {
         return ExtensionLookup::Incompatible {
             path: canonical(path),
             reason: format!(
-                "unsupported extension ABI tag '{tag}' (loadable suffixes are `.so`, `.abi3.so` and `.cpython-314-<platform>.so`)"
+                "unsupported extension ABI tag '{tag}' (loadable suffixes are `.so`, `.abi3.so` and `.{PYTHON_ABI_TAG}-<platform>.so` for Python {PYTHON_VERSION_STRING})"
             ),
         };
     }

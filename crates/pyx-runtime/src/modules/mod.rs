@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pyx_ir::stdlib;
+use pyx_ir::{PYTHON_VERSION, PYTHON_VERSION_STRING};
 
 pub(crate) mod argparse;
 pub(crate) mod asyncio;
@@ -399,10 +400,25 @@ fn constant_value(module: &str, name: &str) -> i64 {
             value::list_new(vec![program])
         }
         ("sys", "platform") => value::str_from_bytes(platform().as_bytes()),
-        ("sys", "version") => value::str_alloc(format!("PyX {}", env!("CARGO_PKG_VERSION"))),
-        ("sys", "version_info") => {
-            value::tuple_new(vec![encode_int(0), encode_int(1), encode_int(0)])
-        }
+        ("sys", "version") => value::str_alloc(format!(
+            "{PYTHON_VERSION_STRING} (PyX {})",
+            env!("CARGO_PKG_VERSION")
+        )),
+        ("sys", "version_info") => value::tuple_new(vec![
+            encode_int(i64::from(PYTHON_VERSION.0)),
+            encode_int(i64::from(PYTHON_VERSION.1)),
+            encode_int(i64::from(PYTHON_VERSION.2)),
+            value::str_from_bytes(b"final"),
+            encode_int(0),
+        ]),
+        ("sys", "pyx_version") => value::str_from_bytes(env!("CARGO_PKG_VERSION").as_bytes()),
+        ("sys", "pyx_version_info") => value::tuple_new(vec![
+            encode_int(0),
+            encode_int(1),
+            encode_int(0),
+            value::str_from_bytes(b"dev"),
+            encode_int(0),
+        ]),
         // `i64::MAX` does not fit into the 61-bit tagged integer; the
         // documented value is `2^60 - 1` (`value::MAX_INT`).
         ("sys", "maxsize") => encode_int(value::MAX_INT),
@@ -414,7 +430,6 @@ fn constant_value(module: &str, name: &str) -> i64 {
             let sep = if cfg!(windows) { "\\" } else { "/" };
             value::str_from_bytes(sep.as_bytes())
         }
-        ("platform", "python_implementation") => value::str_from_bytes(b"PyX"),
         ("socket", "AF_INET") => encode_int(2),
         ("socket", "SOCK_STREAM") => encode_int(1),
         ("socket", "SOL_SOCKET") => encode_int(1),
@@ -788,10 +803,6 @@ fn platform_node() -> String {
     String::new()
 }
 
-fn platform_python_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
-
 fn platform_call(function: &str) -> i64 {
     match function {
         "system" => value::str_from_bytes(platform_system().as_bytes()),
@@ -805,7 +816,8 @@ fn platform_call(function: &str) -> i64 {
             platform_release(),
             platform_machine()
         )),
-        "python_version" => value::str_from_bytes(platform_python_version().as_bytes()),
+        "python_version" => value::str_from_bytes(PYTHON_VERSION_STRING.as_bytes()),
+        "python_implementation" => value::str_from_bytes(b"PyX"),
         _ => missing_attribute("platform", function),
     }
 }
@@ -3215,12 +3227,46 @@ mod tests {
 
         assert_eq!(value::as_str(get("sys", "platform")), Some(platform()));
         let version = value::as_str(get("sys", "version")).expect("version string");
-        assert!(version.starts_with("PyX "));
+        assert_eq!(
+            version,
+            format!(
+                "{PYTHON_VERSION_STRING} (PyX {})",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
         let info = value::as_tuple(get("sys", "version_info")).expect("tuple");
-        assert_eq!(info.len(), 3);
-        assert_eq!(as_int(info[0]), 0);
-        assert_eq!(as_int(info[2]), 0);
+        assert_eq!(info.len(), 5);
+        assert_eq!(as_int(info[0]), i64::from(PYTHON_VERSION.0));
+        assert_eq!(as_int(info[1]), i64::from(PYTHON_VERSION.1));
+        assert_eq!(as_int(info[2]), i64::from(PYTHON_VERSION.2));
+        assert_eq!(value::as_str(info[3]), Some("final"));
+        assert_eq!(as_int(info[4]), 0);
+        assert_eq!(
+            value::as_str(get("sys", "pyx_version")),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        let pyx_info = value::as_tuple(get("sys", "pyx_version_info")).expect("tuple");
+        assert_eq!(pyx_info.len(), 5);
+        assert_eq!(as_int(pyx_info[0]), 0);
+        assert_eq!(as_int(pyx_info[1]), 1);
+        assert_eq!(as_int(pyx_info[2]), 0);
+        assert_eq!(value::as_str(pyx_info[3]), Some("dev"));
+        assert_eq!(as_int(pyx_info[4]), 0);
         assert_eq!(as_int(get("sys", "maxsize")), value::MAX_INT);
+    }
+
+    #[test]
+    fn platform_reports_compat_target() {
+        exc::init();
+        assert_eq!(
+            value::as_str(call("platform", "python_version", &[])),
+            Some(PYTHON_VERSION_STRING)
+        );
+        assert_eq!(
+            value::as_str(call("platform", "python_implementation", &[])),
+            Some("PyX")
+        );
+        assert!(!exc::pending());
     }
 
     #[test]

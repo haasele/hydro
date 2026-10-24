@@ -46,10 +46,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
         run: cargo test --workspace
+
+      - name: CPython gate manifest
+        run: python3 scripts/cpython_compat.py --check-manifest
 
       - name: Full gate (E2E, AOT, GC)
         run: ./scripts/verify.sh

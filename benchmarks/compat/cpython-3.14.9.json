@@ -1,0 +1,6007 @@
+{
+  "meta": {
+    "cpython": {
+      "path": "/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14",
+      "version": "3.14.9"
+    },
+    "cwd": "/mnt/Vault/GitHub/pyx",
+    "date": "2026-10-24T21:13:36Z",
+    "elapsed_seconds": 535.6,
+    "options": {
+      "limit": null,
+      "only": null,
+      "timeout": 10.0
+    },
+    "python_target": "3.14.9",
+    "pyx": {
+      "path": "/mnt/Vault/GitHub/pyx/target/release/pyx",
+      "version": "pyx 0.1.0"
+    },
+    "source": "/mnt/Vault/GitHub/pyx/.pyx/cpython/Python-3.14.9"
+  },
+  "passing": [],
+  "summary": {
+    "by_status": {
+      "cpython_fail": 0,
+      "expected_fail": 76,
+      "pyx_fail": 322,
+      "pyx_pass": 0,
+      "timeout": 0
+    },
+    "failed": 398,
+    "passed": 0,
+    "total": 398
+  },
+  "tests": [
+    {
+      "cpython": {
+        "duration_ms": 1915.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test___all__.py",
+      "pyx": {
+        "duration_ms": 2.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 257.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test__colorize.py",
+      "pyx": {
+        "duration_ms": 3.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1500.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test__interpchannels.py",
+      "pyx": {
+        "duration_ms": 6.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1782.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test__interpreters.py",
+      "pyx": {
+        "duration_ms": 5.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 174.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '_locale' not found: not supported unless a sibling _locale.py exists",
+      "name": "test__locale.py",
+      "pyx": {
+        "duration_ms": 4.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 172.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'dis' not found: not supported unless a sibling dis.py exists",
+      "name": "test__opcode.py",
+      "pyx": {
+        "duration_ms": 3.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 186.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'stat' not found: not supported unless a sibling stat.py exists",
+      "name": "test__osx_support.py",
+      "pyx": {
+        "duration_ms": 2.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 164.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_abc.py",
+      "pyx": {
+        "duration_ms": 4.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 154.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'abc' not found: not supported unless a sibling abc.py exists",
+      "name": "test_abstract_numbers.py",
+      "pyx": {
+        "duration_ms": 2.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 243.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists",
+      "name": "test_android.py",
+      "pyx": {
+        "duration_ms": 3.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 204.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0001]: invalid syntax: invalid syntax. Got unexpected token \"{a}\"",
+      "name": "test_annotationlib.py",
+      "pyx": {
+        "duration_ms": 2.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 236.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_apple.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2550.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '_colorize' not found: not supported unless a sibling _colorize.py exists",
+      "name": "test_argparse.py",
+      "pyx": {
+        "duration_ms": 27.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 519.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'collections.abc'",
+      "name": "test_array.py",
+      "pyx": {
+        "duration_ms": 10.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 149.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'importlib.machinery'",
+      "name": "test_asdl_parser.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1047.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists",
+      "name": "test_asyncgen.py",
+      "pyx": {
+        "duration_ms": 8.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 307.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'atexit' not found: not supported unless a sibling atexit.py exists",
+      "name": "test_atexit.py",
+      "pyx": {
+        "duration_ms": 2.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 5636.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists",
+      "name": "test_audit.py",
+      "pyx": {
+        "duration_ms": 3.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 178.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_augassign.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 403.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_base64.py",
+      "pyx": {
+        "duration_ms": 8.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 216.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_baseexception.py",
+      "pyx": {
+        "duration_ms": 2.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 316.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'bdb' not found: not supported unless a sibling bdb.py exists",
+      "name": "test_bdb.py",
+      "pyx": {
+        "duration_ms": 6.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 414.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_bigaddrspace.py",
+      "pyx": {
+        "duration_ms": 16.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 431.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_bigmem.py",
+      "pyx": {
+        "duration_ms": 9.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 240.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_binascii.py",
+      "pyx": {
+        "duration_ms": 5.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 181.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_binop.py",
+      "pyx": {
+        "duration_ms": 3.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 212.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_bisect.py",
+      "pyx": {
+        "duration_ms": 4.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 208.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_bool.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 246.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_buffer.py",
+      "pyx": {
+        "duration_ms": 30.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 275.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_bufio.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 360.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'importlib' not found: not supported unless a sibling importlib.py exists",
+      "name": "test_build_details.py",
+      "pyx": {
+        "duration_ms": 6.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 859.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'ast' not found: not supported unless a sibling ast.py exists",
+      "name": "test_builtin.py",
+      "pyx": {
+        "duration_ms": 19.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 252.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'array' not found: not supported unless a sibling array.py exists",
+      "name": "test_bytes.py",
+      "pyx": {
+        "duration_ms": 15.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 613.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_bz2.py",
+      "pyx": {
+        "duration_ms": 8.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1472.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'locale' not found: not supported unless a sibling locale.py exists",
+      "name": "test_c_locale_coercion.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1570.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'calendar' not found: not supported unless a sibling calendar.py exists",
+      "name": "test_calendar.py",
+      "pyx": {
+        "duration_ms": 6.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 186.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_call.py",
+      "pyx": {
+        "duration_ms": 5.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 139.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_charmapcodec.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 190.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_class.py",
+      "pyx": {
+        "duration_ms": 5.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 357.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_clinic.py",
+      "pyx": {
+        "duration_ms": 15.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 215.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_cmath.py",
+      "pyx": {
+        "duration_ms": 4.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 362.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'cmd' not found: not supported unless a sibling cmd.py exists",
+      "name": "test_cmd.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2746.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists",
+      "name": "test_cmd_line.py",
+      "pyx": {
+        "duration_ms": 6.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1613.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_cmd_line_script.py",
+      "pyx": {
+        "duration_ms": 5.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 282.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_code.py",
+      "pyx": {
+        "duration_ms": 6.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 198.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'traceback' not found: not supported unless a sibling traceback.py exists",
+      "name": "test_code_module.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 93.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '_codecs' not found: not supported unless a sibling _codecs.py exists",
+      "name": "test_codeccallbacks.py",
+      "pyx": {
+        "duration_ms": 5.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 179.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecencodings_cn.py",
+      "pyx": {
+        "duration_ms": 2.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 151.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecencodings_hk.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 211.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecencodings_iso2022.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 229.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecencodings_jp.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 169.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecencodings_kr.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 156.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecencodings_tw.py",
+      "pyx": {
+        "duration_ms": 1.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 4134.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecmaps_cn.py",
+      "pyx": {
+        "duration_ms": 2.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 997.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecmaps_hk.py",
+      "pyx": {
+        "duration_ms": 1.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 4932.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecmaps_jp.py",
+      "pyx": {
+        "duration_ms": 1.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 3086.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecmaps_kr.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1932.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_codecmaps_tw.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 411.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists",
+      "name": "test_codecs.py",
+      "pyx": {
+        "duration_ms": 14.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 119.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_codeop.py",
+      "pyx": {
+        "duration_ms": 3.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1274.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'array' not found: not supported unless a sibling array.py exists",
+      "name": "test_collections.py",
+      "pyx": {
+        "duration_ms": 11.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 78.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_colorsys.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 111.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_compare.py",
+      "pyx": {
+        "duration_ms": 3.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2470.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_compile.py",
+      "pyx": {
+        "duration_ms": 14.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 135.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'compileall' not found: not supported unless a sibling compileall.py exists",
+      "name": "test_compileall.py",
+      "pyx": {
+        "duration_ms": 7.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 91.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'dis' not found: not supported unless a sibling dis.py exists",
+      "name": "test_compiler_assemble.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 98.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists",
+      "name": "test_compiler_codegen.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 132.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_complex.py",
+      "pyx": {
+        "duration_ms": 7.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 517.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'configparser' not found: not supported unless a sibling configparser.py exists",
+      "name": "test_configparser.py",
+      "pyx": {
+        "duration_ms": 11.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 96.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_contains.py",
+      "pyx": {
+        "duration_ms": 2.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 647.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'collections.abc'",
+      "name": "test_context.py",
+      "pyx": {
+        "duration_ms": 6.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 130.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists",
+      "name": "test_contextlib.py",
+      "pyx": {
+        "duration_ms": 6.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 129.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_contextlib_async.py",
+      "pyx": {
+        "duration_ms": 4.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 133.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_copy.py",
+      "pyx": {
+        "duration_ms": 5.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 162.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copyreg' not found: not supported unless a sibling copyreg.py exists",
+      "name": "test_copyreg.py",
+      "pyx": {
+        "duration_ms": 2.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 355.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'ast' not found: not supported unless a sibling ast.py exists",
+      "name": "test_coroutines.py",
+      "pyx": {
+        "duration_ms": 8.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 618.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_cprofile.py",
+      "pyx": {
+        "duration_ms": 2.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 116.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_crossinterp.py",
+      "pyx": {
+        "duration_ms": 6.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 334.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_csv.py",
+      "pyx": {
+        "duration_ms": 8.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 382.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists",
+      "name": "test_curses.py",
+      "pyx": {
+        "duration_ms": 9.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10003.7,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_datetime.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 435.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_dbm.py",
+      "pyx": {
+        "duration_ms": 3.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 123.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_dbm_dumb.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 98.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_dbm_gnu.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 158.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_dbm_ndbm.py",
+      "pyx": {
+        "duration_ms": 2.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 654.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'stat' not found: not supported unless a sibling stat.py exists",
+      "name": "test_dbm_sqlite3.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2064.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'logging' not found: not supported unless a sibling logging.py exists",
+      "name": "test_decimal.py",
+      "pyx": {
+        "duration_ms": 26.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 73.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_decorators.py",
+      "pyx": {
+        "duration_ms": 3.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 80.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_defaultdict.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 473.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_deque.py",
+      "pyx": {
+        "duration_ms": 6.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 394.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists",
+      "name": "test_descr.py",
+      "pyx": {
+        "duration_ms": 22.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 207.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_descrtut.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 96.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'select' not found: not supported unless a sibling select.py exists",
+      "name": "test_devpoll.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 376.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'collections.abc'",
+      "name": "test_dict.py",
+      "pyx": {
+        "duration_ms": 7.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 113.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'traceback' not found: not supported unless a sibling traceback.py exists",
+      "name": "test_dictcomps.py",
+      "pyx": {
+        "duration_ms": 3.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 245.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'collections.abc'",
+      "name": "test_dictviews.py",
+      "pyx": {
+        "duration_ms": 5.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 381.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'difflib' not found: not supported unless a sibling difflib.py exists",
+      "name": "test_difflib.py",
+      "pyx": {
+        "duration_ms": 5.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 364.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'ast' not found: not supported unless a sibling ast.py exists",
+      "name": "test_dis.py",
+      "pyx": {
+        "duration_ms": 13.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2261.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'xmlrpc.server'",
+      "name": "test_docxmlrpc.py",
+      "pyx": {
+        "duration_ms": 2.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 146.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'dis' not found: not supported unless a sibling dis.py exists",
+      "name": "test_dtrace.py",
+      "pyx": {
+        "duration_ms": 4.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 130.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists",
+      "name": "test_dynamic.py",
+      "pyx": {
+        "duration_ms": 3.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 90.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'abc' not found: not supported unless a sibling abc.py exists",
+      "name": "test_dynamicclassattribute.py",
+      "pyx": {
+        "duration_ms": 2.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 205.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'signal' not found: not supported unless a sibling signal.py exists",
+      "name": "test_eintr.py",
+      "pyx": {
+        "duration_ms": 2.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 156.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_embed.py",
+      "pyx": {
+        "duration_ms": 9.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 267.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_ensurepip.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 785.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_enum.py",
+      "pyx": {
+        "duration_ms": 26.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 161.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_enumerate.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 417.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists",
+      "name": "test_eof.py",
+      "pyx": {
+        "duration_ms": 2.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 214.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_epoll.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 79.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_errno.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 111.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_except_star.py",
+      "pyx": {
+        "duration_ms": 4.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 323.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'types' not found: not supported unless a sibling types.py exists",
+      "name": "test_exception_group.py",
+      "pyx": {
+        "duration_ms": 4.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 81.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists",
+      "name": "test_exception_hierarchy.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 80.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_exception_variations.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1042.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_exceptions.py",
+      "pyx": {
+        "duration_ms": 10.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 211.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_extcall.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1765.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_external_inspection.py",
+      "pyx": {
+        "duration_ms": 6.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10005.5,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_faulthandler.py",
+      "pyx": {
+        "duration_ms": 4.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 477.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_fcntl.py",
+      "pyx": {
+        "duration_ms": 3.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 171.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_file.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1561.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'select' not found: not supported unless a sibling select.py exists",
+      "name": "test_file_eintr.py",
+      "pyx": {
+        "duration_ms": 3.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 138.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'filecmp' not found: not supported unless a sibling filecmp.py exists",
+      "name": "test_filecmp.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 213.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'fileinput' not found: not supported unless a sibling fileinput.py exists",
+      "name": "test_fileinput.py",
+      "pyx": {
+        "duration_ms": 5.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 628.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_fileio.py",
+      "pyx": {
+        "duration_ms": 5.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 209.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_fileutils.py",
+      "pyx": {
+        "duration_ms": 2.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 170.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_finalization.py",
+      "pyx": {
+        "duration_ms": 4.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 176.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'fractions' not found: not supported unless a sibling fractions.py exists",
+      "name": "test_float.py",
+      "pyx": {
+        "duration_ms": 10.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 93.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '__future__' not found: not supported unless a sibling __future__.py exists",
+      "name": "test_flufl.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 88.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'string' not found: not supported unless a sibling string.py exists",
+      "name": "test_fnmatch.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 5208.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '_imp' not found: not supported unless a sibling _imp.py exists",
+      "name": "test_fork1.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 123.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_format.py",
+      "pyx": {
+        "duration_ms": 5.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 151.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'decimal' not found: not supported unless a sibling decimal.py exists",
+      "name": "test_fractions.py",
+      "pyx": {
+        "duration_ms": 11.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1084.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_frame.py",
+      "pyx": {
+        "duration_ms": 4.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 119.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'importlib.machinery'",
+      "name": "test_frozen.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 596.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0001]: invalid syntax: f-string: expecting '}'",
+      "name": "test_fstring.py",
+      "pyx": {
+        "duration_ms": 5.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 7382.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'ftplib' not found: not supported unless a sibling ftplib.py exists",
+      "name": "test_ftplib.py",
+      "pyx": {
+        "duration_ms": 6.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 117.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists",
+      "name": "test_funcattrs.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 460.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'abc' not found: not supported unless a sibling abc.py exists",
+      "name": "test_functools.py",
+      "pyx": {
+        "duration_ms": 15.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1601.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_gc.py",
+      "pyx": {
+        "duration_ms": 5.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 188.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_generated_cases.py",
+      "pyx": {
+        "duration_ms": 4.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 74.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '__future__' not found: not supported unless a sibling __future__.py exists",
+      "name": "test_generator_stop.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 263.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_generators.py",
+      "pyx": {
+        "duration_ms": 6.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 282.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_genericalias.py",
+      "pyx": {
+        "duration_ms": 6.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 111.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_genericclass.py",
+      "pyx": {
+        "duration_ms": 2.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 121.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'genericpath' not found: not supported unless a sibling genericpath.py exists",
+      "name": "test_genericpath.py",
+      "pyx": {
+        "duration_ms": 3.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 212.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_genexps.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 239.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_getopt.py",
+      "pyx": {
+        "duration_ms": 3.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 185.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'getpass' not found: not supported unless a sibling getpass.py exists",
+      "name": "test_getpass.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 91.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_getpath.py",
+      "pyx": {
+        "duration_ms": 5.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 224.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'base64' not found: not supported unless a sibling base64.py exists",
+      "name": "test_gettext.py",
+      "pyx": {
+        "duration_ms": 4.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 156.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'glob' not found: not supported unless a sibling glob.py exists",
+      "name": "test_glob.py",
+      "pyx": {
+        "duration_ms": 5.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 105.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_global.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 129.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0001]: invalid syntax: invalid syntax. Got unexpected token ','",
+      "name": "test_grammar.py",
+      "pyx": {
+        "duration_ms": 5.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 148.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'graphlib' not found: not supported unless a sibling graphlib.py exists",
+      "name": "test_graphlib.py",
+      "pyx": {
+        "duration_ms": 2.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 322.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'string' not found: not supported unless a sibling string.py exists",
+      "name": "test_grp.py",
+      "pyx": {
+        "duration_ms": 2.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 986.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'array' not found: not supported unless a sibling array.py exists",
+      "name": "test_gzip.py",
+      "pyx": {
+        "duration_ms": 6.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 363.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'datetime' not found: not supported unless a sibling datetime.py exists",
+      "name": "test_hash.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10004.2,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'array' not found: not supported unless a sibling array.py exists",
+      "name": "test_hashlib.py",
+      "pyx": {
+        "duration_ms": 7.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 321.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_heapq.py",
+      "pyx": {
+        "duration_ms": 4.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 232.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'binascii' not found: not supported unless a sibling binascii.py exists",
+      "name": "test_hmac.py",
+      "pyx": {
+        "duration_ms": 6.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 77.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'html' not found: not supported unless a sibling html.py exists",
+      "name": "test_html.py",
+      "pyx": {
+        "duration_ms": 2.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 554.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'html.parser'",
+      "name": "test_htmlparser.py",
+      "pyx": {
+        "duration_ms": 7.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 350.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'stat' not found: not supported unless a sibling stat.py exists",
+      "name": "test_http_cookiejar.py",
+      "pyx": {
+        "duration_ms": 8.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 787.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_http_cookies.py",
+      "pyx": {
+        "duration_ms": 4.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 3761.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'enum' not found: not supported unless a sibling enum.py exists",
+      "name": "test_httplib.py",
+      "pyx": {
+        "duration_ms": 11.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 4386.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'http.server'",
+      "name": "test_httpservers.py",
+      "pyx": {
+        "duration_ms": 9.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10009.0,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_idle.py",
+      "pyx": {
+        "duration_ms": 2.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10004.6,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_imaplib.py",
+      "pyx": {
+        "duration_ms": 11.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 104.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_index.py",
+      "pyx": {
+        "duration_ms": 2.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10004.8,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_int.py",
+      "pyx": {
+        "duration_ms": 5.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 96.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_int_literal.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10005.4,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'abc' not found: not supported unless a sibling abc.py exists",
+      "name": "test_io.py",
+      "pyx": {
+        "duration_ms": 19.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 606.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'array' not found: not supported unless a sibling array.py exists",
+      "name": "test_ioctl.py",
+      "pyx": {
+        "duration_ms": 3.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 175.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_ipaddress.py",
+      "pyx": {
+        "duration_ms": 13.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 972.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_isinstance.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 136.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_iter.py",
+      "pyx": {
+        "duration_ms": 6.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 79.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_iterlen.py",
+      "pyx": {
+        "duration_ms": 2.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 854.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_itertools.py",
+      "pyx": {
+        "duration_ms": 14.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 115.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'keyword' not found: not supported unless a sibling keyword.py exists",
+      "name": "test_keyword.py",
+      "pyx": {
+        "duration_ms": 2.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 75.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_keywordonlyarg.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 89.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_kqueue.py",
+      "pyx": {
+        "duration_ms": 2.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1615.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_largefile.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 131.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_launcher.py",
+      "pyx": {
+        "duration_ms": 4.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 179.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'importlib' not found: not supported unless a sibling importlib.py exists",
+      "name": "test_linecache.py",
+      "pyx": {
+        "duration_ms": 4.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 460.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'signal' not found: not supported unless a sibling signal.py exists",
+      "name": "test_list.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 227.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_listcomps.py",
+      "pyx": {
+        "duration_ms": 4.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 121.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'dis' not found: not supported unless a sibling dis.py exists",
+      "name": "test_lltrace.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 217.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'decimal' not found: not supported unless a sibling decimal.py exists",
+      "name": "test_locale.py",
+      "pyx": {
+        "duration_ms": 4.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10009.2,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'logging' not found: not supported unless a sibling logging.py exists",
+      "name": "test_logging.py",
+      "pyx": {
+        "duration_ms": 25.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 559.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_long.py",
+      "pyx": {
+        "duration_ms": 10.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 157.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_longexp.py",
+      "pyx": {
+        "duration_ms": 2.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 223.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'array' not found: not supported unless a sibling array.py exists",
+      "name": "test_lzma.py",
+      "pyx": {
+        "duration_ms": 8.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1346.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'email' not found: not supported unless a sibling email.py exists",
+      "name": "test_mailbox.py",
+      "pyx": {
+        "duration_ms": 11.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 264.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_marshal.py",
+      "pyx": {
+        "duration_ms": 6.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10012.4,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_math.py",
+      "pyx": {
+        "duration_ms": 17.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 95.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_math_property.py",
+      "pyx": {
+        "duration_ms": 1.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 151.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_memoryio.py",
+      "pyx": {
+        "duration_ms": 5.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 452.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_memoryview.py",
+      "pyx": {
+        "duration_ms": 5.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 173.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_metaclass.py",
+      "pyx": {
+        "duration_ms": 1.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 536.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'mimetypes' not found: not supported unless a sibling mimetypes.py exists",
+      "name": "test_mimetypes.py",
+      "pyx": {
+        "duration_ms": 4.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 166.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_minidom.py",
+      "pyx": {
+        "duration_ms": 9.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 177.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_mmap.py",
+      "pyx": {
+        "duration_ms": 5.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 339.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_modulefinder.py",
+      "pyx": {
+        "duration_ms": 2.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 117.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'dis' not found: not supported unless a sibling dis.py exists",
+      "name": "test_monitoring.py",
+      "pyx": {
+        "duration_ms": 8.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 91.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists",
+      "name": "test_msvcrt.py",
+      "pyx": {
+        "duration_ms": 2.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 268.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '_multibytecodec' not found: not supported unless a sibling _multibytecodec.py exists",
+      "name": "test_multibytecodec.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1478.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_multiprocessing_main_handling.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 125.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_named_expressions.py",
+      "pyx": {
+        "duration_ms": 5.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 140.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'netrc' not found: not supported unless a sibling netrc.py exists",
+      "name": "test_netrc.py",
+      "pyx": {
+        "duration_ms": 3.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 408.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists",
+      "name": "test_ntpath.py",
+      "pyx": {
+        "duration_ms": 10.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 141.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_nturl2path.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 122.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_numeric_tower.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 488.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_opcache.py",
+      "pyx": {
+        "duration_ms": 7.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 124.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_opcodes.py",
+      "pyx": {
+        "duration_ms": 3.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 103.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_openpty.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 151.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_operator.py",
+      "pyx": {
+        "duration_ms": 6.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 121.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_optimizer.py",
+      "pyx": {
+        "duration_ms": 2.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 228.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_optparse.py",
+      "pyx": {
+        "duration_ms": 6.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 286.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists",
+      "name": "test_ordered_dict.py",
+      "pyx": {
+        "duration_ms": 8.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10007.3,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists",
+      "name": "test_os.py",
+      "pyx": {
+        "duration_ms": 25.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 117.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support.os_helper'",
+      "name": "test_osx_env.py",
+      "pyx": {
+        "duration_ms": 2.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 102.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'array' not found: not supported unless a sibling array.py exists",
+      "name": "test_patma.py",
+      "pyx": {
+        "duration_ms": 11.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10004.1,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module '_colorize' not found: not supported unless a sibling _colorize.py exists",
+      "name": "test_pdb.py",
+      "pyx": {
+        "duration_ms": 10.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 416.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'ast' not found: not supported unless a sibling ast.py exists",
+      "name": "test_peepholer.py",
+      "pyx": {
+        "duration_ms": 11.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 253.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_pep646_syntax.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 434.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_perf_profiler.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 125.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_perfmaps.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2285.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '_compat_pickle' not found: not supported unless a sibling _compat_pickle.py exists",
+      "name": "test_pickle.py",
+      "pyx": {
+        "duration_ms": 5.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 175.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'gc' not found: not supported unless a sibling gc.py exists",
+      "name": "test_picklebuffer.py",
+      "pyx": {
+        "duration_ms": 3.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 597.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'pickletools' not found: not supported unless a sibling pickletools.py exists",
+      "name": "test_pickletools.py",
+      "pyx": {
+        "duration_ms": 3.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 145.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists",
+      "name": "test_pkg.py",
+      "pyx": {
+        "duration_ms": 2.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 211.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support.import_helper'",
+      "name": "test_pkgutil.py",
+      "pyx": {
+        "duration_ms": 4.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 453.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_platform.py",
+      "pyx": {
+        "duration_ms": 4.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 286.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_plistlib.py",
+      "pyx": {
+        "duration_ms": 5.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10012.7,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists",
+      "name": "test_poll.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 196.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_popen.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 6432.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'poplib' not found: not supported unless a sibling poplib.py exists",
+      "name": "test_poplib.py",
+      "pyx": {
+        "duration_ms": 3.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 224.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'dis' not found: not supported unless a sibling dis.py exists",
+      "name": "test_positional_only_arg.py",
+      "pyx": {
+        "duration_ms": 4.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1142.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_posix.py",
+      "pyx": {
+        "duration_ms": 10.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 371.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists",
+      "name": "test_posixpath.py",
+      "pyx": {
+        "duration_ms": 7.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 314.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_pow.py",
+      "pyx": {
+        "duration_ms": 2.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 221.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_pprint.py",
+      "pyx": {
+        "duration_ms": 4.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 160.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_print.py",
+      "pyx": {
+        "duration_ms": 2.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 350.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'pstats' not found: not supported unless a sibling pstats.py exists",
+      "name": "test_profile.py",
+      "pyx": {
+        "duration_ms": 2.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 118.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_property.py",
+      "pyx": {
+        "duration_ms": 3.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 235.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_pstats.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 142.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_pty.py",
+      "pyx": {
+        "duration_ms": 3.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 199.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_pulldom.py",
+      "pyx": {
+        "duration_ms": 3.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 136.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'string' not found: not supported unless a sibling string.py exists",
+      "name": "test_pwd.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 391.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'importlib.util'",
+      "name": "test_py_compile.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 140.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'importlib.machinery'",
+      "name": "test_pyclbr.py",
+      "pyx": {
+        "duration_ms": 3.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 262.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'abc' not found: not supported unless a sibling abc.py exists",
+      "name": "test_pyexpat.py",
+      "pyx": {
+        "duration_ms": 5.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 7965.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists",
+      "name": "test_queue.py",
+      "pyx": {
+        "duration_ms": 6.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 216.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_quopri.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 231.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_raise.py",
+      "pyx": {
+        "duration_ms": 8.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1075.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_random.py",
+      "pyx": {
+        "duration_ms": 9.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 268.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_range.py",
+      "pyx": {
+        "duration_ms": 6.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 606.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_re.py",
+      "pyx": {
+        "duration_ms": 19.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 385.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists",
+      "name": "test_readline.py",
+      "pyx": {
+        "duration_ms": 5.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2254.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '_colorize' not found: not supported unless a sibling _colorize.py exists",
+      "name": "test_regrtest.py",
+      "pyx": {
+        "duration_ms": 12.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2682.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists",
+      "name": "test_remote_pdb.py",
+      "pyx": {
+        "duration_ms": 7.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1044.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'select' not found: not supported unless a sibling select.py exists",
+      "name": "test_repl.py",
+      "pyx": {
+        "duration_ms": 3.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 81.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'annotationlib' not found: not supported unless a sibling annotationlib.py exists",
+      "name": "test_reprlib.py",
+      "pyx": {
+        "duration_ms": 4.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 83.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_resource.py",
+      "pyx": {
+        "duration_ms": 2.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 46.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_richcmp.py",
+      "pyx": {
+        "duration_ms": 2.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 109.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_rlcompleter.py",
+      "pyx": {
+        "duration_ms": 3.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1318.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_robotparser.py",
+      "pyx": {
+        "duration_ms": 5.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10007.6,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_runpy.py",
+      "pyx": {
+        "duration_ms": 5.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 224.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'xml.sax'",
+      "name": "test_sax.py",
+      "pyx": {
+        "duration_ms": 7.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 583.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'sched' not found: not supported unless a sibling sched.py exists",
+      "name": "test_sched.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 53.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_scope.py",
+      "pyx": {
+        "duration_ms": 3.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 192.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists",
+      "name": "test_script_helper.py",
+      "pyx": {
+        "duration_ms": 2.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 43.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'secrets' not found: not supported unless a sibling secrets.py exists",
+      "name": "test_secrets.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1556.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_select.py",
+      "pyx": {
+        "duration_ms": 2.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10005.3,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_selectors.py",
+      "pyx": {
+        "duration_ms": 4.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 765.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'collections.abc'",
+      "name": "test_set.py",
+      "pyx": {
+        "duration_ms": 10.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 124.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_setcomps.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2615.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_shelve.py",
+      "pyx": {
+        "duration_ms": 2.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 138.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists",
+      "name": "test_shlex.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 492.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_shutil.py",
+      "pyx": {
+        "duration_ms": 16.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10004.2,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'enum' not found: not supported unless a sibling enum.py exists",
+      "name": "test_signal.py",
+      "pyx": {
+        "duration_ms": 5.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2459.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_site.py",
+      "pyx": {
+        "duration_ms": 6.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 54.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists",
+      "name": "test_slice.py",
+      "pyx": {
+        "duration_ms": 3.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1440.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'base64' not found: not supported unless a sibling base64.py exists",
+      "name": "test_smtplib.py",
+      "pyx": {
+        "duration_ms": 8.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10003.8,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_smtpnet.py",
+      "pyx": {
+        "duration_ms": 2.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10006.4,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_socket.py",
+      "pyx": {
+        "duration_ms": 29.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 520.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_socketserver.py",
+      "pyx": {
+        "duration_ms": 3.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 73.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_sort.py",
+      "pyx": {
+        "duration_ms": 2.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10013.4,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_source_encoding.py",
+      "pyx": {
+        "duration_ms": 4.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10005.5,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_ssl.py",
+      "pyx": {
+        "duration_ms": 21.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 119.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_stable_abi_ctypes.py",
+      "pyx": {
+        "duration_ms": 3.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 119.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_startfile.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 147.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_stat.py",
+      "pyx": {
+        "duration_ms": 3.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 9836.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'bisect' not found: not supported unless a sibling bisect.py exists",
+      "name": "test_statistics.py",
+      "pyx": {
+        "duration_ms": 14.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1145.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '_string' not found: not supported unless a sibling _string.py exists",
+      "name": "test_str.py",
+      "pyx": {
+        "duration_ms": 14.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 174.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'calendar' not found: not supported unless a sibling calendar.py exists",
+      "name": "test_strftime.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 136.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'shutil' not found: not supported unless a sibling shutil.py exists",
+      "name": "test_string_literals.py",
+      "pyx": {
+        "duration_ms": 3.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 124.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_stringprep.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 170.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_strptime.py",
+      "pyx": {
+        "duration_ms": 5.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 247.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_strtod.py",
+      "pyx": {
+        "duration_ms": 3.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 393.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists",
+      "name": "test_struct.py",
+      "pyx": {
+        "duration_ms": 8.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 160.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_structseq.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 124.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'types' not found: not supported unless a sibling types.py exists",
+      "name": "test_subclassinit.py",
+      "pyx": {
+        "duration_ms": 2.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10004.5,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_subprocess.py",
+      "pyx": {
+        "duration_ms": 15.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 145.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'importlib' not found: not supported unless a sibling importlib.py exists",
+      "name": "test_sundry.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 262.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_super.py",
+      "pyx": {
+        "duration_ms": 3.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 5629.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_support.py",
+      "pyx": {
+        "duration_ms": 5.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 63.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists",
+      "name": "test_symtable.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 193.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_syntax.py",
+      "pyx": {
+        "duration_ms": 4.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1265.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists",
+      "name": "test_sys.py",
+      "pyx": {
+        "duration_ms": 11.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 53.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'gc' not found: not supported unless a sibling gc.py exists",
+      "name": "test_sys_setprofile.py",
+      "pyx": {
+        "duration_ms": 3.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 797.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_sys_settrace.py",
+      "pyx": {
+        "duration_ms": 9.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 195.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_sysconfig.py",
+      "pyx": {
+        "duration_ms": 5.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 195.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_syslog.py",
+      "pyx": {
+        "duration_ms": 2.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 136.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_tabnanny.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 5621.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_tarfile.py",
+      "pyx": {
+        "duration_ms": 18.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 116.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_tcl.py",
+      "pyx": {
+        "duration_ms": 6.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 397.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists",
+      "name": "test_tempfile.py",
+      "pyx": {
+        "duration_ms": 8.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 557.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists",
+      "name": "test_termios.py",
+      "pyx": {
+        "duration_ms": 3.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 43.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_textwrap.py",
+      "pyx": {
+        "duration_ms": 4.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1298.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_thread.py",
+      "pyx": {
+        "duration_ms": 3.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 56.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists",
+      "name": "test_thread_local_bytecode.py",
+      "pyx": {
+        "duration_ms": 2.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 57.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists",
+      "name": "test_threadedtempfile.py",
+      "pyx": {
+        "duration_ms": 2.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10003.3,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_threading.py",
+      "pyx": {
+        "duration_ms": 7.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 345.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_threading_local.py",
+      "pyx": {
+        "duration_ms": 2.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 4900.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_threadsignals.py",
+      "pyx": {
+        "duration_ms": 2.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 3087.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_time.py",
+      "pyx": {
+        "duration_ms": 6.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 63.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'timeit' not found: not supported unless a sibling timeit.py exists",
+      "name": "test_timeit.py",
+      "pyx": {
+        "duration_ms": 2.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10004.2,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_timeout.py",
+      "pyx": {
+        "duration_ms": 2.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 6617.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_tokenize.py",
+      "pyx": {
+        "duration_ms": 9.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 993.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_trace.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2277.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'linecache' not found: not supported unless a sibling linecache.py exists",
+      "name": "test_traceback.py",
+      "pyx": {
+        "duration_ms": 20.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 731.5,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_tracemalloc.py",
+      "pyx": {
+        "duration_ms": 5.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 289.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0001]: invalid syntax: invalid syntax. Got unexpected token \"Hello\"",
+      "name": "test_tstring.py",
+      "pyx": {
+        "duration_ms": 1.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 73.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_ttk_textonly.py",
+      "pyx": {
+        "duration_ms": 3.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 47.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_tty.py",
+      "pyx": {
+        "duration_ms": 2.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 231.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_tuple.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 199.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists",
+      "name": "test_turtle.py",
+      "pyx": {
+        "duration_ms": 4.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 55.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'types' not found: not supported unless a sibling types.py exists",
+      "name": "test_type_aliases.py",
+      "pyx": {
+        "duration_ms": 3.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 59.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'annotationlib' not found: not supported unless a sibling annotationlib.py exists",
+      "name": "test_type_annotations.py",
+      "pyx": {
+        "duration_ms": 4.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 55.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'collections.abc'",
+      "name": "test_type_cache.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 54.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'ast' not found: not supported unless a sibling ast.py exists",
+      "name": "test_type_comments.py",
+      "pyx": {
+        "duration_ms": 3.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 59.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0001]: invalid syntax: invalid syntax. Got unexpected token '='",
+      "name": "test_type_params.py",
+      "pyx": {
+        "duration_ms": 6.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 44.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_typechecks.py",
+      "pyx": {
+        "duration_ms": 2.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 279.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_types.py",
+      "pyx": {
+        "duration_ms": 12.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 407.3,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'annotationlib' not found: not supported unless a sibling annotationlib.py exists",
+      "name": "test_typing.py",
+      "pyx": {
+        "duration_ms": 41.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 669.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'ast' not found: not supported unless a sibling ast.py exists",
+      "name": "test_ucn.py",
+      "pyx": {
+        "duration_ms": 2.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 43.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_unary.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 50.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'glob' not found: not supported unless a sibling glob.py exists",
+      "name": "test_unicode_file.py",
+      "pyx": {
+        "duration_ms": 2.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 74.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_unicode_file_functions.py",
+      "pyx": {
+        "duration_ms": 2.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 47.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_unicode_identifiers.py",
+      "pyx": {
+        "duration_ms": 1.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 5847.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'hashlib' not found: not supported unless a sibling hashlib.py exists",
+      "name": "test_unicodedata.py",
+      "pyx": {
+        "duration_ms": 6.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 64.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module '_pyio' not found: not supported unless a sibling _pyio.py exists",
+      "name": "test_univnewlines.py",
+      "pyx": {
+        "duration_ms": 2.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 157.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_unpack.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 151.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists",
+      "name": "test_unpack_ex.py",
+      "pyx": {
+        "duration_ms": 1.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 6218.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_unparse.py",
+      "pyx": {
+        "duration_ms": 4.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 248.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'urllib.parse'",
+      "name": "test_urllib.py",
+      "pyx": {
+        "duration_ms": 8.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 1860.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_urllib2.py",
+      "pyx": {
+        "duration_ms": 9.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2170.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'base64' not found: not supported unless a sibling base64.py exists",
+      "name": "test_urllib2_localnet.py",
+      "pyx": {
+        "duration_ms": 3.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10011.7,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_urllib2net.py",
+      "pyx": {
+        "duration_ms": 2.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 56.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists",
+      "name": "test_urllib_response.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 7551.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_urllibnet.py",
+      "pyx": {
+        "duration_ms": 2.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 134.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unicodedata' not found: not supported unless a sibling unicodedata.py exists",
+      "name": "test_urlparse.py",
+      "pyx": {
+        "duration_ms": 11.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 144.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_userdict.py",
+      "pyx": {
+        "duration_ms": 3.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 135.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_userlist.py",
+      "pyx": {
+        "duration_ms": 2.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 579.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_userstring.py",
+      "pyx": {
+        "duration_ms": 2.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 433.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'locale' not found: not supported unless a sibling locale.py exists",
+      "name": "test_utf8_mode.py",
+      "pyx": {
+        "duration_ms": 2.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 44.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_utf8source.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 286.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists",
+      "name": "test_uuid.py",
+      "pyx": {
+        "duration_ms": 7.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 5611.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists",
+      "name": "test_venv.py",
+      "pyx": {
+        "duration_ms": 6.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 5068.1,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists",
+      "name": "test_wait3.py",
+      "pyx": {
+        "duration_ms": 2.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 5056.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_wait4.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 61.9,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_wave.py",
+      "pyx": {
+        "duration_ms": 2.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2604.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'gc' not found: not supported unless a sibling gc.py exists",
+      "name": "test_weakref.py",
+      "pyx": {
+        "duration_ms": 8.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 73.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_weakset.py",
+      "pyx": {
+        "duration_ms": 3.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2109.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'shlex' not found: not supported unless a sibling shlex.py exists",
+      "name": "test_webbrowser.py",
+      "pyx": {
+        "duration_ms": 4.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 54.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_winapi.py",
+      "pyx": {
+        "duration_ms": 2.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 50.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists",
+      "name": "test_winconsoleio.py",
+      "pyx": {
+        "duration_ms": 2.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 52.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'gc' not found: not supported unless a sibling gc.py exists",
+      "name": "test_winreg.py",
+      "pyx": {
+        "duration_ms": 3.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 48.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_winsound.py",
+      "pyx": {
+        "duration_ms": 2.1,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 48.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'traceback' not found: not supported unless a sibling traceback.py exists",
+      "name": "test_with.py",
+      "pyx": {
+        "duration_ms": 4.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 51.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_wmi.py",
+      "pyx": {
+        "duration_ms": 1.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 235.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_wsgiref.py",
+      "pyx": {
+        "duration_ms": 5.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 50.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_xml_dom_minicompat.py",
+      "pyx": {
+        "duration_ms": 2.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 167.2,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_xml_dom_xmlbuilder.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 793.8,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists",
+      "name": "test_xml_etree.py",
+      "pyx": {
+        "duration_ms": 19.3,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 521.4,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'struct' not found: not supported unless a sibling struct.py exists",
+      "name": "test_xml_etree_c.py",
+      "pyx": {
+        "duration_ms": 2.7,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10003.7,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'base64' not found: not supported unless a sibling base64.py exists",
+      "name": "test_xmlrpc.py",
+      "pyx": {
+        "duration_ms": 8.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 2018.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'struct' not found: not supported unless a sibling struct.py exists",
+      "name": "test_xpickle.py",
+      "pyx": {
+        "duration_ms": 2.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 48.5,
+        "exit": 1,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_xxlimited.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 53.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'faulthandler' not found: not supported unless a sibling faulthandler.py exists",
+      "name": "test_xxtestfuzz.py",
+      "pyx": {
+        "duration_ms": 1.8,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 61.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_yield_from.py",
+      "pyx": {
+        "duration_ms": 6.9,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 150.0,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'stat' not found: not supported unless a sibling stat.py exists",
+      "name": "test_zipapp.py",
+      "pyx": {
+        "duration_ms": 3.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10022.7,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'test' not found: not supported unless a sibling test.py exists",
+      "name": "test_zipfile64.py",
+      "pyx": {
+        "duration_ms": 2.2,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 10013.5,
+        "exit": null,
+        "timed_out": true
+      },
+      "error": "error[PYX0002]: module 'marshal' not found: not supported unless a sibling marshal.py exists",
+      "name": "test_zipimport.py",
+      "pyx": {
+        "duration_ms": 9.4,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "expected_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 513.7,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: dotted imports are not supported for user modules: 'test.support'",
+      "name": "test_zipimport_support.py",
+      "pyx": {
+        "duration_ms": 3.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 461.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py exists",
+      "name": "test_zlib.py",
+      "pyx": {
+        "duration_ms": 5.6,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    },
+    {
+      "cpython": {
+        "duration_ms": 534.6,
+        "exit": 0,
+        "timed_out": false
+      },
+      "error": "error[PYX0002]: module 'array' not found: not supported unless a sibling array.py exists",
+      "name": "test_zstd.py",
+      "pyx": {
+        "duration_ms": 12.0,
+        "exit": 1,
+        "timed_out": false
+      },
+      "status": "pyx_fail"
+    }
+  ]
+}

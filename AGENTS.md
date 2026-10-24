@@ -18,11 +18,17 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators (send/throw/close/yield expressions/yield from)/coroutines/event loop (no GIL)** | 875 tests, JIT+AOT |
+| P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators (send/throw/close/yield expressions/yield from)/coroutines/event loop (no GIL)** | 877 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
-| P4 Compatibility | **P4-04a/b complete for the defined subset: abi3 shim (scalars/containers/capsules/buffers), loader (env/venv paths, dotted submodules, wheel-tag policy, multi-phase init) under JIT+AOT, no `libpython`; full ABI/stdlib/ecosystem open (P4-04c…P4-11)** | `docs/C_API.md`, extension tests |
+| P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
 | P6 Polish | **largely done; diagnostics/JSON/doctor/CLI** | codes, snippets, help, ICE |
+
+**Compatibility target:** **CPython 3.14.9** (single definition in
+`pyx_ir::compat`; 3.13 is security-only, 3.15 is newer than the oracle).
+Official `Lib/test` runs are a release gate (`docs/CPYTHON_TESTS.md`), and the
+offline manifest check runs in `scripts/verify.sh`/CI. Future LTS lines are
+keyed to CPython minors (P4-12, policy only).
 
 **Current focus:** Phase-2 completion and documentation. Most recently
 implemented were real **lazy generators** (stackful fibers), real **coroutines
@@ -42,8 +48,8 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
 
 **Verification (as of 2026-10-24):**
 
-- `cargo test --workspace`: **875 tests** — 269 frontend, 18 codegen, 3 IR,
-  230 runtime unit, 182 CLI/E2E (135 E2E incl. the abi3 extension fixture,
+- `cargo test --workspace`: **877 tests** — 269 frontend, 18 codegen, 4 IR,
+  231 runtime unit, 182 CLI/E2E (135 E2E incl. the abi3 extension fixture,
   22 fibers, 6 closures, 5 user modules, completions, extension
   path/dotted/multi-phase), 173 further runtime integration tests
   (allocator, bytes, GC/concurrent GC, IO, CSV, stdlib modules, classes,
@@ -51,7 +57,7 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   send/throw/close + yield expressions, C-API containers, extension
   value/loader conversion, extension import lowering and the JIT+AOT abi3
   fixture (`crates/pyx-cli/tests/extensions.rs`).
-- `scripts/verify.sh`: fmt, clippy (zero warnings; no `-D warnings` gate), build, tests, E2E for JIT
+- `scripts/verify.sh`: fmt, clippy (`-D warnings`), build, tests, E2E for JIT
   and AOT (incl. classes/closures/generators_async/formatting/socket_echo/
   stdlib_modules/pathlib), negative tests, GC threshold/stress — ALL GREEN.
 - C-API: the environment is unblocked (Python 3.14.8 with `Python.h`,
@@ -74,9 +80,15 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   `next`/`send` echo, `close` running `finally`, `throw(caught_exception)`
   re-raised inside the generator, StopIteration after completion.
 - **Stdlib compatibility baseline:** `python3 scripts/stdlib_compat.py`
-  (CPython 3.14.8, PyX 0.1.0): **23/297 modules importable** (5 builtin/frozen,
+  (CPython 3.14.9, PyX 0.1.0): **23/297 modules importable** (5 builtin/frozen,
   17 pure, 1 extension; 8 names fail under CPython too). Report:
   `docs/COMPATIBILITY.md`, JSON `benchmarks/compat/latest.json`.
+- **Official CPython suite baseline:** `python3 scripts/cpython_compat.py`
+  (398 `Lib/test` modules, pinned 3.14.9 oracle): **0 passing** (322
+  `pyx_fail`, 76 `expected_fail`, 0 timeouts); all PyX failures are currently
+  missing-stdlib imports (`unittest`, `contextlib`, ...). Manifest
+  `tests/compat/cpython-3.14.9.json` stays empty; `--check-manifest` runs
+  offline in `scripts/verify.sh`/CI.
 
 **Phase-2.0 slice (containers, 2026-10-23) — done & verified:**
 
@@ -501,7 +513,7 @@ parallel benchmarks and race/stress tests.
   Deterministic per seed, but **not CPython-reproducible**
   (documented deviation).
 - `platform`: `system`/`machine`/`release`/`version`/`node`/`platform`/
-  `python_version` + `python_implementation = "PyX"`.
+  `python_version` + `python_implementation() == "PyX"`.
 - `statistics`: `mean`/`fmean`/`median`/`pstdev`/`stdev` over numeric
   sequences incl. error paths (empty/non-numeric, stdev n<2).
 - Verified: **533 tests** (110 E2E incl. stdlib_utils JIT+AOT, 169 frontend,
@@ -521,7 +533,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 875 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 877 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -725,7 +737,7 @@ parallel benchmarks and race/stress tests.
   JIT 7.7 ms, AOT 6.8 ms; `strace -c` counts 94 syscalls total (previously
   200,097, two `rt_sigprocmask` per yield). Remaining weak spots: string
   concatenation (O(n²)) and float boxing — open performance work.
-- **Verified:** 875 tests, `cargo fmt`, `cargo clippy --workspace
+- **Verified:** 877 tests, `cargo fmt`, `cargo clippy --workspace -- -D warnings
   --all-targets -- -D warnings` and `cargo test --workspace` green;
   micro baseline renewed (while_sum AOT 1.7 ms vs. CPython 23.5 ms).
 
@@ -797,8 +809,8 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (875)
-cargo clippy --workspace
+cargo test                             # unit/integration tests (877)
+cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
 cargo run -q -p pyx-cli -- new /tmp/demo
@@ -1113,3 +1125,15 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   multi-phase extensions; 875 tests, zero clippy warnings,
   `scripts/verify.sh` green. The CI/verify clippy gate no longer uses
   `-D warnings`; warnings remain fixed at zero.
+
+- 2026-10-24 (continuation 43): CPython 3.14.9 target + official test gate.
+  Central `pyx_ir::compat` constants drive `sys.version`/`version_info`
+  (3.14.9, plus `sys.pyx_version`), `platform.python_version()`, CLI verbose
+  output and the wheel-tag policy. Added `scripts/cpython_compat.py` (pinned
+  3.14.9 oracle, cached official source, differential `Lib/test` runs,
+  JSON/Markdown, `--gate`, monotonic `--update-manifest`,
+  `--check-manifest`), the empty 3.14.9 manifest initially (no fabricated
+  passes), and pinned the stdlib import report oracle to 3.14.9. Restored the
+  clippy `-D warnings` gate in verify/CI and kept the tree warning-free.
+  Added the LTS policy (PyX LTS lines keyed to CPython minors) to PLAN/TODO.
+  877 tests, clippy `-D warnings` and `scripts/verify.sh` green.

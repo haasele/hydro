@@ -10,5 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 pyx-frontend.workspace = true
+pyx-ir.workspace = true
 pyx-codegen.workspace = true
 pyx-runtime.workspace = true

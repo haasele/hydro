@@ -57,14 +57,44 @@ Full Python compatibility is large enough to be a permanent, independent goal. I
 
 ## Current Status
 
-Phases 1–6 are tracked item by item in `docs/TODO.md`. The gate is `scripts/verify.sh` on a fresh checkout; the suite currently holds 771 tests.
+Phases 1–6 are tracked item by item in `docs/TODO.md`. The gate is `scripts/verify.sh` on a fresh checkout; the suite currently holds 877 tests. The main compatibility target is **CPython 3.14.9** (see “Compatibility targets and LTS”).
 
 - **Phase 1 — done.** Compiler, JIT and AOT paths, CLI and verification are complete.
 - **Phase 2 — largely done.** Includes real lazy generators and coroutines on a cooperative event loop, and a concurrent GC with a shared heap and no GIL. Open: async generators/comprehensions, and precise GC roots and stack maps.
 - **Phase 3 — core done.** `new`/`init`/`add`/`remove`/`sync`/`lock`, the build cache and `run` work. Open: uv interpreter injection, own lockfile/venv semantics, reproducible builds and packaging.
-- **Phase 4 — unblocked; decision B.** CPython 3.14 development files are available. The project implements the CPython C API/ABI on PyX objects (no `libpython` in production; CPython only as build-time header source and test oracle). The stdlib/ecosystem program covers 297 stdlib modules, ecosystem suites and benchmarks (P4-01…P4-11); see `docs/C_API.md`.
+- **Phase 4 — unblocked; decision B.** CPython 3.14.9 is the pinned compatibility target; development headers/oracle for 3.14 are available. The project implements the CPython C API/ABI on PyX objects (no `libpython` in production; CPython only as build-time header source and differential test oracle). The stdlib/ecosystem program covers 297 stdlib modules, ecosystem suites and benchmarks (P4-01…P4-12); see `docs/C_API.md` and `docs/CPYTHON_TESTS.md`.
 - **Phase 5 — baseline in place.** Micro-benchmark harness, baseline artifacts and local regression thresholds exist; PyPy/Go comparisons, PGO and a JIT decision remain open.
 - **Phase 6 — diagnostics mostly done.** Stable codes, spans, snippets, `--json` output and exit codes are implemented; ICE regression tests, completions, manpage and the CLI/diagnostic reference are open.
+
+## Compatibility Targets and LTS
+
+PyX pins its behavioural conformance to a single CPython patch release at a
+time. The current target is **CPython 3.14.9**:
+
+- 3.15 is too new to be the conformance oracle;
+- 3.13 is already in security-only maintenance;
+- every compatibility claim, extension ABI tag (`cpython-314-*`) and CPython
+  test-suite run is evaluated against 3.14.9 (differential oracle).
+
+The target lives in one place (`pyx_ir::compat`) and is surfaced through
+`sys.version`/`sys.version_info`, `platform.python_version()`, the CLI's
+`--version --verbose`, the wheel-tag policy and the test harnesses. Changing
+the patch target means a new baseline/manifest and a wheel-tag review, not an
+edit in place.
+
+**LTS policy (future, not before production):** PyX LTS lines are keyed to
+CPython *minor* versions — 3.13, 3.14, 3.15, … — rather than to PyX release
+numbers alone. An LTS line freezes:
+
+- the CPython minor and the exact patch baseline used as conformance oracle;
+- the supported C-ABI tag(s) and extension-wheel policy;
+- the frozen standard-library and language surface with its compatibility
+  matrix;
+- security-patch intake and a documented support window.
+
+No LTS line is declared or promised now; pre-production releases track the
+moving 3.14.x patch target. The full policy and its gates are tracked as P4-12
+in `docs/TODO.md`.
 
 ## Risks and Open Decisions
 

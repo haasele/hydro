@@ -1,0 +1,7 @@
+{
+  "python": "3.14.9",
+  "minimum_passing": 0,
+  "required": [],
+  "known_passing": [],
+  "notes": "Release gate; grow as stdlib/language support lands. Import-only baseline is separate in docs/COMPATIBILITY.md."
+}

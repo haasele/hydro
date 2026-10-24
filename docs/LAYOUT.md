@@ -15,18 +15,22 @@ repository root.
 ├── Cargo.toml                 workspace + shared dependency versions
 ├── scripts/
 │   ├── verify.sh              full gate (fmt/clippy/build/tests/E2E/AOT/GC)
-│   └── check_benchmarks.py    local benchmark regression gate
+│   ├── check_benchmarks.py    local benchmark regression gate
+│   ├── stdlib_compat.py       stdlib import matrix (pinned CPython 3.14.9)
+│   └── cpython_compat.py      official Lib/test differential gate
 ├── benchmarks/
 │   ├── PYX.md                 readiness matrix of the external harnesses
 │   ├── bench_pyx.py           CPython/JIT/AOT comparison, 11 workloads
 │   ├── bench_all.py           orchestrator (e.g. `--only pyx`)
 │   └── pyx/                   micro-benchmarks, run_micro.py, results/, thresholds.json
 ├── spikes/p4_04/              embedded-CPython/abi3 probes + measurements
+├── tests/compat/              pinned CPython test manifests (3.14.9)
 ├── examples/                  JIT/AOT examples + expected/*.txt
 ├── docs/
 │   ├── ARCHITECTURE.md        binding contract (IR/ABI, GC, modules)
 │   ├── C_API.md               P4-04 decision, probes, milestones
 │   ├── COMPATIBILITY.md       generated stdlib import matrix
+│   ├── CPYTHON_TESTS.md       official-test gate policy + baseline
 │   ├── pyx.1                  roff manpage
 │   ├── TODO.md                single work list
 │   └── LAYOUT.md              this file
@@ -35,6 +39,7 @@ repository root.
     │   └── src/
     │       ├── lib.rs         re-exports + contract signatures
     │       ├── model.rs       Type, Const, Builtin, BinOp, exception tags
+    │       ├── compat.rs      CPython target constants (3.14.9, cpython-314)
     │       ├── ir.rs          program/function/Stmt/Expr/Class/Closure
     │       ├── stdlib/        central module/signature table
     │       │   ├── mod.rs

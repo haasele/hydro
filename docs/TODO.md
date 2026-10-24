@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-24 (latest):** 875 tests, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-24 (latest):** 877 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -63,7 +63,7 @@ generated stdlib compatibility baseline (`docs/COMPATIBILITY.md`,
       `LICENSE-APACHE` (matching `MIT OR Apache-2.0`); version 0.1.0.
       Tag/release process remains Q-08.
 
-**Acceptance P0:** `cargo fmt --check`, `cargo clippy` (zero warnings), `cargo test`,
+**Acceptance P0:** `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`,
 `scripts/verify.sh` green; no undocumented contracts.
 
 ## P1 — Minimal compiler (complete)
@@ -244,16 +244,17 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-24: 875 tests total — 403 runtime (230 unit, 173 ABI
+      As of 2026-10-24: 877 tests total — 404 runtime (231 unit, 173 ABI
       integration: among others 22 bytes, 19 IO, 14 stdlib modules, 14 stdlib utils,
       12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 269 frontend, 18 codegen, 3 IR, 182 CLI/E2E (135 E2E incl. the
+      tests), 269 frontend, 18 codegen, 4 IR, 182 CLI/E2E (135 E2E incl. the
       abi3 extension fixture, 22 fibers, 6 closures, 5 user modules,
       extension/path/dotted/multi-phase and completions suites). Property
-      tests open.
+      tests open. The CPython official-test manifest is checked offline by
+      `scripts/verify.sh`/CI; the full suite is a release gate.
 
 **Acceptance P2:** memory does not grow unboundedly in loop benchmarks; GC tests
 cover cycles; container semantics tested against CPython behavior.
@@ -295,13 +296,21 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
 [`docs/C_API.md`](C_API.md): **option B, a PyX-native CPython ABI layer; no
 `libpython` in the production runtime.**
 
-- [~] P4-01 CPython test-suite harness and compatibility report.
-      **Implemented:** `scripts/stdlib_compat.py` runs every
-      `sys.stdlib_module_names` entry under CPython and PyX, classifies
-      failures and writes JSON + `docs/COMPATIBILITY.md`; baseline
-      2026-10-24: **23/297 importable** (5 builtin/frozen, 17 pure, 1
-      extension, 8 `cpython_failed`). `--tests DIR` is the hook for a CPython
-      `Lib/test` checkout; no test is marked passing unless both agree.
+- [~] P4-01 CPython test-suite harness and official gate.
+      **Implemented:** `scripts/stdlib_compat.py` (import matrix,
+      `docs/COMPATIBILITY.md`) and `scripts/cpython_compat.py` (official
+      `Lib/test/test_*.py` differential runs against the pinned CPython
+      **3.14.9** oracle, JSON + `docs/CPYTHON_TESTS.md`, release gate
+      `--gate`, offline `--check-manifest`, monotonic manifest updates).
+      Manifest `tests/compat/cpython-3.14.9.json` starts empty
+      (`minimum_passing: 0`) because `unittest`/`test.support` are not
+      importable under PyX yet; it grows only from real `pyx_pass` results.
+      Stdlib import baseline 2026-10-24: **23/297 importable** (5
+      builtin/frozen, 17 pure, 1 extension, 8 `cpython_failed`). Official-suite
+      baseline 2026-10-24: **0/398 passing** (322 `pyx_fail`, 76
+      `expected_fail` where CPython also fails; 0 timeouts). No test is marked
+      passing unless CPython 3.14.9 and PyX both exit 0; the manifest stays
+      empty until real passes exist.
       Run a defined subset of CPython 3.14 `Lib/test` against `pyx`, and emit a
       machine-readable report (per test: pass/skip/fail, plus the reason).
       Acceptance: `scripts/compat_report.py` produces a deterministic report
@@ -391,7 +400,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       Generated matrix per module/library with CPython version, pass counts,
       unsupported reasons and startup/RSS numbers. Covers stdlib (P4-09),
       C-ABI (P4-04/05) and ecosystem suites (P4-10).
-- [ ] P4-09 Full standard-library parity (297 CPython 3.14 modules).
+- [ ] P4-09 Full standard-library parity (297 CPython **3.14.9** modules).
       Split tracked in the compatibility report; no module is "done" without
       its CPython test subset.
       - [ ] P4-09a Import infrastructure (depends on P4-03).
@@ -423,11 +432,18 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       unsupported-feature list, and a reproducible command. No silent skips.
 - [ ] P4-11 Ecosystem benchmarks and budgets.
       For each Tier-1 library/app: startup, import time, request/throughput,
-      dataframe/array operation, RSS versus CPython 3.14; thresholds in
+      dataframe/array operation, RSS versus CPython 3.14.9; thresholds in
       `benchmarks/ecosystem/` and a report comparable to `bench_pyx.py`.
       Acceptance: reproducible report + documented budgets; regressions fail
       the local gate. This is the evidence that keeps the PyX advantages
       rather than trading them for CPython overhead.
+- [ ] P4-12 LTS compatibility lines (future; no LTS before production).
+      Define PyX LTS lines keyed to CPython minor versions (3.13/3.14/3.15…):
+      frozen CPython patch baseline, supported C-ABI/wheel tags, frozen
+      stdlib/language surface + compatibility matrix, security-patch intake and
+      a documented support window. Acceptance: one manifest/baseline per LTS
+      line, a release checklist and an explicit deprecation policy; 3.14.9 is
+      the only active target today and is not an LTS commitment.
 
 **Acceptance P4:** defined, tested language/stdlib/ecosystem scope; a generated
 compatibility matrix; C-API limits documented; no silent semantic deviations;

@@ -476,7 +476,7 @@ fn platform_values_are_native_and_nonempty() {
     assert!(!eq(version, text("")));
     assert!(bin_bool(OP_IN, text("."), version));
 
-    let implementation = get("platform", "python_implementation");
+    let implementation = module("platform", "python_implementation", &[]);
     assert_str(implementation, "PyX");
 }
 

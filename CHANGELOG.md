@@ -8,7 +8,7 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-24: **875 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
+As of 2026-10-24: **877 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 
@@ -96,7 +96,7 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   `pyx-cli/{cli,cli/commands}`; no behavior change, contracts unchanged.
 - Test count increased from 545 to 721 tests (incl. formatting, attributes,
   classes, closures, stdlib modules, socket, user modules, CLI/build cache);
-  with this slice to **875** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
+  with this slice to **877** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
   dict hash index, GC statistics, generator iteration).
 - AOT builds embed user modules; the cache key takes the
   entire reachable module tree structure into account.
@@ -136,8 +136,21 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 - **Multi-phase init:** `PyModuleDef_Init` + bounded `Py_mod_exec` slot
   execution with policy-slot validation, alongside single-phase
   `PyModule_Create2` modules; JIT+AOT fixture.
-- **Clippy gate:** `scripts/verify.sh`/CI run clippy without `-D warnings`;
-  the tree is kept at zero warnings.
+- **CPython 3.14.9 target:** single source of truth in `pyx_ir::compat`;
+  `sys.version`/`version_info` report 3.14.9 (PyX identity via
+  `sys.pyx_version`), `platform.python_version()` and the CLI verbose output
+  follow; the wheel-tag policy accepts `cpython-314-*`.
+- **Official CPython test gate:** `scripts/cpython_compat.py` runs the 3.14.9
+  `Lib/test` suite differentially, writes JSON/Markdown, and supports
+  `--gate`, `--update-manifest` and offline `--check-manifest`; the manifest
+  starts empty and grows only from real passes. Baseline (2026-10-24, 398
+  modules): 0 passing, 322 `pyx_fail`, 76 `expected_fail`, 0 timeouts.
+  `scripts/verify.sh`/CI check the manifest offline.
+- **LTS policy:** future PyX LTS lines are keyed to CPython minor versions
+  (3.13/3.14/3.15) with frozen patch baseline, ABI/wheel tags, stdlib surface
+  and support window (P4-12; no LTS before production).
+- **Clippy gate:** `scripts/verify.sh`/CI enforce `-D warnings`; the tree is
+  warning-free.
 - **Stdlib compatibility baseline:** `scripts/stdlib_compat.py` +
   `docs/COMPATIBILITY.md` + `benchmarks/compat/latest.json`; 23 of 297
   CPython 3.14 modules importable on 2026-10-24 (import success only, not
