@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
-implemented (795 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (824 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -343,10 +343,17 @@ Python; `IOError` is an alias for `OSError`.
   first `pyx_iter_next`. `yield value`/bare `yield` suspend the fiber,
   `return` ends the iteration, exceptions are propagated on the next resume.
   Every object is independent; `for`, `list`, `sum`, `iter(x)` and
-  `next(it[, default])` work on it. Not supported: `send`/`throw`/
-  `close`, `yield` expressions, `yield from`, async generators (`async def` +
-  `yield` is a diagnostic) and async comprehensions. Generator expressions
-  remain eagerly materialized lists (documented deviation).
+  `next(it[, default])` work on it. `send(v)` resumes the generator and
+  returns the next yielded value; `x = yield v` evaluates to the sent value
+  (`None` for `next`). `throw(exc)` raises an exception *instance* at the
+  suspension point (PyX has no exception class objects yet, so only the
+  one-argument, instance form is supported). `close()` injects
+  `GeneratorExit`, so `finally` blocks run; a generator that yields during
+  `close()` raises `RuntimeError("generator ignored GeneratorExit")`.
+  Exhausted generators raise `StopIteration` from `send`/`throw`. Not
+  supported: `yield from`, async generators (`async def` + `yield` is a
+  diagnostic) and async comprehensions. Generator expressions remain eagerly
+  materialized lists (documented deviation).
 - **async** (Phase 2.32): `async def` creates a coroutine object;
   `await`/`pyx_await` drives it to completion (non-fiber values are
   returned unchanged). `asyncio.run(coro)` runs a cooperative
@@ -549,7 +556,7 @@ it. The cache is not a shared artifact store.
 - Expressions: `Const`, `Local`, `Bin` (incl. `In`/`NotIn`), `Un`, `BoolOp`
   (short-circuit), `List`, `Dict`, `Tuple`, `Set`, `Subscript`, `Slice`,
   `ListComp`, `SetComp`, `DictComp`, `GeneratorExp` (eager), `Await`,
-  `FunctionRef`,
+  `Yield` (expression form; evaluates to the sent value), `FunctionRef`,
   `BuiltinRef` (`f = int`), `IndirectCall`, `ModuleCall`, `ModuleAttr`,
   `GetAttr` (data attribute), `MethodCall { args, keywords }`, `Closure`
   (value), `Call { callee: Function(id) | Builtin(b), args }`.
@@ -572,7 +579,8 @@ it. The cache is not a shared artifact store.
 - Functions carry `is_generator` and `is_async`; codegen derives the
   flags in `pyx_function_new`/`pyx_closure_new` from them (bit 0 async, bit 1
   generator) and generates a wrapper that calls `pyx_coroutine_new` resp.
-  `pyx_generator_new`. `Yield` statements become `pyx_yield`,
+  `pyx_generator_new`. `Yield` statements become `pyx_yield` (result
+  discarded); `Yield` expressions keep the returned sent value.
   `Await` becomes `pyx_await`.
 - **Lowering:** `with`/`async with` become nested `try/finally` with
   `__enter__`/`__exit__`; augmented subscript assignment
@@ -776,9 +784,10 @@ with a C-variadic `PyArg_ParseTuple`; the frontend resolves sibling
 `.so`/`.abi3.so` files at compile time and lowers `ext.member(...)`/
 `from ext import member` to `Callee::Extension`/`ExprKind::ExtensionAttr`;
 `pyx_extension_call`/`pyx_extension_get` load and cache modules lazily
-(`modules/extension.rs`). `pyx` and AOT binaries export the shim symbols with
-`--export-dynamic`; the fixture imports and calls under both with no
-`libpython`. Capsules, the buffer protocol, container constructors,
+(`modules/extension.rs`). Scalars, strings, bytes, floats, lists, tuples and
+dicts convert recursively in both directions (bounded copies). `pyx` and AOT
+binaries export the shim symbols with `--export-dynamic`; the fixture imports
+and calls under both with no `libpython`. Capsules, the buffer protocol,
 wheels/venvs and the full 3.14 ABI are still open.
 
 Evidence: embedded CPython costs ~6.7 ms `Py_Initialize` + ~7.5 ms
@@ -794,7 +803,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-24: **795 tests** (254 frontend, 365 runtime incl. 173
+- As of 2026-10-24: **824 tests** (257 frontend, 384 runtime incl. 173
   ABI integration tests, 17 codegen, 3 IR, 154 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `argparse`/`defaultdict`/`re`, socket echo,
@@ -815,11 +824,12 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   functions and closures in lambdas are diagnostics. No cell/mutable
   capture.
 - **Generators/async:** real lazy generators (stackful fibers) and
-  coroutines with a cooperative event loop. Open: `send`/`throw`/`close`,
-  `yield` expressions, `yield from`, async generators, async comprehensions
-  and `asyncio` beyond `run`/`sleep`/`gather`; generator expressions
-  remain eagerly materialized, `async for`/`async with` use the synchronous
-  protocol.
+  coroutines with a cooperative event loop. Open: `yield from`, async
+  generators, async comprehensions and `asyncio` beyond
+  `run`/`sleep`/`gather`; generator expressions remain eagerly materialized,
+  `async for`/`async with` use the synchronous protocol. `throw` accepts
+  exception instances only (no exception class objects) and has no
+  three-argument form.
 - **Performance:** native module dispatch is fixed (thread-local spec cache;
   math_loop at parity/faster, 50k micro harness AOT 6.2 ms vs. CPython
   13.6 ms). Remaining open weak spots: string concatenation (O(n²)) and float

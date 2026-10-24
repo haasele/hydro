@@ -1183,6 +1183,27 @@ fn generator_functions_are_marked_and_call_results_are_dynamic() {
 }
 
 #[test]
+fn yield_expressions_are_typed_any_and_mark_generators() {
+    let source = "def g():\n    x = (yield 1) + 2\n    yield x\n";
+    let program = crate::check_source(source, "test.py").expect("valid generator");
+    let g = program_function(&program, "g");
+    assert!(g.is_generator, "{:?}", g.body);
+
+    let StmtKind::Assign { target, value } = &g.body[0].kind else {
+        panic!("expected an assignment, got {:?}", g.body[0].kind);
+    };
+    let ExprKind::Bin { lhs, .. } = &value.kind else {
+        panic!("expected a bin op, got {:?}", value.kind);
+    };
+    let ExprKind::Yield { value: Some(inner) } = &lhs.kind else {
+        panic!("expected a yield expression, got {:?}", lhs.kind);
+    };
+    assert_eq!(inner.ty, Type::Int);
+    assert_eq!(lhs.ty, Type::Any, "the sent value is dynamically typed");
+    assert_eq!(g.locals[*target as usize].ty, Type::Any);
+}
+
+#[test]
 fn async_functions_are_marked_and_call_results_are_dynamic() {
     let source = "import asyncio\nasync def f():\n    return 42\nx = asyncio.run(f())\nprint(x)\n";
     let program = crate::check_source(source, "test.py").expect("valid async function");

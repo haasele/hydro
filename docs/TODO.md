@@ -7,9 +7,10 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-24 (latest):** 795 tests, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-24 (latest):** 824 tests, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
-cooperative event loop. Open are `send`/`throw`/`close`, `yield` expressions,
+cooperative event loop. Generator `send`/`throw`/`close` and `yield`
+expressions are implemented (`throw` takes exception instances only). Open are
 `yield from`, async generators/comprehensions, GC precision (P2-05/06/07) and
 the remaining performance work. **P4-04 is unblocked and decided:** CPython
 3.14 development files are available, and the project follows **option B** —
@@ -19,7 +20,10 @@ a limited-API extension (`.so`) next to the source can be imported and called
 under JIT and AOT without `libpython` (P4-04a/b partial). The
 **P4-09/P4-10/P4-11** program tracks full stdlib parity (297 modules),
 ecosystem suites (NumPy, pandas, pydantic, FastAPI, Django, …) and their
-benchmarks.
+benchmarks. **New in this slice:** generator `send`/`throw`/`close` and
+`yield` expressions; C-API container/unicode/float/bytes accessors; a
+generated stdlib compatibility baseline (`docs/COMPATIBILITY.md`,
+23/297 modules importable on 2026-10-24).
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -169,8 +173,8 @@ no CPython is needed at runtime.
 - [~] P2-10 Generators, `yield`, closures/cell variables.
       Closures (nested `def`, by value) and real **lazy** generators
       (stackful fibers, `yield [value]`, bare `yield`, `return` terminates,
-      exceptions propagate, `iter`/`next`) are done. Open: `send`/
-      `throw`/`close`, `yield` expressions, `yield from`, mutable captures.
+      exceptions propagate, `iter`/`next`, `send`/`throw`/`close` and
+      `yield` expressions) are done. Open: `yield from`, mutable captures.
       Generator expressions remain eagerly materialized.
 - [~] P2-11 Exceptions complete: `else`, `finally`, exception hierarchy, chaining.
       `OSError`/`IOError` additionally; exception hierarchy/chaining and
@@ -240,14 +244,15 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-24: 795 tests total — 365 runtime (192 unit, 173 ABI
+      As of 2026-10-24: 824 tests total — 384 runtime (211 unit, 173 ABI
       integration: among others 22 bytes, 19 IO, 14 stdlib modules, 14 stdlib utils,
       12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
-      5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim
-      and extension-value/loader tests), 254 frontend, 18 codegen, 3 IR,
-      155 CLI/E2E (135 E2E incl. the abi3 extension fixture, 9 fibers,
-      6 closures, 5 user modules). Property tests open.
+      5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
+      container round-trips, generator methods and extension-value/loader
+      tests), 257 frontend, 18 codegen, 3 IR, 162 CLI/E2E (135 E2E incl. the
+      abi3 extension fixture, 16 fibers, 6 closures, 5 user modules).
+      Property tests open.
 
 **Acceptance P2:** memory does not grow unboundedly in loop benchmarks; GC tests
 cover cycles; container semantics tested against CPython behavior.
@@ -289,7 +294,13 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
 [`docs/C_API.md`](C_API.md): **option B, a PyX-native CPython ABI layer; no
 `libpython` in the production runtime.**
 
-- [ ] P4-01 CPython test-suite harness and compatibility report.
+- [~] P4-01 CPython test-suite harness and compatibility report.
+      **Implemented:** `scripts/stdlib_compat.py` runs every
+      `sys.stdlib_module_names` entry under CPython and PyX, classifies
+      failures and writes JSON + `docs/COMPATIBILITY.md`; baseline
+      2026-10-24: **23/297 importable** (5 builtin/frozen, 17 pure, 1
+      extension, 8 `cpython_failed`). `--tests DIR` is the hook for a CPython
+      `Lib/test` checkout; no test is marked passing unless both agree.
       Run a defined subset of CPython 3.14 `Lib/test` against `pyx`, and emit a
       machine-readable report (per test: pass/skip/fail, plus the reason).
       Acceptance: `scripts/compat_report.py` produces a deterministic report
@@ -297,8 +308,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       claims. Gating: a test counts as passed only if CPython 3.14 passes it
       too (differential oracle).
 - [ ] P4-02 Language completeness required by the stdlib and ecosystem.
-      Decorators (function/class, parametrised), `yield` expressions,
-      generator `send`/`throw`/`close`, `yield from`, async generators and
+      Decorators (function/class, parametrised), `yield from`, async generators and
       async comprehensions, `async for`/`async with` with real async
       iterators, exception hierarchy/chaining/`except*`, descriptors,
       properties, `__slots__`, metaclasses, user-defined `__iter__`/`__next__`,
@@ -326,14 +336,15 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       - [~] P4-04a `abi3` shim: module init (`PyModule_Create2`), `PyArg_Parse*`,
         scalar/container constructors, error API, `PyCapsule`, buffer basics.
         **Implemented:** module creation/attributes (`PyModule_AddStringConstant`/
-        `AddObject`), `PyLong_FromLong`/`AsLong`, variadic `PyArg_ParseTuple`
-        (`i/l/n/d/s/O/p`, `|`, `:`/`;`), refcount entry points, `PyErr_*`
-        basics, symbol anchor and C-variadic glue. Gate proven for the fixture:
+        `AddObject`), scalars (`PyLong_*`, `PyFloat_*`, `PyUnicode_*`,
+        `PyBytes_*`), containers (`PyList_*`/`PyTuple_*`/`PyDict_*`),
+        variadic `PyArg_ParseTuple` (`i/l/n/d/s/O/p`, `|`, `:`/`;`), refcount
+        entry points, `PyErr_*` basics, symbol anchor and C-variadic glue.
+        Gate proven for the fixture:
         `pyx_capi_probe.abi3.so` imports/calls under JIT and AOT, and neither
         the CLI nor the AOT binary links `libpython`
         (`crates/pyx-cli/tests/extensions.rs`). Open: `PyCapsule`, buffer
-        protocol, container constructors (`PyList_*`/`PyTuple_*`/`PyDict_*`),
-        broader format units and exception-type mapping.
+        protocol, broader format units and exception-type mapping.
       - [~] P4-04b Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags,
         package submodules, multi-phase init, clear init-failure errors.
         **Implemented:** compile-time discovery of `<name>.so`/`<name>.abi3.so`/
@@ -556,10 +567,9 @@ code, span, help and stable exit code; `--json` is documented and tested.
   decision documented (no fork without a blocker).
 - R6: Dynamic features (monkey-patching, `eval`, metaclasses) vs. AOT — tiering
   or an explicit support scope needed.
-- R7: Generator/coroutine remainder: `send`/`throw`/`close`, `yield` expressions,
-  `yield from`, async generators/comprehensions. Generator expressions
-  remain eagerly materialized; `async for`/`async with` use the synchronous
-  protocol.
+- R7: Generator/coroutine remainder: `yield from`, async
+  generators/comprehensions. Generator expressions remain eagerly
+  materialized; `async for`/`async with` use the synchronous protocol.
 - R8: Performance weak spots: string concatenation remains O(n²)
   (`string_concat` ~1.3–1.5x faster than CPython only because of lower
   constant factors) and CPython-extension boundaries will add conversion

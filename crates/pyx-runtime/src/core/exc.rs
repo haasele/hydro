@@ -40,6 +40,9 @@ pub(crate) const STOP_ITERATION: u32 = 8;
 pub(crate) const ATTRIBUTE_ERROR: u32 = 9;
 /// `OSError` (file I/O failures); `IOError` is an alias in CPython.
 pub(crate) const OS_ERROR: u32 = 10;
+/// Runtime-internal `GeneratorExit`, injected by `generator.close()`. It is
+/// not reachable from Python source (PyX has no `GeneratorExit` class yet).
+pub(crate) const GENERATOR_EXIT: u32 = 11;
 
 pub(crate) fn tag_name(tag: u32) -> &'static str {
     match tag {
@@ -54,6 +57,7 @@ pub(crate) fn tag_name(tag: u32) -> &'static str {
         STOP_ITERATION => "StopIteration",
         ATTRIBUTE_ERROR => "AttributeError",
         OS_ERROR => "OSError",
+        GENERATOR_EXIT => "GeneratorExit",
         // Unknown tags are rendered as RuntimeError rather than panicking.
         _ => "RuntimeError",
     }
@@ -67,6 +71,7 @@ fn default_message(tag: u32) -> &'static str {
         STOP_ITERATION => "",
         ATTRIBUTE_ERROR => "attribute not found",
         OS_ERROR => "I/O error",
+        GENERATOR_EXIT => "",
         _ => "unknown error",
     }
 }

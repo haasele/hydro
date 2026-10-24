@@ -1512,8 +1512,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     Some(expr) => self.lower_expr(expr)?,
                     None => self.none(),
                 };
-                // The value sent on resume (always `None` in PyX) is
-                // discarded; `yield` is only used for its suspension effect.
+                // Statement form: the value sent on resume is discarded.
+                // `yield` in an expression position uses `ExprKind::Yield`
+                // instead, which keeps the sent value.
                 let id = self.runtime.yield_value;
                 self.call_rt(id, &[value])?;
                 self.emit_exc_check()?;
@@ -2372,6 +2373,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let result = self.call_rt(id, &[value])?;
                 self.emit_exc_check()?;
                 Ok(result)
+            }
+            ExprKind::Yield { value } => {
+                let value = match value {
+                    Some(expr) => self.lower_expr(expr)?,
+                    None => self.none(),
+                };
+                // Returns the value passed to the resume that continues the
+                // generator (`send(value)`, or `None` for `next`).
+                let id = self.runtime.yield_value;
+                let sent = self.call_rt(id, &[value])?;
+                self.emit_exc_check()?;
+                Ok(sent)
             }
         }
     }

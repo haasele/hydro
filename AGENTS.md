@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators/coroutines/event loop (no GIL)** | 795 tests, JIT+AOT |
+| P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators (send/throw/close/yield expressions)/coroutines/event loop (no GIL)** | 824 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **decision B implemented at the first abi3 slice: limited-API extension imports/calls under JIT+AOT, no `libpython`; full ABI/stdlib/ecosystem open (P4-04a…P4-11)** | `docs/C_API.md`, `crates/pyx-cli/tests/extensions.rs` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -43,13 +43,14 @@ C-API implementation itself. Details: `docs/TODO.md`.
 
 **Verification (as of 2026-10-24):**
 
-- `cargo test --workspace`: **795 tests** — 254 frontend, 18 codegen, 3 IR,
-  192 runtime unit, 155 CLI/E2E (135 E2E incl. the abi3 extension fixture,
-  9 fibers, 6 closures, 5 user modules), 173 further runtime integration tests
+- `cargo test --workspace`: **824 tests** — 257 frontend, 18 codegen, 3 IR,
+  211 runtime unit, 162 CLI/E2E (135 E2E incl. the abi3 extension fixture,
+  16 fibers, 6 closures, 5 user modules), 173 further runtime integration tests
   (allocator, bytes, GC/concurrent GC, IO, CSV, stdlib modules, classes,
-  closures, socket, pathlib, pool, threads). New suites cover the C-API shim,
-  extension value/loader conversion, extension import lowering and the
-  JIT+AOT abi3 fixture (`crates/pyx-cli/tests/extensions.rs`).
+  closures, socket, pathlib, pool, threads). New suites cover generator
+  send/throw/close + yield expressions, C-API containers, extension
+  value/loader conversion, extension import lowering and the JIT+AOT abi3
+  fixture (`crates/pyx-cli/tests/extensions.rs`).
 - `scripts/verify.sh`: fmt, clippy (`-D warnings`), build, tests, E2E for JIT
   and AOT (incl. classes/closures/generators_async/formatting/socket_echo/
   stdlib_modules/pathlib), negative tests, GC threshold/stress — ALL GREEN.
@@ -65,10 +66,17 @@ C-API implementation itself. Details: `docs/TODO.md`.
   (n=200000; 0.94× JIT, 1.01× AOT), 50k micro harness AOT 6.2 ms vs. 13.6 ms.
 - **C-API slice verified:** the limited-API fixture `pyx_capi_probe` builds
   against CPython 3.14 headers (no libpython link), is discovered next to the
-  source, and prints `5/abi3/42/abi3` under both `pyx run` and an AOT binary.
-  `ldd` shows no `libpython` for either binary. Error paths: arity →
-  `TypeError`, missing attribute → `AttributeError`, unsupported argument type
-  → `TypeError`.
+  source, and runs under both `pyx run` and an AOT binary (scalars, strings,
+  bytes, floats, lists, tuples and dicts round-trip). `ldd` shows no
+  `libpython`. Error paths: arity → `TypeError`, missing attribute →
+  `AttributeError`, unsupported argument type → `TypeError`.
+- **Generator methods + yield expressions verified** against CPython:
+  `next`/`send` echo, `close` running `finally`, `throw(caught_exception)`
+  re-raised inside the generator, StopIteration after completion.
+- **Stdlib compatibility baseline:** `python3 scripts/stdlib_compat.py`
+  (CPython 3.14.8, PyX 0.1.0): **23/297 modules importable** (5 builtin/frozen,
+  17 pure, 1 extension; 8 names fail under CPython too). Report:
+  `docs/COMPATIBILITY.md`, JSON `benchmarks/compat/latest.json`.
 
 **Phase-2.0 slice (containers, 2026-10-23) — done & verified:**
 
@@ -716,7 +724,7 @@ parallel benchmarks and race/stress tests.
   JIT 7.7 ms, AOT 6.8 ms; `strace -c` counts 94 syscalls total (previously
   200,097, two `rt_sigprocmask` per yield). Remaining weak spots: string
   concatenation (O(n²)) and float boxing — open performance work.
-- **Verified:** 795 tests, `cargo fmt`, `cargo clippy --workspace
+- **Verified:** 824 tests, `cargo fmt`, `cargo clippy --workspace
   --all-targets -- -D warnings` and `cargo test --workspace` green;
   micro baseline renewed (while_sum AOT 1.7 ms vs. CPython 23.5 ms).
 
@@ -789,7 +797,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (795)
+cargo test                             # unit/integration tests (824)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1065,3 +1073,14 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   `libpython` in `ldd`, arity/missing-attribute/type error paths, 795 tests,
   clippy and `scripts/verify.sh` green. Open: capsules/buffer/containers,
   wheels/venvs, full ABI/NumPy/pydantic-core.
+
+- 2026-10-24 (continuation 39): generator methods, C-API containers, stdlib
+  baseline. Implemented `yield` expressions and generator
+  `send`/`throw`(instance-only)/`close` with GeneratorExit handling;
+  C-API `PyUnicode_*`, `PyFloat_*`, `PyBytes_*`, `PyList_*`, `PyTuple_*`,
+  `PyDict_*` with bounded recursive PyX↔shim container conversion; extended
+  the abi3 fixture and JIT/AOT test. Added `scripts/stdlib_compat.py` and
+  generated `docs/COMPATIBILITY.md` + `benchmarks/compat/latest.json`:
+  23/297 stdlib modules importable (297 = 52 builtin/frozen, 174 pure,
+  71 extension; 8 names fail under CPython). 824 tests, clippy and
+  `scripts/verify.sh` green.

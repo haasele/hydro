@@ -275,3 +275,161 @@ print(await f())
         "diagnostic must mention async, got:\n{stderr}"
     );
 }
+
+#[test]
+fn send_passes_values_into_yield_expressions() {
+    let source = "\
+def echo():
+    x = yield 1
+    yield x
+
+g = echo()
+print(next(g))
+print(g.send(5))
+try:
+    next(g)
+except StopIteration:
+    print(\"done\")
+try:
+    g.send(6)
+except StopIteration:
+    print(\"send-after-done\")
+";
+    let (code, stdout, stderr) = run_source("send", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\n5\ndone\nsend-after-done\n");
+}
+
+#[test]
+fn send_non_none_to_a_just_started_generator_is_a_type_error() {
+    let source = "\
+def gen():
+    x = yield 1
+    yield x
+
+g = gen()
+try:
+    g.send(5)
+except TypeError as e:
+    print(e)
+print(next(g))
+";
+    let (code, stdout, stderr) = run_source("send_unstarted", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(
+        stdout,
+        "can't send non-None value to a just-started generator\n1\n"
+    );
+}
+
+#[test]
+fn close_runs_finally_blocks() {
+    let source = "\
+def gen():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print(\"cleanup\")
+
+g = gen()
+print(next(g))
+print(g.close())
+print(list(g))
+";
+    let (code, stdout, stderr) = run_source("close_finally", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\ncleanup\nNone\n[]\n");
+}
+
+#[test]
+fn close_before_the_first_resume_does_not_run_the_body() {
+    let source = "\
+def gen():
+    print(\"body\")
+    yield 1
+
+g = gen()
+print(g.close())
+print(list(g))
+";
+    let (code, stdout, stderr) = run_source("close_unstarted", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "None\n[]\n");
+}
+
+#[test]
+fn yielding_during_close_raises_runtime_error() {
+    let source = "\
+def gen():
+    try:
+        yield 1
+    finally:
+        yield 2
+
+g = gen()
+print(next(g))
+try:
+    g.close()
+except RuntimeError as e:
+    print(e)
+";
+    let (code, stdout, stderr) = run_source("close_yield", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\ngenerator ignored GeneratorExit\n");
+}
+
+#[test]
+fn throw_delivers_a_caught_exception_inside_the_generator() {
+    let source = "\
+def gen():
+    try:
+        yield 1
+    except ValueError as e:
+        print(\"caught\", e)
+        yield 2
+
+g = gen()
+print(next(g))
+
+try:
+    raise ValueError(\"boom\")
+except ValueError as e:
+    print(g.throw(e))
+";
+    let (code, stdout, stderr) = run_source("throw", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\ncaught boom\n2\n");
+}
+
+#[test]
+fn throw_rejects_non_exception_values() {
+    let source = "\
+def gen():
+    yield 1
+
+g = gen()
+print(next(g))
+try:
+    g.throw(5)
+except TypeError as e:
+    print(e)
+try:
+    next(g)
+except StopIteration:
+    print(\"exhausted\")
+";
+    let (code, stdout, stderr) = run_source("throw_reject", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(
+        stdout,
+        "1\nthrow() argument must be an exception instance\nexhausted\n"
+    );
+}

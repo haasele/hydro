@@ -6,16 +6,19 @@
 //! only converts between tagged PyX values and [`ShimValue`]s and allocates
 //! first-class function values for callables.
 //!
-//! Only scalars cross the boundary in this slice. Containers and user
-//! objects raise a `TypeError` instead of being silently mangled.
+//! Only the `ShimValue` types cross the boundary: scalars, bytes, strings and
+//! lists/tuples/dicts of them. Containers are copied recursively in both
+//! directions (depth-limited to [`MAX_CONVERSION_DEPTH`]); a cyclic PyX
+//! container raises a `TypeError` instead of recursing. User objects still
+//! raise a `TypeError` rather than being silently mangled.
 //!
 //! All fallible paths report a pending exception and return the `None` dummy
 //! value; no user input can panic.
 
 use std::path::Path;
 
-use crate::capi::{self, ShimAttr, ShimValue};
-use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, TYPE_ERROR};
+use crate::capi::{self, ShimAttr, ShimValue, MAX_CONVERSION_DEPTH};
+use crate::exc::{self, ATTRIBUTE_ERROR, INDEX_ERROR, RUNTIME_ERROR, TYPE_ERROR};
 use crate::value::{self, ExtFunctionState, NONE};
 
 /// Maximum length accepted for an ABI name buffer (`isize::MAX` keeps the
@@ -71,9 +74,24 @@ pub(crate) fn init_name(path: &str) -> String {
 
 /// Converts one tagged PyX value to a shim value.
 ///
-/// Supported types are `None`, `bool`, `int`, `float`, `str` and `bytes`.
-/// Everything else reports the unsupported type by name.
+/// Supported types are `None`, `bool`, `int`, `float`, `str`, `bytes`,
+/// `list`, `tuple` and `dict`. Containers are copied recursively; nesting is
+/// bounded by [`MAX_CONVERSION_DEPTH`] and a cycle raises a `TypeError`.
 pub(crate) fn value_to_shim(value_arg: i64) -> Result<ShimValue, String> {
+    value_to_shim_at(value_arg, 0, &mut Vec::new())
+}
+
+/// Recursive body of [`value_to_shim`].
+///
+/// `depth` counts enclosing containers; `path` holds the tagged values of the
+/// containers on the current path so a self-referential PyX list/dict is
+/// reported instead of recursing until the stack overflows. It stays empty
+/// (and therefore allocation-free) for scalar arguments.
+fn value_to_shim_at(
+    value_arg: i64,
+    depth: usize,
+    path: &mut Vec<i64>,
+) -> Result<ShimValue, String> {
     if value_arg == NONE {
         return Ok(ShimValue::None);
     }
@@ -95,14 +113,79 @@ pub(crate) fn value_to_shim(value_arg: i64) -> Result<ShimValue, String> {
     if let Some(bytes) = value::as_bytes(value_arg) {
         return Ok(ShimValue::Bytes(bytes.to_vec()));
     }
+    if let Some(items) = value::as_list(value_arg) {
+        return convert_sequence(value_arg, "list", depth, path, items, ShimValue::List);
+    }
+    if let Some(items) = value::as_tuple(value_arg) {
+        return convert_sequence(value_arg, "tuple", depth, path, items, ShimValue::Tuple);
+    }
+    if let Some(pairs) = value::as_dict(value_arg) {
+        begin_value_container(value_arg, "dict", depth, path)?;
+        let mut converted = Vec::with_capacity(pairs.len());
+        for &(key, item) in pairs {
+            let key = value_to_shim_at(key, depth + 1, path)?;
+            let item = value_to_shim_at(item, depth + 1, path)?;
+            converted.push((key, item));
+        }
+        path.pop();
+        return Ok(ShimValue::Dict(converted));
+    }
     Err(format!(
         "cannot pass '{}' object to a C extension function",
         value::type_name(value_arg)
     ))
 }
 
+/// Converts one PyX sequence (list or tuple) into its shim counterpart.
+fn convert_sequence(
+    value_arg: i64,
+    kind: &str,
+    depth: usize,
+    path: &mut Vec<i64>,
+    items: &[i64],
+    wrap: fn(Vec<ShimValue>) -> ShimValue,
+) -> Result<ShimValue, String> {
+    begin_value_container(value_arg, kind, depth, path)?;
+    let mut converted = Vec::with_capacity(items.len());
+    for &item in items {
+        converted.push(value_to_shim_at(item, depth + 1, path)?);
+    }
+    path.pop();
+    Ok(wrap(converted))
+}
+
+/// Checks depth and cycle state before descending into a PyX container.
+fn begin_value_container(
+    value_arg: i64,
+    kind: &str,
+    depth: usize,
+    path: &mut Vec<i64>,
+) -> Result<(), String> {
+    if depth >= MAX_CONVERSION_DEPTH {
+        return Err(format!(
+            "cannot pass a '{kind}' object nested more than {MAX_CONVERSION_DEPTH} levels \
+             deep to a C extension function"
+        ));
+    }
+    if path.contains(&value_arg) {
+        return Err(format!(
+            "cannot pass a cyclic '{kind}' object to a C extension function"
+        ));
+    }
+    path.push(value_arg);
+    Ok(())
+}
+
 /// Converts one shim value back to a tagged PyX value.
+///
+/// Containers become freshly allocated PyX lists/tuples/dicts; nothing is
+/// shared with the extension-side object.
 pub(crate) fn shim_to_value(shim: ShimValue) -> Result<i64, String> {
+    shim_to_value_at(shim, 0)
+}
+
+/// Recursive body of [`shim_to_value`], bounded like the inbound direction.
+fn shim_to_value_at(shim: ShimValue, depth: usize) -> Result<i64, String> {
     Ok(match shim {
         ShimValue::None => NONE,
         ShimValue::Bool(b) => value::bool_value(b),
@@ -111,7 +194,48 @@ pub(crate) fn shim_to_value(shim: ShimValue) -> Result<i64, String> {
         ShimValue::Float(f) => value::float_new(f),
         ShimValue::Str(s) => value::str_alloc(s),
         ShimValue::Bytes(bytes) => value::bytes_new(bytes),
+        ShimValue::List(items) => {
+            let items = shim_items_to_values(items, "list", depth)?;
+            value::list_new(items)
+        }
+        ShimValue::Tuple(items) => {
+            let items = shim_items_to_values(items, "tuple", depth)?;
+            value::tuple_new(items)
+        }
+        ShimValue::Dict(pairs) => {
+            if depth >= MAX_CONVERSION_DEPTH {
+                return Err(format!(
+                    "extension returned a 'dict' nested more than {MAX_CONVERSION_DEPTH} \
+                     levels deep"
+                ));
+            }
+            let mut converted = Vec::with_capacity(pairs.len());
+            for (key, item) in pairs {
+                let key = shim_to_value_at(key, depth + 1)?;
+                let item = shim_to_value_at(item, depth + 1)?;
+                converted.push((key, item));
+            }
+            value::dict_new(converted)
+        }
     })
+}
+
+/// Converts a shim sequence's items, applying the shared depth bound.
+fn shim_items_to_values(
+    items: Vec<ShimValue>,
+    kind: &str,
+    depth: usize,
+) -> Result<Vec<i64>, String> {
+    if depth >= MAX_CONVERSION_DEPTH {
+        return Err(format!(
+            "extension returned a '{kind}' nested more than {MAX_CONVERSION_DEPTH} levels deep"
+        ));
+    }
+    let mut converted = Vec::with_capacity(items.len());
+    for item in items {
+        converted.push(shim_to_value_at(item, depth + 1)?);
+    }
+    Ok(converted)
 }
 
 /// Python type name of a shim value, used in the not-callable error.
@@ -123,6 +247,9 @@ fn shim_type_name(shim: &ShimValue) -> &'static str {
         ShimValue::Float(_) => "float",
         ShimValue::Str(_) => "str",
         ShimValue::Bytes(_) => "bytes",
+        ShimValue::List(_) => "list",
+        ShimValue::Tuple(_) => "tuple",
+        ShimValue::Dict(_) => "dict",
     }
 }
 
@@ -144,6 +271,8 @@ fn raised_error(message: &str) -> i64 {
         (ATTRIBUTE_ERROR, rest)
     } else if let Some(rest) = message.strip_prefix("TypeError: ") {
         (TYPE_ERROR, rest)
+    } else if let Some(rest) = message.strip_prefix("IndexError: ") {
+        (INDEX_ERROR, rest)
     } else if let Some(rest) = message.strip_prefix("RuntimeError: ") {
         (RUNTIME_ERROR, rest)
     } else if message.contains("has no attribute")
@@ -335,11 +464,71 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_arguments_report_type() {
+    fn containers_roundtrip() {
+        let list = value::list_new(vec![
+            value::encode_int(1).unwrap(),
+            value::encode_int(2).unwrap(),
+        ]);
+        let nested = value::tuple_new(vec![value::str_alloc("x".to_string()), list]);
+        let dict = value::dict_new(vec![(value::str_alloc("k".to_string()), nested)]);
+
+        let shim = value_to_shim(dict).expect("dict converts to the shim");
+        let tagged = shim_to_value(shim).expect("dict converts back");
+
+        let pairs = value::as_dict(tagged).expect("tagged value is a dict");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(value::as_str(pairs[0].0), Some("k"));
+        let items = value::as_tuple(pairs[0].1).expect("tuple value");
+        assert_eq!(value::as_str(items[0]), Some("x"));
+        let items = value::as_list(items[1]).expect("list value");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], value::encode_int(1).unwrap());
+        assert_eq!(items[1], value::encode_int(2).unwrap());
+    }
+
+    #[test]
+    fn cyclic_arguments_report_type() {
         let list = value::list_new(Vec::new());
-        match value_to_shim(list) {
-            Err(message) => assert!(message.contains("'list'"), "{message}"),
-            Ok(_) => panic!("lists are unsupported"),
+        value::list_items_mut(list)
+            .expect("list payload")
+            .push(list);
+
+        let message = value_to_shim(list).expect_err("cycle is rejected");
+        assert!(message.contains("cyclic"), "{message}");
+        assert!(message.contains("'list'"), "{message}");
+    }
+
+    #[test]
+    fn inbound_conversion_depth_is_bounded() {
+        let mut nested = value::list_new(Vec::new());
+        for _ in 0..=MAX_CONVERSION_DEPTH {
+            nested = value::list_new(vec![nested]);
+        }
+
+        let message = value_to_shim(nested).expect_err("deep nesting is rejected");
+        assert!(message.contains("more than"), "{message}");
+    }
+
+    #[test]
+    fn outbound_conversion_depth_is_bounded() {
+        let mut nested = ShimValue::List(Vec::new());
+        for _ in 0..=MAX_CONVERSION_DEPTH {
+            nested = ShimValue::List(vec![nested]);
+        }
+
+        let message = shim_to_value(nested).expect_err("deep result is rejected");
+        assert!(message.contains("more than"), "{message}");
+    }
+
+    #[test]
+    fn unsupported_arguments_report_type() {
+        let function = value::ext_function_new(1, 2, "tag".to_string());
+        match value_to_shim(function) {
+            Err(message) => assert!(
+                message.contains("'builtin_function_or_method'"),
+                "{message}"
+            ),
+            Ok(_) => panic!("extension functions are unsupported arguments"),
         }
     }
 

@@ -27,9 +27,15 @@
 //!   frees; every shim object lives in a process-lifetime arena. A stale shim
 //!   pointer therefore cannot dangle, at the cost of retaining all objects
 //!   until the process exits. `m_free`/`m_clear` module hooks are not run.
-//! - **Values are limited** to the `ShimValue` variants plus tuples of shim
-//!   objects. Returning anything else from an extension is reported as an
-//!   error rather than converted.
+//! - **Values are limited** to the `ShimValue` variants (scalars, bytes,
+//!   strings and lists/tuples/dicts of them). Container arguments are copied
+//!   into the shim object graph and container results are copied back into
+//!   fresh PyX containers; nothing is shared across the boundary. Returning
+//!   any other value from an extension is reported as an error rather than
+//!   converted.
+//! - **Dict keys** are compared structurally for the scalar types the shim
+//!   supports (identity first, then type/value); there is no `__hash__` or
+//!   `__eq__` dispatch.
 
 #![allow(non_snake_case)]
 // These are C ABI entry points: every argument is a raw `PyObject *` supplied
@@ -96,6 +102,10 @@ pub(crate) struct PyMethodDefMirror {
 // -------------------------------------------------------------------------
 
 /// The crate-internal value contract shared with the extension loader.
+///
+/// Container variants are owned copies: passing a PyX list to an extension
+/// copies it, and a container returned by an extension is converted into a
+/// fresh PyX container. Nothing is shared across the boundary.
 #[derive(Clone, Debug)]
 pub(crate) enum ShimValue {
     None,
@@ -104,6 +114,9 @@ pub(crate) enum ShimValue {
     Float(f64),
     Str(String),
     Bytes(Vec<u8>),
+    List(Vec<ShimValue>),
+    Tuple(Vec<ShimValue>),
+    Dict(Vec<(ShimValue, ShimValue)>),
 }
 
 /// A snapshot of a module attribute that denotes one of the module's methods.
@@ -120,25 +133,39 @@ pub(crate) enum ShimAttr {
     Callable(ShimCallable),
 }
 
+/// Maximum nesting depth accepted when converting containers in either
+/// direction. Beyond it the conversion reports an error instead of recursing
+/// without bound.
+pub(crate) const MAX_CONVERSION_DEPTH: usize = 64;
+
 /// Internal representation of one shim object.
 ///
-/// Tuple entries and module objects are stored as addresses because every
+/// Container entries and module objects are stored as addresses because every
 /// object lives in the arena for the whole process; that also keeps the
-/// object `Send`/`Sync` without an unsafe impl.
+/// object `Send`/`Sync` without an unsafe impl. A `0` entry in a freshly
+/// created list/tuple means "not filled in yet".
 #[derive(Clone, Debug)]
 enum ShimKind {
     None,
     Bool(bool),
     Int(i64),
     Float(f64),
-    /// `c_text` is the NUL-terminated form used by `PyArg_ParseTuple("s")`;
-    /// it is absent when the Python string contains an embedded NUL.
+    /// `c_text` is the NUL-terminated form used by `PyArg_ParseTuple("s")`
+    /// and `PyUnicode_AsUTF8`; it is absent when the Python string contains
+    /// an embedded NUL.
     Str {
         text: String,
         c_text: Option<CString>,
     },
-    Bytes(Vec<u8>),
+    /// `data` is the bytes content; `c_data` is `data` plus a trailing NUL,
+    /// matching CPython's guarantee for `PyBytes_AsString`.
+    Bytes {
+        data: Vec<u8>,
+        c_data: Vec<u8>,
+    },
+    List(Vec<usize>),
     Tuple(Vec<usize>),
+    Dict(Vec<(usize, usize)>),
     Module(u64),
     Error,
 }
@@ -197,7 +224,31 @@ fn value_object(value: ShimValue) -> *mut ShimObject {
             let c_text = CString::new(text.as_bytes()).ok();
             ShimKind::Str { text, c_text }
         }
-        ShimValue::Bytes(bytes) => ShimKind::Bytes(bytes),
+        ShimValue::Bytes(data) => {
+            // CPython promises that `PyBytes_AsString` returns a pointer to a
+            // NUL-terminated buffer, so `c_data` carries the extra sentinel.
+            let mut c_data = data.clone();
+            c_data.push(0);
+            ShimKind::Bytes { data, c_data }
+        }
+        ShimValue::List(items) => ShimKind::List(
+            items
+                .into_iter()
+                .map(|item| value_object(item) as usize)
+                .collect(),
+        ),
+        ShimValue::Tuple(items) => ShimKind::Tuple(
+            items
+                .into_iter()
+                .map(|item| value_object(item) as usize)
+                .collect(),
+        ),
+        ShimValue::Dict(pairs) => ShimKind::Dict(
+            pairs
+                .into_iter()
+                .map(|(key, value)| (value_object(key) as usize, value_object(value) as usize))
+                .collect(),
+        ),
     };
     new_object(kind)
 }
@@ -214,6 +265,20 @@ fn tuple_object(arguments: &[ShimValue]) -> *mut ShimObject {
 
 /// Converts an extension's return object to the contract value.
 fn object_to_value(object: *mut ShimObject) -> Result<ShimValue, String> {
+    object_to_value_at(object, 0, &mut Vec::new())
+}
+
+/// Recursive body of [`object_to_value`].
+///
+/// `depth` bounds container nesting; `path` holds the addresses of the
+/// containers currently being converted so an extension-built cycle is
+/// reported instead of overflowing the stack. It is a `Vec` (at most
+/// [`MAX_CONVERSION_DEPTH`] entries) so scalar results allocate nothing.
+fn object_to_value_at(
+    object: *mut ShimObject,
+    depth: usize,
+    path: &mut Vec<usize>,
+) -> Result<ShimValue, String> {
     if object.is_null() {
         return Err("cannot convert a NULL object".to_string());
     }
@@ -224,13 +289,79 @@ fn object_to_value(object: *mut ShimObject) -> Result<ShimValue, String> {
         ShimKind::Int(number) => Ok(ShimValue::Int(*number)),
         ShimKind::Float(number) => Ok(ShimValue::Float(*number)),
         ShimKind::Str { text, .. } => Ok(ShimValue::Str(text.clone())),
-        ShimKind::Bytes(bytes) => Ok(ShimValue::Bytes(bytes.clone())),
-        ShimKind::Tuple(_) => Err("extension returned a tuple, which is not supported".to_string()),
+        ShimKind::Bytes { data, .. } => Ok(ShimValue::Bytes(data.clone())),
+        ShimKind::List(items) => {
+            begin_container(object as usize, "list", depth, path)?;
+            let mut converted = Vec::with_capacity(items.len());
+            for &item in items {
+                if item == 0 {
+                    return Err("extension returned a list with an uninitialized item".to_string());
+                }
+                converted.push(object_to_value_at(
+                    item as *mut ShimObject,
+                    depth + 1,
+                    path,
+                )?);
+            }
+            path.pop();
+            Ok(ShimValue::List(converted))
+        }
+        ShimKind::Tuple(items) => {
+            begin_container(object as usize, "tuple", depth, path)?;
+            let mut converted = Vec::with_capacity(items.len());
+            for &item in items {
+                if item == 0 {
+                    return Err("extension returned a tuple with an uninitialized item".to_string());
+                }
+                converted.push(object_to_value_at(
+                    item as *mut ShimObject,
+                    depth + 1,
+                    path,
+                )?);
+            }
+            path.pop();
+            Ok(ShimValue::Tuple(converted))
+        }
+        ShimKind::Dict(pairs) => {
+            begin_container(object as usize, "dict", depth, path)?;
+            let mut converted = Vec::with_capacity(pairs.len());
+            for &(key, value) in pairs {
+                if key == 0 || value == 0 {
+                    return Err("extension returned a dict with an uninitialized entry".to_string());
+                }
+                let key = object_to_value_at(key as *mut ShimObject, depth + 1, path)?;
+                let value = object_to_value_at(value as *mut ShimObject, depth + 1, path)?;
+                converted.push((key, value));
+            }
+            path.pop();
+            Ok(ShimValue::Dict(converted))
+        }
         ShimKind::Module(_) => {
             Err("extension returned a module object, which is not supported".to_string())
         }
         ShimKind::Error => Err("extension returned an error object".to_string()),
     }
+}
+
+/// Records one container on the conversion path after checking its depth.
+fn begin_container(
+    address: usize,
+    kind: &str,
+    depth: usize,
+    path: &mut Vec<usize>,
+) -> Result<(), String> {
+    if depth >= MAX_CONVERSION_DEPTH {
+        return Err(format!(
+            "extension returned a {kind} nested more than {MAX_CONVERSION_DEPTH} levels deep"
+        ));
+    }
+    if path.contains(&address) {
+        return Err(format!(
+            "extension returned a cyclic {kind} object, which cannot be converted"
+        ));
+    }
+    path.push(address);
+    Ok(())
 }
 
 // -------------------------------------------------------------------------
@@ -332,10 +463,161 @@ fn as_predicate(object: *mut ShimObject) -> Result<bool, String> {
         ShimKind::Int(number) => *number != 0,
         ShimKind::Float(number) => *number != 0.0,
         ShimKind::Str { text, .. } => !text.is_empty(),
-        ShimKind::Bytes(bytes) => !bytes.is_empty(),
+        ShimKind::Bytes { data, .. } => !data.is_empty(),
+        ShimKind::List(items) => !items.is_empty(),
         ShimKind::Tuple(items) => !items.is_empty(),
+        ShimKind::Dict(pairs) => !pairs.is_empty(),
         ShimKind::Module(_) | ShimKind::Error => true,
     })
+}
+
+/// Borrows the kind of a non-NULL shim object.
+fn kind_ref(object: *mut ShimObject) -> Option<&'static ShimKind> {
+    if object.is_null() {
+        return None;
+    }
+    // SAFETY: every shim object lives in the arena for the process lifetime.
+    Some(unsafe { &(*object).kind })
+}
+
+/// Borrows a list's item slots, rejecting NULL and non-list objects.
+fn list_slots(object: *mut ShimObject) -> Result<&'static [usize], String> {
+    match kind_ref(object) {
+        Some(ShimKind::List(items)) => Ok(items.as_slice()),
+        Some(_) => Err("TypeError: expected a list object".to_string()),
+        None => Err("TypeError: expected a list object, got NULL".to_string()),
+    }
+}
+
+/// Mutably borrows a list's item slots.
+fn list_slots_mut(object: *mut ShimObject) -> Result<&'static mut Vec<usize>, String> {
+    if object.is_null() {
+        return Err("TypeError: expected a list object, got NULL".to_string());
+    }
+    // SAFETY: every shim object lives in the arena for the process lifetime.
+    match unsafe { &mut (*object).kind } {
+        ShimKind::List(items) => Ok(items),
+        _ => Err("TypeError: expected a list object".to_string()),
+    }
+}
+
+/// Borrows a tuple's item slots, rejecting NULL and non-tuple objects.
+fn tuple_slots(object: *mut ShimObject) -> Result<&'static [usize], String> {
+    match kind_ref(object) {
+        Some(ShimKind::Tuple(items)) => Ok(items.as_slice()),
+        Some(_) => Err("TypeError: expected a tuple object".to_string()),
+        None => Err("TypeError: expected a tuple object, got NULL".to_string()),
+    }
+}
+
+/// Mutably borrows a tuple's item slots.
+fn tuple_slots_mut(object: *mut ShimObject) -> Result<&'static mut Vec<usize>, String> {
+    if object.is_null() {
+        return Err("TypeError: expected a tuple object, got NULL".to_string());
+    }
+    // SAFETY: every shim object lives in the arena for the process lifetime.
+    match unsafe { &mut (*object).kind } {
+        ShimKind::Tuple(items) => Ok(items),
+        _ => Err("TypeError: expected a tuple object".to_string()),
+    }
+}
+
+/// Borrows a dict's entry slots, rejecting NULL and non-dict objects.
+fn dict_slots(object: *mut ShimObject) -> Result<&'static [(usize, usize)], String> {
+    match kind_ref(object) {
+        Some(ShimKind::Dict(pairs)) => Ok(pairs.as_slice()),
+        Some(_) => Err("TypeError: expected a dict object".to_string()),
+        None => Err("TypeError: expected a dict object, got NULL".to_string()),
+    }
+}
+
+/// Mutably borrows a dict's entry slots.
+fn dict_slots_mut(object: *mut ShimObject) -> Result<&'static mut Vec<(usize, usize)>, String> {
+    if object.is_null() {
+        return Err("TypeError: expected a dict object, got NULL".to_string());
+    }
+    // SAFETY: every shim object lives in the arena for the process lifetime.
+    match unsafe { &mut (*object).kind } {
+        ShimKind::Dict(pairs) => Ok(pairs),
+        _ => Err("TypeError: expected a dict object".to_string()),
+    }
+}
+
+/// Borrows a bytes object's content, rejecting NULL and non-bytes objects.
+fn bytes_data(object: *mut ShimObject) -> Result<&'static [u8], String> {
+    match kind_ref(object) {
+        Some(ShimKind::Bytes { data, .. }) => Ok(data.as_slice()),
+        Some(_) => Err("TypeError: expected a bytes object".to_string()),
+        None => Err("TypeError: expected a bytes object, got NULL".to_string()),
+    }
+}
+
+/// Borrows a bytes object's NUL-terminated buffer.
+fn bytes_c_data(object: *mut ShimObject) -> Result<&'static [u8], String> {
+    match kind_ref(object) {
+        Some(ShimKind::Bytes { c_data, .. }) => Ok(c_data.as_slice()),
+        Some(_) => Err("TypeError: expected a bytes object".to_string()),
+        None => Err("TypeError: expected a bytes object, got NULL".to_string()),
+    }
+}
+
+/// Structural equality for dict keys: pointer identity first, then the scalar
+/// types the shim can represent (numerics compare across int/float/bool).
+fn key_equal(left: *mut ShimObject, right: *mut ShimObject) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Some(left), Some(right)) = (kind_ref(left), kind_ref(right)) else {
+        return false;
+    };
+    match (left, right) {
+        (ShimKind::None, ShimKind::None) => true,
+        (ShimKind::Bool(a), ShimKind::Bool(b)) => a == b,
+        (ShimKind::Int(a), ShimKind::Int(b)) => a == b,
+        (ShimKind::Float(a), ShimKind::Float(b)) => a == b,
+        (ShimKind::Bool(a), ShimKind::Int(b)) | (ShimKind::Int(b), ShimKind::Bool(a)) => {
+            (*a as i64) == *b
+        }
+        (ShimKind::Bool(a), ShimKind::Float(b)) | (ShimKind::Float(b), ShimKind::Bool(a)) => {
+            (if *a { 1.0 } else { 0.0 }) == *b
+        }
+        (ShimKind::Int(a), ShimKind::Float(b)) | (ShimKind::Float(b), ShimKind::Int(a)) => {
+            (*a as f64) == *b
+        }
+        (ShimKind::Str { text: a, .. }, ShimKind::Str { text: b, .. }) => a == b,
+        (ShimKind::Bytes { data: a, .. }, ShimKind::Bytes { data: b, .. }) => a == b,
+        _ => false,
+    }
+}
+
+/// Finds the entry storing `key` (structural equality) in a dict's slots.
+fn dict_position(pairs: &[(usize, usize)], key: *mut ShimObject) -> Option<usize> {
+    pairs
+        .iter()
+        .position(|&(existing, _)| key_equal(existing as *mut ShimObject, key))
+}
+
+/// Stores a key/value pair, replacing an equal existing key.
+fn dict_set(
+    dict: *mut ShimObject,
+    key: *mut ShimObject,
+    value: *mut ShimObject,
+) -> Result<(), String> {
+    let position = dict_position(dict_slots(dict)?, key);
+    let pairs = dict_slots_mut(dict)?;
+    match position {
+        Some(index) => {
+            pairs[index].1 = value as usize;
+            Ok(())
+        }
+        None => {
+            if pairs.try_reserve(1).is_err() {
+                return Err("MemoryError: cannot grow dict".to_string());
+            }
+            pairs.push((key as usize, value as usize));
+            Ok(())
+        }
+    }
 }
 
 /// Returns the NUL-terminated text stored in a string object.
@@ -832,6 +1114,420 @@ pub extern "C" fn PyLong_AsLong(object: *mut ShimObject) -> c_long {
     }
 }
 
+/// Converts a `Py_ssize_t` size argument, rejecting negative values.
+fn non_negative_size(size: isize, what: &str) -> Result<usize, String> {
+    usize::try_from(size).map_err(|_| format!("ValueError: negative {what} size"))
+}
+
+/// Converts a container length to a `Py_ssize_t`.
+fn py_ssize_of(len: usize) -> isize {
+    isize::try_from(len).unwrap_or(isize::MAX)
+}
+
+/// `PyUnicode_FromString`: creates a string shim object.
+#[no_mangle]
+pub extern "C" fn PyUnicode_FromString(value: *const c_char) -> *mut ShimObject {
+    if value.is_null() {
+        set_error("TypeError: PyUnicode_FromString requires a non-NULL string");
+        return ptr::null_mut();
+    }
+    value_object(ShimValue::Str(read_c_string(value)))
+}
+
+/// `PyUnicode_AsUTF8`: returns the string's NUL-terminated UTF-8 buffer.
+///
+/// As in CPython the pointer is valid for as long as the string object lives;
+/// arena objects live for the whole process. A string with an embedded NUL is
+/// rejected because the shim keeps a `CString` cache.
+#[no_mangle]
+pub extern "C" fn PyUnicode_AsUTF8(object: *mut ShimObject) -> *const c_char {
+    match as_c_string(object) {
+        Ok(pointer) => pointer,
+        Err(error) => {
+            set_error(format!("TypeError: {error}"));
+            ptr::null()
+        }
+    }
+}
+
+/// `PyFloat_FromDouble`: creates a float shim object.
+#[no_mangle]
+pub extern "C" fn PyFloat_FromDouble(value: f64) -> *mut ShimObject {
+    new_object(ShimKind::Float(value))
+}
+
+/// `PyFloat_AsDouble`: extracts a double, reporting failure with `-1.0`.
+///
+/// `-1.0` is also a valid value; callers distinguish the cases with
+/// `PyErr_Occurred`, exactly like CPython.
+#[no_mangle]
+pub extern "C" fn PyFloat_AsDouble(object: *mut ShimObject) -> f64 {
+    match as_float(object) {
+        Ok(value) => value,
+        Err(error) => {
+            set_error(format!("TypeError: {error}"));
+            -1.0
+        }
+    }
+}
+
+/// `PyBytes_FromStringAndSize`: copies `length` bytes into a new bytes object.
+#[no_mangle]
+pub extern "C" fn PyBytes_FromStringAndSize(
+    value: *const c_char,
+    length: isize,
+) -> *mut ShimObject {
+    let length = match non_negative_size(length, "bytes") {
+        Ok(length) => length,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    if value.is_null() && length != 0 {
+        set_error("TypeError: NULL bytes buffer with a non-zero length");
+        return ptr::null_mut();
+    }
+    let mut data = Vec::new();
+    if data.try_reserve_exact(length).is_err() {
+        set_error("MemoryError: cannot allocate bytes");
+        return ptr::null_mut();
+    }
+    if length != 0 {
+        // SAFETY: the caller promises `value` points at `length` readable
+        // bytes; a NULL buffer was rejected above.
+        let source = unsafe { std::slice::from_raw_parts(value as *const u8, length) };
+        data.extend_from_slice(source);
+    }
+    let mut c_data = data.clone();
+    c_data.push(0);
+    new_object(ShimKind::Bytes { data, c_data })
+}
+
+/// `PyBytes_AsString`: returns the bytes' NUL-terminated buffer.
+#[no_mangle]
+pub extern "C" fn PyBytes_AsString(object: *mut ShimObject) -> *mut c_char {
+    match bytes_c_data(object) {
+        Ok(data) => data.as_ptr() as *mut c_char,
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyBytes_Size`: number of content bytes, or `-1` for a non-bytes object.
+#[no_mangle]
+pub extern "C" fn PyBytes_Size(object: *mut ShimObject) -> isize {
+    match bytes_data(object) {
+        Ok(data) => py_ssize_of(data.len()),
+        Err(error) => {
+            set_error(error);
+            -1
+        }
+    }
+}
+
+/// `PyList_New`: creates a list whose slots start out uninitialized.
+#[no_mangle]
+pub extern "C" fn PyList_New(size: isize) -> *mut ShimObject {
+    let count = match non_negative_size(size, "list") {
+        Ok(count) => count,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let mut items = Vec::new();
+    if items.try_reserve_exact(count).is_err() {
+        set_error("MemoryError: cannot allocate list");
+        return ptr::null_mut();
+    }
+    items.resize(count, 0);
+    new_object(ShimKind::List(items))
+}
+
+/// `PyList_Size`: number of items, or `-1` for a non-list object.
+#[no_mangle]
+pub extern "C" fn PyList_Size(object: *mut ShimObject) -> isize {
+    match list_slots(object) {
+        Ok(items) => py_ssize_of(items.len()),
+        Err(error) => {
+            set_error(error);
+            -1
+        }
+    }
+}
+
+/// `PyList_GetItem`: borrowed item reference, or NULL when out of range.
+#[no_mangle]
+pub extern "C" fn PyList_GetItem(object: *mut ShimObject, index: isize) -> *mut ShimObject {
+    let items = match list_slots(object) {
+        Ok(items) => items,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    match usize::try_from(index)
+        .ok()
+        .and_then(|index| items.get(index))
+    {
+        Some(&item) if item != 0 => item as *mut ShimObject,
+        Some(_) => {
+            set_error("SystemError: list contains an uninitialized item");
+            ptr::null_mut()
+        }
+        None => {
+            set_error("IndexError: list index out of range");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyList_SetItem`: stores `item` at `index`, stealing its reference.
+#[no_mangle]
+pub extern "C" fn PyList_SetItem(
+    object: *mut ShimObject,
+    index: isize,
+    item: *mut ShimObject,
+) -> c_int {
+    if item.is_null() {
+        set_error("TypeError: list item is NULL");
+        return -1;
+    }
+    let items = match list_slots_mut(object) {
+        Ok(items) => items,
+        Err(error) => {
+            set_error(error);
+            return -1;
+        }
+    };
+    match usize::try_from(index)
+        .ok()
+        .and_then(|index| items.get_mut(index))
+    {
+        Some(slot) => {
+            *slot = item as usize;
+            0
+        }
+        None => {
+            set_error("IndexError: list assignment index out of range");
+            -1
+        }
+    }
+}
+
+/// `PyList_Append`: appends one item, growing the list.
+#[no_mangle]
+pub extern "C" fn PyList_Append(object: *mut ShimObject, item: *mut ShimObject) -> c_int {
+    if item.is_null() {
+        set_error("TypeError: list item is NULL");
+        return -1;
+    }
+    let items = match list_slots_mut(object) {
+        Ok(items) => items,
+        Err(error) => {
+            set_error(error);
+            return -1;
+        }
+    };
+    if items.try_reserve(1).is_err() {
+        set_error("MemoryError: cannot grow list");
+        return -1;
+    }
+    items.push(item as usize);
+    0
+}
+
+/// `PyTuple_New`: creates a tuple whose slots start out uninitialized.
+#[no_mangle]
+pub extern "C" fn PyTuple_New(size: isize) -> *mut ShimObject {
+    let count = match non_negative_size(size, "tuple") {
+        Ok(count) => count,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let mut items = Vec::new();
+    if items.try_reserve_exact(count).is_err() {
+        set_error("MemoryError: cannot allocate tuple");
+        return ptr::null_mut();
+    }
+    items.resize(count, 0);
+    new_object(ShimKind::Tuple(items))
+}
+
+/// `PyTuple_Size`: number of items, or `-1` for a non-tuple object.
+#[no_mangle]
+pub extern "C" fn PyTuple_Size(object: *mut ShimObject) -> isize {
+    match tuple_slots(object) {
+        Ok(items) => py_ssize_of(items.len()),
+        Err(error) => {
+            set_error(error);
+            -1
+        }
+    }
+}
+
+/// `PyTuple_GetItem`: borrowed item reference, or NULL when out of range.
+#[no_mangle]
+pub extern "C" fn PyTuple_GetItem(object: *mut ShimObject, index: isize) -> *mut ShimObject {
+    let items = match tuple_slots(object) {
+        Ok(items) => items,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    match usize::try_from(index)
+        .ok()
+        .and_then(|index| items.get(index))
+    {
+        Some(&item) if item != 0 => item as *mut ShimObject,
+        Some(_) => {
+            set_error("SystemError: tuple contains an uninitialized item");
+            ptr::null_mut()
+        }
+        None => {
+            set_error("IndexError: tuple index out of range");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyTuple_SetItem`: stores `item` at `index`, stealing its reference.
+#[no_mangle]
+pub extern "C" fn PyTuple_SetItem(
+    object: *mut ShimObject,
+    index: isize,
+    item: *mut ShimObject,
+) -> c_int {
+    if item.is_null() {
+        set_error("TypeError: tuple item is NULL");
+        return -1;
+    }
+    let items = match tuple_slots_mut(object) {
+        Ok(items) => items,
+        Err(error) => {
+            set_error(error);
+            return -1;
+        }
+    };
+    match usize::try_from(index)
+        .ok()
+        .and_then(|index| items.get_mut(index))
+    {
+        Some(slot) => {
+            *slot = item as usize;
+            0
+        }
+        None => {
+            set_error("IndexError: tuple assignment index out of range");
+            -1
+        }
+    }
+}
+
+/// `PyDict_New`: creates an empty dict.
+#[no_mangle]
+pub extern "C" fn PyDict_New() -> *mut ShimObject {
+    new_object(ShimKind::Dict(Vec::new()))
+}
+
+/// `PyDict_SetItem`: inserts or overwrites `key` -> `value`.
+#[no_mangle]
+pub extern "C" fn PyDict_SetItem(
+    object: *mut ShimObject,
+    key: *mut ShimObject,
+    value: *mut ShimObject,
+) -> c_int {
+    if key.is_null() {
+        set_error("TypeError: dict key is NULL");
+        return -1;
+    }
+    if value.is_null() {
+        set_error("TypeError: dict value is NULL");
+        return -1;
+    }
+    match dict_set(object, key, value) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_error(error);
+            -1
+        }
+    }
+}
+
+/// `PyDict_SetItemString`: inserts or overwrites a string key.
+#[no_mangle]
+pub extern "C" fn PyDict_SetItemString(
+    object: *mut ShimObject,
+    key: *const c_char,
+    value: *mut ShimObject,
+) -> c_int {
+    if key.is_null() {
+        set_error("TypeError: dict key is NULL");
+        return -1;
+    }
+    let key = value_object(ShimValue::Str(read_c_string(key)));
+    PyDict_SetItem(object, key, value)
+}
+
+/// `PyDict_GetItem`: borrowed value for `key`, or NULL when absent.
+///
+/// A missing key returns NULL *without* setting an error, matching CPython;
+/// a NULL/wrong-typed dict sets a `TypeError` and returns NULL.
+#[no_mangle]
+pub extern "C" fn PyDict_GetItem(object: *mut ShimObject, key: *mut ShimObject) -> *mut ShimObject {
+    if key.is_null() {
+        set_error("TypeError: dict key is NULL");
+        return ptr::null_mut();
+    }
+    let pairs = match dict_slots(object) {
+        Ok(pairs) => pairs,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    match dict_position(pairs, key) {
+        Some(index) => pairs[index].1 as *mut ShimObject,
+        None => ptr::null_mut(),
+    }
+}
+
+/// `PyDict_GetItemString`: borrowed value for a string key, or NULL.
+#[no_mangle]
+pub extern "C" fn PyDict_GetItemString(
+    object: *mut ShimObject,
+    key: *const c_char,
+) -> *mut ShimObject {
+    if key.is_null() {
+        set_error("TypeError: dict key is NULL");
+        return ptr::null_mut();
+    }
+    let name = read_c_string(key);
+    let pairs = match dict_slots(object) {
+        Ok(pairs) => pairs,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let position = pairs.iter().position(|&(existing, _)| {
+        matches!(
+            kind_ref(existing as *mut ShimObject),
+            Some(ShimKind::Str { text, .. }) if text == &name
+        )
+    });
+    match position {
+        Some(index) => pairs[index].1 as *mut ShimObject,
+        None => ptr::null_mut(),
+    }
+}
+
 /// `Py_IncRef`: increments a shim object's reference count.
 #[no_mangle]
 pub extern "C" fn Py_IncRef(object: *mut ShimObject) {
@@ -1065,12 +1761,33 @@ extern "C" {
 /// linker would drop the otherwise unreachable object files, leaving
 /// `dlopen`ed extensions with unresolved `Py*` symbols.
 pub(crate) fn anchor() {
-    let symbols: [*const (); 24] = [
+    let symbols: [*const (); 45] = [
         PyModule_Create2 as *const (),
         PyModule_AddStringConstant as *const (),
         PyModule_AddObject as *const (),
         PyLong_FromLong as *const (),
         PyLong_AsLong as *const (),
+        PyUnicode_FromString as *const (),
+        PyUnicode_AsUTF8 as *const (),
+        PyFloat_FromDouble as *const (),
+        PyFloat_AsDouble as *const (),
+        PyBytes_FromStringAndSize as *const (),
+        PyBytes_AsString as *const (),
+        PyBytes_Size as *const (),
+        PyList_New as *const (),
+        PyList_Size as *const (),
+        PyList_GetItem as *const (),
+        PyList_SetItem as *const (),
+        PyList_Append as *const (),
+        PyTuple_New as *const (),
+        PyTuple_Size as *const (),
+        PyTuple_GetItem as *const (),
+        PyTuple_SetItem as *const (),
+        PyDict_New as *const (),
+        PyDict_SetItem as *const (),
+        PyDict_SetItemString as *const (),
+        PyDict_GetItem as *const (),
+        PyDict_GetItemString as *const (),
         Py_IncRef as *const (),
         Py_DecRef as *const (),
         _Py_IncRef as *const (),
@@ -1092,4 +1809,114 @@ pub(crate) fn anchor() {
         pyx_capi_set_type_error as *const (),
     ];
     let _ = std::hint::black_box(symbols);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_roundtrip_through_the_c_api() {
+        let list = PyList_New(0);
+        assert!(!list.is_null());
+        assert_eq!(PyList_Append(list, PyLong_FromLong(7)), 0);
+        assert_eq!(PyList_Size(list), 1);
+
+        match object_to_value(list) {
+            Ok(ShimValue::List(items)) => assert!(matches!(items.as_slice(), [ShimValue::Int(7)])),
+            other => panic!("unexpected conversion result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uninitialized_container_items_are_rejected() {
+        let message = object_to_value(PyList_New(2)).expect_err("unfilled list");
+        assert!(message.contains("uninitialized"), "{message}");
+
+        let message = object_to_value(PyTuple_New(1)).expect_err("unfilled tuple");
+        assert!(message.contains("uninitialized"), "{message}");
+    }
+
+    #[test]
+    fn cyclic_container_results_are_rejected() {
+        let list = PyList_New(1);
+        assert_eq!(PyList_SetItem(list, 0, list), 0);
+        let message = object_to_value(list).expect_err("cyclic list");
+        assert!(message.contains("cyclic"), "{message}");
+    }
+
+    #[test]
+    fn dict_set_and_get_use_structural_keys() {
+        clear_error();
+        let dict = PyDict_New();
+        let first = PyUnicode_FromString(c"key".as_ptr());
+        let second = PyUnicode_FromString(c"key".as_ptr());
+
+        assert_eq!(PyDict_SetItem(dict, first, PyLong_FromLong(4)), 0);
+        assert_eq!(
+            PyDict_SetItem(dict, second, PyLong_FromLong(5)),
+            0,
+            "replace"
+        );
+        assert_eq!(dict_len_for_test(dict), 1);
+
+        let value = PyDict_GetItem(dict, first);
+        assert!(!value.is_null());
+        assert_eq!(PyLong_AsLong(value), 5);
+
+        let value = PyDict_GetItemString(dict, c"key".as_ptr());
+        assert!(!value.is_null());
+        assert_eq!(PyLong_AsLong(value), 5);
+
+        assert!(PyDict_GetItemString(dict, c"missing".as_ptr()).is_null());
+        assert!(!error_pending(), "a missing key must not set an error");
+    }
+
+    #[test]
+    fn bytes_c_api_keeps_a_trailing_nul() {
+        let bytes = PyBytes_FromStringAndSize(b"hi\0x".as_ptr() as *const c_char, 2);
+        assert!(!bytes.is_null());
+        assert_eq!(PyBytes_Size(bytes), 2);
+        let pointer = PyBytes_AsString(bytes);
+        assert!(!pointer.is_null());
+        // SAFETY: `pointer` addresses the shim's `c_data`, which is
+        // `data.len() + 1` bytes long.
+        unsafe {
+            assert_eq!(*pointer.add(0), b'h' as c_char);
+            assert_eq!(*pointer.add(1), b'i' as c_char);
+            assert_eq!(*pointer.add(2), 0);
+        }
+    }
+
+    #[test]
+    fn null_and_negative_arguments_report_errors() {
+        clear_error();
+        assert!(PyList_New(-1).is_null());
+        assert!(error_pending());
+        clear_error();
+        assert_eq!(PyList_Size(ptr::null_mut()), -1);
+        assert!(error_pending());
+        clear_error();
+        assert!(PyList_GetItem(ptr::null_mut(), 0).is_null());
+        assert!(error_pending());
+        clear_error();
+        assert_eq!(PyTuple_Size(ptr::null_mut()), -1);
+        assert!(error_pending());
+        clear_error();
+        assert!(PyBytes_FromStringAndSize(ptr::null(), 1).is_null());
+        assert!(error_pending());
+        clear_error();
+        assert_eq!(
+            PyDict_SetItem(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()),
+            -1
+        );
+        assert!(error_pending());
+        clear_error();
+    }
+
+    /// Counts the entries of a shim dict without exposing an exported size
+    /// function (CPython's `PyDict_Size` is not part of this slice).
+    fn dict_len_for_test(dict: *mut ShimObject) -> usize {
+        dict_slots(dict).map(|pairs| pairs.len()).unwrap_or(0)
+    }
 }

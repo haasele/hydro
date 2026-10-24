@@ -1405,6 +1405,13 @@ impl<'a> Checker<'a> {
                 // The awaited result is only known at runtime.
                 self.force_any(expr.ty);
             }
+            HExprKind::Yield { value } => {
+                if let Some(value) = value {
+                    self.check_expr(value, f);
+                }
+                // The value sent on the next resume is only known at runtime.
+                self.force_any(expr.ty);
+            }
         }
     }
 
@@ -2812,6 +2819,9 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
         },
         HExprKind::Await { value } => ExprKind::Await {
             value: Box::new(emit_expr(value, inf)),
+        },
+        HExprKind::Yield { value } => ExprKind::Yield {
+            value: value.as_ref().map(|value| Box::new(emit_expr(value, inf))),
         },
     };
     IrExpr::new(kind, inf.type_of(expr.ty), expr.line)

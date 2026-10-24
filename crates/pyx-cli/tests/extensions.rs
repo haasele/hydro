@@ -10,8 +10,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Console output of the probe program: `add`, `tag`, an imported `add`, `tag`.
-const EXPECTED_STDOUT: &str = "5\nabi3\n42\nabi3\n";
+/// Console output of the probe program, in call order.
+const EXPECTED_STDOUT: &str = "\
+5
+abi3
+42
+abi3
+10
+[0, 1, 4, 9]
+(3, 7)
+{'a': 1, 'b': 'two', 'n': 3}
+two
+9
+HELLO, PYX
+3.5
+-0.5
+b'cba'
+b''
+";
 
 const MAIN_SOURCE: &str = "\
 import pyx_capi_probe as p
@@ -25,6 +41,21 @@ def twice(x):
 
 print(twice(21))
 print(tag)
+
+# Containers cross the boundary in both directions.
+print(p.sum_list([1, 2, 3, 4]))
+print(p.make_list(4))
+print(p.make_tuple(3, 7))
+print(p.make_dict())
+print(p.dict_get(p.make_dict(), \"b\"))
+print(p.dict_get({\"a\": 1, \"z\": 9}, \"z\"))
+
+# Strings, floats and bytes use the matching scalar entry points.
+print(p.upper(\"hello, pyx\"))
+print(p.half(7))
+print(p.half(-1))
+print(p.reverse_bytes(b\"abc\"))
+print(p.reverse_bytes(b\"\"))
 ";
 
 struct TestDir {

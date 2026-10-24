@@ -31,7 +31,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::exc::{self, RUNTIME_ERROR, TYPE_ERROR};
+use crate::exc::{self, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR};
 use crate::value::{self, NONE};
 
 // -------------------------------------------------------------------------
@@ -358,6 +358,17 @@ pub(crate) struct FiberState {
     pub(crate) result: i64,
     /// Pending exception captured from the body (`NONE` if none).
     pub(crate) error: i64,
+    /// The body has been resumed at least once.
+    pub(crate) started: bool,
+    /// Value passed to the current (or last) resume; `pyx_yield` returns it
+    /// to the generator body.
+    pub(crate) sent: i64,
+    /// Exception injected by `throw()`/`close()` and raised at the suspended
+    /// `yield` when the fiber is resumed.
+    pub(crate) injected: Option<i64>,
+    /// `close()` is driving the fiber; a `yield` that resumes afterwards is
+    /// an ignored `GeneratorExit`.
+    pub(crate) closing: bool,
     /// Outstanding suspension request, if any.
     pub(crate) request: Option<WaitRequest>,
     /// Lifetime conservative root range: the private stack.
@@ -398,6 +409,10 @@ impl FiberState {
             yielded: NONE,
             result: NONE,
             error: NONE,
+            started: false,
+            sent: NONE,
+            injected: None,
+            closing: false,
             request: None,
             stack_root_lo: stack_lo,
             stack_root_hi: stack_hi,
@@ -429,6 +444,10 @@ impl FiberState {
         mark(self.yielded);
         mark(self.result);
         mark(self.error);
+        mark(self.sent);
+        if let Some(injected) = self.injected {
+            mark(injected);
+        }
         if let Some(WaitRequest::Join(tasks)) = &self.request {
             for &task in tasks {
                 mark(task);
@@ -581,6 +600,8 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
                 aux_published = true;
             }
         }
+        (*ptr).started = true;
+        (*ptr).sent = value;
         (*ptr).running = true;
         crate::heap::push_stack_bounds((*ptr).stack.low(), (*ptr).stack.high());
         let outer = CURRENT.with(|cell| cell.replace(Some(CurrentFiber { ptr, value })));
@@ -700,15 +721,154 @@ pub(crate) fn yield_value(value: i64) -> i64 {
         (*ptr).yielded = value;
         (*ptr).request = None;
         suspend_switch(ptr);
+        // An exception thrown or injected by `close()` is raised at the
+        // suspension point, so codegen routes it through the generator's
+        // handlers and `finally` blocks.
+        if let Some(injected) = (*ptr).injected.take() {
+            return exc::raise_value(injected);
+        }
+        // `close()` resumed this generator after injecting `GeneratorExit`;
+        // a further yield means the body ignored it.
+        if (*ptr).closing {
+            return exc::raise_with_message(RUNTIME_ERROR, "generator ignored GeneratorExit");
+        }
+        // The value passed to the resume that continued this generator.
+        (*ptr).sent
     }
-    NONE
+}
+
+/// Whether a generator has been resumed at least once.
+pub(crate) fn is_started(value: i64) -> bool {
+    value::as_fiber(value)
+        .map(|fiber| fiber.started)
+        .unwrap_or(false)
+}
+
+/// `generator.send(value)`.
+///
+/// A just-started generator only accepts `None`; any other value is a
+/// `TypeError`, mirroring CPython. Resuming returns the next yielded value or
+/// raises `StopIteration` when the body finishes. An exception raised by the
+/// body propagates unchanged.
+pub(crate) fn send_value(generator: i64, value: i64) -> i64 {
+    let Some(ptr) = value::fiber_raw(generator) else {
+        return exc::raise_with_message(TYPE_ERROR, "send() requires a generator object");
+    };
+    // SAFETY: `fiber_raw` returned the address of a live fiber payload that
+    // stays reachable through `generator` for this call.
+    unsafe {
+        if (*ptr).done {
+            return exc::raise_with_message(STOP_ITERATION, "");
+        }
+        if !is_started(generator) && value != NONE {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "can't send non-None value to a just-started generator",
+            );
+        }
+        resume_raw(ptr, value);
+        if (*ptr).error != NONE {
+            return raise_error(generator);
+        }
+        if (*ptr).done {
+            return exc::raise_with_message(STOP_ITERATION, "");
+        }
+        (*ptr).yielded
+    }
+}
+
+/// `generator.throw(exception)`: raises `exception` at the suspension point.
+///
+/// Only exception *instances* are accepted (PyX has no exception class
+/// objects), and only the single-argument form is supported.
+pub(crate) fn throw_value(generator: i64, exception: i64) -> i64 {
+    let Some(ptr) = value::fiber_raw(generator) else {
+        return exc::raise_with_message(TYPE_ERROR, "throw() requires a generator object");
+    };
+    if value::exception_data(exception).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "throw() argument must be an exception instance",
+        );
+    }
+    // SAFETY: `fiber_raw` returned a live fiber payload.
+    unsafe {
+        if (*ptr).done {
+            return exc::raise_with_message(STOP_ITERATION, "");
+        }
+        if !(*ptr).started {
+            // Throwing into a just-started generator raises the exception
+            // without running the body and closes the generator.
+            (*ptr).done = true;
+            (*ptr).finish_seq = next_finish_seq();
+            return exc::raise_value(exception);
+        }
+        (*ptr).injected = Some(exception);
+        resume_raw(ptr, NONE);
+        if (*ptr).error != NONE {
+            return raise_error(generator);
+        }
+        if (*ptr).done {
+            return exc::raise_with_message(STOP_ITERATION, "");
+        }
+        (*ptr).yielded
+    }
+}
+
+/// `generator.close()`: runs the generator's `finally` blocks by raising
+/// `GeneratorExit` at its suspension point.
+pub(crate) fn close_value(generator: i64) -> i64 {
+    let Some(ptr) = value::fiber_raw(generator) else {
+        return exc::raise_with_message(TYPE_ERROR, "close() requires a generator object");
+    };
+    // SAFETY: `fiber_raw` returned a live fiber payload.
+    unsafe {
+        if (*ptr).done {
+            return NONE;
+        }
+        if !(*ptr).started {
+            // A generator whose body never ran has no `finally` to run.
+            (*ptr).done = true;
+            (*ptr).finish_seq = next_finish_seq();
+            return NONE;
+        }
+        exc::raise_with_message(exc::GENERATOR_EXIT, "");
+        let exit = exc::pending_value();
+        let _ = exc::clear();
+        (*ptr).injected = Some(exit);
+        (*ptr).closing = true;
+        resume_raw(ptr, NONE);
+        let error = std::mem::replace(&mut (*ptr).error, NONE);
+        if error != NONE {
+            let tag = value::exception_data(error).map(|data| data.tag);
+            if tag == Some(exc::GENERATOR_EXIT) {
+                // The injected GeneratorExit propagated out of the body:
+                // this is the normal `close()` outcome.
+                (*ptr).closing = false;
+                return NONE;
+            }
+            exc::raise_value(error);
+            return NONE;
+        }
+        if (*ptr).done {
+            (*ptr).closing = false;
+            return NONE;
+        }
+        // The generator yielded while closing: CPython treats it as closed
+        // and reports the ignored GeneratorExit.
+        (*ptr).done = true;
+        (*ptr).closing = false;
+        (*ptr).finish_seq = next_finish_seq();
+        exc::raise_with_message(RUNTIME_ERROR, "generator ignored GeneratorExit")
+    }
 }
 
 /// Resume a fiber by tagged value; `None` if `value` is not a fiber.
 pub(crate) fn resume_value(value: i64) -> Option<bool> {
     let ptr = value::fiber_raw(value)?;
+    // Iteration and `await` deliver `None`; only `send()` passes a value.
     // SAFETY: `fiber_raw` returned the address of a live fiber payload.
-    Some(unsafe { resume_raw(ptr, value) })
+    Some(unsafe { resume_raw(ptr, NONE) })
 }
 
 /// Takes the outstanding suspension request (if any).
@@ -736,7 +896,7 @@ pub(crate) fn await_value(value: i64) -> i64 {
             return finish_value(value);
         }
         // SAFETY: `ptr` is live and not done.
-        unsafe { resume_raw(ptr, value) };
+        unsafe { resume_raw(ptr, NONE) };
         if unsafe { (*ptr).done } {
             return finish_value(value);
         }
@@ -792,4 +952,185 @@ pub(crate) fn blocking_sleep(duration: Duration) {
     crate::heap::blocking_enter();
     std::thread::sleep(duration);
     crate::heap::blocking_leave();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn int(n: i64) -> i64 {
+        value::encode_int(n).expect("representable")
+    }
+
+    fn generator(entry: extern "C" fn(*const i64) -> i64) -> i64 {
+        exc::init();
+        value::fiber_generator_new(entry as usize, "gen".to_string(), Vec::new())
+            .expect("generator stack")
+    }
+
+    /// Builds an exception object and leaves no pending exception behind.
+    fn exception(tag: u32, message: &str) -> i64 {
+        exc::raise_with_message(tag, message);
+        let value = exc::pending_value();
+        exc::clear();
+        value
+    }
+
+    extern "C" fn echoes_sent(_argv: *const i64) -> i64 {
+        let received = yield_value(value::encode_int(1).expect("representable"));
+        yield_value(received);
+        NONE
+    }
+
+    extern "C" fn yields_once(_argv: *const i64) -> i64 {
+        yield_value(value::encode_int(1).expect("representable"));
+        NONE
+    }
+
+    /// Simulates a body that does not catch the exception injected at its
+    /// suspension point.
+    extern "C" fn leaves_exception_pending(_argv: *const i64) -> i64 {
+        yield_value(value::encode_int(1).expect("representable"));
+        NONE
+    }
+
+    /// Simulates `except ValueError: yield 2`.
+    extern "C" fn catches_and_yields(_argv: *const i64) -> i64 {
+        yield_value(value::encode_int(1).expect("representable"));
+        if exc::pending() {
+            exc::clear();
+        }
+        yield_value(value::encode_int(2).expect("representable"));
+        NONE
+    }
+
+    /// Simulates a `finally` block that yields while the generator is closing.
+    extern "C" fn ignores_close(_argv: *const i64) -> i64 {
+        yield_value(value::encode_int(1).expect("representable"));
+        exc::clear();
+        yield_value(value::encode_int(2).expect("representable"));
+        NONE
+    }
+
+    #[test]
+    fn send_delivers_values_and_reports_stop_iteration() {
+        let generator = generator(echoes_sent);
+        assert!(!is_started(generator));
+
+        assert_eq!(send_value(generator, NONE), int(1));
+        assert!(is_started(generator));
+        assert!(!exc::pending());
+
+        assert_eq!(send_value(generator, int(5)), int(5));
+        assert!(!exc::pending());
+
+        assert_eq!(send_value(generator, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+
+        exc::init();
+        assert_eq!(send_value(generator, int(7)), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+    }
+
+    #[test]
+    fn send_rejects_a_value_to_a_just_started_generator() {
+        let generator = generator(echoes_sent);
+        assert_eq!(send_value(generator, int(5)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "can't send non-None value to a just-started generator"
+        );
+        // The rejected send must not start the body.
+        assert!(!is_started(generator));
+        exc::init();
+        assert_eq!(send_value(generator, NONE), int(1));
+    }
+
+    #[test]
+    fn throw_into_a_just_started_generator_raises_without_running_the_body() {
+        let generator = generator(yields_once);
+        let thrown = exception(exc::VALUE_ERROR, "thrown");
+        assert_eq!(throw_value(generator, thrown), NONE);
+        assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(exc::pending_value(), thrown);
+        assert!(is_done(generator));
+        assert!(!is_started(generator));
+    }
+
+    #[test]
+    fn throw_propagates_an_uncaught_exception() {
+        let generator = generator(leaves_exception_pending);
+        assert_eq!(send_value(generator, NONE), int(1));
+
+        let thrown = exception(exc::VALUE_ERROR, "thrown");
+        assert_eq!(throw_value(generator, thrown), NONE);
+        assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(exc::pending_value(), thrown);
+        assert!(is_done(generator));
+    }
+
+    #[test]
+    fn throw_returns_the_value_yielded_by_the_handler() {
+        let generator = generator(catches_and_yields);
+        assert_eq!(send_value(generator, NONE), int(1));
+
+        let thrown = exception(exc::VALUE_ERROR, "thrown");
+        assert_eq!(throw_value(generator, thrown), int(2));
+        assert!(!exc::pending());
+        assert_eq!(send_value(generator, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+    }
+
+    #[test]
+    fn throw_rejects_non_exception_values() {
+        let generator = generator(yields_once);
+        assert_eq!(throw_value(generator, int(3)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "throw() argument must be an exception instance"
+        );
+        // The generator is untouched and still suspended.
+        assert!(!is_done(generator));
+        exc::init();
+        assert_eq!(send_value(generator, NONE), int(1));
+    }
+
+    #[test]
+    fn close_swallows_the_injected_generator_exit() {
+        let generator = generator(yields_once);
+        assert_eq!(send_value(generator, NONE), int(1));
+        assert_eq!(close_value(generator), NONE);
+        assert!(!exc::pending());
+        assert!(is_done(generator));
+        assert!(!has_error(generator));
+
+        assert_eq!(send_value(generator, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+    }
+
+    #[test]
+    fn close_before_the_first_resume_just_marks_the_generator_done() {
+        let generator = generator(yields_once);
+        assert!(!is_started(generator));
+        assert_eq!(close_value(generator), NONE);
+        assert!(is_done(generator));
+        assert!(!is_started(generator));
+        assert_eq!(send_value(generator, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+    }
+
+    #[test]
+    fn yielding_while_closing_is_a_runtime_error() {
+        let generator = generator(ignores_close);
+        assert_eq!(send_value(generator, NONE), int(1));
+        assert_eq!(close_value(generator), NONE);
+        assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "generator ignored GeneratorExit"
+        );
+        assert!(is_done(generator));
+    }
 }

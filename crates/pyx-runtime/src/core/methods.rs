@@ -10,6 +10,10 @@
 //! `dict.values()` and `dict.items()` materialise plain lists (insertion
 //! order) because Phase 2 has no views; only the method subset in
 //! ARCHITECTURE §3.2 is provided. `dict.items()` yields `(key, value)` tuples.
+//!
+//! Generator objects expose `send`, `throw` and `close`. `throw` accepts an
+//! exception *instance* only (PyX has no exception class objects) and supports
+//! just the single-argument form.
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -50,6 +54,14 @@ pub(crate) fn call(
             argc
         ));
     };
+    // Generators expose `send`, `throw` and `close`; coroutine fibers have no
+    // such methods.
+    if value::as_fiber(obj)
+        .map(|fiber| fiber.kind == crate::fiber::FiberKind::Generator)
+        .unwrap_or(false)
+    {
+        return generator_method(obj, &method, &args);
+    }
     if let Some(s) = value::as_str(obj) {
         // Copy the receiver before any allocation: a reference into a heap
         // object must not be read after an allocation that may collect.
@@ -2980,6 +2992,38 @@ fn glob_match_chars(pattern: &[char], text: &[char]) -> bool {
             Some((&ch, tail)) => ch == expected && glob_match_chars(rest, tail),
             None => false,
         },
+    }
+}
+
+/// Methods of a generator object (`generator.send/throw/close`).
+///
+/// Only positional arguments are supported. `throw` accepts an exception
+/// *instance* only: PyX has no exception class objects, so the supported form
+/// is `gen.throw(e)` where `e` is an exception object obtained from
+/// `except ... as e` (or another runtime-provided exception value).
+/// `throw` takes exactly one argument; the CPython 3-argument form (type,
+/// value, traceback) is not available.
+fn generator_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    match method {
+        "send" => {
+            if let Some(err) = check_arity("generator", method, args.len(), 1, 1) {
+                return err;
+            }
+            crate::fiber::send_value(obj, args[0])
+        }
+        "throw" => {
+            if let Some(err) = check_arity("generator", method, args.len(), 1, 1) {
+                return err;
+            }
+            crate::fiber::throw_value(obj, args[0])
+        }
+        "close" => {
+            if let Some(err) = check_arity("generator", method, args.len(), 0, 0) {
+                return err;
+            }
+            crate::fiber::close_value(obj)
+        }
+        _ => attribute_error(obj, method),
     }
 }
 

@@ -162,6 +162,12 @@ pub enum ExprKind {
     Await {
         value: Box<Expr>,
     },
+    /// `yield [value]` used as an expression. Its value is the value sent by
+    /// the resumer (`None` for plain iteration); a statement-level `yield`
+    /// keeps using [`StmtKind::Yield`].
+    Yield {
+        value: Option<Box<Expr>>,
+    },
 }
 
 /// Statement node with its source line.

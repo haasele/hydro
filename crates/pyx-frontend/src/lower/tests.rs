@@ -2568,20 +2568,59 @@ fn generator_return_value_is_allowed() {
 }
 
 #[test]
-fn yield_inside_an_expression_is_rejected() {
+fn yield_expressions_lower_and_mark_the_generator() {
     for source in [
-        "def g():\n    x = yield 1\n",
+        "def g():\n    x = yield 1\n    yield x\n",
+        "def g():\n    x = (yield 1) + 2\n    yield x\n",
         "def g():\n    print((yield 1))\n",
+        "def g():\n    return (yield 1)\n",
     ] {
-        let (_, _, diags) = lower_source(source, &parse(source));
-        assert!(
-            diags.iter().any(|d| {
-                d.message == "yield expressions are not supported; use `yield value` as a statement"
-                    && d.code == codes::UNSUPPORTED
-            }),
-            "{source}: {diags:?}"
-        );
+        let (hir, _, diags) = lower_source(source, &parse(source));
+        assert!(diags.is_empty(), "{source}: {diags:?}");
+        assert!(function(&hir, "g").is_generator, "{source}");
     }
+}
+
+#[test]
+fn assignment_yield_lowers_to_a_yield_expression() {
+    let source = "def g():\n    x = (yield 1) + 2\n    yield x\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let g = function(&hir, "g");
+
+    let HStmtKind::Assign { value, .. } = &g.body[0].kind else {
+        panic!("expected an assignment, got {:?}", g.body[0].kind);
+    };
+    let HExprKind::Bin { lhs, .. } = &value.kind else {
+        panic!("expected a bin op, got {:?}", value.kind);
+    };
+    let HExprKind::Yield { value: Some(inner) } = &lhs.kind else {
+        panic!("expected a yield expression, got {:?}", lhs.kind);
+    };
+    assert!(matches!(&inner.kind, HExprKind::Const(Const::Int(1))));
+
+    // The following `yield x` is still the statement form.
+    let HStmtKind::Yield { value: Some(value) } = &g.body[1].kind else {
+        panic!("expected a yield statement, got {:?}", g.body[1].kind);
+    };
+    assert!(matches!(&value.kind, HExprKind::Local(_)));
+}
+
+#[test]
+fn return_yield_expression_lowers_to_a_returned_yield() {
+    let source = "def g():\n    return (yield 1)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let g = function(&hir, "g");
+    assert!(g.is_generator);
+    let HStmtKind::Return(Some(value)) = &g.body[0].kind else {
+        panic!("expected a returned expression, got {:?}", g.body[0].kind);
+    };
+    assert!(matches!(
+        &value.kind,
+        HExprKind::Yield { value: Some(inner) }
+            if matches!(&inner.kind, HExprKind::Const(Const::Int(1)))
+    ));
 }
 
 #[test]

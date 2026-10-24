@@ -92,12 +92,16 @@ The first vertical slice of option B is in `pyx-runtime` and verified by
 
 - **Shim** (`crates/pyx-runtime/src/capi/`): `PyModule_Create2`,
   `PyModule_AddStringConstant`, `PyModule_AddObject`, `PyLong_FromLong`,
-  `PyLong_AsLong`, `Py_IncRef`/`Py_DecRef` (+ `_Py_*` aliases required by the
-  3.12+ limited API headers), `PyErr_Occurred`/`SetString`/`Clear`, and the
-  variadic `PyArg_ParseTuple` (C shim in `parse.c`, formats
-  `i/l/n/s/O/p/d`, `|`, `:`/`;`). Objects live in a process-lifetime arena;
-  `Py_DecRef` never frees in this slice (no use-after-free, but no reclamation
-  either).
+  `PyLong_AsLong`, `PyUnicode_FromString`/`AsUTF8`, `PyFloat_FromDouble`/
+  `AsDouble`, `PyBytes_FromStringAndSize`/`AsString`/`Size`,
+  `PyList_New`/`Size`/`GetItem`/`SetItem`/`Append`,
+  `PyTuple_New`/`Size`/`GetItem`/`SetItem`,
+  `PyDict_New`/`SetItem`/`SetItemString`/`GetItem`/`GetItemString`,
+  `Py_IncRef`/`Py_DecRef` (+ `_Py_*` aliases required by the 3.12+ limited
+  API headers), `PyErr_Occurred`/`SetString`/`Clear`, and the variadic
+  `PyArg_ParseTuple` (C shim in `parse.c`, formats `i/l/n/s/O/p/d`, `|`,
+  `:`/`;`). Objects live in a process-lifetime arena; `Py_DecRef` never frees
+  in this slice (no use-after-free, but no reclamation either).
 - **Loader** (`crates/pyx-runtime/src/modules/extension.rs`): discovery of
   sibling `<name>.so`, `<name>.abi3.so` or `<name>.*.so` at compile time in the
   frontend; lazy `dlopen(RTLD_NOW)` + `PyInit_<name>` resolution, cached by
@@ -110,9 +114,10 @@ The first vertical slice of option B is in `pyx-runtime` and verified by
   prints `5`, `abi3`, `42`, `abi3` under `pyx run` and an AOT binary; `ldd`
   shows no `libpython`; arity errors are `TypeError`, missing members are
   `AttributeError`, unsupported argument types are `TypeError`.
-- **Not in this slice:** capsules, buffer protocol, container constructors,
-  arbitrary object passing, wheel/venv discovery, package submodules,
-  multi-phase init, GIL/thread emulation, full 3.14 ABI (NumPy/pydantic-core).
+- **Not in this slice:** capsules, buffer protocol, arbitrary object passing
+  beyond bounded recursive list/tuple/dict copies, wheel/venv discovery,
+  package submodules, multi-phase init, GIL/thread emulation, full 3.14 ABI
+  (NumPy/pydantic-core).
 
 ### Scope of "full stdlib"
 

@@ -8,7 +8,7 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-24: **795 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
+As of 2026-10-24: **824 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 
@@ -96,7 +96,7 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   `pyx-cli/{cli,cli/commands}`; no behavior change, contracts unchanged.
 - Test count increased from 545 to 721 tests (incl. formatting, attributes,
   classes, closures, stdlib modules, socket, user modules, CLI/build cache);
-  with this slice to **795** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
+  with this slice to **824** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
   dict hash index, GC statistics, generator iteration).
 - AOT builds embed user modules; the cache key takes the
   entire reachable module tree structure into account.
@@ -112,6 +112,17 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   names without allocating and cache the resolved spec per thread; `math_loop`
   moved from 0.81x to parity/faster (AOT 22.50 ms vs. CPython 22.65 ms at
   n=200000; 50k micro harness 6.2 ms vs. 13.6 ms).
+- **Generator protocol complete:** `yield` expressions (`x = yield v`),
+  generator `send(v)`, `throw(exception_instance)` and `close()`
+  (GeneratorExit, `finally` execution, RuntimeError when a closing generator
+  yields); StopIteration on exhaustion; tests against CPython behaviour.
+- **C-API containers:** `PyUnicode_*`, `PyFloat_*`, `PyBytes_*`, `PyList_*`,
+  `PyTuple_*`, `PyDict_*` plus bounded recursive list/tuple/dict conversion
+  in both directions (copies, depth 64, cycle rejection).
+- **Stdlib compatibility baseline:** `scripts/stdlib_compat.py` +
+  `docs/COMPATIBILITY.md` + `benchmarks/compat/latest.json`; 23 of 297
+  CPython 3.14 modules importable on 2026-10-24 (import success only, not
+  test-suite success).
 - **First abi3 extension slice:** `pyx-runtime/src/capi/` implements a
   limited-API host surface (`PyModule_Create2`, `PyModule_AddStringConstant`/
   `AddObject`, `PyLong_From/AsLong`, variadic `PyArg_ParseTuple` via a small C
@@ -120,7 +131,7 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   and the loader (`modules/extension.rs`) caches modules by path. `pyx` and AOT
   binaries are linked with `--export-dynamic`; the fixture imports and calls
   under JIT and AOT with no `libpython` (`crates/pyx-cli/tests/extensions.rs`).
-  Open: capsules/buffer/container constructors, wheels/venvs, full ABI.
+  Open: capsules/buffer protocol, wheels/venvs, full ABI.
 - **P4-04 decision (2026-10-24): option B** — a PyX-native CPython C-API/ABI
   layer without embedded `libpython`; CPython 3.14 headers/toolchain are used
   at build time and the interpreter as a differential test oracle. Probes:

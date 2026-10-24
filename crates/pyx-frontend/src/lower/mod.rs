@@ -309,6 +309,11 @@ pub enum HExprKind {
     Await {
         value: Box<HExpr>,
     },
+    /// `yield value` in an expression position (`x = yield v`). Suspends the
+    /// generator and evaluates to the value sent on the next resume.
+    Yield {
+        value: Option<Box<HExpr>>,
+    },
 }
 
 /// Signature-relevant fields shared by `def` and `async def`.
@@ -2347,9 +2352,9 @@ impl<'a> Lowerer<'a> {
     /// Lower a `yield value` statement.
     ///
     /// The statement becomes [`HStmtKind::Yield`]; the generator fiber is
-    /// suspended by the runtime and resumed with `None` (plain resume).
-    /// `yield` in an expression position (assignment, argument, ...) is
-    /// diagnosed in [`Lowerer::expr`].
+    /// suspended by the runtime and resumed with `None` (plain resume). A
+    /// `yield` in an expression position (assignment, argument, ...) becomes
+    /// [`HExprKind::Yield`] instead, which evaluates to the sent value.
     fn lower_yield_stmt(
         &mut self,
         y: &ast::ExprYield,
@@ -3394,12 +3399,29 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Expr::Yield(y) => {
-                self.error_at_code(
-                    y.range,
-                    codes::UNSUPPORTED,
-                    "yield expressions are not supported; use `yield value` as a statement",
-                );
-                self.error_expr(e.range())
+                if fs.is_module {
+                    self.error_at_code(y.range, codes::CONTROL, "yield outside a function");
+                } else if fs.in_lambda {
+                    self.error_at_code(
+                        y.range,
+                        codes::UNSUPPORTED,
+                        "yield is not supported inside a lambda",
+                    );
+                } else if !fs.is_generator {
+                    self.error_at_code(
+                        y.range,
+                        codes::UNSUPPORTED,
+                        "yield is only supported inside a generator function body",
+                    );
+                }
+                HExpr {
+                    kind: HExprKind::Yield {
+                        value: y.value.as_ref().map(|value| Box::new(self.expr(value, fs))),
+                    },
+                    ty: self.infer.fresh(),
+                    line,
+                    col,
+                }
             }
             ast::Expr::YieldFrom(y) => {
                 self.error_at_code(
@@ -4423,31 +4445,130 @@ fn fold_un(op: pyx_ir::UnOp, operand: &HExpr) -> Option<Const> {
     }
 }
 
-/// True when a function body contains a `yield`/`yield value` statement.
+/// True when a function body contains a `yield`/`yield value`, either as a
+/// statement or in any expression position (`x = yield 1`).
 ///
 /// The scan stays inside compound statements but never descends into nested
-/// functions, lambdas or classes: a `yield` there belongs to that nested scope
-/// (and is diagnosed separately), not to the function being registered.
+/// functions, lambdas, classes or comprehensions: a `yield` there belongs to
+/// that nested scope (and is diagnosed separately), not to the function being
+/// registered.
 fn body_has_yield(stmts: &[ast::Stmt]) -> bool {
     stmts.iter().any(|stmt| match stmt {
-        ast::Stmt::Expr(s) => matches!(&*s.value, ast::Expr::Yield(_)),
-        ast::Stmt::If(s) => body_has_yield(&s.body) || body_has_yield(&s.orelse),
-        ast::Stmt::While(s) => body_has_yield(&s.body) || body_has_yield(&s.orelse),
-        ast::Stmt::For(s) => body_has_yield(&s.body) || body_has_yield(&s.orelse),
-        ast::Stmt::AsyncFor(s) => body_has_yield(&s.body) || body_has_yield(&s.orelse),
-        ast::Stmt::With(s) => body_has_yield(&s.body),
-        ast::Stmt::AsyncWith(s) => body_has_yield(&s.body),
-        ast::Stmt::Try(s) => {
-            body_has_yield(&s.body)
-                || s.handlers.iter().any(|handler| {
-                    let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    body_has_yield(&h.body)
-                })
+        ast::Stmt::Expr(s) => expr_has_yield(&s.value),
+        ast::Stmt::Assign(s) => expr_has_yield(&s.value) || s.targets.iter().any(expr_has_yield),
+        ast::Stmt::AugAssign(s) => expr_has_yield(&s.target) || expr_has_yield(&s.value),
+        ast::Stmt::AnnAssign(s) => s.value.as_deref().is_some_and(expr_has_yield),
+        ast::Stmt::Return(s) => s.value.as_deref().is_some_and(expr_has_yield),
+        ast::Stmt::Delete(s) => s.targets.iter().any(expr_has_yield),
+        ast::Stmt::Raise(s) => {
+            s.exc.as_deref().is_some_and(expr_has_yield)
+                || s.cause.as_deref().is_some_and(expr_has_yield)
+        }
+        ast::Stmt::Assert(s) => {
+            expr_has_yield(&s.test) || s.msg.as_deref().is_some_and(expr_has_yield)
+        }
+        ast::Stmt::If(s) => {
+            expr_has_yield(&s.test) || body_has_yield(&s.body) || body_has_yield(&s.orelse)
+        }
+        ast::Stmt::While(s) => {
+            expr_has_yield(&s.test) || body_has_yield(&s.body) || body_has_yield(&s.orelse)
+        }
+        ast::Stmt::For(s) => {
+            expr_has_yield(&s.iter)
+                || expr_has_yield(&s.target)
+                || body_has_yield(&s.body)
                 || body_has_yield(&s.orelse)
-                || body_has_yield(&s.finalbody)
+        }
+        ast::Stmt::AsyncFor(s) => {
+            expr_has_yield(&s.iter)
+                || expr_has_yield(&s.target)
+                || body_has_yield(&s.body)
+                || body_has_yield(&s.orelse)
+        }
+        ast::Stmt::With(s) => {
+            s.items
+                .iter()
+                .any(|item| expr_has_yield(&item.context_expr))
+                || body_has_yield(&s.body)
+        }
+        ast::Stmt::AsyncWith(s) => {
+            s.items
+                .iter()
+                .any(|item| expr_has_yield(&item.context_expr))
+                || body_has_yield(&s.body)
+        }
+        ast::Stmt::Try(s) => try_parts_have_yield(&s.body, &s.handlers, &s.orelse, &s.finalbody),
+        ast::Stmt::TryStar(s) => {
+            try_parts_have_yield(&s.body, &s.handlers, &s.orelse, &s.finalbody)
         }
         _ => false,
     })
+}
+
+fn try_parts_have_yield(
+    body: &[ast::Stmt],
+    handlers: &[ast::ExceptHandler],
+    orelse: &[ast::Stmt],
+    finalbody: &[ast::Stmt],
+) -> bool {
+    body_has_yield(body)
+        || handlers.iter().any(|handler| {
+            let ast::ExceptHandler::ExceptHandler(h) = handler;
+            body_has_yield(&h.body)
+        })
+        || body_has_yield(orelse)
+        || body_has_yield(finalbody)
+}
+
+/// True when `expr` contains a `yield` (or `yield from`) outside a nested
+/// scope. Comprehensions and lambdas are nested scopes and are not inspected.
+fn expr_has_yield(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Yield(_) | ast::Expr::YieldFrom(_) => true,
+        ast::Expr::BoolOp(b) => b.values.iter().any(expr_has_yield),
+        ast::Expr::NamedExpr(n) => expr_has_yield(&n.value),
+        ast::Expr::BinOp(b) => expr_has_yield(&b.left) || expr_has_yield(&b.right),
+        ast::Expr::UnaryOp(u) => expr_has_yield(&u.operand),
+        ast::Expr::IfExp(i) => {
+            expr_has_yield(&i.test) || expr_has_yield(&i.body) || expr_has_yield(&i.orelse)
+        }
+        ast::Expr::Dict(d) => {
+            d.keys.iter().flatten().any(expr_has_yield) || d.values.iter().any(expr_has_yield)
+        }
+        ast::Expr::Set(s) => s.elts.iter().any(expr_has_yield),
+        ast::Expr::Compare(c) => {
+            expr_has_yield(&c.left) || c.comparators.iter().any(expr_has_yield)
+        }
+        ast::Expr::Call(c) => {
+            expr_has_yield(&c.func)
+                || c.args.iter().any(expr_has_yield)
+                || c.keywords
+                    .iter()
+                    .any(|keyword| expr_has_yield(&keyword.value))
+        }
+        ast::Expr::FormattedValue(f) => {
+            expr_has_yield(&f.value) || f.format_spec.as_deref().is_some_and(expr_has_yield)
+        }
+        ast::Expr::JoinedStr(s) => s.values.iter().any(expr_has_yield),
+        ast::Expr::Await(a) => expr_has_yield(&a.value),
+        ast::Expr::Attribute(a) => expr_has_yield(&a.value),
+        ast::Expr::Subscript(s) => expr_has_yield(&s.value) || expr_has_yield(&s.slice),
+        ast::Expr::Starred(s) => expr_has_yield(&s.value),
+        ast::Expr::List(l) => l.elts.iter().any(expr_has_yield),
+        ast::Expr::Tuple(t) => t.elts.iter().any(expr_has_yield),
+        ast::Expr::Slice(s) => [s.lower.as_deref(), s.upper.as_deref(), s.step.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(expr_has_yield),
+        // Nested scopes and constant/name leaves.
+        ast::Expr::Lambda(_)
+        | ast::Expr::ListComp(_)
+        | ast::Expr::SetComp(_)
+        | ast::Expr::DictComp(_)
+        | ast::Expr::GeneratorExp(_)
+        | ast::Expr::Constant(_)
+        | ast::Expr::Name(_) => false,
+    }
 }
 
 /// Whether the module body itself loads `__name__`.
