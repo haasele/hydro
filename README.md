@@ -19,12 +19,12 @@ defined subset (see [Language Scope](#language-and-stdlib-scope) and
 | Phase 1 — Compiler, runtime ABI, JIT/AOT | done, verified by `scripts/verify.sh` |
 | Phase 2 — Runtime, GC, modules, classes, concurrency | largely done; real lazy generators/coroutines + event loop available; precise GC roots and `send`/`throw`/`close` open |
 | Phase 3 — Toolchain (`new`/`init`/`test`/`fmt`/`lint`/`clean`, build cache, uv passthrough) | core available; uv interpreter injection/packaging open |
-| Phase 4 — Python compatibility, C API/ABI | **unblocked; decision B** (PyX-native CPython ABI layer, no `libpython`); stdlib/ecosystem program opened (P4-09…P4-11), see [`docs/C_API.md`](docs/C_API.md) |
+| Phase 4 — Python compatibility, C API/ABI | **decision B; first abi3 slice works** (limited-API `.so` imports/calls under JIT+AOT, no `libpython`); full ABI/stdlib/ecosystem open (P4-04a…P4-11), see [`docs/C_API.md`](docs/C_API.md) |
 | Phase 5 — Performance | baseline + local regression gate available |
 | Phase 6 — Diagnostics/Developer Experience | largely done; completions/manpage and ICE regression test open |
 
 Current state of work (Cargo version 0.1.0, no public release yet):
-**771 tests** (unit, integration, E2E). JIT (`pyx run`) and AOT
+**795 tests** (unit, integration, E2E). JIT (`pyx run`) and AOT
 (`pyx build`) share the same runtime and IR. Details:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
 [`docs/TODO.md`](docs/TODO.md), source tree in
@@ -275,7 +275,7 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests and Benchmarks
 
 - `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), build,
-  `cargo test --workspace` (771 tests), E2E comparison JIT vs. AOT,
+  `cargo test --workspace` (795 tests), E2E comparison JIT vs. AOT,
   negative tests (diagnostics/tracebacks) and GC stress tests.
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Ubuntu, stable
   Rust, fmt/clippy/test/verify, no secrets).

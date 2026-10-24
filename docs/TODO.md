@@ -7,16 +7,19 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-24 (latest):** 771 tests, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-24 (latest):** 795 tests, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Open are `send`/`throw`/`close`, `yield` expressions,
 `yield from`, async generators/comprehensions, GC precision (P2-05/06/07) and
 the remaining performance work. **P4-04 is unblocked and decided:** CPython
 3.14 development files are available, and the project follows **option B** —
 a PyX-native CPython C-API/ABI layer without embedded `libpython`; evidence and
-gates in [`docs/C_API.md`](C_API.md). The new **P4-09/P4-10/P4-11** program
-tracks full stdlib parity (297 modules), ecosystem suites (NumPy, pandas,
-pydantic, FastAPI, Django, …) and their benchmarks.
+gates in [`docs/C_API.md`](C_API.md). The **first abi3 slice is implemented**:
+a limited-API extension (`.so`) next to the source can be imported and called
+under JIT and AOT without `libpython` (P4-04a/b partial). The
+**P4-09/P4-10/P4-11** program tracks full stdlib parity (297 modules),
+ecosystem suites (NumPy, pandas, pydantic, FastAPI, Django, …) and their
+benchmarks.
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -237,13 +240,14 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-24: 771 tests total — 353 runtime (180 unit, 173 ABI
+      As of 2026-10-24: 795 tests total — 365 runtime (192 unit, 173 ABI
       integration: among others 22 bytes, 19 IO, 14 stdlib modules, 14 stdlib utils,
       12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
-      5 closures, 3 STW GC, 1 JSON GC), 244 frontend, 17 codegen, 3 IR,
-      154 CLI/E2E (134 E2E, 9 fibers, 6 closures, 5 user modules).
-      Property tests open.
+      5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim
+      and extension-value/loader tests), 254 frontend, 18 codegen, 3 IR,
+      155 CLI/E2E (135 E2E incl. the abi3 extension fixture, 9 fibers,
+      6 closures, 5 user modules). Property tests open.
 
 **Acceptance P2:** memory does not grow unboundedly in loop benchmarks; GC tests
 cover cycles; container semantics tested against CPython behavior.
@@ -319,12 +323,25 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       ~0.8–1.0 ms. A stable-ABI probe module builds and imports with just four
       undefined CPython symbols, confirming the loader/shim model. Details in
       [`docs/C_API.md`](C_API.md).
-      - [ ] P4-04a `abi3` shim: module init (`PyModule_Create2`), `PyArg_Parse*`,
+      - [~] P4-04a `abi3` shim: module init (`PyModule_Create2`), `PyArg_Parse*`,
         scalar/container constructors, error API, `PyCapsule`, buffer basics.
-        Gate: the abi3 fixture imports/runs under PyX and `ldd pyx` has no
-        `libpython`.
-      - [ ] P4-04b Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags,
+        **Implemented:** module creation/attributes (`PyModule_AddStringConstant`/
+        `AddObject`), `PyLong_FromLong`/`AsLong`, variadic `PyArg_ParseTuple`
+        (`i/l/n/d/s/O/p`, `|`, `:`/`;`), refcount entry points, `PyErr_*`
+        basics, symbol anchor and C-variadic glue. Gate proven for the fixture:
+        `pyx_capi_probe.abi3.so` imports/calls under JIT and AOT, and neither
+        the CLI nor the AOT binary links `libpython`
+        (`crates/pyx-cli/tests/extensions.rs`). Open: `PyCapsule`, buffer
+        protocol, container constructors (`PyList_*`/`PyTuple_*`/`PyDict_*`),
+        broader format units and exception-type mapping.
+      - [~] P4-04b Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags,
         package submodules, multi-phase init, clear init-failure errors.
+        **Implemented:** compile-time discovery of `<name>.so`/`<name>.abi3.so`/
+        `<name>.*.so` next to the source, lazy per-path load/caching,
+        `PyInit_<name>` resolution, symbol resolution from the `pyx` process,
+        callable values via `pyx_getattr`/`pyx_call`, and clear
+        init/attribute/argument errors. Open: wheel ABI tags and venv
+        `site-packages` discovery, package submodules, multi-phase init.
       - [ ] P4-04c Full CPython 3.14 ABI: `PyTypeObject` layout, refcounted
         `PyObject` handles over PyX objects, vectorcall, full buffer protocol,
         `PyType_FromSpec`, GC traverse/clear integration.

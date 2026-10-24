@@ -380,9 +380,18 @@ impl fmt::Display for ExcKind {
     }
 }
 
-/// Call target: a program function or a builtin.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Call target: a program function, a builtin, or a member of a compiled
+/// CPython extension module.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Callee {
     Function(FunctionId),
     Builtin(Builtin),
+    /// `ext.member(args...)` where `ext` is a compiled extension module. The
+    /// frontend resolves `path` to the shared object at compile time; the
+    /// runtime loads it lazily and caches it. `member` is the Python-visible
+    /// attribute name.
+    Extension {
+        path: String,
+        member: String,
+    },
 }

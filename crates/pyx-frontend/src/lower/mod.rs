@@ -7,6 +7,8 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use pyx_ir::stdlib::{self, ConstantSpec, FunctionSpec, ModuleSpec};
 use pyx_ir::{BinOp, Builtin, Callee, Const, ExcKind, FunctionId, LocalId, Type};
@@ -280,6 +282,15 @@ pub enum HExprKind {
         module: String,
         name: String,
     },
+    /// `extension.member` / an imported extension member used as a value.
+    ///
+    /// `path` is the compiled shared object resolved by the frontend and
+    /// `member` is the Python attribute name. The value type is dynamic:
+    /// a limited-API extension exposes no static type information.
+    ExtensionAttr {
+        path: String,
+        member: String,
+    },
     /// `object.name` data attribute of a native value.
     GetAttr {
         object: Box<HExpr>,
@@ -390,6 +401,61 @@ fn module_member(module: &'static ModuleSpec, name: &str) -> Option<ModuleMember
         .map(ModuleMember::Constant)
 }
 
+/// Finds a compiled extension for a single-segment module name in `dir`.
+///
+/// Only `<name>.so`, `<name>.abi3.so` and other `<name>.*.so` siblings are
+/// considered. The result is an absolute path; dotted or path-like names are
+/// never extensions.
+fn find_extension_in(dir: &Path, name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.chars().any(|c| matches!(c, '.' | '/' | '\\')) {
+        return None;
+    }
+    let candidate = extension_candidate(dir, name)?;
+    Some(fs::canonicalize(&candidate).unwrap_or(candidate))
+}
+
+/// Finds a compiled extension for `name` visible to `source`: the source
+/// file's directory first, then each `PYX_EXTENSION_PATH` entry.
+pub(crate) fn find_extension_for_source(source: &Path, name: &str) -> Option<PathBuf> {
+    let parent = source.parent().unwrap_or_else(|| Path::new("."));
+    let mut dirs = vec![parent.to_path_buf()];
+    if let Some(paths) = std::env::var_os("PYX_EXTENSION_PATH") {
+        dirs.extend(std::env::split_paths(&paths));
+    }
+    dirs.iter().find_map(|dir| find_extension_in(dir, name))
+}
+
+/// Picks the shared object for `name` in `dir`.
+///
+/// `<name>.so` wins over `<name>.abi3.so`, which wins over any other
+/// `<name>.*.so` (first in sorted order).
+fn extension_candidate(dir: &Path, name: &str) -> Option<PathBuf> {
+    let direct = dir.join(format!("{name}.so"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let abi3 = dir.join(format!("{name}.abi3.so"));
+    if abi3.is_file() {
+        return Some(abi3);
+    }
+    let prefix = format!("{name}.");
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name.starts_with(&prefix) && file_name.ends_with(".so") {
+            let path = entry.path();
+            if path.is_file() {
+                matches.push(path);
+            }
+        }
+    }
+    matches.sort();
+    matches.into_iter().next()
+}
+
 const SUPPORTED_MODULES_HELP: &str = "supported modules: math, io, functools, operator, time, sys, json, os, os.path, _thread, threading, queue, multiprocessing, pickle";
 
 /// A user module (a sibling `.py` file) visible to this unit.
@@ -416,6 +482,11 @@ pub struct Lowerer<'a> {
     module_aliases: HashMap<String, &'static ModuleSpec>,
     /// `import X [as Y]` bindings of user modules: alias -> module name.
     user_module_aliases: HashMap<String, String>,
+    /// `import ext [as e]` bindings of compiled extensions: alias -> shared
+    /// object path (canonical absolute).
+    extension_aliases: HashMap<String, String>,
+    /// `from ext import member [as x]` bindings: name -> (path, member).
+    imported_extension_members: HashMap<String, (String, String)>,
     /// User modules visible to this unit, keyed by the name in the import.
     user_modules: HashMap<String, UserModule>,
     /// `from X import f [as g]` bindings of user functions: name -> function id.
@@ -468,6 +539,8 @@ impl<'a> Lowerer<'a> {
             module_local_names: HashSet::new(),
             module_aliases: HashMap::new(),
             user_module_aliases: HashMap::new(),
+            extension_aliases: HashMap::new(),
+            imported_extension_members: HashMap::new(),
             user_modules: HashMap::new(),
             imported_user_functions: HashMap::new(),
             fid_base: 0,
@@ -798,6 +871,10 @@ impl<'a> Lowerer<'a> {
                 .insert(binding.to_string(), imported.to_string());
             return;
         }
+        if let Some(path) = self.find_extension(imported) {
+            self.extension_aliases.insert(binding.to_string(), path);
+            return;
+        }
         self.error_unsupported_module(alias.range, imported);
     }
 
@@ -823,6 +900,10 @@ impl<'a> Lowerer<'a> {
             Some(module) => module,
             None => {
                 let Some(user) = self.user_modules.get(imported).cloned() else {
+                    if let Some(path) = self.find_extension(imported) {
+                        self.collect_extension_members(s, imported, &path);
+                        return;
+                    }
                     self.error_unsupported_module(s.range, imported);
                     return;
                 };
@@ -881,6 +962,90 @@ impl<'a> Lowerer<'a> {
                 }
                 None => self.error_unknown_member(alias.range, module, member),
             }
+        }
+    }
+
+    /// Finds a compiled extension for a single-segment module name.
+    ///
+    /// Dotted names are never extensions.
+    fn find_extension(&self, name: &str) -> Option<String> {
+        find_extension_for_source(Path::new(self.filename), name)
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+
+    /// Records `from ext import member [as x]` bindings. Star imports are
+    /// rejected: an extension's members are not knowable statically.
+    fn collect_extension_members(&mut self, s: &ast::StmtImportFrom, module: &str, path: &str) {
+        for alias in &s.names {
+            let member = alias.name.as_str();
+            if member == "*" {
+                self.error_at_code(
+                    alias.range,
+                    codes::UNSUPPORTED,
+                    format!("'from {module} import *' is not supported for extension modules"),
+                );
+                continue;
+            }
+            let binding = match &alias.asname {
+                Some(name) => name.as_str(),
+                None => member,
+            };
+            self.imported_extension_members
+                .insert(binding.to_string(), (path.to_string(), member.to_string()));
+        }
+    }
+
+    /// Resolves the base of an attribute chain to an imported extension.
+    ///
+    /// A local of the same name shadows the import, exactly like module
+    /// resolution.
+    fn resolve_extension_alias(&self, expr: &ast::Expr, fs: &FuncState) -> Option<String> {
+        let ast::Expr::Name(name) = expr else {
+            return None;
+        };
+        if fs.lookup(name.id.as_str()).is_some() {
+            return None;
+        }
+        self.extension_aliases.get(name.id.as_str()).cloned()
+    }
+
+    /// Lowers `ext.member(...)` / `member(...)` for a compiled extension.
+    ///
+    /// Keyword arguments are not supported by the extension ABI yet; the call
+    /// itself is checked at runtime by `pyx_extension_call`.
+    fn extension_call(
+        &mut self,
+        path: &str,
+        member: &str,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        if !call.keywords.is_empty() {
+            self.error_at_code(
+                call.range,
+                codes::CALL,
+                format!("keyword arguments are not supported for extension function '{member}'"),
+            );
+            return self.error_expr(call.range);
+        }
+        let mut args = Vec::with_capacity(call.args.len());
+        for arg in &call.args {
+            args.push(self.expr(arg, fs));
+        }
+        HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Extension {
+                    path: path.to_string(),
+                    member: member.to_string(),
+                },
+                args,
+            },
+            // Extensions expose no static types; the result is dynamic.
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
         }
     }
 
@@ -2809,8 +2974,19 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
+                } else if let Some((path, member)) = self.imported_extension_members.get(name) {
+                    HExpr {
+                        kind: HExprKind::ExtensionAttr {
+                            path: path.clone(),
+                            member: member.clone(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
                 } else if self.module_aliases.contains_key(name)
                     || self.user_module_aliases.contains_key(name)
+                    || self.extension_aliases.contains_key(name)
                 {
                     self.error_module_value(n.range, name);
                     self.error_expr(e.range())
@@ -3004,6 +3180,17 @@ impl<'a> Lowerer<'a> {
                             );
                             self.error_expr(e.range())
                         }
+                    };
+                }
+                if let Some(path) = self.resolve_extension_alias(&a.value, fs) {
+                    return HExpr {
+                        kind: HExprKind::ExtensionAttr {
+                            path,
+                            member: a.attr.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
                     };
                 }
                 let object = self.expr(&a.value, fs);
@@ -3609,6 +3796,9 @@ impl<'a> Lowerer<'a> {
                 if let Some(module) = self.resolve_user_module(&attr.value, fs) {
                     return self.user_module_call(&module, attr.attr.as_str(), call, fs, line, col);
                 }
+                if let Some(path) = self.resolve_extension_alias(&attr.value, fs) {
+                    return self.extension_call(&path, attr.attr.as_str(), call, fs, line, col);
+                }
                 let object = self.expr(&attr.value, fs);
                 let mut args = Vec::with_capacity(call.args.len());
                 for arg in &call.args {
@@ -3747,7 +3937,14 @@ impl<'a> Lowerer<'a> {
             return self.error_expr(call.range);
         }
 
-        if self.module_aliases.contains_key(name) || self.user_module_aliases.contains_key(name) {
+        if let Some((path, member)) = self.imported_extension_members.get(name).cloned() {
+            return self.extension_call(&path, &member, call, fs, line, col);
+        }
+
+        if self.module_aliases.contains_key(name)
+            || self.user_module_aliases.contains_key(name)
+            || self.extension_aliases.contains_key(name)
+        {
             self.error_module_value(name_expr.range, name);
             return self.error_expr(call.range);
         }

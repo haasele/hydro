@@ -104,6 +104,10 @@ pub(crate) const KIND_INSTANCE: u32 = 30;
 /// Stackful generator/coroutine fiber. Traces its arguments and result; the
 /// suspended stack is registered as a separate GC root.
 pub(crate) const KIND_FIBER: u32 = 31;
+/// Function obtained from a CPython limited-API extension module. Stores the
+/// shim's module handle and method id plus the Python attribute name; it has
+/// no PyX children.
+pub(crate) const KIND_EXT_FUNCTION: u32 = 32;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
 pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
@@ -1407,6 +1411,17 @@ impl InstanceState {
     }
 }
 
+/// Callable member of a loaded extension module.
+///
+/// `module` is the shim's process-wide module handle and `method` its cache
+/// index; both are opaque outside `crate::capi`. `name` is the Python-visible
+/// attribute, used for `repr` and error messages.
+pub(crate) struct ExtFunctionState {
+    pub(crate) module: u64,
+    pub(crate) method: u32,
+    pub(crate) name: String,
+}
+
 #[repr(C)]
 pub(crate) enum ObjData {
     Str(String),
@@ -1477,6 +1492,8 @@ pub(crate) enum ObjData {
     /// Stackful generator/coroutine. Traces its arguments and result; the
     /// suspended stack is registered as a separate conservative root.
     Fiber(Box<crate::fiber::FiberState>),
+    /// Callable member of a loaded extension module; holds no PyX values.
+    ExtFunction(ExtFunctionState),
 }
 
 // -------------------------------------------------------------------------
@@ -1973,6 +1990,23 @@ pub(crate) fn as_function(v: i64) -> Option<&'static FunctionObj> {
     }
     match &obj.data {
         ObjData::Function(function) => Some(function),
+        _ => None,
+    }
+}
+
+/// Returns the shim handle of an extension-module function value.
+pub(crate) fn as_ext_function(v: i64) -> Option<&'static ExtFunctionState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked above; the object is rooted for the duration of
+    // this call (the collector only frees unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_EXT_FUNCTION {
+        return None;
+    }
+    match &obj.data {
+        ObjData::ExtFunction(state) => Some(state),
         _ => None,
     }
 }
@@ -2647,6 +2681,18 @@ pub(crate) fn builtin_function_new(builtin: pyx_ir::Builtin) -> i64 {
     )
 }
 
+/// Allocates a callable member of a loaded extension module.
+pub(crate) fn ext_function_new(module: u64, method: u32, name: String) -> i64 {
+    alloc(
+        KIND_EXT_FUNCTION,
+        ObjData::ExtFunction(ExtFunctionState {
+            module,
+            method,
+            name,
+        }),
+    )
+}
+
 /// Creates a lazy generator object. No body code runs until the first
 /// `pyx_iter_next`.
 pub(crate) fn fiber_generator_new(entry: usize, name: String, args: Vec<i64>) -> Option<i64> {
@@ -2891,6 +2937,7 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             Some(ObjData::Socket(_)) => "socket",
             Some(ObjData::Class(_)) => "type",
             Some(ObjData::Instance(_)) => "instance",
+            Some(ObjData::ExtFunction(_)) => "builtin_function_or_method",
             Some(ObjData::Fiber(state)) => match state.kind {
                 crate::fiber::FiberKind::Generator => "generator",
                 crate::fiber::FiberKind::Coroutine => "coroutine",
@@ -2963,6 +3010,8 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjData::Class(_)) | Some(ObjData::Instance(_)) => true,
             // Generator and coroutine objects are always truthy.
             Some(ObjData::Fiber(_)) => true,
+            // Function objects are always truthy.
+            Some(ObjData::ExtFunction(_)) => true,
             None => true,
         };
     }
@@ -3088,6 +3137,9 @@ pub(crate) fn to_string(v: i64) -> String {
                 ObjData::Class(state) => format!("<class '{}'>", state.name),
                 ObjData::Instance(state) => instance_default_repr(state),
                 ObjData::Fiber(state) => fiber_repr(state),
+                ObjData::ExtFunction(state) => {
+                    format!("<built-in function {}>", state.name)
+                }
             };
         }
     }

@@ -417,14 +417,15 @@ fn run_linker(object: &Path, runtime: &Path, output: &Path) -> Result<(), LinkFa
     };
 
     let mut command = Command::new(&compiler);
-    command
-        .arg(object)
-        .arg(runtime)
-        .arg("-o")
-        .arg(output)
-        .arg("-lpthread")
-        .arg("-ldl")
-        .arg("-lm");
+    command.arg(object).arg(runtime).arg("-o").arg(output);
+    // Extensions loaded at run time resolve the CPython C API against the
+    // process image, so the executable must export its dynamic symbols. The
+    // abi3 extension itself needs no `libpython`: the interpreter symbols it
+    // uses are already present in this process.
+    if cfg!(target_os = "linux") {
+        command.arg("-Wl,--export-dynamic");
+    }
+    command.arg("-lpthread").arg("-ldl").arg("-lm");
 
     let result = command.output().map_err(|error| LinkFailure {
         compiler: compiler.clone(),

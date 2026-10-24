@@ -579,6 +579,9 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
     if value::as_class(function).is_some() {
         return instantiate(function, argc, argv);
     }
+    if let Some(state) = value::as_ext_function(function) {
+        return modules::extension::call_value(state, argc, argv);
+    }
     let Some(func) = value::as_function(function) else {
         return exc::raise_with_message(
             TYPE_ERROR,

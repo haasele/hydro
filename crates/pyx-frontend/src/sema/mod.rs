@@ -1371,6 +1371,7 @@ impl<'a> Checker<'a> {
                     self.force_any(expr.ty);
                 }
             }
+            HExprKind::ExtensionAttr { .. } => self.force_any(expr.ty),
             HExprKind::GetAttr { object, .. } => {
                 // Attributes are resolved at runtime by receiver kind, so the
                 // result is always dynamic. The receiver still gets checked.
@@ -1398,7 +1399,7 @@ impl<'a> Checker<'a> {
                 }
                 self.force_any(expr.ty);
             }
-            HExprKind::Call { callee, args } => self.check_call(expr, *callee, args, f),
+            HExprKind::Call { callee, args } => self.check_call(expr, callee, args, f),
             HExprKind::Await { value } => {
                 self.check_expr(value, f);
                 // The awaited result is only known at runtime.
@@ -1407,12 +1408,13 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_call(&mut self, expr: &HExpr, callee: Callee, args: &[HExpr], f: &HFunction) {
+    fn check_call(&mut self, expr: &HExpr, callee: &Callee, args: &[HExpr], f: &HFunction) {
         for arg in args {
             self.check_expr(arg, f);
         }
         match callee {
             Callee::Function(id) => {
+                let id = *id;
                 let (name, params, ret_ty, is_coroutine) = {
                     let function = &self.prog.functions[id as usize];
                     (
@@ -1475,6 +1477,7 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(expr.ty, result_ty);
             }
             Callee::Builtin(builtin) => {
+                let builtin = *builtin;
                 // `range(...)` has a concrete result type, and callers check
                 // it eagerly (e.g. subscripting rejects it before the deferred
                 // builtin checks run). Argument validation stays deferred.
@@ -1489,6 +1492,9 @@ impl<'a> Checker<'a> {
                     col: expr.col,
                 });
             }
+            // A limited-API extension exposes no static types: the call is
+            // checked at runtime and returns a dynamically typed value.
+            Callee::Extension { .. } => self.force_any(expr.ty),
         }
     }
 
@@ -2788,6 +2794,10 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
             module: module.clone(),
             name: name.clone(),
         },
+        HExprKind::ExtensionAttr { path, member } => ExprKind::ExtensionAttr {
+            path: path.clone(),
+            member: member.clone(),
+        },
         HExprKind::GetAttr { object, name } => ExprKind::GetAttr {
             object: Box::new(emit_expr(object, inf)),
             name: name.clone(),
@@ -2797,7 +2807,7 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
             args: args.iter().map(|a| emit_expr(a, inf)).collect(),
         },
         HExprKind::Call { callee, args } => ExprKind::Call {
-            callee: *callee,
+            callee: callee.clone(),
             args: args.iter().map(|a| emit_expr(a, inf)).collect(),
         },
         HExprKind::Await { value } => ExprKind::Await {

@@ -18,9 +18,9 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators/coroutines/event loop (no GIL)** | 771 tests, JIT+AOT |
+| P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators/coroutines/event loop (no GIL)** | 795 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
-| P4 Compatibility | **unblocked; decision B (PyX-native CPython ABI layer, no `libpython`); stdlib/ecosystem program opened (P4-09…P4-11)** | `docs/C_API.md`, `docs/TODO.md` |
+| P4 Compatibility | **decision B implemented at the first abi3 slice: limited-API extension imports/calls under JIT+AOT, no `libpython`; full ABI/stdlib/ecosystem open (P4-04a…P4-11)** | `docs/C_API.md`, `crates/pyx-cli/tests/extensions.rs` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
 | P6 Polish | **largely done; diagnostics/JSON/doctor/CLI** | codes, snippets, help, ICE |
 
@@ -30,11 +30,12 @@ with a cooperative event loop** (`async def`, `await`, `asyncio.run/sleep/gather
 the builtins `iter()`/`next()`, `pyx gc [--json]`, the dict hash index,
 typed int fastpaths, constant folding and the `bench_pyx.py` integration.
 Native module dispatch now uses a thread-local spec cache (math_loop at
-parity/faster; 2.2× end-to-end in the 50k micro harness). P4-04 is unblocked:
-CPython 3.14 development files are available, the decision is **option B**
-(PyX-native CPython ABI layer, no `libpython`; CPython only as build-time
-header source and differential test oracle), and the full stdlib/ecosystem
-program is tracked as P4-09…P4-11.
+parity/faster; 2.2× end-to-end in the 50k micro harness). P4-04 option B is
+implemented at the first abi3 slice: an extension `.so` next to the source can
+be imported and called under JIT and AOT without `libpython`; the shim covers
+the limited-API fixture surface and the loader discovers sibling `.so` files.
+Open: capsules/buffer/container constructors, wheels/venvs, the full CPython
+3.14 ABI for NumPy/pydantic-core, and the stdlib/ecosystem program P4-09…P4-11.
 Still open are `send`/`throw`/`close`, `yield` expressions, `yield from`, async
 generators/comprehensions, variable payload size classes as well as precise
 GC stack maps (P2-05/06/07), packaging/cross-platform/fuzzing and the
@@ -42,13 +43,13 @@ C-API implementation itself. Details: `docs/TODO.md`.
 
 **Verification (as of 2026-10-24):**
 
-- `cargo test --workspace`: **771 tests** — 244 frontend, 17 codegen, 3 IR,
-  180 runtime unit, 154 CLI/E2E (134 E2E, 9 fibers, 6 closures, 5 user modules),
-  173 further runtime integration tests (allocator, bytes, GC/concurrent GC,
-  IO, CSV, stdlib modules, classes, closures, socket, pathlib, pool, threads).
-  New suites cover lazy generators/coroutines (`pyx-cli/tests/fibers.rs`),
-  the dict hash index and the GC statistics (dict/GC/generator unit
-  tests).
+- `cargo test --workspace`: **795 tests** — 254 frontend, 18 codegen, 3 IR,
+  192 runtime unit, 155 CLI/E2E (135 E2E incl. the abi3 extension fixture,
+  9 fibers, 6 closures, 5 user modules), 173 further runtime integration tests
+  (allocator, bytes, GC/concurrent GC, IO, CSV, stdlib modules, classes,
+  closures, socket, pathlib, pool, threads). New suites cover the C-API shim,
+  extension value/loader conversion, extension import lowering and the
+  JIT+AOT abi3 fixture (`crates/pyx-cli/tests/extensions.rs`).
 - `scripts/verify.sh`: fmt, clippy (`-D warnings`), build, tests, E2E for JIT
   and AOT (incl. classes/closures/generators_async/formatting/socket_echo/
   stdlib_modules/pathlib), negative tests, GC threshold/stress — ALL GREEN.
@@ -62,7 +63,12 @@ C-API implementation itself. Details: `docs/TODO.md`.
   52 builtin/frozen); program in P4-09…P4-11.
 - Native module dispatch cache: `math_loop` AOT 22.50 ms vs. CPython 22.65 ms
   (n=200000; 0.94× JIT, 1.01× AOT), 50k micro harness AOT 6.2 ms vs. 13.6 ms.
-- No code/Cargo/CI changes in this docs slice.
+- **C-API slice verified:** the limited-API fixture `pyx_capi_probe` builds
+  against CPython 3.14 headers (no libpython link), is discovered next to the
+  source, and prints `5/abi3/42/abi3` under both `pyx run` and an AOT binary.
+  `ldd` shows no `libpython` for either binary. Error paths: arity →
+  `TypeError`, missing attribute → `AttributeError`, unsupported argument type
+  → `TypeError`.
 
 **Phase-2.0 slice (containers, 2026-10-23) — done & verified:**
 
@@ -507,7 +513,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 771 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 795 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -710,7 +716,7 @@ parallel benchmarks and race/stress tests.
   JIT 7.7 ms, AOT 6.8 ms; `strace -c` counts 94 syscalls total (previously
   200,097, two `rt_sigprocmask` per yield). Remaining weak spots: string
   concatenation (O(n²)) and float boxing — open performance work.
-- **Verified:** 771 tests, `cargo fmt`, `cargo clippy --workspace
+- **Verified:** 795 tests, `cargo fmt`, `cargo clippy --workspace
   --all-targets -- -D warnings` and `cargo test --workspace` green;
   micro baseline renewed (while_sum AOT 1.7 ms vs. CPython 23.5 ms).
 
@@ -751,9 +757,10 @@ context manager present.
 **Bytes:** literals/constructor/ops/core methods, but no
 `bytearray`/`memoryview`.
 **C-API/ecosystem:** decision B (PyX-native CPython ABI layer, no
-`libpython`); no extension runs under PyX yet. Full stdlib parity (297
-modules), ecosystem suites (NumPy, pandas, pydantic, FastAPI, Django, …) and
-their benchmarks are open (P4-09…P4-11).
+`libpython`). A limited-API fixture now imports/calls under JIT and AOT, but
+the shim covers only the first symbol subset (no capsules/buffer/container
+constructors, no wheels/venvs, no full 3.14 ABI); NumPy/pydantic-core and the
+whole stdlib/ecosystem program remain open (P4-04a…P4-11).
 **Platform:** Linux x86_64 verified; aarch64 paths untested; macOS/
 Windows/cross-compilation missing.
 
@@ -765,9 +772,9 @@ Windows/cross-compilation missing.
    module dispatch and generator resume are no longer bottlenecks.
 3. P2-05/P2-06/P2-07: size-class allocator, precise shadow-stack roots/
    stack maps, finer safepoint polling (P2-08 metrics are available).
-4. P4: implement the chosen option B in order — `abi3` shim (P4-04a),
-   extension loader (P4-04b), full CPython 3.14 ABI/NumPy/pydantic-core
-   (P4-04c/d), then P4-05/P4-06; run the stdlib program
+4. P4: extend the working abi3 slice (capsules, buffer, container
+   constructors, wheels/venv discovery), then the full CPython 3.14
+   ABI/NumPy/pydantic-core (P4-04c/d), P4-05/P4-06; run the stdlib program
    P4-01/P4-02/P4-03/P4-09 and the ecosystem suites/benchmarks P4-10/P4-11.
 5. P3-03/P3-08: uv interpreter injection (`.python-version`, venv marker,
    `sys.executable` equivalent), packaging/cross-compilation.
@@ -782,7 +789,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (771)
+cargo test                             # unit/integration tests (795)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1045,3 +1052,16 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   (174 pure Python, 71 extension, 52 builtin/frozen), P4-09 parity,
   P4-10 ecosystem suites (numpy/pandas/pydantic/fastapi/django/...),
   P4-11 ecosystem benchmarks. No code changes claimed as C-API support.
+
+- 2026-10-24 (continuation 38): first abi3 extension slice (P4-04a/b partial).
+  `pyx-runtime` gained a limited-API shim (`src/capi/`, variadic
+  `PyArg_ParseTuple` in C via the `cc` build script) and an extension loader
+  (`modules/extension.rs`, `KIND_EXT_FUNCTION`). The frontend resolves sibling
+  `.so`/`.abi3.so` files at compile time and lowers `ext.member(...)`/
+  `from ext import member` to `Callee::Extension`/`ExpressionAttr`; codegen
+  emits `pyx_extension_call`/`pyx_extension_get`. `pyx` and AOT binaries are
+  linked with `--export-dynamic`; `pyx_runtime_init` pins the shim symbols.
+  Verified `pyx_capi_probe.abi3.so` under JIT and AOT (`5/abi3/42/abi3`), no
+  `libpython` in `ldd`, arity/missing-attribute/type error paths, 795 tests,
+  clippy and `scripts/verify.sh` green. Open: capsules/buffer/containers,
+  wheels/venvs, full ABI/NumPy/pydantic-core.

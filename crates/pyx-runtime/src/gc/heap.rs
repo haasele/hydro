@@ -1880,7 +1880,8 @@ unsafe fn trace(addr: usize) {
                 | ObjData::Pattern(_)
                 | ObjData::Match(_)
                 | ObjData::Socket(_)
-                | ObjData::CsvReader(_) => {}
+                | ObjData::CsvReader(_)
+                | ObjData::ExtFunction(_) => {}
                 // The mutable containers were handled above; they cannot
                 // appear here.
                 ObjData::List(_)

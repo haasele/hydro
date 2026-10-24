@@ -1249,3 +1249,76 @@ fn asyncio_unsupported_members_are_rejected() {
         "module 'asyncio' has no attribute 'create_task'"
     );
 }
+
+#[test]
+fn extension_nodes_type_as_any() {
+    let prog = empty_prog();
+    let mut inf = Infer::new();
+    let mut ck = checker(&prog, &mut inf);
+    let function = HFunction {
+        name: "<module>".to_string(),
+        params: Vec::new(),
+        capture_count: 0,
+        ret_ty: Ty::Concrete(Type::None),
+        locals: Vec::new(),
+        body: Vec::new(),
+        is_async: false,
+        is_generator: false,
+        is_module: true,
+        line: 1,
+        col: 1,
+    };
+
+    let attr_ty = ck.inf.fresh();
+    let attr = HExpr {
+        kind: HExprKind::ExtensionAttr {
+            path: "/tmp/mod_ext.abi3.so".to_string(),
+            member: "tag".to_string(),
+        },
+        ty: attr_ty,
+        line: 1,
+        col: 1,
+    };
+    ck.check_expr(&attr, &function);
+    assert!(ck.diags.is_empty(), "{:?}", ck.diags);
+    assert_eq!(ck.inf.resolve(attr_ty), Ty::Concrete(Type::Any));
+
+    let arg_ty = ck.inf.fresh();
+    let arg = HExpr {
+        kind: HExprKind::Const(pyx_ir::Const::Int(2)),
+        ty: arg_ty,
+        line: 1,
+        col: 1,
+    };
+    let out_ty = ck.inf.fresh();
+    let call = HExpr {
+        kind: HExprKind::Call {
+            callee: Callee::Extension {
+                path: "/tmp/mod_ext.abi3.so".to_string(),
+                member: "add".to_string(),
+            },
+            args: vec![arg],
+        },
+        ty: out_ty,
+        line: 1,
+        col: 1,
+    };
+    ck.check_expr(&call, &function);
+    assert!(ck.diags.is_empty(), "{:?}", ck.diags);
+    assert_eq!(ck.inf.resolve(out_ty), Ty::Concrete(Type::Any));
+
+    let emitted = emit_expr(&call, &mut *ck.inf);
+    match emitted.kind {
+        ExprKind::Call {
+            callee: Callee::Extension { path, member },
+            args,
+        } => {
+            assert_eq!(
+                (path.as_str(), member.as_str()),
+                ("/tmp/mod_ext.abi3.so", "add")
+            );
+            assert_eq!(args.len(), 1);
+        }
+        other => panic!("expected an extension call, got {other:?}"),
+    }
+}

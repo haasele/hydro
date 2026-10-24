@@ -21,11 +21,12 @@ repository root.
 │   ├── bench_pyx.py           CPython/JIT/AOT comparison, 11 workloads
 │   ├── bench_all.py           orchestrator (e.g. `--only pyx`)
 │   └── pyx/                   micro-benchmarks, run_micro.py, results/, thresholds.json
+├── spikes/p4_04/              embedded-CPython/abi3 probes + measurements
 ├── examples/                  JIT/AOT examples + expected/*.txt
 ├── docs/
 │   ├── ARCHITECTURE.md        binding contract (IR/ABI, GC, modules)
 │   ├── TODO.md                single work list
-│   ├── C_API.md               P4-04 spike: options, environment probe, blockers
+│   ├── C_API.md               P4-04 decision, probes, milestones
 │   └── LAYOUT.md              this file
 └── crates/
     ├── pyx-ir/                typed IR, only Frontend↔Codegen contract
@@ -48,16 +49,19 @@ repository root.
     │       ├── lib.rs
     │       ├── backend/       JIT and AOT drivers
     │       └── lower/         IR → Cranelift (frames, cleanup stack, safepoints)
-    ├── pyx-runtime/           value model, ABI, GC, modules (rlib + staticlib)
+    ├── pyx-runtime/           value model, ABI, GC, modules, C-API shim
+    │   ├── build.rs           compiles the C-variadic PyArg_ParseTuple glue
     │   ├── src/
     │   │   ├── lib.rs
     │   │   ├── abi.rs         all `extern "C"` symbols (docs/ARCHITECTURE §3)
+    │   │   ├── capi/          CPython limited-API shim (PyModule/PyLong/parser)
+    │   │   │                  and `parse.c` variadic adapter
     │   │   ├── core/          value, ops, container, iter, builtins, methods,
     │   │   │                  exc, format, fiber (generators/coroutines;
     │   │   │                  x86_64 register switch, ucontext fallback)
     │   │   ├── gc/            heap, color/barriers, safepoints, sweep
     │   │   ├── modules/       math/io/json/os/... + argparse, collections,
-    │   │   │                  re, socket, asyncio
+    │   │   │                  re, socket, asyncio; extension.rs (abi3 loader)
     │   │   ├── concurrency/   threads/locks/queue/processes/pool/spawn
     │   │   ├── support/       PYX1 serialization (pickle/spawn/mp.Queue)
     │   │   └── csv.rs         CSV reader/writer
@@ -73,7 +77,8 @@ repository root.
         │       └── commands/  new, init, check, run, build, test, fmt,
         │                      lint, clean, doctor, help, uv, spawn, scan;
         │                      `gc.rs` = `pyx gc` (run + GC statistics)
-        └── tests/             E2E, fibers, closures, user modules
+        └── tests/             E2E, fibers, closures, user modules, extensions
+                               (+ fixtures/abi3_probe.c)
 ```
 
 ## Mapping rules

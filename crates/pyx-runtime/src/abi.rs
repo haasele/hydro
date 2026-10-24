@@ -438,6 +438,43 @@ pub extern "C" fn pyx_module_get(
 }
 
 // ---------------------------------------------------------------------
+// CPython limited-API extensions (P4-04)
+// ---------------------------------------------------------------------
+
+/// `extension.function(args...)` for a loaded `abi3` extension module.
+///
+/// `path` is the shared-object path resolved by the frontend and `member` the
+/// Python attribute name. Unknown modules/attributes raise `AttributeError`,
+/// call failures propagate as pending exceptions. Returns the result value or
+/// `None` with a pending exception.
+#[no_mangle]
+pub extern "C" fn pyx_extension_call(
+    path: *const c_uchar,
+    path_len: usize,
+    member: *const c_uchar,
+    member_len: usize,
+    argc: usize,
+    argv: *const i64,
+) -> i64 {
+    modules::extension::call(path, path_len, member, member_len, argc, argv)
+}
+
+/// `extension.member`: a scalar value or a callable function object.
+///
+/// Callables become `KIND_EXT_FUNCTION` values and remain callable through
+/// `pyx_call`. Unknown names raise `AttributeError`; returns `None` with a
+/// pending exception.
+#[no_mangle]
+pub extern "C" fn pyx_extension_get(
+    path: *const c_uchar,
+    path_len: usize,
+    member: *const c_uchar,
+    member_len: usize,
+) -> i64 {
+    modules::extension::get(path, path_len, member, member_len)
+}
+
+// ---------------------------------------------------------------------
 // Comprehension builders
 // ---------------------------------------------------------------------
 
@@ -773,6 +810,9 @@ pub extern "C" fn pyx_runtime_init() {
     crate::process::reset_start_method();
     exc::init();
     heap::reset();
+    // Anchor the CPython shim so its symbols are linked into AOT binaries and
+    // never dropped as unreachable (JIT links the same runtime object).
+    crate::capi::anchor();
 }
 
 // ---------------------------------------------------------------------

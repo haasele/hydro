@@ -105,6 +105,12 @@ pub enum ExprKind {
         module: String,
         name: String,
     },
+    /// `ext.name` value from a compiled CPython extension module identified
+    /// by the shared-object path resolved at compile time.
+    ExtensionAttr {
+        path: String,
+        member: String,
+    },
     /// `object.name` data attribute of a native value. Method attributes
     /// without a call raise `AttributeError` at runtime.
     GetAttr {

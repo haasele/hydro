@@ -8,8 +8,9 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-24: **771 tests**, `scripts/verify.sh` ALL GREEN. C API remains
-blocked (see `docs/C_API.md`).
+As of 2026-10-24: **795 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
+extension slice runs under JIT and AOT without `libpython`; the full C
+API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 
 ### Added
 
@@ -95,7 +96,7 @@ blocked (see `docs/C_API.md`).
   `pyx-cli/{cli,cli/commands}`; no behavior change, contracts unchanged.
 - Test count increased from 545 to 721 tests (incl. formatting, attributes,
   classes, closures, stdlib modules, socket, user modules, CLI/build cache);
-  with this slice to **771** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
+  with this slice to **795** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
   dict hash index, GC statistics, generator iteration).
 - AOT builds embed user modules; the cache key takes the
   entire reachable module tree structure into account.
@@ -111,6 +112,15 @@ blocked (see `docs/C_API.md`).
   names without allocating and cache the resolved spec per thread; `math_loop`
   moved from 0.81x to parity/faster (AOT 22.50 ms vs. CPython 22.65 ms at
   n=200000; 50k micro harness 6.2 ms vs. 13.6 ms).
+- **First abi3 extension slice:** `pyx-runtime/src/capi/` implements a
+  limited-API host surface (`PyModule_Create2`, `PyModule_AddStringConstant`/
+  `AddObject`, `PyLong_From/AsLong`, variadic `PyArg_ParseTuple` via a small C
+  file, refcount entry points, `PyErr_*` basics, symbol anchor). The frontend
+  discovers sibling `.so`/`.abi3.so` files, lowers extension calls/attributes,
+  and the loader (`modules/extension.rs`) caches modules by path. `pyx` and AOT
+  binaries are linked with `--export-dynamic`; the fixture imports and calls
+  under JIT and AOT with no `libpython` (`crates/pyx-cli/tests/extensions.rs`).
+  Open: capsules/buffer/container constructors, wheels/venvs, full ABI.
 - **P4-04 decision (2026-10-24): option B** — a PyX-native CPython C-API/ABI
   layer without embedded `libpython`; CPython 3.14 headers/toolchain are used
   at build time and the interpreter as a differential test oracle. Probes:
@@ -139,9 +149,11 @@ blocked (see `docs/C_API.md`).
 - `re` uses Rust `regex` syntax (no lookarounds/backreferences);
   `socket` only blocking TCP; `random` not CPython-reproducible.
 - GC conservative, without precise roots/stack maps or size-class allocator.
-- C API/C extensions: decision B (PyX-native ABI layer, no `libpython`) but
-  not implemented yet; no extension runs under PyX. The 297-module stdlib
-  parity, ecosystem suites and ecosystem benchmarks are open (P4-04a…P4-11).
+- C API/C extensions: decision B (PyX-native ABI layer, no `libpython`).
+  A limited-API fixture runs under JIT and AOT, but the shim covers only the
+  first symbol subset (no capsules/buffer/container constructors, no
+  wheels/venvs, no full 3.14 ABI). The 297-module stdlib parity, ecosystem
+  suites and benchmarks are open (P4-04a…P4-11).
 
 ## [0.1.0] - 2026-10-24
 

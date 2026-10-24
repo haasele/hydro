@@ -25,6 +25,7 @@
 //! - [`support`]: serialization helpers (pickle, JSON).
 //! - `csv`: CSV reader/writer support.
 
+mod capi;
 mod concurrency;
 mod core;
 mod csv;

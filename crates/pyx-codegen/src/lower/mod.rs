@@ -139,6 +139,8 @@ struct Runtime {
     slice: FuncId,
     module_call: FuncId,
     module_get: FuncId,
+    extension_call: FuncId,
+    extension_get: FuncId,
     getattr: FuncId,
     setattr: FuncId,
     class_new: FuncId,
@@ -281,6 +283,23 @@ impl Runtime {
             module_get: declare_runtime(
                 module,
                 "pyx_module_get",
+                &[ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
+            // Compiled CPython extension member: `path_len`, `member_len` and
+            // `argc` are `size_t`/`usize` in the ABI: pointer-width. `argv`
+            // points to `argc` tagged values and `path` is the shared-object
+            // file name (not `init_name`).
+            extension_call: declare_runtime(
+                module,
+                "pyx_extension_call",
+                &[ptr, ptr, ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
+            // Same `path`/`member` (ptr+len) pair as `extension_call`.
+            extension_get: declare_runtime(
+                module,
+                "pyx_extension_get",
                 &[ptr, ptr, ptr, ptr],
                 Some(i64t),
             )?,
@@ -2335,6 +2354,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 args,
             } => self.lower_module_call(module, function, args),
             ExprKind::ModuleAttr { module, name } => self.lower_module_attr(module, name),
+            ExprKind::ExtensionAttr { path, member } => self.lower_extension_attr(path, member),
             ExprKind::GetAttr { object, name } => self.lower_getattr(object, name),
             ExprKind::MethodCall {
                 object,
@@ -2345,7 +2365,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             ExprKind::FunctionRef(id) => self.lower_function_ref(*id),
             ExprKind::BuiltinRef(builtin) => self.lower_builtin_ref(*builtin),
             ExprKind::IndirectCall { callee, args } => self.lower_indirect_call(callee, args),
-            ExprKind::Call { callee, args } => self.lower_call(*callee, args),
+            ExprKind::Call { callee, args } => self.lower_call(callee, args),
             ExprKind::Await { value } => {
                 let value = self.lower_expr(value)?;
                 let id = self.runtime.await_value;
@@ -2666,6 +2686,64 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(result)
     }
 
+    /// Lower `ext.member(args...)` for a compiled CPython extension module to
+    /// `pyx_extension_call`.
+    ///
+    /// Python evaluates the arguments left to right before the call; each
+    /// value is stored into an 8-byte-aligned stack array immediately so that
+    /// a collection triggered by a later allocation cannot observe a stale
+    /// value. The shared-object path and the member name are materialized in
+    /// byte slots, like `pyx_module_call`. Keyword arguments never reach the
+    /// IR: the frontend rejects them for extension members.
+    fn lower_extension_call(
+        &mut self,
+        path: &str,
+        member: &str,
+        args: &'a [Expr],
+    ) -> Result<Value, CodegenError> {
+        let argv_slot = self.stack_array_slot(args.len(), "extension call arguments")?;
+        for (index, arg) in args.iter().enumerate() {
+            let value = self.lower_expr(arg)?;
+            self.builder
+                .ins()
+                .stack_store(value, argv_slot, (index * 8) as i32);
+        }
+
+        // Empty names still get a valid, non-null pointer to a one-byte slot.
+        let (path_slot, path_len) = make_bytes_slot(&mut self.builder, path.as_bytes())?;
+        let path_ptr = self.builder.ins().stack_addr(self.ptr_ty, path_slot, 0);
+        let path_len = self.builder.ins().iconst(self.ptr_ty, path_len as i64);
+        let (member_slot, member_len) = make_bytes_slot(&mut self.builder, member.as_bytes())?;
+        let member_ptr = self.builder.ins().stack_addr(self.ptr_ty, member_slot, 0);
+        let member_len = self.builder.ins().iconst(self.ptr_ty, member_len as i64);
+        let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
+        // `argc == 0` still passes a valid pointer (the slot has one element).
+        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        let id = self.runtime.extension_call;
+        let result = self.call_rt(
+            id,
+            &[path_ptr, path_len, member_ptr, member_len, argc, argv],
+        )?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
+    /// Lower `ext.name` for a compiled CPython extension module to
+    /// `pyx_extension_get` (constant or callable value).
+    fn lower_extension_attr(&mut self, path: &str, member: &str) -> Result<Value, CodegenError> {
+        // Empty names still get a valid, non-null pointer to a one-byte slot.
+        let (path_slot, path_len) = make_bytes_slot(&mut self.builder, path.as_bytes())?;
+        let path_ptr = self.builder.ins().stack_addr(self.ptr_ty, path_slot, 0);
+        let path_len = self.builder.ins().iconst(self.ptr_ty, path_len as i64);
+        let (member_slot, member_len) = make_bytes_slot(&mut self.builder, member.as_bytes())?;
+        let member_ptr = self.builder.ins().stack_addr(self.ptr_ty, member_slot, 0);
+        let member_len = self.builder.ins().iconst(self.ptr_ty, member_len as i64);
+        let id = self.runtime.extension_get;
+        let result = self.call_rt(id, &[path_ptr, path_len, member_ptr, member_len])?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
     /// Lower `object.name` to `pyx_getattr`: the receiver is evaluated first,
     /// then the runtime resolves the data attribute by receiver kind.
     fn lower_getattr(&mut self, object: &'a Expr, name: &str) -> Result<Value, CodegenError> {
@@ -2832,9 +2910,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         }
     }
 
-    fn lower_call(&mut self, callee: Callee, args: &'a [Expr]) -> Result<Value, CodegenError> {
+    fn lower_call(&mut self, callee: &Callee, args: &'a [Expr]) -> Result<Value, CodegenError> {
         match callee {
-            Callee::Function(id) => self.lower_direct_call(id, args),
+            Callee::Function(id) => self.lower_direct_call(*id, args),
             // F-string fields carry their static spec and conversion flag as
             // trailing constant arguments; they become a direct runtime call
             // instead of a first-class builtin invocation.
@@ -2844,8 +2922,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 for arg in args {
                     values.push(self.lower_expr(arg)?);
                 }
-                self.lower_builtin(builtin, &values)
+                self.lower_builtin(*builtin, &values)
             }
+            // Keyword arguments are impossible here: the frontend rejects
+            // them for extension members.
+            Callee::Extension { path, member } => self.lower_extension_call(path, member, args),
         }
     }
 
@@ -4112,31 +4193,111 @@ mod tests {
         assert!(!object.is_empty());
     }
 
-    /// Number of relocation entries in an object file that target the
-    /// `pyx_binop` import, i.e. the number of emitted calls to the dynamic
-    /// operator.
-    fn runtime_binop_call_sites(object: &[u8]) -> usize {
+    /// Number of relocation entries in an object file that target the import
+    /// named `symbol`, i.e. the number of emitted calls to it.
+    fn runtime_call_sites(object: &[u8], symbol: &str) -> usize {
         use cranelift_object::object::read::{Object, ObjectSection, ObjectSymbol};
         use cranelift_object::object::RelocationTarget;
 
         let file = cranelift_object::object::read::File::parse(object)
             .expect("the AOT backend must emit a readable object file");
-        let Some(binop) = file
+        let Some(target) = file
             .symbols()
-            .find(|symbol| symbol.name().ok() == Some("pyx_binop"))
-            .map(|symbol| symbol.index())
+            .find(|candidate| candidate.name().ok() == Some(symbol))
+            .map(|candidate| candidate.index())
         else {
             return 0;
         };
         let mut sites = 0;
         for section in file.sections() {
             for (_, relocation) in section.relocations() {
-                if relocation.target() == RelocationTarget::Symbol(binop) {
+                if relocation.target() == RelocationTarget::Symbol(target) {
                     sites += 1;
                 }
             }
         }
         sites
+    }
+
+    /// Number of relocation entries in an object file that target the
+    /// `pyx_binop` import, i.e. the number of emitted calls to the dynamic
+    /// operator.
+    fn runtime_binop_call_sites(object: &[u8]) -> usize {
+        runtime_call_sites(object, "pyx_binop")
+    }
+
+    #[test]
+    fn extension_call_and_attr_lower_to_the_runtime_imports() {
+        let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let path = "pyx_capi_probe.abi3.so".to_string();
+        let call = Expr::new(
+            ExprKind::Call {
+                callee: Callee::Extension {
+                    path: path.clone(),
+                    member: "add".to_string(),
+                },
+                args: vec![int(2), int(3)],
+            },
+            Type::Int,
+            1,
+        );
+        let attr = Expr::new(
+            ExprKind::ExtensionAttr {
+                path: path.clone(),
+                member: "tag".to_string(),
+            },
+            Type::Any,
+            2,
+        );
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![
+                    LocalInfo {
+                        name: "x".to_string(),
+                        ty: Type::Int,
+                    },
+                    LocalInfo {
+                        name: "tag".to_string(),
+                        ty: Type::Any,
+                    },
+                ],
+                body: vec![
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 0,
+                            value: call,
+                        },
+                        1,
+                    ),
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 1,
+                            value: attr,
+                        },
+                        2,
+                    ),
+                ],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+        };
+        let object = crate::compile_object(&program)
+            .expect("extension call and attribute must lower to object code");
+        assert!(!object.is_empty());
+        assert!(
+            runtime_call_sites(&object, "pyx_extension_call") > 0,
+            "the extension call must reference pyx_extension_call"
+        );
+        assert!(
+            runtime_call_sites(&object, "pyx_extension_get") > 0,
+            "the extension attribute must reference pyx_extension_get"
+        );
     }
 
     #[test]

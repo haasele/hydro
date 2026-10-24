@@ -1,6 +1,10 @@
 # PyX — C API/ABI Strategy (P4-04)
 
-Status: **decided 2026-10-24** — Option B (PyX-native CPython C-API/ABI layer).
+Status: **decided 2026-10-24** — Option B (PyX-native CPython C-API/ABI
+layer). The **first abi3 slice is implemented and verified**: a limited-API
+extension (`.so`) next to a PyX source file imports and calls under JIT and
+AOT with no `libpython` (see §3.1). The full surface, wheels/venvs and the
+ecosystem program remain open.
 
 This document records the decision basis for P4-04 and the follow-up items
 (P4-05/P4-06/P4-09/P4-10). It contains measured probe results and an explicit
@@ -81,6 +85,35 @@ undefined CPython symbols that the host runtime resolves. PyX will export
 those symbols from its shim (option B) instead of resolving them from
 `libpython` (option A).
 
+### 3.1 Implemented slice (2026-10-24)
+
+The first vertical slice of option B is in `pyx-runtime` and verified by
+`crates/pyx-cli/tests/extensions.rs`:
+
+- **Shim** (`crates/pyx-runtime/src/capi/`): `PyModule_Create2`,
+  `PyModule_AddStringConstant`, `PyModule_AddObject`, `PyLong_FromLong`,
+  `PyLong_AsLong`, `Py_IncRef`/`Py_DecRef` (+ `_Py_*` aliases required by the
+  3.12+ limited API headers), `PyErr_Occurred`/`SetString`/`Clear`, and the
+  variadic `PyArg_ParseTuple` (C shim in `parse.c`, formats
+  `i/l/n/s/O/p/d`, `|`, `:`/`;`). Objects live in a process-lifetime arena;
+  `Py_DecRef` never frees in this slice (no use-after-free, but no reclamation
+  either).
+- **Loader** (`crates/pyx-runtime/src/modules/extension.rs`): discovery of
+  sibling `<name>.so`, `<name>.abi3.so` or `<name>.*.so` at compile time in the
+  frontend; lazy `dlopen(RTLD_NOW)` + `PyInit_<name>` resolution, cached by
+  path; callable values participate in `pyx_call`; errors map to
+  `AttributeError`/`TypeError`/`RuntimeError`.
+- **Linking:** `pyx` and AOT binaries are linked with `--export-dynamic` and
+  pin the shim symbols via `capi::anchor()` in `pyx_runtime_init`; extension
+  symbols resolve from the process, not from `libpython`.
+- **Verified fixture:** `pyx_capi_probe.abi3.so` (`Py_LIMITED_API 0x030C0000`)
+  prints `5`, `abi3`, `42`, `abi3` under `pyx run` and an AOT binary; `ldd`
+  shows no `libpython`; arity errors are `TypeError`, missing members are
+  `AttributeError`, unsupported argument types are `TypeError`.
+- **Not in this slice:** capsules, buffer protocol, container constructors,
+  arbitrary object passing, wheel/venv discovery, package submodules,
+  multi-phase init, GIL/thread emulation, full 3.14 ABI (NumPy/pydantic-core).
+
 ### Scope of "full stdlib"
 
 CPython 3.14 `sys.stdlib_module_names` contains **297** modules:
@@ -117,8 +150,8 @@ machine-readable compatibility report, not by prose claims.
 
 | Milestone | Content | Acceptance |
 |---|---|---|
-| P4-04a | `abi3` shim: module init, `PyArg_Parse*`, scalar/container constructors, error API, capsuled types, buffer basics | `pyx_capi_probe.abi3.so` imports and runs under PyX with **no** `libpython` in `ldd` (current probe: 4 undefined symbols) |
-| P4-04b | Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags, package submodules, multi-phase init | loader fixture + error-path tests; no crash on init failure |
+| P4-04a | `abi3` shim: module init, `PyArg_Parse*`, scalar/container constructors, error API, capsuled types, buffer basics | **Partial:** fixture gate green (imports/runs under PyX, no `libpython`); capsules/buffer/containers/list-tuple-dict constructors still open |
+| P4-04b | Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags, package submodules, multi-phase init | **Partial:** sibling-`.so` discovery, `PyInit_*`, caching and error paths green; wheels/venvs, package submodules, multi-phase init open |
 | P4-04c | Full 3.14 ABI: `PyTypeObject`, refcounts/GC integration, vectorcall, full buffer protocol | NumPy 2.5 smoke (array create/ops/dtype) and `pydantic-core` model validation |
 | P4-04d | GIL emulation and callback safety | threaded extension callbacks + GC stress; no deadlock/data race |
 | P4-05 | `ctypes`/`cffi` boundaries | `ctypes.CDLL` on libc, `cffi` ABI-mode smoke |
@@ -141,7 +174,8 @@ machine-readable compatibility report, not by prose claims.
 
 ## 7. What this document does not claim
 
-- No CPython C extension runs under PyX yet.
+- No general CPython C extension support: only the fixture-level `abi3` subset
+  in §3.1 runs today.
 - No NumPy/pandas/pydantic/FastAPI compatibility is achieved or promised by
   this decision; the gates in §5 define when a claim is allowed.
 - No benchmark number is extrapolated beyond the measured probe outputs in §3.

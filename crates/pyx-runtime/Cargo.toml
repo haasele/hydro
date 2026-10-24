@@ -12,3 +12,6 @@ crate-type = ["rlib", "staticlib"]
 libc = "0.2"
 regex = "1"
 pyx-ir.workspace = true
+
+[build-dependencies]
+cc = "1"

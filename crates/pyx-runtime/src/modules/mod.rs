@@ -22,6 +22,7 @@ use pyx_ir::stdlib;
 pub(crate) mod argparse;
 pub(crate) mod asyncio;
 pub(crate) mod collections;
+pub(crate) mod extension;
 pub(crate) mod re;
 pub(crate) mod socket;
 

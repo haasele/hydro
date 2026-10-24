@@ -69,6 +69,8 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         pyx_slice,
         pyx_module_call,
         pyx_module_get,
+        pyx_extension_call,
+        pyx_extension_get,
         pyx_getattr,
         pyx_setattr,
         pyx_class_new,

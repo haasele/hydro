@@ -318,6 +318,12 @@ impl ModuleLoader {
         }
 
         let parent = display.parent().unwrap_or_else(|| Path::new("."));
+        // A compiled extension next to the importing file is resolved by the
+        // lowerer: it binds aliases/members to `Callee::Extension` and needs
+        // no linked module unit.
+        if lower::find_extension_for_source(display, name).is_some() {
+            return;
+        }
         let expected = parent.join(format!("{name}.py"));
         if !expected.is_file() {
             self.push_span(

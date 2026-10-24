@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
-implemented (771 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (795 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -770,6 +770,17 @@ CPython 3.14 ABI required by NumPy 2.5 and `pydantic-core` (`PyTypeObject`
 layout, vectorcall, full buffer protocol, GC integration, package/wheel
 loading).
 
+**Implemented (2026-10-24, first abi3 slice):** the shim in
+`pyx-runtime/src/capi/` exports the limited-API module/scalar/error surface
+with a C-variadic `PyArg_ParseTuple`; the frontend resolves sibling
+`.so`/`.abi3.so` files at compile time and lowers `ext.member(...)`/
+`from ext import member` to `Callee::Extension`/`ExprKind::ExtensionAttr`;
+`pyx_extension_call`/`pyx_extension_get` load and cache modules lazily
+(`modules/extension.rs`). `pyx` and AOT binaries export the shim symbols with
+`--export-dynamic`; the fixture imports and calls under both with no
+`libpython`. Capsules, the buffer protocol, container constructors,
+wheels/venvs and the full 3.14 ABI are still open.
+
 Evidence: embedded CPython costs ~6.7 ms `Py_Initialize` + ~7.5 ms
 `Py_Finalize` and ~41.6 ms for `import numpy`, versus ~0.8–1.0 ms for a PyX
 AOT process; a stable-ABI probe imports with four undefined CPython symbols
@@ -783,7 +794,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-24: **771 tests** (244 frontend, 353 runtime incl. 173
+- As of 2026-10-24: **795 tests** (254 frontend, 365 runtime incl. 173
   ABI integration tests, 17 codegen, 3 IR, 154 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `argparse`/`defaultdict`/`re`, socket echo,
@@ -834,5 +845,6 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   switch is measured here, the `ucontext` fallback for aarch64/other targets
   exists but is not verified on this machine. macOS/Windows and
   cross-compilation are missing. The C API/ABI path is decided (P4-04 option B)
-  but no extension runs yet; implementation and the 297-module stdlib program
-  are open (P4-04a…P4-11).
+  and the first abi3 slice runs a limited-API fixture under JIT/AOT without
+  `libpython`; capsules/buffer/containers, wheels/venvs, the full 3.14 ABI and
+  the 297-module stdlib program are open (P4-04a…P4-11).

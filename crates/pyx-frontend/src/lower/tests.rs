@@ -1,5 +1,8 @@
 use super::*;
 use rustpython_parser::Mode;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn parse(source: &str) -> ast::ModModule {
     match rustpython_parser::parse(source, Mode::Module, "test.py") {
@@ -1638,7 +1641,7 @@ fn assigned_call(source: &str) -> (LHir, Infer, Vec<Diagnostic>, Callee, usize) 
         let HExprKind::Call { callee, args } = &value.kind else {
             panic!("expected a call, got {:?}", value.kind);
         };
-        (*callee, args.len())
+        (callee.clone(), args.len())
     };
     (hir, infer, diags, callee, arity)
 }
@@ -3064,4 +3067,292 @@ fn literal_conditions_drop_dead_statements() {
         body[2].kind
     );
     assert!(matches!(&body[3].kind, HStmtKind::Assign { .. }));
+}
+
+// ----------------------------------------------------------------------
+// Compiled extensions
+// ----------------------------------------------------------------------
+
+static EXT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Temporary directory holding a source file and compiled-extension stubs.
+struct ExtensionDir {
+    path: PathBuf,
+}
+
+impl ExtensionDir {
+    fn new(test_name: &str) -> ExtensionDir {
+        let unique = EXT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "pyx-frontend-ext-{}-{test_name}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create temp dir");
+        ExtensionDir { path }
+    }
+
+    fn add_extension(&self, name: &str) -> PathBuf {
+        let path = self.path.join(name);
+        fs::write(&path, b"").expect("write extension stub");
+        path
+    }
+}
+
+impl Drop for ExtensionDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn lower_source_in(dir: &Path, source: &str) -> (LHir, Infer, Vec<Diagnostic>) {
+    let filename = dir.join("test.py");
+    let filename = filename.to_string_lossy();
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, &filename, &mut infer);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    (hir, infer, diags)
+}
+
+fn function_body<'a>(hir: &'a LHir, name: &str) -> &'a [HStmt] {
+    &hir.functions
+        .iter()
+        .find(|function| function.name == name)
+        .unwrap_or_else(|| panic!("no function '{name}'"))
+        .body
+}
+
+fn extension_callee(expr: &HExpr) -> (&str, &str) {
+    match &expr.kind {
+        HExprKind::Call {
+            callee: Callee::Extension { path, member },
+            ..
+        } => (path.as_str(), member.as_str()),
+        other => panic!("expected an extension call, got {other:?}"),
+    }
+}
+
+#[test]
+fn extension_import_lowers_calls_and_attributes() {
+    let dir = ExtensionDir::new("import");
+    let so = dir.add_extension("mod_ext.abi3.so");
+    let expected = fs::canonicalize(&so).expect("canonical extension path");
+    let expected_path = expected.to_string_lossy().into_owned();
+
+    let source = r#"import mod_ext as ext
+a = ext.add(2, 3)
+def f(x):
+    return ext.add(x, 1)
+b = ext.tag
+c = ext.add
+"#;
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let (path, member) = extension_callee(assigned(&hir, "a"));
+    assert_eq!((path, member), (expected_path.as_str(), "add"));
+    assert_eq!(assigned(&hir, "a").ty, Ty::Concrete(Type::Any));
+
+    let body = function_body(&hir, "f");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert_eq!(extension_callee(value), (expected_path.as_str(), "add"));
+
+    match &assigned(&hir, "b").kind {
+        HExprKind::ExtensionAttr { path, member } => {
+            assert_eq!(
+                (path.as_str(), member.as_str()),
+                (expected_path.as_str(), "tag")
+            );
+        }
+        other => panic!("expected an extension attribute, got {other:?}"),
+    }
+    match &assigned(&hir, "c").kind {
+        HExprKind::ExtensionAttr { path, member } => {
+            assert_eq!(
+                (path.as_str(), member.as_str()),
+                (expected_path.as_str(), "add")
+            );
+        }
+        other => panic!("expected an extension attribute, got {other:?}"),
+    }
+    assert_eq!(assigned(&hir, "b").ty, Ty::Concrete(Type::Any));
+}
+
+#[test]
+fn from_extension_import_lowers_members() {
+    let dir = ExtensionDir::new("from-import");
+    let so = dir.add_extension("mod_ext.abi3.so");
+    let expected = fs::canonicalize(&so).expect("canonical extension path");
+    let expected_path = expected.to_string_lossy().into_owned();
+
+    let source = r#"from mod_ext import add, tag as label
+a = add(1, 2)
+def f():
+    return add(3, 4)
+b = label
+c = add
+"#;
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    assert_eq!(
+        extension_callee(assigned(&hir, "a")),
+        (expected_path.as_str(), "add")
+    );
+    let body = function_body(&hir, "f");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert_eq!(extension_callee(value), (expected_path.as_str(), "add"));
+
+    for (binding, member) in [("b", "tag"), ("c", "add")] {
+        match &assigned(&hir, binding).kind {
+            HExprKind::ExtensionAttr {
+                path,
+                member: got_member,
+            } => {
+                assert_eq!(
+                    (path.as_str(), got_member.as_str()),
+                    (expected_path.as_str(), member)
+                );
+            }
+            other => panic!("expected an extension attribute, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn locals_shadow_extension_aliases() {
+    let dir = ExtensionDir::new("shadow");
+    dir.add_extension("mod_ext.abi3.so");
+
+    // A module-level local shadows the alias in the module body; a parameter
+    // shadows it inside a function.
+    let source = r#"import mod_ext as ext
+ext = 1
+a = ext.add(2, 3)
+def f(ext):
+    return ext.add(4)
+"#;
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    assert!(
+        matches!(&assigned(&hir, "a").kind, HExprKind::MethodCall { .. }),
+        "{:?}",
+        assigned(&hir, "a").kind
+    );
+    let body = function_body(&hir, "f");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::MethodCall { .. }),
+        "{:?}",
+        value.kind
+    );
+}
+
+#[test]
+fn extension_type_suffixes_are_discovered() {
+    // `<name>.so` is preferred over other suffixes; a suffixed wheel-style
+    // name (`<name>.*.so`) is used when no plain `.so` exists.
+    let dir = ExtensionDir::new("suffixes");
+    let suffixed = dir.add_extension("mod_ext.cpython-312-x86_64-linux-gnu.so");
+
+    let source = "import mod_ext\nx = mod_ext.add(1, 2)\n";
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let expected = fs::canonicalize(&suffixed).expect("canonical extension path");
+    let expected_path = expected.to_string_lossy().into_owned();
+    match &assigned(&hir, "x").kind {
+        HExprKind::Call {
+            callee: Callee::Extension { path, member },
+            ..
+        } => {
+            assert_eq!(
+                (path.as_str(), member.as_str()),
+                (expected_path.as_str(), "add")
+            );
+        }
+        other => panic!("expected an extension call, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_extension_module_still_diagnoses() {
+    let dir = ExtensionDir::new("missing");
+    let source = "import missing_ext\n";
+    let (_, _, diags) = lower_source_in(&dir.path, source);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert_eq!(
+        diags[0].message,
+        "module 'missing_ext' is not supported yet"
+    );
+}
+
+#[test]
+fn extension_alias_used_as_value_is_rejected() {
+    let dir = ExtensionDir::new("alias-value");
+    dir.add_extension("mod_ext.abi3.so");
+    let source = "import mod_ext as ext\nx = ext\n";
+    let (_, _, diags) = lower_source_in(&dir.path, source);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert!(diags[0].message.contains("'ext' is a module"), "{diags:?}");
+}
+
+#[test]
+fn extension_keyword_arguments_are_rejected() {
+    let dir = ExtensionDir::new("keywords");
+    dir.add_extension("mod_ext.abi3.so");
+    let source = r#"import mod_ext as ext
+def f():
+    return ext.add(x=1)
+a = ext.add(y=2)
+"#;
+    let (_, _, diags) = lower_source_in(&dir.path, source);
+    assert_eq!(diags.len(), 2, "{diags:?}");
+    for diag in &diags {
+        assert_eq!(diag.code, codes::CALL);
+        assert!(
+            diag.message
+                .contains("keyword arguments are not supported for extension function 'add'"),
+            "{diag:?}"
+        );
+    }
+}
+
+#[test]
+fn extension_star_import_is_rejected() {
+    let dir = ExtensionDir::new("star");
+    dir.add_extension("mod_ext.abi3.so");
+    let source = "from mod_ext import *\n";
+    let (_, _, diags) = lower_source_in(&dir.path, source);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert_eq!(
+        diags[0].message,
+        "'from mod_ext import *' is not supported for extension modules"
+    );
+}
+
+#[test]
+fn dotted_extension_names_remain_diagnostics() {
+    let dir = ExtensionDir::new("dotted");
+    dir.add_extension("mod_ext.abi3.so");
+    let source = "import mod_ext.sub\n";
+    let (_, _, diags) = lower_source_in(&dir.path, source);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert_eq!(
+        diags[0].message,
+        "module 'mod_ext.sub' is not supported yet"
+    );
 }
