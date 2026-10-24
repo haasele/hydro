@@ -85,7 +85,8 @@ repository root.
         │                      lint, clean, doctor, help, uv, spawn, scan,
         │                      completions; `gc.rs` = `pyx gc`
         └── tests/             E2E, fibers, closures, user modules, extensions
-                               (paths, dotted, multi-phase), completions
+                               (paths, dotted, multi-phase), completions,
+                               exceptions, unittest_runner
                                (+ fixtures/abi3_probe.c, abi3_multiphase.c)
 ```
 

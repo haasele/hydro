@@ -519,6 +519,10 @@ fn check_imported_body(hir: &LHir, file: &str) -> Result<(), Vec<Diagnostic>> {
                     .is_some_and(|local| local.name == "__name__")
                     && matches!(&value.kind, lower::HExprKind::Const(pyx_ir::Const::Str(_)))
             }
+            // Every module-body assignment is followed by its global mirror;
+            // the assignment itself already carries the diagnostic, so the
+            // mirror is not reported twice.
+            lower::HStmtKind::GlobalSet { .. } => true,
             _ => false,
         };
         if allowed {

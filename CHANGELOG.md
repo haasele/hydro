@@ -8,7 +8,9 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-24: **905 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
+As of 2026-10-25: **934 tests**, `scripts/verify.sh` ALL GREEN. The official
+CPython suite has its first real pass (`test_errno.py`), recorded in the
+manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 
@@ -148,9 +150,17 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 - **Official CPython test gate:** `scripts/cpython_compat.py` runs the 3.14.9
   `Lib/test` suite differentially, writes JSON/Markdown, and supports
   `--gate`, `--update-manifest` and offline `--check-manifest`; the manifest
-  starts empty and grows only from real passes. Baseline (2026-10-24, 398
-  modules): 0 passing, 322 `pyx_fail`, 76 `expected_fail`, 0 timeouts.
-  `scripts/verify.sh`/CI check the manifest offline.
+  starts empty and grows only from real passes. Baseline (2026-10-25, 398
+  modules): **1 passing** (`test_errno.py`), 334 `pyx_fail`, 63
+  `expected_fail`, 0 timeouts. `scripts/verify.sh`/CI check the manifest
+  offline.
+- **First official Python test:** unmodified `Lib/test/test_errno.py` passes
+  under JIT and AOT. Adds first-class standard-library module values
+  (`pyx_module_value`, module-aware `getattr`), module-level globals
+  (`pyx_global_get`/`pyx_global_set`), `frozenset`, `str.isupper`/`islower`,
+  `AssertionError` (tag 14), a native `errno` module (Linux table,
+  `errorcode`, `__dict__`) and a minimal native `unittest`
+  (`TestCase`/runner/native assertions).
 - **LTS policy:** future PyX LTS lines are keyed to CPython minor versions
   (3.13/3.14/3.15) with frozen patch baseline, ABI/wheel tags, stdlib surface
   and support window (P4-12; no LTS before production).

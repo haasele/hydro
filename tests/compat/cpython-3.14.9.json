@@ -1,7 +1,10 @@
 {
   "python": "3.14.9",
-  "minimum_passing": 0,
+  "minimum_passing": 1,
   "required": [],
-  "known_passing": [],
-  "notes": "Release gate; grow as stdlib/language support lands. Import-only baseline is separate in docs/COMPATIBILITY.md."
+  "known_passing": [
+    "test_errno.py"
+  ],
+  "notes": "Release gate; grow as stdlib/language support lands. Import-only baseline is separate in docs/COMPATIBILITY.md.",
+  "generated": "2026-10-24T22:16:44Z"
 }

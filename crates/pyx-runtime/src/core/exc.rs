@@ -51,6 +51,8 @@ pub(crate) const GENERATOR_EXIT: u32 = 11;
 pub(crate) const EXCEPTION: u32 = 12;
 /// `BaseException`: a handler for this tag matches every exception.
 pub(crate) const BASE_EXCEPTION: u32 = 13;
+/// `AssertionError`: raised by `assert` statements and unittest assertions.
+pub(crate) const ASSERTION_ERROR: u32 = 14;
 
 pub(crate) fn tag_name(tag: u32) -> &'static str {
     match tag {
@@ -68,6 +70,7 @@ pub(crate) fn tag_name(tag: u32) -> &'static str {
         GENERATOR_EXIT => "GeneratorExit",
         EXCEPTION => "Exception",
         BASE_EXCEPTION => "BaseException",
+        ASSERTION_ERROR => "AssertionError",
         // Unknown tags are rendered as RuntimeError rather than panicking.
         _ => "RuntimeError",
     }
@@ -84,6 +87,7 @@ fn default_message(tag: u32) -> &'static str {
         GENERATOR_EXIT => "",
         // `Exception()` and `BaseException()` stringify to the empty string.
         EXCEPTION | BASE_EXCEPTION => "",
+        ASSERTION_ERROR => "",
         _ => "unknown error",
     }
 }

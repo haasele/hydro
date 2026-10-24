@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-24 (latest):** 905 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** 934 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -23,7 +23,8 @@ ecosystem suites (NumPy, pandas, pydantic, FastAPI, Django, …) and their
 benchmarks. **New in this slice:** generator `send`/`throw`/`close` and
 `yield` expressions; C-API container/unicode/float/bytes accessors; a
 generated stdlib compatibility baseline (`docs/COMPATIBILITY.md`,
-23/297 modules importable on 2026-10-24).
+25/297 modules importable on 2026-10-25) and the first official CPython
+test pass (`test_errno.py`).
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -139,9 +140,12 @@ no CPython is needed at runtime.
 - [x] P2-04 Modules: import system, builtin modules, `__name__`, module cache.
       Native modules + user modules (`import foo`, `from foo import f`) with
       cache per canonical path, cycle detection, `__name__` (`__main__` in
-      the entry file) and AOT embedding. Limits: only sibling `.py`,
-      no packages/dots/relative imports, no top-level side effects in
-      imported modules, no runtime module object/`sys.modules`.
+      the entry file) and AOT embedding. Stdlib modules are first-class
+      values (`m = errno`, `getattr(m, name)`); module-level assignments are
+      visible inside functions via a keyed global store. Limits: user-module
+      values are rejected, only sibling `.py`, no packages/dots/relative
+      imports, no top-level side effects in imported modules, no general
+      runtime module object/`sys.modules`.
 - [ ] P2-05 Allocator: size classes, arena/chunk allocation, alignment, statistics.
       Object registry + GC heap + fixed `PyxObj` slab/free-list allocator
       (`gc/alloc.rs`, 64-slot chunks, stats) are present; variable payload
@@ -247,15 +251,16 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-24: 905 tests total — 411 runtime (238 unit, 173 ABI
+      As of 2026-10-25: 934 tests total — 426 runtime (253 unit, 173 ABI
       integration: among others 22 bytes, 19 IO, 14 stdlib modules, 14 stdlib utils,
       12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 281 frontend, 19 codegen, 4 IR, 190 CLI/E2E (135 E2E incl. the
+      tests), 289 frontend, 23 codegen, 4 IR, 192 CLI/E2E (135 E2E incl. the
       abi3 extension fixture, 22 fibers, 6 closures, 5 user modules,
-      extension/path/dotted/multi-phase, completions and exceptions suites).
+      extension/path/dotted/multi-phase, completions, exceptions and
+      unittest-runner suites).
       Property tests open. The CPython official-test manifest is checked offline by
       `scripts/verify.sh`/CI; the full suite is a release gate.
 
@@ -305,15 +310,13 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `Lib/test/test_*.py` differential runs against the pinned CPython
       **3.14.9** oracle, JSON + `docs/CPYTHON_TESTS.md`, release gate
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
-      Manifest `tests/compat/cpython-3.14.9.json` starts empty
-      (`minimum_passing: 0`) because `unittest`/`test.support` are not
-      importable under PyX yet; it grows only from real `pyx_pass` results.
-      Stdlib import baseline 2026-10-24: **23/297 importable** (5
-      builtin/frozen, 17 pure, 1 extension, 8 `cpython_failed`). Official-suite
-      baseline 2026-10-24: **0/398 passing** (322 `pyx_fail`, 76
+      Manifest `tests/compat/cpython-3.14.9.json` records **1** pass
+      (`test_errno.py`); it grows only from real `pyx_pass` results.
+      Stdlib import baseline 2026-10-25: **25/297 importable** (6
+      builtin/frozen, 18 pure, 1 extension; 8 `cpython_failed`). Official-suite
+      baseline 2026-10-25: **1/398 passing** (334 `pyx_fail`, 63
       `expected_fail` where CPython also fails; 0 timeouts). No test is marked
-      passing unless CPython 3.14.9 and PyX both exit 0; the manifest stays
-      empty until real passes exist.
+      passing unless CPython 3.14.9 and PyX both exit 0.
       Run a defined subset of CPython 3.14 `Lib/test` against `pyx`, and emit a
       machine-readable report (per test: pass/skip/fail, plus the reason).
       Acceptance: `scripts/compat_report.py` produces a deterministic report

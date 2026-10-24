@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
-implemented (905 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (934 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -168,6 +168,11 @@ i64  pyx_module_call(const uint8_t* module, size_t module_len,
                      uint64_t argc, const i64* argv);
 i64  pyx_module_get(const uint8_t* module, size_t module_len,
                     const uint8_t* name, size_t name_len);
+i64  pyx_module_value(const uint8_t* module, size_t module_len);
+i64  pyx_global_get(const uint8_t* module, size_t module_len,
+                    const uint8_t* name, size_t name_len);
+i64  pyx_global_set(const uint8_t* module, size_t module_len,
+                    const uint8_t* name, size_t name_len, i64 value);
 i64  pyx_subscript(i64 obj, i64 index);
 i64  pyx_subscript_set(i64 obj, i64 index, i64 value);
 i64  pyx_slice(i64 obj, i64 start, i64 stop, i64 step);
@@ -224,7 +229,7 @@ followed by the call arguments. The fiber starts only on the first
 Exception tags: `0 ValueError, 1 TypeError, 2 ZeroDivisionError,
 3 RuntimeError, 4 OverflowError, 5 KeyboardInterrupt, 6 IndexError,
 7 KeyError, 8 StopIteration, 9 AttributeError, 10 OSError, 11 GeneratorExit`
-(internal), `12 Exception`, `13 BaseException`. Names 1:1 as in Python;
+(internal), `12 Exception`, `13 BaseException`, `14 AssertionError`. Names 1:1 as in Python;
 `IOError` is an alias for `OSError`. `except Exception` matches every tag
 except 5/11; `except BaseException` matches every tag. Explicit causes are
 stored on the exception and traced by the GC.
@@ -399,8 +404,14 @@ implement the protocol; without `as`, `__enter__` still runs.
   level; imported names are visible inside functions. `X.f(...)` →
   ModuleCall, `X.const`/`X.f` as a value → ModuleAttr. Native functions are
   materialized as function objects; calls/arity/errors go through the
-  shared specification. Unknown modules/members and module values as
-  variables are diagnostics.
+  shared specification. A stdlib module used as a value lowers to
+  `ModuleRef` and materializes a runtime module object, so
+  `getattr(module, name)` works. User/extension module values remain
+  diagnostics; unknown members are compile-time diagnostics.
+  Module-level simple-name assignments that are read by a function are
+  mirrored into a keyed global store (`GlobalSet`/`GlobalGet`,
+  `pyx_global_set`/`pyx_global_get`); other module locals remain invisible
+  inside functions.
 - **User modules** (Phase 2.30): `import foo` / `from foo import f` resolve
   `foo.py` next to the importing file. The loader loads every module
   **once per canonical path** (module cache at compile time), loads
@@ -412,8 +423,10 @@ implement the protocol; without `as`, `__enter__` still runs.
   functions end up in one `Program`; JIT and AOT execute the same code
   (AOT embeds the modules into the binary).
 - `__name__` is a module body local and is injected only if the body
-  reads it: `"__main__"` for the entry file, otherwise the module name. A
-  runtime module object (`sys.modules`, `module.__dict__`) does not exist.
+  reads it: `"__main__"` for the entry file, otherwise the module name.
+  There is no general runtime module object or `sys.modules`; stdlib module
+  values are a native `module` kind, and `errno` exposes a synthetic
+  `__dict__` for compatibility.
 
 #### Stdlib Modules
 
@@ -828,11 +841,11 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-24: **905 tests** (281 frontend, 411 runtime incl. 173
-  ABI integration tests, 17 codegen, 3 IR, 154 CLI/E2E). E2E coverage
+- As of 2026-10-25: **934 tests** (289 frontend, 23 codegen, 4 IR, 253
+  runtime unit, 173 runtime integration, 192 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
-  (`fibers.rs`), user modules, `argparse`/`defaultdict`/`re`, socket echo,
-  pathlib, build cache, `pyx gc` and uv passthrough.
+  (`fibers.rs`), user modules, `unittest` runner, `argparse`/`defaultdict`/`re`,
+  socket echo, pathlib, build cache, `pyx gc` and uv passthrough.
 - New unit tests cover the dict hash index, the GC statistics and
   fiber iteration; `examples/generators_async.py` runs under JIT and AOT.
 - E2E compares stdout/exit code of `pyx run` and the AOT binary; negative tests
@@ -861,9 +874,11 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   fiber switch is register-only (two switches per yield, no syscalls); a
   100k generator sum reaches release AOT 6.8 ms / JIT 7.7 ms versus CPython
   10.2 ms (`strace -c`: 94 syscalls total).
-- **Modules:** only native modules and sibling `.py` files; no packages,
-  dots/relative imports, top-level side effects in imported modules,
-  no runtime module objects/`sys.modules`.
+- **Modules:** native modules and sibling `.py` files; stdlib module values
+  work (with `getattr`), and simple module-level assignments are visible
+  inside functions. No user-module values, packages, dots/relative imports,
+  top-level side effects in imported modules, or general runtime module
+  objects/`sys.modules`.
 - **Stdlib:** curated subset (see §3.3); `re` uses the Rust
   `regex` syntax, `socket` only blocking TCP, `argparse` without
   `SystemExit`, `random` not CPython-reproducible.

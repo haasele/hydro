@@ -329,3 +329,39 @@ pub static ASYNCIO: ModuleSpec = ModuleSpec {
     ],
     constants: &[],
 };
+
+/// `errno`: POSIX error numbers and the `errorcode` reverse mapping.
+///
+/// The runtime resolves every other attribute through
+/// `modules::errno::lookup`, which raises `AttributeError` for unknown names.
+pub static ERRNO: ModuleSpec = ModuleSpec {
+    name: "errno",
+    functions: &[],
+    constants: &[
+        c("EDOM", Type::Int),
+        c("ERANGE", Type::Int),
+        c("errorcode", Type::Dict),
+        c("__dict__", Type::Dict),
+    ],
+};
+
+/// `unittest`: the minimal test runner used by the compatibility corpus.
+///
+/// `TestCase` is a native class whose methods are dispatched by the runtime;
+/// `main()` runs every registered test case. The `_`-prefixed functions are
+/// internal runtime hooks and are not part of the Python-visible API.
+pub static UNITTEST: ModuleSpec = ModuleSpec {
+    name: "unittest",
+    functions: &[
+        f("main", 0, 0, Type::None),
+        f("_case_marker", 1, 1, Type::None),
+        f("_assert_has_attr", 3, 4, Type::None),
+        f("_assert_in", 3, 4, Type::None),
+        f("_assert_equal", 3, 4, Type::None),
+        f("_assert_true", 2, 2, Type::None),
+        f("_assert_false", 2, 2, Type::None),
+        f("_assert_is", 3, 3, Type::None),
+        f("_fail", 1, 2, Type::None),
+    ],
+    constants: &[c("TestCase", Type::Any)],
+};

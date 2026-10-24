@@ -790,6 +790,19 @@ pub(crate) fn set_pending_mirror(value: i64) {
     }
 }
 
+/// Adds `value` to the calling thread's out-of-stack roots so a collection
+/// keeps it alive while it is only reachable from Rust-side state (the
+/// unittest class registry). A no-op outside the runtime, where no collector
+/// can run.
+pub(crate) fn add_thread_root(value: i64) {
+    if let Some(gc) = current_gc() {
+        gc.roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(value);
+    }
+}
+
 /// Locks the shared heap, ignoring poisoning: a panic in user code must not
 /// make the process unable to allocate. The registry is always consistent
 /// because no user code runs while the lock is held.
@@ -948,6 +961,9 @@ pub(crate) fn reset() {
     HEAP.with(|cell| cell.borrow_mut().free_all());
     // A fresh program run must not resolve functions from the previous one.
     crate::spawn::reset();
+    // The registered unittest classes lived in the freed heap; drop the
+    // stale tagged values before user code runs.
+    crate::modules::unittest::reset();
     // Defensive cleanup of a previous run in the same process (the runtime
     // tests reuse their process). Legal because the precondition above says
     // no thread is alive.
@@ -1570,6 +1586,17 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
         }
         // The pending exception is a thread-local root.
         mark_word(exc::pending_value() as usize, addresses);
+        // Rust-side owners registered through `add_thread_root` (the unittest
+        // class registry) are invisible to the stack scan in local mode too.
+        if let Some(gc) = current_gc() {
+            let roots = gc
+                .roots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for &root in roots.iter() {
+                mark_word(root as usize, addresses);
+            }
+        }
 
         scan_stack(sp, stack_high, addresses);
         mark_captured_registers(addresses);
@@ -1888,7 +1915,8 @@ unsafe fn trace(addr: usize) {
                 | ObjData::Socket(_)
                 | ObjData::CsvReader(_)
                 | ObjData::ExtFunction(_)
-                | ObjData::Capsule { .. } => {}
+                | ObjData::Capsule { .. }
+                | ObjData::Module(_) => {}
                 // The mutable containers were handled above; they cannot
                 // appear here.
                 ObjData::List(_)
@@ -2331,6 +2359,20 @@ mod tests {
         // through `tagged` for the rest of the test.
         assert!(stats.live_objects >= 1);
         assert_eq!(crate::value::as_str(tagged), Some("live"));
+    }
+
+    #[test]
+    fn module_values_have_no_children_and_survive_collection() {
+        let _guard = stats_test_guard();
+        let module = crate::value::module_value(String::from("unittest"));
+        // The module holds no PyX edges; a collection with it as an explicit
+        // root must neither trace a child nor free the object itself.
+        let _ = collect_with_root(Some(module));
+        assert_eq!(crate::value::type_name(module), "module");
+        assert_eq!(
+            crate::value::as_module(module).map(|state| state.name()),
+            Some("unittest")
+        );
     }
 
     #[test]

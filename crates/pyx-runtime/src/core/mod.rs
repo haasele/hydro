@@ -9,6 +9,7 @@ pub(crate) mod container;
 pub(crate) mod exc;
 pub(crate) mod fiber;
 pub(crate) mod format;
+pub(crate) mod globals;
 pub(crate) mod iter;
 pub(crate) mod methods;
 pub(crate) mod ops;

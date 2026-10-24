@@ -140,6 +140,9 @@ struct Runtime {
     slice: FuncId,
     module_call: FuncId,
     module_get: FuncId,
+    module_value: FuncId,
+    global_get: FuncId,
+    global_set: FuncId,
     extension_call: FuncId,
     extension_get: FuncId,
     getattr: FuncId,
@@ -290,6 +293,21 @@ impl Runtime {
                 module,
                 "pyx_module_get",
                 &[ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
+            // `name_len` is a `size_t` in the ABI: pointer-width.
+            module_value: declare_runtime(module, "pyx_module_value", &[ptr, ptr], Some(i64t))?,
+            // Module name plus global name, each a pointer/length pair.
+            global_get: declare_runtime(
+                module,
+                "pyx_global_get",
+                &[ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
+            global_set: declare_runtime(
+                module,
+                "pyx_global_set",
+                &[ptr, ptr, ptr, ptr, i64t],
                 Some(i64t),
             )?,
             // Compiled CPython extension member: `path_len`, `member_len` and
@@ -1232,6 +1250,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let var = self.local_var(*target)?;
                 let value = self.lower_expr(value)?;
                 self.builder.def_var(var, value);
+            }
+            StmtKind::GlobalSet {
+                module,
+                name,
+                value,
+            } => {
+                // The result is `None` and is never observed.
+                self.lower_global_set(module, name, value)?;
             }
             StmtKind::AugAssign { target, op, value } => {
                 let var = self.local_var(*target)?;
@@ -2419,6 +2445,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 function,
                 args,
             } => self.lower_module_call(module, function, args),
+            ExprKind::ModuleRef { module } => self.lower_module_ref(module),
+            ExprKind::GlobalGet { module, name } => self.lower_global_get(module, name),
             ExprKind::ModuleAttr { module, name } => self.lower_module_attr(module, name),
             ExprKind::ExtensionAttr { path, member } => self.lower_extension_attr(path, member),
             ExprKind::GetAttr { object, name } => self.lower_getattr(object, name),
@@ -2757,6 +2785,67 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(result)
     }
 
+    /// Lower `module` used as a value to `pyx_module_value`.
+    ///
+    /// The runtime returns (and caches) the module object for the builtin
+    /// module name; names are materialized in a byte slot like every other
+    /// module ABI call.
+    fn lower_module_ref(&mut self, module: &str) -> Result<Value, CodegenError> {
+        // Empty names still get a valid, non-null pointer to a one-byte slot.
+        let (name_slot, name_len) = make_bytes_slot(&mut self.builder, module.as_bytes())?;
+        let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+        let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
+        let id = self.runtime.module_value;
+        let result = self.call_rt(id, &[name_ptr, name_len])?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
+    /// Lower a module-global read to `pyx_global_get`.
+    fn lower_global_get(&mut self, module: &str, name: &str) -> Result<Value, CodegenError> {
+        let (module_ptr, module_len) = self.module_name_args(module)?;
+        let (name_ptr, name_len) = self.module_name_args(name)?;
+        let id = self.runtime.global_get;
+        let result = self.call_rt(id, &[module_ptr, module_len, name_ptr, name_len])?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
+    /// Lower a module-global store to `pyx_global_set`, which returns `None`.
+    fn lower_global_set(
+        &mut self,
+        module: &str,
+        name: &str,
+        value: &'a Expr,
+    ) -> Result<Value, CodegenError> {
+        let module_args = self.module_name_args(module)?;
+        let name_args = self.module_name_args(name)?;
+        let value = self.lower_expr(value)?;
+        let id = self.runtime.global_set;
+        let result = self.call_rt(
+            id,
+            &[
+                module_args.0,
+                module_args.1,
+                name_args.0,
+                name_args.1,
+                value,
+            ],
+        )?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
+    /// Materializes one module/global name in a byte slot and returns the
+    /// `(pointer, length)` pair expected by the module/global ABI calls.
+    fn module_name_args(&mut self, name: &str) -> Result<(Value, Value), CodegenError> {
+        // Empty names still get a valid, non-null pointer to a one-byte slot.
+        let (slot, len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
+        let ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+        let len = self.builder.ins().iconst(self.ptr_ty, len as i64);
+        Ok((ptr, len))
+    }
+
     /// Lower `module.name` to `pyx_module_get` (constant or native function
     /// value).
     fn lower_module_attr(&mut self, module: &str, name: &str) -> Result<Value, CodegenError> {
@@ -2841,6 +2930,51 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
         let id = self.runtime.getattr;
         let result = self.call_rt(id, &[object, name_ptr, name_len])?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
+    /// Lower `getattr(object, name)`.
+    ///
+    /// A constant name uses the `pyx_getattr(object, bytes, len)` entry point,
+    /// which resolves the attribute by receiver kind (native value, class or
+    /// builtin module). A dynamic name first materializes the `getattr` native
+    /// function with `pyx_builtin_function` and calls it through `pyx_call`,
+    /// exactly like `g = getattr; g(obj, name)`.
+    fn lower_getattr_builtin(&mut self, args: &'a [Expr]) -> Result<Value, CodegenError> {
+        let [object, name] = args else {
+            return Err(CodegenError::new(format!(
+                "builtin getattr expects 2 arguments, got {}",
+                args.len()
+            )));
+        };
+        if let ExprKind::Const(Const::Str(name)) = &name.kind {
+            return self.lower_getattr(object, name);
+        }
+
+        // Park the callee and both arguments in stack slots as soon as they
+        // are evaluated, so a later allocation cannot invalidate them.
+        let callee_slot = self.stack_array_slot(1, "getattr callee")?;
+        let (name_slot, name_len) = make_bytes_slot(&mut self.builder, b"getattr")?;
+        let builtin_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+        let builtin_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
+        let id = self.runtime.builtin_function;
+        let function = self.call_rt(id, &[builtin_ptr, builtin_len])?;
+        self.emit_exc_check()?;
+        self.builder.ins().stack_store(function, callee_slot, 0);
+
+        let argv_slot = self.stack_array_slot(2, "getattr arguments")?;
+        let object = self.lower_expr(object)?;
+        self.builder.ins().stack_store(object, argv_slot, 0);
+        let name_value = self.lower_expr(name)?;
+        self.builder.ins().stack_store(name_value, argv_slot, 8);
+        // Reload after both argument expressions: the slot is the GC-safe
+        // owner of the callee while they may allocate.
+        let callee = self.builder.ins().stack_load(types::I64, callee_slot, 0);
+        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        let argc = self.builder.ins().iconst(self.ptr_ty, 2);
+        let id = self.runtime.call;
+        let result = self.call_rt(id, &[callee, argc, argv])?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -3004,6 +3138,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             // trailing constant arguments; they become a direct runtime call
             // instead of a first-class builtin invocation.
             Callee::Builtin(Builtin::Format) => self.lower_format_call(args),
+            Callee::Builtin(Builtin::Getattr) => self.lower_getattr_builtin(args),
             Callee::Builtin(builtin) => {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
@@ -3216,11 +3351,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_exc_check()?;
                 Ok(result)
             }
-            Builtin::Set => {
+            Builtin::Set | Builtin::Frozenset => {
+                // PyX has a single immutable set representation, so
+                // `frozenset(...)` shares the `set(...)` lowering.
+                let name = builtin.name();
                 match values.len() {
                     0 => {
-                        // `set()` — a valid dummy pointer is required by the ABI.
-                        let slot = self.stack_array_slot(0, "set()")?;
+                        // A valid dummy pointer is required by the ABI.
+                        let slot = self.stack_array_slot(0, name)?;
                         let dummy = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
                         let argc = self.builder.ins().iconst(self.ptr_ty, 0);
                         let id = self.runtime.set_new;
@@ -3235,10 +3373,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         Ok(result)
                     }
                     actual => Err(CodegenError::new(format!(
-                        "builtin set expects at most 1 argument, got {actual}"
+                        "builtin {name} expects at most 1 argument, got {actual}"
                     ))),
                 }
             }
+            Builtin::Getattr => Err(CodegenError::new(
+                "internal error: getattr reached first-class builtin lowering",
+            )),
             Builtin::Range => {
                 // Tagged integer 1 (`n << 3`), the default step.
                 let one = self.tagged_int(1 << 3);
@@ -4384,6 +4525,132 @@ mod tests {
         assert!(
             runtime_call_sites(&object, "pyx_extension_get") > 0,
             "the extension attribute must reference pyx_extension_get"
+        );
+    }
+
+    #[test]
+    fn module_ref_lowers_to_pyx_module_value() {
+        let program = program_assigning(Expr::new(
+            ExprKind::ModuleRef {
+                module: "errno".to_string(),
+            },
+            Type::Any,
+            1,
+        ));
+        let object =
+            crate::compile_object(&program).expect("a module value must lower to object code");
+        assert!(
+            runtime_call_sites(&object, "pyx_module_value") > 0,
+            "the module value must reference pyx_module_value"
+        );
+    }
+
+    #[test]
+    fn getattr_builtin_lowers_to_pyx_getattr() {
+        let module = Expr::new(
+            ExprKind::ModuleRef {
+                module: "errno".to_string(),
+            },
+            Type::Any,
+            1,
+        );
+        let name = Expr::new(
+            ExprKind::Const(Const::Str("EDOM".to_string())),
+            Type::Str,
+            1,
+        );
+        let program = program_assigning(Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::Getattr),
+                args: vec![module, name],
+            },
+            Type::Any,
+            1,
+        ));
+        let object = crate::compile_object(&program).expect("getattr must lower to pyx_getattr");
+        assert!(
+            runtime_call_sites(&object, "pyx_getattr") > 0,
+            "getattr() must reference pyx_getattr"
+        );
+    }
+
+    #[test]
+    fn dynamic_getattr_name_calls_the_native_builtin() {
+        let module = Expr::new(
+            ExprKind::ModuleRef {
+                module: "errno".to_string(),
+            },
+            Type::Any,
+            1,
+        );
+        let name = Expr::new(ExprKind::Local(0), Type::Str, 1);
+        let program = program_assigning(Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::Getattr),
+                args: vec![module, name],
+            },
+            Type::Any,
+            1,
+        ));
+        let object = crate::compile_object(&program)
+            .expect("getattr with a dynamic name must lower through pyx_call");
+        assert!(
+            runtime_call_sites(&object, "pyx_call") > 0,
+            "a dynamic getattr must call the native builtin through pyx_call"
+        );
+    }
+
+    #[test]
+    fn global_get_and_set_lower_to_the_runtime_imports() {
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![LocalInfo {
+                    name: "x".to_string(),
+                    ty: Type::Any,
+                }],
+                body: vec![
+                    Stmt::new(
+                        StmtKind::GlobalSet {
+                            module: "__main__".to_string(),
+                            name: "x".to_string(),
+                            value: Expr::new(ExprKind::Const(Const::Int(1)), Type::Int, 1),
+                        },
+                        1,
+                    ),
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 0,
+                            value: Expr::new(
+                                ExprKind::GlobalGet {
+                                    module: "__main__".to_string(),
+                                    name: "x".to_string(),
+                                },
+                                Type::Any,
+                                2,
+                            ),
+                        },
+                        2,
+                    ),
+                ],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+        };
+        let object = crate::compile_object(&program)
+            .expect("module-global access must lower to object code");
+        assert!(
+            runtime_call_sites(&object, "pyx_global_set") > 0,
+            "GlobalSet must reference pyx_global_set"
+        );
+        assert!(
+            runtime_call_sites(&object, "pyx_global_get") > 0,
+            "GlobalGet must reference pyx_global_get"
         );
     }
 

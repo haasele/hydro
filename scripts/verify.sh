@@ -154,7 +154,13 @@ check_fails examples/errors/import_unsupported.py "not supported"
 check_fails examples/errors/module_member_unknown.py "no attribute"
 check_fails examples/errors/import_in_function.py "module level"
 check_fails examples/errors/from_member_unknown.py "no attribute"
-check_fails examples/errors/module_value.py "module values"
+# Standard-library modules are first-class values now (getattr/argv cases).
+"$PYX" check examples/errors/module_value.py >"$tmp/check.out" 2>"$tmp/check.err" || {
+    echo "FAIL: examples/errors/module_value.py must compile" >&2
+    cat "$tmp/check.err" >&2
+    exit 1
+}
+echo "ok: examples/errors/module_value.py"
 check_fails examples/errors/module_call_noncallable.py "not callable"
 check_fails examples/errors/json_member_unknown.py "no attribute"
 check_fails examples/errors/os_member_unknown.py "no attribute"

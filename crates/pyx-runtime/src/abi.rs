@@ -446,6 +446,68 @@ pub extern "C" fn pyx_module_get(
     modules::module_get(module, module_len, name, name_len)
 }
 
+/// `module.name = value` for a module-level global.
+///
+/// Module globals live in a thread-local side store keyed by module and name;
+/// the stored value is also installed as a GC root. Invalid ABI buffers raise
+/// `TypeError`. Returns `None`.
+#[no_mangle]
+pub extern "C" fn pyx_global_set(
+    module_ptr: *const c_uchar,
+    module_len: usize,
+    name_ptr: *const c_uchar,
+    name_len: usize,
+    value: i64,
+) -> i64 {
+    let (Some(module), Some(name)) = (
+        required_name(module_ptr, module_len),
+        required_name(name_ptr, name_len),
+    ) else {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "module global name must be a non-empty string",
+        );
+    };
+    crate::core::globals::set_value(&module, &name, value)
+}
+
+/// `module.name` for a module-level global.
+///
+/// A missing entry raises `RuntimeError` (`name '<name>' is not defined in
+/// module '<module>'`) with a pending exception and returns `None`. Invalid
+/// ABI buffers raise `TypeError` instead.
+#[no_mangle]
+pub extern "C" fn pyx_global_get(
+    module_ptr: *const c_uchar,
+    module_len: usize,
+    name_ptr: *const c_uchar,
+    name_len: usize,
+) -> i64 {
+    let (Some(module), Some(name)) = (
+        required_name(module_ptr, module_len),
+        required_name(name_ptr, name_len),
+    ) else {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "module global name must be a non-empty string",
+        );
+    };
+    crate::core::globals::get(&module, &name)
+}
+
+/// `module_name` used as a value (`getattr(module_name, attribute)`).
+///
+/// Materialises a module object from the import name; its attributes are
+/// resolved on demand by `pyx_getattr`/`getattr`. An empty or malformed name
+/// raises `TypeError` and returns `None`.
+#[no_mangle]
+pub extern "C" fn pyx_module_value(name_ptr: *const c_uchar, name_len: usize) -> i64 {
+    let Some(name) = required_name(name_ptr, name_len) else {
+        return exc::raise_with_message(exc::TYPE_ERROR, "module name must be a non-empty string");
+    };
+    value::module_value(name)
+}
+
 // ---------------------------------------------------------------------
 // CPython limited-API extensions (P4-04)
 // ---------------------------------------------------------------------
@@ -845,6 +907,9 @@ pub extern "C" fn pyx_runtime_init() {
     crate::process::reset_start_method();
     exc::init();
     heap::reset();
+    // A fresh program run starts with no module globals (the unittest class
+    // registry is cleared by `heap::reset`).
+    crate::core::globals::reset();
     // Anchor the CPython shim so its symbols are linked into AOT binaries and
     // never dropped as unreachable (JIT links the same runtime object).
     crate::capi::anchor();

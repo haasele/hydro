@@ -246,6 +246,12 @@ pub enum Builtin {
     /// `next(iterator[, default])`: the next element, `StopIteration` at the
     /// end unless a default is given.
     Next,
+    /// `frozenset()` / `frozenset(iterable)`. PyX values are immutable sets:
+    /// the result shares the runtime set representation.
+    Frozenset,
+    /// `getattr(object, name)`: the attribute value, raising `AttributeError`
+    /// when it is missing.
+    Getattr,
     /// Internal: one f-string interpolation field lowered to
     /// `pyx_format_value`. Arguments are the value, a constant format spec
     /// string and a constant conversion flag (`0` none, `1` `!s`, `2` `!r`,
@@ -274,6 +280,8 @@ impl Builtin {
             Builtin::Bytes => "bytes",
             Builtin::Iter => "iter",
             Builtin::Next => "next",
+            Builtin::Frozenset => "frozenset",
+            Builtin::Getattr => "getattr",
             Builtin::Format => "format",
         }
     }
@@ -300,6 +308,8 @@ impl Builtin {
             "bytes" => Builtin::Bytes,
             "iter" => Builtin::Iter,
             "next" => Builtin::Next,
+            "frozenset" => Builtin::Frozenset,
+            "getattr" => Builtin::Getattr,
             _ => return None,
         })
     }

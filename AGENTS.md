@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators/coroutines/event loop (no GIL)** | 905 tests, JIT+AOT |
+| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators/coroutines/event loop (no GIL)** | 934 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -46,13 +46,13 @@ Still open are async generators/comprehensions, variable payload size classes as
 well as precise GC stack maps (P2-05/06/07), packaging/cross-platform/fuzzing
 and the C-API implementation itself. Details: `docs/TODO.md`.
 
-**Verification (as of 2026-10-24):**
+**Verification (as of 2026-10-25):**
 
-- `cargo test --workspace`: **905 tests** — 281 frontend, 19 codegen, 4 IR,
-  238 runtime unit, 190 CLI/E2E (135 E2E incl. the abi3 extension fixture,
+- `cargo test --workspace`: **934 tests** — 289 frontend, 23 codegen, 4 IR,
+  253 runtime unit, 192 CLI/E2E (135 E2E incl. the abi3 extension fixture,
   22 fibers, 6 closures, 5 user modules, completions, extension
-  path/dotted/multi-phase, 8 exception tests), 173 further runtime
-  integration tests
+  path/dotted/multi-phase, 8 exception tests, 2 unittest-runner tests),
+  173 further runtime integration tests
   (allocator, bytes, GC/concurrent GC, IO, CSV, stdlib modules, classes,
   closures, socket, pathlib, pool, threads). New suites cover generator
   send/throw/close + yield expressions, C-API containers, extension
@@ -81,15 +81,15 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   `next`/`send` echo, `close` running `finally`, `throw(caught_exception)`
   re-raised inside the generator, StopIteration after completion.
 - **Stdlib compatibility baseline:** `python3 scripts/stdlib_compat.py`
-  (CPython 3.14.9, PyX 0.1.0): **23/297 modules importable** (5 builtin/frozen,
-  17 pure, 1 extension; 8 names fail under CPython too). Report:
+  (CPython 3.14.9, PyX 0.1.0): **25/297 modules importable** (6 builtin/frozen,
+  18 pure, 1 extension; 8 unknown names fail under CPython too). Report:
   `docs/COMPATIBILITY.md`, JSON `benchmarks/compat/latest.json`.
 - **Official CPython suite baseline:** `python3 scripts/cpython_compat.py`
-  (398 `Lib/test` modules, pinned 3.14.9 oracle): **0 passing** (322
-  `pyx_fail`, 76 `expected_fail`, 0 timeouts); all PyX failures are currently
-  missing-stdlib imports (`unittest`, `contextlib`, ...). Manifest
-  `tests/compat/cpython-3.14.9.json` stays empty; `--check-manifest` runs
-  offline in `scripts/verify.sh`/CI.
+  (398 `Lib/test` modules, pinned 3.14.9 oracle): **1 passing**
+  (`test_errno.py`), 334 `pyx_fail`, 63 `expected_fail`, 0 timeouts. The
+  manifest records the real pass and blocks regressions; `--check-manifest`
+  runs offline in `scripts/verify.sh`/CI. Remaining failures are mostly
+  missing stdlib imports/packages (`test.support`, `unittest` features).
 
 **Phase-2.0 slice (containers, 2026-10-23) — done & verified:**
 
@@ -534,7 +534,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 905 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 934 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -738,7 +738,7 @@ parallel benchmarks and race/stress tests.
   JIT 7.7 ms, AOT 6.8 ms; `strace -c` counts 94 syscalls total (previously
   200,097, two `rt_sigprocmask` per yield). Remaining weak spots: string
   concatenation (O(n²)) and float boxing — open performance work.
-- **Verified:** 905 tests, `cargo fmt`, `cargo clippy --workspace -- -D warnings
+- **Verified:** 934 tests, `cargo fmt`, `cargo clippy --workspace -- -D warnings
   --all-targets -- -D warnings` and `cargo test --workspace` green;
   micro baseline renewed (while_sum AOT 1.7 ms vs. CPython 23.5 ms).
 
@@ -766,9 +766,11 @@ math_loop at parity/faster). Remaining weak spots: string concatenation is
 O(n²) and CPython-extension boundaries will add conversion cost. The x86_64
 fiber switch costs two register-only switches without syscalls (100k
 generator sum AOT 6.8 ms vs. CPython 10.2 ms).
-**Modules:** only native modules + sibling `.py`; no packages, dots/
-relative imports, top-level side effects in imported modules or
-runtime module objects/`sys.modules`; imports only at module level.
+**Modules:** native modules + sibling `.py`; stdlib modules are first-class
+values (`m = errno`, `getattr(m, name)`) and simple module-level assignments
+are visible inside functions. User-module values, packages, dots/relative
+imports, top-level side effects in imported modules and a general runtime
+module object/`sys.modules` are missing; imports only at module level.
 **Stdlib:** curated subset; `re` = Rust `regex` syntax, `socket` only
 blocking TCP (no TLS/UDP/select, timeout → `OSError`), `argparse` without
 `SystemExit`, `random` not CPython-reproducible, CSV entirely in
@@ -813,7 +815,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (905)
+cargo test                             # unit/integration tests (934)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1149,3 +1151,15 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   suppression. Runtime matcher (`pyx_exc_matches`), cause storage traced by
   the GC, caused-raise ABIs, codegen hierarchy dispatch. 905 tests, clippy
   `-D warnings` and `scripts/verify.sh` (incl. manifest check) green.
+
+- 2026-10-25 (continuation 45): first official CPython test green.
+  Added first-class native module values (`KIND_MODULE`, `pyx_module_value`,
+  module-aware `getattr`), module-level globals (`GlobalGet`/`GlobalSet`,
+  `pyx_global_get`/`pyx_global_set`, thread-local keyed store with GC roots),
+  `frozenset`, `str.isupper`/`islower`, `AssertionError` (tag 14).
+  New native `errno` (Linux table, `errorcode`, `__dict__`) and minimal
+  `unittest` (`TestCase` native base, native assertions, registered-subclass
+  runner). `Lib/test/test_errno.py` passes unmodified under JIT and AOT and is
+  recorded in the manifest. Official baseline **1/398**; stdlib imports
+  **25/297**; **934 tests**, clippy `-D warnings` and `scripts/verify.sh`
+  green.

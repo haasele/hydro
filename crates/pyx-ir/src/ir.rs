@@ -100,8 +100,19 @@ pub enum ExprKind {
         function: String,
         args: Vec<Expr>,
     },
+    /// Reference to a builtin module as a value (`m = errno`, `getattr(errno,
+    /// ...)`). Codegen materializes the runtime module object.
+    ModuleRef {
+        module: String,
+    },
     /// `module.name` (constant or callable value) from a builtin module.
     ModuleAttr {
+        module: String,
+        name: String,
+    },
+    /// Read of a module-level name from inside a function. `module` is the
+    /// compilation unit's module name (`__main__` for the entry unit).
+    GlobalGet {
         module: String,
         name: String,
     },
@@ -202,6 +213,15 @@ pub enum StmtKind {
     Expr(Expr),
     Assign {
         target: LocalId,
+        value: Expr,
+    },
+    /// Store a module-level name so functions of the same unit can read it.
+    /// Emitted right after the module-body assignment; `value` is normally a
+    /// read of the just-assigned local, so the right-hand side is evaluated
+    /// once.
+    GlobalSet {
+        module: String,
+        name: String,
         value: Expr,
     },
     AugAssign {

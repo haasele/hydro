@@ -112,6 +112,9 @@ pub(crate) const KIND_EXT_FUNCTION: u32 = 32;
 /// pointer and an optional name; it has no PyX children, and its destructor
 /// is never called in this slice.
 pub(crate) const KIND_CAPSULE: u32 = 33;
+/// Module value materialised by `pyx_module_value`; stores only its name and
+/// has no PyX children.
+pub(crate) const KIND_MODULE: u32 = 34;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
 pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
@@ -1415,6 +1418,19 @@ impl InstanceState {
     }
 }
 
+/// State of a module value: its import name. The value holds no PyX
+/// children; attribute access goes through `crate::modules`.
+pub(crate) struct ModuleState {
+    pub(crate) name: String,
+}
+
+impl ModuleState {
+    /// The module's import name, e.g. `"errno"`.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// Callable member of a loaded extension module.
 ///
 /// `module` is the shim's process-wide module handle and `method` its cache
@@ -1506,6 +1522,8 @@ pub(crate) enum ObjData {
         ptr: usize,
         name: Option<String>,
     },
+    /// Module value (`<module 'name'>`); holds no PyX values.
+    Module(ModuleState),
 }
 
 // -------------------------------------------------------------------------
@@ -1837,6 +1855,23 @@ pub(crate) fn as_class(v: i64) -> Option<&'static ClassState> {
     }
     match &obj.data {
         ObjData::Class(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Borrows the state of a module value.
+pub(crate) fn as_module(v: i64) -> Option<&'static ModuleState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked above; the object is rooted/immutable for the
+    // duration of this call (the collector only frees unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_MODULE {
+        return None;
+    }
+    match &obj.data {
+        ObjData::Module(state) => Some(state),
         _ => None,
     }
 }
@@ -2522,14 +2557,25 @@ pub(crate) fn namespace_new(pairs: Vec<(String, i64)>) -> i64 {
 /// are function values in declaration order (duplicates already collapsed by
 /// the ABI entry point).
 pub(crate) fn class_new(name: String, base: i64, methods: Vec<(String, i64)>) -> i64 {
-    alloc(
+    let class = alloc(
         KIND_CLASS,
         ObjData::Class(ClassState {
             name,
             base,
             methods,
         }),
-    )
+    );
+    // A subclass of the native unittest `TestCase` joins the test registry so
+    // `unittest.main()` can discover and run it.
+    if base != NONE && class_method(base, "__unittest_case__").is_some() {
+        crate::modules::unittest::register(class);
+    }
+    class
+}
+
+/// Allocates a module value rendering as `<module 'name'>`.
+pub(crate) fn module_value(name: String) -> i64 {
+    alloc(KIND_MODULE, ObjData::Module(ModuleState { name }))
 }
 
 /// Allocates an instance of `class` with an empty attribute table.
@@ -2976,6 +3022,7 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             Some(ObjData::Instance(_)) => "instance",
             Some(ObjData::ExtFunction(_)) => "builtin_function_or_method",
             Some(ObjData::Capsule { .. }) => "PyCapsule",
+            Some(ObjData::Module(_)) => "module",
             Some(ObjData::Fiber(state)) => match state.kind {
                 crate::fiber::FiberKind::Generator => "generator",
                 crate::fiber::FiberKind::Coroutine => "coroutine",
@@ -3050,8 +3097,8 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjData::Fiber(_)) => true,
             // Function objects are always truthy.
             Some(ObjData::ExtFunction(_)) => true,
-            // Capsules are always truthy, like CPython.
-            Some(ObjData::Capsule { .. }) => true,
+            // Capsules and module values are always truthy, like CPython.
+            Some(ObjData::Capsule { .. }) | Some(ObjData::Module(_)) => true,
             None => true,
         };
     }
@@ -3184,6 +3231,7 @@ pub(crate) fn to_string(v: i64) -> String {
                     Some(name) => format!("<capsule object \"{name}\">"),
                     None => "<capsule object NULL>".to_string(),
                 },
+                ObjData::Module(state) => format!("<module '{}'>", state.name),
             };
         }
     }
@@ -3237,6 +3285,9 @@ fn repr_depth(v: i64, depth: usize) -> String {
     }
     if let Some(state) = as_class(v) {
         return format!("<class '{}'>", state.name);
+    }
+    if let Some(state) = as_module(v) {
+        return format!("<module '{}'>", state.name);
     }
     if let Some(state) = as_instance(v) {
         return instance_default_repr(state);
@@ -3609,6 +3660,21 @@ mod tests {
         assert_eq!(as_capsule(unnamed), Some((0x5678, None)));
         assert!(as_capsule(NONE).is_none());
         assert!(as_capsule(str_from_bytes(b"x")).is_none());
+    }
+
+    #[test]
+    fn module_semantics() {
+        let module = module_value("errno".to_string());
+        assert_eq!(type_name(module), "module");
+        assert!(truthy(module));
+        assert_eq!(to_string(module), "<module 'errno'>");
+        assert_eq!(repr(module), "<module 'errno'>");
+        assert_eq!(as_module(module).map(|state| state.name()), Some("errno"));
+
+        // A module is not a class, instance, string or capsule.
+        assert!(as_module(NONE).is_none());
+        assert!(as_module(str_from_bytes(b"errno")).is_none());
+        assert!(as_module(module_value("unittest".to_string())).is_some());
     }
 
     #[test]

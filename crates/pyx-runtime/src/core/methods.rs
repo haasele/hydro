@@ -376,6 +376,9 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    if let Some(module) = value::as_module(obj) {
+        return crate::modules::module_get_by_name(module.name(), &attr);
+    }
     if value::as_path(obj).is_some() {
         return path_attr(obj, &attr);
     }
@@ -850,6 +853,32 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
                 "isalnum" => matches(char::is_alphanumeric),
                 _ => matches(char::is_whitespace),
             })
+        }
+        // CPython semantics: at least one cased character, and no character
+        // of the opposite case. Uncased characters (digits, punctuation) are
+        // ignored, so `"ABC1"` is upper and `"abc1"` is lower.
+        "isupper" | "islower" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
+                return err;
+            }
+            let upper = method == "isupper";
+            let mut cased = false;
+            let mut matched = true;
+            for ch in s.chars() {
+                let wrong_case = if upper {
+                    ch.is_lowercase()
+                } else {
+                    ch.is_uppercase()
+                };
+                if wrong_case {
+                    matched = false;
+                    break;
+                }
+                if ch.is_uppercase() || ch.is_lowercase() {
+                    cased = true;
+                }
+            }
+            value::bool_value(matched && cased)
         }
         _ => attribute_error(obj, method),
     }
@@ -3231,6 +3260,26 @@ mod tests {
         for method in ["isdigit", "isalpha", "isalnum", "isspace"] {
             assert_eq!(invoke(string(""), method, &[]), FALSE);
         }
+    }
+
+    #[test]
+    fn upper_lower_predicates() {
+        reset();
+        assert_eq!(invoke(string("EDOM"), "isupper", &[]), TRUE);
+        assert_eq!(invoke(string("EPERM2"), "isupper", &[]), TRUE);
+        assert_eq!(invoke(string("ÄÖÜ"), "isupper", &[]), TRUE);
+        assert_eq!(invoke(string("Error"), "isupper", &[]), FALSE);
+        assert_eq!(invoke(string("123"), "isupper", &[]), FALSE);
+        assert_eq!(invoke(string("__dict__"), "isupper", &[]), FALSE);
+        assert_eq!(invoke(string(""), "isupper", &[]), FALSE);
+
+        assert_eq!(invoke(string("errorcode"), "islower", &[]), TRUE);
+        assert_eq!(invoke(string("abc2!"), "islower", &[]), TRUE);
+        assert_eq!(invoke(string("αβγ"), "islower", &[]), TRUE);
+        assert_eq!(invoke(string("aBc"), "islower", &[]), FALSE);
+        assert_eq!(invoke(string("123"), "islower", &[]), FALSE);
+        assert_eq!(invoke(string(""), "islower", &[]), FALSE);
+        assert!(!crate::exc::pending());
     }
 
     #[test]

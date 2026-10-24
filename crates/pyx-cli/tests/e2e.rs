@@ -1645,14 +1645,16 @@ fn check_from_member_unknown() {
 
 #[test]
 fn check_module_value() {
+    // Standard-library modules are first-class values (used by the official
+    // `test_errno.py` through `getattr(errno, name)`).
     let program = example("errors/module_value.py");
     let (code, stdout, stderr) = run(&["check", &program]);
 
-    assert_eq!(code, 1, "using a module as a value must exit with status 1");
+    assert_eq!(code, 0, "stdlib module values must be accepted:\n{stderr}");
     assert!(stdout.is_empty(), "pyx check must not write to stdout");
     assert!(
-        stderr.contains("module values"),
-        "missing module value diagnostic, got:\n{stderr}"
+        stderr.is_empty(),
+        "unexpected module value diagnostic:\n{stderr}"
     );
 }
 

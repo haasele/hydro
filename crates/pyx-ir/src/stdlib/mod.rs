@@ -85,6 +85,8 @@ pub static MODULES: &[&ModuleSpec] = &[
     &RE,
     &SOCKET,
     &ASYNCIO,
+    &ERRNO,
+    &UNITTEST,
 ];
 
 pub fn module(name: &str) -> Option<&'static ModuleSpec> {

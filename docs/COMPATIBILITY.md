@@ -36,17 +36,17 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
-| builtin/frozen | 52 | 5 | 47 |
-| pure | 174 | 17 | 157 |
+| builtin/frozen | 52 | 6 | 46 |
+| pure | 174 | 18 | 156 |
 | extension | 63 | 1 | 62 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 23 | 274 |
+| **Total** | 297 | 25 | 272 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:PYX0002 | 265 |
+| compile_error:PYX0002 | 263 |
 | cpython_failed | 9 |
 
 ## Modules by layer
@@ -89,7 +89,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `atexit` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'atexit' not found: not supported unless a sibling atexit.py exists |
 | `builtins` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'builtins' not found: not supported unless a sibling builtins.py e… |
 | `codecs` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists |
-| `errno` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'errno' not found: not supported unless a sibling errno.py exists |
+| `errno` | ok | ok | ok | - |
 | `faulthandler` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'faulthandler' not found: not supported unless a sibling faulthand… |
 | `gc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'gc' not found: not supported unless a sibling gc.py exists |
 | `genericpath` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'genericpath' not found: not supported unless a sibling genericpat… |
@@ -272,7 +272,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `turtledemo` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'turtledemo' not found: not supported unless a sibling turtledemo.… |
 | `types` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'types' not found: not supported unless a sibling types.py exists |
 | `typing` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'typing' not found: not supported unless a sibling typing.py exists |
-| `unittest` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'unittest' not found: not supported unless a sibling unittest.py e… |
+| `unittest` | ok | ok | ok | - |
 | `urllib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'urllib' not found: not supported unless a sibling urllib.py exists |
 | `uuid` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'uuid' not found: not supported unless a sibling uuid.py exists |
 | `venv` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'venv' not found: not supported unless a sibling venv.py exists |

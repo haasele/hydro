@@ -9,6 +9,7 @@ use pyx_ir::Builtin;
 use crate::container;
 use crate::exc::{self, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::iter;
+use crate::methods;
 use crate::modules;
 use crate::ops;
 use crate::value::{self, FunctionBody, NONE};
@@ -758,6 +759,32 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [iterable] => container::set_from(*iterable),
             _ => builtin_arity_error("set", "0 or 1", argc),
         },
+        // PyX has a single set representation; `frozenset` builds the same
+        // deduplicated value as `set`.
+        Builtin::Frozenset => match args {
+            [] => container::set_new(0, std::ptr::null()),
+            [iterable] => container::set_from(*iterable),
+            _ => builtin_arity_error("frozenset", "0 or 1", argc),
+        },
+        Builtin::Getattr => match args {
+            [object, name] => match value::as_str(*name) {
+                Some(name) => {
+                    if let Some(module) = value::as_module(*object) {
+                        modules::module_get_by_name(module.name(), name)
+                    } else {
+                        methods::getattr(*object, name.as_ptr(), name.len())
+                    }
+                }
+                None => exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "attribute name must be string, not '{}'",
+                        value::type_name(*name)
+                    ),
+                ),
+            },
+            _ => builtin_arity_error("getattr", "exactly 2", argc),
+        },
         Builtin::Range => match args {
             [stop] => range_new(ops::int_result(0), *stop, ops::int_result(1)),
             [start, stop] => range_new(*start, *stop, ops::int_result(1)),
@@ -1279,6 +1306,86 @@ mod tests {
         assert_eq!(
             pending_message(),
             "iter() takes exactly 1 argument(s) (0 given)"
+        );
+    }
+
+    fn builtin_call(builtin: Builtin, args: &[i64]) -> i64 {
+        call_builtin(builtin, args.len(), args.as_ptr())
+    }
+
+    fn set_integers(v: i64) -> Vec<i64> {
+        let mut items: Vec<i64> = value::as_set(v)
+            .expect("set result")
+            .iter()
+            .map(|&item| value::as_integer(item).expect("integer element"))
+            .collect();
+        items.sort_unstable();
+        items
+    }
+
+    #[test]
+    fn frozenset_builds_a_set() {
+        exc::init();
+        let empty = builtin_call(Builtin::Frozenset, &[]);
+        assert_eq!(value::type_name(empty), "set");
+        assert_eq!(rendered(empty), "set()");
+        assert!(!value::truthy(empty));
+
+        let source = value::list_new(vec![int(3), int(1), int(3)]);
+        let built = builtin_call(Builtin::Frozenset, &[source]);
+        assert_eq!(set_integers(built), vec![1, 3]);
+
+        let duplicated = builtin_call(Builtin::Frozenset, &[built]);
+        assert_eq!(set_integers(duplicated), vec![1, 3]);
+
+        assert_eq!(builtin_call(Builtin::Frozenset, &[source, source]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "frozenset() takes 0 or 1 argument(s) (2 given)"
+        );
+    }
+
+    #[test]
+    fn getattr_dispatches_module_values_and_objects() {
+        exc::init();
+        let math = value::module_value("math".to_string());
+        let pi = builtin_call(Builtin::Getattr, &[math, string("pi")]);
+        assert_eq!(value::as_float(pi), Some(std::f64::consts::PI));
+        assert!(!exc::pending());
+
+        assert_eq!(
+            builtin_call(Builtin::Getattr, &[math, string("missing")]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), exc::ATTRIBUTE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "module 'math' has no attribute 'missing'"
+        );
+
+        exc::init();
+        let namespace = value::namespace_new(vec![("answer".to_string(), int(42))]);
+        assert_eq!(
+            builtin_call(Builtin::Getattr, &[namespace, string("answer")]),
+            int(42)
+        );
+        assert!(!exc::pending());
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Getattr, &[math, int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "attribute name must be string, not 'int'"
+        );
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Getattr, &[math]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "getattr() takes exactly 2 argument(s) (1 given)"
         );
     }
 

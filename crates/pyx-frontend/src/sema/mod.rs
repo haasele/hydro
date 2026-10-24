@@ -272,6 +272,8 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
     ("isalpha", MethodSig::new(0, 0, &[], Type::Bool)),
     ("isalnum", MethodSig::new(0, 0, &[], Type::Bool)),
     ("isspace", MethodSig::new(0, 0, &[], Type::Bool)),
+    ("isupper", MethodSig::new(0, 0, &[], Type::Bool)),
+    ("islower", MethodSig::new(0, 0, &[], Type::Bool)),
     (
         "split",
         MethodSig::new(0, 2, &[ArgKind::Str, ArgKind::Int], Type::List),
@@ -753,6 +755,10 @@ impl<'a> Checker<'a> {
                         ),
                     );
                 }
+            }
+            HStmtKind::GlobalSet { value, .. } => {
+                // The global table stores dynamically typed values.
+                self.check_expr(value, f);
             }
             HStmtKind::Unpack { targets, value } => {
                 self.check_expr(value, f);
@@ -1375,6 +1381,15 @@ impl<'a> Checker<'a> {
                 } else {
                     self.force_any(expr.ty);
                 }
+            }
+            HExprKind::ModuleRef { .. } => {
+                // A module value has no static type; attributes read from it
+                // are resolved at runtime.
+                self.force_any(expr.ty);
+            }
+            HExprKind::GlobalGet { .. } => {
+                // Module-level values are dynamically typed at the read site.
+                self.force_any(expr.ty);
             }
             HExprKind::ExtensionAttr { .. } => self.force_any(expr.ty),
             HExprKind::GetAttr { object, .. } => {
@@ -2032,6 +2047,53 @@ impl<'a> Checker<'a> {
                 // runtime `TypeError`, mirroring CPython).
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
             }
+            Builtin::Frozenset => {
+                if count > 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("frozenset() takes 0 to 1 positional argument(s) ({count} given)"),
+                    );
+                    return;
+                }
+                if count == 1 {
+                    let (ty, arg_line, arg_col) = args[0];
+                    match self.inf.resolve(ty) {
+                        Ty::Var(_) => {
+                            // No static element information: iterate dynamically.
+                            let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
+                        }
+                        Ty::Concrete(Type::List)
+                        | Ty::Concrete(Type::Tuple)
+                        | Ty::Concrete(Type::Set)
+                        | Ty::Concrete(Type::Str)
+                        | Ty::Concrete(Type::Bytes)
+                        | Ty::Concrete(Type::Dict)
+                        | Ty::Concrete(Type::Any)
+                        | Ty::Concrete(Type::Never) => {}
+                        Ty::Concrete(_) => {
+                            self.error(arg_line, arg_col, "frozenset() argument must be iterable")
+                        }
+                    }
+                }
+                // PyX has one immutable set representation.
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Set));
+            }
+            Builtin::Getattr => {
+                if count != 2 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("getattr() takes exactly 2 arguments ({count} given)"),
+                    );
+                    return;
+                }
+                // The attribute name is resolved at runtime; a missing
+                // attribute raises `AttributeError`.
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
             Builtin::Range => {
                 if count == 0 || count > 3 {
                     self.error_code(
@@ -2595,6 +2657,15 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
             target: *target,
             value: emit_expr(value, inf),
         },
+        HStmtKind::GlobalSet {
+            module,
+            name,
+            value,
+        } => StmtKind::GlobalSet {
+            module: module.clone(),
+            name: name.clone(),
+            value: emit_expr(value, inf),
+        },
         HStmtKind::Unpack { targets, value } => StmtKind::Unpack {
             targets: targets.clone(),
             value: emit_expr(value, inf),
@@ -2809,6 +2880,13 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
             args: args.iter().map(|a| emit_expr(a, inf)).collect(),
         },
         HExprKind::ModuleAttr { module, name } => ExprKind::ModuleAttr {
+            module: module.clone(),
+            name: name.clone(),
+        },
+        HExprKind::ModuleRef { module } => ExprKind::ModuleRef {
+            module: module.clone(),
+        },
+        HExprKind::GlobalGet { module, name } => ExprKind::GlobalGet {
             module: module.clone(),
             name: name.clone(),
         },

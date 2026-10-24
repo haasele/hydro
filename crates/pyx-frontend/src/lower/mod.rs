@@ -103,6 +103,13 @@ pub enum HStmtKind {
         targets: Vec<LocalId>,
         value: HExpr,
     },
+    /// Store a module-level name after its module-body assignment so
+    /// functions of the same unit can read it back.
+    GlobalSet {
+        module: String,
+        name: String,
+        value: HExpr,
+    },
     AugAssign {
         target: LocalId,
         op: BinOp,
@@ -287,6 +294,15 @@ pub enum HExprKind {
         module: String,
         name: String,
     },
+    /// A builtin module used as a value (`m = errno`, `getattr(errno, ...)`).
+    ModuleRef {
+        module: String,
+    },
+    /// Read of a module-level name from inside a function.
+    GlobalGet {
+        module: String,
+        name: String,
+    },
     /// `extension.member` / an imported extension member used as a value.
     ///
     /// `path` is the compiled shared object resolved by the frontend and
@@ -373,7 +389,7 @@ impl<'a> FnDecl<'a> {
 /// A class header/body registered before any function body is lowered.
 #[derive(Clone, Debug)]
 struct ClassPlan {
-    /// Index of the single `Name` base in the `ClassDef` bases, if any.
+    /// Index of the single base expression in `ClassDef::bases`, if any.
     base: Option<usize>,
     /// Method name, function id and the index of its `FunctionDef` in the
     /// class body. Methods are lowered after their signatures are registered.
@@ -687,6 +703,14 @@ pub struct Lowerer<'a> {
     fid_base: FunctionId,
     /// Value bound to the module body's `__name__`.
     dunder_name: String,
+    /// Module-level names mirrored into the runtime global table. Only simple
+    /// assignment targets are tracked: those are the statements that emit a
+    /// [`HStmtKind::GlobalSet`].
+    global_names: HashSet<String>,
+    /// Global names actually read by a function or method of this unit. The
+    /// module body only mirrors those, so units whose functions never read a
+    /// module-level value gain no extra statements.
+    used_globals: HashSet<String>,
     /// `from X import f [as g]` bindings: name -> (module, function spec).
     imported_functions: HashMap<String, (&'static ModuleSpec, &'static FunctionSpec)>,
     /// `from X import c [as d]` bindings: name -> (module, constant spec).
@@ -736,6 +760,8 @@ impl<'a> Lowerer<'a> {
             imported_user_functions: HashMap::new(),
             fid_base: 0,
             dunder_name: "__main__".to_string(),
+            global_names: HashSet::new(),
+            used_globals: HashSet::new(),
             imported_functions: HashMap::new(),
             imported_constants: HashMap::new(),
             unpack_counter: 0,
@@ -815,6 +841,7 @@ impl<'a> Lowerer<'a> {
             module_locals.insert(name, id);
         }
         self.module_local_names = module_locals.keys().cloned().collect();
+        collect_global_names(&module.body, &mut self.global_names);
 
         // 3. Module-level imports bind global names. They are collected before
         //    any function body is lowered so imported names are visible inside
@@ -919,7 +946,7 @@ impl<'a> Lowerer<'a> {
                 continue;
             }
             if let Some(s) = self.lower_stmt(stmt, &mut fs) {
-                body.push(s);
+                self.push_lowered_stmt(stmt, s, &fs, &mut body);
             }
         }
         self.functions[0].body = {
@@ -1679,14 +1706,10 @@ impl<'a> Lowerer<'a> {
 
         let base = match s.bases.as_slice() {
             [] => None,
-            [base] => {
-                if matches!(base, ast::Expr::Name(_)) {
-                    Some(0)
-                } else {
-                    self.error_at(base.range(), "class base must be a simple name");
-                    None
-                }
-            }
+            // Any single base expression is accepted; the frontend lowers it
+            // like any other value (e.g. `unittest.TestCase` is a module
+            // attribute) and the runtime validates it at class creation.
+            [_] => Some(0),
             [_, second, ..] => {
                 self.error_at(second.range(), "multiple inheritance is not supported yet");
                 None
@@ -1937,10 +1960,59 @@ impl<'a> Lowerer<'a> {
         let mut out = Vec::new();
         for stmt in stmts {
             if let Some(h) = self.lower_stmt(stmt, fs) {
-                out.push(h);
+                self.push_lowered_stmt(stmt, h, fs, &mut out);
             }
         }
         out
+    }
+
+    /// Appends one lowered statement and, for module-body assignments, the
+    /// matching [`HStmtKind::GlobalSet`].
+    ///
+    /// The global store reads the just-assigned local, so the right-hand side
+    /// is evaluated exactly once even when it has side effects. Compound
+    /// module-level blocks (`if`, `for`, `try`, ...) lower through
+    /// [`Self::lower_block`], so conditional assignments are mirrored on the
+    /// path that actually runs.
+    fn push_lowered_stmt(
+        &mut self,
+        stmt: &ast::Stmt,
+        h: HStmt,
+        fs: &FuncState,
+        out: &mut Vec<HStmt>,
+    ) {
+        let target = if fs.is_module {
+            global_assignment_target(stmt, &h).filter(|(name, _)| self.used_globals.contains(name))
+        } else {
+            None
+        };
+        let (line, col) = (h.line, h.col);
+        out.push(h);
+        let Some((name, local)) = target else {
+            return;
+        };
+        let ty = match self
+            .functions
+            .get(fs.fid as usize)
+            .and_then(|function| function.locals.get(local as usize))
+        {
+            Some(local) => local.ty,
+            None => Ty::Concrete(Type::Any),
+        };
+        out.push(HStmt {
+            kind: HStmtKind::GlobalSet {
+                module: self.dunder_name.clone(),
+                name,
+                value: HExpr {
+                    kind: HExprKind::Local(local),
+                    ty,
+                    line,
+                    col,
+                },
+            },
+            line,
+            col,
+        });
     }
 
     fn lower_stmt(&mut self, stmt: &ast::Stmt, fs: &mut FuncState) -> Option<HStmt> {
@@ -3235,8 +3307,18 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
-                } else if self.module_aliases.contains_key(name)
-                    || self.user_module_aliases.contains_key(name)
+                } else if let Some(module) = self.module_aliases.get(name).copied() {
+                    // A stdlib module is a first-class runtime value; user and
+                    // extension modules are still rejected.
+                    HExpr {
+                        kind: HExprKind::ModuleRef {
+                            module: module.name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
+                } else if self.user_module_aliases.contains_key(name)
                     || self.extension_aliases.contains_key(name)
                 {
                     self.error_module_value(n.range, name);
@@ -3259,6 +3341,20 @@ impl<'a> Lowerer<'a> {
                     HExpr {
                         kind: HExprKind::BuiltinRef(builtin),
                         ty: Ty::Concrete(Type::Function),
+                        line,
+                        col,
+                    }
+                } else if self.global_names.contains(name) {
+                    // Module-level value read from a function. The module body
+                    // mirrors every assignment into the runtime global table,
+                    // keyed by this unit's module name.
+                    self.used_globals.insert(name.to_string());
+                    HExpr {
+                        kind: HExprKind::GlobalGet {
+                            module: self.dunder_name.clone(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
                         line,
                         col,
                     }
@@ -4280,6 +4376,28 @@ impl<'a> Lowerer<'a> {
             Callee::Function(*id)
         } else if let Some(builtin) = builtin_by_name(name) {
             Callee::Builtin(builtin)
+        } else if self.global_names.contains(name) {
+            // A module-level value (class or function) used as a callee.
+            self.used_globals.insert(name.to_string());
+            let (callee_line, callee_col) = self.span(name_expr.range);
+            let callee = HExpr {
+                kind: HExprKind::GlobalGet {
+                    module: self.dunder_name.clone(),
+                    name: name.to_string(),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line: callee_line,
+                col: callee_col,
+            };
+            return HExpr {
+                kind: HExprKind::IndirectCall {
+                    callee: Box::new(callee),
+                    args,
+                },
+                ty: self.infer.fresh(),
+                line,
+                col,
+            };
         } else {
             if !fs.is_module && self.module_local_names.contains(name) {
                 self.error_at_code(
@@ -4863,6 +4981,66 @@ fn module_refers_to_dunder_name(stmts: &[ast::Stmt]) -> bool {
 /// functions live in the function table instead of module locals. Nested
 /// function bodies and lambdas are never descended into: they have their own
 /// scopes.
+/// Collects the module-level simple-name assignment targets that are mirrored
+/// into the runtime global table. Function and class bodies are not entered;
+/// assignments inside module-level compound statements are, because those
+/// statements execute at module level.
+fn collect_global_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Assign(s) => {
+                if let [ast::Expr::Name(name)] = s.targets.as_slice() {
+                    out.insert(name.id.to_string());
+                }
+            }
+            ast::Stmt::AugAssign(s) => {
+                if let ast::Expr::Name(name) = &*s.target {
+                    out.insert(name.id.to_string());
+                }
+            }
+            ast::Stmt::If(s) => {
+                collect_global_names(&s.body, out);
+                collect_global_names(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_global_names(&s.body, out);
+                collect_global_names(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_global_names(&s.body, out);
+                collect_global_names(&s.orelse, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_global_names(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_global_names(&handler.body, out);
+                }
+                collect_global_names(&s.orelse, out);
+                collect_global_names(&s.finalbody, out);
+            }
+            ast::Stmt::With(s) => collect_global_names(&s.body, out),
+            _ => {}
+        }
+    }
+}
+
+/// The `(name, local)` pair mirrored by a module-body assignment, if the
+/// statement is a simple-name `Assign`/`AugAssign`.
+fn global_assignment_target(stmt: &ast::Stmt, h: &HStmt) -> Option<(String, LocalId)> {
+    match (stmt, &h.kind) {
+        (ast::Stmt::Assign(s), HStmtKind::Assign { target, .. }) => match s.targets.as_slice() {
+            [ast::Expr::Name(name)] => Some((name.id.to_string(), *target)),
+            _ => None,
+        },
+        (ast::Stmt::AugAssign(s), HStmtKind::AugAssign { target, .. }) => match &*s.target {
+            ast::Expr::Name(name) => Some((name.id.to_string(), *target)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool) {
     for stmt in stmts {
         match stmt {

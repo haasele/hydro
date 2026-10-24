@@ -240,11 +240,12 @@ fn unknown_module_attribute_value_is_rejected() {
 }
 
 #[test]
-fn module_values_are_rejected() {
+fn stdlib_module_values_are_accepted() {
+    // A standard-library module is a first-class value; user modules still
+    // report the "not supported yet" diagnostic (covered by the CLI tests).
     let source = "import math\nm = math\n";
     let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert!(diags[0].message.contains("module values"), "{diags:?}");
+    assert!(diags.is_empty(), "{diags:?}");
 }
 
 #[test]
@@ -3854,5 +3855,164 @@ fn extension_search_path_reads_environment_prefixes() {
         search,
         vec![windows_site, posix_site, conda_site],
         "Windows and POSIX site-packages layouts must both be discovered"
+    );
+}
+
+#[test]
+fn module_value_arguments_lower_to_module_refs() {
+    let source = "import errno\nx = getattr(errno, \"EDOM\")\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let x = assigned(&hir, "x");
+    let HExprKind::Call { callee, args } = &x.kind else {
+        panic!("expected a direct builtin call, got {x:?}");
+    };
+    assert_eq!(*callee, Callee::Builtin(Builtin::Getattr));
+    assert_eq!(args.len(), 2);
+    match &args[0].kind {
+        HExprKind::ModuleRef { module } => assert_eq!(module, "errno"),
+        other => panic!("expected a module reference, got {other:?}"),
+    }
+    match &args[1].kind {
+        HExprKind::Const(pyx_ir::Const::Str(name)) => assert_eq!(name, "EDOM"),
+        other => panic!("expected a string constant, got {other:?}"),
+    }
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn module_alias_still_rejects_user_module_values() {
+    let source = "import helper\nx = helper\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "helper".to_string(),
+        UserModule {
+            name: "helper".to_string(),
+            exports: HashMap::new(),
+        },
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    let _ = hir;
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0]
+            .message
+            .contains("module values are not supported yet"),
+        "{:?}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn unittest_test_case_is_accepted_as_a_class_base() {
+    let source =
+        "import unittest\nclass T(unittest.TestCase):\n    def test_errno(self):\n        pass\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::ClassDef {
+        base: Some(base), ..
+    } = &hir.functions[0].body[0].kind
+    else {
+        panic!(
+            "expected a class with a base, got {:?}",
+            hir.functions[0].body[0].kind
+        );
+    };
+    match &base.kind {
+        HExprKind::ModuleAttr { module, name } => {
+            assert_eq!((module.as_str(), name.as_str()), ("unittest", "TestCase"));
+        }
+        other => panic!("expected a module attribute base, got {other:?}"),
+    }
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn multiple_class_bases_are_still_rejected() {
+    let source = "class T(A, B):\n    pass\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0].message.contains("multiple inheritance"),
+        "{:?}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn module_assignment_emits_a_global_set_after_the_local_assign() {
+    let source = "x = 1\ndef f():\n    return x\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = &hir.functions[0].body;
+    assert_eq!(body.len(), 2, "{body:?}");
+    let HStmtKind::Assign { target, .. } = &body[0].kind else {
+        panic!("expected the local assignment, got {:?}", body[0].kind);
+    };
+    let HStmtKind::GlobalSet {
+        module,
+        name,
+        value,
+    } = &body[1].kind
+    else {
+        panic!("expected a global store, got {:?}", body[1].kind);
+    };
+    assert_eq!(module, "__main__");
+    assert_eq!(name, "x");
+    match &value.kind {
+        HExprKind::Local(local) => assert_eq!(local, target),
+        other => panic!("expected a read of the just-assigned local, got {other:?}"),
+    }
+}
+
+#[test]
+fn nested_module_level_assignments_are_mirrored_to_globals() {
+    let source = "if True:\n    x = 1\ndef f():\n    return x\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::If { then_body, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected an if statement");
+    };
+    assert_eq!(then_body.len(), 2, "{then_body:?}");
+    assert!(matches!(
+        then_body[1].kind,
+        HStmtKind::GlobalSet { ref name, .. } if name == "x"
+    ));
+}
+
+#[test]
+fn functions_read_module_level_names_as_globals() {
+    let source = "value = 41\ndef f():\n    return value\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = &function(&hir, "f").body;
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    match &value.kind {
+        HExprKind::GlobalGet { module, name } => {
+            assert_eq!((module.as_str(), name.as_str()), ("__main__", "value"));
+        }
+        other => panic!("expected a global read, got {other:?}"),
+    }
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn local_bindings_shadow_module_level_names() {
+    let source = "value = 41\ndef f(value):\n    return value\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = &function(&hir, "f").body;
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(
+        matches!(value.kind, HExprKind::Local(_)),
+        "a parameter must shadow the module global, got {:?}",
+        value.kind
     );
 }

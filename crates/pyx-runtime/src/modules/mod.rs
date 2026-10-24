@@ -23,9 +23,11 @@ use pyx_ir::{PYTHON_VERSION, PYTHON_VERSION_STRING};
 pub(crate) mod argparse;
 pub(crate) mod asyncio;
 pub(crate) mod collections;
+pub(crate) mod errno;
 pub(crate) mod extension;
 pub(crate) mod re;
 pub(crate) mod socket;
+pub(crate) mod unittest;
 
 use crate::builtins;
 use crate::exc::{
@@ -276,7 +278,21 @@ pub(crate) fn module_get(
     module_get_named(&module, &name)
 }
 
+/// Resolves `module.name` for a module value receiver (`getattr(module, name)`
+/// in `crate::methods`/`crate::builtins`).
+pub(crate) fn module_get_by_name(module: &str, name: &str) -> i64 {
+    module_get_named(module, name)
+}
+
 fn module_get_named(module: &str, name: &str) -> i64 {
+    // `errno` attributes are platform-defined names resolved on demand; the
+    // static spec table cannot enumerate them.
+    if module == "errno" {
+        return errno::lookup(name);
+    }
+    if module == "unittest" && name == "TestCase" {
+        return unittest::test_case();
+    }
     if let Some(spec) = stdlib::function(module, name) {
         let module_name = stdlib::module(module).map(|m| m.name).unwrap_or("<module>");
         return value::native_function_new(module_name, spec.name, spec.max_args);
@@ -380,6 +396,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "re" => re::call(function, args),
         "socket" => socket::call(function, args),
         "asyncio" => asyncio::call(function, args),
+        "unittest" => unittest::call(function, args),
         _ => missing_attribute(module, function),
     }
 }
