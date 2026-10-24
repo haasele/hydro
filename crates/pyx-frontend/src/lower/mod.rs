@@ -412,40 +412,83 @@ fn module_member(module: &'static ModuleSpec, name: &str) -> Option<ModuleMember
         .map(ModuleMember::Constant)
 }
 
-/// Finds a compiled extension for a single-segment module name in `dir`.
-///
-/// Only `<name>.so`, `<name>.abi3.so` and other `<name>.*.so` siblings are
-/// considered. The result is an absolute path; dotted or path-like names are
-/// never extensions.
-fn find_extension_in(dir: &Path, name: &str) -> Option<PathBuf> {
-    if name.is_empty() || name.chars().any(|c| matches!(c, '.' | '/' | '\\')) {
-        return None;
-    }
-    let candidate = extension_candidate(dir, name)?;
-    Some(fs::canonicalize(&candidate).unwrap_or(candidate))
+/// Result of looking up a compiled extension module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExtensionLookup {
+    /// A loadable shared object at this canonical absolute path.
+    Found(PathBuf),
+    /// A shared object exists, but its wheel ABI tag cannot be loaded.
+    Incompatible { path: PathBuf, reason: String },
+    /// No shared object with a supported suffix exists.
+    Missing,
 }
 
-/// Finds a compiled extension for `name` visible to `source`: the source
+/// Looks up a compiled extension for `name` in `dir`.
+///
+/// `name` may be dotted: `pkg.sub_ext` searches `<dir>/pkg/sub_ext...so`. Only
+/// `<leaf>.so`, `<leaf>.abi3.so` and `<leaf>.cpython-314-<platform>.so` are
+/// loadable; any other `<leaf>.*.so` is reported as incompatible instead of
+/// being silently preferred.
+fn extension_lookup_in(dir: &Path, name: &str) -> ExtensionLookup {
+    let mut relative = PathBuf::new();
+    for segment in name.split('.') {
+        if segment.is_empty() || segment.contains(['/', '\\']) {
+            return ExtensionLookup::Missing;
+        }
+        relative.push(segment);
+    }
+    if relative.as_os_str().is_empty() {
+        return ExtensionLookup::Missing;
+    }
+    extension_candidate(dir, &relative)
+}
+
+/// Looks up a compiled extension for `name` visible to `source`: the source
 /// file's directory first, then the environment-configured search path (see
 /// [`extension_search_paths_from`]).
-pub(crate) fn find_extension_for_source(source: &Path, name: &str) -> Option<PathBuf> {
-    find_extension_in_search_dirs(source, &extension_search_paths(), name)
+pub(crate) fn find_extension_for_source(source: &Path, name: &str) -> ExtensionLookup {
+    lookup_extension_in_search_dirs(source, &extension_search_paths(), name)
 }
 
-/// Finds `name` in the source file's directory, then in each of `search_dirs`.
+/// Looks up `name` in the source file's directory, then in each of
+/// `search_dirs`.
+///
+/// The first directory that contains a matching shared object decides the
+/// result, mirroring source-file precedence; an incompatible candidate is
+/// never skipped in favour of a later directory.
 ///
 /// `search_dirs` is ordinarily the list produced by
 /// [`extension_search_paths_from`]; taking it as an argument keeps the lookup
 /// policy testable without touching the process environment.
+fn lookup_extension_in_search_dirs(
+    source: &Path,
+    search_dirs: &[PathBuf],
+    name: &str,
+) -> ExtensionLookup {
+    let parent = source
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for dir in std::iter::once(parent).chain(search_dirs.iter().map(PathBuf::as_path)) {
+        match extension_lookup_in(dir, name) {
+            ExtensionLookup::Missing => continue,
+            found => return found,
+        }
+    }
+    ExtensionLookup::Missing
+}
+
+/// Test-only convenience wrapper preserving the old `Option` shape.
+#[cfg(test)]
 fn find_extension_in_search_dirs(
     source: &Path,
     search_dirs: &[PathBuf],
     name: &str,
 ) -> Option<PathBuf> {
-    let parent = source.parent().unwrap_or_else(|| Path::new("."));
-    std::iter::once(parent)
-        .chain(search_dirs.iter().map(PathBuf::as_path))
-        .find_map(|dir| find_extension_in(dir, name))
+    match lookup_extension_in_search_dirs(source, search_dirs, name) {
+        ExtensionLookup::Found(path) => Some(path),
+        ExtensionLookup::Incompatible { .. } | ExtensionLookup::Missing => None,
+    }
 }
 
 /// Directories searched by [`find_extension_for_source`], in order.
@@ -525,35 +568,76 @@ fn prefix_site_packages(prefix: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Picks the shared object for `name` in `dir`.
+/// Picks the shared object for `name` (a relative path without `.so`) in `dir`.
 ///
-/// `<name>.so` wins over `<name>.abi3.so`, which wins over any other
-/// `<name>.*.so` (first in sorted order).
-fn extension_candidate(dir: &Path, name: &str) -> Option<PathBuf> {
-    let direct = dir.join(format!("{name}.so"));
+/// A plain `<name>.so` wins over `<name>.abi3.so`, which wins over any
+/// `<name>.cpython-314-<platform>.so` (first in sorted order). Every other
+/// `<name>.*.so` tag is incompatible: PyX cannot load it and reports the
+/// offending file instead of falling back to it.
+fn extension_candidate(dir: &Path, name: &Path) -> ExtensionLookup {
+    let stem = dir.join(name);
+    let direct = stem.with_extension("so");
     if direct.is_file() {
-        return Some(direct);
+        return ExtensionLookup::Found(canonical(direct));
     }
-    let abi3 = dir.join(format!("{name}.abi3.so"));
+    let abi3 = stem.with_extension("abi3.so");
     if abi3.is_file() {
-        return Some(abi3);
+        return ExtensionLookup::Found(canonical(abi3));
     }
-    let prefix = format!("{name}.");
-    let mut matches = Vec::new();
-    for entry in fs::read_dir(dir).ok()?.flatten() {
+
+    let Some(parent) = stem.parent() else {
+        return ExtensionLookup::Missing;
+    };
+    let Some(leaf) = stem.file_name().and_then(|leaf| leaf.to_str()) else {
+        return ExtensionLookup::Missing;
+    };
+    let prefix = format!("{leaf}.");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return ExtensionLookup::Missing;
+    };
+    let mut compatible = Vec::new();
+    let mut incompatible = Vec::new();
+    for entry in entries.flatten() {
         let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             continue;
         };
-        if file_name.starts_with(&prefix) && file_name.ends_with(".so") {
-            let path = entry.path();
-            if path.is_file() {
-                matches.push(path);
-            }
+        let Some(tag) = file_name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".so"))
+        else {
+            continue;
+        };
+        if tag.is_empty() {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        match tag.strip_prefix("cpython-314-") {
+            Some(platform) if !platform.is_empty() => compatible.push((tag.to_string(), path)),
+            _ => incompatible.push((tag.to_string(), path)),
         }
     }
-    matches.sort();
-    matches.into_iter().next()
+    compatible.sort();
+    if let Some((_, path)) = compatible.into_iter().next() {
+        return ExtensionLookup::Found(canonical(path));
+    }
+    incompatible.sort();
+    if let Some((tag, path)) = incompatible.into_iter().next() {
+        return ExtensionLookup::Incompatible {
+            path: canonical(path),
+            reason: format!(
+                "unsupported extension ABI tag '{tag}' (loadable suffixes are `.so`, `.abi3.so` and `.cpython-314-<platform>.so`)"
+            ),
+        };
+    }
+    ExtensionLookup::Missing
+}
+
+fn canonical(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path).unwrap_or(path)
 }
 
 const SUPPORTED_MODULES_HELP: &str = "supported modules: math, io, functools, operator, time, sys, json, os, os.path, _thread, threading, queue, multiprocessing, pickle";
@@ -971,9 +1055,25 @@ impl<'a> Lowerer<'a> {
                 .insert(binding.to_string(), imported.to_string());
             return;
         }
-        if let Some(path) = self.find_extension(imported) {
-            self.extension_aliases.insert(binding.to_string(), path);
-            return;
+        match self.find_extension(imported) {
+            ExtensionLookup::Found(path) => {
+                if alias.asname.is_none() && imported.contains('.') {
+                    self.error_at_code(
+                        alias.range,
+                        codes::UNSUPPORTED,
+                        "dotted extension imports require an alias",
+                    );
+                    return;
+                }
+                self.extension_aliases
+                    .insert(binding.to_string(), path.to_string_lossy().into_owned());
+                return;
+            }
+            ExtensionLookup::Incompatible { path, reason } => {
+                self.error_incompatible_extension(alias.range, &path, &reason);
+                return;
+            }
+            ExtensionLookup::Missing => {}
         }
         self.error_unsupported_module(alias.range, imported);
     }
@@ -1000,12 +1100,21 @@ impl<'a> Lowerer<'a> {
             Some(module) => module,
             None => {
                 let Some(user) = self.user_modules.get(imported).cloned() else {
-                    if let Some(path) = self.find_extension(imported) {
-                        self.collect_extension_members(s, imported, &path);
-                        return;
+                    match self.find_extension(imported) {
+                        ExtensionLookup::Found(path) => {
+                            let path = path.to_string_lossy().into_owned();
+                            self.collect_extension_members(s, imported, &path);
+                            return;
+                        }
+                        ExtensionLookup::Incompatible { path, reason } => {
+                            self.error_incompatible_extension(s.range, &path, &reason);
+                            return;
+                        }
+                        ExtensionLookup::Missing => {
+                            self.error_unsupported_module(s.range, imported);
+                            return;
+                        }
                     }
-                    self.error_unsupported_module(s.range, imported);
-                    return;
                 };
                 for alias in &s.names {
                     let member = alias.name.as_str();
@@ -1065,12 +1174,21 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Finds a compiled extension for a single-segment module name.
-    ///
-    /// Dotted names are never extensions.
-    fn find_extension(&self, name: &str) -> Option<String> {
+    /// Looks up a compiled extension for `name` (possibly dotted).
+    fn find_extension(&self, name: &str) -> ExtensionLookup {
         find_extension_for_source(Path::new(self.filename), name)
-            .map(|path| path.to_string_lossy().into_owned())
+    }
+
+    /// Reports a shared object whose wheel ABI tag PyX cannot load.
+    fn error_incompatible_extension(&mut self, range: TextRange, path: &Path, reason: &str) {
+        self.error_at_code(
+            range,
+            codes::UNSUPPORTED,
+            format!(
+                "compiled extension '{}' is incompatible: {reason}",
+                path.display()
+            ),
+        );
     }
 
     /// Records `from ext import member [as x]` bindings. Star imports are

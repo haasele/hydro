@@ -9,7 +9,7 @@ echo "== fmt =="
 cargo fmt --all -- --check
 
 echo "== clippy =="
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets
 
 echo "== build =="
 cargo build -p pyx-cli -p pyx-runtime

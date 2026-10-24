@@ -3166,6 +3166,9 @@ impl ExtensionDir {
 
     fn add_extension(&self, name: &str) -> PathBuf {
         let path = self.path.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create extension dir");
+        }
         fs::write(&path, b"").expect("write extension stub");
         path
     }
@@ -3331,10 +3334,12 @@ def f(ext):
 
 #[test]
 fn extension_type_suffixes_are_discovered() {
-    // `<name>.so` is preferred over other suffixes; a suffixed wheel-style
-    // name (`<name>.*.so`) is used when no plain `.so` exists.
+    // `<name>.so` is preferred over other suffixes; a matching wheel-style
+    // name (`<name>.cpython-314-<platform>.so`) is used when no plain `.so`
+    // exists.
     let dir = ExtensionDir::new("suffixes");
-    let suffixed = dir.add_extension("mod_ext.cpython-312-x86_64-linux-gnu.so");
+    let suffixed = dir.add_extension("mod_ext.cpython-314-x86_64-linux-gnu.so");
+    dir.add_extension("mod_ext.cpython-312-x86_64-linux-gnu.so");
 
     let source = "import mod_ext\nx = mod_ext.add(1, 2)\n";
     let (hir, _, diags) = lower_source_in(&dir.path, source);
@@ -3426,6 +3431,156 @@ fn dotted_extension_names_remain_diagnostics() {
     assert_eq!(
         diags[0].message,
         "module 'mod_ext.sub' is not supported yet"
+    );
+}
+
+#[test]
+fn dotted_extension_alias_and_members_are_lowered() {
+    let dir = ExtensionDir::new("dotted-import");
+    let so = dir.add_extension("pkg/sub_ext.abi3.so");
+    let expected = fs::canonicalize(&so).expect("canonical extension path");
+    let expected_path = expected.to_string_lossy().into_owned();
+
+    let source = r#"import pkg.sub_ext as e
+from pkg.sub_ext import add as plus, tag
+a = e.add(1, 2)
+b = plus(3, 4)
+c = tag
+d = e.add
+"#;
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    assert_eq!(
+        extension_callee(assigned(&hir, "a")),
+        (expected_path.as_str(), "add")
+    );
+    assert_eq!(
+        extension_callee(assigned(&hir, "b")),
+        (expected_path.as_str(), "add")
+    );
+    for (binding, member) in [("c", "tag"), ("d", "add")] {
+        match &assigned(&hir, binding).kind {
+            HExprKind::ExtensionAttr {
+                path,
+                member: got_member,
+            } => {
+                assert_eq!(
+                    (path.as_str(), got_member.as_str()),
+                    (expected_path.as_str(), member)
+                );
+            }
+            other => panic!("expected an extension attribute, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn dotted_extension_import_without_alias_is_rejected() {
+    let dir = ExtensionDir::new("dotted-no-alias");
+    dir.add_extension("pkg/sub_ext.abi3.so");
+    let source = "import pkg.sub_ext\n";
+    let (_, _, diags) = lower_source_in(&dir.path, source);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert_eq!(
+        diags[0].message,
+        "dotted extension imports require an alias"
+    );
+}
+
+#[test]
+fn missing_dotted_extension_module_still_diagnoses() {
+    let dir = ExtensionDir::new("dotted-missing");
+    dir.add_extension("pkg/sub_ext.abi3.so");
+    let source = "import pkg.missing as m\n";
+    let (_, _, diags) = lower_source_in(&dir.path, source);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert_eq!(
+        diags[0].message,
+        "module 'pkg.missing' is not supported yet"
+    );
+}
+
+#[test]
+fn incompatible_wheel_tags_are_rejected() {
+    let dir = ExtensionDir::new("abi-policy");
+    dir.add_extension("bad.cpython-312-x86_64-linux-gnu.so");
+
+    let source = "import bad as b\n";
+    let (_, _, diags) = lower_source_in(&dir.path, source);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert!(
+        diags[0].message.contains("cpython-312-x86_64-linux-gnu"),
+        "{diags:?}"
+    );
+    assert!(
+        diags[0]
+            .message
+            .contains("bad.cpython-312-x86_64-linux-gnu.so"),
+        "{diags:?}"
+    );
+
+    let dir = ExtensionDir::new("abi-policy-from");
+    dir.add_extension("bad.pp310-pypy310_pp73-x86_64-linux-gnu.so");
+    let source = "from bad import add\n";
+    let (_, _, diags) = lower_source_in(&dir.path, source);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert!(diags[0].message.contains("pp310"), "{diags:?}");
+}
+
+#[test]
+fn cpython_314_and_plain_suffixes_are_preferred_in_order() {
+    let dir = ExtensionDir::new("abi-order");
+    let suffixed = dir.add_extension("mod_ext.cpython-314-aarch64-linux-gnu.so");
+    let abi3 = dir.add_extension("mod_ext.abi3.so");
+    let plain = dir.add_extension("mod_ext.so");
+
+    let (hir, _, diags) = lower_source_in(&dir.path, "import mod_ext\nx = mod_ext.add(1, 2)\n");
+    assert!(diags.is_empty(), "{diags:?}");
+    let expected_path = fs::canonicalize(&plain)
+        .expect("canonical extension path")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        extension_callee(assigned(&hir, "x")).0,
+        expected_path.as_str()
+    );
+
+    fs::remove_file(&plain).expect("remove plain stub");
+    let (hir, _, diags) = lower_source_in(&dir.path, "import mod_ext\nx = mod_ext.add(1, 2)\n");
+    assert!(diags.is_empty(), "{diags:?}");
+    let expected_path = fs::canonicalize(&abi3)
+        .expect("canonical extension path")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        extension_callee(assigned(&hir, "x")).0,
+        expected_path.as_str()
+    );
+
+    fs::remove_file(&abi3).expect("remove abi3 stub");
+    let (hir, _, diags) = lower_source_in(&dir.path, "import mod_ext\nx = mod_ext.add(1, 2)\n");
+    assert!(diags.is_empty(), "{diags:?}");
+    let expected_path = fs::canonicalize(&suffixed)
+        .expect("canonical extension path")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        extension_callee(assigned(&hir, "x")).0,
+        expected_path.as_str()
+    );
+
+    // An incompatible tag next to a compatible one never wins.
+    dir.add_extension("mod_ext.cpython-312-x86_64-linux-gnu.so");
+    let (hir, _, diags) = lower_source_in(&dir.path, "import mod_ext\nx = mod_ext.add(1, 2)\n");
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(
+        extension_callee(assigned(&hir, "x")).0,
+        expected_path.as_str()
     );
 }
 

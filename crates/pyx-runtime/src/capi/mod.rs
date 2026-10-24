@@ -76,10 +76,26 @@ const METHOD_FLAGS: c_int = METH_VARARGS | METH_KEYWORDS | METH_NOARGS | METH_O;
 /// declared limit; bounding it keeps a corrupt table from scanning forever.
 const MAX_METHODS: usize = 4096;
 
+/// Upper bound on the entries read from a `PyModuleDef_Slot` table. CPython
+/// has no declared limit; bounding it keeps a corrupt table from scanning
+/// forever.
+const MAX_MODULE_SLOTS: usize = 64;
+
+/// `Py_mod_*` slot identifiers from CPython's `moduleobject.h` (stable ABI).
+const PY_MOD_CREATE: c_int = 1;
+const PY_MOD_EXEC: c_int = 2;
+const PY_MOD_MULTIPLE_INTERPRETERS: c_int = 3;
+const PY_MOD_GIL: c_int = 4;
+
+/// Largest accepted `Py_mod_multiple_interpreters` / `Py_mod_gil` values;
+/// both policies use small enum values starting at zero.
+const PY_MOD_MULTIPLE_INTERPRETERS_PER_INTERPRETER_GIL_SUPPORTED: c_int = 2;
+const PY_MOD_GIL_NOT_USED: c_int = 1;
+
 /// Mirrors `PyModuleDef` from CPython 3.14 on x86_64, including
 /// `PyModuleDef_Base` (`ob_refcnt`, `ob_type`, `m_init`, `m_index`,
 /// `m_copy`) and the trailing name/doc/size/methods/slots/traverse/clear/free
-/// fields. Only the name and method fields are inspected.
+/// fields. The name, method and slot fields are inspected.
 #[repr(C)]
 #[allow(dead_code)]
 pub(crate) struct PyModuleDefMirror {
@@ -92,11 +108,28 @@ pub(crate) struct PyModuleDefMirror {
     m_doc: *const c_char,
     m_size: isize,
     m_methods: *mut PyMethodDefMirror,
-    m_slots: *mut c_void,
+    m_slots: *mut PyModuleDefSlotMirror,
     m_traverse: *mut c_void,
     m_clear: *mut c_void,
     m_free: *mut c_void,
 }
+
+/// Mirrors `PyModuleDef_Slot`: `{ slot, value }` followed by the padding that
+/// aligns `value` to a pointer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct PyModuleDefSlotMirror {
+    slot: c_int,
+    value: *mut c_void,
+}
+
+// CPython 3.14 x86_64: one `int`, four bytes of padding, one pointer.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<PyModuleDefSlotMirror>() == 16);
+    assert!(std::mem::offset_of!(PyModuleDefSlotMirror, slot) == 0);
+    assert!(std::mem::offset_of!(PyModuleDefSlotMirror, value) == 8);
+};
 
 /// Mirrors `PyMethodDef`: `{ ml_name, ml_meth, ml_flags, ml_doc }`.
 #[repr(C)]
@@ -242,6 +275,13 @@ enum ShimKind {
         name: String,
     },
     Module(u64),
+    /// A `PyModuleDef` wrapped by `PyModuleDef_Init`, holding the
+    /// extension-owned definition address (stored as `usize` so every shim
+    /// object stays `Send`/`Sync`) until the loader creates the module and
+    /// runs its exec slots.
+    ModuleDef {
+        def: usize,
+    },
     Error,
 }
 
@@ -496,6 +536,9 @@ fn object_to_value_at(
         ShimKind::Module(_) => {
             Err("extension returned a module object, which is not supported".to_string())
         }
+        ShimKind::ModuleDef { .. } => {
+            Err("extension returned a module definition object, which is not supported".to_string())
+        }
         ShimKind::Capsule { ptr, name, .. } => Ok(ShimValue::Capsule {
             ptr: *ptr,
             name: name
@@ -635,7 +678,7 @@ fn as_predicate(object: *mut ShimObject) -> Result<bool, String> {
         ShimKind::Dict(pairs) => !pairs.is_empty(),
         ShimKind::Capsule { .. } => true,
         ShimKind::ErrorType { .. } => true,
-        ShimKind::Module(_) | ShimKind::Error => true,
+        ShimKind::Module(_) | ShimKind::ModuleDef { .. } | ShimKind::Error => true,
     })
 }
 
@@ -855,6 +898,9 @@ struct ModuleEntry {
 struct Registry {
     next_id: u64,
     modules: HashMap<u64, ModuleEntry>,
+    /// Successfully loaded modules keyed by shared-object path. A path is
+    /// loaded once per process, so multi-phase exec slots run exactly once.
+    by_path: HashMap<String, u64>,
 }
 
 impl Default for Registry {
@@ -863,6 +909,7 @@ impl Default for Registry {
             // Module ids start at 1; 0 is never a valid module.
             next_id: 1,
             modules: HashMap::new(),
+            by_path: HashMap::new(),
         }
     }
 }
@@ -884,13 +931,13 @@ fn read_module_definition(
     definition: *mut PyModuleDefMirror,
 ) -> Result<(String, Vec<MethodSpec>), String> {
     if definition.is_null() {
-        return Err("PyModule_Create2: module definition is NULL".to_string());
+        return Err("extension module definition is NULL".to_string());
     }
     // SAFETY: the extension owns a live `PyModuleDef` for at least the
     // duration of its `PyInit_*` call; the mirror matches CPython 3.14 x86_64.
     let definition = unsafe { &*definition };
     if definition.m_name.is_null() {
-        return Err("PyModule_Create2: module definition has no name".to_string());
+        return Err("extension module definition has no name".to_string());
     }
     // SAFETY: `m_name` is a NUL-terminated C string by the CPython contract.
     let name = unsafe { CStr::from_ptr(definition.m_name) }
@@ -931,6 +978,145 @@ fn read_module_definition(
     Ok((name, methods))
 }
 
+/// Parses `definition`, allocates a module shim and registers it.
+///
+/// Shared by `PyModule_Create2` (single-phase) and the multi-phase loader so
+/// both forms produce identical attribute and method behaviour.
+fn create_module_from_definition(
+    definition: *mut PyModuleDefMirror,
+) -> Result<(u64, *mut ShimObject), String> {
+    let (name, methods) = read_module_definition(definition)?;
+    let id = allocate_module_id();
+    let module_object = new_object(ShimKind::Module(id));
+
+    let mut attrs = HashMap::with_capacity(methods.len());
+    for (index, method) in methods.iter().enumerate() {
+        // `MAX_METHODS` keeps this conversion trivially in range.
+        let method_index = index as u32;
+        attrs.insert(
+            method.name.clone(),
+            ShimAttr::Callable(ShimCallable {
+                module: id,
+                method: method_index,
+            }),
+        );
+    }
+
+    registry_lock().modules.insert(
+        id,
+        ModuleEntry {
+            name,
+            handle: 0,
+            module_object: module_object as usize,
+            attrs,
+            methods,
+        },
+    );
+    Ok((id, module_object))
+}
+
+/// Reads a definition's module name for diagnostics, tolerating a missing
+/// name (which `read_module_definition` rejects before slots run).
+fn definition_name(definition: &PyModuleDefMirror) -> String {
+    if definition.m_name.is_null() {
+        "<unnamed>".to_string()
+    } else {
+        read_c_string(definition.m_name)
+    }
+}
+
+/// Signature of a `Py_mod_exec` slot callback.
+type ModuleExec = unsafe extern "C" fn(*mut ShimObject) -> c_int;
+
+/// Runs the `Py_mod_exec` callbacks declared by a multi-phase definition.
+///
+/// The NULL-terminated `m_slots` array is walked at most [`MAX_MODULE_SLOTS`]
+/// times. Policy-only slots are validated rather than silently ignored, and
+/// `Py_mod_create` is outside this host's model, so both are reported as
+/// errors. A failing callback aborts the load with its pending error.
+fn run_module_slots(
+    definition: *mut PyModuleDefMirror,
+    module: *mut ShimObject,
+) -> Result<(), String> {
+    if definition.is_null() {
+        return Err("PyModuleDef_Init: module definition is NULL".to_string());
+    }
+    // SAFETY: the extension owns a live `PyModuleDef` for at least the
+    // duration of its initialisation; the mirror matches CPython 3.14 x86_64.
+    let definition = unsafe { &*definition };
+    if definition.m_slots.is_null() {
+        return Ok(());
+    }
+    let name = definition_name(definition);
+    let mut cursor = definition.m_slots;
+    for index in 0..MAX_MODULE_SLOTS {
+        // SAFETY: `m_slots` points at a NULL-terminated array of
+        // `PyModuleDef_Slot`, so the current entry is readable.
+        let slot = unsafe { &*cursor };
+        if slot.slot == 0 {
+            return Ok(());
+        }
+        match slot.slot {
+            PY_MOD_EXEC => {
+                if slot.value.is_null() {
+                    return Err(format!(
+                        "module definition '{name}' has a NULL Py_mod_exec callback"
+                    ));
+                }
+                // SAFETY: a `Py_mod_exec` value is `int (*)(PyObject *)`.
+                let callback: ModuleExec = unsafe { std::mem::transmute(slot.value) };
+                clear_error();
+                // SAFETY: `module` is a live module shim and the extension
+                // owns the callback for the process lifetime.
+                let status = unsafe { callback(module) };
+                if status != 0 {
+                    return Err(take_error().unwrap_or_else(|| {
+                        format!(
+                            "Py_mod_exec callback {index} of module definition '{name}' failed with status {status}"
+                        )
+                    }));
+                }
+                // A successful callback that left an error behind is an
+                // extension bug; do not leak it into later shim calls.
+                clear_error();
+            }
+            PY_MOD_MULTIPLE_INTERPRETERS => {
+                let value = slot.value as isize;
+                if !(0..=PY_MOD_MULTIPLE_INTERPRETERS_PER_INTERPRETER_GIL_SUPPORTED as isize)
+                    .contains(&value)
+                {
+                    return Err(format!(
+                        "module definition '{name}' has an invalid Py_mod_multiple_interpreters value {value}"
+                    ));
+                }
+            }
+            PY_MOD_GIL => {
+                let value = slot.value as isize;
+                if !(0..=PY_MOD_GIL_NOT_USED as isize).contains(&value) {
+                    return Err(format!(
+                        "module definition '{name}' has an invalid Py_mod_gil value {value}"
+                    ));
+                }
+            }
+            PY_MOD_CREATE => {
+                return Err(format!(
+                    "module definition '{name}' uses Py_mod_create, which is not supported"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "module definition '{name}' uses unsupported Py_mod slot {other}"
+                ));
+            }
+        }
+        // SAFETY: advancing one entry inside the NULL-terminated table.
+        cursor = unsafe { cursor.add(1) };
+    }
+    Err(format!(
+        "module definition '{name}' has more than {MAX_MODULE_SLOTS} slots without a zero terminator"
+    ))
+}
+
 /// Validates that `object` is a shim module object and returns its id.
 fn module_id(object: *mut ShimObject) -> Result<u64, String> {
     if object.is_null() {
@@ -961,16 +1147,26 @@ fn add_attribute(object: *mut ShimObject, name: String, attribute: ShimAttr) -> 
 /// Loads an extension shared object and runs its `PyInit_<init_name>`.
 ///
 /// `init_name` is the bare module name (`foo`, not `PyInit_foo`). The
-/// `dlopen` handle is kept open for the process lifetime. Returns the module
-/// id used by [`get_attr`] and [`call_method`].
+/// `dlopen` handle is kept open for the process lifetime, and successful loads
+/// are cached by path so later attribute accesses reuse the same module.
+/// Returns the module id used by [`get_attr`] and [`call_method`].
+///
+/// A single-phase initializer returns a module object from
+/// `PyModule_Create2`; a multi-phase one returns a definition wrapped by
+/// [`PyModuleDef_Init`], in which case the module is created here and its
+/// `Py_mod_exec` slots run before the load is reported as successful.
 pub(crate) fn load_extension(path: &str, init_name: &str) -> Result<u64, String> {
-    let path = CString::new(path)
+    if let Some(module) = registry_lock().by_path.get(path).copied() {
+        return Ok(module);
+    }
+
+    let path_c = CString::new(path)
         .map_err(|_| "extension path contains an embedded null character".to_string())?;
     let symbol = CString::new(format!("PyInit_{init_name}"))
         .map_err(|_| "extension init name contains an embedded null character".to_string())?;
 
-    // SAFETY: `path` is a NUL-terminated string that outlives the call.
-    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    // SAFETY: `path_c` is a NUL-terminated string that outlives the call.
+    let handle = unsafe { libc::dlopen(path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
         return Err(dl_error());
     }
@@ -992,22 +1188,48 @@ pub(crate) fn load_extension(path: &str, init_name: &str) -> Result<u64, String>
     // CPython does. It runs on this thread without the registry lock held, so
     // its calls back into `PyModule_Create2`/`PyModule_AddStringConstant` can
     // take the lock.
-    let module = unsafe { init() };
-    if module.is_null() {
+    let result = unsafe { init() };
+    if result.is_null() {
         let error = take_error().unwrap_or_else(|| format!("PyInit_{init_name} returned NULL"));
         // SAFETY: the initializer failed and handed nothing back; the module
         // cannot be called later.
         unsafe { libc::dlclose(handle) };
         return Err(error);
     }
+    // A non-NULL return with a stale error is an extension bug; CPython
+    // discards it, and keeping it would misattribute a later slot failure.
+    clear_error();
 
-    // SAFETY: `module` points into the arena and stays alive for the process.
-    let kind = unsafe { (*module).kind.clone() };
-    let ShimKind::Module(id) = kind else {
-        // SAFETY: no shim module was produced; nothing can call into the
-        // extension through the registry.
-        unsafe { libc::dlclose(handle) };
-        return Err(format!("PyInit_{init_name} did not create a module"));
+    // SAFETY: `result` points into the arena and stays alive for the process.
+    let kind = unsafe { (*result).kind.clone() };
+    let id = match kind {
+        ShimKind::Module(id) => id,
+        ShimKind::ModuleDef { def } => {
+            let definition = def as *mut PyModuleDefMirror;
+            let (id, module_object) = match create_module_from_definition(definition) {
+                Ok(created) => created,
+                Err(error) => {
+                    // SAFETY: no module was registered, so nothing can call
+                    // back into the extension through the registry.
+                    unsafe { libc::dlclose(handle) };
+                    return Err(error);
+                }
+            };
+            if let Err(error) = run_module_slots(definition, module_object) {
+                // SAFETY: the partially initialised module is discarded and
+                // never becomes reachable through the registry.
+                unsafe { libc::dlclose(handle) };
+                let _ = registry_lock().modules.remove(&id);
+                return Err(error);
+            }
+            id
+        }
+        _ => {
+            // SAFETY: no shim module was produced; nothing can call into the
+            // extension through the registry.
+            unsafe { libc::dlclose(handle) };
+            return Err(format!("PyInit_{init_name} did not create a module"));
+        }
     };
 
     let mut registry = registry_lock();
@@ -1015,6 +1237,7 @@ pub(crate) fn load_extension(path: &str, init_name: &str) -> Result<u64, String>
         return Err(format!("PyInit_{init_name} registered no module"));
     };
     entry.handle = handle as usize;
+    registry.by_path.insert(path.to_string(), id);
     Ok(id)
 }
 
@@ -1172,41 +1395,29 @@ pub extern "C" fn PyModule_Create2(
     definition: *mut PyModuleDefMirror,
     _api_version: c_int,
 ) -> *mut ShimObject {
-    let (name, methods) = match read_module_definition(definition) {
-        Ok(parsed) => parsed,
+    match create_module_from_definition(definition) {
+        Ok((_, module_object)) => module_object,
         Err(error) => {
             set_error(error);
-            return ptr::null_mut();
+            ptr::null_mut()
         }
-    };
-
-    let id = allocate_module_id();
-    let module_object = new_object(ShimKind::Module(id));
-
-    let mut attrs = HashMap::with_capacity(methods.len());
-    for (index, method) in methods.iter().enumerate() {
-        // `MAX_METHODS` keeps this conversion trivially in range.
-        let method_index = index as u32;
-        attrs.insert(
-            method.name.clone(),
-            ShimAttr::Callable(ShimCallable {
-                module: id,
-                method: method_index,
-            }),
-        );
     }
+}
 
-    registry_lock().modules.insert(
-        id,
-        ModuleEntry {
-            name,
-            handle: 0,
-            module_object: module_object as usize,
-            attrs,
-            methods,
-        },
-    );
-    module_object
+/// `PyModuleDef_Init`: wraps a `PyModuleDef` for multi-phase initialisation.
+///
+/// CPython returns the definition itself cast to `PyObject *`. This host
+/// records the pointer in an arena shim so the loader can tell the multi-phase
+/// result apart from a module object before running the definition's slots.
+#[no_mangle]
+pub extern "C" fn PyModuleDef_Init(definition: *mut PyModuleDefMirror) -> *mut ShimObject {
+    if definition.is_null() {
+        set_error("PyModuleDef_Init: module definition is NULL");
+        return ptr::null_mut();
+    }
+    new_object(ShimKind::ModuleDef {
+        def: definition as usize,
+    })
 }
 
 /// `PyModule_AddStringConstant`: adds (or overwrites) a string attribute.
@@ -2173,8 +2384,9 @@ pub(crate) fn anchor() {
     // staticlib linker does not drop them.
     initialize_exception_types();
     anchor_exception_types();
-    let symbols: [*const (); 53] = [
+    let symbols: [*const (); 54] = [
         PyModule_Create2 as *const (),
+        PyModuleDef_Init as *const (),
         PyModule_AddStringConstant as *const (),
         PyModule_AddObject as *const (),
         PyLong_FromLong as *const (),
@@ -2529,5 +2741,227 @@ mod tests {
     /// function (CPython's `PyDict_Size` is not part of this slice).
     fn dict_len_for_test(dict: *mut ShimObject) -> usize {
         dict_slots(dict).map(|pairs| pairs.len()).unwrap_or(0)
+    }
+
+    /// Builds a minimal live `PyModuleDef` for slot parsing tests.
+    fn empty_definition() -> PyModuleDefMirror {
+        PyModuleDefMirror {
+            ob_refcnt: 1,
+            ob_type: ptr::null_mut(),
+            m_init: ptr::null_mut(),
+            m_index: 0,
+            m_copy: ptr::null_mut(),
+            m_name: c"slot_test_module".as_ptr(),
+            m_doc: ptr::null(),
+            m_size: 0,
+            m_methods: ptr::null_mut(),
+            m_slots: ptr::null_mut(),
+            m_traverse: ptr::null_mut(),
+            m_clear: ptr::null_mut(),
+            m_free: ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn module_def_init_wraps_a_definition() {
+        clear_error();
+        let mut definition = empty_definition();
+        let object = PyModuleDef_Init(&mut definition);
+        assert!(!object.is_null());
+        assert!(!error_pending());
+        match kind_ref(object) {
+            Some(ShimKind::ModuleDef { def }) => {
+                assert_eq!(*def, &mut definition as *mut PyModuleDefMirror as usize);
+            }
+            other => panic!("unexpected module definition object: {other:?}"),
+        }
+        let message = object_to_value(object).expect_err("definitions are not values");
+        assert!(message.contains("module definition"), "{message}");
+
+        clear_error();
+        assert!(PyModuleDef_Init(ptr::null_mut()).is_null());
+        assert!(error_pending());
+        clear_error();
+    }
+
+    #[test]
+    fn module_slots_run_until_the_zero_terminator() {
+        use std::sync::atomic::AtomicUsize;
+        clear_error();
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn exec(_module: *mut ShimObject) -> c_int {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        CALLS.store(0, Ordering::Relaxed);
+        let mut slots = [
+            PyModuleDefSlotMirror {
+                slot: PY_MOD_EXEC,
+                value: exec as *mut c_void,
+            },
+            PyModuleDefSlotMirror {
+                slot: PY_MOD_EXEC,
+                value: exec as *mut c_void,
+            },
+            PyModuleDefSlotMirror {
+                slot: 0,
+                value: ptr::null_mut(),
+            },
+            // Entries after the terminator are never read.
+            PyModuleDefSlotMirror {
+                slot: PY_MOD_EXEC,
+                value: exec as *mut c_void,
+            },
+        ];
+        let mut definition = empty_definition();
+        definition.m_slots = slots.as_mut_ptr();
+        let (id, module) = create_module_from_definition(&mut definition).expect("module");
+        run_module_slots(&mut definition, module).expect("exec slots");
+        assert_eq!(
+            CALLS.load(Ordering::Relaxed),
+            2,
+            "the zero slot terminates the walk"
+        );
+        assert!(!error_pending());
+        let _ = registry_lock().modules.remove(&id);
+    }
+
+    #[test]
+    fn module_policy_slots_are_validated() {
+        let mut accepted = [
+            PyModuleDefSlotMirror {
+                slot: PY_MOD_MULTIPLE_INTERPRETERS,
+                value: ptr::without_provenance_mut(2),
+            },
+            PyModuleDefSlotMirror {
+                slot: PY_MOD_GIL,
+                value: ptr::without_provenance_mut(1),
+            },
+            PyModuleDefSlotMirror {
+                slot: 0,
+                value: ptr::null_mut(),
+            },
+        ];
+        let mut definition = empty_definition();
+        definition.m_slots = accepted.as_mut_ptr();
+        run_module_slots(&mut definition, ptr::null_mut()).expect("accepted policy slots");
+
+        let mut interpreters = [
+            PyModuleDefSlotMirror {
+                slot: PY_MOD_MULTIPLE_INTERPRETERS,
+                value: ptr::without_provenance_mut(3),
+            },
+            PyModuleDefSlotMirror {
+                slot: 0,
+                value: ptr::null_mut(),
+            },
+        ];
+        definition.m_slots = interpreters.as_mut_ptr();
+        let message = run_module_slots(&mut definition, ptr::null_mut())
+            .expect_err("invalid multiple-interpreters value");
+        assert!(
+            message.contains("Py_mod_multiple_interpreters"),
+            "{message}"
+        );
+
+        let mut gil = [
+            PyModuleDefSlotMirror {
+                slot: PY_MOD_GIL,
+                value: ptr::without_provenance_mut(2),
+            },
+            PyModuleDefSlotMirror {
+                slot: 0,
+                value: ptr::null_mut(),
+            },
+        ];
+        definition.m_slots = gil.as_mut_ptr();
+        let message =
+            run_module_slots(&mut definition, ptr::null_mut()).expect_err("invalid GIL value");
+        assert!(message.contains("Py_mod_gil"), "{message}");
+    }
+
+    #[test]
+    fn unsupported_module_slots_are_rejected() {
+        let mut create = [
+            PyModuleDefSlotMirror {
+                slot: PY_MOD_CREATE,
+                value: ptr::null_mut(),
+            },
+            PyModuleDefSlotMirror {
+                slot: 0,
+                value: ptr::null_mut(),
+            },
+        ];
+        let mut definition = empty_definition();
+        definition.m_slots = create.as_mut_ptr();
+        let message =
+            run_module_slots(&mut definition, ptr::null_mut()).expect_err("Py_mod_create");
+        assert!(message.contains("Py_mod_create"), "{message}");
+
+        let mut unknown = [
+            PyModuleDefSlotMirror {
+                slot: 99,
+                value: ptr::null_mut(),
+            },
+            PyModuleDefSlotMirror {
+                slot: 0,
+                value: ptr::null_mut(),
+            },
+        ];
+        definition.m_slots = unknown.as_mut_ptr();
+        let message = run_module_slots(&mut definition, ptr::null_mut()).expect_err("unknown slot");
+        assert!(message.contains("unsupported Py_mod slot 99"), "{message}");
+    }
+
+    #[test]
+    fn module_slot_exec_failures_are_reported() {
+        clear_error();
+        extern "C" fn status_only(_module: *mut ShimObject) -> c_int {
+            1
+        }
+        extern "C" fn with_error(_module: *mut ShimObject) -> c_int {
+            pyx_capi_set_error(c"exec failed".as_ptr());
+            1
+        }
+        let mut slots = [
+            PyModuleDefSlotMirror {
+                slot: PY_MOD_EXEC,
+                value: status_only as *mut c_void,
+            },
+            PyModuleDefSlotMirror {
+                slot: 0,
+                value: ptr::null_mut(),
+            },
+        ];
+        let mut definition = empty_definition();
+        definition.m_slots = slots.as_mut_ptr();
+        let message = run_module_slots(&mut definition, ptr::null_mut()).expect_err("status");
+        assert!(message.contains("failed with status 1"), "{message}");
+
+        slots[0].value = with_error as *mut c_void;
+        let message = run_module_slots(&mut definition, ptr::null_mut()).expect_err("error");
+        assert_eq!(message, "exec failed");
+
+        slots[0].value = ptr::null_mut();
+        let message =
+            run_module_slots(&mut definition, ptr::null_mut()).expect_err("NULL callback");
+        assert!(message.contains("NULL Py_mod_exec"), "{message}");
+        assert!(slots[0].value.is_null());
+    }
+
+    #[test]
+    fn module_slot_iteration_is_bounded() {
+        let mut slots = vec![
+            PyModuleDefSlotMirror {
+                slot: PY_MOD_GIL,
+                value: ptr::null_mut(),
+            };
+            MAX_MODULE_SLOTS
+        ];
+        let mut definition = empty_definition();
+        definition.m_slots = slots.as_mut_ptr();
+        let message =
+            run_module_slots(&mut definition, ptr::null_mut()).expect_err("unterminated table");
+        assert!(message.contains("more than"), "{message}");
     }
 }

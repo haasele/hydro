@@ -8,7 +8,7 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-24: **861 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
+As of 2026-10-24: **875 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 
@@ -96,7 +96,7 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   `pyx-cli/{cli,cli/commands}`; no behavior change, contracts unchanged.
 - Test count increased from 545 to 721 tests (incl. formatting, attributes,
   classes, closures, stdlib modules, socket, user modules, CLI/build cache);
-  with this slice to **861** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
+  with this slice to **875** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
   dict hash index, GC statistics, generator iteration).
 - AOT builds embed user modules; the cache key takes the
   entire reachable module tree structure into account.
@@ -128,7 +128,16 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   layout), and `PyExc_*` singletons with typed `PyErr_SetString` mapping.
 - **Installed extension discovery:** extension lookup also searches
   `PYTHONPATH`, `PYX_SITE_PACKAGES`, `VIRTUAL_ENV`/`CONDA_PREFIX`
-  site-packages, and wheel-style `<name>.cpython-*.so` filenames.
+  site-packages, and wheel-style `<name>.cpython-314-*.so` filenames.
+- **Dotted extension submodules & ABI policy:** `pkg.sub_ext` resolves to
+  `<dir>/pkg/sub_ext*.so` without package Python source (aliased and
+  from-import forms); incompatible ABI tags (`cpython-312`, `pp310`, ...) are
+  compile-time diagnostics instead of dlopen attempts.
+- **Multi-phase init:** `PyModuleDef_Init` + bounded `Py_mod_exec` slot
+  execution with policy-slot validation, alongside single-phase
+  `PyModule_Create2` modules; JIT+AOT fixture.
+- **Clippy gate:** `scripts/verify.sh`/CI run clippy without `-D warnings`;
+  the tree is kept at zero warnings.
 - **Stdlib compatibility baseline:** `scripts/stdlib_compat.py` +
   `docs/COMPATIBILITY.md` + `benchmarks/compat/latest.json`; 23 of 297
   CPython 3.14 modules importable on 2026-10-24 (import success only, not

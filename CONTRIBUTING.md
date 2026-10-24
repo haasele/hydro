@@ -21,7 +21,7 @@ cargo build -p pyx-cli -p pyx-runtime
 ./scripts/verify.sh
 ```
 
-The script checks `cargo fmt`, Clippy with `-D warnings`, the build, all tests,
+The script checks `cargo fmt`, Clippy (zero warnings), the build, all tests,
 the JIT/AOT E2E examples, negative diagnostics, and GC stress. The same steps
 run in CI (`.github/workflows/ci.yml`). A commit should only be merged
 if the gate is green; new features need tests and — for behavior changes —

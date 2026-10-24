@@ -305,6 +305,30 @@ impl ModuleLoader {
         if pyx_ir::stdlib::module(name).is_some() {
             return;
         }
+
+        // A compiled extension is resolved by the lowerer: it binds
+        // aliases/members to `Callee::Extension` and needs no linked module
+        // unit. Look it up before rejecting dotted names so `pkg.sub_ext`
+        // works without package Python code.
+        match lower::find_extension_for_source(display, name) {
+            lower::ExtensionLookup::Found(_) => return,
+            lower::ExtensionLookup::Incompatible { path, reason } => {
+                self.push_span(
+                    source,
+                    display,
+                    range,
+                    codes::UNSUPPORTED,
+                    format!(
+                        "compiled extension '{}' is incompatible: {reason}",
+                        path.display()
+                    ),
+                );
+                *failed = true;
+                return;
+            }
+            lower::ExtensionLookup::Missing => {}
+        }
+
         if name.contains('.') {
             self.push_span(
                 source,
@@ -318,12 +342,6 @@ impl ModuleLoader {
         }
 
         let parent = display.parent().unwrap_or_else(|| Path::new("."));
-        // A compiled extension next to the importing file is resolved by the
-        // lowerer: it binds aliases/members to `Callee::Extension` and needs
-        // no linked module unit.
-        if lower::find_extension_for_source(display, name).is_some() {
-            return;
-        }
         let expected = parent.join(format!("{name}.py"));
         if !expected.is_file() {
             self.push_span(

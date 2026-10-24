@@ -91,6 +91,7 @@ The first vertical slice of option B is in `pyx-runtime` and verified by
 `crates/pyx-cli/tests/extensions.rs`:
 
 - **Shim** (`crates/pyx-runtime/src/capi/`): `PyModule_Create2`,
+  `PyModuleDef_Init` (multi-phase results, `Py_mod_exec` slots),
   `PyModule_AddStringConstant`, `PyModule_AddObject`, `PyLong_FromLong`,
   `PyLong_AsLong`, `PyUnicode_FromString`/`AsUTF8`, `PyFloat_FromDouble`/
   `AsDouble`, `PyBytes_FromStringAndSize`/`AsString`/`Size`,
@@ -109,19 +110,24 @@ The first vertical slice of option B is in `pyx-runtime` and verified by
   `<name>.so`, `<name>.abi3.so` or `<name>.*.so` at compile time in the
   frontend (sibling directory, `PYX_EXTENSION_PATH`, `PYTHONPATH`,
   `PYX_SITE_PACKAGES`, venv/conda `site-packages`); lazy `dlopen(RTLD_NOW)` +
-  `PyInit_<name>` resolution, cached by path; callable values participate in
-  `pyx_call`; errors map to the matching PyX exception.
+  `PyInit_<name>` resolution, cached by path; single-phase modules use the
+  returned module object, multi-phase ones are created from their
+  `PyModuleDef` and their `Py_mod_exec` slots run once before the load is
+  cached; callable values participate in `pyx_call`; errors map to the
+  matching PyX exception.
 - **Linking:** `pyx` and AOT binaries are linked with `--export-dynamic` and
   pin the shim symbols via `capi::anchor()` in `pyx_runtime_init`; extension
   symbols resolve from the process, not from `libpython`.
 - **Verified fixture:** `pyx_capi_probe.abi3.so` (`Py_LIMITED_API 0x030C0000`)
-  prints `5`, `abi3`, `42`, `abi3` under `pyx run` and an AOT binary; `ldd`
-  shows no `libpython`; arity errors are `TypeError`, missing members are
-  `AttributeError`, unsupported argument types are `TypeError`.
+  prints `5`, `abi3`, `42`, `abi3` under `pyx run` and an AOT binary; a second
+  fixture (`abi3_multiphase.c`) returns a `PyModuleDef` from `PyInit_*`, adds
+  `tag` from a `Py_mod_exec` slot and prints `multiphase`/`42` under both;
+  `ldd` shows no `libpython`; arity errors are `TypeError`, missing members
+  are `AttributeError`, unsupported argument types are `TypeError`.
 - **Not in this slice:** arbitrary object passing beyond bounded recursive
   list/tuple/dict copies, writable/multi-dimensional buffers, capsule
-  destructors, package submodules, multi-phase init, the wheel ABI-tag policy,
-  GIL/thread emulation, full 3.14 ABI (NumPy/pydantic-core).
+  destructors, `Py_mod_create`, GIL/thread emulation, full 3.14 ABI
+  (NumPy/pydantic-core).
 
 ### Scope of "full stdlib"
 
@@ -160,7 +166,7 @@ machine-readable compatibility report, not by prose claims.
 | Milestone | Content | Acceptance |
 |---|---|---|
 | P4-04a | `abi3` shim: module init, `PyArg_Parse*`, scalar/container constructors, error API, capsuled types, buffer basics | **Done for the defined subset:** module/scalar/container APIs, capsules, read-only bytes buffers, `PyExc_*`; fixture imports/runs under PyX with no `libpython`. Further symbols are driven by P4-10 |
-| P4-04b | Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags, package submodules, multi-phase init | **Partial:** sibling/env/venv discovery, wheel-style filenames, `PyInit_*`, caching and error paths green; package submodules, multi-phase init and the tag policy open |
+| P4-04b | Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags, package submodules, multi-phase init | **Done:** sibling/env/venv discovery, wheel tags validated at compile time, dotted package submodules, single- and multi-phase init (exec slots, clear slot errors), caching and error paths green |
 | P4-04c | Full 3.14 ABI: `PyTypeObject`, refcounts/GC integration, vectorcall, full buffer protocol | NumPy 2.5 smoke (array create/ops/dtype) and `pydantic-core` model validation |
 | P4-04d | GIL emulation and callback safety | threaded extension callbacks + GC stress; no deadlock/data race |
 | P4-05 | `ctypes`/`cffi` boundaries | `ctypes.CDLL` on libc, `cffi` ABI-mode smoke |
