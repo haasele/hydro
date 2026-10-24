@@ -8,6 +8,10 @@
 *.o
 *.a
 
+# P4-04 probe binaries (built by spikes/p4_04/build.sh)
+/spikes/p4_04/embed_probe
+/spikes/p4_04/*.so
+
 # Python
 __pycache__/
 *.py[cod]

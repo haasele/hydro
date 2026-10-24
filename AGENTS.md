@@ -20,7 +20,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
 | P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators/coroutines/event loop (no GIL)** | 771 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
-| P4 Compatibility | **blocked (P4-04: no `python3-config`/`Python.h`)** | `docs/C_API.md` |
+| P4 Compatibility | **unblocked; decision B (PyX-native CPython ABI layer, no `libpython`); stdlib/ecosystem program opened (P4-09…P4-11)** | `docs/C_API.md`, `docs/TODO.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
 | P6 Polish | **largely done; diagnostics/JSON/doctor/CLI** | codes, snippets, help, ICE |
 
@@ -29,10 +29,16 @@ implemented were real **lazy generators** (stackful fibers), real **coroutines
 with a cooperative event loop** (`async def`, `await`, `asyncio.run/sleep/gather`),
 the builtins `iter()`/`next()`, `pyx gc [--json]`, the dict hash index,
 typed int fastpaths, constant folding and the `bench_pyx.py` integration.
+Native module dispatch now uses a thread-local spec cache (math_loop at
+parity/faster; 2.2× end-to-end in the 50k micro harness). P4-04 is unblocked:
+CPython 3.14 development files are available, the decision is **option B**
+(PyX-native CPython ABI layer, no `libpython`; CPython only as build-time
+header source and differential test oracle), and the full stdlib/ecosystem
+program is tracked as P4-09…P4-11.
 Still open are `send`/`throw`/`close`, `yield` expressions, `yield from`, async
 generators/comprehensions, variable payload size classes as well as precise
 GC stack maps (P2-05/06/07), packaging/cross-platform/fuzzing and the
-C-API spike (P4-04, environment-blocked). Details: `docs/TODO.md`.
+C-API implementation itself. Details: `docs/TODO.md`.
 
 **Verification (as of 2026-10-24):**
 
@@ -46,9 +52,16 @@ C-API spike (P4-04, environment-blocked). Details: `docs/TODO.md`.
 - `scripts/verify.sh`: fmt, clippy (`-D warnings`), build, tests, E2E for JIT
   and AOT (incl. classes/closures/generators_async/formatting/socket_echo/
   stdlib_modules/pathlib), negative tests, GC threshold/stress — ALL GREEN.
-- C-API environment probe: `python3` 3.12.3, but no `python3-config`,
-  no `Python.h`, no linkable `libpython3.12.so`/`.a`; P4-04 therefore `[!]`.
-  No embedding/ABI3 measurements were invented.
+- C-API: the environment is unblocked (Python 3.14.8 with `Python.h`,
+  `libpython3.14.so`, `python3-config --embed`; NumPy 2.5.4 and pydantic
+  2.14.1 installed). P4-04 decision: **option B** (no `libpython` in the
+  production runtime). Probes (`spikes/p4_04/`): embedded CPython init
+  6.67 ms + finalize 7.46 ms, `import numpy` 41.64 ms, `import pydantic`
+  11.96 ms; a stable-ABI fixture imports with four undefined CPython symbols.
+  Full stdlib parity is 297 modules (174 pure Python, 71 extension,
+  52 builtin/frozen); program in P4-09…P4-11.
+- Native module dispatch cache: `math_loop` AOT 22.50 ms vs. CPython 22.65 ms
+  (n=200000; 0.94× JIT, 1.01× AOT), 50k micro harness AOT 6.2 ms vs. 13.6 ms.
 - No code/Cargo/CI changes in this docs slice.
 
 **Phase-2.0 slice (containers, 2026-10-23) — done & verified:**
@@ -690,14 +703,16 @@ parallel benchmarks and race/stress tests.
   workloads (incl. lazy generator sum and real async `gather`), checks the
   output against CPython and is registered in `bench_all.py` as `pyx`
   (`uv run benchmarks/bench_all.py --only pyx`). Release, n=200000:
-  while_sum 8.6x JIT / 11.9x AOT, for_range_sum 7.0/13.1, dict_insert
-  3.7/6.6. Generator sum over 100k elements (release): CPython 11.0 ms,
+  while_sum 7.7x JIT / 12.4x AOT, for_range_sum 6.4/8.0, dict_insert
+  3.6/4.5. `math_loop` is at parity after the native dispatch cache
+  (0.94x JIT / 1.01x AOT; 50k micro harness 6.2 ms vs. CPython 13.6 ms).
+  Generator sum over 100k elements (release): CPython 10.2 ms,
   JIT 7.7 ms, AOT 6.8 ms; `strace -c` counts 94 syscalls total (previously
-  200,097, two `rt_sigprocmask` per yield). Remaining weak spot:
-  native module dispatch (math_loop 0.8x) — open performance work.
+  200,097, two `rt_sigprocmask` per yield). Remaining weak spots: string
+  concatenation (O(n²)) and float boxing — open performance work.
 - **Verified:** 771 tests, `cargo fmt`, `cargo clippy --workspace
   --all-targets -- -D warnings` and `cargo test --workspace` green;
-  micro baseline renewed (while_sum AOT 2.4 ms vs. CPython 28.9 ms).
+  micro baseline renewed (while_sum AOT 1.7 ms vs. CPython 23.5 ms).
 
 **Known, documented limits Phase 1/2:** i64 instead of BigInt; GC is a
 conservative collector (stack scan, STW root rescan; white partition briefly
@@ -716,9 +731,11 @@ with a cooperative event loop. Open: `send`/`throw`/`close`,
 `yield` expressions, `yield from`, async generators, async comprehensions and
 `asyncio` beyond `run`/`sleep`/`gather`; `async for`/`async with` use
 the synchronous protocol. Generator expressions remain eagerly materialized.
-**Performance:** native module dispatch (math_loop 0.8x) is the remaining
-open weak spot; the x86_64 fiber switch costs two register-only
-switches without syscalls (100k generator sum AOT 6.8 ms vs. CPython 11.0 ms).
+**Performance:** native module dispatch is fixed (thread-local spec cache;
+math_loop at parity/faster). Remaining weak spots: string concatenation is
+O(n²) and CPython-extension boundaries will add conversion cost. The x86_64
+fiber switch costs two register-only switches without syscalls (100k
+generator sum AOT 6.8 ms vs. CPython 10.2 ms).
 **Modules:** only native modules + sibling `.py`; no packages, dots/
 relative imports, top-level side effects in imported modules or
 runtime module objects/`sys.modules`; imports only at module level.
@@ -733,8 +750,10 @@ context manager present.
 `+` mode; `newline`/`errors` ignored.
 **Bytes:** literals/constructor/ops/core methods, but no
 `bytearray`/`memoryview`.
-**C-API:** P4-04 blocked (no `python3-config`/`Python.h`/linkable
-`libpython`); no embedding/ABI3 measurements, no decision.
+**C-API/ecosystem:** decision B (PyX-native CPython ABI layer, no
+`libpython`); no extension runs under PyX yet. Full stdlib parity (297
+modules), ecosystem suites (NumPy, pandas, pydantic, FastAPI, Django, …) and
+their benchmarks are open (P4-09…P4-11).
 **Platform:** Linux x86_64 verified; aarch64 paths untested; macOS/
 Windows/cross-compilation missing.
 
@@ -742,13 +761,14 @@ Windows/cross-compilation missing.
 
 1. P2-10/P2-12 remainder: `send`/`throw`/`close`, `yield` expressions, `yield from`,
    async generators/comprehensions and `asyncio` beyond `run`/`sleep`/`gather`.
-2. Performance: measure and reduce native module dispatch (math_loop 0.8x);
-   generator resume is no longer a bottleneck thanks to the register-only switch.
+2. Performance: string concatenation (O(n²)) and float boxing remain; native
+   module dispatch and generator resume are no longer bottlenecks.
 3. P2-05/P2-06/P2-07: size-class allocator, precise shadow-stack roots/
    stack maps, finer safepoint polling (P2-08 metrics are available).
-4. P4-04: clarify the blocking environment question (CPython dev package/sysroot),
-   then embedding, ABI3 and NumPy smoke per `docs/C_API.md`; only after that
-   P4-05/P4-06.
+4. P4: implement the chosen option B in order — `abi3` shim (P4-04a),
+   extension loader (P4-04b), full CPython 3.14 ABI/NumPy/pydantic-core
+   (P4-04c/d), then P4-05/P4-06; run the stdlib program
+   P4-01/P4-02/P4-03/P4-09 and the ecosystem suites/benchmarks P4-10/P4-11.
 5. P3-03/P3-08: uv interpreter injection (`.python-version`, venv marker,
    `sys.executable` equivalent), packaging/cross-compilation.
 6. P5/P6 remainder: Hyperfine adapter, CI thresholds (Q-06), completions/manpage
@@ -1011,3 +1031,17 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   Measured (release, 100k generator sum): CPython 11.0 ms, JIT 7.7 ms,
   AOT 6.8 ms; `strace -c` 94 syscalls total instead of 200,097 (two
   `rt_sigprocmask` per yield). No builds/tests in this docs slice.
+
+- 2026-10-24 (continuation 37): math dispatch cache + P4-04 decision B.
+  `pyx_module_call`/`call_native` resolve names without allocations and
+  cache the spec per thread (no module-table scan on a hit); math_loop
+  improved from 0.81x to parity/faster (AOT 22.50 ms vs. CPython 22.65 ms at
+  n=200000; micro 50k AOT 6.2 ms vs. 13.6 ms). Environment probe: Python
+  3.14.8 with dev files, NumPy 2.5.4, pydantic 2.14.1. Embedded-CPython
+  probe: init 6.67 ms + finalize 7.46 ms, import numpy 41.64 ms, import
+  pydantic 11.96 ms; abi3 fixture imports with four undefined Py symbols.
+  Decision: **option B**, PyX-native CPython ABI layer, no `libpython` in
+  production. TODO P4 reworked into a full stdlib program: 297 modules
+  (174 pure Python, 71 extension, 52 builtin/frozen), P4-09 parity,
+  P4-10 ecosystem suites (numpy/pandas/pydantic/fastapi/django/...),
+  P4-11 ecosystem benchmarks. No code changes claimed as C-API support.

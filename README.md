@@ -19,7 +19,7 @@ defined subset (see [Language Scope](#language-and-stdlib-scope) and
 | Phase 1 — Compiler, runtime ABI, JIT/AOT | done, verified by `scripts/verify.sh` |
 | Phase 2 — Runtime, GC, modules, classes, concurrency | largely done; real lazy generators/coroutines + event loop available; precise GC roots and `send`/`throw`/`close` open |
 | Phase 3 — Toolchain (`new`/`init`/`test`/`fmt`/`lint`/`clean`, build cache, uv passthrough) | core available; uv interpreter injection/packaging open |
-| Phase 4 — Python compatibility, C API/ABI | **blocked** (P4-04: no `python3-config`/`Python.h` in this environment), see [`docs/C_API.md`](docs/C_API.md) |
+| Phase 4 — Python compatibility, C API/ABI | **unblocked; decision B** (PyX-native CPython ABI layer, no `libpython`); stdlib/ecosystem program opened (P4-09…P4-11), see [`docs/C_API.md`](docs/C_API.md) |
 | Phase 5 — Performance | baseline + local regression gate available |
 | Phase 6 — Diagnostics/Developer Experience | largely done; completions/manpage and ICE regression test open |
 
@@ -36,19 +36,19 @@ Medians over 5 runs, fresh process per run; AOT excludes build time. Measured on
 
 | Workload | CPython | PyX JIT | PyX AOT | CPython/JIT | CPython/AOT |
 |---|---:|---:|---:|---:|---:|
-| hello | 7.87 ms | 1.63 ms | 1.04 ms | 4.82× | 7.56× |
-| while_sum | 19.40 ms | 3.28 ms | 1.47 ms | 5.92× | 13.19× |
-| for_range_sum | 14.97 ms | 2.06 ms | 1.28 ms | 7.25× | 11.65× |
-| list_append | 15.80 ms | 4.43 ms | 4.36 ms | 3.56× | 3.63× |
-| list_comp | 10.87 ms | 3.45 ms | 2.94 ms | 3.15× | 3.70× |
-| dict_insert | 9.58 ms | 2.91 ms | 1.80 ms | 3.30× | 5.33× |
-| string_concat | 8.33 ms | 5.55 ms | 4.52 ms | 1.50× | 1.84× |
-| json_roundtrip | 12.62 ms | 2.92 ms | 2.07 ms | 4.32× | 6.09× |
-| math_loop | 23.16 ms | 28.38 ms | 28.74 ms | 0.82× | 0.81× |
-| generator_sum | 11.09 ms | 9.02 ms | 8.11 ms | 1.23× | 1.37× |
-| async_gather | 60.60 ms | 22.91 ms | 21.30 ms | 2.65× | 2.85× |
+| hello | 7.35 ms | 2.17 ms | 0.80 ms | 3.39× | 9.18× |
+| while_sum | 20.86 ms | 2.73 ms | 1.68 ms | 7.65× | 12.39× |
+| for_range_sum | 15.60 ms | 2.45 ms | 1.95 ms | 6.37× | 8.00× |
+| list_append | 18.41 ms | 5.09 ms | 4.08 ms | 3.62× | 4.51× |
+| list_comp | 11.56 ms | 3.18 ms | 2.54 ms | 3.64× | 4.54× |
+| dict_insert | 7.89 ms | 2.22 ms | 1.76 ms | 3.55× | 4.48× |
+| string_concat | 8.28 ms | 6.39 ms | 5.57 ms | 1.30× | 1.49× |
+| json_roundtrip | 13.31 ms | 2.71 ms | 2.16 ms | 4.90× | 6.17× |
+| math_loop | 22.65 ms | 24.08 ms | 22.50 ms | 0.94× | 1.01× |
+| generator_sum | 10.19 ms | 7.68 ms | 6.78 ms | 1.33× | 1.50× |
+| async_gather | 57.93 ms | 23.17 ms | 21.44 ms | 2.50× | 2.70× |
 
-PyX AOT is faster than CPython on 10/11 workloads; `math_loop` remains slower because every `math.*` call goes through dynamic native-module dispatch. `async_gather` runs four coroutines with `asyncio.sleep(0.02)`; wall time is ≈ one sleep, confirming the cooperative event loop runs them concurrently. The 100k-element lazy generator (`sum(gen(100000))`) takes ~11.0 ms under CPython, ~7.7 ms under PyX JIT and ~6.8 ms under PyX AOT (register-switch fibers, no syscalls per yield).
+PyX AOT is faster than CPython on 10/11 workloads; `math_loop` is at parity (1.01× AOT, 0.94× JIT) after native-module dispatch moved to a thread-local spec cache (no per-call name allocations or table scans), up from 0.81×. In the 50k-iteration micro harness the same loop is 2.2× faster end-to-end (6.2 ms vs 13.6 ms). `async_gather` runs four coroutines with `asyncio.sleep(0.02)`; wall time is ≈ one sleep, confirming the cooperative event loop runs them concurrently. The 100k-element lazy generator (`sum(gen(100000))`) takes ~10.2 ms under CPython, ~7.7 ms under PyX JIT and ~6.8 ms under PyX AOT (register-switch fibers, no syscalls per yield).
 
 ## Requirements
 

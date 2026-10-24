@@ -76,16 +76,19 @@ runners (CPython, PyX JIT via `pyx run`, PyX AOT via `pyx build` + binary):
   output directory absolutely so that child processes write into the same
   directory. Invocation: `uv run benchmarks/bench_all.py --only pyx`.
 
-Measured speedups (release, n=200000, median): while_sum 8.6x JIT / 11.9x
-AOT, for_range_sum 7.0x/13.1x, list_append 3.2x/3.8x, list_comp 3.0x/4.0x,
-dict_insert 3.7x/6.6x, json_roundtrip 4.6x/7.2x, async_gather 2.6x/2.8x.
-For the lazy generator sum over 100k elements (release), CPython measures
-11.0 ms, JIT 7.7 ms, and AOT 6.8 ms; the x86_64 switch is register-only, and
-`strace -c` counts 94 syscalls in total instead of 200,097 (two `rt_sigprocmask`
-per yield). Remaining weakness: math_loop ~0.8x (native module dispatch),
-open performance work, no "solved" claims.
-The micro harness (`run_micro.py`) shows with the same release build, among others,
-while_sum AOT 2.4 ms vs. CPython 28.9 ms and for_sum AOT 2.0 ms vs. 27.5 ms.
+Measured speedups (release, n=200000, median): while_sum 7.7x JIT / 12.4x
+AOT, for_range_sum 6.4x/8.0x, list_append 3.6x/4.5x, list_comp 3.6x/4.5x,
+dict_insert 3.6x/4.5x, json_roundtrip 4.9x/6.2x, async_gather 2.5x/2.7x.
+math_loop is at parity after the thread-local native-module dispatch cache
+(0.94x JIT, 1.01x AOT; previously 0.81x); in the 50k micro harness it is
+2.2x faster end-to-end (AOT 6.2 ms vs. CPython 13.6 ms). For the lazy
+generator sum over 100k elements, CPython measures 10.2 ms, JIT 7.7 ms, and
+AOT 6.8 ms; the x86_64 switch is register-only, and `strace -c` counts 94
+syscalls in total instead of 200,097 (two `rt_sigprocmask` per yield).
+Remaining open performance work: string concatenation (O(n²)) and float
+boxing; no "solved" claims beyond the measurements above. The micro harness
+(`run_micro.py`) shows with the same release build, among others, while_sum
+AOT 1.7 ms vs. CPython 23.5 ms and for_sum AOT 1.4 ms vs. 19.3 ms.
 
 ## Process/Pool scaling (P2-20e)
 
@@ -149,8 +152,9 @@ not gated.
 
 1. PyX adapter (`PYX_BIN`, subprocess) for the unchanged `bench_*.py`;
    remaining blockers per harness are listed in the table above.
-2. `numpy`/`pandas`/FastAPI need the C API/ABI (P4-04, blocked) as well as
-   decorators; real async infrastructure is present for pure coroutines.
+2. `numpy`/`pandas`/FastAPI need the C API/ABI (P4-04 decision B: PyX-native
+   ABI shim) and decorators; real async infrastructure is present for pure
+   coroutines. Ecosystem suites/benchmarks are P4-10/P4-11.
 3. Non-blocking `select`-like I/O and `asyncio` beyond
    `run`/`sleep`/`gather` for `bench_request_handling.py`;
    blocking TCP, real coroutines, and the event loop are there.

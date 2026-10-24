@@ -53,7 +53,7 @@ Beyond compiler, runtime, GC and package manager, the project needs at least:
 5. **Phase 5 — Performance.** AOT optimization, profile-guided optimization, GC tuning and only then a possible JIT. Benchmarks against CPython, PyPy, Go and comparable implementations.
 6. **Phase 6 — Polish and developer experience.** First-class diagnostics, machine-readable error output, a coherent CLI and documentation.
 
-Full Python compatibility is large enough to be a permanent, independent goal. Projects such as Nuitka and PyPy show how much effort already goes into compiler, runtime and compatibility.
+Full Python compatibility is large enough to be a permanent, independent goal. It means the 297 modules of the CPython 3.14 standard library (174 pure Python, 71 extension, 52 builtin/frozen), plus the common ecosystem (NumPy, pandas, pydantic, FastAPI, Django, …) with reproducible tests and benchmarks, not only a familiar syntax subset. Projects such as Nuitka and PyPy show how much effort already goes into compiler, runtime and compatibility.
 
 ## Current Status
 
@@ -62,13 +62,13 @@ Phases 1–6 are tracked item by item in `docs/TODO.md`. The gate is `scripts/ve
 - **Phase 1 — done.** Compiler, JIT and AOT paths, CLI and verification are complete.
 - **Phase 2 — largely done.** Includes real lazy generators and coroutines on a cooperative event loop, and a concurrent GC with a shared heap and no GIL. Open: `send`/`throw`/`close`, `yield from`, async generators/comprehensions, and precise GC roots and stack maps.
 - **Phase 3 — core done.** `new`/`init`/`add`/`remove`/`sync`/`lock`, the build cache and `run` work. Open: uv interpreter injection, own lockfile/venv semantics, reproducible builds and packaging.
-- **Phase 4 — started, C-API blocked.** The C-API strategy spike is environment-blocked (no `python3-config`, `Python.h` or linkable `libpython`); see `docs/C_API.md`.
+- **Phase 4 — unblocked; decision B.** CPython 3.14 development files are available. The project implements the CPython C API/ABI on PyX objects (no `libpython` in production; CPython only as build-time header source and test oracle). The stdlib/ecosystem program covers 297 stdlib modules, ecosystem suites and benchmarks (P4-01…P4-11); see `docs/C_API.md`.
 - **Phase 5 — baseline in place.** Micro-benchmark harness, baseline artifacts and local regression thresholds exist; PyPy/Go comparisons, PGO and a JIT decision remain open.
 - **Phase 6 — diagnostics mostly done.** Stable codes, spans, snippets, `--json` output and exit codes are implemented; ICE regression tests, completions, manpage and the CLI/diagnostic reference are open.
 
 ## Risks and Open Decisions
 
-- **C-API/ABI compatibility** is the largest cost driver. The early spike decides the object model and refcount design; it currently has neither measurements nor an embed-vs-shim decision.
+- **C-API/ABI compatibility** is the largest cost driver. The decision is a PyX-native shim (option B) so that the PyX startup/GC/performance advantages survive; the remaining risk is the full CPython 3.14 `PyTypeObject`/refcount/GC/GIL surface required by NumPy and `pydantic-core`.
 - **i64 instead of BigInt** is a documented boundary; BigInt is a later feature.
 - **Cranelift vs LLVM** trades faster startup against optimization depth. LLVM remains optional.
 - **Precise GC roots** are still open: conservative scanning of fiber stacks and context register frames is an interim measure, not the target design.

@@ -7,12 +7,16 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-24:** 771 tests, `scripts/verify.sh` ALL GREEN. Phase 1 is
-complete; Phase 2 has real lazy generators and coroutines with a
+**As of 2026-10-24 (latest):** 771 tests, `scripts/verify.sh` ALL GREEN.
+Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Open are `send`/`throw`/`close`, `yield` expressions,
 `yield from`, async generators/comprehensions, GC precision (P2-05/06/07) and
-the remaining performance work. P4-04 is blocked in this environment
-(`python3-config`/`Python.h` missing; see `docs/C_API.md`).
+the remaining performance work. **P4-04 is unblocked and decided:** CPython
+3.14 development files are available, and the project follows **option B** —
+a PyX-native CPython C-API/ABI layer without embedded `libpython`; evidence and
+gates in [`docs/C_API.md`](C_API.md). The new **P4-09/P4-10/P4-11** program
+tracks full stdlib parity (297 modules), ecosystem suites (NumPy, pandas,
+pydantic, FastAPI, Django, …) and their benchmarks.
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -273,33 +277,119 @@ cover cycles; container semantics tested against CPython behavior.
 `pyx sync && pyx run` (defined support scope). *Not yet
 met*: without uv interpreter injection/packaging this remains a goal.
 
-## P4 — Python compatibility
+## P4 — Python compatibility & ecosystem
 
-- [ ] P4-01 CPython test suite subset as harness; progress tracking.
-- [ ] P4-02 Language features complete: decorators, comprehensions, pattern matching,
-      descriptors, metaclasses, `__dunder__` protocols.
-      Partial: classes (single-base), comprehensions, closures, `with`.
-- [ ] P4-03 Standard library broad (pure Python + Rust replacement).
-      Curated core present (P2-13); broad coverage open.
-- [!] P4-04 C API strategy spike: embedding CPython (`libpython`) vs.
-      reimplementation vs. limited compatibility; ABI3/NumPy smoke test.
-      **Blocked (2026-10-24):** the current environment lacks
-      `python3-config`, `Python.h` and a linkable `libpython3.12.so`/`.a`
-      (only the runtime SO `libpython3.12.so.1.0` is present). Without
-      development headers neither embedding nor an ABI3 shim can be compiled.
-      Options/probe/spike plan: `docs/C_API.md`. There are **no** measurements
-      and **no** embed-vs-shim decision has been made.
-- [ ] P4-05 Native extension loading (`.so`) + CPython ABI shim. Depends on P4-04.
-- [ ] P4-06 `ctypes`, define `cffi`-like boundaries. Depends on the P4-04 option.
-- [~] P4-07 Pickle/serialization, encoding details, numeric limits (i64 vs BigInt).
+Goal: run unmodified Python code — the CPython standard library and the common
+ecosystem — on the PyX runtime while keeping the PyX advantages (single VM,
+concurrent GC, fast startup). The decision for the C-API path is recorded in
+[`docs/C_API.md`](C_API.md): **option B, a PyX-native CPython ABI layer; no
+`libpython` in the production runtime.**
+
+- [ ] P4-01 CPython test-suite harness and compatibility report.
+      Run a defined subset of CPython 3.14 `Lib/test` against `pyx`, and emit a
+      machine-readable report (per test: pass/skip/fail, plus the reason).
+      Acceptance: `scripts/compat_report.py` produces a deterministic report
+      and `docs/COMPATIBILITY.md` is generated from it; no hand-written pass
+      claims. Gating: a test counts as passed only if CPython 3.14 passes it
+      too (differential oracle).
+- [ ] P4-02 Language completeness required by the stdlib and ecosystem.
+      Decorators (function/class, parametrised), `yield` expressions,
+      generator `send`/`throw`/`close`, `yield from`, async generators and
+      async comprehensions, `async for`/`async with` with real async
+      iterators, exception hierarchy/chaining/`except*`, descriptors,
+      properties, `__slots__`, metaclasses, user-defined `__iter__`/`__next__`,
+      `__dunder__` protocols, pattern matching, positional-only/keyword-only/
+      `*args`/`**kwargs`, `del`, slice assignment, dict views, `bytearray`/
+      `memoryview`, BigInt (parity for arbitrary-size integers), and the full
+      format mini-language.
+      Acceptance: the CPython language-feature tests in scope pass; every
+      remaining deviation is listed in `docs/COMPATIBILITY.md`.
+- [ ] P4-03 Import system and module model for real packages.
+      Packages/`__init__.py`, dotted and relative imports, `sys.path`,
+      `sys.modules`, `importlib` core, `site`, `.pth`, namespace packages,
+      zip imports, frozen modules, correct circular-import behaviour, module
+      `__all__`, and top-level module execution (side effects).
+      Acceptance: a standard venv `site-packages` tree can be imported;
+      package/relative-import fixtures pass.
+- [x] P4-04 C-API/ABI strategy: decision recorded (2026-10-24).
+      **Option B** (PyX-native ABI shim, no `libpython` in production; CPython
+      3.14 headers at build time and the CPython interpreter as differential
+      test oracle only). Evidence: embedded CPython costs ~6.7 ms init +
+      ~7.5 ms finalize and ~41.6 ms for `import numpy`; PyX AOT startup is
+      ~0.8–1.0 ms. A stable-ABI probe module builds and imports with just four
+      undefined CPython symbols, confirming the loader/shim model. Details in
+      [`docs/C_API.md`](C_API.md).
+      - [ ] P4-04a `abi3` shim: module init (`PyModule_Create2`), `PyArg_Parse*`,
+        scalar/container constructors, error API, `PyCapsule`, buffer basics.
+        Gate: the abi3 fixture imports/runs under PyX and `ldd pyx` has no
+        `libpython`.
+      - [ ] P4-04b Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags,
+        package submodules, multi-phase init, clear init-failure errors.
+      - [ ] P4-04c Full CPython 3.14 ABI: `PyTypeObject` layout, refcounted
+        `PyObject` handles over PyX objects, vectorcall, full buffer protocol,
+        `PyType_FromSpec`, GC traverse/clear integration.
+        Gate: NumPy 2.5 array smoke and `pydantic-core` model validation.
+      - [ ] P4-04d GIL emulation at extension boundaries and callback safety.
+        Gate: threaded extension callbacks under GC stress without
+        deadlock/data race.
+- [ ] P4-05 Native extension loading (`.so`) + wheel support.
+      Load manylinux wheels from a venv, resolve CPython symbols from the PyX
+      shim, support package submodules and ABI tags; explicit errors for
+      unsupported wheel ABIs. Depends on P4-04a/b.
+- [ ] P4-06 `ctypes`/`cffi` boundaries.
+      `ctypes.CDLL` on libc and `cffi` ABI-mode smoke; pointer/struct/array
+      conversion rules documented. Depends on P4-04a.
+- [~] P4-07 Pickle/serialization, encoding details, numeric limits.
       PYX1 is deliberately not CPython-compatible; `bytes`/UTF-8/string escapes
-      tested; i64 limit documented. CPython `pickle` compatibility open.
-- [ ] P4-08 Publish compatibility matrix (what runs, what does not).
-      README/ARCHITECTURE document the scope; a matrix per module/
-      feature is missing.
+      tested; i64 limit documented. Required: CPython pickle protocols 2–5,
+      `marshal` subset, `datetime`/`decimal` encodings, and BigInt (P4-02)
+      so numeric results match CPython.
+- [ ] P4-08 Compatibility matrix and support policy.
+      Generated matrix per module/library with CPython version, pass counts,
+      unsupported reasons and startup/RSS numbers. Covers stdlib (P4-09),
+      C-ABI (P4-04/05) and ecosystem suites (P4-10).
+- [ ] P4-09 Full standard-library parity (297 CPython 3.14 modules).
+      Split tracked in the compatibility report; no module is "done" without
+      its CPython test subset.
+      - [ ] P4-09a Import infrastructure (depends on P4-03).
+      - [ ] P4-09b Pure-Python stdlib: run the 174 pure-Python modules
+        unmodified from a CPython 3.14 stdlib tree (PSF license, optional
+        sysroot); adapt through shims, never forks; per-module test runs.
+      - [ ] P4-09c Native/extension modules (71): implement in Rust where
+        performance/semantics matter (e.g. `_io`, `_json`, `_csv`, `_struct`,
+        `_datetime`, `_decimal`, `_hashlib`, `_socket`, `_ssl`, `_sqlite3`,
+        `select`, `zlib`, `_bz2`, `_lzma`, `array`, `binascii`,
+        `unicodedata`); pure-Python fallbacks where semantics allow; explicit
+        unsupported list otherwise.
+      - [ ] P4-09d Builtin/frozen modules (52): `sys`, `builtins`, `_imp`,
+        `_thread`, `_warnings`, `_weakref`, `marshal`, `errno`, `posix`,
+        `time`, `itertools`, `_io`, `_collections`, `_functools`, `_operator`,
+        `_signal`, `_stat`, `_tracemalloc`, etc.
+      - [ ] P4-09e CPython stdlib test runs per module, wired into P4-01.
+      Acceptance: every module is either green in its CPython test subset or
+      listed as unsupported with a reason; the report is reproducible.
+- [ ] P4-10 Ecosystem compatibility suites (pinned versions, Python 3.14).
+      Install wheels into a venv with `uv`, run upstream test subsets plus a
+      real application smoke; record pass/fail per library.
+      - [ ] Tier 1 (release gate): `numpy`, `pandas`, `pydantic`, `fastapi`
+        (+`starlette`/`uvicorn`/`httpx`), `django`, `requests`, `sqlalchemy`,
+        `pytest`.
+      - [ ] Tier 2: `scipy`, `matplotlib`, `flask`, `aiohttp`, `pillow`,
+        `cryptography`, `protobuf`, `grpcio`, `boto3`, `polars`.
+      Per-library acceptance: upstream test subset result, app smoke result,
+      unsupported-feature list, and a reproducible command. No silent skips.
+- [ ] P4-11 Ecosystem benchmarks and budgets.
+      For each Tier-1 library/app: startup, import time, request/throughput,
+      dataframe/array operation, RSS versus CPython 3.14; thresholds in
+      `benchmarks/ecosystem/` and a report comparable to `bench_pyx.py`.
+      Acceptance: reproducible report + documented budgets; regressions fail
+      the local gate. This is the evidence that keeps the PyX advantages
+      rather than trading them for CPython overhead.
 
-**Acceptance P4:** defined, tested language/stdlib scope; documented
-C API limits; no silent semantic deviations.
+**Acceptance P4:** defined, tested language/stdlib/ecosystem scope; a generated
+compatibility matrix; C-API limits documented; no silent semantic deviations;
+ecosystem benchmarks show where PyX is faster, equal or slower than CPython
+(the latter documented, not hidden).
 
 ## P5 — Performance & JIT
 
@@ -339,13 +429,18 @@ C API limits; no silent semantic deviations.
       zero-division-protected), dead `if`/`while False` and typed
       int fast paths (`+`/`-`/`*`, comparisons, AugAssign, fully
       int-typed `for range` counters; checked overflow →
-      `pyx_binop` slow path) are implemented. Measured (release,
-      n=200000): while_sum 8.6x JIT / 11.9x AOT versus CPython,
-      for_range_sum 7.0x/13.1x. The x86_64 fiber switch is a
+      `pyx_binop` slow path) are implemented. Native module calls resolve
+      through a thread-local spec cache (no name allocations, no table scan);
+      `math_loop` moved from 0.81x to parity (AOT 1.01x, JIT 0.94x at
+      n=200000) and to 2.2x end-to-end in the 50k micro harness
+      (AOT 6.2 ms vs CPython 13.6 ms). Measured (release, n=200000):
+      while_sum 7.7x JIT / 12.4x AOT versus CPython,
+      for_range_sum 6.4x/8.0x. The x86_64 fiber switch is a
       register-only `global_asm!` switch without syscalls; a
-      100k generator sum runs in release with CPython 11.0 / JIT 7.7 / AOT
+      100k generator sum runs in release with CPython 10.2 / JIT 7.7 / AOT
       6.8 ms (`strace -c`: 94 syscalls total). Inlining/escape analysis/
-      devirtualization open; safepoints at backedges remain measurable.
+      devirtualization and float boxing remain open; safepoints at backedges
+      remain measurable.
 - [~] P5-04 GC tuning based on measurements (pauses, allocation rate).
       Growth-based threshold, relaxed-safepoint fast path,
       edge barriers, concurrent sweep, `PYX_GC_STATS`, `gc_stats()`/
@@ -430,8 +525,10 @@ code, span, help and stable exit code; `--json` is documented and tested.
 ## Risks / open decisions
 
 - R1: C-API/ABI compatibility is the biggest cost driver (PLAN.md §3).
-  P4-04 is currently **environment-blocked** (no CPython dev headers/
-  `python3-config`); the result determines object model/refcount design.
+  The environment is unblocked (CPython 3.14 dev files) and the decision is
+  option B (PyX-native ABI layer, no `libpython`); the remaining risk is the
+  full 3.14 `PyTypeObject`/refcount/GC/GIL surface required by NumPy and
+  `pydantic-core`.
 - R2: i64 instead of BigInt — documented limit; BigInt later behind a feature.
 - R3: Cranelift instead of LLVM: faster startup, less optimization; LLVM optional.
 - R4: GC with native frames needs precise roots; conservative scanning is the
@@ -446,7 +543,10 @@ code, span, help and stable exit code; `--json` is documented and tested.
   `yield from`, async generators/comprehensions. Generator expressions
   remain eagerly materialized; `async for`/`async with` use the synchronous
   protocol.
-- R8: Performance weak spot: native module dispatch (math_loop ~0.8x).
-  The x86_64 fiber switch is register-only; the 100k generator sum is
-  AOT 6.8 / JIT 7.7 ms in release versus CPython 11.0 ms. No
-  optimization claims without measurement.
+- R8: Performance weak spots: string concatenation remains O(n²)
+  (`string_concat` ~1.3–1.5x faster than CPython only because of lower
+  constant factors) and CPython-extension boundaries will add conversion
+  cost. Native module dispatch is fixed (thread-local spec cache; `math_loop`
+  at parity/faster). The x86_64 fiber switch is register-only; the 100k
+  generator sum is AOT 6.8 / JIT 7.7 ms versus CPython 10.2 ms (same run).
+  No optimization claims without measurement.

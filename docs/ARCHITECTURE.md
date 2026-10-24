@@ -3,8 +3,9 @@
 As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
 implemented (771 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
-update of this document and of all consumers. The C API spike (P4-04) is blocked
-and documented in [`C_API.md`](C_API.md).
+update of this document and of all consumers. The C API decision (P4-04,
+option B: PyX-native ABI layer without `libpython`) and its gates are
+documented in [`C_API.md`](C_API.md).
 
 ## 1. Vision
 
@@ -751,18 +752,31 @@ under `.pyx/cache/`.
 
 ## 9. C API/ABI Strategy (Phase 4)
 
-Options: (a) embed CPython (`libpython`, same ABI), (b) C API shim on
-PyX objects (ABI3/limited API), (c) explicitly limited compatibility.
+**Decision (2026-10-24): option B — a PyX-native CPython C-API/ABI layer.
+No `libpython` in the production runtime.**
 
-**Status: P4-04 is blocked.** The environment probe (2026-10-24) found
-`python3` 3.12.3, but no `python3-config`, no `Python.h` and no
-linkable `libpython3.12.so`/`.a` (only the runtime SO
-`libpython3.12.so.1.0`). Without development headers, neither an
-embedding nor an ABI3 smoke test can be built. Details, options and the
-spike plan are in [`C_API.md`](C_API.md); there are **no** invented
-measurements and no decision has been made. The spike decides on the
-object model, refcounting and BigInt/descriptor design before these are
-frozen.
+CPython 3.14 development files are used at build time to compile extensions
+and test fixtures; the CPython interpreter serves as a differential test
+oracle only. `ldd pyx` must not contain `libpython`. One process keeps the
+PyX tagged-value model, the concurrent GC and the fast startup path; foreign
+code sees refcounted `PyObject` handles whose lifetime is integrated with the
+collector (refcount as an additional root, `tp_traverse`/`tp_clear` mirroring
+GC edges). The GIL is emulated only while foreign code runs; PyX code remains
+GIL-free.
+
+Two tiers: (1) `abi3`/limited API (module init, `PyArg_Parse*`, scalar and
+container constructors, errors, capsules, buffer basics); (2) the full
+CPython 3.14 ABI required by NumPy 2.5 and `pydantic-core` (`PyTypeObject`
+layout, vectorcall, full buffer protocol, GC integration, package/wheel
+loading).
+
+Evidence: embedded CPython costs ~6.7 ms `Py_Initialize` + ~7.5 ms
+`Py_Finalize` and ~41.6 ms for `import numpy`, versus ~0.8–1.0 ms for a PyX
+AOT process; a stable-ABI probe imports with four undefined CPython symbols
+(the initial shim surface). Full rationale, milestones and acceptance gates:
+[`C_API.md`](C_API.md). The 297-module stdlib program (174 pure Python,
+71 extension, 52 builtin/frozen modules), the ecosystem suites and their
+benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 
 ## 10. Verification and Documented Limits
 
@@ -795,11 +809,13 @@ frozen.
   and `asyncio` beyond `run`/`sleep`/`gather`; generator expressions
   remain eagerly materialized, `async for`/`async with` use the synchronous
   protocol.
-- **Performance:** native module dispatch (math_loop ~0.8x) is the
-  remaining open weak spot. The x86_64 fiber switch is register-only
-  (two switches per yield, no syscalls); a 100k generator sum
-  reaches release AOT 6.8 ms / JIT 7.7 ms versus CPython 11.0 ms
-  (`strace -c`: 94 syscalls total).
+- **Performance:** native module dispatch is fixed (thread-local spec cache;
+  math_loop at parity/faster, 50k micro harness AOT 6.2 ms vs. CPython
+  13.6 ms). Remaining open weak spots: string concatenation (O(n²)) and float
+  boxing; CPython-extension boundaries will add conversion cost. The x86_64
+  fiber switch is register-only (two switches per yield, no syscalls); a
+  100k generator sum reaches release AOT 6.8 ms / JIT 7.7 ms versus CPython
+  10.2 ms (`strace -c`: 94 syscalls total).
 - **Modules:** only native modules and sibling `.py` files; no packages,
   dots/relative imports, top-level side effects in imported modules,
   no runtime module objects/`sys.modules`.
@@ -817,4 +833,6 @@ frozen.
 - **Platform:** Linux x86_64 is the verified target; the x86_64 register
   switch is measured here, the `ucontext` fallback for aarch64/other targets
   exists but is not verified on this machine. macOS/Windows and
-  cross-compilation are missing. C API/C extensions are blocked (P4-04).
+  cross-compilation are missing. The C API/ABI path is decided (P4-04 option B)
+  but no extension runs yet; implementation and the 297-module stdlib program
+  are open (P4-04a…P4-11).

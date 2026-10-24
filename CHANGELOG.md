@@ -107,6 +107,20 @@ blocked (see `docs/C_API.md`).
   switch. `PYX_GC_STRESS=1` covers interleaved generators.
 - `bench_all.py` resolves its output directory absolutely so that child scripts
   write into the same directory.
+- **Native module dispatch cache:** `pyx_module_call`/`call_native` borrow
+  names without allocating and cache the resolved spec per thread; `math_loop`
+  moved from 0.81x to parity/faster (AOT 22.50 ms vs. CPython 22.65 ms at
+  n=200000; 50k micro harness 6.2 ms vs. 13.6 ms).
+- **P4-04 decision (2026-10-24): option B** — a PyX-native CPython C-API/ABI
+  layer without embedded `libpython`; CPython 3.14 headers/toolchain are used
+  at build time and the interpreter as a differential test oracle. Probes:
+  embedded CPython init 6.67 ms + finalize 7.46 ms, `import numpy` 41.64 ms;
+  a stable-ABI fixture imports with four undefined CPython symbols
+  (`spikes/p4_04/`).
+- **Full-compatibility program:** P4-09 (297 stdlib modules: 174 pure Python,
+  71 extension, 52 builtin/frozen), P4-10 (ecosystem suites: NumPy, pandas,
+  pydantic, FastAPI, Django, …) and P4-11 (ecosystem benchmarks) added to
+  `docs/TODO.md`.
 
 ### Known limitations
 
@@ -114,9 +128,10 @@ blocked (see `docs/C_API.md`).
   `yield from`, async generators, and async comprehensions are missing;
   `asyncio` offers only `run`/`sleep`/`gather`, `async for`/`async with` use
   the synchronous protocol. Generator expressions remain eagerly materialized.
-- Performance weakness: native module dispatch (math_loop ~0.8x); the
-  register-only fiber switch is no longer a resume bottleneck (100k generator
-  sum AOT 6.8 ms vs. CPython 11.0 ms).
+- Performance weaknesses: string concatenation is O(n²) and float boxing is
+  per-value; extension boundaries will add conversion cost. Native module
+  dispatch and generator resume are no longer bottlenecks (math_loop at
+  parity; 100k generator sum AOT 6.8 ms vs. CPython 10.2 ms).
 - Classes with only one base and without class attributes/decorators/metaclasses/
   descriptors; closures are by-value (no mutable capture).
 - User modules only as sibling `.py` (no packages/dots/relative
@@ -124,8 +139,9 @@ blocked (see `docs/C_API.md`).
 - `re` uses Rust `regex` syntax (no lookarounds/backreferences);
   `socket` only blocking TCP; `random` not CPython-reproducible.
 - GC conservative, without precise roots/stack maps or size-class allocator.
-- C API/C extensions (P4-04) blocked: no `python3-config`/`Python.h` in
-  the current environment; no measurements/decision.
+- C API/C extensions: decision B (PyX-native ABI layer, no `libpython`) but
+  not implemented yet; no extension runs under PyX. The 297-module stdlib
+  parity, ecosystem suites and ecosystem benchmarks are open (P4-04a…P4-11).
 
 ## [0.1.0] - 2026-10-24
 

@@ -10,6 +10,7 @@
 //! All fallible paths report a pending exception and return the `None` dummy
 //! value; no user input can panic.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
@@ -43,8 +44,23 @@ const MAX_NAME_LEN: usize = isize::MAX as usize;
 /// Maximum argument count whose byte length still fits in `isize`.
 const MAX_ARGS: usize = MAX_NAME_LEN / std::mem::size_of::<i64>();
 
+/// Borrows a UTF-8 name from the ABI buffer without allocating. `NULL`, empty,
+/// over-long and non-UTF-8 buffers decode to `None`; those are error paths,
+/// where callers fall back to [`decode_name`] to preserve the historical lossy
+/// rendering.
+fn name_str<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    if ptr.is_null() || len == 0 || len > MAX_NAME_LEN {
+        return None;
+    }
+    // SAFETY: the ABI contract requires `ptr..ptr+len` to be readable; the
+    // length check above keeps the slice representable.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    std::str::from_utf8(bytes).ok()
+}
+
 /// Copies a UTF-8 name from the ABI buffer. `NULL`, empty and over-long
 /// buffers decode to the empty string, which then fails the module lookup.
+/// Only used on error paths; hot paths borrow through [`name_str`].
 fn decode_name(ptr: *const u8, len: usize) -> String {
     if ptr.is_null() || len == 0 || len > MAX_NAME_LEN {
         return String::new();
@@ -53,6 +69,138 @@ fn decode_name(ptr: *const u8, len: usize) -> String {
     // length check above keeps the slice representable.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// One resolved native call. Names identify the call-site buffers by
+/// pointer/length pair; the byte comparison in [`NativeCache::lookup`]
+/// rechecks the contents so a recycled pointer with different text cannot
+/// produce a false hit.
+#[derive(Clone, Copy)]
+struct NativeCacheEntry {
+    module_ptr: usize,
+    module_len: usize,
+    function_ptr: usize,
+    function_len: usize,
+    /// Interned from `ModuleSpec::name`; never allocated per call.
+    module: &'static str,
+    /// Interned from `FunctionSpec::name`; never allocated per call.
+    function: &'static str,
+    spec: &'static stdlib::FunctionSpec,
+}
+
+const NATIVE_CACHE_SIZE: usize = 8;
+
+/// Bounded FIFO cache of resolved native calls. Resolving a name scans the
+/// central spec table; repeated `module.function(...)` call sites instead pay
+/// a pointer/length probe plus a byte comparison and reuse the interned names.
+struct NativeCache {
+    entries: [Option<NativeCacheEntry>; NATIVE_CACHE_SIZE],
+    next: usize,
+    #[cfg(test)]
+    hits: usize,
+}
+
+thread_local! {
+    static NATIVE_CACHE: RefCell<NativeCache> = const {
+        RefCell::new(NativeCache {
+            entries: [None; NATIVE_CACHE_SIZE],
+            next: 0,
+            #[cfg(test)]
+            hits: 0,
+        })
+    };
+}
+
+impl NativeCache {
+    fn lookup(
+        &mut self,
+        module_ptr: usize,
+        module_len: usize,
+        module: &str,
+        function_ptr: usize,
+        function_len: usize,
+        function: &str,
+    ) -> Option<NativeCacheEntry> {
+        let entry = self.entries.iter().flatten().copied().find(|entry| {
+            entry.module_ptr == module_ptr
+                && entry.module_len == module_len
+                && entry.function_ptr == function_ptr
+                && entry.function_len == function_len
+                && entry.module.as_bytes() == module.as_bytes()
+                && entry.function.as_bytes() == function.as_bytes()
+        });
+        #[cfg(test)]
+        if entry.is_some() {
+            self.hits += 1;
+        }
+        entry
+    }
+
+    fn insert(&mut self, entry: NativeCacheEntry) {
+        self.entries[self.next] = Some(entry);
+        self.next += 1;
+        if self.next == NATIVE_CACHE_SIZE {
+            self.next = 0;
+        }
+    }
+}
+
+/// Resolves a native call without the cache. The spec table owns the names,
+/// so they are interned as `&'static str` and error rendering never allocates
+/// on the hit path.
+fn resolve_native(
+    module: &str,
+    function: &str,
+) -> Option<(&'static str, &'static str, &'static stdlib::FunctionSpec)> {
+    let spec = stdlib::function(module, function)?;
+    let module_name = stdlib::module(module)?.name;
+    Some((module_name, spec.name, spec))
+}
+
+/// Resolves `module.function` through the per-thread cache, falling back to a
+/// spec-table scan on a miss. Empty names (invalid ABI buffers) are never
+/// cached and simply fail the lookup.
+fn native_spec(
+    module_ptr: usize,
+    module_len: usize,
+    module: &str,
+    function_ptr: usize,
+    function_len: usize,
+    function: &str,
+) -> Option<(&'static str, &'static str, &'static stdlib::FunctionSpec)> {
+    if module_len == 0 || function_len == 0 {
+        return None;
+    }
+    let cached = NATIVE_CACHE.try_with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.lookup(
+            module_ptr,
+            module_len,
+            module,
+            function_ptr,
+            function_len,
+            function,
+        ) {
+            return Some((entry.module, entry.function, entry.spec));
+        }
+        let resolved = resolve_native(module, function)?;
+        cache.insert(NativeCacheEntry {
+            module_ptr,
+            module_len,
+            function_ptr,
+            function_len,
+            module: resolved.0,
+            function: resolved.1,
+            spec: resolved.2,
+        });
+        Some(resolved)
+    });
+    match cached {
+        Ok(resolved) => resolved,
+        // The thread-local is unavailable only while thread state is being
+        // torn down; resolve directly rather than panic.
+        Err(_) => resolve_native(module, function),
+    }
 }
 
 fn missing_attribute(module: &str, name: &str) -> i64 {
@@ -84,6 +232,23 @@ pub(crate) fn module_call(
     argc: usize,
     argv: *const i64,
 ) -> i64 {
+    if let (Some(module), Some(function)) = (
+        name_str(module_ptr, module_len),
+        name_str(function_ptr, function_len),
+    ) {
+        return call_native_at(
+            module_ptr as usize,
+            module_len,
+            module,
+            function_ptr as usize,
+            function_len,
+            function,
+            argc,
+            argv,
+        );
+    }
+    // Invalid buffer or non-UTF-8 name: decode lossily so the resulting
+    // error message matches the historical rendering.
     let module = decode_name(module_ptr, module_len);
     let function = decode_name(function_ptr, function_len);
     call_native(&module, &function, argc, argv)
@@ -96,25 +261,67 @@ pub(crate) fn module_get(
     name_ptr: *const u8,
     name_len: usize,
 ) -> i64 {
+    if let (Some(module), Some(name)) = (
+        name_str(module_ptr, module_len),
+        name_str(name_ptr, name_len),
+    ) {
+        return module_get_named(module, name);
+    }
+    // Invalid buffer or non-UTF-8 name: decode lossily so the resulting
+    // error message matches the historical rendering.
     let module = decode_name(module_ptr, module_len);
     let name = decode_name(name_ptr, name_len);
+    module_get_named(&module, &name)
+}
 
-    if let Some(spec) = stdlib::function(&module, &name) {
-        let module_name = stdlib::module(&module)
-            .map(|m| m.name)
-            .unwrap_or("<module>");
+fn module_get_named(module: &str, name: &str) -> i64 {
+    if let Some(spec) = stdlib::function(module, name) {
+        let module_name = stdlib::module(module).map(|m| m.name).unwrap_or("<module>");
         return value::native_function_new(module_name, spec.name, spec.max_args);
     }
-    if stdlib::constant(&module, &name).is_some() {
-        return constant_value(&module, &name);
+    if stdlib::constant(module, name).is_some() {
+        return constant_value(module, name);
     }
-    missing_attribute(&module, &name)
+    missing_attribute(module, name)
 }
 
 /// Calls a native function by name, validating it against the central spec.
 /// Shared by `pyx_module_call` and calls through native function values.
 pub(crate) fn call_native(module: &str, function: &str, argc: usize, argv: *const i64) -> i64 {
-    let Some(spec) = stdlib::function(module, function) else {
+    // `FunctionBody::Native` stores `&'static str`, so the pointer identity
+    // used as the cache key is stable; the byte recheck still guards any
+    // caller that passes an ordinary borrow.
+    call_native_at(
+        module.as_ptr() as usize,
+        module.len(),
+        module,
+        function.as_ptr() as usize,
+        function.len(),
+        function,
+        argc,
+        argv,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_native_at(
+    module_ptr: usize,
+    module_len: usize,
+    module: &str,
+    function_ptr: usize,
+    function_len: usize,
+    function: &str,
+    argc: usize,
+    argv: *const i64,
+) -> i64 {
+    let Some((module_name, function_name, spec)) = native_spec(
+        module_ptr,
+        module_len,
+        module,
+        function_ptr,
+        function_len,
+        function,
+    ) else {
         return missing_attribute(module, function);
     };
     if argc < spec.min_args || argc > spec.max_args {
@@ -125,7 +332,7 @@ pub(crate) fn call_native(module: &str, function: &str, argc: usize, argv: *cons
         };
         return exc::raise_with_message(
             TYPE_ERROR,
-            &format!("{module}.{function}() takes {detail} ({argc} given)"),
+            &format!("{module_name}.{function_name}() takes {detail} ({argc} given)"),
         );
     }
     if argc > MAX_ARGS {
@@ -143,7 +350,7 @@ pub(crate) fn call_native(module: &str, function: &str, argc: usize, argv: *cons
         // length check above keeps the slice representable.
         unsafe { std::slice::from_raw_parts(argv, argc) }
     };
-    dispatch(module, function, args)
+    dispatch(module_name, function_name, args)
 }
 
 fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
@@ -2691,6 +2898,11 @@ mod tests {
         crate::builtins::call(function, args.len(), args.as_ptr())
     }
 
+    /// Number of native-call cache hits observed on this thread.
+    fn cache_hits() -> usize {
+        NATIVE_CACHE.with(|cache| cache.borrow().hits)
+    }
+
     #[test]
     fn math_constants_and_functions() {
         exc::init();
@@ -2756,6 +2968,139 @@ mod tests {
         exc::init();
         assert_eq!(call("math", "pow", &[int(1)]), NONE);
         assert_eq!(message(), "math.pow() takes 2 arguments (1 given)");
+    }
+
+    #[test]
+    fn native_call_cache_hits_for_alternating_names() {
+        exc::init();
+        let module = "math";
+        let sqrt = "sqrt";
+        let floor = "floor";
+        let sin = "sin";
+        let sqrt_arg = int(9);
+        let floor_arg = value::float_new(2.7);
+        let sin_arg = int(0);
+
+        // Warm the cache (one miss per name) and confirm the results.
+        assert_eq!(as_float(call(module, sqrt, &[sqrt_arg])), 3.0);
+        assert_eq!(as_int(call(module, floor, &[floor_arg])), 2);
+        assert_eq!(as_float(call(module, sin, &[sin_arg])), 0.0);
+        let warmed = cache_hits();
+
+        // Alternating call sites with the same names must all hit the cache
+        // and keep returning identical results.
+        for _ in 0..32 {
+            assert_eq!(as_float(call(module, sqrt, &[sqrt_arg])), 3.0);
+            assert_eq!(as_int(call(module, floor, &[floor_arg])), 2);
+            assert_eq!(as_float(call(module, sin, &[sin_arg])), 0.0);
+        }
+        assert_eq!(cache_hits() - warmed, 32 * 3);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn native_call_cache_handles_fresh_name_buffers() {
+        exc::init();
+
+        // Fresh heap buffers per call: the cache must not assume that equal
+        // names imply equal pointers.
+        for _ in 0..8 {
+            let module = String::from("math");
+            let function = String::from("sqrt");
+            let argument = int(16);
+            let result = module_call(
+                module.as_bytes().as_ptr(),
+                module.len(),
+                function.as_bytes().as_ptr(),
+                function.len(),
+                1,
+                &argument,
+            );
+            assert_eq!(as_float(result), 4.0);
+        }
+
+        // One stack buffer whose contents change between calls: the
+        // pointer/length pair repeats with different bytes, so the cache must
+        // fall through to a fresh resolution instead of trusting the pointer.
+        let module = *b"math";
+        let argument = value::float_new(-2.7);
+        let mut function = [0u8; 5];
+        function.copy_from_slice(b"floor");
+        assert_eq!(
+            as_int(module_call(
+                module.as_ptr(),
+                module.len(),
+                function.as_ptr(),
+                function.len(),
+                1,
+                &argument
+            )),
+            -3
+        );
+        function.copy_from_slice(b"trunc");
+        assert_eq!(
+            as_int(module_call(
+                module.as_ptr(),
+                module.len(),
+                function.as_ptr(),
+                function.len(),
+                1,
+                &argument
+            )),
+            -2
+        );
+        function.copy_from_slice(b"fabs!");
+        assert_eq!(
+            module_call(
+                module.as_ptr(),
+                module.len(),
+                function.as_ptr(),
+                function.len(),
+                1,
+                &argument
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        assert_eq!(message(), "module 'math' has no attribute 'fabs!'");
+    }
+
+    #[test]
+    fn native_call_cache_preserves_unknown_and_arity_errors() {
+        exc::init();
+        let module = "math";
+        // An unknown member is never cached but still raises AttributeError.
+        assert_eq!(call(module, "nope", &[]), NONE);
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        assert_eq!(message(), "module 'math' has no attribute 'nope'");
+
+        // Arity validation runs on the cached spec on hit paths only.
+        exc::init();
+        let sqrt = "sqrt";
+        let argument = int(4);
+        assert_eq!(as_float(call(module, sqrt, &[argument])), 2.0);
+        assert_eq!(call(module, sqrt, &[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "math.sqrt() takes 1 arguments (0 given)");
+        exc::init();
+        assert_eq!(call(module, sqrt, &[argument, argument]), NONE);
+        assert_eq!(message(), "math.sqrt() takes 1 arguments (2 given)");
+    }
+
+    #[test]
+    fn native_function_values_use_the_call_cache() {
+        exc::init();
+        let sqrt = get("math", "sqrt");
+        let argument = int(25);
+        assert_eq!(as_float(call_value(sqrt, &[argument])), 5.0);
+        let warmed = cache_hits();
+        for _ in 0..16 {
+            assert_eq!(as_float(call_value(sqrt, &[argument])), 5.0);
+        }
+        // `FunctionBody::Native` names are `&'static str`, so every call
+        // reaches the cache through the same pointer/length key.
+        assert_eq!(cache_hits() - warmed, 16);
+        assert!(!exc::pending());
     }
 
     #[test]
