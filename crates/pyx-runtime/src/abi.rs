@@ -770,6 +770,32 @@ pub extern "C" fn pyx_raise_value(v: i64) -> i64 {
     exc::raise_value(v)
 }
 
+/// `raise X(msg) from cause`: `cause` is `None` for `from None` (no chained
+/// traceback), otherwise a tagged exception value stored as the explicit
+/// cause.
+#[no_mangle]
+pub extern "C" fn pyx_raise_from(tag: u32, msg: i64, cause: i64) -> i64 {
+    exc::raise_from(tag, msg, cause)
+}
+
+/// `raise value from cause` for an existing exception object; `cause` is
+/// `None` for `from None`.
+#[no_mangle]
+pub extern "C" fn pyx_raise_value_from(value: i64, cause: i64) -> i64 {
+    exc::raise_value_from(value, cause)
+}
+
+/// Handler dispatch: `1` when the pending exception is caught by a handler
+/// for `handler_tag`, `0` otherwise (and when nothing is pending).
+///
+/// `BaseException` catches every exception, `Exception` catches everything
+/// except `KeyboardInterrupt` and the internal `GeneratorExit`, and other
+/// tags match by equality.
+#[no_mangle]
+pub extern "C" fn pyx_exc_matches(handler_tag: u32) -> i32 {
+    exc::matches_handler(handler_tag)
+}
+
 #[no_mangle]
 pub extern "C" fn pyx_uncaught() -> i64 {
     exc::uncaught()
@@ -1595,6 +1621,40 @@ mod tests {
         assert_eq!(data.line, 7);
         assert_eq!(data.frame, "main");
 
+        // Hierarchy dispatch: Exception catches normal exceptions but not
+        // KeyboardInterrupt; BaseException catches everything.
+        assert_eq!(pyx_exc_matches(exc::EXCEPTION), 1);
+        assert_eq!(pyx_exc_matches(exc::BASE_EXCEPTION), 1);
+        assert_eq!(pyx_exc_matches(exc::ZERO_DIVISION_ERROR), 1);
+        assert_eq!(pyx_exc_matches(exc::VALUE_ERROR), 0);
+        pyx_raise(exc::KEYBOARD_INTERRUPT, pyx_none());
+        assert_eq!(pyx_exc_matches(exc::EXCEPTION), 0);
+        assert_eq!(pyx_exc_matches(exc::BASE_EXCEPTION), 1);
+
+        // `raise RuntimeError(custom=?) from cause`: the new pending
+        // exception keeps the previous one as its explicit cause.
+        pyx_raise_msg(exc::ZERO_DIVISION_ERROR, b"custom".as_ptr(), 6);
+        let cause = pyx_exc_value();
+        assert_eq!(
+            pyx_raise_from(exc::RUNTIME_ERROR, pyx_none(), cause),
+            pyx_none()
+        );
+        assert_eq!(pyx_exc_tag(), exc::RUNTIME_ERROR as i64);
+        let chained = value::exception_data(pyx_exc_value()).expect("exception");
+        assert_eq!(chained.cause, Some(cause));
+
+        // `from None` stores no cause.
+        assert_eq!(
+            pyx_raise_value_from(pyx_exc_value(), pyx_none()),
+            pyx_none()
+        );
+        let suppressed = value::exception_data(pyx_exc_value()).expect("exception");
+        assert_eq!(suppressed.cause, None);
+
+        assert_eq!(pyx_exc_clear(), 0);
+        assert_eq!(pyx_exc_matches(exc::BASE_EXCEPTION), 0);
+
+        pyx_raise(exc::ZERO_DIVISION_ERROR, pyx_none());
         assert_eq!(pyx_uncaught(), 1);
         assert_eq!(pyx_exc_pending(), 0);
         assert_eq!(pyx_uncaught(), 0);

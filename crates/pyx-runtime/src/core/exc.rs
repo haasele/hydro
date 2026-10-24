@@ -25,6 +25,9 @@ pub(crate) struct ExcData {
     pub(crate) line: u32,
     /// Function name at raise time (`""` if unknown).
     pub(crate) frame: String,
+    /// Tagged exception value that caused this one, or `None` for no explicit
+    /// cause (including `raise ... from None`).
+    pub(crate) cause: Option<i64>,
 }
 
 // Exception tags, fixed by ARCHITECTURE §3.2.
@@ -43,6 +46,11 @@ pub(crate) const OS_ERROR: u32 = 10;
 /// Runtime-internal `GeneratorExit`, injected by `generator.close()`. It is
 /// not reachable from Python source (PyX has no `GeneratorExit` class yet).
 pub(crate) const GENERATOR_EXIT: u32 = 11;
+/// `Exception`: a handler for this tag matches every concrete exception
+/// except `KeyboardInterrupt` and `GeneratorExit`.
+pub(crate) const EXCEPTION: u32 = 12;
+/// `BaseException`: a handler for this tag matches every exception.
+pub(crate) const BASE_EXCEPTION: u32 = 13;
 
 pub(crate) fn tag_name(tag: u32) -> &'static str {
     match tag {
@@ -58,6 +66,8 @@ pub(crate) fn tag_name(tag: u32) -> &'static str {
         ATTRIBUTE_ERROR => "AttributeError",
         OS_ERROR => "OSError",
         GENERATOR_EXIT => "GeneratorExit",
+        EXCEPTION => "Exception",
+        BASE_EXCEPTION => "BaseException",
         // Unknown tags are rendered as RuntimeError rather than panicking.
         _ => "RuntimeError",
     }
@@ -72,6 +82,8 @@ fn default_message(tag: u32) -> &'static str {
         ATTRIBUTE_ERROR => "attribute not found",
         OS_ERROR => "I/O error",
         GENERATOR_EXIT => "",
+        // `Exception()` and `BaseException()` stringify to the empty string.
+        EXCEPTION | BASE_EXCEPTION => "",
         _ => "unknown error",
     }
 }
@@ -167,6 +179,12 @@ pub(crate) fn init() {
 /// Raises `tag` with `message`, capturing the current file/line/frame.
 /// Returns the ABI dummy value (`None`).
 pub(crate) fn raise_with_message(tag: u32, message: &str) -> i64 {
+    raise_with_message_cause(tag, message, None)
+}
+
+/// [`raise_with_message`] with an explicit cause (already filtered: `None`
+/// means "no cause").
+fn raise_with_message_cause(tag: u32, message: &str, cause: Option<i64>) -> i64 {
     let (file, line) = STATE.with(|s| {
         let st = s.borrow();
         (st.file.clone(), st.line)
@@ -179,13 +197,42 @@ pub(crate) fn raise_with_message(tag: u32, message: &str) -> i64 {
         file,
         line,
         frame,
+        cause,
     };
-    let exc = value::exception_new(data);
+    publish(value::exception_new(data))
+}
+
+/// Installs `exc` as the pending exception and mirrors it into the thread's
+/// GC registration so a collector stopping the world at a safepoint also
+/// marks it. Returns the ABI dummy value (`None`).
+fn publish(exc: i64) -> i64 {
     STATE.with(|s| s.borrow_mut().pending = Some(exc));
-    // Mirrored into the thread's GC registration so a collector stopping the
-    // world at a safepoint also marks this exception object.
     crate::heap::set_pending_mirror(exc);
     NONE
+}
+
+/// Normalises the ABI `cause` argument: `None` suppresses the cause
+/// (`raise ... from None`), any other tagged value is stored as the cause.
+fn cause_of(cause: i64) -> Option<i64> {
+    if cause == NONE {
+        None
+    } else {
+        Some(cause)
+    }
+}
+
+/// Renders the `msg` argument of a raise: `None` selects the default text,
+/// `KeyError` and non-string arguments use `repr()` and strings `str()`.
+fn rendered_message(tag: u32, msg: i64) -> String {
+    if msg == value::NONE {
+        default_message(tag).to_string()
+    } else if tag == KEY_ERROR {
+        value::repr(msg)
+    } else if let Some(s) = value::as_str(msg) {
+        s.to_string()
+    } else {
+        value::repr(msg)
+    }
 }
 
 /// `pyx_raise`: `msg` is a string value or `None` (default message).
@@ -194,16 +241,7 @@ pub(crate) fn raise_with_message(tag: u32, message: &str) -> i64 {
 /// prints `'k'`), while other exception types use `str()` for strings and
 /// `repr()` for non-string arguments.
 pub(crate) fn raise(tag: u32, msg: i64) -> i64 {
-    let text = if msg == value::NONE {
-        default_message(tag).to_string()
-    } else if tag == KEY_ERROR {
-        value::repr(msg)
-    } else if let Some(s) = value::as_str(msg) {
-        s.to_string()
-    } else {
-        value::repr(msg)
-    };
-    raise_with_message(tag, &text)
+    raise_with_message(tag, &rendered_message(tag, msg))
 }
 
 /// `pyx_raise_msg`: copies the message bytes before storing them.
@@ -219,49 +257,85 @@ pub(crate) fn raise_msg_ptr(tag: u32, ptr: *const u8, len: usize) -> i64 {
 /// matching CPython.
 pub(crate) fn raise_value(v: i64) -> i64 {
     if value::exception_data(v).is_some() {
-        STATE.with(|s| s.borrow_mut().pending = Some(v));
-        crate::heap::set_pending_mirror(v);
-        NONE
+        publish(v)
     } else {
         raise_with_message(RUNTIME_ERROR, "exceptions must derive from BaseException")
     }
+}
+
+/// `pyx_raise_from`: `raise X(msg) from cause`.
+///
+/// A `cause` of `None` (`from None`) suppresses the cause entirely; any other
+/// tagged value is stored as the explicit cause so the chained traceback and
+/// the collector can follow it.
+pub(crate) fn raise_from(tag: u32, msg: i64, cause: i64) -> i64 {
+    let text = rendered_message(tag, msg);
+    raise_with_message_cause(tag, &text, cause_of(cause))
+}
+
+/// `pyx_raise_value_from`: `raise value from cause` for an existing exception
+/// object.
+///
+/// The payload is copied with the new cause rather than mutated: exception
+/// objects can be shared between threads, so the original stays untouched.
+/// Non-exception values raise `RuntimeError`, matching [`raise_value`].
+pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
+    match value::exception_data(v) {
+        Some(data) => {
+            let mut data = data.clone();
+            data.cause = cause_of(cause);
+            publish(value::exception_new(data))
+        }
+        None => raise_with_message(RUNTIME_ERROR, "exceptions must derive from BaseException"),
+    }
+}
+
+/// `pyx_exc_matches`: whether the pending exception is caught by a handler for
+/// `handler_tag`.
+///
+/// `BaseException` matches every tag, `Exception` matches everything except
+/// `KeyboardInterrupt` and the internal `GeneratorExit`, and every other
+/// handler tag matches only an exception with the same tag. Without a pending
+/// exception nothing matches.
+pub(crate) fn matches_handler(handler_tag: u32) -> i32 {
+    let pending = STATE.with(|s| s.borrow().pending);
+    let Some(tag) = pending.and_then(|exc| value::exception_data(exc).map(|data| data.tag)) else {
+        return 0;
+    };
+    let matched = match handler_tag {
+        BASE_EXCEPTION => true,
+        EXCEPTION => tag != KEYBOARD_INTERRUPT && tag != GENERATOR_EXIT,
+        _ => handler_tag == tag,
+    };
+    i32::from(matched)
 }
 
 // -------------------------------------------------------------------------
 // Uncaught traceback
 // -------------------------------------------------------------------------
 
+/// Maximum number of exceptions rendered for one cause chain. Deeper chains
+/// stop at the outermost exception (the chain is rendered deepest first).
+const MAX_CAUSE_CHAIN: usize = 8;
+
 /// Prints the traceback for the pending exception to stderr, clears it and
 /// returns the process exit code `1`. Returns `0` if nothing is pending.
 pub(crate) fn uncaught() -> i64 {
-    let (has_pending, data) = STATE.with(|s| {
-        let st = s.borrow();
-        (
-            st.pending.is_some(),
-            st.pending.and_then(value::exception_clone),
-        )
-    });
-    if !has_pending {
+    let root = STATE.with(|s| s.borrow().pending);
+    let Some(root) = root else {
         return 0;
-    }
-    let data = data.unwrap_or_else(|| ExcData {
+    };
+    let data = value::exception_clone(root).unwrap_or_else(|| ExcData {
         tag: RUNTIME_ERROR,
         name: tag_name(RUNTIME_ERROR),
         msg: default_message(RUNTIME_ERROR).to_string(),
         file: String::new(),
         line: 0,
         frame: String::new(),
+        cause: None,
     });
 
-    let mut text = String::new();
-    let _ = writeln!(text, "Traceback (most recent call last):");
-    let _ = writeln!(
-        text,
-        "  File \"{}\", line {}, in {}",
-        data.file, data.line, data.frame
-    );
-    let _ = writeln!(text, "{}: {}", data.name, data.msg);
-
+    let text = render_chain(root, &data);
     let stderr = std::io::stderr();
     let mut stderr = stderr.lock();
     let _ = stderr.write_all(text.as_bytes());
@@ -269,6 +343,49 @@ pub(crate) fn uncaught() -> i64 {
 
     clear();
     1
+}
+
+/// Renders `data` after the tracebacks of its explicit causes.
+///
+/// The chain is followed through `ExcData::cause` only (implicit context is
+/// not tracked), deepest cause first, separated by the CPython marker line.
+/// At most [`MAX_CAUSE_CHAIN`] exceptions are rendered and cycles are cut off,
+/// so a self-referential chain cannot loop.
+fn render_chain(root: i64, data: &ExcData) -> String {
+    let mut chain = vec![data.clone()];
+    let mut seen = vec![root];
+    let mut cause = data.cause;
+    while let Some(handle) = cause {
+        if chain.len() >= MAX_CAUSE_CHAIN || seen.contains(&handle) {
+            break;
+        }
+        seen.push(handle);
+        let Some(next) = value::exception_data(handle) else {
+            break;
+        };
+        cause = next.cause;
+        chain.push(next.clone());
+    }
+
+    let mut text = String::new();
+    for (index, data) in chain.iter().rev().enumerate() {
+        if index > 0 {
+            let _ = writeln!(text);
+            let _ = writeln!(
+                text,
+                "The above exception was the direct cause of the following exception:"
+            );
+            let _ = writeln!(text);
+        }
+        let _ = writeln!(text, "Traceback (most recent call last):");
+        let _ = writeln!(
+            text,
+            "  File \"{}\", line {}, in {}",
+            data.file, data.line, data.frame
+        );
+        let _ = writeln!(text, "{}: {}", data.name, data.msg);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -399,6 +516,258 @@ mod tests {
         raise(ZERO_DIVISION_ERROR, NONE);
         let data = value::exception_data(pending_value()).expect("exception object");
         assert_eq!(data.frame, "");
+        init();
+    }
+
+    /// Builds an exception payload directly, bypassing the raise machinery.
+    fn test_data(tag: u32, msg: &str, line: u32, frame: &str, cause: Option<i64>) -> ExcData {
+        ExcData {
+            tag,
+            name: tag_name(tag),
+            msg: msg.to_string(),
+            file: "test.py".to_string(),
+            line,
+            frame: frame.to_string(),
+            cause,
+        }
+    }
+
+    /// Overwrites the dead helper frames below the caller with zeroes, so a
+    /// stale tagged value cannot keep a garbage object alive.
+    #[inline(never)]
+    fn scrub_stack() {
+        let mut buffer = [0u8; 64 * 1024];
+        std::hint::black_box(&mut buffer);
+        buffer[0] = 0;
+        std::hint::black_box(&buffer);
+    }
+
+    /// Raises an outer exception with an inner one as its cause; no local in
+    /// this frame keeps the inner value alive once the frame is gone.
+    #[inline(never)]
+    fn raise_chain_with_cause() -> i64 {
+        let inner = value::exception_new(test_data(VALUE_ERROR, "inner", 1, "inner", None));
+        raise_from(RUNTIME_ERROR, NONE, inner);
+        pending_value()
+    }
+
+    #[test]
+    fn hierarchy_tags_raise_like_concrete_exceptions() {
+        init();
+        raise(EXCEPTION, NONE);
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert_eq!(data.tag, EXCEPTION);
+        assert_eq!(data.name, "Exception");
+        assert_eq!(data.msg, "");
+        assert_eq!(value::type_name(pending_value()), "Exception");
+
+        init();
+        raise(BASE_EXCEPTION, value::str_from_bytes(b"base"));
+        assert_eq!(value::type_name(pending_value()), "BaseException");
+        assert_eq!(value::to_string(pending_value()), "base");
+        init();
+    }
+
+    #[test]
+    fn handler_matching_follows_the_hierarchy() {
+        // Handlers: ValueError, TypeError, KeyboardInterrupt, GeneratorExit,
+        // Exception, BaseException.
+        let handlers = [
+            VALUE_ERROR,
+            TYPE_ERROR,
+            KEYBOARD_INTERRUPT,
+            GENERATOR_EXIT,
+            EXCEPTION,
+            BASE_EXCEPTION,
+        ];
+        let cases: &[(u32, [bool; 6])] = &[
+            (VALUE_ERROR, [true, false, false, false, true, true]),
+            (KEYBOARD_INTERRUPT, [false, false, true, false, false, true]),
+            (GENERATOR_EXIT, [false, false, false, true, false, true]),
+            (EXCEPTION, [false, false, false, false, true, true]),
+            (BASE_EXCEPTION, [false, false, false, false, true, true]),
+        ];
+
+        init();
+        for &(tag, expected) in cases {
+            raise_with_message(tag, "boom");
+            for (&handler, &want) in handlers.iter().zip(expected.iter()) {
+                assert_eq!(
+                    matches_handler(handler),
+                    i32::from(want),
+                    "exception tag {tag} against handler {handler}"
+                );
+            }
+        }
+
+        // No pending exception: nothing matches, not even BaseException.
+        clear();
+        for handler in handlers {
+            assert_eq!(matches_handler(handler), 0);
+        }
+        init();
+    }
+
+    #[test]
+    fn cause_is_stored_and_cloned() {
+        init();
+        raise(VALUE_ERROR, value::str_from_bytes(b"inner"));
+        let inner = pending_value();
+        clear();
+
+        assert_eq!(
+            raise_from(RUNTIME_ERROR, value::str_from_bytes(b"outer"), inner),
+            NONE
+        );
+        let outer = pending_value();
+        let data = value::exception_data(outer).expect("exception object");
+        assert_eq!(data.tag, RUNTIME_ERROR);
+        assert_eq!(data.msg, "outer");
+        assert_eq!(data.cause, Some(inner));
+
+        let cloned = value::exception_clone(outer).expect("clone");
+        assert_eq!(cloned.cause, Some(inner));
+        assert_eq!(cloned.msg, "outer");
+
+        // `from None` suppresses the cause.
+        raise_from(TYPE_ERROR, NONE, NONE);
+        assert_eq!(
+            value::exception_data(pending_value())
+                .expect("exception object")
+                .cause,
+            None
+        );
+        init();
+    }
+
+    #[test]
+    fn raise_value_from_copies_with_cause() {
+        init();
+        raise(VALUE_ERROR, value::str_from_bytes(b"inner"));
+        let inner = pending_value();
+        clear();
+        raise(TYPE_ERROR, value::str_from_bytes(b"outer"));
+        let original = pending_value();
+        clear();
+
+        assert_eq!(raise_value_from(original, inner), NONE);
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert_eq!(data.tag, TYPE_ERROR);
+        assert_eq!(data.msg, "outer");
+        assert_eq!(data.cause, Some(inner));
+        // The source object is not mutated by the re-raise.
+        assert_eq!(
+            value::exception_data(original)
+                .expect("exception object")
+                .cause,
+            None
+        );
+
+        // `from None` suppresses the cause for an existing exception too.
+        raise_value_from(original, NONE);
+        assert_eq!(
+            value::exception_data(pending_value())
+                .expect("exception object")
+                .cause,
+            None
+        );
+
+        // Non-exception values raise RuntimeError, matching bare `raise`.
+        raise_value_from(NONE, inner);
+        assert_eq!(pending_tag(), RUNTIME_ERROR as i64);
+        init();
+    }
+
+    #[test]
+    fn chained_traceback_is_rendered_cause_first() {
+        init();
+        let inner = value::exception_new(test_data(VALUE_ERROR, "inner", 3, "inner_fn", None));
+        let outer = value::exception_new(test_data(
+            RUNTIME_ERROR,
+            "outer",
+            7,
+            "outer_fn",
+            Some(inner),
+        ));
+
+        let data = value::exception_clone(outer).expect("clone");
+        assert_eq!(
+            render_chain(outer, &data),
+            concat!(
+                "Traceback (most recent call last):\n",
+                "  File \"test.py\", line 3, in inner_fn\n",
+                "ValueError: inner\n",
+                "\n",
+                "The above exception was the direct cause of the following exception:\n",
+                "\n",
+                "Traceback (most recent call last):\n",
+                "  File \"test.py\", line 7, in outer_fn\n",
+                "RuntimeError: outer\n",
+            )
+        );
+
+        // Without a cause the single-exception format is unchanged.
+        let lone = value::exception_new(test_data(RUNTIME_ERROR, "outer", 7, "outer_fn", None));
+        let data = value::exception_clone(lone).expect("clone");
+        assert_eq!(
+            render_chain(lone, &data),
+            concat!(
+                "Traceback (most recent call last):\n",
+                "  File \"test.py\", line 7, in outer_fn\n",
+                "RuntimeError: outer\n",
+            )
+        );
+        init();
+    }
+
+    #[test]
+    fn cause_chain_is_depth_limited() {
+        init();
+        let mut exc = value::exception_new(test_data(VALUE_ERROR, "e0", 0, "root", None));
+        for index in 1..12 {
+            exc = value::exception_new(test_data(
+                RUNTIME_ERROR,
+                &format!("e{index}"),
+                index,
+                "outer",
+                Some(exc),
+            ));
+        }
+
+        let data = value::exception_clone(exc).expect("clone");
+        let text = render_chain(exc, &data);
+        assert_eq!(
+            text.matches("Traceback (most recent call last):").count(),
+            MAX_CAUSE_CHAIN
+        );
+        // The outermost exception is always rendered last.
+        assert!(text.ends_with("RuntimeError: e11\n"), "{text}");
+        init();
+    }
+
+    #[test]
+    fn collection_keeps_the_cause_of_the_pending_exception() {
+        init();
+        crate::heap::reset();
+        let outer = raise_chain_with_cause();
+        assert!(pending());
+        assert_eq!(crate::heap::objects(), 2, "inner and outer were allocated");
+
+        scrub_stack();
+        let freed = crate::heap::collect();
+        assert_eq!(
+            freed, 0,
+            "the pending exception and its cause must stay reachable"
+        );
+        assert_eq!(crate::heap::objects(), 2);
+
+        // The cause survived and still carries its payload.
+        let data = value::exception_data(outer).expect("exception object");
+        let cause = data.cause.expect("cause edge");
+        assert_eq!(
+            value::exception_data(cause).expect("cause object").msg,
+            "inner"
+        );
         init();
     }
 }

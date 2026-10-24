@@ -24,7 +24,7 @@ defined subset (see [Language Scope](#language-and-stdlib-scope) and
 | Phase 6 — Diagnostics/Developer Experience | largely done; completions/manpage and ICE regression test open |
 
 Current state of work (Cargo version 0.1.0, no public release yet):
-**877 tests** (unit, integration, E2E). Compatibility target: **CPython
+**905 tests** (unit, integration, E2E). Compatibility target: **CPython
 3.14.9**; the official `Lib/test` baseline is 0/398 today (missing stdlib
 imports), tracked in [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md). JIT (`pyx run`) and AOT
 (`pyx build`) share the same runtime and IR. Details:
@@ -172,8 +172,10 @@ supported by `run`.
 
 **Control flow, exceptions, context**
 
-- `raise`, `try`/`except [as]`/`else`/`finally`, re-raise, Python-style
-  tracebacks; unhandled exceptions exit with exit code 1.
+- `raise` (incl. `raise ... from ...`), `try`/`except [as]`/`else`/`finally`,
+  re-raise, `except Exception`/`BaseException`, tuple handlers and simplified
+  Python-style tracebacks (explicit chains are deepest-first); unhandled
+  exceptions exit with exit code 1.
 - `with a as x, b as y:` via the `__enter__`/`__exit__` protocol (files,
   `Pool`, user classes); return values of `__exit__` do not suppress
   exceptions. `with` items are exited in reverse order.
@@ -241,7 +243,7 @@ Async generators and async comprehensions (`asyncio` only
 `run`/`sleep`/`gather`), decorators,
 pattern matching, metaclasses, descriptor/`__dunder__` protocols, multiple
 inheritance, `bytearray`/`memoryview`, BigInt, slice assignment,
-exception chaining, `except*`; arbitrary
+implicit exception context, `except*`; arbitrary
 C extensions or the C API/ABI, the complete CPython stdlib, packages/
 relative imports, imports inside functions as well as top-level code in
 imported modules. Precise GC roots and a dedicated size-class allocator
@@ -278,7 +280,7 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests and Benchmarks
 
 - `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), build,
-  `cargo test --workspace` (877 tests), E2E comparison JIT vs. AOT,
+  `cargo test --workspace` (905 tests), E2E comparison JIT vs. AOT,
   negative tests (diagnostics/tracebacks) and GC stress tests.
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Ubuntu, stable
   Rust, fmt/clippy/test/verify, no secrets).

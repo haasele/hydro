@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
-implemented (877 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (905 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -201,6 +201,9 @@ i64  pyx_exc_clear(void);
 i64  pyx_raise(uint32_t tag, i64 msg);
 i64  pyx_raise_msg(uint32_t tag, const uint8_t* p, size_t n);
 i64  pyx_raise_value(i64 exc);
+i64  pyx_raise_from(uint32_t tag, i64 msg, i64 cause);
+i64  pyx_raise_value_from(i64 exc, i64 cause);
+int  pyx_exc_matches(uint32_t handler_tag);
 i64  pyx_uncaught(void);
 void pyx_runtime_init(void);
 void pyx_register_function(const uint8_t* name, size_t name_len,
@@ -220,8 +223,11 @@ followed by the call arguments. The fiber starts only on the first
 
 Exception tags: `0 ValueError, 1 TypeError, 2 ZeroDivisionError,
 3 RuntimeError, 4 OverflowError, 5 KeyboardInterrupt, 6 IndexError,
-7 KeyError, 8 StopIteration, 9 AttributeError, 10 OSError`. Names 1:1 as in
-Python; `IOError` is an alias for `OSError`.
+7 KeyError, 8 StopIteration, 9 AttributeError, 10 OSError, 11 GeneratorExit`
+(internal), `12 Exception`, `13 BaseException`. Names 1:1 as in Python;
+`IOError` is an alias for `OSError`. `except Exception` matches every tag
+except 5/11; `except BaseException` matches every tag. Explicit causes are
+stored on the exception and traced by the GC.
 
 ### 3.3 Semantics
 
@@ -579,13 +585,16 @@ it. The cache is not a shared artifact store.
   only after an error-free body; `finally` runs on every path (normal, `return`,
   `break`, `continue`, exception) and can override the previous action
   (return/break/continue suppress a pending exception; a new exception
-  in finally replaces the old one). Exception chaining is not implemented.
-  `except*` is not supported.
+  in finally replaces the old one). Tuple handlers are expanded by the
+  frontend into ordered handlers. `raise ... from ...` stores an explicit
+  cause, rendered deepest-first; `from None` suppresses it. Implicit context
+  chaining ("During handling ...") and `except*` are not implemented.
 - `ForEach` iterates lists/strings/dicts via the runtime iterators;
   `ForRange` remains the syntactically specialized `range(...)` form (since
   Phase 2.7, `range` is additionally a value). Negative step is
   allowed, step `0` is a runtime `ValueError`.
-- `Raise { exc: None, msg: None }` is a bare re-raise.
+- `Raise { exc, msg, cause }`: `exc == msg == None` is a bare re-raise;
+  `cause` is the optional explicit chaining expression.
 - Functions carry `is_generator` and `is_async`; codegen derives the
   flags in `pyx_function_new`/`pyx_closure_new` from them (bit 0 async, bit 1
   generator) and generates a wrapper that calls `pyx_coroutine_new` resp.
@@ -819,7 +828,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-24: **877 tests** (269 frontend, 404 runtime incl. 173
+- As of 2026-10-24: **905 tests** (281 frontend, 411 runtime incl. 173
   ABI integration tests, 17 codegen, 3 IR, 154 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `argparse`/`defaultdict`/`re`, socket echo,
@@ -834,7 +843,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 
 - **Language:** no BigInt (i64), no decorators, pattern matching,
   metaclasses, descriptor/`__dunder__` protocols, `except*`,
-  exception chaining, `bytearray`/`memoryview`; no slice assignment; no
+  implicit exception context, `bytearray`/`memoryview`; no slice assignment; no
   class attributes/multiple inheritance; class namespace immutable.
 - **Closures:** by value at definition time; recursive nested
   functions and closures in lambdas are diagnostics. No cell/mutable

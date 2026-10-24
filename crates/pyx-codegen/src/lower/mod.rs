@@ -162,6 +162,9 @@ struct Runtime {
     exc_clear: FuncId,
     raise: FuncId,
     raise_value: FuncId,
+    raise_from: FuncId,
+    raise_value_from: FuncId,
+    exc_matches: FuncId,
     uncaught: FuncId,
     runtime_init: FuncId,
     register_function: FuncId,
@@ -352,6 +355,19 @@ impl Runtime {
             exc_clear: declare_runtime(module, "pyx_exc_clear", &[], Some(i64t))?,
             raise: declare_runtime(module, "pyx_raise", &[i32t, i64t], Some(i64t))?,
             raise_value: declare_runtime(module, "pyx_raise_value", &[i64t], Some(i64t))?,
+            // Explicit chaining. Both arguments are tagged values; a `None`
+            // cause stands for `from None` (no chained traceback).
+            raise_from: declare_runtime(module, "pyx_raise_from", &[i32t, i64t, i64t], Some(i64t))?,
+            raise_value_from: declare_runtime(
+                module,
+                "pyx_raise_value_from",
+                &[i64t, i64t],
+                Some(i64t),
+            )?,
+            // Exception-hierarchy test used by `except Exception` /
+            // `except BaseException`; returns 1 when the pending exception
+            // matches the encoded hierarchy kind.
+            exc_matches: declare_runtime(module, "pyx_exc_matches", &[i32t], Some(i32t))?,
             uncaught: declare_runtime(module, "pyx_uncaught", &[], Some(i64t))?,
             runtime_init: declare_runtime(module, "pyx_runtime_init", &[], None)?,
             register_function: declare_runtime(
@@ -1522,8 +1538,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.call_rt(id, &[value])?;
                 self.emit_exc_check()?;
             }
-            StmtKind::Raise { exc, msg } => {
-                self.lower_raise(*exc, msg.as_ref())?;
+            StmtKind::Raise { exc, msg, cause } => {
+                self.lower_raise(*exc, msg.as_ref(), cause.as_ref())?;
             }
             StmtKind::Try {
                 body,
@@ -2051,12 +2067,25 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         self.jump(handler_block);
                     }
                     Some(kind) => {
-                        let tag_id = self.runtime.exc_tag;
-                        let tag = self.call_rt(tag_id, &[])?;
-                        let matches =
-                            self.builder
-                                .ins()
-                                .icmp_imm(IntCC::Equal, tag, kind.tag() as i64);
+                        let matches = match kind {
+                            // `Exception` matches every concrete kind except
+                            // `KeyboardInterrupt`/`GeneratorExit`, and
+                            // `BaseException` matches everything. The runtime
+                            // owns that hierarchy so codegen only asks it.
+                            ExcKind::Exception | ExcKind::BaseException => {
+                                let tag = self.builder.ins().iconst(types::I32, kind.tag() as i64);
+                                let id = self.runtime.exc_matches;
+                                let caught = self.call_rt(id, &[tag])?;
+                                self.builder.ins().icmp_imm(IntCC::NotEqual, caught, 0)
+                            }
+                            _ => {
+                                let tag_id = self.runtime.exc_tag;
+                                let tag = self.call_rt(tag_id, &[])?;
+                                self.builder
+                                    .ins()
+                                    .icmp_imm(IntCC::Equal, tag, kind.tag() as i64)
+                            }
+                        };
                         self.builder
                             .ins()
                             .brif(matches, handler_block, &[], next_handler, &[]);
@@ -2141,23 +2170,56 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         &mut self,
         exc: Option<ExcKind>,
         msg: Option<&'a Expr>,
+        cause: Option<&'a Expr>,
     ) -> Result<(), CodegenError> {
         match exc {
             Some(kind) => {
+                // Python evaluates the exception expression before the
+                // `from` cause; an exception raised while evaluating either
+                // one propagates through the normal exception path.
                 let message = match msg {
                     Some(expr) => self.lower_expr(expr)?,
                     None => self.none(),
                 };
                 let tag = self.builder.ins().iconst(types::I32, kind.tag() as i64);
-                let id = self.runtime.raise;
-                self.call_rt(id, &[tag, message])?;
+                match cause {
+                    Some(expr) => {
+                        let cause = self.lower_expr(expr)?;
+                        let id = self.runtime.raise_from;
+                        self.call_rt(id, &[tag, message, cause])?;
+                    }
+                    None => {
+                        let id = self.runtime.raise;
+                        self.call_rt(id, &[tag, message])?;
+                    }
+                }
                 let target = self.exc_target;
                 self.emit_jump_exc_target(target)?;
             }
             None => {
-                if msg.is_some() {
+                if let Some(expr) = msg {
+                    // `raise <value>`: the expression evaluates to an
+                    // exception object. As with a kind/message raise, the
+                    // explicit cause is evaluated after the exception value.
+                    let value = self.lower_expr(expr)?;
+                    match cause {
+                        Some(expr) => {
+                            let cause = self.lower_expr(expr)?;
+                            let id = self.runtime.raise_value_from;
+                            self.call_rt(id, &[value, cause])?;
+                        }
+                        None => {
+                            let id = self.runtime.raise_value;
+                            self.call_rt(id, &[value])?;
+                        }
+                    }
+                    let target = self.exc_target;
+                    self.emit_jump_exc_target(target)?;
+                    return Ok(());
+                }
+                if cause.is_some() {
                     return Err(CodegenError::new(
-                        "invalid IR: raise without an exception kind but with a message",
+                        "invalid IR: bare raise cannot have an explicit cause",
                     ));
                 }
                 // Bare raise inside an `except` arm re-raises the handled
@@ -4372,5 +4434,82 @@ mod tests {
             int_sites < any_sites,
             "the int loop condition must avoid pyx_binop: int={int_sites}, any={any_sites}"
         );
+    }
+
+    #[test]
+    fn exception_hierarchy_and_chaining_lower_to_the_runtime_imports() {
+        let text =
+            |value: &str| Expr::new(ExprKind::Const(Const::Str(value.to_string())), Type::Str, 1);
+        let pass = || Stmt::new(StmtKind::Pass, 2);
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![LocalInfo {
+                    name: "exc".to_string(),
+                    ty: Type::Any,
+                }],
+                body: vec![
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 0,
+                            value: Expr::new(ExprKind::Const(Const::None), Type::None, 1),
+                        },
+                        1,
+                    ),
+                    Stmt::new(
+                        StmtKind::Try {
+                            body: vec![Stmt::new(
+                                StmtKind::Raise {
+                                    exc: Some(ExcKind::ValueError),
+                                    msg: Some(text("boom")),
+                                    cause: Some(text("origin")),
+                                },
+                                2,
+                            )],
+                            handlers: vec![
+                                Handler {
+                                    exc: Some(ExcKind::Exception),
+                                    binding: None,
+                                    body: vec![pass()],
+                                },
+                                Handler {
+                                    exc: Some(ExcKind::BaseException),
+                                    binding: None,
+                                    body: vec![pass()],
+                                },
+                            ],
+                            else_body: Vec::new(),
+                            finally_body: Vec::new(),
+                        },
+                        1,
+                    ),
+                    // `raise <value> from <cause>` exercises the value-based
+                    // chaining ABI.
+                    Stmt::new(
+                        StmtKind::Raise {
+                            exc: None,
+                            msg: Some(Expr::new(ExprKind::Local(0), Type::Any, 3)),
+                            cause: Some(text("chained")),
+                        },
+                        3,
+                    ),
+                ],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+        };
+        let object = crate::compile_object(&program)
+            .expect("exception hierarchy handlers and chaining must lower");
+        for symbol in ["pyx_exc_matches", "pyx_raise_from", "pyx_raise_value_from"] {
+            assert!(
+                runtime_call_sites(&object, symbol) > 0,
+                "the generated code must reference {symbol}"
+            );
+        }
     }
 }

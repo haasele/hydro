@@ -1371,3 +1371,75 @@ fn extension_nodes_type_as_any() {
         other => panic!("expected an extension call, got {other:?}"),
     }
 }
+
+#[test]
+fn raise_from_emits_the_cause_expression() {
+    let source = "def f(cause):\n    raise RuntimeError('outer') from cause\n";
+    let program = crate::check_source(source, "test.py").expect("valid raise-from");
+    let f = program_function(&program, "f");
+    let StmtKind::Raise { exc, msg, cause } = &f.body[0].kind else {
+        panic!("expected a raise statement, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(*exc, Some(pyx_ir::ExcKind::RuntimeError));
+    assert!(msg.is_some());
+    let cause = cause.as_ref().expect("cause must be emitted");
+    assert!(
+        matches!(&cause.kind, ExprKind::Local(_)),
+        "cause must reference the parameter: {:?}",
+        cause.kind
+    );
+}
+
+#[test]
+fn raise_from_none_emits_a_none_constant_cause() {
+    let source = "def f():\n    raise ValueError('inner') from None\n";
+    let program = crate::check_source(source, "test.py").expect("valid raise-from-none");
+    let f = program_function(&program, "f");
+    let StmtKind::Raise {
+        exc,
+        cause: Some(cause),
+        ..
+    } = &f.body[0].kind
+    else {
+        panic!(
+            "expected a raise statement with a cause, got {:?}",
+            f.body[0].kind
+        );
+    };
+    assert_eq!(*exc, Some(pyx_ir::ExcKind::ValueError));
+    assert!(matches!(&cause.kind, ExprKind::Const(pyx_ir::Const::None)));
+}
+
+#[test]
+fn tuple_handler_emits_one_handler_per_type_in_source_order() {
+    let source = "def f():\n    try:\n        pass\n    except (TypeError, ValueError) as e:\n        print(e)\n";
+    let program = crate::check_source(source, "test.py").expect("valid tuple handler");
+    let f = program_function(&program, "f");
+    let StmtKind::Try { handlers, .. } = &f.body[0].kind else {
+        panic!("expected a try statement, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(handlers.len(), 2, "{handlers:?}");
+    assert_eq!(handlers[0].exc, Some(pyx_ir::ExcKind::TypeError));
+    assert_eq!(handlers[1].exc, Some(pyx_ir::ExcKind::ValueError));
+    assert!(handlers[0].binding.is_some());
+    assert_eq!(handlers[0].binding, handlers[1].binding);
+    assert_eq!(handlers[0].body.len(), handlers[1].body.len());
+}
+
+#[test]
+fn exception_hierarchy_handlers_survive_emission() {
+    let source = "def f():\n    try:\n        pass\n    except Exception:\n        pass\n    except BaseException:\n        pass\n";
+    let program = crate::check_source(source, "test.py").expect("valid hierarchy handlers");
+    let f = program_function(&program, "f");
+    let StmtKind::Try { handlers, .. } = &f.body[0].kind else {
+        panic!("expected a try statement, got {:?}", f.body[0].kind);
+    };
+    let kinds: Vec<Option<pyx_ir::ExcKind>> = handlers.iter().map(|h| h.exc).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            Some(pyx_ir::ExcKind::Exception),
+            Some(pyx_ir::ExcKind::BaseException)
+        ]
+    );
+}

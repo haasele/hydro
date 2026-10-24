@@ -392,6 +392,152 @@ fn bare_except_must_be_last() {
 }
 
 #[test]
+fn exception_and_base_exception_handlers_resolve() {
+    let source = "try:\n    pass\nexcept Exception:\n    pass\nexcept BaseException:\n    pass\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Try { handlers, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a try statement");
+    };
+    let kinds: Vec<Option<ExcKind>> = handlers.iter().map(|h| h.exc).collect();
+    assert_eq!(
+        kinds,
+        vec![Some(ExcKind::Exception), Some(ExcKind::BaseException)]
+    );
+}
+
+#[test]
+fn tuple_handler_expands_in_source_order_with_a_shared_body() {
+    let source = "try:\n    pass\nexcept (TypeError, ValueError) as e:\n    print(e)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Try { handlers, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a try statement");
+    };
+    assert_eq!(handlers.len(), 2, "{handlers:?}");
+    assert_eq!(handlers[0].exc, Some(ExcKind::TypeError));
+    assert_eq!(handlers[1].exc, Some(ExcKind::ValueError));
+    let binding = handlers[0].binding.expect("handler binding");
+    assert_eq!(handlers[1].binding, Some(binding));
+    assert_eq!(handlers[0].body.len(), 1);
+    assert_eq!(
+        format!("{:?}", handlers[0].body),
+        format!("{:?}", handlers[1].body),
+        "tuple handlers must share the same lowered body"
+    );
+}
+
+#[test]
+fn single_element_exception_tuple_expands() {
+    let source = "try:\n    pass\nexcept (ValueError,) as e:\n    print(e)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Try { handlers, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a try statement");
+    };
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].exc, Some(ExcKind::ValueError));
+}
+
+#[test]
+fn tuple_handler_rejects_unknown_and_non_name_elements() {
+    let source = "try:\n    pass\nexcept (ValueError, NopeError):\n    pass\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::NAME);
+    assert_eq!(diags[0].message, "unknown exception type 'NopeError'");
+
+    let source = "try:\n    pass\nexcept (ValueError, ex.Error):\n    pass\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message == "only simple exception names are supported in exception tuples"),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn empty_exception_tuple_is_rejected() {
+    let source = "try:\n    pass\nexcept ():\n    pass\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message == "empty exception tuple in except handler"),
+        "{diags:?}"
+    );
+    let HStmtKind::Try { handlers, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a try statement");
+    };
+    assert!(handlers.is_empty(), "{handlers:?}");
+}
+
+#[test]
+fn raise_from_lowers_the_cause_after_the_message() {
+    let source =
+        "try:\n    pass\nexcept ValueError as e:\n    raise RuntimeError('outer') from e\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Try { handlers, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a try statement");
+    };
+    let binding = handlers[0].binding.expect("handler binding");
+    let HStmtKind::Raise { exc, msg, cause } = &handlers[0].body[0].kind else {
+        panic!("expected a raise statement, got {:?}", handlers[0].body[0]);
+    };
+    assert_eq!(*exc, Some(ExcKind::RuntimeError));
+    assert!(matches!(
+        &msg.as_ref().expect("message").kind,
+        HExprKind::Const(Const::Str(_))
+    ));
+    assert!(
+        matches!(&cause.as_ref().expect("cause").kind, HExprKind::Local(id) if *id == binding),
+        "{cause:?}"
+    );
+}
+
+#[test]
+fn raise_from_none_lowers_the_none_constant_as_cause() {
+    let source = "raise ValueError('inner') from None\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Raise { exc, msg, cause } = &hir.functions[0].body[0].kind else {
+        panic!("expected a raise statement");
+    };
+    assert_eq!(*exc, Some(ExcKind::ValueError));
+    assert!(msg.is_some());
+    assert!(matches!(
+        &cause.as_ref().expect("cause").kind,
+        HExprKind::Const(Const::None)
+    ));
+}
+
+#[test]
+fn raise_from_without_an_exception_is_rejected() {
+    let source = "raise ValueError\n";
+    let mut module = parse(source);
+    let ast::Stmt::Raise(raise) = &mut module.body[0] else {
+        panic!("expected a raise statement");
+    };
+    raise.exc = None;
+    let range = raise.range;
+    raise.cause = Some(Box::new(ast::Expr::Constant(ast::ExprConstant {
+        value: ast::Constant::None,
+        kind: None,
+        range,
+    })));
+    let (hir, _, diags) = lower_source(source, &module);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message == "raise ... from ... requires an exception"),
+        "{diags:?}"
+    );
+    assert!(hir.functions[0].body.is_empty());
+}
+
+#[test]
 fn try_else_without_except_is_rejected() {
     let source = "try:\n    pass\nexcept ValueError:\n    pass\nelse:\n    pass\n";
     let mut module = parse(source);

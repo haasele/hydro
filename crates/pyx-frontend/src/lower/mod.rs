@@ -167,6 +167,8 @@ pub enum HStmtKind {
     Raise {
         exc: Option<ExcKind>,
         msg: Option<HExpr>,
+        /// `raise ... from cause`; `None` for no explicit cause.
+        cause: Option<HExpr>,
     },
     Try {
         body: Vec<HStmt>,
@@ -178,7 +180,8 @@ pub enum HStmtKind {
 
 #[derive(Clone, Debug)]
 pub struct HHandler {
-    /// `None` for a bare `except:`.
+    /// `None` for a bare `except:`; tuple handlers are expanded into one
+    /// handler per type by the lowering pass.
     pub exc: Option<ExcKind>,
     pub binding: Option<LocalId>,
     pub body: Vec<HStmt>,
@@ -2795,89 +2798,76 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
-        if let Some(cause) = &s.cause {
-            self.error_at(
-                cause.range(),
-                "raise ... from ... is not supported in Phase 1",
+        if s.cause.is_some() && s.exc.is_none() {
+            self.error_at_code(
+                s.range,
+                codes::CONTROL,
+                "raise ... from ... requires an exception",
             );
             return None;
         }
-        let Some(exc_expr) = &s.exc else {
-            return Some(HStmt {
-                kind: HStmtKind::Raise {
-                    exc: None,
-                    msg: None,
-                },
-                line,
-                col,
-            });
-        };
 
-        match &**exc_expr {
-            ast::Expr::Name(n) => match ExcKind::from_name(n.id.as_str()) {
-                Some(kind) => Some(HStmt {
-                    kind: HStmtKind::Raise {
-                        exc: Some(kind),
-                        msg: None,
-                    },
-                    line,
-                    col,
-                }),
-                None => {
-                    self.error_at_code(
-                        n.range,
-                        codes::NAME,
-                        format!("unknown exception type '{}'", n.id),
-                    );
-                    None
+        let (exc, msg) = match &s.exc {
+            None => (None, None),
+            Some(exc_expr) => match &**exc_expr {
+                ast::Expr::Name(n) => match ExcKind::from_name(n.id.as_str()) {
+                    Some(kind) => (Some(kind), None),
+                    None => {
+                        self.error_at_code(
+                            n.range,
+                            codes::NAME,
+                            format!("unknown exception type '{}'", n.id),
+                        );
+                        return None;
+                    }
+                },
+                ast::Expr::Call(call) => {
+                    let ast::Expr::Name(n) = &*call.func else {
+                        self.error_at(
+                            call.func.range(),
+                            "raise only supports exception names in Phase 1",
+                        );
+                        return None;
+                    };
+                    let Some(kind) = ExcKind::from_name(n.id.as_str()) else {
+                        self.error_at_code(
+                            n.range,
+                            codes::NAME,
+                            format!("unknown exception type '{}'", n.id),
+                        );
+                        return None;
+                    };
+                    if !call.keywords.is_empty() {
+                        self.error_at(call.range, "keyword arguments are not supported in Phase 1");
+                        return None;
+                    }
+                    if call.args.len() != 1 {
+                        self.error_at_code(
+                            call.range,
+                            codes::CALL,
+                            "raise with a message requires exactly one argument",
+                        );
+                        return None;
+                    }
+                    (Some(kind), Some(self.expr(&call.args[0], fs)))
                 }
-            },
-            ast::Expr::Call(call) => {
-                let ast::Expr::Name(n) = &*call.func else {
+                other => {
                     self.error_at(
-                        call.func.range(),
+                        other.range(),
                         "raise only supports exception names in Phase 1",
                     );
                     return None;
-                };
-                let Some(kind) = ExcKind::from_name(n.id.as_str()) else {
-                    self.error_at_code(
-                        n.range,
-                        codes::NAME,
-                        format!("unknown exception type '{}'", n.id),
-                    );
-                    return None;
-                };
-                if !call.keywords.is_empty() {
-                    self.error_at(call.range, "keyword arguments are not supported in Phase 1");
-                    return None;
                 }
-                if call.args.len() != 1 {
-                    self.error_at_code(
-                        call.range,
-                        codes::CALL,
-                        "raise with a message requires exactly one argument",
-                    );
-                    return None;
-                }
-                let msg = self.expr(&call.args[0], fs);
-                Some(HStmt {
-                    kind: HStmtKind::Raise {
-                        exc: Some(kind),
-                        msg: Some(msg),
-                    },
-                    line,
-                    col,
-                })
-            }
-            other => {
-                self.error_at(
-                    other.range(),
-                    "raise only supports exception names in Phase 1",
-                );
-                None
-            }
-        }
+            },
+        };
+        // Python evaluates the raised exception (and its message) before the
+        // explicit cause, so the cause is lowered last.
+        let cause = s.cause.as_ref().map(|c| self.expr(c, fs));
+        Some(HStmt {
+            kind: HStmtKind::Raise { exc, msg, cause },
+            line,
+            col,
+        })
     }
 
     fn lower_try(
@@ -2910,7 +2900,9 @@ impl<'a> Lowerer<'a> {
         let mut handlers = Vec::new();
         for (idx, handler) in s.handlers.iter().enumerate() {
             let ast::ExceptHandler::ExceptHandler(h) = handler;
-            let exc = match &h.type_ {
+            let is_bare = h.type_.is_none();
+            let mut kinds: Vec<ExcKind> = Vec::new();
+            match &h.type_ {
                 None => {
                     if idx + 1 != s.handlers.len() {
                         self.error_at_code(
@@ -2919,11 +2911,10 @@ impl<'a> Lowerer<'a> {
                             "bare except must be the last handler",
                         );
                     }
-                    None
                 }
                 Some(type_expr) => match &**type_expr {
                     ast::Expr::Name(n) => match ExcKind::from_name(n.id.as_str()) {
-                        Some(kind) => Some(kind),
+                        Some(kind) => kinds.push(kind),
                         None => {
                             self.error_at_code(
                                 n.range,
@@ -2933,6 +2924,41 @@ impl<'a> Lowerer<'a> {
                             continue;
                         }
                     },
+                    ast::Expr::Tuple(tuple) => {
+                        if tuple.elts.is_empty() {
+                            self.error_at_code(
+                                tuple.range,
+                                codes::CONTROL,
+                                "empty exception tuple in except handler",
+                            );
+                            continue;
+                        }
+                        let mut ok = true;
+                        for elt in &tuple.elts {
+                            let ast::Expr::Name(n) = elt else {
+                                self.error_at(
+                                    elt.range(),
+                                    "only simple exception names are supported in exception tuples",
+                                );
+                                ok = false;
+                                continue;
+                            };
+                            match ExcKind::from_name(n.id.as_str()) {
+                                Some(kind) => kinds.push(kind),
+                                None => {
+                                    self.error_at_code(
+                                        n.range,
+                                        codes::NAME,
+                                        format!("unknown exception type '{}'", n.id),
+                                    );
+                                    ok = false;
+                                }
+                            }
+                        }
+                        if !ok {
+                            continue;
+                        }
+                    }
                     other => {
                         self.error_at(other.range(), "only simple exception names are supported");
                         continue;
@@ -2954,12 +2980,23 @@ impl<'a> Lowerer<'a> {
                 },
                 None => None,
             };
+            // Lower the handler body once; tuple handlers share it.
             let handler_body = self.lower_block(&h.body, fs);
-            handlers.push(HHandler {
-                exc,
-                binding,
-                body: handler_body,
-            });
+            if is_bare {
+                handlers.push(HHandler {
+                    exc: None,
+                    binding,
+                    body: handler_body,
+                });
+            } else {
+                for kind in kinds {
+                    handlers.push(HHandler {
+                        exc: Some(kind),
+                        binding,
+                        body: handler_body.clone(),
+                    });
+                }
+            }
         }
 
         let else_body = self.lower_block(&s.orelse, fs);

@@ -283,6 +283,10 @@ pub enum StmtKind {
     Raise {
         exc: Option<ExcKind>,
         msg: Option<Expr>,
+        /// `raise ... from cause` (explicit exception chaining). `None` means
+        /// no explicit cause; `Some(None)` is represented by a `None`
+        /// constant expression, which suppresses chaining.
+        cause: Option<Expr>,
     },
     /// `try: ... except ...: ... else: ... finally: ...`.
     /// At least one of `handlers` and `finally_body` is non-empty. `else_body`

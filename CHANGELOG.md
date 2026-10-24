@@ -8,7 +8,7 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-24: **877 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
+As of 2026-10-24: **905 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 
@@ -96,7 +96,7 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   `pyx-cli/{cli,cli/commands}`; no behavior change, contracts unchanged.
 - Test count increased from 545 to 721 tests (incl. formatting, attributes,
   classes, closures, stdlib modules, socket, user modules, CLI/build cache);
-  with this slice to **877** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
+  with this slice to **905** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
   dict hash index, GC statistics, generator iteration).
 - AOT builds embed user modules; the cache key takes the
   entire reachable module tree structure into account.
@@ -112,6 +112,11 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   names without allocating and cache the resolved spec per thread; `math_loop`
   moved from 0.81x to parity/faster (AOT 22.50 ms vs. CPython 22.65 ms at
   n=200000; 50k micro harness 6.2 ms vs. 13.6 ms).
+- **Exception hierarchy & chaining:** `except Exception` /
+  `BaseException`, tuple handlers (`except (A, B) as e`), explicit
+  `raise ... from ...` with deepest-first chained traceback and
+  `from None` suppression; causes are GC-traced. Implicit context chaining
+  and `except*` remain open.
 - **Generator protocol complete:** `yield` expressions (`x = yield v`),
   generator `send(v)`, `throw(exception_instance)`, `close()` (GeneratorExit,
   `finally` execution, RuntimeError when a closing generator yields) and

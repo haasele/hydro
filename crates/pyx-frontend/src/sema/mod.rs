@@ -955,7 +955,7 @@ impl<'a> Checker<'a> {
                 }
             }
             HStmtKind::Break | HStmtKind::Continue | HStmtKind::Pass => {}
-            HStmtKind::Raise { exc: _, msg } => {
+            HStmtKind::Raise { msg, cause, .. } => {
                 if let Some(msg) = msg {
                     self.check_expr(msg, f);
                     self.checks.push(Check::RaiseMsg {
@@ -963,6 +963,11 @@ impl<'a> Checker<'a> {
                         line: msg.line,
                         col: msg.col,
                     });
+                }
+                // The explicit cause is a runtime exception object; its static
+                // type is dynamic, so only walk it for inner expression checks.
+                if let Some(cause) = cause {
+                    self.check_expr(cause, f);
                 }
             }
             HStmtKind::Try {
@@ -2685,9 +2690,10 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
         HStmtKind::Break => StmtKind::Break,
         HStmtKind::Continue => StmtKind::Continue,
         HStmtKind::Pass => StmtKind::Pass,
-        HStmtKind::Raise { exc, msg } => StmtKind::Raise {
+        HStmtKind::Raise { exc, msg, cause } => StmtKind::Raise {
             exc: *exc,
             msg: msg.as_ref().map(|e| emit_expr(e, inf)),
+            cause: cause.as_ref().map(|e| emit_expr(e, inf)),
         },
         HStmtKind::Try {
             body,

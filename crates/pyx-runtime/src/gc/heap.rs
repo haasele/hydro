@@ -1863,12 +1863,18 @@ unsafe fn trace(addr: usize) {
                         }
                     }
                 }
+                // The explicit cause (`raise X from Y`) is a GC edge; `from
+                // None` stores no cause.
+                ObjData::Exception(exception) => {
+                    if let Some(cause) = exception.cause {
+                        mark_value(cause);
+                    }
+                }
                 // Scalars, ranges, locks, events, cross-process
                 // queues, files, csv readers, paths, compiled patterns and
                 // matches hold no PyX values.
                 ObjData::Str(_)
                 | ObjData::Float(_)
-                | ObjData::Exception(_)
                 | ObjData::Range { .. }
                 | ObjData::Lock(_)
                 | ObjData::Event(_)

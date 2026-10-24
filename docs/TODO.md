@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-24 (latest):** 877 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-24 (latest):** 905 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -177,8 +177,11 @@ no CPython is needed at runtime.
       `yield` expressions and `yield from`) are done. Open: mutable captures.
       Generator expressions remain eagerly materialized.
 - [~] P2-11 Exceptions complete: `else`, `finally`, exception hierarchy, chaining.
-      `OSError`/`IOError` additionally; exception hierarchy/chaining and
-      `except*` open.
+      `except Exception`/`BaseException`, tuple handlers
+      (`except (A, B) as e`) and explicit `raise ... from ...` chaining
+      (deepest-first traceback, `from None` suppression) are implemented;
+      `OSError`/`IOError` are tags. Open: implicit context chaining
+      ("During handling ...") and `except*`.
 - [~] P2-12 `async`/`await`, event loop foundation.
       `async def` creates coroutine objects; `await`/`pyx_await` drives them,
       `asyncio.run` drives a cooperative single-thread loop, `sleep`
@@ -244,16 +247,16 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-24: 877 tests total — 404 runtime (231 unit, 173 ABI
+      As of 2026-10-24: 905 tests total — 411 runtime (238 unit, 173 ABI
       integration: among others 22 bytes, 19 IO, 14 stdlib modules, 14 stdlib utils,
       12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 269 frontend, 18 codegen, 4 IR, 182 CLI/E2E (135 E2E incl. the
+      tests), 281 frontend, 19 codegen, 4 IR, 190 CLI/E2E (135 E2E incl. the
       abi3 extension fixture, 22 fibers, 6 closures, 5 user modules,
-      extension/path/dotted/multi-phase and completions suites). Property
-      tests open. The CPython official-test manifest is checked offline by
+      extension/path/dotted/multi-phase, completions and exceptions suites).
+      Property tests open. The CPython official-test manifest is checked offline by
       `scripts/verify.sh`/CI; the full suite is a release gate.
 
 **Acceptance P2:** memory does not grow unboundedly in loop benchmarks; GC tests
@@ -519,7 +522,9 @@ ecosystem benchmarks show where PyX is faster, equal or slower than CPython
 
 - [ ] Q-01 Debugger integration (DAP), source maps/DWARF.
 - [~] Q-02 Python-like tracebacks incl. chained exceptions; stable error codes.
-      Tracebacks and stable codes present; exception chaining open.
+      Simplified tracebacks, stable codes and explicit `raise ... from`
+      chaining (deepest-first, cycle-guarded) are present. Open: implicit
+      context chaining and fuller frame stacks.
 - [ ] Q-03 Fuzzing: parser, lowering, codegen (cargo-fuzz).
 - [ ] Q-04 Fuzzing: runtime/GC (allocation/object operations).
 - [ ] Q-05 Security review of `unsafe` code; policy in ARCHITECTURE.md.

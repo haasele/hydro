@@ -319,6 +319,12 @@ pub enum ExcKind {
     StopIteration,
     AttributeError,
     OSError,
+    /// Base class matching every exception except `KeyboardInterrupt` and
+    /// `GeneratorExit` (Python's `Exception`).
+    Exception,
+    /// Root exception class matching every exception (Python's
+    /// `BaseException`).
+    BaseException,
 }
 
 impl ExcKind {
@@ -335,6 +341,8 @@ impl ExcKind {
             ExcKind::StopIteration => 8,
             ExcKind::AttributeError => 9,
             ExcKind::OSError => 10,
+            ExcKind::Exception => 12,
+            ExcKind::BaseException => 13,
         }
     }
 
@@ -351,6 +359,8 @@ impl ExcKind {
             ExcKind::StopIteration => "StopIteration",
             ExcKind::AttributeError => "AttributeError",
             ExcKind::OSError => "OSError",
+            ExcKind::Exception => "Exception",
+            ExcKind::BaseException => "BaseException",
         }
     }
 
@@ -368,6 +378,8 @@ impl ExcKind {
             "StopIteration" => ExcKind::StopIteration,
             "AttributeError" => ExcKind::AttributeError,
             "OSError" => ExcKind::OSError,
+            "Exception" => ExcKind::Exception,
+            "BaseException" => ExcKind::BaseException,
             "IOError" => ExcKind::OSError,
             _ => return None,
         })
