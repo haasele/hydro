@@ -1,0 +1,1798 @@
+{
+  "meta": {
+    "timestamp": "2026-10-23 21:50:53",
+    "quick": true,
+    "total_s": 83.24498168399441,
+    "system": {
+      "OS": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+      "CPU": "AMD EPYC-Rome Processor",
+      "Kerne": 10,
+      "RAM": "25.2 GB",
+      "Python (Runner)": "3.12.3",
+      "uv": "uv 0.12.11 (x86_64-unknown-linux-gnu)",
+      "Last (1 min)": "1.19"
+    }
+  },
+  "runs": [
+    {
+      "key": "loops",
+      "title": "For-Schleifen",
+      "status": "ok",
+      "duration_s": 2.3796316370135173,
+      "error": null
+    },
+    {
+      "key": "csv",
+      "title": "CSV",
+      "status": "ok",
+      "duration_s": 10.51391803502338,
+      "error": null
+    },
+    {
+      "key": "startup",
+      "title": "Startzeiten",
+      "status": "ok",
+      "duration_s": 13.920564628991997,
+      "error": null
+    },
+    {
+      "key": "request",
+      "title": "Request-Handling",
+      "status": "ok",
+      "duration_s": 28.85261664900463,
+      "error": null
+    },
+    {
+      "key": "fastapi",
+      "title": "FastAPI-Durchsatz",
+      "status": "ok",
+      "duration_s": 27.545966208999744,
+      "error": null
+    }
+  ],
+  "benchmarks": {
+    "loops": {
+      "benchmark": "loops",
+      "title": "For-Schleifen",
+      "meta": {
+        "n": 200000,
+        "repeat": 3,
+        "numpy": "2.5.4"
+      },
+      "sections": [
+        {
+          "title": "Summieren",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Variante"
+            },
+            {
+              "key": "best_ms",
+              "label": "best",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "median_ms",
+              "label": "median",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "ns_iter",
+              "label": "pro Iteration",
+              "unit": "ns",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "sum_numpy",
+              "best_ms": 0.10766499326564372,
+              "median_ms": 0.563131005037576,
+              "ns_iter": 0.5383249663282186
+            },
+            {
+              "name": "sum_builtin",
+              "best_ms": 3.0917399853933603,
+              "median_ms": 3.1526559905614704,
+              "ns_iter": 15.458699926966801
+            },
+            {
+              "name": "sum_genexp",
+              "best_ms": 6.924398010596633,
+              "median_ms": 6.973851996008307,
+              "ns_iter": 34.621990052983165
+            },
+            {
+              "name": "sum_reduce",
+              "best_ms": 7.963244017446414,
+              "median_ms": 8.019670989597216,
+              "ns_iter": 39.81622008723207
+            },
+            {
+              "name": "sum_for",
+              "best_ms": 9.079846990061924,
+              "median_ms": 9.097330999793485,
+              "ns_iter": 45.39923495030962
+            },
+            {
+              "name": "sum_while",
+              "best_ms": 10.719566023908556,
+              "median_ms": 10.806831996887922,
+              "ns_iter": 53.59783011954278
+            },
+            {
+              "name": "sum_map",
+              "best_ms": 11.579220998100936,
+              "median_ms": 14.449167996644974,
+              "ns_iter": 57.89610499050468
+            }
+          ],
+          "primary": "best_ms",
+          "lower_is_better": true
+        },
+        {
+          "title": "Liste bauen",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Variante"
+            },
+            {
+              "key": "best_ms",
+              "label": "best",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "median_ms",
+              "label": "median",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "ns_iter",
+              "label": "pro Iteration",
+              "unit": "ns",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "list_numpy",
+              "best_ms": 6.371266994392499,
+              "median_ms": 6.732022011419758,
+              "ns_iter": 31.856334971962497
+            },
+            {
+              "name": "list_comp",
+              "best_ms": 10.312541999155656,
+              "median_ms": 10.447108012158424,
+              "ns_iter": 51.56270999577828
+            },
+            {
+              "name": "list_append",
+              "best_ms": 11.344572994858027,
+              "median_ms": 11.576185002923012,
+              "ns_iter": 56.72286497429013
+            },
+            {
+              "name": "list_append_bound",
+              "best_ms": 12.640239001484588,
+              "median_ms": 12.71213500876911,
+              "ns_iter": 63.20119500742294
+            },
+            {
+              "name": "list_map_lambda",
+              "best_ms": 21.233200008282438,
+              "median_ms": 21.463988989125937,
+              "ns_iter": 106.16600004141219
+            }
+          ],
+          "primary": "best_ms",
+          "lower_is_better": true
+        },
+        {
+          "title": "Filtern (jedes 3. Element)",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Variante"
+            },
+            {
+              "key": "best_ms",
+              "label": "best",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "median_ms",
+              "label": "median",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "ns_iter",
+              "label": "pro Iteration",
+              "unit": "ns",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "filter_slice",
+              "best_ms": 1.3671900087501854,
+              "median_ms": 1.4365520037245005,
+              "ns_iter": 6.835950043750927
+            },
+            {
+              "name": "filter_comp",
+              "best_ms": 9.054638998350129,
+              "median_ms": 11.815229983767495,
+              "ns_iter": 45.27319499175064
+            },
+            {
+              "name": "filter_for",
+              "best_ms": 9.628500993130729,
+              "median_ms": 9.78250300977379,
+              "ns_iter": 48.14250496565364
+            },
+            {
+              "name": "filter_builtin",
+              "best_ms": 18.193730007624254,
+              "median_ms": 18.285044003278017,
+              "ns_iter": 90.96865003812127
+            }
+          ],
+          "primary": "best_ms",
+          "lower_is_better": true
+        },
+        {
+          "title": "Dict & String bauen",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Variante"
+            },
+            {
+              "key": "best_ms",
+              "label": "best",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "median_ms",
+              "label": "median",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "ns_iter",
+              "label": "pro Iteration",
+              "unit": "ns",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "str_join",
+              "best_ms": 2.0022680109832436,
+              "median_ms": 2.04141199355945,
+              "ns_iter": 100.11340054916218
+            },
+            {
+              "name": "str_join_gen",
+              "best_ms": 2.244147995952517,
+              "median_ms": 2.5577749765943736,
+              "ns_iter": 112.20739979762584
+            },
+            {
+              "name": "str_concat",
+              "best_ms": 3.1091019918676466,
+              "median_ms": 3.1374460086226463,
+              "ns_iter": 155.45509959338233
+            },
+            {
+              "name": "dict_comp",
+              "best_ms": 23.255856009200215,
+              "median_ms": 24.114789004670456,
+              "ns_iter": 116.27928004600108
+            },
+            {
+              "name": "dict_for",
+              "best_ms": 24.033825000515208,
+              "median_ms": 29.44040799047798,
+              "ns_iter": 120.16912500257604
+            },
+            {
+              "name": "dict_zip",
+              "best_ms": 33.687645016470924,
+              "median_ms": 34.65008598868735,
+              "ns_iter": 168.43822508235462
+            }
+          ],
+          "primary": "best_ms",
+          "lower_is_better": true
+        },
+        {
+          "title": "Iteration über Liste (inkl. Listenaufbau)",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Variante"
+            },
+            {
+              "key": "best_ms",
+              "label": "best",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "median_ms",
+              "label": "median",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "ns_iter",
+              "label": "pro Iteration",
+              "unit": "ns",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "iter_direct",
+              "best_ms": 10.894178005401045,
+              "median_ms": 10.985290980897844,
+              "ns_iter": 54.470890027005225
+            },
+            {
+              "name": "iter_index",
+              "best_ms": 15.082501980941743,
+              "median_ms": 16.113341989694163,
+              "ns_iter": 75.41250990470871
+            },
+            {
+              "name": "iter_enumerate",
+              "best_ms": 17.536319006467238,
+              "median_ms": 17.68627398996614,
+              "ns_iter": 87.68159503233619
+            },
+            {
+              "name": "iter_zip",
+              "best_ms": 27.668928989442065,
+              "median_ms": 27.893655002117157,
+              "ns_iter": 138.34464494721033
+            }
+          ],
+          "primary": "best_ms",
+          "lower_is_better": true
+        },
+        {
+          "title": "Verschachtelt & Funktionsaufrufe",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Variante"
+            },
+            {
+              "key": "best_ms",
+              "label": "best",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "median_ms",
+              "label": "median",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "ns_iter",
+              "label": "pro Iteration",
+              "unit": "ns",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "call_inline",
+              "best_ms": 8.209792984416708,
+              "median_ms": 8.23940901318565,
+              "ns_iter": 41.04896492208354
+            },
+            {
+              "name": "nested_comp",
+              "best_ms": 9.915144997648895,
+              "median_ms": 10.122259991476312,
+              "ns_iter": 49.575724988244474
+            },
+            {
+              "name": "nested_loops",
+              "best_ms": 10.472115012817085,
+              "median_ms": 10.708314017392695,
+              "ns_iter": 52.360575064085424
+            },
+            {
+              "name": "call_function",
+              "best_ms": 13.01707501988858,
+              "median_ms": 13.158924004528672,
+              "ns_iter": 65.0853750994429
+            },
+            {
+              "name": "call_lambda",
+              "best_ms": 13.189392979256809,
+              "median_ms": 13.417245994787663,
+              "ns_iter": 65.94696489628404
+            }
+          ],
+          "primary": "best_ms",
+          "lower_is_better": true
+        }
+      ],
+      "headlines": [
+        {
+          "key": "loops.sum_for",
+          "label": "for-Schleife: Summe",
+          "value": 45.39923495030962,
+          "unit": "ns/Iter",
+          "higher_is_better": false
+        },
+        {
+          "key": "loops.sum_builtin",
+          "label": "sum(range)",
+          "value": 15.458699926966801,
+          "unit": "ns/Iter",
+          "higher_is_better": false
+        },
+        {
+          "key": "loops.list_comp",
+          "label": "List-Comprehension",
+          "value": 51.56270999577828,
+          "unit": "ns/Iter",
+          "higher_is_better": false
+        },
+        {
+          "key": "loops.call_function",
+          "label": "Schleife mit Funktionsaufruf",
+          "value": 65.0853750994429,
+          "unit": "ns/Iter",
+          "higher_is_better": false
+        }
+      ],
+      "insights": [
+        "List-Comprehension ist 1.10× schneller als append() in einer for-Schleife.",
+        "sum(range(n)) ist 2.9× schneller als die manuelle for-Schleife.",
+        "numpy summiert 29× schneller als builtin sum() (reine C-Schleife).",
+        "''.join() ist 1.55× schneller als String-Konkatenation mit += .",
+        "Index-Zugriff (data[i]) ist 1.38× langsamer als direkte Iteration.",
+        "Ein Python-Funktionsaufruf kostet ≈ 24 ns zusätzlich pro Iteration."
+      ],
+      "python": "CPython 3.12.3"
+    },
+    "csv": {
+      "benchmark": "csv",
+      "title": "CSV generieren / lesen / schreiben / verarbeiten",
+      "meta": {
+        "rows": 100000,
+        "repeat": 2,
+        "dateigroesse_mb": 5.4,
+        "pandas": "3.1.0"
+      },
+      "sections": [
+        {
+          "title": "In-Memory",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Test"
+            },
+            {
+              "key": "best_s",
+              "label": "best",
+              "unit": "s",
+              "fmt": ".3f"
+            },
+            {
+              "key": "median_s",
+              "label": "median",
+              "unit": "s",
+              "fmt": ".3f"
+            },
+            {
+              "key": "rows_s",
+              "label": "Zeilen/s",
+              "fmt": ",.0f"
+            },
+            {
+              "key": "mb_s",
+              "label": "Durchsatz",
+              "unit": "MB/s",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "Zeilen generieren",
+              "best_s": 0.6145136909908615,
+              "median_s": 0.6408981224958552,
+              "rows_s": 162730.30441153687,
+              "mb_s": null
+            },
+            {
+              "name": "csv.writer -> StringIO",
+              "best_s": 0.1758696649922058,
+              "median_s": 0.17666196599020623,
+              "rows_s": 568602.8912628668,
+              "mb_s": 30.558288720446345
+            }
+          ],
+          "note": "Unabhängige Messungen, kein Vergleich untereinander."
+        },
+        {
+          "title": "Schreiben (Datei)",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Test"
+            },
+            {
+              "key": "best_s",
+              "label": "best",
+              "unit": "s",
+              "fmt": ".3f"
+            },
+            {
+              "key": "median_s",
+              "label": "median",
+              "unit": "s",
+              "fmt": ".3f"
+            },
+            {
+              "key": "rows_s",
+              "label": "Zeilen/s",
+              "fmt": ",.0f"
+            },
+            {
+              "key": "mb_s",
+              "label": "Durchsatz",
+              "unit": "MB/s",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "csv.writer",
+              "best_s": 0.1963403150148224,
+              "median_s": 0.20012618400505744,
+              "rows_s": 509319.7491938966,
+              "mb_s": 27.37224904418778
+            },
+            {
+              "name": "csv.DictWriter",
+              "best_s": 0.41862350297742523,
+              "median_s": 0.45824445100151934,
+              "rows_s": 238878.13103841094,
+              "mb_s": 12.837970065645871
+            },
+            {
+              "name": "manuell (join)",
+              "best_s": 0.19393941899761558,
+              "median_s": 0.19844199599174317,
+              "rows_s": 515624.9333779301,
+              "mb_s": 27.711107044546086
+            },
+            {
+              "name": "pandas.to_csv",
+              "best_s": 0.34407182698487304,
+              "median_s": 0.3586385389935458,
+              "rows_s": 290636.9895969322,
+              "mb_s": 15.619633979030423
+            }
+          ],
+          "primary": "best_s",
+          "lower_is_better": true
+        },
+        {
+          "title": "Lesen",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Test"
+            },
+            {
+              "key": "best_s",
+              "label": "best",
+              "unit": "s",
+              "fmt": ".3f"
+            },
+            {
+              "key": "median_s",
+              "label": "median",
+              "unit": "s",
+              "fmt": ".3f"
+            },
+            {
+              "key": "rows_s",
+              "label": "Zeilen/s",
+              "fmt": ",.0f"
+            },
+            {
+              "key": "mb_s",
+              "label": "Durchsatz",
+              "unit": "MB/s",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "csv.reader",
+              "best_s": 0.09625673299888149,
+              "median_s": 0.10227206749550533,
+              "rows_s": 1038888.3653589408,
+              "mb_s": 55.83272808627787
+            },
+            {
+              "name": "csv.DictReader",
+              "best_s": 0.22983555198879912,
+              "median_s": 0.24427392448706087,
+              "rows_s": 435093.69692672015,
+              "mb_s": 23.383136131445458
+            },
+            {
+              "name": "str.split",
+              "best_s": 0.05149304500082508,
+              "median_s": 0.05656721501145512,
+              "rows_s": 1942009.8383849254,
+              "mb_s": 104.36896866195984
+            },
+            {
+              "name": "pandas.read_csv",
+              "best_s": 0.052892376988893375,
+              "median_s": 0.05710758749046363,
+              "rows_s": 1890631.6125856575,
+              "mb_s": 101.60776100360397
+            }
+          ],
+          "primary": "best_s",
+          "lower_is_better": true,
+          "note": "str.split parst keine Quotes/Escapes – nur Untergrenze als Referenz."
+        },
+        {
+          "title": "Aggregation (Gruppieren nach Kategorie)",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Test"
+            },
+            {
+              "key": "best_s",
+              "label": "best",
+              "unit": "s",
+              "fmt": ".3f"
+            },
+            {
+              "key": "median_s",
+              "label": "median",
+              "unit": "s",
+              "fmt": ".3f"
+            },
+            {
+              "key": "rows_s",
+              "label": "Zeilen/s",
+              "fmt": ",.0f"
+            },
+            {
+              "key": "mb_s",
+              "label": "Durchsatz",
+              "unit": "MB/s",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "Aggregation (DictReader)",
+              "best_s": 0.2949484880082309,
+              "median_s": 0.303012784497696,
+              "rows_s": 339042.2533619137,
+              "mb_s": 18.22106645228852
+            },
+            {
+              "name": "Aggregation (pandas groupby)",
+              "best_s": 0.07110166500206105,
+              "median_s": 0.07165758199698757,
+              "rows_s": 1406436.8253134615,
+              "mb_s": 75.58579675798329
+            }
+          ],
+          "primary": "best_s",
+          "lower_is_better": true
+        },
+        {
+          "title": "Transformation (Lesen → Schreiben)",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Test"
+            },
+            {
+              "key": "best_s",
+              "label": "best",
+              "unit": "s",
+              "fmt": ".3f"
+            },
+            {
+              "key": "median_s",
+              "label": "median",
+              "unit": "s",
+              "fmt": ".3f"
+            },
+            {
+              "key": "rows_s",
+              "label": "Zeilen/s",
+              "fmt": ",.0f"
+            },
+            {
+              "key": "mb_s",
+              "label": "Durchsatz",
+              "unit": "MB/s",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "DictReader → Transform → csv.writer",
+              "best_s": 0.5444191720162053,
+              "median_s": 0.5520930400089128,
+              "rows_s": 183681.99567561038,
+              "mb_s": 9.871577409915366
+            }
+          ]
+        }
+      ],
+      "headlines": [
+        {
+          "key": "csv.generate",
+          "label": "Zeilen generieren",
+          "value": 162730.30441153687,
+          "unit": "Zeilen/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "csv.write",
+          "label": "csv.writer schreiben",
+          "value": 509319.7491938966,
+          "unit": "Zeilen/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "csv.read",
+          "label": "csv.reader lesen",
+          "value": 1038888.3653589408,
+          "unit": "Zeilen/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "csv.aggregate",
+          "label": "Aggregation (DictReader)",
+          "value": 339042.2533619137,
+          "unit": "Zeilen/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "csv.read_pandas",
+          "label": "pandas.read_csv",
+          "value": 1890631.6125856575,
+          "unit": "Zeilen/s",
+          "higher_is_better": true
+        }
+      ],
+      "insights": [
+        "DictReader ist 2.39× langsamer als csv.reader (Preis für Spaltennamen-Zugriff).",
+        "DictWriter ist 2.13× langsamer als csv.writer.",
+        "pandas.read_csv liest 1.8× schneller als csv.reader (C-Parser).",
+        "Aggregation: pandas ist 4.1× schneller als reines Python."
+      ],
+      "python": "CPython 3.12.3"
+    },
+    "startup": {
+      "benchmark": "startup",
+      "title": "Startzeiten",
+      "meta": {
+        "runs": 3,
+        "python_exe": "python"
+      },
+      "sections": [
+        {
+          "title": "Interpreter-Start",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Test"
+            },
+            {
+              "key": "min_ms",
+              "label": "min",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "median_ms",
+              "label": "median",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "max_ms",
+              "label": "max",
+              "unit": "ms",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "python -c pass",
+              "min_ms": 16.466244007460773,
+              "median_ms": 16.523052006959915,
+              "max_ms": 17.34420398133807,
+              "delta_ms": null
+            },
+            {
+              "name": "python -S -c pass (ohne site)",
+              "min_ms": 9.915465983795002,
+              "median_ms": 10.532779997447506,
+              "max_ms": 10.638712003128603,
+              "delta_ms": null
+            },
+            {
+              "name": "python -I -c pass (isolated)",
+              "min_ms": 17.516861989861354,
+              "median_ms": 17.927123000845313,
+              "max_ms": 19.97078998829238,
+              "delta_ms": null
+            },
+            {
+              "name": "uv run --no-project python -c pass",
+              "min_ms": 25.836795015493408,
+              "median_ms": 26.065248006489128,
+              "max_ms": 27.675460994942114,
+              "delta_ms": null
+            }
+          ],
+          "primary": "median_ms",
+          "lower_is_better": true
+        },
+        {
+          "title": "Import-Zeiten",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Test"
+            },
+            {
+              "key": "min_ms",
+              "label": "min",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "median_ms",
+              "label": "median",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "max_ms",
+              "label": "max",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "delta_ms",
+              "label": "Δ zu leer",
+              "unit": "ms",
+              "fmt": "+.1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "import pandas",
+              "min_ms": 414.84960698289797,
+              "median_ms": 443.63150297431275,
+              "max_ms": 453.6168620106764,
+              "delta_ms": 398.3833629754372
+            },
+            {
+              "name": "import fastapi",
+              "min_ms": 384.28098399890587,
+              "median_ms": 384.32620000094175,
+              "max_ms": 389.0526789764408,
+              "delta_ms": 367.8147399914451
+            },
+            {
+              "name": "import requests",
+              "min_ms": 165.3685639903415,
+              "median_ms": 172.73687702254392,
+              "max_ms": 237.4525189807173,
+              "delta_ms": 148.90231998288073
+            },
+            {
+              "name": "import uvicorn",
+              "min_ms": 123.37394201313145,
+              "median_ms": 124.76769302156754,
+              "max_ms": 137.20443402417004,
+              "delta_ms": 106.90769800567068
+            },
+            {
+              "name": "import httpx",
+              "min_ms": 103.38205398875289,
+              "median_ms": 111.42128199571744,
+              "max_ms": 121.881494007539,
+              "delta_ms": 86.91580998129211
+            },
+            {
+              "name": "import numpy",
+              "min_ms": 100.52829698543064,
+              "median_ms": 110.0106080120895,
+              "max_ms": 143.70034699095413,
+              "delta_ms": 84.06205297796987
+            },
+            {
+              "name": "import asyncio",
+              "min_ms": 66.18101699859835,
+              "median_ms": 66.5386870095972,
+              "max_ms": 67.54593300865963,
+              "delta_ms": 49.71477299113758
+            },
+            {
+              "name": "import pydantic",
+              "min_ms": 63.41557900304906,
+              "median_ms": 66.78325301618315,
+              "max_ms": 69.8890789935831,
+              "delta_ms": 46.94933499558829
+            },
+            {
+              "name": "import http.server",
+              "min_ms": 52.334243984660134,
+              "median_ms": 54.60131599102169,
+              "max_ms": 55.509222991531715,
+              "delta_ms": 35.86799997719936
+            },
+            {
+              "name": "import dataclasses",
+              "min_ms": 31.08845098176971,
+              "median_ms": 31.85302601195872,
+              "max_ms": 32.12357999291271,
+              "delta_ms": 14.622206974308938
+            },
+            {
+              "name": "import typing",
+              "min_ms": 23.546078009530902,
+              "median_ms": 24.990103993332013,
+              "max_ms": 25.362122018123046,
+              "delta_ms": 7.079834002070129
+            },
+            {
+              "name": "import json",
+              "min_ms": 20.988604024751112,
+              "median_ms": 21.70364500489086,
+              "max_ms": 22.135635983431712,
+              "delta_ms": 4.522360017290339
+            },
+            {
+              "name": "import csv",
+              "min_ms": 19.90861998638138,
+              "median_ms": 21.523511997656897,
+              "max_ms": 23.09847599826753,
+              "delta_ms": 3.4423759789206088
+            },
+            {
+              "name": "import sqlite3",
+              "min_ms": 19.717405986739323,
+              "median_ms": 19.793049985310063,
+              "max_ms": 20.474446995649487,
+              "delta_ms": 3.2511619792785496
+            },
+            {
+              "name": "import decimal",
+              "min_ms": 17.148682003607973,
+              "median_ms": 17.294248013058677,
+              "max_ms": 17.813717015087605,
+              "delta_ms": 0.6824379961472005
+            },
+            {
+              "name": "import starlette",
+              "min_ms": 15.903943974990398,
+              "median_ms": 16.40152098843828,
+              "max_ms": 16.53089700266719,
+              "delta_ms": 0.0
+            }
+          ],
+          "share": "delta_ms",
+          "note": "Δ = min minus min des leeren Interpreters (rauschärmer als Median); Balken = Anteil am teuersten Import."
+        },
+        {
+          "title": "FastAPI & uvicorn",
+          "columns": [
+            {
+              "key": "name",
+              "label": "Test"
+            },
+            {
+              "key": "min_ms",
+              "label": "min",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "median_ms",
+              "label": "median",
+              "unit": "ms",
+              "fmt": ".1f"
+            },
+            {
+              "key": "max_ms",
+              "label": "max",
+              "unit": "ms",
+              "fmt": ".1f"
+            }
+          ],
+          "rows": [
+            {
+              "name": "python: import fastapi + App + 1 Route",
+              "min_ms": 393.2832650025375,
+              "median_ms": 398.25211398419924,
+              "max_ms": 426.46709000109695,
+              "delta_ms": null
+            },
+            {
+              "name": "uvicorn: Prozessstart → erste 200-Antwort",
+              "min_ms": 398.48122900002636,
+              "median_ms": 430.9927079884801,
+              "max_ms": 487.4900490103755,
+              "delta_ms": null
+            }
+          ]
+        }
+      ],
+      "headlines": [
+        {
+          "key": "startup.python_empty",
+          "label": "python -c pass",
+          "value": 16.523052006959915,
+          "unit": "ms",
+          "higher_is_better": false
+        },
+        {
+          "key": "startup.import_pandas",
+          "label": "import pandas",
+          "value": 398.3833629754372,
+          "unit": "ms",
+          "higher_is_better": false
+        },
+        {
+          "key": "startup.import_fastapi",
+          "label": "import fastapi",
+          "value": 367.8147399914451,
+          "unit": "ms",
+          "higher_is_better": false
+        },
+        {
+          "key": "startup.uvicorn_cold",
+          "label": "uvicorn Kaltstart",
+          "value": 430.9927079884801,
+          "unit": "ms",
+          "higher_is_better": false
+        }
+      ],
+      "insights": [
+        "uv run fügt ≈ 10 ms Overhead pro Start (Resolver + Env-Check) hinzu.",
+        "Teuerste Imports: pandas (+398 ms), fastapi (+368 ms), requests (+149 ms).",
+        "uvicorn-Kaltstart 431 ms = FastAPI-Import inkl. Interpreter ≈ 398 ms + Server-Init/Listen/erster Request ≈ 33 ms."
+      ],
+      "python": "CPython 3.12.3"
+    },
+    "request": {
+      "benchmark": "request",
+      "title": "Request-Handling (Webserver)",
+      "meta": {
+        "concurrency": 50,
+        "duration_s": 2.0,
+        "uvloop": "ja",
+        "live": "ja"
+      },
+      "sections": [
+        {
+          "title": "Pipeline-Stufen (Micro-Benchmark, 1 Thread, ohne Netzwerk)",
+          "columns": [
+            {
+              "key": "stage",
+              "label": "Stufe"
+            },
+            {
+              "key": "us_op",
+              "label": "Zeit/Op",
+              "unit": "µs",
+              "fmt": ".2f"
+            },
+            {
+              "key": "ops_s",
+              "label": "Ops/s",
+              "fmt": ",.0f"
+            }
+          ],
+          "rows": [
+            {
+              "stage": "parse_request (7 Header)",
+              "us_op": 2.746846330119297,
+              "ops_s": 364053.8566118366
+            },
+            {
+              "stage": "parse_query (4 Parameter)",
+              "us_op": 1.0415804450167343,
+              "ops_s": 960079.4684504026
+            },
+            {
+              "stage": "route: statisch /ping",
+              "us_op": 0.459463028004393,
+              "ops_s": 2176453.6840828005
+            },
+            {
+              "stage": "route: dynamisch /users/42?v=1",
+              "us_op": 1.4598125549673568,
+              "ops_s": 685019.4544479453
+            },
+            {
+              "stage": "route: 404 (kein Treffer)",
+              "us_op": 0.5516761919716373,
+              "ops_s": 1812657.523657305
+            },
+            {
+              "stage": "route: POST /echo (JSON-Body)",
+              "us_op": 3.84765646973392,
+              "ops_s": 259898.46231494614
+            },
+            {
+              "stage": "json.loads (Body)",
+              "us_op": 3.3551646801060997,
+              "ops_s": 298047.9634663945
+            },
+            {
+              "stage": "build_response: klein",
+              "us_op": 3.9000207500066613,
+              "ops_s": 256408.8921830203
+            },
+            {
+              "stage": "build_response: 50 Objekte",
+              "us_op": 38.9782046986511,
+              "ops_s": 25655.363240334325
+            },
+            {
+              "stage": "Pipeline komplett (parse+route+build)",
+              "us_op": 9.438329639961012,
+              "ops_s": 105950.9508722913
+            }
+          ],
+          "share": "us_op",
+          "note": "Balken = Anteil an der teuersten Stufe (Stufen sind keine Alternativen)."
+        },
+        {
+          "title": "Live-Test (asyncio-Server, Keep-Alive)",
+          "note": "concurrency=50, uvloop=ja",
+          "columns": [
+            {
+              "key": "scenario",
+              "label": "Szenario"
+            },
+            {
+              "key": "req_s",
+              "label": "Durchsatz",
+              "unit": "req/s",
+              "fmt": ",.0f"
+            },
+            {
+              "key": "mean_ms",
+              "label": "mean",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "p50_ms",
+              "label": "p50",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "p95_ms",
+              "label": "p95",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "p99_ms",
+              "label": "p99",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "errors",
+              "label": "Fehler"
+            }
+          ],
+          "rows": [
+            {
+              "key": "ping",
+              "scenario": "GET /ping",
+              "req_s": 33705.20518543587,
+              "mean_ms": 1.480121371985929,
+              "p50_ms": 1.1983590084128082,
+              "p95_ms": 2.398561016889289,
+              "p99_ms": 11.666225997032598,
+              "errors": 0
+            },
+            {
+              "key": "user",
+              "scenario": "GET /users/42?v=1",
+              "req_s": 29908.51825279782,
+              "mean_ms": 1.667508518319173,
+              "p50_ms": 1.4059039822313935,
+              "p95_ms": 2.5335179816465825,
+              "p99_ms": 11.809016985353082,
+              "errors": 0
+            },
+            {
+              "key": "echo",
+              "scenario": "POST /echo",
+              "req_s": 19934.25963284446,
+              "mean_ms": 2.502185680551483,
+              "p50_ms": 2.1337380167096853,
+              "p95_ms": 3.7139829946681857,
+              "p99_ms": 12.957771978108212,
+              "errors": 0
+            },
+            {
+              "key": "list",
+              "scenario": "GET /list (50 Objekte)",
+              "req_s": 10106.095489603484,
+              "mean_ms": 4.930495271508907,
+              "p50_ms": 4.126528016058728,
+              "p95_ms": 11.577085009776056,
+              "p99_ms": 16.213563008932397,
+              "errors": 0
+            },
+            {
+              "key": "404",
+              "scenario": "GET /nope (404)",
+              "req_s": 31836.23333264959,
+              "mean_ms": 1.567470225441542,
+              "p50_ms": 1.302667980780825,
+              "p95_ms": 2.615774021251127,
+              "p99_ms": 11.40462901093997,
+              "errors": 0
+            }
+          ],
+          "primary": "req_s",
+          "lower_is_better": false
+        }
+      ],
+      "headlines": [
+        {
+          "key": "request.pipeline_us",
+          "label": "Pipeline parse+route+build",
+          "value": 9.438329639961012,
+          "unit": "µs",
+          "higher_is_better": false
+        },
+        {
+          "key": "request.live_ping",
+          "label": "Live /ping",
+          "value": 33705.20518543587,
+          "unit": "req/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "request.live_list",
+          "label": "Live /list (50 Obj.)",
+          "value": 10106.095489603484,
+          "unit": "req/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "request.live_ping_p99",
+          "label": "Live /ping p99",
+          "value": 11.666225997032598,
+          "unit": "ms",
+          "higher_is_better": false
+        }
+      ],
+      "insights": [
+        "Die Pipeline allein erlaubt ≈ 105,951 req/s pro Kern; live erreicht /ping 33,705 req/s (32%) – der Rest entfällt auf Socket-I/O, Event-Loop und den Client im selben Host.",
+        "Ein 50-Objekte-JSON senkt den Durchsatz auf 30% von /ping (Serialisierungskosten)."
+      ],
+      "python": "CPython 3.12.3"
+    },
+    "fastapi": {
+      "benchmark": "fastapi",
+      "title": "FastAPI-Durchsatz",
+      "meta": {
+        "modes": "asgi,http",
+        "concurrency": 32,
+        "duration_s": 2.0,
+        "fastapi": "0.162.0",
+        "uvicorn": "0.54.0",
+        "httpx": "0.28.1"
+      },
+      "sections": [
+        {
+          "title": "Modus: ASGI",
+          "note": "In-Process (ASGITransport): reiner Framework-Overhead ohne Netzwerk/Server.",
+          "columns": [
+            {
+              "key": "scenario",
+              "label": "Szenario"
+            },
+            {
+              "key": "req_s",
+              "label": "Durchsatz",
+              "unit": "req/s",
+              "fmt": ",.0f"
+            },
+            {
+              "key": "mean_ms",
+              "label": "mean",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "p50_ms",
+              "label": "p50",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "p95_ms",
+              "label": "p95",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "p99_ms",
+              "label": "p99",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "errors",
+              "label": "Fehler"
+            }
+          ],
+          "rows": [
+            {
+              "key": "ping",
+              "scenario": "GET /ping (async)",
+              "req_s": 2445.2585441808696,
+              "mean_ms": 0.408735535787289,
+              "p50_ms": 0.3507770015858114,
+              "p95_ms": 0.4918350023217499,
+              "p99_ms": 0.6119440076872706,
+              "errors": 0
+            },
+            {
+              "key": "sync",
+              "scenario": "GET /sync (threadpool)",
+              "req_s": 1559.631196704585,
+              "mean_ms": 20.43166659895727,
+              "p50_ms": 20.22360998671502,
+              "p95_ms": 26.908753003226593,
+              "p99_ms": 30.509981996146962,
+              "errors": 0
+            },
+            {
+              "key": "item_get",
+              "scenario": "GET /items/{id}?q= (Path+Query)",
+              "req_s": 2024.3698957726517,
+              "mean_ms": 0.4937396886477085,
+              "p50_ms": 0.41084099211730063,
+              "p95_ms": 0.5846120184287429,
+              "p99_ms": 0.7474120066035539,
+              "errors": 0
+            },
+            {
+              "key": "item_post",
+              "scenario": "POST /items (Pydantic)",
+              "req_s": 1709.7614412552873,
+              "mean_ms": 0.584617049757688,
+              "p50_ms": 0.49201498040929437,
+              "p95_ms": 0.7330530206672847,
+              "p99_ms": 0.9821669955272228,
+              "errors": 0
+            },
+            {
+              "key": "json100",
+              "scenario": "GET /json100 (100 Objekte)",
+              "req_s": 678.4286004733784,
+              "mean_ms": 1.4736217890539074,
+              "p50_ms": 1.2850939820054919,
+              "p95_ms": 1.724748988635838,
+              "p99_ms": 11.681525007588789,
+              "errors": 0
+            }
+          ],
+          "primary": "req_s",
+          "lower_is_better": false
+        },
+        {
+          "title": "Modus: HTTP",
+          "note": "uvicorn in eigenem Prozess, httpx über localhost, Keep-Alive. httpx ist selbst CPU-lastig: Werte sind eine Untergrenze, nicht das Server-Maximum.",
+          "columns": [
+            {
+              "key": "scenario",
+              "label": "Szenario"
+            },
+            {
+              "key": "req_s",
+              "label": "Durchsatz",
+              "unit": "req/s",
+              "fmt": ",.0f"
+            },
+            {
+              "key": "mean_ms",
+              "label": "mean",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "p50_ms",
+              "label": "p50",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "p95_ms",
+              "label": "p95",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "p99_ms",
+              "label": "p99",
+              "unit": "ms",
+              "fmt": ".2f"
+            },
+            {
+              "key": "errors",
+              "label": "Fehler"
+            }
+          ],
+          "rows": [
+            {
+              "key": "ping",
+              "scenario": "GET /ping (async)",
+              "req_s": 230.6799765715295,
+              "mean_ms": 135.61334565134183,
+              "p50_ms": 106.32978999637999,
+              "p95_ms": 354.56485400209203,
+              "p99_ms": 540.9847119881306,
+              "errors": 0
+            },
+            {
+              "key": "sync",
+              "scenario": "GET /sync (threadpool)",
+              "req_s": 262.975906930357,
+              "mean_ms": 119.91963352908526,
+              "p50_ms": 82.1510279783979,
+              "p95_ms": 331.90056300372817,
+              "p99_ms": 545.5497739894781,
+              "errors": 0
+            },
+            {
+              "key": "item_get",
+              "scenario": "GET /items/{id}?q= (Path+Query)",
+              "req_s": 420.90455779322446,
+              "mean_ms": 74.829141017133,
+              "p50_ms": 53.14727098448202,
+              "p95_ms": 206.3143730047159,
+              "p99_ms": 295.0227620021906,
+              "errors": 0
+            },
+            {
+              "key": "item_post",
+              "scenario": "POST /items (Pydantic)",
+              "req_s": 395.0823776800344,
+              "mean_ms": 79.96891359976266,
+              "p50_ms": 55.15611098962836,
+              "p95_ms": 233.04022799129598,
+              "p99_ms": 335.52686899201944,
+              "errors": 0
+            },
+            {
+              "key": "json100",
+              "scenario": "GET /json100 (100 Objekte)",
+              "req_s": 409.14679440947043,
+              "mean_ms": 76.8956051098974,
+              "p50_ms": 52.833263005595654,
+              "p95_ms": 220.99655400961637,
+              "p99_ms": 330.62493699253537,
+              "errors": 0
+            }
+          ],
+          "primary": "req_s",
+          "lower_is_better": false
+        }
+      ],
+      "headlines": [
+        {
+          "key": "fastapi.asgi.ping",
+          "label": "ASGI /ping",
+          "value": 2445.2585441808696,
+          "unit": "req/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "fastapi.asgi.item_post",
+          "label": "ASGI POST /items",
+          "value": 1709.7614412552873,
+          "unit": "req/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "fastapi.asgi.json100",
+          "label": "ASGI /json100",
+          "value": 678.4286004733784,
+          "unit": "req/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "fastapi.asgi.ping_p99",
+          "label": "ASGI /ping p99",
+          "value": 0.6119440076872706,
+          "unit": "ms",
+          "higher_is_better": false
+        },
+        {
+          "key": "fastapi.http.ping",
+          "label": "HTTP /ping",
+          "value": 230.6799765715295,
+          "unit": "req/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "fastapi.http.item_post",
+          "label": "HTTP POST /items",
+          "value": 395.0823776800344,
+          "unit": "req/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "fastapi.http.json100",
+          "label": "HTTP /json100",
+          "value": 409.14679440947043,
+          "unit": "req/s",
+          "higher_is_better": true
+        },
+        {
+          "key": "fastapi.http.ping_p99",
+          "label": "HTTP /ping p99",
+          "value": 540.9847119881306,
+          "unit": "ms",
+          "higher_is_better": false
+        }
+      ],
+      "insights": [
+        "[ASGI] JSON-Antwort mit 100 Objekten kostet 3.6× so viel Zeit pro Request wie /ping.",
+        "[ASGI] POST mit Pydantic-Validierung kostet 1.4× so viel Zeit pro Request wie /ping.",
+        "[ASGI] `def`-Endpoint (Threadpool) erreicht 64% des async-Durchsatzes.",
+        "[HTTP] JSON-Antwort mit 100 Objekten: kein messbarer Mehraufwand ggü. /ping (Server-/Client-Overhead dominiert).",
+        "[HTTP] POST mit Pydantic-Validierung: kein messbarer Mehraufwand ggü. /ping (Server-/Client-Overhead dominiert).",
+        "[HTTP] `def`-Endpoint (Threadpool) ist 1.14× schneller als async.",
+        "Server-/Netzwerk-Stack kostet: ASGI-in-process schafft 10.6× mehr /ping-req/s als HTTP."
+      ],
+      "python": "CPython 3.12.3"
+    }
+  },
+  "headlines": [
+    {
+      "key": "loops.sum_for",
+      "label": "for-Schleife: Summe",
+      "value": 45.39923495030962,
+      "unit": "ns/Iter",
+      "higher_is_better": false,
+      "benchmark": "For-Schleifen"
+    },
+    {
+      "key": "loops.sum_builtin",
+      "label": "sum(range)",
+      "value": 15.458699926966801,
+      "unit": "ns/Iter",
+      "higher_is_better": false,
+      "benchmark": "For-Schleifen"
+    },
+    {
+      "key": "loops.list_comp",
+      "label": "List-Comprehension",
+      "value": 51.56270999577828,
+      "unit": "ns/Iter",
+      "higher_is_better": false,
+      "benchmark": "For-Schleifen"
+    },
+    {
+      "key": "loops.call_function",
+      "label": "Schleife mit Funktionsaufruf",
+      "value": 65.0853750994429,
+      "unit": "ns/Iter",
+      "higher_is_better": false,
+      "benchmark": "For-Schleifen"
+    },
+    {
+      "key": "csv.generate",
+      "label": "Zeilen generieren",
+      "value": 162730.30441153687,
+      "unit": "Zeilen/s",
+      "higher_is_better": true,
+      "benchmark": "CSV"
+    },
+    {
+      "key": "csv.write",
+      "label": "csv.writer schreiben",
+      "value": 509319.7491938966,
+      "unit": "Zeilen/s",
+      "higher_is_better": true,
+      "benchmark": "CSV"
+    },
+    {
+      "key": "csv.read",
+      "label": "csv.reader lesen",
+      "value": 1038888.3653589408,
+      "unit": "Zeilen/s",
+      "higher_is_better": true,
+      "benchmark": "CSV"
+    },
+    {
+      "key": "csv.aggregate",
+      "label": "Aggregation (DictReader)",
+      "value": 339042.2533619137,
+      "unit": "Zeilen/s",
+      "higher_is_better": true,
+      "benchmark": "CSV"
+    },
+    {
+      "key": "csv.read_pandas",
+      "label": "pandas.read_csv",
+      "value": 1890631.6125856575,
+      "unit": "Zeilen/s",
+      "higher_is_better": true,
+      "benchmark": "CSV"
+    },
+    {
+      "key": "startup.python_empty",
+      "label": "python -c pass",
+      "value": 16.523052006959915,
+      "unit": "ms",
+      "higher_is_better": false,
+      "benchmark": "Startzeiten"
+    },
+    {
+      "key": "startup.import_pandas",
+      "label": "import pandas",
+      "value": 398.3833629754372,
+      "unit": "ms",
+      "higher_is_better": false,
+      "benchmark": "Startzeiten"
+    },
+    {
+      "key": "startup.import_fastapi",
+      "label": "import fastapi",
+      "value": 367.8147399914451,
+      "unit": "ms",
+      "higher_is_better": false,
+      "benchmark": "Startzeiten"
+    },
+    {
+      "key": "startup.uvicorn_cold",
+      "label": "uvicorn Kaltstart",
+      "value": 430.9927079884801,
+      "unit": "ms",
+      "higher_is_better": false,
+      "benchmark": "Startzeiten"
+    },
+    {
+      "key": "request.pipeline_us",
+      "label": "Pipeline parse+route+build",
+      "value": 9.438329639961012,
+      "unit": "µs",
+      "higher_is_better": false,
+      "benchmark": "Request-Handling"
+    },
+    {
+      "key": "request.live_ping",
+      "label": "Live /ping",
+      "value": 33705.20518543587,
+      "unit": "req/s",
+      "higher_is_better": true,
+      "benchmark": "Request-Handling"
+    },
+    {
+      "key": "request.live_list",
+      "label": "Live /list (50 Obj.)",
+      "value": 10106.095489603484,
+      "unit": "req/s",
+      "higher_is_better": true,
+      "benchmark": "Request-Handling"
+    },
+    {
+      "key": "request.live_ping_p99",
+      "label": "Live /ping p99",
+      "value": 11.666225997032598,
+      "unit": "ms",
+      "higher_is_better": false,
+      "benchmark": "Request-Handling"
+    },
+    {
+      "key": "fastapi.asgi.ping",
+      "label": "ASGI /ping",
+      "value": 2445.2585441808696,
+      "unit": "req/s",
+      "higher_is_better": true,
+      "benchmark": "FastAPI-Durchsatz"
+    },
+    {
+      "key": "fastapi.asgi.item_post",
+      "label": "ASGI POST /items",
+      "value": 1709.7614412552873,
+      "unit": "req/s",
+      "higher_is_better": true,
+      "benchmark": "FastAPI-Durchsatz"
+    },
+    {
+      "key": "fastapi.asgi.json100",
+      "label": "ASGI /json100",
+      "value": 678.4286004733784,
+      "unit": "req/s",
+      "higher_is_better": true,
+      "benchmark": "FastAPI-Durchsatz"
+    },
+    {
+      "key": "fastapi.asgi.ping_p99",
+      "label": "ASGI /ping p99",
+      "value": 0.6119440076872706,
+      "unit": "ms",
+      "higher_is_better": false,
+      "benchmark": "FastAPI-Durchsatz"
+    },
+    {
+      "key": "fastapi.http.ping",
+      "label": "HTTP /ping",
+      "value": 230.6799765715295,
+      "unit": "req/s",
+      "higher_is_better": true,
+      "benchmark": "FastAPI-Durchsatz"
+    },
+    {
+      "key": "fastapi.http.item_post",
+      "label": "HTTP POST /items",
+      "value": 395.0823776800344,
+      "unit": "req/s",
+      "higher_is_better": true,
+      "benchmark": "FastAPI-Durchsatz"
+    },
+    {
+      "key": "fastapi.http.json100",
+      "label": "HTTP /json100",
+      "value": 409.14679440947043,
+      "unit": "req/s",
+      "higher_is_better": true,
+      "benchmark": "FastAPI-Durchsatz"
+    },
+    {
+      "key": "fastapi.http.ping_p99",
+      "label": "HTTP /ping p99",
+      "value": 540.9847119881306,
+      "unit": "ms",
+      "higher_is_better": false,
+      "benchmark": "FastAPI-Durchsatz"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+[package]
+name = "pyx-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pyx-ir.workspace = true
+rustpython-parser.workspace = true

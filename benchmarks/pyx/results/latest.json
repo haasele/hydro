@@ -1,0 +1,702 @@
+{
+  "meta": {
+    "timestamp": "2026-10-24 15:45:52",
+    "python": "3.12.3",
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "cpu": "x86_64",
+    "repeats": 5,
+    "pyx": "/home/aura/github/pyx/target/release/pyx"
+  },
+  "results": [
+    {
+      "workload": "while_sum",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 47.88338497746736,
+      "median_ms": 50.71393499383703,
+      "max_ms": 57.7015089802444,
+      "rss_kb": 10576,
+      "status": "ok"
+    },
+    {
+      "workload": "while_sum",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 13.002671010326594,
+      "median_ms": 13.064198021311313,
+      "max_ms": 13.449503981973976,
+      "rss_kb": 8000,
+      "status": "ok"
+    },
+    {
+      "workload": "while_sum",
+      "impl": "pyx-aot",
+      "build_ms": 308.6480100173503,
+      "min_ms": 10.117867030203342,
+      "median_ms": 10.446465981658548,
+      "max_ms": 14.354254002682865,
+      "rss_kb": 3616,
+      "status": "ok"
+    },
+    {
+      "workload": "for_sum",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 43.7511769705452,
+      "median_ms": 44.20390195446089,
+      "max_ms": 55.31391495605931,
+      "rss_kb": 10576,
+      "status": "ok"
+    },
+    {
+      "workload": "for_sum",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 17.324771033599973,
+      "median_ms": 17.76591397356242,
+      "max_ms": 18.86891102185473,
+      "rss_kb": 7992,
+      "status": "ok"
+    },
+    {
+      "workload": "for_sum",
+      "impl": "pyx-aot",
+      "build_ms": 296.6641319799237,
+      "min_ms": 13.48224701359868,
+      "median_ms": 14.367428957484663,
+      "max_ms": 15.371017972938716,
+      "rss_kb": 3680,
+      "status": "ok"
+    },
+    {
+      "workload": "range_sum",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 25.266839016694576,
+      "median_ms": 26.096124958712608,
+      "max_ms": 26.961747964378446,
+      "rss_kb": 10712,
+      "status": "ok"
+    },
+    {
+      "workload": "range_sum",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 9.729684970807284,
+      "median_ms": 10.038977023214102,
+      "max_ms": 10.30165801057592,
+      "rss_kb": 8100,
+      "status": "ok"
+    },
+    {
+      "workload": "range_sum",
+      "impl": "pyx-aot",
+      "build_ms": 254.6681470121257,
+      "min_ms": 7.914305024314672,
+      "median_ms": 8.483183977659792,
+      "max_ms": 9.59974603028968,
+      "rss_kb": 3496,
+      "status": "ok"
+    },
+    {
+      "workload": "list_append",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 37.48776495922357,
+      "median_ms": 38.77820202615112,
+      "max_ms": 46.46712698740885,
+      "rss_kb": 14544,
+      "status": "ok"
+    },
+    {
+      "workload": "list_append",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 18.244397011585534,
+      "median_ms": 18.780232989229262,
+      "max_ms": 20.13769600307569,
+      "rss_kb": 8944,
+      "status": "ok"
+    },
+    {
+      "workload": "list_append",
+      "impl": "pyx-aot",
+      "build_ms": 247.36086901975796,
+      "min_ms": 16.14623802015558,
+      "median_ms": 16.58950501587242,
+      "max_ms": 18.262101046275347,
+      "rss_kb": 4500,
+      "status": "ok"
+    },
+    {
+      "workload": "dict_insert",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 21.42305299639702,
+      "median_ms": 24.267099041026086,
+      "max_ms": 26.89955895766616,
+      "rss_kb": 11120,
+      "status": "ok"
+    },
+    {
+      "workload": "dict_insert",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 62.495327030774206,
+      "median_ms": 68.62853799248114,
+      "max_ms": 73.60577204963192,
+      "rss_kb": 8248,
+      "status": "ok"
+    },
+    {
+      "workload": "dict_insert",
+      "impl": "pyx-aot",
+      "build_ms": 241.47511599585414,
+      "min_ms": 56.25441903248429,
+      "median_ms": 58.15801699645817,
+      "max_ms": 63.241233001463115,
+      "rss_kb": 3692,
+      "status": "ok"
+    },
+    {
+      "workload": "string_concat",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 21.924450004007667,
+      "median_ms": 25.708532019052655,
+      "max_ms": 27.137043012771755,
+      "rss_kb": 10700,
+      "status": "ok"
+    },
+    {
+      "workload": "string_concat",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 15.026917972136289,
+      "median_ms": 17.055093951057643,
+      "max_ms": 22.08724297815934,
+      "rss_kb": 21696,
+      "status": "ok"
+    },
+    {
+      "workload": "string_concat",
+      "impl": "pyx-aot",
+      "build_ms": 244.4422520347871,
+      "min_ms": 12.153676012530923,
+      "median_ms": 12.952743971254677,
+      "max_ms": 15.612166025675833,
+      "rss_kb": 17248,
+      "status": "ok"
+    },
+    {
+      "workload": "list_comp",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 27.265357959549874,
+      "median_ms": 29.66649702284485,
+      "max_ms": 30.426418990828097,
+      "rss_kb": 14552,
+      "status": "ok"
+    },
+    {
+      "workload": "list_comp",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 10.056909988634288,
+      "median_ms": 11.235491023398936,
+      "max_ms": 11.853081989102066,
+      "rss_kb": 8864,
+      "status": "ok"
+    },
+    {
+      "workload": "list_comp",
+      "impl": "pyx-aot",
+      "build_ms": 268.3768899878487,
+      "min_ms": 7.437984982971102,
+      "median_ms": 7.653196051251143,
+      "max_ms": 7.889757980592549,
+      "rss_kb": 4700,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_comp",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 27.97267900314182,
+      "median_ms": 29.21776898438111,
+      "max_ms": 35.05096602020785,
+      "rss_kb": 11992,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_comp",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 11.892347014509141,
+      "median_ms": 12.458238983526826,
+      "max_ms": 13.954798982013017,
+      "rss_kb": 8372,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_comp",
+      "impl": "pyx-aot",
+      "build_ms": 260.68744197255,
+      "min_ms": 10.067669965792447,
+      "median_ms": 10.420836042612791,
+      "max_ms": 12.070148019120097,
+      "rss_kb": 4076,
+      "status": "ok"
+    },
+    {
+      "workload": "sum_genexp",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 26.52235800633207,
+      "median_ms": 28.260407969355583,
+      "max_ms": 29.971980024129152,
+      "rss_kb": 10724,
+      "status": "ok"
+    },
+    {
+      "workload": "sum_genexp",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 12.271701009012759,
+      "median_ms": 12.9545169766061,
+      "max_ms": 14.000736991874874,
+      "rss_kb": 9024,
+      "status": "ok"
+    },
+    {
+      "workload": "sum_genexp",
+      "impl": "pyx-aot",
+      "build_ms": 286.51194396661595,
+      "min_ms": 8.10458802152425,
+      "median_ms": 8.645260997582227,
+      "max_ms": 10.421156010124832,
+      "rss_kb": 4460,
+      "status": "ok"
+    },
+    {
+      "workload": "map_lambda",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 32.46281901374459,
+      "median_ms": 32.71957900142297,
+      "max_ms": 35.09789501549676,
+      "rss_kb": 14584,
+      "status": "ok"
+    },
+    {
+      "workload": "map_lambda",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 16.299799957778305,
+      "median_ms": 16.713510965928435,
+      "max_ms": 16.882463998626918,
+      "rss_kb": 9532,
+      "status": "ok"
+    },
+    {
+      "workload": "map_lambda",
+      "impl": "pyx-aot",
+      "build_ms": 250.72386401006952,
+      "min_ms": 14.553192013408989,
+      "median_ms": 14.912088983692229,
+      "max_ms": 15.271283977199346,
+      "rss_kb": 5356,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_lambda",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 28.378132032230496,
+      "median_ms": 29.77531199576333,
+      "max_ms": 30.333849950693548,
+      "rss_kb": 12028,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_lambda",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 16.739601036533713,
+      "median_ms": 17.11647998308763,
+      "max_ms": 17.426884034648538,
+      "rss_kb": 8620,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_lambda",
+      "impl": "pyx-aot",
+      "build_ms": 270.7066700095311,
+      "min_ms": 15.33672004006803,
+      "median_ms": 16.967625997494906,
+      "max_ms": 18.63626396516338,
+      "rss_kb": 4260,
+      "status": "ok"
+    },
+    {
+      "workload": "lambda_call",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 35.31692299293354,
+      "median_ms": 35.64205300062895,
+      "max_ms": 35.93204799108207,
+      "rss_kb": 10616,
+      "status": "ok"
+    },
+    {
+      "workload": "lambda_call",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 17.766382021363825,
+      "median_ms": 19.531545985955745,
+      "max_ms": 20.221443031914532,
+      "rss_kb": 8120,
+      "status": "ok"
+    },
+    {
+      "workload": "lambda_call",
+      "impl": "pyx-aot",
+      "build_ms": 245.49239204498008,
+      "min_ms": 15.717996982857585,
+      "median_ms": 15.995138033758849,
+      "max_ms": 16.270803986117244,
+      "rss_kb": 3620,
+      "status": "ok"
+    },
+    {
+      "workload": "reduce_add",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 24.521171988453716,
+      "median_ms": 24.84960900619626,
+      "max_ms": 26.65094198891893,
+      "rss_kb": 10584,
+      "status": "ok"
+    },
+    {
+      "workload": "reduce_add",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 8.913485042285174,
+      "median_ms": 9.917032031808048,
+      "max_ms": 10.67531103035435,
+      "rss_kb": 8000,
+      "status": "ok"
+    },
+    {
+      "workload": "reduce_add",
+      "impl": "pyx-aot",
+      "build_ms": 241.31699901772663,
+      "min_ms": 7.0879349950701,
+      "median_ms": 7.144364004489034,
+      "max_ms": 8.064490975812078,
+      "rss_kb": 3844,
+      "status": "ok"
+    },
+    {
+      "workload": "math_loop",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 28.723952011205256,
+      "median_ms": 29.52709695091471,
+      "max_ms": 30.667726998217404,
+      "rss_kb": 10888,
+      "status": "ok"
+    },
+    {
+      "workload": "math_loop",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 23.81016203435138,
+      "median_ms": 25.300301029346883,
+      "max_ms": 25.655047968029976,
+      "rss_kb": 9644,
+      "status": "ok"
+    },
+    {
+      "workload": "math_loop",
+      "impl": "pyx-aot",
+      "build_ms": 250.32238400308415,
+      "min_ms": 23.764204001054168,
+      "median_ms": 25.67285200348124,
+      "max_ms": 28.42889999737963,
+      "rss_kb": 5180,
+      "status": "ok"
+    },
+    {
+      "workload": "json_dumps",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 26.638596958946437,
+      "median_ms": 28.81812199484557,
+      "max_ms": 33.55068602832034,
+      "rss_kb": 11588,
+      "status": "ok"
+    },
+    {
+      "workload": "json_dumps",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 5.641372001264244,
+      "median_ms": 5.977542954497039,
+      "max_ms": 6.429678003769368,
+      "rss_kb": 8896,
+      "status": "ok"
+    },
+    {
+      "workload": "json_dumps",
+      "impl": "pyx-aot",
+      "build_ms": 235.96063698641956,
+      "min_ms": 3.3297030022367835,
+      "median_ms": 3.5377610474824905,
+      "max_ms": 3.8030680152587593,
+      "rss_kb": 4812,
+      "status": "ok"
+    },
+    {
+      "workload": "json_loads",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 29.090212017763406,
+      "median_ms": 29.58818298066035,
+      "max_ms": 30.359356955159456,
+      "rss_kb": 11672,
+      "status": "ok"
+    },
+    {
+      "workload": "json_loads",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 5.560735997278243,
+      "median_ms": 6.1795589863322675,
+      "max_ms": 6.3307780073955655,
+      "rss_kb": 9248,
+      "status": "ok"
+    },
+    {
+      "workload": "json_loads",
+      "impl": "pyx-aot",
+      "build_ms": 269.3445309996605,
+      "min_ms": 3.363105992320925,
+      "median_ms": 3.821733989752829,
+      "max_ms": 4.201530013233423,
+      "rss_kb": 4920,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_serial",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 118.99766302667558,
+      "median_ms": 126.2131710536778,
+      "max_ms": 141.3078189943917,
+      "rss_kb": 10572,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_serial",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 38.56546804308891,
+      "median_ms": 40.36958602955565,
+      "max_ms": 43.367162987124175,
+      "rss_kb": 8220,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_serial",
+      "impl": "pyx-aot",
+      "build_ms": 257.68817198695615,
+      "min_ms": 32.72730205208063,
+      "median_ms": 33.338228007778525,
+      "max_ms": 35.55153799243271,
+      "rss_kb": 3620,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_parallel",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 70.83546405192465,
+      "median_ms": 72.84533500205725,
+      "max_ms": 76.04703301331028,
+      "rss_kb": 10900,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_parallel",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 17.347720975521952,
+      "median_ms": 18.65662104682997,
+      "max_ms": 21.043724031187594,
+      "rss_kb": 8616,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_parallel",
+      "impl": "pyx-aot",
+      "build_ms": 244.58976596361026,
+      "min_ms": 11.724114010576159,
+      "median_ms": 12.037463020533323,
+      "max_ms": 13.915211020503193,
+      "rss_kb": 3996,
+      "status": "ok"
+    },
+    {
+      "workload": "pool_map",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 60.91045599896461,
+      "median_ms": 64.63687797077,
+      "max_ms": 68.51258396636695,
+      "rss_kb": 14804,
+      "status": "ok"
+    },
+    {
+      "workload": "pool_map",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 9.655190980993211,
+      "median_ms": 11.495376995299011,
+      "max_ms": 11.84043602552265,
+      "rss_kb": 8348,
+      "status": "ok"
+    },
+    {
+      "workload": "pool_map",
+      "impl": "pyx-aot",
+      "build_ms": 253.35709401406348,
+      "min_ms": 5.79915102571249,
+      "median_ms": 7.312113011721522,
+      "max_ms": 7.838109042495489,
+      "rss_kb": 3748,
+      "status": "ok"
+    },
+    {
+      "workload": "pool_serial",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 112.58911003824323,
+      "median_ms": 116.28396104788408,
+      "max_ms": 123.73311497503892,
+      "rss_kb": 14800,
+      "status": "ok"
+    },
+    {
+      "workload": "pool_serial",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 48.879312991630286,
+      "median_ms": 51.65433697402477,
+      "max_ms": 58.56616602977738,
+      "rss_kb": 8384,
+      "status": "ok"
+    },
+    {
+      "workload": "pool_serial",
+      "impl": "pyx-aot",
+      "build_ms": 238.23409201577306,
+      "min_ms": 47.22694598603994,
+      "median_ms": 50.5097089917399,
+      "max_ms": 59.58261695923284,
+      "rss_kb": 3856,
+      "status": "ok"
+    },
+    {
+      "workload": "pool_parallel",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 75.22114901803434,
+      "median_ms": 78.79339600913227,
+      "max_ms": 83.60110403737053,
+      "rss_kb": 14668,
+      "status": "ok"
+    },
+    {
+      "workload": "pool_parallel",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 17.894093005452305,
+      "median_ms": 18.63044098718092,
+      "max_ms": 28.446690004784614,
+      "rss_kb": 8296,
+      "status": "ok"
+    },
+    {
+      "workload": "pool_parallel",
+      "impl": "pyx-aot",
+      "build_ms": 237.18395904870704,
+      "min_ms": 14.584699994884431,
+      "median_ms": 15.193744038697332,
+      "max_ms": 16.19725103955716,
+      "rss_kb": 3816,
+      "status": "ok"
+    },
+    {
+      "workload": "process_queue",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 63.47487302264199,
+      "median_ms": 64.67838300159201,
+      "max_ms": 67.75303796166554,
+      "rss_kb": 14252,
+      "status": "ok"
+    },
+    {
+      "workload": "process_queue",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 18.558603012934327,
+      "median_ms": 19.665889034513384,
+      "max_ms": 20.233002956956625,
+      "rss_kb": 8568,
+      "status": "ok"
+    },
+    {
+      "workload": "process_queue",
+      "impl": "pyx-aot",
+      "build_ms": 254.74147498607635,
+      "min_ms": 13.362573983613402,
+      "median_ms": 14.627060038037598,
+      "max_ms": 15.40333399316296,
+      "rss_kb": 3912,
+      "status": "ok"
+    },
+    {
+      "workload": "startup_hello",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 18.997773004230112,
+      "median_ms": 19.703611033037305,
+      "max_ms": 20.079669018741697,
+      "rss_kb": 10576,
+      "status": "ok"
+    },
+    {
+      "workload": "startup_hello",
+      "impl": "pyx-jit",
+      "build_ms": null,
+      "min_ms": 2.729828003793955,
+      "median_ms": 3.060088027268648,
+      "max_ms": 3.415865998249501,
+      "rss_kb": 7868,
+      "status": "ok"
+    },
+    {
+      "workload": "startup_hello",
+      "impl": "pyx-aot",
+      "build_ms": 253.60711297253147,
+      "min_ms": 1.0667589958757162,
+      "median_ms": 1.7102589481510222,
+      "max_ms": 2.94962601037696,
+      "rss_kb": 3440,
+      "status": "ok"
+    }
+  ]
+}

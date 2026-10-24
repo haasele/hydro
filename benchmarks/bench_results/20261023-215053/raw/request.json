@@ -1,0 +1,219 @@
+{
+  "benchmark": "request",
+  "title": "Request-Handling (Webserver)",
+  "meta": {
+    "concurrency": 50,
+    "duration_s": 2.0,
+    "uvloop": "ja",
+    "live": "ja"
+  },
+  "sections": [
+    {
+      "title": "Pipeline-Stufen (Micro-Benchmark, 1 Thread, ohne Netzwerk)",
+      "columns": [
+        {
+          "key": "stage",
+          "label": "Stufe"
+        },
+        {
+          "key": "us_op",
+          "label": "Zeit/Op",
+          "unit": "µs",
+          "fmt": ".2f"
+        },
+        {
+          "key": "ops_s",
+          "label": "Ops/s",
+          "fmt": ",.0f"
+        }
+      ],
+      "rows": [
+        {
+          "stage": "parse_request (7 Header)",
+          "us_op": 2.746846330119297,
+          "ops_s": 364053.8566118366
+        },
+        {
+          "stage": "parse_query (4 Parameter)",
+          "us_op": 1.0415804450167343,
+          "ops_s": 960079.4684504026
+        },
+        {
+          "stage": "route: statisch /ping",
+          "us_op": 0.459463028004393,
+          "ops_s": 2176453.6840828005
+        },
+        {
+          "stage": "route: dynamisch /users/42?v=1",
+          "us_op": 1.4598125549673568,
+          "ops_s": 685019.4544479453
+        },
+        {
+          "stage": "route: 404 (kein Treffer)",
+          "us_op": 0.5516761919716373,
+          "ops_s": 1812657.523657305
+        },
+        {
+          "stage": "route: POST /echo (JSON-Body)",
+          "us_op": 3.84765646973392,
+          "ops_s": 259898.46231494614
+        },
+        {
+          "stage": "json.loads (Body)",
+          "us_op": 3.3551646801060997,
+          "ops_s": 298047.9634663945
+        },
+        {
+          "stage": "build_response: klein",
+          "us_op": 3.9000207500066613,
+          "ops_s": 256408.8921830203
+        },
+        {
+          "stage": "build_response: 50 Objekte",
+          "us_op": 38.9782046986511,
+          "ops_s": 25655.363240334325
+        },
+        {
+          "stage": "Pipeline komplett (parse+route+build)",
+          "us_op": 9.438329639961012,
+          "ops_s": 105950.9508722913
+        }
+      ],
+      "share": "us_op",
+      "note": "Balken = Anteil an der teuersten Stufe (Stufen sind keine Alternativen)."
+    },
+    {
+      "title": "Live-Test (asyncio-Server, Keep-Alive)",
+      "note": "concurrency=50, uvloop=ja",
+      "columns": [
+        {
+          "key": "scenario",
+          "label": "Szenario"
+        },
+        {
+          "key": "req_s",
+          "label": "Durchsatz",
+          "unit": "req/s",
+          "fmt": ",.0f"
+        },
+        {
+          "key": "mean_ms",
+          "label": "mean",
+          "unit": "ms",
+          "fmt": ".2f"
+        },
+        {
+          "key": "p50_ms",
+          "label": "p50",
+          "unit": "ms",
+          "fmt": ".2f"
+        },
+        {
+          "key": "p95_ms",
+          "label": "p95",
+          "unit": "ms",
+          "fmt": ".2f"
+        },
+        {
+          "key": "p99_ms",
+          "label": "p99",
+          "unit": "ms",
+          "fmt": ".2f"
+        },
+        {
+          "key": "errors",
+          "label": "Fehler"
+        }
+      ],
+      "rows": [
+        {
+          "key": "ping",
+          "scenario": "GET /ping",
+          "req_s": 33705.20518543587,
+          "mean_ms": 1.480121371985929,
+          "p50_ms": 1.1983590084128082,
+          "p95_ms": 2.398561016889289,
+          "p99_ms": 11.666225997032598,
+          "errors": 0
+        },
+        {
+          "key": "user",
+          "scenario": "GET /users/42?v=1",
+          "req_s": 29908.51825279782,
+          "mean_ms": 1.667508518319173,
+          "p50_ms": 1.4059039822313935,
+          "p95_ms": 2.5335179816465825,
+          "p99_ms": 11.809016985353082,
+          "errors": 0
+        },
+        {
+          "key": "echo",
+          "scenario": "POST /echo",
+          "req_s": 19934.25963284446,
+          "mean_ms": 2.502185680551483,
+          "p50_ms": 2.1337380167096853,
+          "p95_ms": 3.7139829946681857,
+          "p99_ms": 12.957771978108212,
+          "errors": 0
+        },
+        {
+          "key": "list",
+          "scenario": "GET /list (50 Objekte)",
+          "req_s": 10106.095489603484,
+          "mean_ms": 4.930495271508907,
+          "p50_ms": 4.126528016058728,
+          "p95_ms": 11.577085009776056,
+          "p99_ms": 16.213563008932397,
+          "errors": 0
+        },
+        {
+          "key": "404",
+          "scenario": "GET /nope (404)",
+          "req_s": 31836.23333264959,
+          "mean_ms": 1.567470225441542,
+          "p50_ms": 1.302667980780825,
+          "p95_ms": 2.615774021251127,
+          "p99_ms": 11.40462901093997,
+          "errors": 0
+        }
+      ],
+      "primary": "req_s",
+      "lower_is_better": false
+    }
+  ],
+  "headlines": [
+    {
+      "key": "request.pipeline_us",
+      "label": "Pipeline parse+route+build",
+      "value": 9.438329639961012,
+      "unit": "µs",
+      "higher_is_better": false
+    },
+    {
+      "key": "request.live_ping",
+      "label": "Live /ping",
+      "value": 33705.20518543587,
+      "unit": "req/s",
+      "higher_is_better": true
+    },
+    {
+      "key": "request.live_list",
+      "label": "Live /list (50 Obj.)",
+      "value": 10106.095489603484,
+      "unit": "req/s",
+      "higher_is_better": true
+    },
+    {
+      "key": "request.live_ping_p99",
+      "label": "Live /ping p99",
+      "value": 11.666225997032598,
+      "unit": "ms",
+      "higher_is_better": false
+    }
+  ],
+  "insights": [
+    "Die Pipeline allein erlaubt ≈ 105,951 req/s pro Kern; live erreicht /ping 33,705 req/s (32%) – der Rest entfällt auf Socket-I/O, Event-Loop und den Client im selben Host.",
+    "Ein 50-Objekte-JSON senkt den Durchsatz auf 30% von /ping (Serialisierungskosten)."
+  ],
+  "python": "CPython 3.12.3"
+}

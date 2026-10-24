@@ -1,0 +1,297 @@
+{
+  "benchmark": "startup",
+  "title": "Startzeiten",
+  "meta": {
+    "runs": 3,
+    "python_exe": "python"
+  },
+  "sections": [
+    {
+      "title": "Interpreter-Start",
+      "columns": [
+        {
+          "key": "name",
+          "label": "Test"
+        },
+        {
+          "key": "min_ms",
+          "label": "min",
+          "unit": "ms",
+          "fmt": ".1f"
+        },
+        {
+          "key": "median_ms",
+          "label": "median",
+          "unit": "ms",
+          "fmt": ".1f"
+        },
+        {
+          "key": "max_ms",
+          "label": "max",
+          "unit": "ms",
+          "fmt": ".1f"
+        }
+      ],
+      "rows": [
+        {
+          "name": "python -c pass",
+          "min_ms": 16.466244007460773,
+          "median_ms": 16.523052006959915,
+          "max_ms": 17.34420398133807,
+          "delta_ms": null
+        },
+        {
+          "name": "python -S -c pass (ohne site)",
+          "min_ms": 9.915465983795002,
+          "median_ms": 10.532779997447506,
+          "max_ms": 10.638712003128603,
+          "delta_ms": null
+        },
+        {
+          "name": "python -I -c pass (isolated)",
+          "min_ms": 17.516861989861354,
+          "median_ms": 17.927123000845313,
+          "max_ms": 19.97078998829238,
+          "delta_ms": null
+        },
+        {
+          "name": "uv run --no-project python -c pass",
+          "min_ms": 25.836795015493408,
+          "median_ms": 26.065248006489128,
+          "max_ms": 27.675460994942114,
+          "delta_ms": null
+        }
+      ],
+      "primary": "median_ms",
+      "lower_is_better": true
+    },
+    {
+      "title": "Import-Zeiten",
+      "columns": [
+        {
+          "key": "name",
+          "label": "Test"
+        },
+        {
+          "key": "min_ms",
+          "label": "min",
+          "unit": "ms",
+          "fmt": ".1f"
+        },
+        {
+          "key": "median_ms",
+          "label": "median",
+          "unit": "ms",
+          "fmt": ".1f"
+        },
+        {
+          "key": "max_ms",
+          "label": "max",
+          "unit": "ms",
+          "fmt": ".1f"
+        },
+        {
+          "key": "delta_ms",
+          "label": "Δ zu leer",
+          "unit": "ms",
+          "fmt": "+.1f"
+        }
+      ],
+      "rows": [
+        {
+          "name": "import pandas",
+          "min_ms": 414.84960698289797,
+          "median_ms": 443.63150297431275,
+          "max_ms": 453.6168620106764,
+          "delta_ms": 398.3833629754372
+        },
+        {
+          "name": "import fastapi",
+          "min_ms": 384.28098399890587,
+          "median_ms": 384.32620000094175,
+          "max_ms": 389.0526789764408,
+          "delta_ms": 367.8147399914451
+        },
+        {
+          "name": "import requests",
+          "min_ms": 165.3685639903415,
+          "median_ms": 172.73687702254392,
+          "max_ms": 237.4525189807173,
+          "delta_ms": 148.90231998288073
+        },
+        {
+          "name": "import uvicorn",
+          "min_ms": 123.37394201313145,
+          "median_ms": 124.76769302156754,
+          "max_ms": 137.20443402417004,
+          "delta_ms": 106.90769800567068
+        },
+        {
+          "name": "import httpx",
+          "min_ms": 103.38205398875289,
+          "median_ms": 111.42128199571744,
+          "max_ms": 121.881494007539,
+          "delta_ms": 86.91580998129211
+        },
+        {
+          "name": "import numpy",
+          "min_ms": 100.52829698543064,
+          "median_ms": 110.0106080120895,
+          "max_ms": 143.70034699095413,
+          "delta_ms": 84.06205297796987
+        },
+        {
+          "name": "import asyncio",
+          "min_ms": 66.18101699859835,
+          "median_ms": 66.5386870095972,
+          "max_ms": 67.54593300865963,
+          "delta_ms": 49.71477299113758
+        },
+        {
+          "name": "import pydantic",
+          "min_ms": 63.41557900304906,
+          "median_ms": 66.78325301618315,
+          "max_ms": 69.8890789935831,
+          "delta_ms": 46.94933499558829
+        },
+        {
+          "name": "import http.server",
+          "min_ms": 52.334243984660134,
+          "median_ms": 54.60131599102169,
+          "max_ms": 55.509222991531715,
+          "delta_ms": 35.86799997719936
+        },
+        {
+          "name": "import dataclasses",
+          "min_ms": 31.08845098176971,
+          "median_ms": 31.85302601195872,
+          "max_ms": 32.12357999291271,
+          "delta_ms": 14.622206974308938
+        },
+        {
+          "name": "import typing",
+          "min_ms": 23.546078009530902,
+          "median_ms": 24.990103993332013,
+          "max_ms": 25.362122018123046,
+          "delta_ms": 7.079834002070129
+        },
+        {
+          "name": "import json",
+          "min_ms": 20.988604024751112,
+          "median_ms": 21.70364500489086,
+          "max_ms": 22.135635983431712,
+          "delta_ms": 4.522360017290339
+        },
+        {
+          "name": "import csv",
+          "min_ms": 19.90861998638138,
+          "median_ms": 21.523511997656897,
+          "max_ms": 23.09847599826753,
+          "delta_ms": 3.4423759789206088
+        },
+        {
+          "name": "import sqlite3",
+          "min_ms": 19.717405986739323,
+          "median_ms": 19.793049985310063,
+          "max_ms": 20.474446995649487,
+          "delta_ms": 3.2511619792785496
+        },
+        {
+          "name": "import decimal",
+          "min_ms": 17.148682003607973,
+          "median_ms": 17.294248013058677,
+          "max_ms": 17.813717015087605,
+          "delta_ms": 0.6824379961472005
+        },
+        {
+          "name": "import starlette",
+          "min_ms": 15.903943974990398,
+          "median_ms": 16.40152098843828,
+          "max_ms": 16.53089700266719,
+          "delta_ms": 0.0
+        }
+      ],
+      "share": "delta_ms",
+      "note": "Δ = min minus min des leeren Interpreters (rauschärmer als Median); Balken = Anteil am teuersten Import."
+    },
+    {
+      "title": "FastAPI & uvicorn",
+      "columns": [
+        {
+          "key": "name",
+          "label": "Test"
+        },
+        {
+          "key": "min_ms",
+          "label": "min",
+          "unit": "ms",
+          "fmt": ".1f"
+        },
+        {
+          "key": "median_ms",
+          "label": "median",
+          "unit": "ms",
+          "fmt": ".1f"
+        },
+        {
+          "key": "max_ms",
+          "label": "max",
+          "unit": "ms",
+          "fmt": ".1f"
+        }
+      ],
+      "rows": [
+        {
+          "name": "python: import fastapi + App + 1 Route",
+          "min_ms": 393.2832650025375,
+          "median_ms": 398.25211398419924,
+          "max_ms": 426.46709000109695,
+          "delta_ms": null
+        },
+        {
+          "name": "uvicorn: Prozessstart → erste 200-Antwort",
+          "min_ms": 398.48122900002636,
+          "median_ms": 430.9927079884801,
+          "max_ms": 487.4900490103755,
+          "delta_ms": null
+        }
+      ]
+    }
+  ],
+  "headlines": [
+    {
+      "key": "startup.python_empty",
+      "label": "python -c pass",
+      "value": 16.523052006959915,
+      "unit": "ms",
+      "higher_is_better": false
+    },
+    {
+      "key": "startup.import_pandas",
+      "label": "import pandas",
+      "value": 398.3833629754372,
+      "unit": "ms",
+      "higher_is_better": false
+    },
+    {
+      "key": "startup.import_fastapi",
+      "label": "import fastapi",
+      "value": 367.8147399914451,
+      "unit": "ms",
+      "higher_is_better": false
+    },
+    {
+      "key": "startup.uvicorn_cold",
+      "label": "uvicorn Kaltstart",
+      "value": 430.9927079884801,
+      "unit": "ms",
+      "higher_is_better": false
+    }
+  ],
+  "insights": [
+    "uv run fügt ≈ 10 ms Overhead pro Start (Resolver + Env-Check) hinzu.",
+    "Teuerste Imports: pandas (+398 ms), fastapi (+368 ms), requests (+149 ms).",
+    "uvicorn-Kaltstart 431 ms = FastAPI-Import inkl. Interpreter ≈ 398 ms + Server-Init/Listen/erster Request ≈ 33 ms."
+  ],
+  "python": "CPython 3.12.3"
+}

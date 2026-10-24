@@ -1,0 +1,7 @@
+print(f"{3.14159:.2f}")
+print(f"{42:04d}")
+print(f"{'x'!r}")
+print(f"{255:#x}")
+print("{} {:.1f}".format("a", 2.25))
+print("%s:%d" % ("x", 3))
+print("%.2f %05d %%" % (1.234, 42))

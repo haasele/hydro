@@ -1,0 +1,28 @@
+body
+finally
+1
+cleanup
+7
+inner-finally
+outer-finally
+3
+ok
+else
+fin
+inner
+else-inner
+fin-inner
+loop 1
+finally 1
+finally 2
+loop 3
+finally 3
+finally 4
+after 4
+propagate-finally
+caught boom
+try-else
+caught-else from else
+bare caught
+after-break
+second wins second

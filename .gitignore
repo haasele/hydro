@@ -1,0 +1,28 @@
+# Rust build output
+/target
+
+# PyX build cache / project state (also test-created caches under crates/)
+.pyx/
+
+# Native artifacts from `pyx build` (ad-hoc, in-tree output)
+*.o
+*.a
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Benchmark scratch output (baselines under benchmarks/**/results stay tracked)
+/tmp/
+*.tmp
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

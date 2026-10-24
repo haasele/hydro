@@ -1,0 +1,13 @@
+3 True False True
+True True True True True
+4 True
+3 False
+remove 9
+3 4 False True
+5 True True
+0 False True
+1 True
+3 True False
+12
+True True
+hash unhashable type: 'list'

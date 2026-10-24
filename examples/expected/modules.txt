@@ -1,0 +1,17 @@
+3.0
+4.0 True
+2 3 -2 3.5
+8.0 1.0 1.0
+0.0 1.0
+True True
+5 20 ab
+10
+24
+10
+13
+10
+True True
+True
+True
+True
+True True

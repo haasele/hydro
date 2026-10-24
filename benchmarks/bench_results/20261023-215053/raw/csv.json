@@ -1,0 +1,325 @@
+{
+  "benchmark": "csv",
+  "title": "CSV generieren / lesen / schreiben / verarbeiten",
+  "meta": {
+    "rows": 100000,
+    "repeat": 2,
+    "dateigroesse_mb": 5.4,
+    "pandas": "3.1.0"
+  },
+  "sections": [
+    {
+      "title": "In-Memory",
+      "columns": [
+        {
+          "key": "name",
+          "label": "Test"
+        },
+        {
+          "key": "best_s",
+          "label": "best",
+          "unit": "s",
+          "fmt": ".3f"
+        },
+        {
+          "key": "median_s",
+          "label": "median",
+          "unit": "s",
+          "fmt": ".3f"
+        },
+        {
+          "key": "rows_s",
+          "label": "Zeilen/s",
+          "fmt": ",.0f"
+        },
+        {
+          "key": "mb_s",
+          "label": "Durchsatz",
+          "unit": "MB/s",
+          "fmt": ".1f"
+        }
+      ],
+      "rows": [
+        {
+          "name": "Zeilen generieren",
+          "best_s": 0.6145136909908615,
+          "median_s": 0.6408981224958552,
+          "rows_s": 162730.30441153687,
+          "mb_s": null
+        },
+        {
+          "name": "csv.writer -> StringIO",
+          "best_s": 0.1758696649922058,
+          "median_s": 0.17666196599020623,
+          "rows_s": 568602.8912628668,
+          "mb_s": 30.558288720446345
+        }
+      ],
+      "note": "Unabhängige Messungen, kein Vergleich untereinander."
+    },
+    {
+      "title": "Schreiben (Datei)",
+      "columns": [
+        {
+          "key": "name",
+          "label": "Test"
+        },
+        {
+          "key": "best_s",
+          "label": "best",
+          "unit": "s",
+          "fmt": ".3f"
+        },
+        {
+          "key": "median_s",
+          "label": "median",
+          "unit": "s",
+          "fmt": ".3f"
+        },
+        {
+          "key": "rows_s",
+          "label": "Zeilen/s",
+          "fmt": ",.0f"
+        },
+        {
+          "key": "mb_s",
+          "label": "Durchsatz",
+          "unit": "MB/s",
+          "fmt": ".1f"
+        }
+      ],
+      "rows": [
+        {
+          "name": "csv.writer",
+          "best_s": 0.1963403150148224,
+          "median_s": 0.20012618400505744,
+          "rows_s": 509319.7491938966,
+          "mb_s": 27.37224904418778
+        },
+        {
+          "name": "csv.DictWriter",
+          "best_s": 0.41862350297742523,
+          "median_s": 0.45824445100151934,
+          "rows_s": 238878.13103841094,
+          "mb_s": 12.837970065645871
+        },
+        {
+          "name": "manuell (join)",
+          "best_s": 0.19393941899761558,
+          "median_s": 0.19844199599174317,
+          "rows_s": 515624.9333779301,
+          "mb_s": 27.711107044546086
+        },
+        {
+          "name": "pandas.to_csv",
+          "best_s": 0.34407182698487304,
+          "median_s": 0.3586385389935458,
+          "rows_s": 290636.9895969322,
+          "mb_s": 15.619633979030423
+        }
+      ],
+      "primary": "best_s",
+      "lower_is_better": true
+    },
+    {
+      "title": "Lesen",
+      "columns": [
+        {
+          "key": "name",
+          "label": "Test"
+        },
+        {
+          "key": "best_s",
+          "label": "best",
+          "unit": "s",
+          "fmt": ".3f"
+        },
+        {
+          "key": "median_s",
+          "label": "median",
+          "unit": "s",
+          "fmt": ".3f"
+        },
+        {
+          "key": "rows_s",
+          "label": "Zeilen/s",
+          "fmt": ",.0f"
+        },
+        {
+          "key": "mb_s",
+          "label": "Durchsatz",
+          "unit": "MB/s",
+          "fmt": ".1f"
+        }
+      ],
+      "rows": [
+        {
+          "name": "csv.reader",
+          "best_s": 0.09625673299888149,
+          "median_s": 0.10227206749550533,
+          "rows_s": 1038888.3653589408,
+          "mb_s": 55.83272808627787
+        },
+        {
+          "name": "csv.DictReader",
+          "best_s": 0.22983555198879912,
+          "median_s": 0.24427392448706087,
+          "rows_s": 435093.69692672015,
+          "mb_s": 23.383136131445458
+        },
+        {
+          "name": "str.split",
+          "best_s": 0.05149304500082508,
+          "median_s": 0.05656721501145512,
+          "rows_s": 1942009.8383849254,
+          "mb_s": 104.36896866195984
+        },
+        {
+          "name": "pandas.read_csv",
+          "best_s": 0.052892376988893375,
+          "median_s": 0.05710758749046363,
+          "rows_s": 1890631.6125856575,
+          "mb_s": 101.60776100360397
+        }
+      ],
+      "primary": "best_s",
+      "lower_is_better": true,
+      "note": "str.split parst keine Quotes/Escapes – nur Untergrenze als Referenz."
+    },
+    {
+      "title": "Aggregation (Gruppieren nach Kategorie)",
+      "columns": [
+        {
+          "key": "name",
+          "label": "Test"
+        },
+        {
+          "key": "best_s",
+          "label": "best",
+          "unit": "s",
+          "fmt": ".3f"
+        },
+        {
+          "key": "median_s",
+          "label": "median",
+          "unit": "s",
+          "fmt": ".3f"
+        },
+        {
+          "key": "rows_s",
+          "label": "Zeilen/s",
+          "fmt": ",.0f"
+        },
+        {
+          "key": "mb_s",
+          "label": "Durchsatz",
+          "unit": "MB/s",
+          "fmt": ".1f"
+        }
+      ],
+      "rows": [
+        {
+          "name": "Aggregation (DictReader)",
+          "best_s": 0.2949484880082309,
+          "median_s": 0.303012784497696,
+          "rows_s": 339042.2533619137,
+          "mb_s": 18.22106645228852
+        },
+        {
+          "name": "Aggregation (pandas groupby)",
+          "best_s": 0.07110166500206105,
+          "median_s": 0.07165758199698757,
+          "rows_s": 1406436.8253134615,
+          "mb_s": 75.58579675798329
+        }
+      ],
+      "primary": "best_s",
+      "lower_is_better": true
+    },
+    {
+      "title": "Transformation (Lesen → Schreiben)",
+      "columns": [
+        {
+          "key": "name",
+          "label": "Test"
+        },
+        {
+          "key": "best_s",
+          "label": "best",
+          "unit": "s",
+          "fmt": ".3f"
+        },
+        {
+          "key": "median_s",
+          "label": "median",
+          "unit": "s",
+          "fmt": ".3f"
+        },
+        {
+          "key": "rows_s",
+          "label": "Zeilen/s",
+          "fmt": ",.0f"
+        },
+        {
+          "key": "mb_s",
+          "label": "Durchsatz",
+          "unit": "MB/s",
+          "fmt": ".1f"
+        }
+      ],
+      "rows": [
+        {
+          "name": "DictReader → Transform → csv.writer",
+          "best_s": 0.5444191720162053,
+          "median_s": 0.5520930400089128,
+          "rows_s": 183681.99567561038,
+          "mb_s": 9.871577409915366
+        }
+      ]
+    }
+  ],
+  "headlines": [
+    {
+      "key": "csv.generate",
+      "label": "Zeilen generieren",
+      "value": 162730.30441153687,
+      "unit": "Zeilen/s",
+      "higher_is_better": true
+    },
+    {
+      "key": "csv.write",
+      "label": "csv.writer schreiben",
+      "value": 509319.7491938966,
+      "unit": "Zeilen/s",
+      "higher_is_better": true
+    },
+    {
+      "key": "csv.read",
+      "label": "csv.reader lesen",
+      "value": 1038888.3653589408,
+      "unit": "Zeilen/s",
+      "higher_is_better": true
+    },
+    {
+      "key": "csv.aggregate",
+      "label": "Aggregation (DictReader)",
+      "value": 339042.2533619137,
+      "unit": "Zeilen/s",
+      "higher_is_better": true
+    },
+    {
+      "key": "csv.read_pandas",
+      "label": "pandas.read_csv",
+      "value": 1890631.6125856575,
+      "unit": "Zeilen/s",
+      "higher_is_better": true
+    }
+  ],
+  "insights": [
+    "DictReader ist 2.39× langsamer als csv.reader (Preis für Spaltennamen-Zugriff).",
+    "DictWriter ist 2.13× langsamer als csv.writer.",
+    "pandas.read_csv liest 1.8× schneller als csv.reader (C-Parser).",
+    "Aggregation: pandas ist 4.1× schneller als reines Python."
+  ],
+  "python": "CPython 3.12.3"
+}

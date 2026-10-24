@@ -1,0 +1,18 @@
+import multiprocessing
+
+
+def work(n):
+    total = 0
+    i = 0
+    while i < n:
+        total += i
+        i += 1
+    return total
+
+
+# Scaling pair: same chunks as pool_parallel.py, one worker.
+pool = multiprocessing.Pool(1)
+results = pool.map(work, [250000, 250000, 250000, 250000])
+print(sum(results))
+pool.close()
+pool.join()

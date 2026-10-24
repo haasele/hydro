@@ -1,0 +1,14 @@
+[package]
+name = "pyx-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pyx_runtime"
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+libc = "0.2"
+regex = "1"
+pyx-ir.workspace = true

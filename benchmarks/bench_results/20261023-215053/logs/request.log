@@ -1,0 +1,54 @@
+$ uv run --script /home/aura/github/pyx/benchmarks/bench_request_handling.py --json bench_results/20261023-215053/raw/request.json --duration 2 --warmup 0.5 --repeat 3
+
+--- stdout ---
+
+### Request-Handling (Webserver)
+    concurrency=50  duration_s=2.0  uvloop=ja  live=ja
+
+== Pipeline-Stufen (Micro-Benchmark, 1 Thread, ohne Netzwerk) ==
+   Balken = Anteil an der teuersten Stufe (Stufen sind keine Alternativen).
+Stufe                                  Zeit/Op (µs)      Ops/s
+-------------------------------------  ------------  ---------
+parse_request (7 Header)                       2.75    364,054
+parse_query (4 Parameter)                      1.04    960,079
+route: statisch /ping                          0.46  2,176,454
+route: dynamisch /users/42?v=1                 1.46    685,019
+route: 404 (kein Treffer)                      0.55  1,812,658
+route: POST /echo (JSON-Body)                  3.85    259,898
+json.loads (Body)                              3.36    298,048
+build_response: klein                          3.90    256,409
+build_response: 50 Objekte                    38.98     25,655
+Pipeline komplett (parse+route+build)          9.44    105,951
+
+== Live-Test (asyncio-Server, Keep-Alive) ==
+   concurrency=50, uvloop=ja
+Szenario                Durchsatz (req/s)  mean (ms)  p50 (ms)  p95 (ms)  p99 (ms)  Fehler    rel
+----------------------  -----------------  ---------  --------  --------  --------  ------  -----
+GET /ping                          33,705       1.48      1.20      2.40     11.67       0  1.00x
+GET /users/42?v=1                  29,909       1.67      1.41      2.53     11.81       0  1.13x
+POST /echo                         19,934       2.50      2.13      3.71     12.96       0  1.69x
+GET /list (50 Objekte)             10,106       4.93      4.13     11.58     16.21       0  3.34x
+GET /nope (404)                    31,836       1.57      1.30      2.62     11.40       0  1.06x
+
+Auswertung:
+  -> Die Pipeline allein erlaubt ≈ 105,951 req/s pro Kern; live erreicht /ping 33,705 req/s (32%) – der Rest entfällt auf Socket-I/O, Event-Loop und den Client im selben Host.
+  -> Ein 50-Objekte-JSON senkt den Durchsatz auf 30% von /ping (Serialisierungskosten).
+
+--- stderr ---
+Installed 1 package in 5ms
+request: micro parse_request (7 Header)
+request: micro parse_query (4 Parameter)
+request: micro route: statisch /ping
+request: micro route: dynamisch /users/42?v=1
+request: micro route: 404 (kein Treffer)
+request: micro route: POST /echo (JSON-Body)
+request: micro json.loads (Body)
+request: micro build_response: klein
+request: micro build_response: 50 Objekte
+request: micro Pipeline komplett (parse+route+build)
+request: live GET /ping
+request: live GET /users/42?v=1
+request: live POST /echo
+request: live GET /list (50 Objekte)
+request: live GET /nope (404)
+

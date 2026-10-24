@@ -1,0 +1,7 @@
+True a.txt .txt
+hello
+b'\x00A'
+2
+1
+a.txt
+b.bin

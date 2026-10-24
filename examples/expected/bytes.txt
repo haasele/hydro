@@ -1,0 +1,12 @@
+12
+72 10
+b'Hello'
+[72, 101, 108]
+Hello, PyX!
+b'h\xc3\xa9'
+[b'a', b'b', b'c']
+b'a-b'
+True 616263
+1
+b'\x00\xff'
+b'AB' b'\x00\x00' b'x'

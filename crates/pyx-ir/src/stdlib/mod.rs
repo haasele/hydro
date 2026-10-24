@@ -1,0 +1,106 @@
+//! Static module/function/constant metadata shared by the frontend (type
+//! checking) and the runtime (arity/type validation and native function
+//! objects). Keeping one table avoids signature drift.
+
+use crate::Type;
+
+pub struct FunctionSpec {
+    pub name: &'static str,
+    pub min_args: usize,
+    pub max_args: usize,
+    pub ret: Type,
+    /// Parameter names accepted as keyword arguments. Empty means that a
+    /// call with keywords is rejected by the frontend. Constructors use
+    /// this to support the common Python spelling (`Thread(target=...)`).
+    pub params: &'static [&'static str],
+}
+
+pub struct ConstantSpec {
+    pub name: &'static str,
+    pub ty: Type,
+}
+
+pub struct ModuleSpec {
+    pub name: &'static str,
+    pub functions: &'static [FunctionSpec],
+    pub constants: &'static [ConstantSpec],
+}
+
+pub(crate) const fn f(name: &'static str, min: usize, max: usize, ret: Type) -> FunctionSpec {
+    FunctionSpec {
+        name,
+        min_args: min,
+        max_args: max,
+        ret,
+        params: &[],
+    }
+}
+
+/// A function whose parameters may also be passed by keyword.
+pub(crate) const fn kw(
+    name: &'static str,
+    min: usize,
+    max: usize,
+    ret: Type,
+    params: &'static [&'static str],
+) -> FunctionSpec {
+    FunctionSpec {
+        name,
+        min_args: min,
+        max_args: max,
+        ret,
+        params,
+    }
+}
+
+pub(crate) const fn c(name: &'static str, ty: Type) -> ConstantSpec {
+    ConstantSpec { name, ty }
+}
+
+mod specs;
+pub use specs::*;
+
+pub static MODULES: &[&ModuleSpec] = &[
+    &MATH,
+    &IO,
+    &FUNCTOOLS,
+    &OPERATOR,
+    &TIME,
+    &SYS,
+    &RANDOM,
+    &PLATFORM,
+    &PATHLIB,
+    &STATISTICS,
+    &JSON,
+    &CSV,
+    &OS,
+    &OS_PATH,
+    &THREAD,
+    &THREADING,
+    &QUEUE,
+    &MULTIPROCESSING,
+    &PICKLE,
+    &ARGPARSE,
+    &COLLECTIONS,
+    &RE,
+    &SOCKET,
+    &ASYNCIO,
+];
+
+pub fn module(name: &str) -> Option<&'static ModuleSpec> {
+    MODULES.iter().copied().find(|module| module.name == name)
+}
+
+pub fn function(module: &str, name: &str) -> Option<&'static FunctionSpec> {
+    self::module(module)?
+        .functions
+        .iter()
+        .find(|function| function.name == name)
+}
+
+pub fn constant(module: &str, name: &str) -> Option<&'static ConstantSpec> {
+    self::module(module)?
+        .constants
+        .iter()
+        .find(|constant| constant.name == name)
+}

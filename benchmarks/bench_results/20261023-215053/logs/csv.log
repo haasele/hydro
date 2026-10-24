@@ -1,0 +1,67 @@
+$ uv run --script /home/aura/github/pyx/benchmarks/bench_csv.py --json bench_results/20261023-215053/raw/csv.json --rows 100000 --repeat 2
+
+--- stdout ---
+
+### CSV generieren / lesen / schreiben / verarbeiten
+    rows=100000  repeat=2  dateigroesse_mb=5.4  pandas=3.1.0
+
+== In-Memory ==
+   Unabhängige Messungen, kein Vergleich untereinander.
+Test                    best (s)  median (s)  Zeilen/s  Durchsatz (MB/s)
+----------------------  --------  ----------  --------  ----------------
+Zeilen generieren          0.615       0.641   162,730                 -
+csv.writer -> StringIO     0.176       0.177   568,603              30.6
+
+== Schreiben (Datei) ==
+Test            best (s)  median (s)  Zeilen/s  Durchsatz (MB/s)    rel
+--------------  --------  ----------  --------  ----------------  -----
+csv.writer         0.196       0.200   509,320              27.4  1.01x
+csv.DictWriter     0.419       0.458   238,878              12.8  2.16x
+manuell (join)     0.194       0.198   515,625              27.7  1.00x
+pandas.to_csv      0.344       0.359   290,637              15.6  1.77x
+
+== Lesen ==
+   str.split parst keine Quotes/Escapes – nur Untergrenze als Referenz.
+Test             best (s)  median (s)   Zeilen/s  Durchsatz (MB/s)    rel
+---------------  --------  ----------  ---------  ----------------  -----
+csv.reader          0.096       0.102  1,038,888              55.8  1.87x
+csv.DictReader      0.230       0.244    435,094              23.4  4.46x
+str.split           0.051       0.057  1,942,010             104.4  1.00x
+pandas.read_csv     0.053       0.057  1,890,632             101.6  1.03x
+
+== Aggregation (Gruppieren nach Kategorie) ==
+Test                          best (s)  median (s)   Zeilen/s  Durchsatz (MB/s)    rel
+----------------------------  --------  ----------  ---------  ----------------  -----
+Aggregation (DictReader)         0.295       0.303    339,042              18.2  4.15x
+Aggregation (pandas groupby)     0.071       0.072  1,406,437              75.6  1.00x
+
+== Transformation (Lesen → Schreiben) ==
+Test                                 best (s)  median (s)  Zeilen/s  Durchsatz (MB/s)
+-----------------------------------  --------  ----------  --------  ----------------
+DictReader → Transform → csv.writer     0.544       0.552   183,682               9.9
+
+Auswertung:
+  -> DictReader ist 2.39× langsamer als csv.reader (Preis für Spaltennamen-Zugriff).
+  -> DictWriter ist 2.13× langsamer als csv.writer.
+  -> pandas.read_csv liest 1.8× schneller als csv.reader (C-Parser).
+  -> Aggregation: pandas ist 4.1× schneller als reines Python.
+
+--- stderr ---
+Downloading pandas (11.5MiB)
+ Downloaded pandas
+Installed 5 packages in 510ms
+csv: generiere Testdaten
+csv: Zeilen generieren
+csv: csv.writer -> StringIO
+csv: csv.writer
+csv: csv.DictWriter
+csv: manuell (join)
+csv: pandas.to_csv
+csv: csv.reader
+csv: csv.DictReader
+csv: str.split
+csv: pandas.read_csv
+csv: Aggregation (DictReader)
+csv: Aggregation (pandas groupby)
+csv: DictReader → Transform → csv.writer
+
