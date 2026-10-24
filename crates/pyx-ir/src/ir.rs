@@ -168,6 +168,11 @@ pub enum ExprKind {
     Yield {
         value: Option<Box<Expr>>,
     },
+    /// `yield from iterable`: delegates iteration to `iterable`; the
+    /// expression evaluates to the delegate's return value.
+    YieldFrom {
+        value: Box<Expr>,
+    },
 }
 
 /// Statement node with its source line.

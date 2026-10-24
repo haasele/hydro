@@ -3,6 +3,7 @@
 mod build;
 mod check;
 mod clean;
+mod completions;
 mod doctor;
 mod fmt;
 mod gc;
@@ -17,6 +18,7 @@ mod uv;
 pub(crate) use self::build::cmd_build;
 pub(crate) use self::check::cmd_check;
 pub(crate) use self::clean::cmd_clean;
+pub(crate) use self::completions::cmd_completions;
 pub(crate) use self::doctor::cmd_doctor;
 pub(crate) use self::fmt::cmd_fmt;
 pub(crate) use self::gc::cmd_gc;

@@ -25,8 +25,10 @@ repository root.
 ├── examples/                  JIT/AOT examples + expected/*.txt
 ├── docs/
 │   ├── ARCHITECTURE.md        binding contract (IR/ABI, GC, modules)
-│   ├── TODO.md                single work list
 │   ├── C_API.md               P4-04 decision, probes, milestones
+│   ├── COMPATIBILITY.md       generated stdlib import matrix
+│   ├── pyx.1                  roff manpage
+│   ├── TODO.md                single work list
 │   └── LAYOUT.md              this file
 └── crates/
     ├── pyx-ir/                typed IR, only Frontend↔Codegen contract
@@ -75,8 +77,8 @@ repository root.
         │       ├── diag.rs    snippet/JSON/color rendering
         │       ├── dispatch.rs subcommand table
         │       └── commands/  new, init, check, run, build, test, fmt,
-        │                      lint, clean, doctor, help, uv, spawn, scan;
-        │                      `gc.rs` = `pyx gc` (run + GC statistics)
+        │                      lint, clean, doctor, help, uv, spawn, scan,
+        │                      completions; `gc.rs` = `pyx gc`
         └── tests/             E2E, fibers, closures, user modules, extensions
                                (+ fixtures/abi3_probe.c)
 ```

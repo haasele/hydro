@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators (send/throw/close/yield expressions)/coroutines/event loop (no GIL)** | 824 tests, JIT+AOT |
+| P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators (send/throw/close/yield expressions/yield from)/coroutines/event loop (no GIL)** | 846 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **decision B implemented at the first abi3 slice: limited-API extension imports/calls under JIT+AOT, no `libpython`; full ABI/stdlib/ecosystem open (P4-04a…P4-11)** | `docs/C_API.md`, `crates/pyx-cli/tests/extensions.rs` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -36,16 +36,16 @@ be imported and called under JIT and AOT without `libpython`; the shim covers
 the limited-API fixture surface and the loader discovers sibling `.so` files.
 Open: capsules/buffer/container constructors, wheels/venvs, the full CPython
 3.14 ABI for NumPy/pydantic-core, and the stdlib/ecosystem program P4-09…P4-11.
-Still open are `send`/`throw`/`close`, `yield` expressions, `yield from`, async
-generators/comprehensions, variable payload size classes as well as precise
-GC stack maps (P2-05/06/07), packaging/cross-platform/fuzzing and the
-C-API implementation itself. Details: `docs/TODO.md`.
+Still open are async generators/comprehensions, variable payload size classes as
+well as precise GC stack maps (P2-05/06/07), packaging/cross-platform/fuzzing
+and the C-API implementation itself. Details: `docs/TODO.md`.
 
 **Verification (as of 2026-10-24):**
 
-- `cargo test --workspace`: **824 tests** — 257 frontend, 18 codegen, 3 IR,
-  211 runtime unit, 162 CLI/E2E (135 E2E incl. the abi3 extension fixture,
-  16 fibers, 6 closures, 5 user modules), 173 further runtime integration tests
+- `cargo test --workspace`: **846 tests** — 260 frontend, 18 codegen, 3 IR,
+  214 runtime unit, 178 CLI/E2E (135 E2E incl. the abi3 extension fixture,
+  22 fibers, 6 closures, 5 user modules, completions), 173 further runtime
+  integration tests
   (allocator, bytes, GC/concurrent GC, IO, CSV, stdlib modules, classes,
   closures, socket, pathlib, pool, threads). New suites cover generator
   send/throw/close + yield expressions, C-API containers, extension
@@ -521,7 +521,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 795 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 846 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -686,10 +686,11 @@ parallel benchmarks and race/stress tests.
   single-thread loop, `asyncio.sleep` suspends only the current fiber
   (blocking outside a loop), `asyncio.gather` starts
   concurrent tasks, delivers results in input order and
-  propagates the first error. No GIL. Not supported: `send`/`throw`/
-  `close`, `yield` expressions, `yield from`, async generators (`async def` +
-  `yield` is a diagnostic), async comprehensions; `async for`/`async with`
-  still use the synchronous protocol.
+  propagates the first error. No GIL. Generators support
+  `send`/`throw`/`close`, `yield` expressions and `yield from`; `throw`
+  accepts exception instances only. Not supported: async generators
+  (`async def` + `yield` is a diagnostic) and async comprehensions;
+  `async for`/`async with` still use the synchronous protocol.
 - **GC:** fiber stack as well as `ctx` and `caller_ctx` (the callee-saved
   register frames) are registered as conservative roots from creation
   for the entire lifetime; while a fiber runs, `push_stack_bounds`
@@ -724,7 +725,7 @@ parallel benchmarks and race/stress tests.
   JIT 7.7 ms, AOT 6.8 ms; `strace -c` counts 94 syscalls total (previously
   200,097, two `rt_sigprocmask` per yield). Remaining weak spots: string
   concatenation (O(n²)) and float boxing — open performance work.
-- **Verified:** 824 tests, `cargo fmt`, `cargo clippy --workspace
+- **Verified:** 846 tests, `cargo fmt`, `cargo clippy --workspace
   --all-targets -- -D warnings` and `cargo test --workspace` green;
   micro baseline renewed (while_sum AOT 1.7 ms vs. CPython 23.5 ms).
 
@@ -741,9 +742,8 @@ descriptors; instance representation `<Name object>`; class namespace immutable.
 **Closures:** by value; no mutable captures, no recursive nested
 functions, no closures in lambdas.
 **Generators/async:** real lazy generators (stackful fibers) and coroutines
-with a cooperative event loop. Open: `send`/`throw`/`close`,
-`yield` expressions, `yield from`, async generators, async comprehensions and
-`asyncio` beyond `run`/`sleep`/`gather`; `async for`/`async with` use
+with a cooperative event loop. Open: async generators, async comprehensions
+and `asyncio` beyond `run`/`sleep`/`gather`; `async for`/`async with` use
 the synchronous protocol. Generator expressions remain eagerly materialized.
 **Performance:** native module dispatch is fixed (thread-local spec cache;
 math_loop at parity/faster). Remaining weak spots: string concatenation is
@@ -774,8 +774,8 @@ Windows/cross-compilation missing.
 
 ## Next Steps
 
-1. P2-10/P2-12 remainder: `send`/`throw`/`close`, `yield` expressions, `yield from`,
-   async generators/comprehensions and `asyncio` beyond `run`/`sleep`/`gather`.
+1. P2-10/P2-12 remainder: async generators/comprehensions and `asyncio`
+   beyond `run`/`sleep`/`gather`.
 2. Performance: string concatenation (O(n²)) and float boxing remain; native
    module dispatch and generator resume are no longer bottlenecks.
 3. P2-05/P2-06/P2-07: size-class allocator, precise shadow-stack roots/
@@ -797,7 +797,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (824)
+cargo test                             # unit/integration tests (846)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1070,9 +1070,10 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   emits `pyx_extension_call`/`pyx_extension_get`. `pyx` and AOT binaries are
   linked with `--export-dynamic`; `pyx_runtime_init` pins the shim symbols.
   Verified `pyx_capi_probe.abi3.so` under JIT and AOT (`5/abi3/42/abi3`), no
-  `libpython` in `ldd`, arity/missing-attribute/type error paths, 795 tests,
-  clippy and `scripts/verify.sh` green. Open: capsules/buffer/containers,
-  wheels/venvs, full ABI/NumPy/pydantic-core.
+  `libpython` in `ldd`, arity/missing-attribute/type error paths; generator
+  `send`/`throw`/`close`/`yield` expressions/`yield from` and C-API containers
+  landed afterwards; 846 tests, clippy and `scripts/verify.sh` green. Open:
+  capsules/buffer, wheels/venvs, full ABI/NumPy/pydantic-core.
 
 - 2026-10-24 (continuation 39): generator methods, C-API containers, stdlib
   baseline. Implemented `yield` expressions and generator
@@ -1084,3 +1085,10 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   23/297 stdlib modules importable (297 = 52 builtin/frozen, 174 pure,
   71 extension; 8 names fail under CPython). 824 tests, clippy and
   `scripts/verify.sh` green.
+
+- 2026-10-24 (continuation 40): `yield from` + P6-07. Implemented full
+  `yield from` delegation (values, send forwarding, close/GeneratorExit,
+  throw forwarding, delegate return value; plain-iterator send raises
+  AttributeError) with PyX/CPython parity tests. Added `pyx completions
+  <bash|zsh|fish>`, `docs/pyx.1`, and `pyx --version --verbose`
+  (target/backend/runtime). 846 tests, clippy and `scripts/verify.sh` green.

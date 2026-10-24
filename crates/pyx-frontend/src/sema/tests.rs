@@ -1204,6 +1204,34 @@ fn yield_expressions_are_typed_any_and_mark_generators() {
 }
 
 #[test]
+fn yield_from_is_typed_any_and_marks_generators() {
+    let source = "def g():\n    x = yield from range(3)\n    yield x\n";
+    let program = crate::check_source(source, "test.py").expect("valid generator");
+    let g = program_function(&program, "g");
+    assert!(g.is_generator, "{:?}", g.body);
+
+    let StmtKind::Assign { value, .. } = &g.body[0].kind else {
+        panic!("expected an assignment, got {:?}", g.body[0].kind);
+    };
+    assert!(
+        matches!(&value.kind, ExprKind::YieldFrom { .. }),
+        "{:?}",
+        value.kind
+    );
+    assert_eq!(value.ty, Type::Any, "the delegate result is dynamic");
+
+    let statement_source = "def g():\n    yield from [1, 2]\n";
+    let statement_program =
+        crate::check_source(statement_source, "test.py").expect("valid generator");
+    let statement_g = program_function(&statement_program, "g");
+    assert!(statement_g.is_generator);
+    assert!(matches!(
+        &statement_g.body[0].kind,
+        StmtKind::Expr(expr) if matches!(expr.kind, ExprKind::YieldFrom { .. })
+    ));
+}
+
+#[test]
 fn async_functions_are_marked_and_call_results_are_dynamic() {
     let source = "import asyncio\nasync def f():\n    return 42\nx = asyncio.run(f())\nprint(x)\n";
     let program = crate::check_source(source, "test.py").expect("valid async function");

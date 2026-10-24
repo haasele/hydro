@@ -2635,12 +2635,45 @@ fn bare_yield_lowers_to_a_yield_statement() {
 }
 
 #[test]
-fn yield_from_is_rejected() {
+fn yield_from_lowers_as_a_statement() {
     let source = "def g():\n    yield from [1, 2]\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let g = function(&hir, "g");
+    assert!(g.is_generator);
+    assert_eq!(g.body.len(), 1, "{:?}", g.body);
+    let HStmtKind::Expr(value) = &g.body[0].kind else {
+        panic!("expected an expression statement, got {:?}", g.body[0].kind);
+    };
+    let HExprKind::YieldFrom { value: iterable } = &value.kind else {
+        panic!("expected a yield-from expression, got {:?}", value.kind);
+    };
+    assert!(matches!(&iterable.kind, HExprKind::List(_)));
+}
+
+#[test]
+fn yield_from_lowers_as_an_expression() {
+    let source = "def g():\n    x = yield from range(3)\n    yield x\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let g = function(&hir, "g");
+    assert!(g.is_generator);
+    let HStmtKind::Assign { value, .. } = &g.body[0].kind else {
+        panic!("expected an assignment, got {:?}", g.body[0].kind);
+    };
+    assert!(matches!(&value.kind, HExprKind::YieldFrom { .. }));
+}
+
+#[test]
+fn yield_from_outside_a_generator_is_rejected() {
+    let source = "yield from [1, 2]\n";
     let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].message, "yield from is not supported yet");
-    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message == "yield outside a function"),
+        "{diags:?}"
+    );
 }
 
 #[test]

@@ -361,11 +361,20 @@ pub extern "C" fn pyx_await(value: i64) -> i64 {
 }
 
 /// `yield value`: suspends the running generator and returns the value sent
-/// on resume (`None`; PyX supports plain resumption only). Outside a running
-/// generator this raises `RuntimeError`.
+/// on resume (`None` for plain iteration). Outside a running generator this
+/// raises `RuntimeError`.
 #[no_mangle]
 pub extern "C" fn pyx_yield(value: i64) -> i64 {
     fiber::yield_value(value)
+}
+
+/// `yield from value`: delegates iteration to `value`. Each delegated item is
+/// yielded through the running generator; `send` values, `throw` exceptions
+/// and `close` are forwarded to a delegated generator. Returns the delegate's
+/// return value (`None` for a plain iterator).
+#[no_mangle]
+pub extern "C" fn pyx_yield_from(value: i64) -> i64 {
+    fiber::yield_from_value(value)
 }
 
 /// Creates a function value for a builtin referenced as a first-class value.

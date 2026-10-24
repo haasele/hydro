@@ -56,6 +56,7 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         pyx_generator_new,
         pyx_await,
         pyx_yield,
+        pyx_yield_from,
         pyx_map,
         pyx_filter,
         pyx_sum,

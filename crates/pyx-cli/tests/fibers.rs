@@ -433,3 +433,181 @@ except StopIteration:
         "1\nthrow() argument must be an exception instance\nexhausted\n"
     );
 }
+
+#[test]
+fn yield_from_delegates_a_plain_iterable() {
+    let source = "\
+def gen():
+    yield from [1, 2]
+    yield 3
+
+print(list(gen()))
+";
+    let (code, stdout, stderr) = run_source("yield_from_list", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "[1, 2, 3]\n");
+}
+
+#[test]
+fn yield_from_evaluates_to_the_delegate_return_value() {
+    let source = "\
+def sub():
+    yield 1
+    return 42
+
+def outer():
+    x = yield from sub()
+    print(\"sub returned\", x)
+    yield x
+
+g = outer()
+print(next(g))
+print(next(g))
+";
+    let (code, stdout, stderr) = run_source("yield_from_result", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\nsub returned 42\n42\n");
+}
+
+#[test]
+fn yield_from_forwards_send_values() {
+    let source = "\
+def sub():
+    x = yield 1
+    yield x * 2
+
+def outer():
+    yield from sub()
+
+g = outer()
+print(next(g))
+print(g.send(5))
+try:
+    next(g)
+except StopIteration:
+    print(\"done\")
+";
+    let (code, stdout, stderr) = run_source("yield_from_send", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\n10\ndone\n");
+}
+
+#[test]
+fn close_closes_the_delegated_generator_first() {
+    let source = "\
+def sub():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print(\"sub cleanup\")
+
+def outer():
+    try:
+        yield from sub()
+    finally:
+        print(\"outer cleanup\")
+
+g = outer()
+print(next(g))
+print(g.close())
+";
+    let (code, stdout, stderr) = run_source("yield_from_close", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\nsub cleanup\nouter cleanup\nNone\n");
+}
+
+#[test]
+fn throw_is_forwarded_into_the_delegated_generator() {
+    let source = "\
+def sub():
+    try:
+        yield 1
+    except ValueError as e:
+        print(\"sub caught\", e)
+        yield 2
+
+def outer():
+    yield from sub()
+
+g = outer()
+print(next(g))
+
+try:
+    raise ValueError(\"boom\")
+except ValueError as e:
+    print(g.throw(e))
+";
+    let (code, stdout, stderr) = run_source("yield_from_throw", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\nsub caught boom\n2\n");
+}
+
+#[test]
+fn send_to_a_plain_iterator_delegate_is_an_attribute_error() {
+    let source = "\
+def gen():
+    yield from [1, 2]
+
+g = gen()
+print(next(g))
+try:
+    g.send(5)
+except AttributeError as e:
+    print(e)
+";
+    let (code, stdout, stderr) = run_source("yield_from_send_attr", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\n'iterator' object has no attribute 'send'\n");
+}
+
+#[test]
+fn delegating_to_the_running_generator_is_a_runtime_error() {
+    let source = "\
+def gen(holder):
+    yield from holder[0]
+
+holder = []
+g = gen(holder)
+holder.append(g)
+try:
+    next(g)
+except RuntimeError as e:
+    print(e)
+";
+    let (code, stdout, stderr) = run_source("yield_from_self", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "generator already executing\n");
+}
+
+#[test]
+fn a_delegate_that_yields_during_close_raises_runtime_error() {
+    let source = "\
+def sub():
+    try:
+        yield 1
+    finally:
+        yield 2
+
+def outer():
+    yield from sub()
+
+g = outer()
+print(next(g))
+try:
+    g.close()
+except RuntimeError as e:
+    print(e)
+";
+    let (code, stdout, stderr) = run_source("yield_from_close_yield", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\ngenerator ignored GeneratorExit\n");
+}

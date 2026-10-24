@@ -24,7 +24,7 @@ defined subset (see [Language Scope](#language-and-stdlib-scope) and
 | Phase 6 — Diagnostics/Developer Experience | largely done; completions/manpage and ICE regression test open |
 
 Current state of work (Cargo version 0.1.0, no public release yet):
-**824 tests** (unit, integration, E2E). JIT (`pyx run`) and AOT
+**846 tests** (unit, integration, E2E). JIT (`pyx run`) and AOT
 (`pyx build`) share the same runtime and IR. Details:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
 [`docs/TODO.md`](docs/TODO.md), source tree in
@@ -193,8 +193,9 @@ supported by `run`.
   `asyncio.sleep` suspends only the current fiber (blocking outside a loop),
   `asyncio.gather` starts concurrent tasks, returns the
   results in input order and propagates the first error.
-  Not supported: `send`/`throw`/`close`, `yield` expressions,
-  `yield from`, async generators, async comprehensions; `async for`/
+  Generators support `send`/`throw`/`close`, `yield` expressions and
+  `yield from` (`throw` accepts exception instances only).
+  Not supported: async generators, async comprehensions; `async for`/
   `async with` use the synchronous protocol. Generator expressions are
   still materialized eagerly as a list.
 
@@ -234,8 +235,8 @@ supported by `run`.
 
 **Not supported (selection)**
 
-`send`/`throw`/`close`, `yield` expressions, `yield from`, async generators
-and async comprehensions (`asyncio` only `run`/`sleep`/`gather`), decorators,
+Async generators and async comprehensions (`asyncio` only
+`run`/`sleep`/`gather`), decorators,
 pattern matching, metaclasses, descriptor/`__dunder__` protocols, multiple
 inheritance, `bytearray`/`memoryview`, BigInt, slice assignment,
 exception chaining, `except*`; arbitrary
@@ -275,7 +276,7 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests and Benchmarks
 
 - `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), build,
-  `cargo test --workspace` (824 tests), E2E comparison JIT vs. AOT,
+  `cargo test --workspace` (846 tests), E2E comparison JIT vs. AOT,
   negative tests (diagnostics/tracebacks) and GC stress tests.
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Ubuntu, stable
   Rust, fmt/clippy/test/verify, no secrets).

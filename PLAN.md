@@ -60,7 +60,7 @@ Full Python compatibility is large enough to be a permanent, independent goal. I
 Phases 1–6 are tracked item by item in `docs/TODO.md`. The gate is `scripts/verify.sh` on a fresh checkout; the suite currently holds 771 tests.
 
 - **Phase 1 — done.** Compiler, JIT and AOT paths, CLI and verification are complete.
-- **Phase 2 — largely done.** Includes real lazy generators and coroutines on a cooperative event loop, and a concurrent GC with a shared heap and no GIL. Open: `send`/`throw`/`close`, `yield from`, async generators/comprehensions, and precise GC roots and stack maps.
+- **Phase 2 — largely done.** Includes real lazy generators and coroutines on a cooperative event loop, and a concurrent GC with a shared heap and no GIL. Open: async generators/comprehensions, and precise GC roots and stack maps.
 - **Phase 3 — core done.** `new`/`init`/`add`/`remove`/`sync`/`lock`, the build cache and `run` work. Open: uv interpreter injection, own lockfile/venv semantics, reproducible builds and packaging.
 - **Phase 4 — unblocked; decision B.** CPython 3.14 development files are available. The project implements the CPython C API/ABI on PyX objects (no `libpython` in production; CPython only as build-time header source and test oracle). The stdlib/ecosystem program covers 297 stdlib modules, ecosystem suites and benchmarks (P4-01…P4-11); see `docs/C_API.md`.
 - **Phase 5 — baseline in place.** Micro-benchmark harness, baseline artifacts and local regression thresholds exist; PyPy/Go comparisons, PGO and a JIT decision remain open.
@@ -74,7 +74,7 @@ Phases 1–6 are tracked item by item in `docs/TODO.md`. The gate is `scripts/ve
 - **Precise GC roots** are still open: conservative scanning of fiber stacks and context register frames is an interim measure, not the target design.
 - **uv coupling** may force a fork; the current decision is passthrough with no fork without an architectural blocker.
 - **Dynamic features** (monkey-patching, `eval`, metaclasses) conflict with AOT; they need tiering or an explicitly defined support scope.
-- **Generator/coroutine remainder** — `send`/`throw`/`close`, `yield` expressions, `yield from`, async generators; generator expressions are still materialized eagerly.
+- **Generator/coroutine remainder** — async generators; generator expressions are still materialized eagerly.
 - **Native module dispatch** is a known performance weakness. No optimization is claimed without measurement.
 
 ## Recommendation

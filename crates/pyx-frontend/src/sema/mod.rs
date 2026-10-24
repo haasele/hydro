@@ -1412,6 +1412,11 @@ impl<'a> Checker<'a> {
                 // The value sent on the next resume is only known at runtime.
                 self.force_any(expr.ty);
             }
+            HExprKind::YieldFrom { value } => {
+                self.check_expr(value, f);
+                // The delegate's return value is only known at runtime.
+                self.force_any(expr.ty);
+            }
         }
     }
 
@@ -2822,6 +2827,9 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
         },
         HExprKind::Yield { value } => ExprKind::Yield {
             value: value.as_ref().map(|value| Box::new(emit_expr(value, inf))),
+        },
+        HExprKind::YieldFrom { value } => ExprKind::YieldFrom {
+            value: Box::new(emit_expr(value, inf)),
         },
     };
     IrExpr::new(kind, inf.type_of(expr.ty), expr.line)

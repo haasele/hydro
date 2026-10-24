@@ -1,0 +1,304 @@
+.TH PYX 1 "2026-10-24" "pyx 0.1.0" "User Commands"
+.SH NAME
+pyx \- compile, check and run a subset of Python 3
+.SH SYNOPSIS
+.B pyx
+.I command
+.RI [ options ]
+.RI [ arguments ]
+.PP
+.B pyx
+.B \-\-version
+.RB [ \-\-verbose ]
+.SH DESCRIPTION
+.B pyx
+is the command\-line driver for PyX, a Python 3 implementation with a
+JIT and an ahead\-of\-time (AOT) compiler backend.
+It parses and type\-checks Python sources with its own frontend, lowers them
+to a native program and runs it with the Cranelift JIT, or links a native
+executable.
+No CPython installation is required to run a PyX program.
+.PP
+When no command is given a usage message is printed and the process exits
+with status 2.
+.SH COMMANDS
+.TP
+.B new \fIpath\fR [\fB\-\-force\fR]
+Create a project directory containing
+.BR main.py ,
+.B pyproject.toml
+and
+.BR .gitignore .
+Without
+.B \-\-force
+existing non\-empty files are never overwritten.
+.TP
+.B init \fR[\fIpath\fR] [\fB\-\-force\fR]
+Scaffold a project in an existing directory.
+.I path
+defaults to the current directory.
+.TP
+.B check \fIfile.py\fR [\fIdiagnostic options\fR]
+Parse and type\-check
+.I file.py
+without running it.
+.TP
+.B run \fIfile.py\fR [\fIdiagnostic options\fR]
+Compile
+.I file.py
+with the JIT and run it.
+Program arguments are not supported yet.
+.TP
+.B gc \fR[\fB\-\-json\fR] \fIfile.py\fR [\fIdiagnostic options\fR]
+Compile and run exactly like
+.BR run ,
+then print cumulative garbage collector statistics to stdout after the
+program output.
+With
+.B \-\-json
+the statistics are one JSON object on stdout and diagnostics are rendered
+as JSON; otherwise the statistics are a plain text block.
+.TP
+.B build \fIfile.py\fR [\fIbuild options\fR] [\fIdiagnostic options\fR]
+Compile and link a native executable.
+.TP
+.B test \fR[\fIpaths\fR...] [\fIdiagnostic options\fR]
+Run every
+.B test_*.py
+and
+.B *_test.py
+file found under
+.IR paths .
+A test passes when its program exits with status 0; there are no
+pytest\-style assertions.
+.TP
+.B fmt \fR[\fIpaths\fR...] [\fB\-\-check\fR] [\fIdiagnostic options\fR]
+Strip trailing whitespace and terminate each file with exactly one newline.
+Indentation, intra\-line spacing and line breaks are preserved.
+With
+.B \-\-check
+the files that would change are reported instead of written.
+.TP
+.B lint \fR[\fIpaths\fR...] [\fIdiagnostic options\fR]
+Type\-check every
+.B .py
+file under
+.IR paths ;
+the command fails when any file has diagnostics.
+.TP
+.B clean \fR[\fB\-\-dry\-run\fR]
+Remove the project\-local build cache
+.B .pyx/cache
+and the temporary AOT directory
+.BR target/pyx\-tmp .
+The rest of
+.B target/
+is left alone, and missing paths are not an error.
+.TP
+.B add \fIspec\fR... [\fIuv options\fR]
+.TQ
+.B remove \fIspec\fR... [\fIuv options\fR]
+.TQ
+.B sync \fR[\fIuv options\fR]
+.TQ
+.B lock \fR[\fIuv options\fR]
+Forward all arguments verbatim to
+.B uv
+in the current directory and return the exit status of
+.BR uv .
+These commands add no options of their own.
+.TP
+.B doctor \fR[\fB\-\-json\fR] [\fB\-\-no\-color\fR]
+Report the C compiler, the runtime static library and the workspace the CLI
+will use.
+.TP
+.B completions \fIshell\fR
+Print a completion script for
+.I shell
+on stdout.
+.I shell
+is one of
+.BR bash ,
+.B zsh
+or
+.BR fish .
+The script is static and self\-contained.
+.TP
+.B help
+.TQ
+.B \-\-help
+.TQ
+.B \-h
+Print the command summary.
+.TP
+.B \-\-version
+.TQ
+.B \-V
+Print
+.B pyx
+followed by the workspace version.
+With
+.B \-\-verbose
+additional lines report the build target
+.RI ( architecture \- operating\ system ),
+the backend
+.RB ( Cranelift ),
+the runtime version
+.RB ( runtime: workspace
+.I version
+.RB ),
+and the implemented Python compatibility mode.
+.SH OPTIONS
+Options are positional: each command accepts only those listed for it.
+.SS Diagnostic options
+Accepted by
+.BR check ,
+.BR run ,
+.BR gc ,
+.BR build ,
+.BR test ,
+.BR lint
+and
+.BR fmt .
+.TP
+.B \-\-json
+Render diagnostics as a JSON array on stderr.
+For
+.B test
+the per\-file results are a JSON array on stdout;
+for
+.B lint
+the aggregated diagnostics are a JSON array on stderr.
+.TP
+.BI \-\-color= WHEN
+Colorize diagnostics.
+.I WHEN
+is
+.BR auto ,
+.B always
+or
+.BR never .
+The default is
+.BR auto ,
+which colors only when stderr is a terminal and
+.B NO_COLOR
+is unset.
+.TP
+.B \-\-no\-color
+Disable colors; same as
+.BR \-\-color=never .
+.SS Build options
+.TP
+.BI \-o " OUT"
+.TQ
+.BI \-\-output " OUT"
+Output path of the executable
+(default: the source file stem in the current directory).
+.TP
+.BI \-\-runtime\-lib " PATH"
+Path to
+.BR libpyx_runtime.a .
+.TP
+.B \-\-no\-cache
+Do not read or write the build cache under
+.BR .pyx/cache .
+.SS Project options
+.TP
+.B \-\-force
+Allow
+.B new
+and
+.B init
+to overwrite existing non\-empty files.
+.SS Path discovery
+The
+.BR test ,
+.B fmt
+and
+.B lint
+commands default to the current directory and search it recursively.
+Hidden entries,
+.BR target ,
+.B __pycache__
+and
+.B node_modules
+are skipped; explicit file arguments are always used as given.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+User or program error: a diagnostic, a failed program, or an I/O failure.
+For
+.BR add ,
+.BR remove ,
+.B sync
+and
+.BR lock
+the exit status is the one returned by
+.BR uv .
+.TP
+.B 2
+Usage, setup or internal error, including a compiler panic (ICE).
+.SH ENVIRONMENT
+.TP
+.B CC
+C compiler used by
+.B build
+to link the executable (default:
+.BR cc ).
+.TP
+.B PYX_RUNTIME_LIB
+Path to
+.BR libpyx_runtime.a ;
+overridden by
+.BR \-\-runtime\-lib .
+.TP
+.B PYX_UV
+.B uv
+executable used by
+.BR add ,
+.BR remove ,
+.B sync
+and
+.B lock
+(default:
+.BR uv ).
+.TP
+.B NO_COLOR
+When set, colored diagnostics are disabled unless
+.B \-\-color=always
+is given.
+.TP
+.B PYX_EXTENSION_PATH
+A path list of directories searched for compiled extension modules
+.RI ( name .so,
+.IR name .abi3.so ,
+.IR name .* .so)
+after the importing source file's own directory.
+.SH FILES
+.TP
+.B .pyx/cache
+Project\-local build cache.
+Removed by
+.BR "pyx clean" ;
+not read or written when
+.B \-\-no\-cache
+is given.
+.TP
+.B target/pyx\-tmp
+Temporary directory used while linking AOT executables; removed by
+.BR "pyx clean" .
+.SH COMPATIBILITY
+PyX implements a deliberately limited subset of Python 3 and its standard
+library; it is neither fully Python\-compatible nor production\-ready.
+Unsupported syntax and modules are rejected by the frontend with
+.B error[PYXnnnn]
+diagnostics.
+See the "Language and Stdlib Scope" section of the README and
+.I docs/COMPATIBILITY.md
+for the supported syntax, bundled modules and the stdlib import matrix.
+.SH SEE ALSO
+.BR uv (1),
+.BR cc (1)

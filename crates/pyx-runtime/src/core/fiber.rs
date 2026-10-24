@@ -31,7 +31,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::exc::{self, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR};
+use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR};
 use crate::value::{self, NONE};
 
 // -------------------------------------------------------------------------
@@ -863,6 +863,152 @@ pub(crate) fn close_value(generator: i64) -> i64 {
     }
 }
 
+/// One advance of a `yield from` delegate.
+enum DelegateStep {
+    /// The delegate produced a value for the outer generator to yield.
+    Item(i64),
+    /// The delegate finished normally with this result value.
+    Done(i64),
+    /// An exception is pending and must propagate through the outer generator.
+    Failed,
+}
+
+/// Maps a pending delegate completion to [`DelegateStep::Done`]. A pending
+/// `StopIteration` is the normal end of iteration; every other exception
+/// propagates unchanged.
+fn finish_delegate(delegate: i64) -> DelegateStep {
+    if exc::pending_tag() == STOP_ITERATION as i64 {
+        let _ = exc::clear();
+        DelegateStep::Done(result_value(delegate))
+    } else {
+        DelegateStep::Failed
+    }
+}
+
+/// Advances a `yield from` delegate by one step, forwarding `sent`.
+///
+/// A delegated generator uses the same `send` semantics as a Python call
+/// (including `StopIteration` on completion and exception propagation); a
+/// plain iterator only accepts `None`, mirroring CPython (`send` on an
+/// iterator without a `send` method).
+fn advance_delegate(delegate: i64, is_generator: bool, sent: i64) -> DelegateStep {
+    if is_generator {
+        let item = send_value(delegate, sent);
+        if exc::pending() {
+            return finish_delegate(delegate);
+        }
+        return DelegateStep::Item(item);
+    }
+    if sent != NONE {
+        exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!(
+                "'{}' object has no attribute 'send'",
+                value::type_name(delegate)
+            ),
+        );
+        return DelegateStep::Failed;
+    }
+    let mut out = NONE;
+    if crate::iter::iter_next(delegate, &mut out) == 1 {
+        DelegateStep::Item(out)
+    } else if exc::pending() {
+        DelegateStep::Failed
+    } else {
+        DelegateStep::Done(NONE)
+    }
+}
+
+/// Forwards an injected exception into a delegated generator.
+fn throw_delegate(delegate: i64, exception: i64) -> DelegateStep {
+    let item = throw_value(delegate, exception);
+    if exc::pending() {
+        return finish_delegate(delegate);
+    }
+    DelegateStep::Item(item)
+}
+
+/// `yield from iterable`: drives `iterable` from the running generator.
+///
+/// Each delegated item is yielded through the outer generator. `send` values
+/// are forwarded to a delegated generator; `throw` exceptions are forwarded
+/// as well, and `close` closes the delegate first so its `finally` blocks run.
+/// The expression evaluates to the delegate's return value (`None` for a plain
+/// iterator). Outside a running generator this raises `RuntimeError`.
+pub(crate) fn yield_from_value(iterable: i64) -> i64 {
+    let Some(outer) = current_ptr() else {
+        return exc::raise_with_message(RUNTIME_ERROR, "'yield from' outside of a generator");
+    };
+    // SAFETY: `outer` is the running fiber installed by `resume_raw`.
+    if unsafe { (*outer).kind } != FiberKind::Generator {
+        return exc::raise_with_message(RUNTIME_ERROR, "'yield from' outside of a generator");
+    }
+    let delegate = crate::iter::iter_of(iterable);
+    if exc::pending() {
+        return NONE;
+    }
+    let delegate_is_generator = value::as_fiber(delegate)
+        .map(|fiber| fiber.kind == FiberKind::Generator)
+        .unwrap_or(false);
+    // Delegating to a generator that is still on a stack (the outer one or an
+    // ancestor in a cycle) would resume a running fiber.
+    if value::as_fiber(delegate)
+        .map(|fiber| fiber.running)
+        .unwrap_or(false)
+    {
+        return exc::raise_with_message(RUNTIME_ERROR, "generator already executing");
+    }
+
+    let mut to_send = NONE;
+    let mut pending_item: Option<i64> = None;
+    loop {
+        let item = match pending_item.take() {
+            Some(item) => item,
+            None => match advance_delegate(delegate, delegate_is_generator, to_send) {
+                DelegateStep::Item(item) => item,
+                DelegateStep::Done(value) => return value,
+                DelegateStep::Failed => return NONE,
+            },
+        };
+        // Suspend the outer generator with the delegate's item. The result is
+        // the next `send` value; a pending exception means `throw`/`close`
+        // interrupted the delegation.
+        let sent = yield_value(item);
+        if !exc::pending() {
+            to_send = sent;
+            continue;
+        }
+        // Take the injected exception before `close_value`/`throw_value` can
+        // overwrite the pending slot; the native local keeps it rooted.
+        let exception = exc::pending_value();
+        let tag = exc::pending_tag();
+        let _ = exc::clear();
+        if !delegate_is_generator {
+            // A plain iterator has no `throw`/`close`: the exception
+            // propagates in the outer generator.
+            exc::raise_value(exception);
+            return NONE;
+        }
+        if tag == exc::GENERATOR_EXIT as i64 {
+            // `close()`: close the delegate first so its `finally` blocks
+            // run, then re-raise GeneratorExit through the outer generator.
+            close_value(delegate);
+            if exc::pending() {
+                return NONE;
+            }
+            exc::raise_value(exception);
+            return NONE;
+        }
+        // `throw()`: forward the exception; a value yielded by the delegate's
+        // handler is yielded again by the outer generator.
+        pending_item = match throw_delegate(delegate, exception) {
+            DelegateStep::Item(item) => Some(item),
+            DelegateStep::Done(value) => return value,
+            DelegateStep::Failed => return NONE,
+        };
+    }
+}
+
 /// Resume a fiber by tagged value; `None` if `value` is not a fiber.
 pub(crate) fn resume_value(value: i64) -> Option<bool> {
     let ptr = value::fiber_raw(value)?;
@@ -1132,5 +1278,62 @@ mod tests {
             "generator ignored GeneratorExit"
         );
         assert!(is_done(generator));
+    }
+
+    extern "C" fn echoes_two_values(_argv: *const i64) -> i64 {
+        let received = yield_value(value::encode_int(1).expect("representable"));
+        yield_value(received);
+        value::encode_int(7).expect("representable")
+    }
+
+    extern "C" fn delegates_to_sub(_argv: *const i64) -> i64 {
+        let sub = value::fiber_generator_new(
+            echoes_two_values as *const () as usize,
+            "sub".to_string(),
+            Vec::new(),
+        )
+        .expect("sub generator stack");
+        yield_from_value(sub)
+    }
+
+    extern "C" fn delegates_to_list(_argv: *const i64) -> i64 {
+        let items = value::list_new(vec![
+            value::encode_int(1).expect("representable"),
+            value::encode_int(2).expect("representable"),
+        ]);
+        yield_from_value(items)
+    }
+
+    #[test]
+    fn yield_from_delegates_a_plain_iterator() {
+        let generator = generator(delegates_to_list);
+        assert_eq!(send_value(generator, NONE), int(1));
+        assert_eq!(send_value(generator, NONE), int(2));
+        // A plain iterator has no return value: `yield from` evaluates to
+        // `None` and the outer body then finishes.
+        assert_eq!(send_value(generator, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+    }
+
+    #[test]
+    fn yield_from_forwards_send_and_returns_the_delegate_result() {
+        let generator = generator(delegates_to_sub);
+        assert_eq!(send_value(generator, NONE), int(1));
+        assert_eq!(send_value(generator, int(5)), int(5));
+        assert_eq!(send_value(generator, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+        assert_eq!(result_value(generator), int(7));
+    }
+
+    #[test]
+    fn yield_from_rejects_send_to_a_plain_iterator() {
+        let generator = generator(delegates_to_list);
+        assert_eq!(send_value(generator, NONE), int(1));
+        assert_eq!(send_value(generator, int(5)), NONE);
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "'iterator' object has no attribute 'send'"
+        );
     }
 }

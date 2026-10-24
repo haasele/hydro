@@ -124,6 +124,7 @@ struct Runtime {
     generator_new: FuncId,
     await_value: FuncId,
     yield_value: FuncId,
+    yield_from: FuncId,
     builtin_function: FuncId,
     call: FuncId,
     map: FuncId,
@@ -242,9 +243,11 @@ impl Runtime {
             )?,
             // `pyx_await` takes the awaitable and returns its result;
             // `pyx_yield` takes the yielded value and returns the value sent
-            // on resume.
+            // on resume; `pyx_yield_from` delegates iteration to an iterable
+            // and returns its result.
             await_value: declare_runtime(module, "pyx_await", &[i64t], Some(i64t))?,
             yield_value: declare_runtime(module, "pyx_yield", &[i64t], Some(i64t))?,
+            yield_from: declare_runtime(module, "pyx_yield_from", &[i64t], Some(i64t))?,
             // `name_len` is a `size_t` in the ABI: pointer-width.
             builtin_function: declare_runtime(
                 module,
@@ -2385,6 +2388,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let sent = self.call_rt(id, &[value])?;
                 self.emit_exc_check()?;
                 Ok(sent)
+            }
+            ExprKind::YieldFrom { value } => {
+                let value = self.lower_expr(value)?;
+                // Delegates iteration; the result is the delegate's return
+                // value (or `None` for a plain iterator).
+                let id = self.runtime.yield_from;
+                let result = self.call_rt(id, &[value])?;
+                self.emit_exc_check()?;
+                Ok(result)
             }
         }
     }

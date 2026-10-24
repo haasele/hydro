@@ -7,12 +7,12 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-24 (latest):** 824 tests, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-24 (latest):** 846 tests, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
-cooperative event loop. Generator `send`/`throw`/`close` and `yield`
-expressions are implemented (`throw` takes exception instances only). Open are
-`yield from`, async generators/comprehensions, GC precision (P2-05/06/07) and
-the remaining performance work. **P4-04 is unblocked and decided:** CPython
+cooperative event loop. Generator `send`/`throw`/`close`, `yield`
+expressions and `yield from` are implemented (`throw` takes exception
+instances only). Open are async generators/comprehensions, GC precision
+(P2-05/06/07) and the remaining performance work. **P4-04 is unblocked and decided:** CPython
 3.14 development files are available, and the project follows **option B** —
 a PyX-native CPython C-API/ABI layer without embedded `libpython`; evidence and
 gates in [`docs/C_API.md`](C_API.md). The **first abi3 slice is implemented**:
@@ -173,8 +173,8 @@ no CPython is needed at runtime.
 - [~] P2-10 Generators, `yield`, closures/cell variables.
       Closures (nested `def`, by value) and real **lazy** generators
       (stackful fibers, `yield [value]`, bare `yield`, `return` terminates,
-      exceptions propagate, `iter`/`next`, `send`/`throw`/`close` and
-      `yield` expressions) are done. Open: `yield from`, mutable captures.
+      exceptions propagate, `iter`/`next`, `send`/`throw`/`close`,
+      `yield` expressions and `yield from`) are done. Open: mutable captures.
       Generator expressions remain eagerly materialized.
 - [~] P2-11 Exceptions complete: `else`, `finally`, exception hierarchy, chaining.
       `OSError`/`IOError` additionally; exception hierarchy/chaining and
@@ -244,15 +244,15 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-24: 824 tests total — 384 runtime (211 unit, 173 ABI
+      As of 2026-10-24: 846 tests total — 387 runtime (214 unit, 173 ABI
       integration: among others 22 bytes, 19 IO, 14 stdlib modules, 14 stdlib utils,
       12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 257 frontend, 18 codegen, 3 IR, 162 CLI/E2E (135 E2E incl. the
-      abi3 extension fixture, 16 fibers, 6 closures, 5 user modules).
-      Property tests open.
+      tests), 260 frontend, 18 codegen, 3 IR, 178 CLI/E2E (135 E2E incl. the
+      abi3 extension fixture, 22 fibers, 6 closures, 5 user modules,
+      extension and completions suites). Property tests open.
 
 **Acceptance P2:** memory does not grow unboundedly in loop benchmarks; GC tests
 cover cycles; container semantics tested against CPython behavior.
@@ -308,7 +308,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       claims. Gating: a test counts as passed only if CPython 3.14 passes it
       too (differential oracle).
 - [ ] P4-02 Language completeness required by the stdlib and ecosystem.
-      Decorators (function/class, parametrised), `yield from`, async generators and
+      Decorators (function/class, parametrised), async generators and
       async comprehensions, `async for`/`async with` with real async
       iterators, exception hierarchy/chaining/`except*`, descriptors,
       properties, `__slots__`, metaclasses, user-defined `__iter__`/`__next__`,
@@ -534,8 +534,12 @@ a collection of scripts. Errors are first-class products, not an afterthought.
   project is ready to go without third-party tools; `pyproject.toml` compatibility.
       Scaffold (`main.py`, `pyproject.toml`, `.gitignore`) with `--force`
       policy; `pyproject.toml` remains uv-compatible.
-- [ ] P6-07 Shell completions, manpage, `--version --verbose` (target, LLVM/
+- [x] P6-07 Shell completions, manpage, `--version --verbose` (target,
   Cranelift, runtime version).
+      `pyx completions <bash|zsh|fish>` emits complete scripts;
+      `docs/pyx.1` is the roff manpage; `pyx --version --verbose` prints
+      version, target, backend and runtime version. Tests in
+      `crates/pyx-cli/tests/completions.rs`.
 - [~] P6-08 Diagnostic regression tests: codes, spans, JSON schema, colors/
   TTY behavior, exit codes, ICE path.
       E2E covers human/JSON/color/doctor/caret/syntax code; ICE and
@@ -567,9 +571,9 @@ code, span, help and stable exit code; `--json` is documented and tested.
   decision documented (no fork without a blocker).
 - R6: Dynamic features (monkey-patching, `eval`, metaclasses) vs. AOT — tiering
   or an explicit support scope needed.
-- R7: Generator/coroutine remainder: `yield from`, async
-  generators/comprehensions. Generator expressions remain eagerly
-  materialized; `async for`/`async with` use the synchronous protocol.
+- R7: Generator/coroutine remainder: async generators/comprehensions.
+  Generator expressions remain eagerly materialized; `async for`/`async with`
+  use the synchronous protocol.
 - R8: Performance weak spots: string concatenation remains O(n²)
   (`string_concat` ~1.3–1.5x faster than CPython only because of lower
   constant factors) and CPython-extension boundaries will add conversion

@@ -314,6 +314,11 @@ pub enum HExprKind {
     Yield {
         value: Option<Box<HExpr>>,
     },
+    /// `yield from iterable`: delegates iteration to `iterable`; the
+    /// expression evaluates to the delegate's return value.
+    YieldFrom {
+        value: Box<HExpr>,
+    },
 }
 
 /// Signature-relevant fields shared by `def` and `async def`.
@@ -1728,14 +1733,6 @@ impl<'a> Lowerer<'a> {
         let kind = match stmt {
             ast::Stmt::Expr(s) => match &*s.value {
                 ast::Expr::Yield(y) => return self.lower_yield_stmt(y, fs, line, col),
-                ast::Expr::YieldFrom(y) => {
-                    self.error_at_code(
-                        y.range,
-                        codes::UNSUPPORTED,
-                        "yield from is not supported yet",
-                    );
-                    return None;
-                }
                 _ => HStmtKind::Expr(self.expr(&s.value, fs)),
             },
             ast::Stmt::Assign(s) => {
@@ -3424,12 +3421,29 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Expr::YieldFrom(y) => {
-                self.error_at_code(
-                    y.range,
-                    codes::UNSUPPORTED,
-                    "yield from is not supported yet",
-                );
-                self.error_expr(e.range())
+                if fs.is_module {
+                    self.error_at_code(y.range, codes::CONTROL, "yield outside a function");
+                } else if fs.in_lambda {
+                    self.error_at_code(
+                        y.range,
+                        codes::UNSUPPORTED,
+                        "yield is not supported inside a lambda",
+                    );
+                } else if !fs.is_generator {
+                    self.error_at_code(
+                        y.range,
+                        codes::UNSUPPORTED,
+                        "yield is only supported inside a generator function body",
+                    );
+                }
+                HExpr {
+                    kind: HExprKind::YieldFrom {
+                        value: Box::new(self.expr(&y.value, fs)),
+                    },
+                    ty: self.infer.fresh(),
+                    line,
+                    col,
+                }
             }
             ast::Expr::JoinedStr(s) => self.joined_str_expr(s, fs, line, col),
             ast::Expr::FormattedValue(_) => {

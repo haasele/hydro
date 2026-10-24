@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
-implemented (824 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (846 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -20,8 +20,8 @@ file I/O, user modules, native stdlib modules, lazy generators and coroutines
 with a cooperative event loop, threads/processes/pool, a conservative
 concurrent mark-&-sweep GC.
 
-**Deliberately not (as of now):** BigInt, `send`/`throw`/`close`, `yield from`,
-async generators/comprehensions, the complete CPython stdlib,
+**Deliberately not (as of now):** BigInt, async generators/comprehensions, the
+complete CPython stdlib,
 C extensions/C API, decorators, pattern matching, metaclasses,
 `bytearray`/`memoryview`, precise GC roots and a dedicated
 size-class allocator. Details in §10 and `docs/TODO.md`.
@@ -185,6 +185,7 @@ i64  pyx_next(i64 obj, i64 default, i64 has_default); // next(obj[, default])
 i64  pyx_generator_new(const uint8_t* entry, uint64_t argc, const i64* argv);
 i64  pyx_coroutine_new(const uint8_t* entry, uint64_t argc, const i64* argv);
 i64  pyx_yield(i64 value);                          // suspends the fiber
+i64  pyx_yield_from(i64 iterable);                  // delegates iteration
 i64  pyx_await(i64 value);                          // drives a coroutine
 i64  pyx_gc_collect(void);
 i64  pyx_gc_objects(void);
@@ -350,10 +351,18 @@ Python; `IOError` is an alias for `OSError`.
   one-argument, instance form is supported). `close()` injects
   `GeneratorExit`, so `finally` blocks run; a generator that yields during
   `close()` raises `RuntimeError("generator ignored GeneratorExit")`.
-  Exhausted generators raise `StopIteration` from `send`/`throw`. Not
-  supported: `yield from`, async generators (`async def` + `yield` is a
-  diagnostic) and async comprehensions. Generator expressions remain eagerly
-  materialized lists (documented deviation).
+  Exhausted generators raise `StopIteration` from `send`/`throw`.
+  `yield from iterable` delegates iteration (`pyx_yield_from`): each
+  delegated item is yielded, `send`/`throw` are forwarded to a delegated
+  generator, and `close()` closes the delegate first so its `finally` blocks
+  run. The expression evaluates to the delegate's return value (`None` for a
+  plain iterator). Delegating to a running generator raises `RuntimeError`.
+  Not supported: async generators (`async def` + `yield` is a diagnostic) and
+  async comprehensions. Generator expressions remain eagerly materialized
+  lists (documented deviation). Deviations: `send` into a plain-iterator
+  delegate raises `AttributeError` naming the iterator as `'iterator'` (not
+  e.g. `'list_iterator'`), and PEP 479 (converting a body-raised
+  `StopIteration` into `RuntimeError`) is not implemented.
 - **async** (Phase 2.32): `async def` creates a coroutine object;
   `await`/`pyx_await` drives it to completion (non-fiber values are
   returned unchanged). `asyncio.run(coro)` runs a cooperative
@@ -556,7 +565,8 @@ it. The cache is not a shared artifact store.
 - Expressions: `Const`, `Local`, `Bin` (incl. `In`/`NotIn`), `Un`, `BoolOp`
   (short-circuit), `List`, `Dict`, `Tuple`, `Set`, `Subscript`, `Slice`,
   `ListComp`, `SetComp`, `DictComp`, `GeneratorExp` (eager), `Await`,
-  `Yield` (expression form; evaluates to the sent value), `FunctionRef`,
+  `Yield` (expression form; evaluates to the sent value), `YieldFrom`
+  (delegation; evaluates to the delegate's result), `FunctionRef`,
   `BuiltinRef` (`f = int`), `IndirectCall`, `ModuleCall`, `ModuleAttr`,
   `GetAttr` (data attribute), `MethodCall { args, keywords }`, `Closure`
   (value), `Call { callee: Function(id) | Builtin(b), args }`.
@@ -580,8 +590,8 @@ it. The cache is not a shared artifact store.
   flags in `pyx_function_new`/`pyx_closure_new` from them (bit 0 async, bit 1
   generator) and generates a wrapper that calls `pyx_coroutine_new` resp.
   `pyx_generator_new`. `Yield` statements become `pyx_yield` (result
-  discarded); `Yield` expressions keep the returned sent value.
-  `Await` becomes `pyx_await`.
+  discarded); `Yield` expressions keep the returned sent value; `YieldFrom`
+  becomes `pyx_yield_from`. `Await` becomes `pyx_await`.
 - **Lowering:** `with`/`async with` become nested `try/finally` with
   `__enter__`/`__exit__`; augmented subscript assignment
   (`a[i] += x`) evaluates object and index exactly once into `$aug` locals.
@@ -803,7 +813,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-24: **824 tests** (257 frontend, 384 runtime incl. 173
+- As of 2026-10-24: **846 tests** (260 frontend, 387 runtime incl. 173
   ABI integration tests, 17 codegen, 3 IR, 154 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `argparse`/`defaultdict`/`re`, socket echo,
@@ -824,12 +834,11 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   functions and closures in lambdas are diagnostics. No cell/mutable
   capture.
 - **Generators/async:** real lazy generators (stackful fibers) and
-  coroutines with a cooperative event loop. Open: `yield from`, async
-  generators, async comprehensions and `asyncio` beyond
-  `run`/`sleep`/`gather`; generator expressions remain eagerly materialized,
-  `async for`/`async with` use the synchronous protocol. `throw` accepts
-  exception instances only (no exception class objects) and has no
-  three-argument form.
+  coroutines with a cooperative event loop. Open: async generators, async
+  comprehensions and `asyncio` beyond `run`/`sleep`/`gather`; generator
+  expressions remain eagerly materialized, `async for`/`async with` use the
+  synchronous protocol. `throw` accepts exception instances only (no
+  exception class objects) and has no three-argument form.
 - **Performance:** native module dispatch is fixed (thread-local spec cache;
   math_loop at parity/faster, 50k micro harness AOT 6.2 ms vs. CPython
   13.6 ms). Remaining open weak spots: string concatenation (O(n²)) and float
