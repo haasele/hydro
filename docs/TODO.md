@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** 968 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** 1011 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -23,8 +23,8 @@ ecosystem suites (NumPy, pandas, pydantic, FastAPI, Django, …) and their
 benchmarks. **New in this slice:** generator `send`/`throw`/`close` and
 `yield` expressions; C-API container/unicode/float/bytes accessors; a
 generated stdlib compatibility baseline (`docs/COMPATIBILITY.md`,
-36/297 modules importable on 2026-10-25 with Batch A of P7) and the first
-official CPython test pass (`test_errno.py`).
+42/297 modules importable on 2026-10-25 with Batch A and the Batch B native
+core of P7) and the first official CPython test pass (`test_errno.py`).
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -251,16 +251,16 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-25: 968 tests total — 458 runtime (285 unit, 173 ABI
+      As of 2026-10-25: 1011 tests total — 499 runtime (326 unit, 173 ABI
       integration: among others 22 bytes, 19 IO, 14 stdlib modules, 14 stdlib utils,
       12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 289 frontend, 23 codegen, 4 IR, 194 CLI/E2E (135 E2E incl. the
+      tests), 289 frontend, 23 codegen, 4 IR, 196 CLI/E2E (135 E2E incl. the
       abi3 extension fixture, 22 fibers, 6 closures, 5 user modules,
       extension/path/dotted/multi-phase, completions, exceptions,
-      unittest-runner and stdlib-batch-a suites).
+      unittest-runner, stdlib-batch-a and stdlib-batch-b suites).
       Property tests open. The CPython official-test manifest is checked offline by
       `scripts/verify.sh`/CI; the full suite is a release gate.
 
@@ -312,11 +312,13 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
       Manifest `tests/compat/cpython-3.14.9.json` records **1** pass
       (`test_errno.py`); it grows only from real `pyx_pass` results.
-      Stdlib import baseline 2026-10-25: **36/297 importable** (10
-      builtin/frozen, 23 pure, 3 extension; 8 `cpython_failed`); Batch A of
+      Stdlib import baseline 2026-10-25: **42/297 importable** (11
+      builtin/frozen, 27 pure, 4 extension; 8 `cpython_failed`); Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
-      `_operator`, `_functools`, `_io`) is importable and API-tested. Official-suite
+      `_operator`, `_functools`, `_io`) and the Batch B native core
+      (`binascii`, `base64`, `quopri`, `fnmatch`, `getopt`, `mimetypes`)
+      are importable and API-tested. Official-suite
       baseline 2026-10-25: **1/398 passing** (334 `pyx_fail`, 63
       `expected_fail` where CPython also fails; 0 timeouts). No test is marked
       passing unless CPython 3.14.9 and PyX both exit 0.
@@ -604,8 +606,8 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the PyX runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-25: **36/297 modules importable**, **261 missing**
-(42 builtin/frozen, 151 pure Python, 60 extension, 8 unknown/platform),
+from it). Status 2026-10-25: **42/297 modules importable**, **255 missing**
+(41 builtin/frozen, 147 pure Python, 59 extension, 8 unknown/platform),
 with 8 modules where CPython 3.14.9 itself fails on this host.
 
 Acceptance: 297/297 modules accounted for on CPython 3.14.9 — every module
@@ -682,14 +684,16 @@ ledger below is the per-layer checklist that tracks the actual work.
       `_bisect`, `bisect`, `_heapq`, `heapq`, `colorsys`, `keyword`,
       `_stat`, `stat`, `_operator`, `_functools`, `_io`
 
-- [ ] P7-11 Batch B — 25 modules: text, string and shell utilities. Needs the
+- [~] P7-11 Batch B — 25 modules: text, string and shell utilities. The
+      self-contained native codec/text core is done; the rest needs the
       pure-Python source pipeline (P7-02) and the `_string` shim (P7-03).
-      Modules (all `[ ]` in the ledger):
-      `string`, `_string`, `stringprep`, `textwrap`, `fnmatch`, `glob`,
+      Native core done: `binascii`, `base64`, `quopri`, `fnmatch`,
+      `getopt`, `mimetypes`.
+      Remaining (ledger entries are checked for the native core):
+      `string`, `_string`, `stringprep`, `textwrap`, `glob`,
       `shutil`, `tempfile`, `filecmp`, `fileinput`, `shlex`, `reprlib`,
-      `pprint`, `difflib`, `quopri`, `base64`, `linecache`, `html`,
-      `_markupbase`, `mimetypes`, `getopt`, `cmd`, `mailbox`, `email`,
-      `wave`
+      `pprint`, `difflib`, `linecache`, `html`, `_markupbase`, `cmd`,
+      `mailbox`, `email`, `wave`
 
 - [ ] P7-12 Batch C — 45 modules: import, builtins and object model. Needs P7-01;
       unblocks every remaining batch.
@@ -863,7 +867,7 @@ platform-unsupported rather than implemented.
 - [ ] `annotationlib`
 - [ ] `antigravity`
 - [ ] `ast`
-- [ ] `base64`
+- [x] `base64`
 - [ ] `bdb`
 - [x] `bisect`
 - [ ] `bz2`
@@ -896,10 +900,10 @@ platform-unsupported rather than implemented.
 - [ ] `enum`
 - [ ] `filecmp`
 - [ ] `fileinput`
-- [ ] `fnmatch`
+- [x] `fnmatch`
 - [ ] `fractions`
 - [ ] `ftplib`
-- [ ] `getopt`
+- [x] `getopt`
 - [ ] `getpass`
 - [ ] `gettext`
 - [ ] `glob`
@@ -921,7 +925,7 @@ platform-unsupported rather than implemented.
 - [ ] `logging`
 - [ ] `lzma`
 - [ ] `mailbox`
-- [ ] `mimetypes`
+- [x] `mimetypes`
 - [ ] `modulefinder`
 - [ ] `netrc`
 - [ ] `nturl2path`
@@ -941,7 +945,7 @@ platform-unsupported rather than implemented.
 - [ ] `pyclbr`
 - [ ] `pydoc`
 - [ ] `pydoc_data`
-- [ ] `quopri`
+- [x] `quopri`
 - [ ] `reprlib`
 - [ ] `rlcompleter`
 - [ ] `sched`
@@ -1047,7 +1051,7 @@ platform-unsupported rather than implemented.
 - [ ] `_zoneinfo`
 - [ ] `_zstd`
 - [ ] `array`
-- [ ] `binascii`
+- [x] `binascii`
 - [ ] `cmath`
 - [ ] `fcntl`
 - [ ] `grp`

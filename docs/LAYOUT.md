@@ -86,7 +86,8 @@ repository root.
         │                      completions; `gc.rs` = `pyx gc`
         └── tests/             E2E, fibers, closures, user modules, extensions
                                (paths, dotted, multi-phase), completions,
-                               exceptions, unittest_runner, stdlib_batch_a
+                               exceptions, unittest_runner, stdlib_batch_a,
+                               stdlib_batch_b
                                (+ fixtures/abi3_probe.c, abi3_multiphase.c)
 ```
 

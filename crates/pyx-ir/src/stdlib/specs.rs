@@ -605,3 +605,142 @@ pub static _STAT: ModuleSpec = ModuleSpec {
     functions: STAT_FUNCTIONS,
     constants: STAT_CONSTANTS,
 };
+
+/// `binascii`: conversions between binary data and ASCII encodings.
+pub static BINASCII: ModuleSpec = ModuleSpec {
+    name: "binascii",
+    functions: &[
+        kw(
+            "hexlify",
+            1,
+            3,
+            Type::Bytes,
+            &["data", "sep", "bytes_per_sep"],
+        ),
+        kw(
+            "b2a_hex",
+            1,
+            3,
+            Type::Bytes,
+            &["data", "sep", "bytes_per_sep"],
+        ),
+        f("unhexlify", 1, 1, Type::Bytes),
+        f("a2b_hex", 1, 1, Type::Bytes),
+        kw("b2a_base64", 1, 2, Type::Bytes, &["data", "newline"]),
+        kw("a2b_base64", 1, 2, Type::Bytes, &["data", "strict_mode"]),
+        kw("crc32", 1, 2, Type::Int, &["data", "value"]),
+        kw("adler32", 1, 2, Type::Int, &["data", "value"]),
+    ],
+    constants: &[],
+};
+
+/// `base64`: RFC 4648 encodings plus the legacy uuencode-style helpers.
+pub static BASE64: ModuleSpec = ModuleSpec {
+    name: "base64",
+    functions: &[
+        kw("b64encode", 1, 2, Type::Bytes, &["s", "altchars"]),
+        kw(
+            "b64decode",
+            1,
+            3,
+            Type::Bytes,
+            &["s", "altchars", "validate"],
+        ),
+        f("standard_b64encode", 1, 1, Type::Bytes),
+        f("standard_b64decode", 1, 1, Type::Bytes),
+        f("urlsafe_b64encode", 1, 1, Type::Bytes),
+        f("urlsafe_b64decode", 1, 1, Type::Bytes),
+        f("encodebytes", 1, 1, Type::Bytes),
+        f("decodebytes", 1, 1, Type::Bytes),
+        f("encodestring", 1, 1, Type::Bytes),
+        f("decodestring", 1, 1, Type::Bytes),
+        f("b16encode", 1, 1, Type::Bytes),
+        kw("b16decode", 1, 2, Type::Bytes, &["s", "casefold"]),
+        f("b32encode", 1, 1, Type::Bytes),
+        kw("b32decode", 1, 3, Type::Bytes, &["s", "casefold", "map01"]),
+    ],
+    constants: &[],
+};
+
+/// `quopri`: quoted-printable encoding and decoding.
+pub static QUOPRI: ModuleSpec = ModuleSpec {
+    name: "quopri",
+    functions: &[
+        kw(
+            "encodestring",
+            1,
+            3,
+            Type::Bytes,
+            &["data", "quotetabs", "header"],
+        ),
+        kw("decodestring", 1, 2, Type::Bytes, &["data", "header"]),
+        kw(
+            "encode",
+            3,
+            4,
+            Type::None,
+            &["input", "output", "quotetabs", "header"],
+        ),
+        kw("decode", 2, 3, Type::None, &["input", "output", "header"]),
+    ],
+    constants: &[],
+};
+
+/// `fnmatch`: Unix shell-style wildcard matching (case-sensitive on Linux).
+pub static FNMATCH: ModuleSpec = ModuleSpec {
+    name: "fnmatch",
+    functions: &[
+        f("fnmatch", 2, 2, Type::Bool),
+        f("fnmatchcase", 2, 2, Type::Bool),
+        f("filter", 2, 2, Type::List),
+        f("filterfalse", 2, 2, Type::List),
+        f("translate", 1, 1, Type::Str),
+    ],
+    constants: &[],
+};
+
+/// `getopt`: C-style command-line option parsing.
+pub static GETOPT: ModuleSpec = ModuleSpec {
+    name: "getopt",
+    functions: &[
+        kw(
+            "getopt",
+            2,
+            3,
+            Type::Tuple,
+            &["args", "shortopts", "longopts"],
+        ),
+        kw(
+            "gnu_getopt",
+            2,
+            3,
+            Type::Tuple,
+            &["args", "shortopts", "longopts"],
+        ),
+    ],
+    constants: &[],
+};
+
+/// `mimetypes`: mapping between filenames and MIME types.
+pub static MIMETYPES: ModuleSpec = ModuleSpec {
+    name: "mimetypes",
+    functions: &[
+        kw("guess_type", 1, 2, Type::Tuple, &["url", "strict"]),
+        kw(
+            "guess_all_extensions",
+            1,
+            2,
+            Type::List,
+            &["type", "strict"],
+        ),
+        kw("guess_extension", 1, 2, Type::Str, &["type", "strict"]),
+        kw("add_type", 2, 3, Type::None, &["type", "ext", "strict"]),
+        kw("init", 0, 1, Type::None, &["files"]),
+    ],
+    constants: &[
+        c("types_map", Type::Dict),
+        c("common_types", Type::Dict),
+        c("encodings_map", Type::Dict),
+        c("suffix_map", Type::Dict),
+    ],
+};

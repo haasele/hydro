@@ -8,7 +8,7 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **968 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25: **1011 tests**, `scripts/verify.sh` ALL GREEN. The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
@@ -161,6 +161,10 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   `AssertionError` (tag 14), a native `errno` module (Linux table,
   `errorcode`, `__dict__`) and a minimal native `unittest`
   (`TestCase`/runner/native assertions).
+- **Batch B native codec/text core:** `binascii`, `base64`, `quopri`,
+  `fnmatch`, `getopt` and `mimetypes` are native and API-tested, bringing the
+  import baseline to 42/297. The remaining Batch B modules still need the
+  pure-Python pipeline.
 - **Standard-library program (P7) and Batch A:** added a complete
   module-by-module plan for all 272 missing stdlib modules with dependency
   batches and a per-layer ledger. First slice implements native

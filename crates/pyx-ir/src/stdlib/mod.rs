@@ -98,6 +98,12 @@ pub static MODULES: &[&ModuleSpec] = &[
     &ASYNCIO,
     &ERRNO,
     &UNITTEST,
+    &BINASCII,
+    &BASE64,
+    &QUOPRI,
+    &FNMATCH,
+    &GETOPT,
+    &MIMETYPES,
 ];
 
 pub fn module(name: &str) -> Option<&'static ModuleSpec> {

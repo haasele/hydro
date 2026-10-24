@@ -37,16 +37,16 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 11 | 41 |
-| pure | 174 | 22 | 152 |
-| extension | 63 | 3 | 60 |
+| pure | 174 | 27 | 147 |
+| extension | 63 | 4 | 59 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 36 | 261 |
+| **Total** | 297 | 42 | 255 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:PYX0002 | 252 |
+| compile_error:PYX0002 | 246 |
 | cpython_failed | 9 |
 
 ## Modules by layer
@@ -138,7 +138,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `argparse` | ok | ok | ok | - |
 | `ast` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ast' not found: not supported unless a sibling ast.py exists |
 | `asyncio` | ok | ok | ok | - |
-| `base64` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'base64' not found: not supported unless a sibling base64.py exists |
+| `base64` | ok | ok | ok | - |
 | `bdb` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'bdb' not found: not supported unless a sibling bdb.py exists |
 | `bisect` | ok | ok | ok | - |
 | `bz2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'bz2' not found: not supported unless a sibling bz2.py exists |
@@ -173,11 +173,11 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `enum` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'enum' not found: not supported unless a sibling enum.py exists |
 | `filecmp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'filecmp' not found: not supported unless a sibling filecmp.py exi… |
 | `fileinput` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'fileinput' not found: not supported unless a sibling fileinput.py… |
-| `fnmatch` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'fnmatch' not found: not supported unless a sibling fnmatch.py exi… |
+| `fnmatch` | ok | ok | ok | - |
 | `fractions` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'fractions' not found: not supported unless a sibling fractions.py… |
 | `ftplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ftplib' not found: not supported unless a sibling ftplib.py exists |
 | `functools` | ok | ok | ok | - |
-| `getopt` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'getopt' not found: not supported unless a sibling getopt.py exists |
+| `getopt` | ok | ok | ok | - |
 | `getpass` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'getpass' not found: not supported unless a sibling getpass.py exi… |
 | `gettext` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'gettext' not found: not supported unless a sibling gettext.py exi… |
 | `glob` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'glob' not found: not supported unless a sibling glob.py exists |
@@ -200,7 +200,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `logging` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'logging' not found: not supported unless a sibling logging.py exi… |
 | `lzma` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'lzma' not found: not supported unless a sibling lzma.py exists |
 | `mailbox` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'mailbox' not found: not supported unless a sibling mailbox.py exi… |
-| `mimetypes` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'mimetypes' not found: not supported unless a sibling mimetypes.py… |
+| `mimetypes` | ok | ok | ok | - |
 | `modulefinder` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'modulefinder' not found: not supported unless a sibling modulefin… |
 | `multiprocessing` | ok | ok | ok | - |
 | `netrc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'netrc' not found: not supported unless a sibling netrc.py exists |
@@ -226,7 +226,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `pydoc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pydoc' not found: not supported unless a sibling pydoc.py exists |
 | `pydoc_data` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pydoc_data' not found: not supported unless a sibling pydoc_data.… |
 | `queue` | ok | ok | ok | - |
-| `quopri` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'quopri' not found: not supported unless a sibling quopri.py exists |
+| `quopri` | ok | ok | ok | - |
 | `random` | ok | ok | ok | - |
 | `re` | ok | ok | ok | - |
 | `reprlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'reprlib' not found: not supported unless a sibling reprlib.py exi… |
@@ -340,7 +340,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_zoneinfo` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_zoneinfo' not found: not supported unless a sibling _zoneinfo.py… |
 | `_zstd` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_zstd' not found: not supported unless a sibling _zstd.py exists |
 | `array` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `binascii` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'binascii' not found: not supported unless a sibling binascii.py e… |
+| `binascii` | ok | ok | ok | - |
 | `cmath` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'cmath' not found: not supported unless a sibling cmath.py exists |
 | `fcntl` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'fcntl' not found: not supported unless a sibling fcntl.py exists |
 | `grp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'grp' not found: not supported unless a sibling grp.py exists |

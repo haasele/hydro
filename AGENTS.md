@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batch A/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators/coroutines/event loop (no GIL)** | 968 tests, JIT+AOT |
+| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batch A/B-native/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators/coroutines/event loop (no GIL)** | 1011 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -48,11 +48,12 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
 
 **Verification (as of 2026-10-25):**
 
-- `cargo test --workspace`: **968 tests** — 289 frontend, 23 codegen, 4 IR,
-  285 runtime unit, 194 CLI/E2E (135 E2E incl. the abi3 extension fixture,
+- `cargo test --workspace`: **1011 tests** — 289 frontend, 23 codegen, 4 IR,
+  326 runtime unit, 196 CLI/E2E (135 E2E incl. the abi3 extension fixture,
   22 fibers, 6 closures, 5 user modules, completions, extension
   path/dotted/multi-phase, 8 exception tests, 2 unittest-runner tests,
-  2 stdlib-batch-a tests), 173 further runtime integration tests
+  2 stdlib-batch-a and 2 stdlib-batch-b tests), 173 further runtime
+  integration tests
   (allocator, bytes, GC/concurrent GC, IO, CSV, stdlib modules, classes,
   closures, socket, pathlib, pool, threads). New suites cover generator
   send/throw/close + yield expressions, C-API containers, extension
@@ -81,9 +82,9 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   `next`/`send` echo, `close` running `finally`, `throw(caught_exception)`
   re-raised inside the generator, StopIteration after completion.
 - **Stdlib compatibility baseline:** `python3 scripts/stdlib_compat.py`
-  (CPython 3.14.9, PyX 0.1.0): **36/297 modules importable** (10 builtin/frozen,
-  23 pure, 3 extension; 8 unknown names fail under CPython too). Batch A of
-  the P7 stdlib program is implemented. Report:
+  (CPython 3.14.9, PyX 0.1.0): **42/297 modules importable** (11 builtin/frozen,
+  27 pure, 4 extension; 8 unknown names fail under CPython too). Batch A and
+  the native core of Batch B are implemented. Report:
   `docs/COMPATIBILITY.md`, JSON `benchmarks/compat/latest.json`.
 - **Official CPython suite baseline:** `python3 scripts/cpython_compat.py`
   (398 `Lib/test` modules, pinned 3.14.9 oracle): **1 passing**
@@ -535,7 +536,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 968 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 1011 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -739,7 +740,7 @@ parallel benchmarks and race/stress tests.
   JIT 7.7 ms, AOT 6.8 ms; `strace -c` counts 94 syscalls total (previously
   200,097, two `rt_sigprocmask` per yield). Remaining weak spots: string
   concatenation (O(n²)) and float boxing — open performance work.
-- **Verified:** 968 tests, `cargo fmt`, `cargo clippy --workspace -- -D warnings
+- **Verified:** 1011 tests, `cargo fmt`, `cargo clippy --workspace -- -D warnings
   --all-targets -- -D warnings` and `cargo test --workspace` green;
   micro baseline renewed (while_sum AOT 1.7 ms vs. CPython 23.5 ms).
 
@@ -799,8 +800,9 @@ Windows/cross-compilation missing.
    module dispatch and generator resume are no longer bottlenecks.
 3. P2-05/P2-06/P2-07: size-class allocator, precise shadow-stack roots/
    stack maps, finer safepoint polling (P2-08 metrics are available).
-4. P7 standard library: Batch A is importable/API-tested; next are P7-01
-   package/import execution, P7-03 builtin shims and Batch B, then the
+4. P7 standard library: Batch A and the Batch B native codec/text core are
+   importable/API-tested; next are P7-01 package/import execution, P7-03
+   builtin shims and the remaining Batch B modules, then the
    dependency-ordered batches in `docs/TODO.md`. P4: extend the working abi3
    slice (capsules, buffer, container constructors, wheels/venv discovery),
    then the full CPython 3.14 ABI/NumPy/pydantic-core (P4-04c/d),
@@ -818,7 +820,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (968)
+cargo test                             # unit/integration tests (1011)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1175,3 +1177,9 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   aliases. Stdlib imports **36/297** (10 builtin/frozen, 23 pure,
   3 extension); 261 modules remain. **968 tests**, clippy `-D warnings` and
   `scripts/verify.sh` green.
+
+- 2026-10-25 (continuation 47): Batch B native codec/text core.
+  Added native `binascii`, `base64`, `quopri`, `fnmatch`, `getopt` and
+  `mimetypes` with specs/dispatch and end-to-end coverage. Stdlib imports
+  **42/297** (11 builtin/frozen, 27 pure, 4 extension); 255 modules remain.
+  **1011 tests**, clippy `-D warnings` and `scripts/verify.sh` green.

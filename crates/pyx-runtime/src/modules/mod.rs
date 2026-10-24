@@ -22,13 +22,19 @@ use pyx_ir::{PYTHON_VERSION, PYTHON_VERSION_STRING};
 
 pub(crate) mod argparse;
 pub(crate) mod asyncio;
+pub(crate) mod base64;
+pub(crate) mod binascii;
 pub(crate) mod bisect;
 pub(crate) mod collections;
 pub(crate) mod colorsys;
 pub(crate) mod errno;
 pub(crate) mod extension;
+pub(crate) mod fnmatch;
+pub(crate) mod getopt;
 pub(crate) mod heapq;
 pub(crate) mod keyword;
+pub(crate) mod mimetypes;
+pub(crate) mod quopri;
 pub(crate) mod re;
 pub(crate) mod socket;
 pub(crate) mod stat;
@@ -407,6 +413,12 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "socket" => socket::call(function, args),
         "asyncio" => asyncio::call(function, args),
         "unittest" => unittest::call(function, args),
+        "binascii" => binascii::call(function, args),
+        "base64" => base64::call(function, args),
+        "quopri" => quopri::call(function, args),
+        "fnmatch" => fnmatch::call(function, args),
+        "getopt" => getopt::call(function, args),
+        "mimetypes" => mimetypes::call(function, args),
         _ => missing_attribute(module, function),
     }
 }
@@ -467,6 +479,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("keyword", "kwlist") => keyword::kwlist(),
         ("keyword", "softkwlist") => keyword::softkwlist(),
         ("stat" | "_stat", name) => stat::constant(name),
+        ("mimetypes", name) => mimetypes::constant(name),
         _ => missing_attribute(module, name),
     }
 }
