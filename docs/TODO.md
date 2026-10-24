@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** 934 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** 968 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -23,8 +23,8 @@ ecosystem suites (NumPy, pandas, pydantic, FastAPI, Django, …) and their
 benchmarks. **New in this slice:** generator `send`/`throw`/`close` and
 `yield` expressions; C-API container/unicode/float/bytes accessors; a
 generated stdlib compatibility baseline (`docs/COMPATIBILITY.md`,
-25/297 modules importable on 2026-10-25) and the first official CPython
-test pass (`test_errno.py`).
+36/297 modules importable on 2026-10-25 with Batch A of P7) and the first
+official CPython test pass (`test_errno.py`).
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -251,16 +251,16 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-25: 934 tests total — 426 runtime (253 unit, 173 ABI
+      As of 2026-10-25: 968 tests total — 458 runtime (285 unit, 173 ABI
       integration: among others 22 bytes, 19 IO, 14 stdlib modules, 14 stdlib utils,
       12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 289 frontend, 23 codegen, 4 IR, 192 CLI/E2E (135 E2E incl. the
+      tests), 289 frontend, 23 codegen, 4 IR, 194 CLI/E2E (135 E2E incl. the
       abi3 extension fixture, 22 fibers, 6 closures, 5 user modules,
-      extension/path/dotted/multi-phase, completions, exceptions and
-      unittest-runner suites).
+      extension/path/dotted/multi-phase, completions, exceptions,
+      unittest-runner and stdlib-batch-a suites).
       Property tests open. The CPython official-test manifest is checked offline by
       `scripts/verify.sh`/CI; the full suite is a release gate.
 
@@ -312,8 +312,11 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
       Manifest `tests/compat/cpython-3.14.9.json` records **1** pass
       (`test_errno.py`); it grows only from real `pyx_pass` results.
-      Stdlib import baseline 2026-10-25: **25/297 importable** (6
-      builtin/frozen, 18 pure, 1 extension; 8 `cpython_failed`). Official-suite
+      Stdlib import baseline 2026-10-25: **36/297 importable** (10
+      builtin/frozen, 23 pure, 3 extension; 8 `cpython_failed`); Batch A of
+      the P7 standard-library program (`_bisect`/`bisect`,
+      `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
+      `_operator`, `_functools`, `_io`) is importable and API-tested. Official-suite
       baseline 2026-10-25: **1/398 passing** (334 `pyx_fail`, 63
       `expected_fail` where CPython also fails; 0 timeouts). No test is marked
       passing unless CPython 3.14.9 and PyX both exit 0.
@@ -408,7 +411,10 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       C-ABI (P4-04/05) and ecosystem suites (P4-10).
 - [ ] P4-09 Full standard-library parity (297 CPython **3.14.9** modules).
       Split tracked in the compatibility report; no module is "done" without
-      its CPython test subset.
+      its CPython test subset. The executable module-by-module program
+      (workstreams, dependency batches, full 272-module ledger) is
+      **P7 — Standard library**; this item keeps the umbrella policy and the
+      P4-03/P4-04 dependencies.
       - [ ] P4-09a Import infrastructure (depends on P4-03).
       - [ ] P4-09b Pure-Python stdlib: run the 174 pure-Python modules
         unmodified from a CPython 3.14 stdlib tree (PSF license, optional
@@ -592,6 +598,484 @@ a collection of scripts. Errors are first-class products, not an afterthought.
 **Acceptance P6:** a user can initialize, build, run and diagnose a project with
 `pyx` without knowing other tools; every error class has a
 code, span, help and stable exit code; `--json` is documented and tested.
+
+## P7 — Standard library
+
+Goal: the CPython 3.14.9 standard library works on the PyX runtime —
+module by module, with evidence. `benchmarks/compat/latest.json` is the
+source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
+from it). Status 2026-10-25: **36/297 modules importable**, **261 missing**
+(42 builtin/frozen, 151 pure Python, 60 extension, 8 unknown/platform),
+with 8 modules where CPython 3.14.9 itself fails on this host.
+
+Acceptance: 297/297 modules accounted for on CPython 3.14.9 — every module
+is either importable **and** green in its CPython `Lib/test/test_*.py`
+subset, or explicitly listed as platform-unsupported with a reason. An
+import that merely succeeds is not parity: representative API calls and
+per-module CPython test runs decide.
+
+This topic is the executable module-by-module program for the umbrella
+goal P4-09; P4-09 keeps the policy and the dependency on P4-03/P4-04.
+
+### Workstreams
+
+- [ ] P7-01 Import and package foundation: packages with `__init__.py`,
+      dotted and relative imports, `sys.path`/`sys.modules` handling,
+      namespace packages, frozen modules, circular imports, and top-level
+      module execution (import side effects). Depends on P4-03.
+- [ ] P7-02 Pure-Python stdlib source and shim pipeline: consume the CPython
+      3.14 stdlib tree unmodified (PSF license, optional sysroot), resolve
+      imports through PyX shims, never fork sources; per-module provenance
+      and drift checks against the pinned 3.14.9 tree.
+- [ ] P7-03 Builtin/frozen native shims: `builtins`, `sys`, `_imp`,
+      `_frozen_importlib*`, `_warnings`, `_weakref`, `_collections`,
+      `itertools`, `marshal`, `_io`, `_abc`, `gc`, `atexit`, `faulthandler`,
+      `site`, `_codecs`, `_sre`, `_thread`-adjacent gaps — the baseline every
+      other batch imports.
+- [ ] P7-04 Extension modules in Rust: implement or back with Rust where
+      semantics/performance matter (`_socket`, `_ssl`, `_hashlib`, `zlib`,
+      `_json`, `_csv`, `_struct`, `_datetime`, `_decimal`, `_sqlite3`,
+      `select`, `array`, `binascii`, `unicodedata`); pure-Python fallbacks
+      only where the semantics allow; explicit unsupported list otherwise.
+- [ ] P7-05 Per-module CPython test integration: map every module to its
+      `Lib/test/test_*.py` subset, run it through the P4-01 differential
+      harness, record `pyx_pass`/`expected_fail` only from real runs, and
+      fail the gate on regressions.
+- [ ] P7-06 Dependency batches and reporting: keep the batch order below
+      current, regenerate the matrix after every batch, and report per
+      module (importable, tests green, unsupported reason) in
+      `docs/COMPATIBILITY.md` and `docs/CPYTHON_TESTS.md`.
+
+### Batches (dependency-ordered)
+
+Each module below is assigned to exactly one batch; Batch A (11 modules) is
+importable now, the remaining 261 are open. Later
+batches may start only when their prerequisites are importable; the module
+ledger below is the per-layer checklist that tracks the actual work.
+
+- [x] P7-10 Batch A — 11 modules: simple native primitives. No dependencies;
+      establishes the native-module pattern for later batches.
+      **First slice: import + representative API verified** (see below);
+      CPython per-module test subsets remain under P7-05. Contracts:
+      `bisect`/`_bisect` expose `bisect_left`, `bisect_right`,
+      `bisect`, `insort_left`, `insort_right`, `insort` (2–5 args,
+      `lo`/`hi`/`key` optional); `heapq`/`_heapq` expose `heappush`,
+      `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nlargest`,
+      `nsmallest`; `colorsys` the six `rgb_*`/`*_rgb` conversions;
+      `keyword` `kwlist`/`softkwlist`/`iskeyword`/`issoftkeyword`;
+      `stat`/`_stat` `S_*`/`ST_*` constants plus `S_IMODE`, `S_IFMT`,
+      `S_IS*`, `filemode`; `_operator`, `_functools`, `_io` re-export
+      the `operator` surface, `reduce` and `open`.
+      **Delivered:** stdlib specs
+      (`crates/pyx-ir/src/stdlib/`), runtime dispatch and submodule
+      declarations (`crates/pyx-runtime/src/modules/`), native
+      implementations, and the CLI regression
+      `crates/pyx-cli/tests/stdlib_batch_a.rs`.
+      Acceptance: all 11 modules import through `pyx`; a
+      representative API call matches CPython 3.14.9 (bisect
+      insertion points, heap pop ordering, HLS/HSV round-trips,
+      `filemode` strings, `operator.add`/`functools.reduce`/
+      `_io.open`); and `stdlib_batch_a.rs` covers import + behaviour
+      for each. The import/API slice is done; the per-module CPython
+      subsets remain P7-05 work and are not yet green.
+      Modules (ledger entries are checked for importable + API-tested):
+      `_bisect`, `bisect`, `_heapq`, `heapq`, `colorsys`, `keyword`,
+      `_stat`, `stat`, `_operator`, `_functools`, `_io`
+
+- [ ] P7-11 Batch B — 25 modules: text, string and shell utilities. Needs the
+      pure-Python source pipeline (P7-02) and the `_string` shim (P7-03).
+      Modules (all `[ ]` in the ledger):
+      `string`, `_string`, `stringprep`, `textwrap`, `fnmatch`, `glob`,
+      `shutil`, `tempfile`, `filecmp`, `fileinput`, `shlex`, `reprlib`,
+      `pprint`, `difflib`, `quopri`, `base64`, `linecache`, `html`,
+      `_markupbase`, `mimetypes`, `getopt`, `cmd`, `mailbox`, `email`,
+      `wave`
+
+- [ ] P7-12 Batch C — 45 modules: import, builtins and object model. Needs P7-01;
+      unblocks every remaining batch.
+      Modules (all `[ ]` in the ledger):
+      `_abc`, `_codecs`, `_collections`, `_collections_abc`,
+      `_frozen_importlib`, `_frozen_importlib_external`, `_imp`, `_sre`,
+      `tracemalloc`, `_tracemalloc`, `_types`, `_typing`, `_warnings`,
+      `_py_warnings`, `_weakref`, `_weakrefset`, `abc`, `_py_abc`, `atexit`,
+      `builtins`, `codecs`, `encodings`, `faulthandler`, `gc`, `itertools`,
+      `runpy`, `site`, `_sitebuiltins`, `zipimport`, `types`, `typing`,
+      `warnings`, `weakref`, `copy`, `contextlib`, `enum`, `importlib`,
+      `pkgutil`, `modulefinder`, `__future__`, `_suggestions`, `_colorize`,
+      `sre_compile`, `sre_constants`, `sre_parse`
+
+- [ ] P7-13 Batch D — 24 modules: filesystem and process. Needs P7-01/P7-03
+      (`posix`, `genericpath`).
+      Modules (all `[ ]` in the ledger):
+      `genericpath`, `posixpath`, `ntpath`, `nturl2path`, `posix`, `pwd`,
+      `_signal`, `signal`, `getpass`, `subprocess`, `_posixsubprocess`,
+      `_pyio`, `fcntl`, `grp`, `resource`, `pty`, `tty`, `termios`,
+      `select`, `selectors`, `syslog`, `mmap`, `sched`, `webbrowser`
+
+- [ ] P7-14 Batch E — 42 modules: data formats, datetime, serialization and
+      numerics. Needs BigInt (P4-02) and P7-04 for
+      `_json`/`_struct`/`_pickle`/`_csv`.
+      Modules (all `[ ]` in the ledger):
+      `datetime`, `_datetime`, `_pydatetime`, `_strptime`, `calendar`,
+      `struct`, `_struct`, `marshal`, `pickletools`, `copyreg`,
+      `_compat_pickle`, `plistlib`, `tomllib`, `dataclasses`, `decimal`,
+      `_decimal`, `_pydecimal`, `_pylong`, `fractions`, `numbers`,
+      `_statistics`, `uuid`, `_uuid`, `ipaddress`, `zoneinfo`, `_zoneinfo`,
+      `dbm`, `_dbm`, `_gdbm`, `shelve`, `sqlite3`, `_sqlite3`, `_json`,
+      `_csv`, `_pickle`, `array`, `cmath`, `graphlib`, `xml`,
+      `_elementtree`, `pyexpat`, `_random`
+
+- [ ] P7-15 Batch F — 39 modules: introspection, REPL and developer tooling. Needs
+      C (import/`ast`) and code-object metadata.
+      Modules (all `[ ]` in the ledger):
+      `_ast`, `_ast_unparse`, `ast`, `_opcode`, `_opcode_metadata`,
+      `opcode`, `dis`, `_symtable`, `symtable`, `_tokenize`, `token`,
+      `tokenize`, `inspect`, `annotationlib`, `_pyrepl`, `code`, `codeop`,
+      `compileall`, `py_compile`, `tabnanny`, `doctest`, `pydoc`,
+      `pydoc_data`, `pyclbr`, `rlcompleter`, `idlelib`, `bdb`, `cProfile`,
+      `profile`, `pstats`, `pdb`, `trace`, `timeit`, `traceback`, `_lsprof`,
+      `_remote_debugging`, `readline`, `this`, `antigravity`
+
+- [ ] P7-16 Batch G — 11 modules: logging, configuration and site/packaging
+      tooling. Needs C (`_sysconfig`, `locale`) and D.
+      Modules (all `[ ]` in the ledger):
+      `_locale`, `locale`, `gettext`, `logging`, `configparser`, `optparse`,
+      `ensurepip`, `venv`, `zipapp`, `_sysconfig`, `sysconfig`
+
+- [ ] P7-17 Batch H — 23 modules: networking and crypto. Needs P7-04 (`_socket`,
+      `_ssl`, `_hashlib`).
+      Modules (all `[ ]` in the ledger):
+      `ftplib`, `http`, `urllib`, `netrc`, `secrets`, `hashlib`, `_hashlib`,
+      `_md5`, `_sha1`, `_sha2`, `_sha3`, `_blake2`, `hmac`, `_hmac`,
+      `imaplib`, `poplib`, `smtplib`, `socketserver`, `wsgiref`, `xmlrpc`,
+      `_socket`, `_ssl`, `ssl`
+
+- [ ] P7-18 Batch I — 11 modules: compression and archives. Needs P7-04 (`zlib`,
+      `_bz2`, `_lzma`, `_zstd`).
+      Modules (all `[ ]` in the ledger):
+      `bz2`, `_bz2`, `gzip`, `lzma`, `_lzma`, `zlib`, `_zstd`,
+      `compression`, `binascii`, `zipfile`, `tarfile`
+
+- [ ] P7-19 Batch J — 11 modules: concurrency, async and subinterpreters. Needs P2
+      scheduler/GC work and P7-04.
+      Modules (all `[ ]` in the ledger):
+      `_contextvars`, `contextvars`, `_asyncio`, `concurrent`,
+      `_threading_local`, `_interpchannels`, `_interpqueues`,
+      `_interpreters`, `_multiprocessing`, `_posixshmem`, `_queue`
+
+- [ ] P7-20 Batch K — 17 modules: large native extension surfaces (Tk, curses,
+      Unicode data, multibyte codecs, `ctypes`, `_random`). Needs P4-04c and
+      P7-04.
+      Modules (all `[ ]` in the ledger):
+      `ctypes`, `_ctypes`, `curses`, `_curses`, `_curses_panel`,
+      `_codecs_cn`, `_codecs_hk`, `_codecs_iso2022`, `_codecs_jp`,
+      `_codecs_kr`, `_codecs_tw`, `_multibytecodec`, `_tkinter`, `tkinter`,
+      `turtle`, `turtledemo`, `unicodedata`
+
+- [ ] P7-21 Batch L — 13 modules: platform-specific modules. The 8
+      Windows/Apple-only modules are `[!]` unsupported on Linux; the 5
+      support modules are pure-Python shims.
+      Modules (all `[ ]` in the ledger):
+      `_aix_support`, `_android_support`, `_apple_support`, `_ios_support`,
+      `_osx_support`, `_overlapped`, `_scproxy`, `_winapi`, `_wmi`,
+      `msvcrt`, `nt`, `winreg`, `winsound`
+
+### Module ledger (272 originally missing)
+
+Derived from the 272-module baseline in `benchmarks/compat/latest.json`.
+The 11 Batch A entries are checked; `[x]` means importable and
+representative-API tested, not CPython test-subset parity (P7-05). `[!]` marks a module CPython ships only for a
+platform PyX does not target on this host (Windows/Apple), tracked as
+platform-unsupported rather than implemented.
+
+#### Builtin / frozen (46)
+
+- [ ] `_abc`
+- [ ] `_ast`
+- [ ] `_codecs`
+- [ ] `_collections`
+- [ ] `_collections_abc`
+- [ ] `_contextvars`
+- [ ] `_datetime`
+- [ ] `_frozen_importlib`
+- [ ] `_frozen_importlib_external`
+- [x] `_functools`
+- [ ] `_imp`
+- [x] `_io`
+- [ ] `_locale`
+- [ ] `_opcode`
+- [x] `_operator`
+- [ ] `_signal`
+- [ ] `_sitebuiltins`
+- [ ] `_sre`
+- [x] `_stat`
+- [ ] `_string`
+- [ ] `_suggestions`
+- [ ] `_symtable`
+- [ ] `_sysconfig`
+- [ ] `_tokenize`
+- [ ] `_tracemalloc`
+- [ ] `_types`
+- [ ] `_typing`
+- [ ] `_warnings`
+- [ ] `_weakref`
+- [ ] `abc`
+- [ ] `atexit`
+- [ ] `builtins`
+- [ ] `codecs`
+- [ ] `faulthandler`
+- [ ] `gc`
+- [ ] `genericpath`
+- [ ] `itertools`
+- [ ] `marshal`
+- [ ] `ntpath`
+- [ ] `posix`
+- [ ] `posixpath`
+- [ ] `pwd`
+- [ ] `runpy`
+- [ ] `site`
+- [x] `stat`
+- [ ] `zipimport`
+
+#### Pure Python (156)
+
+- [ ] `__future__`
+- [ ] `_aix_support`
+- [ ] `_android_support`
+- [ ] `_apple_support`
+- [ ] `_ast_unparse`
+- [ ] `_colorize`
+- [ ] `_compat_pickle`
+- [ ] `_ios_support`
+- [ ] `_markupbase`
+- [ ] `_opcode_metadata`
+- [ ] `_osx_support`
+- [ ] `_py_abc`
+- [ ] `_py_warnings`
+- [ ] `_pydatetime`
+- [ ] `_pydecimal`
+- [ ] `_pyio`
+- [ ] `_pylong`
+- [ ] `_pyrepl`
+- [ ] `_strptime`
+- [ ] `_threading_local`
+- [ ] `_weakrefset`
+- [ ] `annotationlib`
+- [ ] `antigravity`
+- [ ] `ast`
+- [ ] `base64`
+- [ ] `bdb`
+- [x] `bisect`
+- [ ] `bz2`
+- [ ] `cProfile`
+- [ ] `calendar`
+- [ ] `cmd`
+- [ ] `code`
+- [ ] `codeop`
+- [x] `colorsys`
+- [ ] `compileall`
+- [ ] `compression`
+- [ ] `concurrent`
+- [ ] `configparser`
+- [ ] `contextlib`
+- [ ] `contextvars`
+- [ ] `copy`
+- [ ] `copyreg`
+- [ ] `ctypes`
+- [ ] `curses`
+- [ ] `dataclasses`
+- [ ] `datetime`
+- [ ] `dbm`
+- [ ] `decimal`
+- [ ] `difflib`
+- [ ] `dis`
+- [ ] `doctest`
+- [ ] `email`
+- [ ] `encodings`
+- [ ] `ensurepip`
+- [ ] `enum`
+- [ ] `filecmp`
+- [ ] `fileinput`
+- [ ] `fnmatch`
+- [ ] `fractions`
+- [ ] `ftplib`
+- [ ] `getopt`
+- [ ] `getpass`
+- [ ] `gettext`
+- [ ] `glob`
+- [ ] `graphlib`
+- [ ] `gzip`
+- [ ] `hashlib`
+- [x] `heapq`
+- [ ] `hmac`
+- [ ] `html`
+- [ ] `http`
+- [ ] `idlelib`
+- [ ] `imaplib`
+- [ ] `importlib`
+- [ ] `inspect`
+- [ ] `ipaddress`
+- [x] `keyword`
+- [ ] `linecache`
+- [ ] `locale`
+- [ ] `logging`
+- [ ] `lzma`
+- [ ] `mailbox`
+- [ ] `mimetypes`
+- [ ] `modulefinder`
+- [ ] `netrc`
+- [ ] `nturl2path`
+- [ ] `numbers`
+- [ ] `opcode`
+- [ ] `optparse`
+- [ ] `pdb`
+- [ ] `pickletools`
+- [ ] `pkgutil`
+- [ ] `plistlib`
+- [ ] `poplib`
+- [ ] `pprint`
+- [ ] `profile`
+- [ ] `pstats`
+- [ ] `pty`
+- [ ] `py_compile`
+- [ ] `pyclbr`
+- [ ] `pydoc`
+- [ ] `pydoc_data`
+- [ ] `quopri`
+- [ ] `reprlib`
+- [ ] `rlcompleter`
+- [ ] `sched`
+- [ ] `secrets`
+- [ ] `selectors`
+- [ ] `shelve`
+- [ ] `shlex`
+- [ ] `shutil`
+- [ ] `signal`
+- [ ] `smtplib`
+- [ ] `socketserver`
+- [ ] `sqlite3`
+- [ ] `sre_compile`
+- [ ] `sre_constants`
+- [ ] `sre_parse`
+- [ ] `ssl`
+- [ ] `string`
+- [ ] `stringprep`
+- [ ] `struct`
+- [ ] `subprocess`
+- [ ] `symtable`
+- [ ] `sysconfig`
+- [ ] `tabnanny`
+- [ ] `tarfile`
+- [ ] `tempfile`
+- [ ] `textwrap`
+- [ ] `this`
+- [ ] `timeit`
+- [ ] `tkinter`
+- [ ] `token`
+- [ ] `tokenize`
+- [ ] `tomllib`
+- [ ] `trace`
+- [ ] `traceback`
+- [ ] `tracemalloc`
+- [ ] `tty`
+- [ ] `turtle`
+- [ ] `turtledemo`
+- [ ] `types`
+- [ ] `typing`
+- [ ] `urllib`
+- [ ] `uuid`
+- [ ] `venv`
+- [ ] `warnings`
+- [ ] `wave`
+- [ ] `weakref`
+- [ ] `webbrowser`
+- [ ] `wsgiref`
+- [ ] `xml`
+- [ ] `xmlrpc`
+- [ ] `zipapp`
+- [ ] `zipfile`
+- [ ] `zoneinfo`
+
+#### Extension (62)
+
+- [ ] `_asyncio`
+- [x] `_bisect`
+- [ ] `_blake2`
+- [ ] `_bz2`
+- [ ] `_codecs_cn`
+- [ ] `_codecs_hk`
+- [ ] `_codecs_iso2022`
+- [ ] `_codecs_jp`
+- [ ] `_codecs_kr`
+- [ ] `_codecs_tw`
+- [ ] `_csv`
+- [ ] `_ctypes`
+- [ ] `_curses`
+- [ ] `_curses_panel`
+- [ ] `_dbm`
+- [ ] `_decimal`
+- [ ] `_elementtree`
+- [ ] `_gdbm`
+- [ ] `_hashlib`
+- [x] `_heapq`
+- [ ] `_hmac`
+- [ ] `_interpchannels`
+- [ ] `_interpqueues`
+- [ ] `_interpreters`
+- [ ] `_json`
+- [ ] `_lsprof`
+- [ ] `_lzma`
+- [ ] `_md5`
+- [ ] `_multibytecodec`
+- [ ] `_multiprocessing`
+- [ ] `_pickle`
+- [ ] `_posixshmem`
+- [ ] `_posixsubprocess`
+- [ ] `_queue`
+- [ ] `_random`
+- [ ] `_remote_debugging`
+- [ ] `_sha1`
+- [ ] `_sha2`
+- [ ] `_sha3`
+- [ ] `_socket`
+- [ ] `_sqlite3`
+- [ ] `_ssl`
+- [ ] `_statistics`
+- [ ] `_struct`
+- [ ] `_tkinter`
+- [ ] `_uuid`
+- [ ] `_zoneinfo`
+- [ ] `_zstd`
+- [ ] `array`
+- [ ] `binascii`
+- [ ] `cmath`
+- [ ] `fcntl`
+- [ ] `grp`
+- [ ] `mmap`
+- [ ] `pyexpat`
+- [ ] `readline`
+- [ ] `resource`
+- [ ] `select`
+- [ ] `syslog`
+- [ ] `termios`
+- [ ] `unicodedata`
+- [ ] `zlib`
+
+#### Unknown / platform-specific (8)
+
+- [!] `_overlapped`
+- [!] `_scproxy`
+- [!] `_winapi`
+- [!] `_wmi`
+- [!] `msvcrt`
+- [!] `nt`
+- [!] `winreg`
+- [!] `winsound`
+
+**Acceptance P7:** all 272 ledger entries are either checked with green
+per-module CPython test runs, or explicitly documented as
+platform-unsupported; the generated compatibility matrix shows the same
+numbers; no module is declared done on import alone.
 
 ## Risks / open decisions
 

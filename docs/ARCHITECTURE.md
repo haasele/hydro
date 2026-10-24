@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
-implemented (934 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (968 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -841,10 +841,11 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **934 tests** (289 frontend, 23 codegen, 4 IR, 253
-  runtime unit, 173 runtime integration, 192 CLI/E2E). E2E coverage
+- As of 2026-10-25: **968 tests** (289 frontend, 23 codegen, 4 IR, 285
+  runtime unit, 173 runtime integration, 194 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
-  (`fibers.rs`), user modules, `unittest` runner, `argparse`/`defaultdict`/`re`,
+  (`fibers.rs`), user modules, `unittest` runner, stdlib Batch A,
+  `argparse`/`defaultdict`/`re`,
   socket echo, pathlib, build cache, `pyx gc` and uv passthrough.
 - New unit tests cover the dict hash index, the GC statistics and
   fiber iteration; `examples/generators_async.py` runs under JIT and AOT.

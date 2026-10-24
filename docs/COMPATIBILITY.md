@@ -36,17 +36,17 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
-| builtin/frozen | 52 | 6 | 46 |
-| pure | 174 | 18 | 156 |
-| extension | 63 | 1 | 62 |
+| builtin/frozen | 52 | 11 | 41 |
+| pure | 174 | 22 | 152 |
+| extension | 63 | 3 | 60 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 25 | 272 |
+| **Total** | 297 | 36 | 261 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:PYX0002 | 263 |
+| compile_error:PYX0002 | 252 |
 | cpython_failed | 9 |
 
 ## Modules by layer
@@ -64,16 +64,16 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_datetime` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_datetime' not found: not supported unless a sibling _datetime.py… |
 | `_frozen_importlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_frozen_importlib' not found: not supported unless a sibling _fro… |
 | `_frozen_importlib_external` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_frozen_importlib_external' not found: not supported unless a sib… |
-| `_functools` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_functools' not found: not supported unless a sibling _functools.… |
+| `_functools` | ok | ok | ok | - |
 | `_imp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_imp' not found: not supported unless a sibling _imp.py exists |
-| `_io` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_io' not found: not supported unless a sibling _io.py exists |
+| `_io` | ok | ok | ok | - |
 | `_locale` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_locale' not found: not supported unless a sibling _locale.py exi… |
 | `_opcode` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_opcode' not found: not supported unless a sibling _opcode.py exi… |
-| `_operator` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_operator' not found: not supported unless a sibling _operator.py… |
+| `_operator` | ok | ok | ok | - |
 | `_signal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_signal' not found: not supported unless a sibling _signal.py exi… |
 | `_sitebuiltins` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sitebuiltins' not found: not supported unless a sibling _sitebui… |
 | `_sre` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sre' not found: not supported unless a sibling _sre.py exists |
-| `_stat` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_stat' not found: not supported unless a sibling _stat.py exists |
+| `_stat` | ok | ok | ok | - |
 | `_string` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_string' not found: not supported unless a sibling _string.py exi… |
 | `_suggestions` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_suggestions' not found: not supported unless a sibling _suggesti… |
 | `_symtable` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_symtable' not found: not supported unless a sibling _symtable.py… |
@@ -103,7 +103,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `pwd` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pwd' not found: not supported unless a sibling pwd.py exists |
 | `runpy` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'runpy' not found: not supported unless a sibling runpy.py exists |
 | `site` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'site' not found: not supported unless a sibling site.py exists |
-| `stat` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'stat' not found: not supported unless a sibling stat.py exists |
+| `stat` | ok | ok | ok | - |
 | `sys` | ok | ok | ok | - |
 | `time` | ok | ok | ok | - |
 | `zipimport` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zipimport' not found: not supported unless a sibling zipimport.py… |
@@ -140,7 +140,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `asyncio` | ok | ok | ok | - |
 | `base64` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'base64' not found: not supported unless a sibling base64.py exists |
 | `bdb` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'bdb' not found: not supported unless a sibling bdb.py exists |
-| `bisect` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'bisect' not found: not supported unless a sibling bisect.py exists |
+| `bisect` | ok | ok | ok | - |
 | `bz2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'bz2' not found: not supported unless a sibling bz2.py exists |
 | `cProfile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'cProfile' not found: not supported unless a sibling cProfile.py e… |
 | `calendar` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'calendar' not found: not supported unless a sibling calendar.py e… |
@@ -148,7 +148,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `code` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'code' not found: not supported unless a sibling code.py exists |
 | `codeop` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'codeop' not found: not supported unless a sibling codeop.py exists |
 | `collections` | ok | ok | ok | - |
-| `colorsys` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'colorsys' not found: not supported unless a sibling colorsys.py e… |
+| `colorsys` | ok | ok | ok | - |
 | `compileall` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'compileall' not found: not supported unless a sibling compileall.… |
 | `compression` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'compression' not found: not supported unless a sibling compressio… |
 | `concurrent` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'concurrent' not found: not supported unless a sibling concurrent.… |
@@ -184,7 +184,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `graphlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'graphlib' not found: not supported unless a sibling graphlib.py e… |
 | `gzip` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'gzip' not found: not supported unless a sibling gzip.py exists |
 | `hashlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'hashlib' not found: not supported unless a sibling hashlib.py exi… |
-| `heapq` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'heapq' not found: not supported unless a sibling heapq.py exists |
+| `heapq` | ok | ok | ok | - |
 | `hmac` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'hmac' not found: not supported unless a sibling hmac.py exists |
 | `html` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'html' not found: not supported unless a sibling html.py exists |
 | `http` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'http' not found: not supported unless a sibling http.py exists |
@@ -194,7 +194,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `inspect` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'inspect' not found: not supported unless a sibling inspect.py exi… |
 | `ipaddress` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ipaddress' not found: not supported unless a sibling ipaddress.py… |
 | `json` | ok | ok | ok | - |
-| `keyword` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'keyword' not found: not supported unless a sibling keyword.py exi… |
+| `keyword` | ok | ok | ok | - |
 | `linecache` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'linecache' not found: not supported unless a sibling linecache.py… |
 | `locale` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'locale' not found: not supported unless a sibling locale.py exists |
 | `logging` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'logging' not found: not supported unless a sibling logging.py exi… |
@@ -292,7 +292,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Module | CPython | PyX | Status | Error |
 | --- | --- | --- | --- | --- |
 | `_asyncio` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_asyncio' not found: not supported unless a sibling _asyncio.py e… |
-| `_bisect` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_bisect' not found: not supported unless a sibling _bisect.py exi… |
+| `_bisect` | ok | ok | ok | - |
 | `_blake2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_blake2' not found: not supported unless a sibling _blake2.py exi… |
 | `_bz2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_bz2' not found: not supported unless a sibling _bz2.py exists |
 | `_codecs_cn` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_cn' not found: not supported unless a sibling _codecs_cn.… |
@@ -310,7 +310,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_elementtree` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_elementtree' not found: not supported unless a sibling _elementt… |
 | `_gdbm` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_gdbm' not found: not supported unless a sibling _gdbm.py exists |
 | `_hashlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_hashlib' not found: not supported unless a sibling _hashlib.py e… |
-| `_heapq` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_heapq' not found: not supported unless a sibling _heapq.py exists |
+| `_heapq` | ok | ok | ok | - |
 | `_hmac` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_hmac' not found: not supported unless a sibling _hmac.py exists |
 | `_interpchannels` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_interpchannels' not found: not supported unless a sibling _inter… |
 | `_interpqueues` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_interpqueues' not found: not supported unless a sibling _interpq… |

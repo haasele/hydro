@@ -22,11 +22,16 @@ use pyx_ir::{PYTHON_VERSION, PYTHON_VERSION_STRING};
 
 pub(crate) mod argparse;
 pub(crate) mod asyncio;
+pub(crate) mod bisect;
 pub(crate) mod collections;
+pub(crate) mod colorsys;
 pub(crate) mod errno;
 pub(crate) mod extension;
+pub(crate) mod heapq;
+pub(crate) mod keyword;
 pub(crate) mod re;
 pub(crate) mod socket;
+pub(crate) mod stat;
 pub(crate) mod unittest;
 
 use crate::builtins;
@@ -374,8 +379,13 @@ fn call_native_at(
 fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
     match module {
         "math" => math_call(function, args),
-        "functools" => reduce(args),
-        "operator" => operator_call(function, args),
+        "functools" | "_functools" => reduce(args),
+        "operator" | "_operator" => operator_call(function, args),
+        "bisect" | "_bisect" => bisect::call(function, args),
+        "heapq" | "_heapq" => heapq::call(function, args),
+        "colorsys" => colorsys::call(function, args),
+        "keyword" => keyword::call(function, args),
+        "stat" | "_stat" => stat::call(function, args),
         "time" => time_call(function, args),
         "_thread" => thread_call(function, args),
         "threading" => threading_call(function, args),
@@ -384,7 +394,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "pickle" => pickle_call(function, args),
         "json" => json_call(function, args),
         "csv" => csv_call(function, args),
-        "io" => io_call(function, args),
+        "io" | "_io" => io_call(function, args),
         "os" => os_call(function, args),
         "os.path" => os_path_call(function, args),
         "random" => random_call(function, args),
@@ -454,6 +464,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("socket", "SHUT_RD") => encode_int(0),
         ("socket", "SHUT_WR") => encode_int(1),
         ("socket", "SHUT_RDWR") => encode_int(2),
+        ("keyword", "kwlist") => keyword::kwlist(),
+        ("keyword", "softkwlist") => keyword::softkwlist(),
+        ("stat" | "_stat", name) => stat::constant(name),
         _ => missing_attribute(module, name),
     }
 }

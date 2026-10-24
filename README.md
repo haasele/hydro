@@ -24,7 +24,7 @@ defined subset (see [Language Scope](#language-and-stdlib-scope) and
 | Phase 6 — Diagnostics/Developer Experience | largely done; completions/manpage and ICE regression test open |
 
 Current state of work (Cargo version 0.1.0, no public release yet):
-**934 tests** (unit, integration, E2E). Compatibility target: **CPython
+**968 tests** (unit, integration, E2E). Compatibility target: **CPython
 3.14.9**; the official `Lib/test` baseline is 1/398 (`test_errno.py`), tracked in [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md). JIT (`pyx run`) and AOT
 (`pyx build`) share the same runtime and IR. Details:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
@@ -227,8 +227,10 @@ supported by `run`.
 `Pattern`/`Match`), `socket` (blocking TCP), `random`, `platform`,
 `statistics`, `pathlib`, `_thread`, `threading`, `queue`, `multiprocessing`,
 `pickle`, `asyncio` (only `run`/`sleep`/`gather`), `errno` (full Linux
-constant table, `errorcode`, module `__dict__`) and a minimal `unittest`
-(`TestCase` + runner via `main`, native assertions).
+constant table, `errorcode`, module `__dict__`), a minimal `unittest`
+(`TestCase` + runner via `main`, native assertions), and Batch A of the
+standard-library program (`bisect`, `heapq`, `colorsys`, `keyword`, `stat`,
+plus the `_bisect`/`_heapq`/`_stat`/`_operator`/`_functools`/`_io` aliases).
 
 **Concurrency and memory**
 
@@ -284,7 +286,7 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests and Benchmarks
 
 - `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), build,
-  `cargo test --workspace` (934 tests), E2E comparison JIT vs. AOT,
+  `cargo test --workspace` (968 tests), E2E comparison JIT vs. AOT,
   negative tests (diagnostics/tracebacks) and GC stress tests.
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Ubuntu, stable
   Rust, fmt/clippy/test/verify, no secrets).

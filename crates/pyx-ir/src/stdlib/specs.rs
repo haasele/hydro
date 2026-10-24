@@ -1,7 +1,7 @@
 //! Concrete builtin module tables: functions, arities, return types and
 //! constants.
 
-use super::{c, f, kw, ModuleSpec};
+use super::{c, f, kw, ConstantSpec, FunctionSpec, ModuleSpec};
 use crate::Type;
 
 pub static MATH: ModuleSpec = ModuleSpec {
@@ -32,32 +32,53 @@ pub static MATH: ModuleSpec = ModuleSpec {
     ],
 };
 
+/// `functools` and `_functools` share the same function table: the C
+/// accelerator only exposes `reduce`.
+const FUNCTOOLS_FUNCTIONS: &[FunctionSpec] = &[f("reduce", 2, 3, Type::Any)];
+
 pub static FUNCTOOLS: ModuleSpec = ModuleSpec {
     name: "functools",
-    functions: &[f("reduce", 2, 3, Type::Any)],
+    functions: FUNCTOOLS_FUNCTIONS,
     constants: &[],
 };
 
+/// `_functools`: the accelerator alias of `functools`.
+pub static _FUNCTOOLS: ModuleSpec = ModuleSpec {
+    name: "_functools",
+    functions: FUNCTOOLS_FUNCTIONS,
+    constants: &[],
+};
+
+/// `operator` and `_operator` share the same function table.
+const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
+    f("add", 2, 2, Type::Any),
+    f("sub", 2, 2, Type::Any),
+    f("mul", 2, 2, Type::Any),
+    f("truediv", 2, 2, Type::Any),
+    f("floordiv", 2, 2, Type::Any),
+    f("mod", 2, 2, Type::Any),
+    f("pow", 2, 2, Type::Any),
+    f("eq", 2, 2, Type::Bool),
+    f("ne", 2, 2, Type::Bool),
+    f("lt", 2, 2, Type::Bool),
+    f("le", 2, 2, Type::Bool),
+    f("gt", 2, 2, Type::Bool),
+    f("ge", 2, 2, Type::Bool),
+    f("neg", 1, 1, Type::Any),
+    f("not_", 1, 1, Type::Bool),
+    f("truth", 1, 1, Type::Bool),
+];
+
 pub static OPERATOR: ModuleSpec = ModuleSpec {
     name: "operator",
-    functions: &[
-        f("add", 2, 2, Type::Any),
-        f("sub", 2, 2, Type::Any),
-        f("mul", 2, 2, Type::Any),
-        f("truediv", 2, 2, Type::Any),
-        f("floordiv", 2, 2, Type::Any),
-        f("mod", 2, 2, Type::Any),
-        f("pow", 2, 2, Type::Any),
-        f("eq", 2, 2, Type::Bool),
-        f("ne", 2, 2, Type::Bool),
-        f("lt", 2, 2, Type::Bool),
-        f("le", 2, 2, Type::Bool),
-        f("gt", 2, 2, Type::Bool),
-        f("ge", 2, 2, Type::Bool),
-        f("neg", 1, 1, Type::Any),
-        f("not_", 1, 1, Type::Bool),
-        f("truth", 1, 1, Type::Bool),
-    ],
+    functions: OPERATOR_FUNCTIONS,
+    constants: &[],
+};
+
+/// `_operator`: the accelerator alias of `operator`.
+pub static _OPERATOR: ModuleSpec = ModuleSpec {
+    name: "_operator",
+    functions: OPERATOR_FUNCTIONS,
     constants: &[],
 };
 
@@ -245,15 +266,25 @@ pub static SYS: ModuleSpec = ModuleSpec {
     ],
 };
 
+/// `io` and `_io` share the same function table.
+const IO_FUNCTIONS: &[FunctionSpec] = &[kw(
+    "open",
+    1,
+    5,
+    Type::Any,
+    &["file", "mode", "encoding", "newline", "errors"],
+)];
+
 pub static IO: ModuleSpec = ModuleSpec {
     name: "io",
-    functions: &[kw(
-        "open",
-        1,
-        5,
-        Type::Any,
-        &["file", "mode", "encoding", "newline", "errors"],
-    )],
+    functions: IO_FUNCTIONS,
+    constants: &[],
+};
+
+/// `_io`: the accelerator alias of `io`.
+pub static _IO: ModuleSpec = ModuleSpec {
+    name: "_io",
+    functions: IO_FUNCTIONS,
     constants: &[],
 };
 
@@ -364,4 +395,213 @@ pub static UNITTEST: ModuleSpec = ModuleSpec {
         f("_fail", 1, 2, Type::None),
     ],
     constants: &[c("TestCase", Type::Any)],
+};
+
+// -------------------------------------------------------------------------
+// Standard library batch A
+// -------------------------------------------------------------------------
+
+/// `bisect` and `_bisect` share the same function table. `lo`, `hi` and
+/// `key` are optional and may be passed by keyword.
+const BISECT_FUNCTIONS: &[FunctionSpec] = &[
+    kw(
+        "bisect_left",
+        2,
+        5,
+        Type::Int,
+        &["a", "x", "lo", "hi", "key"],
+    ),
+    kw(
+        "bisect_right",
+        2,
+        5,
+        Type::Int,
+        &["a", "x", "lo", "hi", "key"],
+    ),
+    kw("bisect", 2, 5, Type::Int, &["a", "x", "lo", "hi", "key"]),
+    kw(
+        "insort_left",
+        2,
+        5,
+        Type::None,
+        &["a", "x", "lo", "hi", "key"],
+    ),
+    kw(
+        "insort_right",
+        2,
+        5,
+        Type::None,
+        &["a", "x", "lo", "hi", "key"],
+    ),
+    kw("insort", 2, 5, Type::None, &["a", "x", "lo", "hi", "key"]),
+];
+
+pub static BISECT: ModuleSpec = ModuleSpec {
+    name: "bisect",
+    functions: BISECT_FUNCTIONS,
+    constants: &[],
+};
+
+/// `_bisect`: the accelerator alias of `bisect`.
+pub static _BISECT: ModuleSpec = ModuleSpec {
+    name: "_bisect",
+    functions: BISECT_FUNCTIONS,
+    constants: &[],
+};
+
+/// `heapq` and `_heapq` share the same function table.
+const HEAPQ_FUNCTIONS: &[FunctionSpec] = &[
+    f("heappush", 2, 2, Type::None),
+    f("heappop", 1, 1, Type::Any),
+    f("heapify", 1, 1, Type::None),
+    f("heappushpop", 2, 2, Type::Any),
+    f("heapreplace", 2, 2, Type::Any),
+    kw("nlargest", 2, 3, Type::List, &["n", "iterable", "key"]),
+    kw("nsmallest", 2, 3, Type::List, &["n", "iterable", "key"]),
+];
+
+pub static HEAPQ: ModuleSpec = ModuleSpec {
+    name: "heapq",
+    functions: HEAPQ_FUNCTIONS,
+    constants: &[],
+};
+
+/// `_heapq`: the accelerator alias of `heapq`.
+pub static _HEAPQ: ModuleSpec = ModuleSpec {
+    name: "_heapq",
+    functions: HEAPQ_FUNCTIONS,
+    constants: &[],
+};
+
+/// `colorsys`: conversions between RGB and the YIQ/HLS/HSV colour spaces.
+/// Every entry takes three components and returns a three-tuple.
+pub static COLORSYS: ModuleSpec = ModuleSpec {
+    name: "colorsys",
+    functions: &[
+        f("rgb_to_yiq", 3, 3, Type::Tuple),
+        f("yiq_to_rgb", 3, 3, Type::Tuple),
+        f("rgb_to_hls", 3, 3, Type::Tuple),
+        f("hls_to_rgb", 3, 3, Type::Tuple),
+        f("rgb_to_hsv", 3, 3, Type::Tuple),
+        f("hsv_to_rgb", 3, 3, Type::Tuple),
+    ],
+    constants: &[],
+};
+
+/// `keyword`: the interpreter's keyword tables.
+pub static KEYWORD: ModuleSpec = ModuleSpec {
+    name: "keyword",
+    functions: &[
+        f("iskeyword", 1, 1, Type::Bool),
+        f("issoftkeyword", 1, 1, Type::Bool),
+    ],
+    constants: &[c("kwlist", Type::List), c("softkwlist", Type::List)],
+};
+
+/// `stat` and `_stat` share the same function and constant tables.
+const STAT_FUNCTIONS: &[FunctionSpec] = &[
+    f("S_IMODE", 1, 1, Type::Int),
+    f("S_IFMT", 1, 1, Type::Int),
+    f("S_ISDIR", 1, 1, Type::Bool),
+    f("S_ISCHR", 1, 1, Type::Bool),
+    f("S_ISBLK", 1, 1, Type::Bool),
+    f("S_ISREG", 1, 1, Type::Bool),
+    f("S_ISFIFO", 1, 1, Type::Bool),
+    f("S_ISLNK", 1, 1, Type::Bool),
+    f("S_ISSOCK", 1, 1, Type::Bool),
+    f("S_ISDOOR", 1, 1, Type::Bool),
+    f("S_ISPORT", 1, 1, Type::Bool),
+    f("S_ISWHT", 1, 1, Type::Bool),
+    f("filemode", 1, 1, Type::Str),
+];
+
+const STAT_CONSTANTS: &[ConstantSpec] = &[
+    c("FILE_ATTRIBUTE_ARCHIVE", Type::Int),
+    c("FILE_ATTRIBUTE_COMPRESSED", Type::Int),
+    c("FILE_ATTRIBUTE_DEVICE", Type::Int),
+    c("FILE_ATTRIBUTE_DIRECTORY", Type::Int),
+    c("FILE_ATTRIBUTE_ENCRYPTED", Type::Int),
+    c("FILE_ATTRIBUTE_HIDDEN", Type::Int),
+    c("FILE_ATTRIBUTE_INTEGRITY_STREAM", Type::Int),
+    c("FILE_ATTRIBUTE_NORMAL", Type::Int),
+    c("FILE_ATTRIBUTE_NOT_CONTENT_INDEXED", Type::Int),
+    c("FILE_ATTRIBUTE_NO_SCRUB_DATA", Type::Int),
+    c("FILE_ATTRIBUTE_OFFLINE", Type::Int),
+    c("FILE_ATTRIBUTE_READONLY", Type::Int),
+    c("FILE_ATTRIBUTE_REPARSE_POINT", Type::Int),
+    c("FILE_ATTRIBUTE_SPARSE_FILE", Type::Int),
+    c("FILE_ATTRIBUTE_SYSTEM", Type::Int),
+    c("FILE_ATTRIBUTE_TEMPORARY", Type::Int),
+    c("FILE_ATTRIBUTE_VIRTUAL", Type::Int),
+    c("SF_APPEND", Type::Int),
+    c("SF_ARCHIVED", Type::Int),
+    c("SF_DATALESS", Type::Int),
+    c("SF_FIRMLINK", Type::Int),
+    c("SF_IMMUTABLE", Type::Int),
+    c("SF_NOUNLINK", Type::Int),
+    c("SF_RESTRICTED", Type::Int),
+    c("SF_SETTABLE", Type::Int),
+    c("SF_SNAPSHOT", Type::Int),
+    c("ST_ATIME", Type::Int),
+    c("ST_CTIME", Type::Int),
+    c("ST_DEV", Type::Int),
+    c("ST_GID", Type::Int),
+    c("ST_INO", Type::Int),
+    c("ST_MODE", Type::Int),
+    c("ST_MTIME", Type::Int),
+    c("ST_NLINK", Type::Int),
+    c("ST_SIZE", Type::Int),
+    c("ST_UID", Type::Int),
+    c("S_ENFMT", Type::Int),
+    c("S_IEXEC", Type::Int),
+    c("S_IFBLK", Type::Int),
+    c("S_IFCHR", Type::Int),
+    c("S_IFDIR", Type::Int),
+    c("S_IFDOOR", Type::Int),
+    c("S_IFIFO", Type::Int),
+    c("S_IFLNK", Type::Int),
+    c("S_IFPORT", Type::Int),
+    c("S_IFREG", Type::Int),
+    c("S_IFSOCK", Type::Int),
+    c("S_IFWHT", Type::Int),
+    c("S_IREAD", Type::Int),
+    c("S_IRGRP", Type::Int),
+    c("S_IROTH", Type::Int),
+    c("S_IRUSR", Type::Int),
+    c("S_IRWXG", Type::Int),
+    c("S_IRWXO", Type::Int),
+    c("S_IRWXU", Type::Int),
+    c("S_ISGID", Type::Int),
+    c("S_ISUID", Type::Int),
+    c("S_ISVTX", Type::Int),
+    c("S_IWGRP", Type::Int),
+    c("S_IWOTH", Type::Int),
+    c("S_IWRITE", Type::Int),
+    c("S_IWUSR", Type::Int),
+    c("S_IXGRP", Type::Int),
+    c("S_IXOTH", Type::Int),
+    c("S_IXUSR", Type::Int),
+    c("UF_APPEND", Type::Int),
+    c("UF_COMPRESSED", Type::Int),
+    c("UF_DATAVAULT", Type::Int),
+    c("UF_HIDDEN", Type::Int),
+    c("UF_IMMUTABLE", Type::Int),
+    c("UF_NODUMP", Type::Int),
+    c("UF_NOUNLINK", Type::Int),
+    c("UF_OPAQUE", Type::Int),
+    c("UF_SETTABLE", Type::Int),
+    c("UF_TRACKED", Type::Int),
+];
+
+pub static STAT: ModuleSpec = ModuleSpec {
+    name: "stat",
+    functions: STAT_FUNCTIONS,
+    constants: STAT_CONSTANTS,
+};
+
+/// `_stat`: the accelerator alias of `stat`.
+pub static _STAT: ModuleSpec = ModuleSpec {
+    name: "_stat",
+    functions: STAT_FUNCTIONS,
+    constants: STAT_CONSTANTS,
 };

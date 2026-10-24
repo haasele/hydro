@@ -8,7 +8,7 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **934 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25: **968 tests**, `scripts/verify.sh` ALL GREEN. The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
@@ -161,6 +161,12 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   `AssertionError` (tag 14), a native `errno` module (Linux table,
   `errorcode`, `__dict__`) and a minimal native `unittest`
   (`TestCase`/runner/native assertions).
+- **Standard-library program (P7) and Batch A:** added a complete
+  module-by-module plan for all 272 missing stdlib modules with dependency
+  batches and a per-layer ledger. First slice implements native
+  `bisect`/`_bisect`, `heapq`/`_heapq`, `colorsys`, `keyword`,
+  `stat`/`_stat`, plus `_operator`, `_functools` and `_io` aliases; import
+  baseline rises to 36/297. CPython per-module test subsets remain P7-05.
 - **LTS policy:** future PyX LTS lines are keyed to CPython minor versions
   (3.13/3.14/3.15) with frozen patch baseline, ABI/wheel tags, stdlib surface
   and support window (P4-12; no LTS before production).
