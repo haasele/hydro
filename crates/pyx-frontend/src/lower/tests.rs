@@ -3428,3 +3428,130 @@ fn dotted_extension_names_remain_diagnostics() {
         "module 'mod_ext.sub' is not supported yet"
     );
 }
+
+fn join_path_list(dirs: &[&Path]) -> std::ffi::OsString {
+    std::env::join_paths(dirs.iter().map(|dir| dir.to_path_buf())).expect("join path list")
+}
+
+fn resolved(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[test]
+fn extension_search_path_order_and_source_precedence() {
+    let root = ExtensionDir::new("search-order");
+    let src = root.path.join("project");
+    let ext = root.path.join("ext-path");
+    let python = root.path.join("python-path");
+    let site_override = root.path.join("site-packages");
+    let venv = root.path.join("venv");
+    let venv_site = venv.join("lib").join("python3.14").join("site-packages");
+    for dir in [&src, &ext, &python, &site_override, &venv_site] {
+        fs::create_dir_all(dir).expect("create search dir");
+        fs::write(dir.join("mod_ext.abi3.so"), b"").expect("write extension stub");
+    }
+
+    let extension_path = join_path_list(&[ext.as_path()]);
+    let pythonpath = join_path_list(&[python.as_path()]);
+    let site_list = join_path_list(&[site_override.as_path()]);
+    let search = extension_search_paths_from(
+        Some(extension_path.as_os_str()),
+        Some(pythonpath.as_os_str()),
+        Some(site_list.as_os_str()),
+        Some(venv.as_path()),
+        None,
+    );
+    assert_eq!(
+        search,
+        vec![
+            ext.clone(),
+            python.clone(),
+            site_override.clone(),
+            venv_site.clone()
+        ],
+        "PYX_SITE_PACKAGES must override auto-detected venv site-packages"
+    );
+
+    // The source directory always wins; afterwards each search entry is tried
+    // in the documented order as the previous winner disappears.
+    let source = src.join("main.py");
+    for dir in [&src, &ext, &python, &site_override, &venv_site] {
+        let expected = resolved(&dir.join("mod_ext.abi3.so"));
+        assert_eq!(
+            find_extension_in_search_dirs(&source, &search, "mod_ext"),
+            Some(expected.clone()),
+            "unexpected winner while resolving from {}",
+            dir.display()
+        );
+        fs::remove_file(dir.join("mod_ext.abi3.so")).expect("remove stub");
+    }
+    assert_eq!(
+        find_extension_in_search_dirs(&source, &search, "mod_ext"),
+        None
+    );
+}
+
+#[test]
+fn extension_search_path_dedups_and_skips_missing_entries() {
+    let root = ExtensionDir::new("search-dedup");
+    let shared = root.path.join("shared");
+    fs::create_dir_all(&shared).expect("create shared dir");
+    let missing = root.path.join("missing");
+    let not_a_dir = root.path.join("not-a-dir");
+    fs::write(&not_a_dir, b"").expect("write regular file");
+
+    let extension_path =
+        join_path_list(&[shared.as_path(), missing.as_path(), not_a_dir.as_path()]);
+    let pythonpath = join_path_list(&[shared.as_path()]);
+    let search = extension_search_paths_from(
+        Some(extension_path.as_os_str()),
+        Some(pythonpath.as_os_str()),
+        None,
+        Some(missing.as_path()),
+        None,
+    );
+    assert_eq!(search, vec![shared]);
+}
+
+#[test]
+fn extension_search_path_finds_wheel_style_suffix() {
+    let root = ExtensionDir::new("search-wheel");
+    let site = root.path.join("site-packages");
+    fs::create_dir_all(&site).expect("create site-packages");
+    let so = site.join("mod_ext.cpython-314-x86_64-linux-gnu.so");
+    fs::write(&so, b"").expect("write extension stub");
+
+    let list = join_path_list(&[site.as_path()]);
+    let search = extension_search_paths_from(Some(list.as_os_str()), None, None, None, None);
+    let source = root.path.join("project").join("main.py");
+    assert_eq!(
+        find_extension_in_search_dirs(&source, &search, "mod_ext"),
+        Some(resolved(&so))
+    );
+}
+
+#[test]
+fn extension_search_path_reads_environment_prefixes() {
+    let root = ExtensionDir::new("search-prefixes");
+    let venv = root.path.join("venv");
+    let windows_site = venv.join("Lib").join("site-packages");
+    let posix_site = venv.join("lib").join("python3.13").join("site-packages");
+    let conda = root.path.join("conda");
+    let conda_site = conda.join("lib").join("python3.14").join("site-packages");
+    for dir in [&windows_site, &posix_site, &conda_site] {
+        fs::create_dir_all(dir).expect("create site-packages");
+    }
+
+    let search = extension_search_paths_from(
+        None,
+        None,
+        None,
+        Some(venv.as_path()),
+        Some(conda.as_path()),
+    );
+    assert_eq!(
+        search,
+        vec![windows_site, posix_site, conda_site],
+        "Windows and POSIX site-packages layouts must both be discovered"
+    );
+}

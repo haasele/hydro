@@ -108,6 +108,10 @@ pub(crate) const KIND_FIBER: u32 = 31;
 /// shim's module handle and method id plus the Python attribute name; it has
 /// no PyX children.
 pub(crate) const KIND_EXT_FUNCTION: u32 = 32;
+/// Opaque pointer capsule obtained through the CPython C API. Holds a native
+/// pointer and an optional name; it has no PyX children, and its destructor
+/// is never called in this slice.
+pub(crate) const KIND_CAPSULE: u32 = 33;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
 pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
@@ -1494,6 +1498,14 @@ pub(crate) enum ObjData {
     Fiber(Box<crate::fiber::FiberState>),
     /// Callable member of a loaded extension module; holds no PyX values.
     ExtFunction(ExtFunctionState),
+    /// Opaque pointer capsule from an extension module. The pointer belongs
+    /// to the extension; PyX never dereferences or frees it, and the
+    /// destructor is not stored here, matching the documented slice
+    /// limitation (see [`crate::capi`]).
+    Capsule {
+        ptr: usize,
+        name: Option<String>,
+    },
 }
 
 // -------------------------------------------------------------------------
@@ -2007,6 +2019,31 @@ pub(crate) fn as_ext_function(v: i64) -> Option<&'static ExtFunctionState> {
     }
     match &obj.data {
         ObjData::ExtFunction(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Allocates an opaque pointer capsule.
+///
+/// `ptr` is owned by the extension and is never dereferenced or freed by PyX;
+/// capsules carry no PyX children and have no destructor.
+pub(crate) fn capsule_new(ptr: usize, name: Option<String>) -> i64 {
+    alloc(KIND_CAPSULE, ObjData::Capsule { ptr, name })
+}
+
+/// Returns a capsule's pointer and name, or `None` for other values.
+pub(crate) fn as_capsule(v: i64) -> Option<(usize, Option<&'static str>)> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked above; the object is rooted for the duration of
+    // this call (the collector only frees unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_CAPSULE {
+        return None;
+    }
+    match &obj.data {
+        ObjData::Capsule { ptr, name } => Some((*ptr, name.as_deref())),
         _ => None,
     }
 }
@@ -2938,6 +2975,7 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             Some(ObjData::Class(_)) => "type",
             Some(ObjData::Instance(_)) => "instance",
             Some(ObjData::ExtFunction(_)) => "builtin_function_or_method",
+            Some(ObjData::Capsule { .. }) => "PyCapsule",
             Some(ObjData::Fiber(state)) => match state.kind {
                 crate::fiber::FiberKind::Generator => "generator",
                 crate::fiber::FiberKind::Coroutine => "coroutine",
@@ -3012,6 +3050,8 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjData::Fiber(_)) => true,
             // Function objects are always truthy.
             Some(ObjData::ExtFunction(_)) => true,
+            // Capsules are always truthy, like CPython.
+            Some(ObjData::Capsule { .. }) => true,
             None => true,
         };
     }
@@ -3140,6 +3180,10 @@ pub(crate) fn to_string(v: i64) -> String {
                 ObjData::ExtFunction(state) => {
                     format!("<built-in function {}>", state.name)
                 }
+                ObjData::Capsule { name, .. } => match name {
+                    Some(name) => format!("<capsule object \"{name}\">"),
+                    None => "<capsule object NULL>".to_string(),
+                },
             };
         }
     }
@@ -3549,6 +3593,22 @@ mod tests {
         assert_eq!(type_name(list_new(Vec::new())), "list");
         assert_eq!(type_name(dict_new(Vec::new())), "dict");
         assert_eq!(type_name(iter_new(NONE)), "iterator");
+    }
+
+    #[test]
+    fn capsule_semantics() {
+        let named = capsule_new(0x1234, Some("pyx.demo".to_string()));
+        assert_eq!(type_name(named), "PyCapsule");
+        assert!(truthy(named));
+        assert_eq!(to_string(named), "<capsule object \"pyx.demo\">");
+        assert_eq!(repr(named), "<capsule object \"pyx.demo\">");
+        assert_eq!(as_capsule(named), Some((0x1234, Some("pyx.demo"))));
+
+        let unnamed = capsule_new(0x5678, None);
+        assert_eq!(repr(unnamed), "<capsule object NULL>");
+        assert_eq!(as_capsule(unnamed), Some((0x5678, None)));
+        assert!(as_capsule(NONE).is_none());
+        assert!(as_capsule(str_from_bytes(b"x")).is_none());
     }
 
     #[test]

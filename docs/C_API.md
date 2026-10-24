@@ -97,16 +97,20 @@ The first vertical slice of option B is in `pyx-runtime` and verified by
   `PyList_New`/`Size`/`GetItem`/`SetItem`/`Append`,
   `PyTuple_New`/`Size`/`GetItem`/`SetItem`,
   `PyDict_New`/`SetItem`/`SetItemString`/`GetItem`/`GetItemString`,
+  `PyCapsule_New`/`GetPointer`/`GetName`/`IsValid`/`SetPointer`,
+  `PyObject_CheckBuffer`/`GetBuffer`/`PyBuffer_Release` (read-only contiguous
+  bytes, verified `Py_buffer` layout), `PyExc_*` singletons,
   `Py_IncRef`/`Py_DecRef` (+ `_Py_*` aliases required by the 3.12+ limited
   API headers), `PyErr_Occurred`/`SetString`/`Clear`, and the variadic
   `PyArg_ParseTuple` (C shim in `parse.c`, formats `i/l/n/s/O/p/d`, `|`,
   `:`/`;`). Objects live in a process-lifetime arena; `Py_DecRef` never frees
   in this slice (no use-after-free, but no reclamation either).
 - **Loader** (`crates/pyx-runtime/src/modules/extension.rs`): discovery of
-  sibling `<name>.so`, `<name>.abi3.so` or `<name>.*.so` at compile time in the
-  frontend; lazy `dlopen(RTLD_NOW)` + `PyInit_<name>` resolution, cached by
-  path; callable values participate in `pyx_call`; errors map to
-  `AttributeError`/`TypeError`/`RuntimeError`.
+  `<name>.so`, `<name>.abi3.so` or `<name>.*.so` at compile time in the
+  frontend (sibling directory, `PYX_EXTENSION_PATH`, `PYTHONPATH`,
+  `PYX_SITE_PACKAGES`, venv/conda `site-packages`); lazy `dlopen(RTLD_NOW)` +
+  `PyInit_<name>` resolution, cached by path; callable values participate in
+  `pyx_call`; errors map to the matching PyX exception.
 - **Linking:** `pyx` and AOT binaries are linked with `--export-dynamic` and
   pin the shim symbols via `capi::anchor()` in `pyx_runtime_init`; extension
   symbols resolve from the process, not from `libpython`.
@@ -114,10 +118,10 @@ The first vertical slice of option B is in `pyx-runtime` and verified by
   prints `5`, `abi3`, `42`, `abi3` under `pyx run` and an AOT binary; `ldd`
   shows no `libpython`; arity errors are `TypeError`, missing members are
   `AttributeError`, unsupported argument types are `TypeError`.
-- **Not in this slice:** capsules, buffer protocol, arbitrary object passing
-  beyond bounded recursive list/tuple/dict copies, wheel/venv discovery,
-  package submodules, multi-phase init, GIL/thread emulation, full 3.14 ABI
-  (NumPy/pydantic-core).
+- **Not in this slice:** arbitrary object passing beyond bounded recursive
+  list/tuple/dict copies, writable/multi-dimensional buffers, capsule
+  destructors, package submodules, multi-phase init, the wheel ABI-tag policy,
+  GIL/thread emulation, full 3.14 ABI (NumPy/pydantic-core).
 
 ### Scope of "full stdlib"
 
@@ -155,8 +159,8 @@ machine-readable compatibility report, not by prose claims.
 
 | Milestone | Content | Acceptance |
 |---|---|---|
-| P4-04a | `abi3` shim: module init, `PyArg_Parse*`, scalar/container constructors, error API, capsuled types, buffer basics | **Partial:** fixture gate green (imports/runs under PyX, no `libpython`); capsules/buffer/containers/list-tuple-dict constructors still open |
-| P4-04b | Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags, package submodules, multi-phase init | **Partial:** sibling-`.so` discovery, `PyInit_*`, caching and error paths green; wheels/venvs, package submodules, multi-phase init open |
+| P4-04a | `abi3` shim: module init, `PyArg_Parse*`, scalar/container constructors, error API, capsuled types, buffer basics | **Done for the defined subset:** module/scalar/container APIs, capsules, read-only bytes buffers, `PyExc_*`; fixture imports/runs under PyX with no `libpython`. Further symbols are driven by P4-10 |
+| P4-04b | Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags, package submodules, multi-phase init | **Partial:** sibling/env/venv discovery, wheel-style filenames, `PyInit_*`, caching and error paths green; package submodules, multi-phase init and the tag policy open |
 | P4-04c | Full 3.14 ABI: `PyTypeObject`, refcounts/GC integration, vectorcall, full buffer protocol | NumPy 2.5 smoke (array create/ops/dtype) and `pydantic-core` model validation |
 | P4-04d | GIL emulation and callback safety | threaded extension callbacks + GC stress; no deadlock/data race |
 | P4-05 | `ctypes`/`cffi` boundaries | `ctypes.CDLL` on libc, `cffi` ABI-mode smoke |
@@ -179,8 +183,8 @@ machine-readable compatibility report, not by prose claims.
 
 ## 7. What this document does not claim
 
-- No general CPython C extension support: only the fixture-level `abi3` subset
-  in §3.1 runs today.
+- No general CPython C extension support: only the defined `abi3` subset in
+  §3.1 (plus whatever symbols a real extension happens to need) runs today.
 - No NumPy/pandas/pydantic/FastAPI compatibility is achieved or promised by
   this decision; the gates in §5 define when a claim is allowed.
 - No benchmark number is extrapolated beyond the measured probe outputs in §3.

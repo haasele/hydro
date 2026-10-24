@@ -6,11 +6,13 @@
 //! only converts between tagged PyX values and [`ShimValue`]s and allocates
 //! first-class function values for callables.
 //!
-//! Only the `ShimValue` types cross the boundary: scalars, bytes, strings and
-//! lists/tuples/dicts of them. Containers are copied recursively in both
-//! directions (depth-limited to [`MAX_CONVERSION_DEPTH`]); a cyclic PyX
-//! container raises a `TypeError` instead of recursing. User objects still
-//! raise a `TypeError` rather than being silently mangled.
+//! Only the `ShimValue` types cross the boundary: scalars, bytes, strings,
+//! capsules and lists/tuples/dicts of them. Containers are copied recursively
+//! in both directions (depth-limited to [`MAX_CONVERSION_DEPTH`]); a cyclic
+//! PyX container raises a `TypeError` instead of recursing. Capsules cross as
+//! an opaque pointer plus name, so passing one back to the extension returns
+//! the original pointer. User objects still raise a `TypeError` rather than
+//! being silently mangled.
 //!
 //! All fallible paths report a pending exception and return the `None` dummy
 //! value; no user input can panic.
@@ -18,7 +20,10 @@
 use std::path::Path;
 
 use crate::capi::{self, ShimAttr, ShimValue, MAX_CONVERSION_DEPTH};
-use crate::exc::{self, ATTRIBUTE_ERROR, INDEX_ERROR, RUNTIME_ERROR, TYPE_ERROR};
+use crate::exc::{
+    self, ATTRIBUTE_ERROR, INDEX_ERROR, KEY_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR,
+    STOP_ITERATION, TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
+};
 use crate::value::{self, ExtFunctionState, NONE};
 
 /// Maximum length accepted for an ABI name buffer (`isize::MAX` keeps the
@@ -113,6 +118,12 @@ fn value_to_shim_at(
     if let Some(bytes) = value::as_bytes(value_arg) {
         return Ok(ShimValue::Bytes(bytes.to_vec()));
     }
+    if let Some((ptr, name)) = value::as_capsule(value_arg) {
+        return Ok(ShimValue::Capsule {
+            ptr,
+            name: name.map(str::to_string),
+        });
+    }
     if let Some(items) = value::as_list(value_arg) {
         return convert_sequence(value_arg, "list", depth, path, items, ShimValue::List);
     }
@@ -194,6 +205,7 @@ fn shim_to_value_at(shim: ShimValue, depth: usize) -> Result<i64, String> {
         ShimValue::Float(f) => value::float_new(f),
         ShimValue::Str(s) => value::str_alloc(s),
         ShimValue::Bytes(bytes) => value::bytes_new(bytes),
+        ShimValue::Capsule { ptr, name } => value::capsule_new(ptr, name),
         ShimValue::List(items) => {
             let items = shim_items_to_values(items, "list", depth)?;
             value::list_new(items)
@@ -250,6 +262,7 @@ fn shim_type_name(shim: &ShimValue) -> &'static str {
         ShimValue::List(_) => "list",
         ShimValue::Tuple(_) => "tuple",
         ShimValue::Dict(_) => "dict",
+        ShimValue::Capsule { .. } => "PyCapsule",
     }
 }
 
@@ -263,17 +276,34 @@ fn not_callable(shim: &ShimValue) -> i64 {
 
 /// Selects the exception type for a message returned by the shim.
 ///
-/// The shim reports its own failure category in the text (for example
-/// `AttributeError: module 'x' has no attribute 'y'`); anything else is an
-/// internal load/call failure and therefore a `RuntimeError`.
+/// The shim reports its own failure category in the text. `PyErr_SetString`
+/// emits exactly `"<Type>: <message>"` for the exported `PyExc_*` singletons,
+/// so the prefix selects the matching PyX tag; anything else is an internal
+/// load/call failure and therefore a `RuntimeError`.
 fn raised_error(message: &str) -> i64 {
-    let (tag, text) = if let Some(rest) = message.strip_prefix("AttributeError: ") {
-        (ATTRIBUTE_ERROR, rest)
+    let (tag, text) = if let Some(rest) = message.strip_prefix("ValueError: ") {
+        (VALUE_ERROR, rest)
     } else if let Some(rest) = message.strip_prefix("TypeError: ") {
         (TYPE_ERROR, rest)
+    } else if let Some(rest) = message.strip_prefix("ZeroDivisionError: ") {
+        (ZERO_DIVISION_ERROR, rest)
+    } else if let Some(rest) = message.strip_prefix("RuntimeError: ") {
+        (RUNTIME_ERROR, rest)
+    } else if let Some(rest) = message.strip_prefix("OverflowError: ") {
+        (OVERFLOW_ERROR, rest)
     } else if let Some(rest) = message.strip_prefix("IndexError: ") {
         (INDEX_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("RuntimeError: ") {
+    } else if let Some(rest) = message.strip_prefix("KeyError: ") {
+        (KEY_ERROR, rest)
+    } else if let Some(rest) = message.strip_prefix("StopIteration: ") {
+        (STOP_ITERATION, rest)
+    } else if let Some(rest) = message.strip_prefix("AttributeError: ") {
+        (ATTRIBUTE_ERROR, rest)
+    } else if let Some(rest) = message.strip_prefix("OSError: ") {
+        (OS_ERROR, rest)
+    } else if let Some(rest) = message.strip_prefix("BaseException: ") {
+        (RUNTIME_ERROR, rest)
+    } else if let Some(rest) = message.strip_prefix("Exception: ") {
         (RUNTIME_ERROR, rest)
     } else if message.contains("has no attribute")
         || message.contains("attribute not found")
@@ -544,6 +574,35 @@ mod tests {
     }
 
     #[test]
+    fn c_api_exception_prefixes_select_pyx_tags() {
+        let cases = [
+            ("ValueError: bad", i64::from(VALUE_ERROR)),
+            ("TypeError: bad", i64::from(TYPE_ERROR)),
+            ("ZeroDivisionError: bad", i64::from(ZERO_DIVISION_ERROR)),
+            ("RuntimeError: bad", i64::from(RUNTIME_ERROR)),
+            ("OverflowError: bad", i64::from(OVERFLOW_ERROR)),
+            ("IndexError: bad", i64::from(INDEX_ERROR)),
+            ("KeyError: bad", i64::from(KEY_ERROR)),
+            ("StopIteration: done", i64::from(STOP_ITERATION)),
+            ("AttributeError: bad", i64::from(ATTRIBUTE_ERROR)),
+            ("OSError: bad", i64::from(OS_ERROR)),
+            ("BaseException: bad", i64::from(RUNTIME_ERROR)),
+            ("Exception: bad", i64::from(RUNTIME_ERROR)),
+        ];
+        exc::init();
+        for (message, tag) in cases {
+            raised_error(message);
+            assert_eq!(exc::pending_tag(), tag, "{message}");
+            exc::init();
+        }
+
+        raised_error("ValueError: bad value");
+        let exception = value::exception_data(exc::pending_value()).expect("pending exception");
+        assert_eq!(exception.msg, "bad value");
+        exc::init();
+    }
+
+    #[test]
     fn missing_attribute_message_selects_attribute_error() {
         exc::init();
         raised_error("module 'probe' has no attribute 'missing'");
@@ -573,6 +632,46 @@ mod tests {
         assert_eq!(value::repr(function), "<built-in function add>");
         assert!(value::truthy(function));
         assert!(value::as_ext_function(function).is_some());
+    }
+
+    #[test]
+    fn capsule_roundtrips_with_pointer_and_name() {
+        let tagged = value::capsule_new(0xDEAD_BEEF, Some("pyx.demo".to_string()));
+        let shim = value_to_shim(tagged).expect("capsule converts to the shim");
+        match &shim {
+            ShimValue::Capsule { ptr, name } => {
+                assert_eq!(*ptr, 0xDEAD_BEEF);
+                assert_eq!(name.as_deref(), Some("pyx.demo"));
+            }
+            other => panic!("unexpected shim value: {other:?}"),
+        }
+
+        let back = shim_to_value(shim).expect("capsule converts back");
+        assert_eq!(
+            value::as_capsule(back),
+            Some((0xDEAD_BEEF, Some("pyx.demo")))
+        );
+
+        let unnamed = value::capsule_new(0x1234, None);
+        let shim = value_to_shim(unnamed).expect("unnamed capsule converts");
+        assert!(matches!(
+            shim,
+            ShimValue::Capsule {
+                ptr: 0x1234,
+                name: None
+            }
+        ));
+        let back = shim_to_value(shim).expect("unnamed capsule converts back");
+        assert_eq!(value::as_capsule(back), Some((0x1234, None)));
+    }
+
+    #[test]
+    fn serialization_rejects_capsules() {
+        let capsule = value::capsule_new(0x1234, Some("pyx.demo".to_string()));
+        assert_eq!(
+            serialize::encode(capsule, false),
+            Err(PickleError::Unsupported("PyCapsule"))
+        );
     }
 
     #[test]

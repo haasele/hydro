@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -425,14 +426,103 @@ fn find_extension_in(dir: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Finds a compiled extension for `name` visible to `source`: the source
-/// file's directory first, then each `PYX_EXTENSION_PATH` entry.
+/// file's directory first, then the environment-configured search path (see
+/// [`extension_search_paths_from`]).
 pub(crate) fn find_extension_for_source(source: &Path, name: &str) -> Option<PathBuf> {
+    find_extension_in_search_dirs(source, &extension_search_paths(), name)
+}
+
+/// Finds `name` in the source file's directory, then in each of `search_dirs`.
+///
+/// `search_dirs` is ordinarily the list produced by
+/// [`extension_search_paths_from`]; taking it as an argument keeps the lookup
+/// policy testable without touching the process environment.
+fn find_extension_in_search_dirs(
+    source: &Path,
+    search_dirs: &[PathBuf],
+    name: &str,
+) -> Option<PathBuf> {
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
-    let mut dirs = vec![parent.to_path_buf()];
-    if let Some(paths) = std::env::var_os("PYX_EXTENSION_PATH") {
-        dirs.extend(std::env::split_paths(&paths));
+    std::iter::once(parent)
+        .chain(search_dirs.iter().map(PathBuf::as_path))
+        .find_map(|dir| find_extension_in(dir, name))
+}
+
+/// Directories searched by [`find_extension_for_source`], in order.
+fn extension_search_paths() -> Vec<PathBuf> {
+    let pyx_extension_path = std::env::var_os("PYX_EXTENSION_PATH");
+    let pythonpath = std::env::var_os("PYTHONPATH");
+    let pyx_site_packages = std::env::var_os("PYX_SITE_PACKAGES");
+    let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
+    let conda_prefix = std::env::var_os("CONDA_PREFIX").map(PathBuf::from);
+    extension_search_paths_from(
+        pyx_extension_path.as_deref(),
+        pythonpath.as_deref(),
+        pyx_site_packages.as_deref(),
+        virtual_env.as_deref(),
+        conda_prefix.as_deref(),
+    )
+}
+
+/// Builds the extension search path from raw environment values.
+///
+/// Order: `PYX_EXTENSION_PATH`, `PYTHONPATH`, then `PYX_SITE_PACKAGES`, then
+/// the site-packages directories of `VIRTUAL_ENV` and `CONDA_PREFIX`. The
+/// `PYX_SITE_PACKAGES` entries act as an explicit override: they are consulted
+/// before any auto-detected virtual-environment site-packages directory.
+///
+/// Missing and non-directory entries are dropped and duplicates are searched
+/// only once. The result is deterministic.
+fn extension_search_paths_from(
+    pyx_extension_path: Option<&OsStr>,
+    pythonpath: Option<&OsStr>,
+    pyx_site_packages: Option<&OsStr>,
+    virtual_env: Option<&Path>,
+    conda_prefix: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for list in [pyx_extension_path, pythonpath, pyx_site_packages]
+        .into_iter()
+        .flatten()
+    {
+        dirs.extend(std::env::split_paths(list));
     }
-    dirs.iter().find_map(|dir| find_extension_in(dir, name))
+    for prefix in [virtual_env, conda_prefix].into_iter().flatten() {
+        dirs.extend(prefix_site_packages(prefix));
+    }
+
+    let mut seen = HashSet::new();
+    dirs.retain(|dir| {
+        if !dir.is_dir() {
+            return false;
+        }
+        let key = fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        seen.insert(key)
+    });
+    dirs
+}
+
+/// Site-packages directories of an environment prefix, in deterministic order.
+///
+/// `<prefix>/Lib/site-packages` (Windows layout) comes first, followed by
+/// every `<prefix>/lib/python*/site-packages` in sorted order.
+fn prefix_site_packages(prefix: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let windows = prefix.join("Lib").join("site-packages");
+    if windows.is_dir() {
+        dirs.push(windows);
+    }
+    if let Ok(entries) = fs::read_dir(prefix.join("lib")) {
+        let mut posix: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("python"))
+            .map(|entry| entry.path().join("site-packages"))
+            .filter(|dir| dir.is_dir())
+            .collect();
+        posix.sort();
+        dirs.extend(posix);
+    }
+    dirs
 }
 
 /// Picks the shared object for `name` in `dir`.

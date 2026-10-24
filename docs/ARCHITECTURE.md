@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
-implemented (846 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (861 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -795,10 +795,13 @@ with a C-variadic `PyArg_ParseTuple`; the frontend resolves sibling
 `from ext import member` to `Callee::Extension`/`ExprKind::ExtensionAttr`;
 `pyx_extension_call`/`pyx_extension_get` load and cache modules lazily
 (`modules/extension.rs`). Scalars, strings, bytes, floats, lists, tuples and
-dicts convert recursively in both directions (bounded copies). `pyx` and AOT
-binaries export the shim symbols with `--export-dynamic`; the fixture imports
-and calls under both with no `libpython`. Capsules, the buffer protocol,
-wheels/venvs and the full 3.14 ABI are still open.
+dicts convert recursively in both directions (bounded copies); capsules and
+read-only contiguous bytes buffers are supported. Extension discovery includes
+sibling files, `PYX_EXTENSION_PATH`, `PYTHONPATH`, `PYX_SITE_PACKAGES` and
+venv/conda `site-packages`. `pyx` and AOT binaries export the shim symbols with
+`--export-dynamic`; the fixture imports and calls under both with no
+`libpython`. Package submodules, multi-phase init, the wheel tag policy and the
+full 3.14 ABI are still open.
 
 Evidence: embedded CPython costs ~6.7 ms `Py_Initialize` + ~7.5 ms
 `Py_Finalize` and ~41.6 ms for `import numpy`, versus ~0.8–1.0 ms for a PyX
@@ -813,7 +816,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-24: **846 tests** (260 frontend, 387 runtime incl. 173
+- As of 2026-10-24: **861 tests** (264 frontend, 397 runtime incl. 173
   ABI integration tests, 17 codegen, 3 IR, 154 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `argparse`/`defaultdict`/`re`, socket echo,

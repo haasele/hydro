@@ -18,9 +18,9 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators (send/throw/close/yield expressions/yield from)/coroutines/event loop (no GIL)** | 846 tests, JIT+AOT |
+| P2 Runtime | **largely done; shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators (send/throw/close/yield expressions/yield from)/coroutines/event loop (no GIL)** | 861 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
-| P4 Compatibility | **decision B implemented at the first abi3 slice: limited-API extension imports/calls under JIT+AOT, no `libpython`; full ABI/stdlib/ecosystem open (P4-04a…P4-11)** | `docs/C_API.md`, `crates/pyx-cli/tests/extensions.rs` |
+| P4 Compatibility | **P4-04a abi3 shim complete for the defined subset (scalars/containers/capsules/buffers); extension loading from sibling/env/venv paths under JIT+AOT, no `libpython`; full ABI/stdlib/ecosystem open (P4-04b…P4-11)** | `docs/C_API.md`, extension tests |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
 | P6 Polish | **largely done; diagnostics/JSON/doctor/CLI** | codes, snippets, help, ICE |
 
@@ -42,10 +42,10 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
 
 **Verification (as of 2026-10-24):**
 
-- `cargo test --workspace`: **846 tests** — 260 frontend, 18 codegen, 3 IR,
-  214 runtime unit, 178 CLI/E2E (135 E2E incl. the abi3 extension fixture,
-  22 fibers, 6 closures, 5 user modules, completions), 173 further runtime
-  integration tests
+- `cargo test --workspace`: **861 tests** — 264 frontend, 18 codegen, 3 IR,
+  224 runtime unit, 179 CLI/E2E (135 E2E incl. the abi3 extension fixture,
+  22 fibers, 6 closures, 5 user modules, completions, extension paths),
+  173 further runtime integration tests
   (allocator, bytes, GC/concurrent GC, IO, CSV, stdlib modules, classes,
   closures, socket, pathlib, pool, threads). New suites cover generator
   send/throw/close + yield expressions, C-API containers, extension
@@ -521,7 +521,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 846 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 861 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -725,7 +725,7 @@ parallel benchmarks and race/stress tests.
   JIT 7.7 ms, AOT 6.8 ms; `strace -c` counts 94 syscalls total (previously
   200,097, two `rt_sigprocmask` per yield). Remaining weak spots: string
   concatenation (O(n²)) and float boxing — open performance work.
-- **Verified:** 846 tests, `cargo fmt`, `cargo clippy --workspace
+- **Verified:** 861 tests, `cargo fmt`, `cargo clippy --workspace
   --all-targets -- -D warnings` and `cargo test --workspace` green;
   micro baseline renewed (while_sum AOT 1.7 ms vs. CPython 23.5 ms).
 
@@ -797,7 +797,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (846)
+cargo test                             # unit/integration tests (861)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1092,3 +1092,14 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   AttributeError) with PyX/CPython parity tests. Added `pyx completions
   <bash|zsh|fish>`, `docs/pyx.1`, and `pyx --version --verbose`
   (target/backend/runtime). 846 tests, clippy and `scripts/verify.sh` green.
+
+- 2026-10-24 (continuation 41): finished P4-04a and extension discovery.
+  Added CPython capsules (`PyCapsule_New/GetPointer/GetName/IsValid/
+  SetPointer`, PyX `PyCapsule` kind), read-only contiguous bytes buffers
+  (`PyObject_CheckBuffer/GetBuffer/ReleaseBuffer`, verified `Py_buffer`
+  layout), and all common `PyExc_*` singletons with typed error mapping.
+  Extension discovery now also searches `PYTHONPATH`, `PYX_SITE_PACKAGES`,
+  `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages and wheel-style filenames.
+  Fixture covers capsules and buffers under JIT+AOT; 861 tests, clippy and
+  `scripts/verify.sh` green. Open: package submodules, multi-phase init,
+  wheel tag policy, full 3.14 ABI.

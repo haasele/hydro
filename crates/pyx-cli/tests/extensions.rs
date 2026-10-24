@@ -27,6 +27,10 @@ HELLO, PYX
 -0.5
 b'cba'
 b''
+1234
+5
+104
+532
 ";
 
 const MAIN_SOURCE: &str = "\
@@ -56,6 +60,15 @@ print(p.half(7))
 print(p.half(-1))
 print(p.reverse_bytes(b\"abc\"))
 print(p.reverse_bytes(b\"\"))
+
+# Capsules round-trip through PyX: the extension's pointer and name survive.
+cap = p.make_capsule()
+print(p.capsule_value(cap))
+
+# The read-only bytes buffer protocol exposes length, content and sum.
+print(p.buffer_len(b\"hello\"))
+print(p.buffer_first(b\"hello\"))
+print(p.buffer_sum(b\"hello\"))
 ";
 
 struct TestDir {

@@ -8,7 +8,7 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-24: **846 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
+As of 2026-10-24: **861 tests**, `scripts/verify.sh` ALL GREEN. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 
@@ -96,7 +96,7 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   `pyx-cli/{cli,cli/commands}`; no behavior change, contracts unchanged.
 - Test count increased from 545 to 721 tests (incl. formatting, attributes,
   classes, closures, stdlib modules, socket, user modules, CLI/build cache);
-  with this slice to **846** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
+  with this slice to **861** tests (incl. `crates/pyx-cli/tests/fibers.rs`,
   dict hash index, GC statistics, generator iteration).
 - AOT builds embed user modules; the cache key takes the
   entire reachable module tree structure into account.
@@ -122,6 +122,13 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 - **C-API containers:** `PyUnicode_*`, `PyFloat_*`, `PyBytes_*`, `PyList_*`,
   `PyTuple_*`, `PyDict_*` plus bounded recursive list/tuple/dict conversion
   in both directions (copies, depth 64, cycle rejection).
+- **C-API capsules & buffers:** `PyCapsule_New/GetPointer/GetName/IsValid/
+  SetPointer` with a PyX `PyCapsule` kind, read-only contiguous bytes
+  `PyObject_CheckBuffer/GetBuffer/ReleaseBuffer` (verified `Py_buffer`
+  layout), and `PyExc_*` singletons with typed `PyErr_SetString` mapping.
+- **Installed extension discovery:** extension lookup also searches
+  `PYTHONPATH`, `PYX_SITE_PACKAGES`, `VIRTUAL_ENV`/`CONDA_PREFIX`
+  site-packages, and wheel-style `<name>.cpython-*.so` filenames.
 - **Stdlib compatibility baseline:** `scripts/stdlib_compat.py` +
   `docs/COMPATIBILITY.md` + `benchmarks/compat/latest.json`; 23 of 297
   CPython 3.14 modules importable on 2026-10-24 (import success only, not
@@ -134,7 +141,7 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   and the loader (`modules/extension.rs`) caches modules by path. `pyx` and AOT
   binaries are linked with `--export-dynamic`; the fixture imports and calls
   under JIT and AOT with no `libpython` (`crates/pyx-cli/tests/extensions.rs`).
-  Open: capsules/buffer protocol, wheels/venvs, full ABI.
+  Open: package submodules, multi-phase init, wheel tag policy, full ABI.
 - **P4-04 decision (2026-10-24): option B** — a PyX-native CPython C-API/ABI
   layer without embedded `libpython`; CPython 3.14 headers/toolchain are used
   at build time and the interpreter as a differential test oracle. Probes:

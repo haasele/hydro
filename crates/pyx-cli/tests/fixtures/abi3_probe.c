@@ -256,6 +256,89 @@ static PyObject *pyx_capi_reverse_bytes(PyObject *self, PyObject *argument) {
     return result;
 }
 
+/*
+ * Capsule and buffer protocol probes. The capsule points at static storage,
+ * so it stays valid for the whole process; the shim never invokes the (NULL)
+ * destructor.
+ */
+static long pyx_capi_capsule_payload = 1234;
+
+static PyObject *pyx_capi_make_capsule(PyObject *self, PyObject *unused) {
+    (void)self;
+    (void)unused;
+    return PyCapsule_New(&pyx_capi_capsule_payload, "pyx.demo", NULL);
+}
+
+static PyObject *pyx_capi_capsule_value(PyObject *self, PyObject *argument) {
+    long *pointer;
+
+    (void)self;
+    if (!PyCapsule_IsValid(argument, "pyx.demo")) {
+        if (PyErr_Occurred() == NULL) {
+            PyErr_SetString(PyExc_TypeError, "expected a 'pyx.demo' capsule");
+        }
+        return NULL;
+    }
+    pointer = (long *)PyCapsule_GetPointer(argument, "pyx.demo");
+    if (pointer == NULL) {
+        return NULL;
+    }
+    return PyLong_FromLong(*pointer);
+}
+
+static PyObject *pyx_capi_buffer_len(PyObject *self, PyObject *argument) {
+    Py_buffer view;
+    long length;
+
+    (void)self;
+    if (!PyObject_CheckBuffer(argument)) {
+        PyErr_SetString(PyExc_TypeError, "a bytes-like object is required");
+        return NULL;
+    }
+    if (PyObject_GetBuffer(argument, &view, PyBUF_SIMPLE) < 0) {
+        return NULL;
+    }
+    length = (long)view.len;
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(length);
+}
+
+static PyObject *pyx_capi_buffer_first(PyObject *self, PyObject *argument) {
+    Py_buffer view;
+    long first = 0;
+
+    (void)self;
+    if (PyObject_GetBuffer(argument, &view, PyBUF_SIMPLE) < 0) {
+        return NULL;
+    }
+    if (view.len > 0) {
+        first = (long)((const unsigned char *)view.buf)[0];
+    }
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(first);
+}
+
+static PyObject *pyx_capi_buffer_sum(PyObject *self, PyObject *argument) {
+    Py_buffer view;
+    Py_ssize_t index;
+    long total = 0;
+
+    (void)self;
+    if (PyObject_GetBuffer(argument, &view, PyBUF_SIMPLE) < 0) {
+        return NULL;
+    }
+    if (view.ndim != 1 || view.itemsize != 1 || !view.readonly) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "unexpected buffer layout");
+        return NULL;
+    }
+    for (index = 0; index < view.len; index++) {
+        total += ((const unsigned char *)view.buf)[index];
+    }
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(total);
+}
+
 static PyMethodDef pyx_capi_methods[] = {
     {
         "add",
@@ -310,6 +393,36 @@ static PyMethodDef pyx_capi_methods[] = {
         pyx_capi_reverse_bytes,
         METH_O,
         "reverse_bytes(b) -> bytes\n\nReturn the argument's bytes in reverse order.",
+    },
+    {
+        "make_capsule",
+        pyx_capi_make_capsule,
+        METH_NOARGS,
+        "make_capsule() -> capsule\n\nReturn a capsule around a static 'pyx.demo' value.",
+    },
+    {
+        "capsule_value",
+        pyx_capi_capsule_value,
+        METH_O,
+        "capsule_value(cap) -> int\n\nValidate a 'pyx.demo' capsule and read its value.",
+    },
+    {
+        "buffer_len",
+        pyx_capi_buffer_len,
+        METH_O,
+        "buffer_len(b) -> int\n\nReturn the length of a bytes buffer.",
+    },
+    {
+        "buffer_first",
+        pyx_capi_buffer_first,
+        METH_O,
+        "buffer_first(b) -> int\n\nReturn the first byte of a bytes buffer.",
+    },
+    {
+        "buffer_sum",
+        pyx_capi_buffer_sum,
+        METH_O,
+        "buffer_sum(b) -> int\n\nSum the bytes of a read-only buffer.",
     },
     {NULL, NULL, 0, NULL},
 };

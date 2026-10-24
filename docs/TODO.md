@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-24 (latest):** 846 tests, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-24 (latest):** 861 tests, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -244,15 +244,15 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-24: 846 tests total — 387 runtime (214 unit, 173 ABI
+      As of 2026-10-24: 861 tests total — 397 runtime (224 unit, 173 ABI
       integration: among others 22 bytes, 19 IO, 14 stdlib modules, 14 stdlib utils,
       12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 260 frontend, 18 codegen, 3 IR, 178 CLI/E2E (135 E2E incl. the
+      tests), 264 frontend, 18 codegen, 3 IR, 179 CLI/E2E (135 E2E incl. the
       abi3 extension fixture, 22 fibers, 6 closures, 5 user modules,
-      extension and completions suites). Property tests open.
+      extension/extension-path and completions suites). Property tests open.
 
 **Acceptance P2:** memory does not grow unboundedly in loop benchmarks; GC tests
 cover cycles; container semantics tested against CPython behavior.
@@ -333,26 +333,32 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       ~0.8–1.0 ms. A stable-ABI probe module builds and imports with just four
       undefined CPython symbols, confirming the loader/shim model. Details in
       [`docs/C_API.md`](C_API.md).
-      - [~] P4-04a `abi3` shim: module init (`PyModule_Create2`), `PyArg_Parse*`,
+      - [x] P4-04a `abi3` shim: module init (`PyModule_Create2`), `PyArg_Parse*`,
         scalar/container constructors, error API, `PyCapsule`, buffer basics.
         **Implemented:** module creation/attributes (`PyModule_AddStringConstant`/
         `AddObject`), scalars (`PyLong_*`, `PyFloat_*`, `PyUnicode_*`,
         `PyBytes_*`), containers (`PyList_*`/`PyTuple_*`/`PyDict_*`),
-        variadic `PyArg_ParseTuple` (`i/l/n/d/s/O/p`, `|`, `:`/`;`), refcount
-        entry points, `PyErr_*` basics, symbol anchor and C-variadic glue.
-        Gate proven for the fixture:
+        capsules (`PyCapsule_New/GetPointer/GetName/IsValid/SetPointer`),
+        read-only contiguous bytes buffer (`PyObject_CheckBuffer/GetBuffer/
+        ReleaseBuffer`), variadic `PyArg_ParseTuple` (`i/l/n/d/s/O/p`, `|`,
+        `:`/`;`), refcount entry points, `PyErr_*` + `PyExc_*` singletons,
+        symbol anchor and C-variadic glue. Gate proven for the fixture:
         `pyx_capi_probe.abi3.so` imports/calls under JIT and AOT, and neither
         the CLI nor the AOT binary links `libpython`
-        (`crates/pyx-cli/tests/extensions.rs`). Open: `PyCapsule`, buffer
-        protocol, broader format units and exception-type mapping.
+        (`crates/pyx-cli/tests/extensions.rs`). This is the defined limited-API
+        subset; additional `abi3` symbols required by real extensions are
+        driven by P4-10.
       - [~] P4-04b Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags,
         package submodules, multi-phase init, clear init-failure errors.
         **Implemented:** compile-time discovery of `<name>.so`/`<name>.abi3.so`/
         `<name>.*.so` next to the source, lazy per-path load/caching,
         `PyInit_<name>` resolution, symbol resolution from the `pyx` process,
         callable values via `pyx_getattr`/`pyx_call`, and clear
-        init/attribute/argument errors. Open: wheel ABI tags and venv
-        `site-packages` discovery, package submodules, multi-phase init.
+        init/attribute/argument errors. Discovery also searches
+        `PYX_EXTENSION_PATH`, `PYTHONPATH`, `PYX_SITE_PACKAGES` and
+        `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages (wheel-style
+        `<name>.cpython-*.so` names included). Open: package submodules,
+        multi-phase init and the `abi3`/wheel tag policy.
       - [ ] P4-04c Full CPython 3.14 ABI: `PyTypeObject` layout, refcounted
         `PyObject` handles over PyX objects, vectorcall, full buffer protocol,
         `PyType_FromSpec`, GC traverse/clear integration.
@@ -360,10 +366,12 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       - [ ] P4-04d GIL emulation at extension boundaries and callback safety.
         Gate: threaded extension callbacks under GC stress without
         deadlock/data race.
-- [ ] P4-05 Native extension loading (`.so`) + wheel support.
-      Load manylinux wheels from a venv, resolve CPython symbols from the PyX
-      shim, support package submodules and ABI tags; explicit errors for
-      unsupported wheel ABIs. Depends on P4-04a/b.
+- [~] P4-05 Native extension loading (`.so`) + wheel support.
+      **Implemented:** `.so` loading, sibling/`PYX_EXTENSION_PATH`/`PYTHONPATH`/
+      venv `site-packages` discovery, wheel-style filenames, symbol resolution
+      from the PyX shim, explicit init/ABI errors. Open: package submodules
+      (`pkg/_ext.so`), multi-phase init and a wheel ABI-tag policy. Depends on
+      P4-04a/b.
 - [ ] P4-06 `ctypes`/`cffi` boundaries.
       `ctypes.CDLL` on libc and `cffi` ABI-mode smoke; pointer/struct/array
       conversion rules documented. Depends on P4-04a.

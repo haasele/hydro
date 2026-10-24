@@ -79,7 +79,8 @@ repository root.
         │       └── commands/  new, init, check, run, build, test, fmt,
         │                      lint, clean, doctor, help, uv, spawn, scan,
         │                      completions; `gc.rs` = `pyx gc`
-        └── tests/             E2E, fibers, closures, user modules, extensions
+        └── tests/             E2E, fibers, closures, user modules, extensions,
+                               extension paths, completions
                                (+ fixtures/abi3_probe.c)
 ```
 

@@ -28,11 +28,22 @@
 //!   pointer therefore cannot dangle, at the cost of retaining all objects
 //!   until the process exits. `m_free`/`m_clear` module hooks are not run.
 //! - **Values are limited** to the `ShimValue` variants (scalars, bytes,
-//!   strings and lists/tuples/dicts of them). Container arguments are copied
-//!   into the shim object graph and container results are copied back into
-//!   fresh PyX containers; nothing is shared across the boundary. Returning
-//!   any other value from an extension is reported as an error rather than
-//!   converted.
+//!   strings, capsules and lists/tuples/dicts of them). Container arguments
+//!   are copied into the shim object graph and container results are copied
+//!   back into fresh PyX containers; nothing is shared across the boundary.
+//!   Returning any other value from an extension is reported as an error
+//!   rather than converted.
+//! - **Capsules** carry an opaque `void *` and an optional name. The
+//!   destructor is stored but never invoked, because arena objects are never
+//!   finalized; an extension that relies on capsule finalization is
+//!   unsupported.
+//! - **Exception types** are exported as the usual `PyExc_*` data symbols so
+//!   extension code can pass them to `PyErr_SetString`. Their names select
+//!   the exception category the loader reports; `BaseException`/`Exception`
+//!   fall back to `RuntimeError`.
+//! - **Buffers** are read-only, contiguous bytes only: `PyObject_CheckBuffer`,
+//!   `PyObject_GetBuffer` and `PyBuffer_Release` exist, `Py_buffer` mirrors
+//!   CPython 3.14 x86_64, and any other object is a `TypeError`.
 //! - **Dict keys** are compared structurally for the scalar types the shim
 //!   supports (identity first, then type/value); there is no `__hash__` or
 //!   `__eq__` dispatch.
@@ -97,6 +108,49 @@ pub(crate) struct PyMethodDefMirror {
     ml_doc: *const c_char,
 }
 
+/// Mirrors `Py_buffer` from CPython 3.14 on x86_64 (`pybuffer.h`).
+///
+/// The layout and size are part of the stable ABI: a mismatch would corrupt
+/// every extension that fills in a buffer view, so the sizes and offsets are
+/// asserted at compile time below.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub(crate) struct Py_buffer {
+    pub(crate) buf: *mut c_void,
+    pub(crate) obj: *mut ShimObject,
+    pub(crate) len: isize,
+    pub(crate) itemsize: isize,
+    pub(crate) readonly: c_int,
+    pub(crate) ndim: c_int,
+    pub(crate) format: *mut c_char,
+    pub(crate) shape: *mut isize,
+    pub(crate) strides: *mut isize,
+    pub(crate) suboffsets: *mut isize,
+    pub(crate) internal: *mut c_void,
+}
+
+// CPython 3.14 x86_64: eleven fields, 80 bytes, no padding surprises. The
+// 64-bit gate keeps other pointer widths buildable, though only x86_64 is
+// claimed as supported here.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<Py_buffer>() == 80);
+    assert!(std::mem::offset_of!(Py_buffer, buf) == 0);
+    assert!(std::mem::offset_of!(Py_buffer, obj) == 8);
+    assert!(std::mem::offset_of!(Py_buffer, len) == 16);
+    assert!(std::mem::offset_of!(Py_buffer, itemsize) == 24);
+    assert!(std::mem::offset_of!(Py_buffer, readonly) == 32);
+    assert!(std::mem::offset_of!(Py_buffer, ndim) == 36);
+    assert!(std::mem::offset_of!(Py_buffer, format) == 40);
+    assert!(std::mem::offset_of!(Py_buffer, shape) == 48);
+    assert!(std::mem::offset_of!(Py_buffer, strides) == 56);
+    assert!(std::mem::offset_of!(Py_buffer, suboffsets) == 64);
+    assert!(std::mem::offset_of!(Py_buffer, internal) == 72);
+};
+
+/// `PyBUF_WRITABLE`: the only request bit this read-only shim rejects.
+const PYBUF_WRITABLE: c_int = 0x0001;
+
 // -------------------------------------------------------------------------
 // Shim values and objects
 // -------------------------------------------------------------------------
@@ -117,6 +171,13 @@ pub(crate) enum ShimValue {
     List(Vec<ShimValue>),
     Tuple(Vec<ShimValue>),
     Dict(Vec<(ShimValue, ShimValue)>),
+    /// Opaque pointer capsule. The pointer belongs to the extension; this
+    /// host only carries it across calls. Destructors are never called in
+    /// this slice, so the capsule's lifetime is the process lifetime.
+    Capsule {
+        ptr: usize,
+        name: Option<String>,
+    },
 }
 
 /// A snapshot of a module attribute that denotes one of the module's methods.
@@ -166,6 +227,20 @@ enum ShimKind {
     List(Vec<usize>),
     Tuple(Vec<usize>),
     Dict(Vec<(usize, usize)>),
+    /// `name` is kept as a `CString` so `PyCapsule_GetName` can hand out a
+    /// stable `const char *`. `destructor` is stored for API fidelity but is
+    /// never invoked (documented slice limitation).
+    Capsule {
+        ptr: usize,
+        name: Option<CString>,
+        destructor: usize,
+    },
+    /// Exported `PyExc_<Name>` singleton. It is a data symbol for extensions
+    /// (`PyErr_SetString` reads its name), never a Python value that crosses
+    /// back to user code.
+    ErrorType {
+        name: String,
+    },
     Module(u64),
     Error,
 }
@@ -211,6 +286,81 @@ fn new_object(kind: ShimKind) -> *mut ShimObject {
     pointer
 }
 
+/// Declares the `PyExc_<Name>` data symbols exposed to extensions.
+///
+/// Extensions reference these as `PyObject *` globals (for example
+/// `PyErr_SetString(PyExc_ValueError, ...)`), so each symbol must be exported
+/// and populated before any extension initializer runs. They are not Python
+/// values: only [`PyErr_SetString`] inspects them, to derive the exception
+/// category.
+macro_rules! exception_type_symbols {
+    ($($symbol:ident => $name:literal),+ $(,)?) => {
+        $(
+            /// Exported CPython exception-type singleton.
+            #[no_mangle]
+            pub static mut $symbol: *mut ShimObject = ptr::null_mut();
+        )+
+
+        /// Populates every exported exception singleton, exactly once.
+        fn initialize_exception_types() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| unsafe {
+                $(
+                    $symbol = new_object(ShimKind::ErrorType {
+                        name: $name.to_string(),
+                    });
+                )+
+            });
+        }
+
+        /// References every singleton so the staticlib linker keeps the data.
+        fn anchor_exception_types() {
+            let symbols = [$(
+                std::ptr::addr_of_mut!($symbol),
+            )+];
+            let _ = std::hint::black_box(symbols);
+        }
+    };
+}
+
+exception_type_symbols! {
+    PyExc_BaseException => "BaseException",
+    PyExc_Exception => "Exception",
+    PyExc_TypeError => "TypeError",
+    PyExc_ValueError => "ValueError",
+    PyExc_RuntimeError => "RuntimeError",
+    PyExc_AttributeError => "AttributeError",
+    PyExc_IndexError => "IndexError",
+    PyExc_KeyError => "KeyError",
+    PyExc_OverflowError => "OverflowError",
+    PyExc_ZeroDivisionError => "ZeroDivisionError",
+    PyExc_StopIteration => "StopIteration",
+    PyExc_OSError => "OSError",
+}
+
+/// Maps an exported exception singleton to the loader's message prefix.
+///
+/// `BaseException`, `Exception`, NULL and any unknown object have no dedicated
+/// PyX tag and therefore fall back to `RuntimeError`.
+fn exception_prefix(exception: *mut ShimObject) -> &'static str {
+    match kind_ref(exception) {
+        Some(ShimKind::ErrorType { name }) => match name.as_str() {
+            "TypeError" => "TypeError",
+            "ValueError" => "ValueError",
+            "RuntimeError" => "RuntimeError",
+            "AttributeError" => "AttributeError",
+            "IndexError" => "IndexError",
+            "KeyError" => "KeyError",
+            "OverflowError" => "OverflowError",
+            "ZeroDivisionError" => "ZeroDivisionError",
+            "StopIteration" => "StopIteration",
+            "OSError" => "OSError",
+            _ => "RuntimeError",
+        },
+        _ => "RuntimeError",
+    }
+}
+
 /// Turns a contract value into a fresh shim object.
 fn value_object(value: ShimValue) -> *mut ShimObject {
     let kind = match value {
@@ -249,6 +399,13 @@ fn value_object(value: ShimValue) -> *mut ShimObject {
                 .map(|(key, value)| (value_object(key) as usize, value_object(value) as usize))
                 .collect(),
         ),
+        ShimValue::Capsule { ptr, name } => ShimKind::Capsule {
+            ptr,
+            // Capsule names are C strings; an embedded NUL (possible in a
+            // PyX string) drops the name, matching the NULL-name case.
+            name: name.and_then(|name| CString::new(name).ok()),
+            destructor: 0,
+        },
     };
     new_object(kind)
 }
@@ -339,6 +496,15 @@ fn object_to_value_at(
         ShimKind::Module(_) => {
             Err("extension returned a module object, which is not supported".to_string())
         }
+        ShimKind::Capsule { ptr, name, .. } => Ok(ShimValue::Capsule {
+            ptr: *ptr,
+            name: name
+                .as_ref()
+                .map(|name| name.to_string_lossy().into_owned()),
+        }),
+        ShimKind::ErrorType { name } => Err(format!(
+            "extension returned the exception type '{name}', which is not supported"
+        )),
         ShimKind::Error => Err("extension returned an error object".to_string()),
     }
 }
@@ -467,6 +633,8 @@ fn as_predicate(object: *mut ShimObject) -> Result<bool, String> {
         ShimKind::List(items) => !items.is_empty(),
         ShimKind::Tuple(items) => !items.is_empty(),
         ShimKind::Dict(pairs) => !pairs.is_empty(),
+        ShimKind::Capsule { .. } => true,
+        ShimKind::ErrorType { .. } => true,
         ShimKind::Module(_) | ShimKind::Error => true,
     })
 }
@@ -1228,6 +1396,243 @@ pub extern "C" fn PyBytes_Size(object: *mut ShimObject) -> isize {
     }
 }
 
+/// Borrows a capsule's pointer, name and stored destructor.
+///
+/// No error is set here; each entry point maps the failure to its own message.
+fn capsule_fields(
+    object: *mut ShimObject,
+) -> Result<(usize, Option<&'static CString>, usize), String> {
+    if object.is_null() {
+        return Err("TypeError: a capsule object is required, got NULL".to_string());
+    }
+    // SAFETY: every shim object lives in the arena for the process lifetime.
+    match unsafe { &(*object).kind } {
+        ShimKind::Capsule {
+            ptr,
+            name,
+            destructor,
+        } => Ok((*ptr, name.as_ref(), *destructor)),
+        _ => Err("TypeError: a capsule object is required".to_string()),
+    }
+}
+
+/// `PyCapsule_New`: creates a capsule around an extension-owned pointer.
+///
+/// The destructor is stored but never called: arena objects are not
+/// finalized in this slice.
+#[no_mangle]
+pub extern "C" fn PyCapsule_New(
+    pointer: *mut c_void,
+    name: *const c_char,
+    destructor: *mut c_void,
+) -> *mut ShimObject {
+    if pointer.is_null() {
+        set_error("ValueError: PyCapsule_New called with a NULL pointer");
+        return ptr::null_mut();
+    }
+    let name = if name.is_null() {
+        None
+    } else {
+        // `read_c_string` stops at the first NUL, so a `CString` cannot fail
+        // here.
+        CString::new(read_c_string(name)).ok()
+    };
+    new_object(ShimKind::Capsule {
+        ptr: pointer as usize,
+        name,
+        destructor: destructor as usize,
+    })
+}
+
+/// `PyCapsule_GetPointer`: returns the stored pointer after validating the
+/// capsule and its name.
+///
+/// Both the argument name and the stored name must be NULL, or both must be
+/// present and equal; anything else reports a `ValueError`.
+#[no_mangle]
+pub extern "C" fn PyCapsule_GetPointer(
+    capsule: *mut ShimObject,
+    name: *const c_char,
+) -> *mut c_void {
+    let (pointer, stored, _) = match capsule_fields(capsule) {
+        Ok(fields) => fields,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let problem = match (name.is_null(), stored) {
+        (true, None) => None,
+        (true, Some(_)) => Some("PyCapsule_GetPointer called with no name, but capsule has a name"),
+        (false, None) => Some("PyCapsule_GetPointer called with a name, but capsule has no name"),
+        (false, Some(stored)) => {
+            // SAFETY: the CPython contract requires a NUL-terminated name.
+            let requested = unsafe { CStr::from_ptr(name) };
+            (requested != stored.as_c_str())
+                .then_some("PyCapsule_GetPointer called with an incorrect name")
+        }
+    };
+    if let Some(problem) = problem {
+        set_error(format!("ValueError: {problem}"));
+        return ptr::null_mut();
+    }
+    if pointer == 0 {
+        set_error("ValueError: capsule pointer is NULL");
+        return ptr::null_mut();
+    }
+    pointer as *mut c_void
+}
+
+/// `PyCapsule_GetName`: borrowed capsule name, or NULL for an unnamed capsule.
+#[no_mangle]
+pub extern "C" fn PyCapsule_GetName(capsule: *mut ShimObject) -> *const c_char {
+    match capsule_fields(capsule) {
+        Ok((_, Some(name), _)) => name.as_ptr(),
+        Ok((_, None, _)) => ptr::null(),
+        Err(error) => {
+            set_error(error);
+            ptr::null()
+        }
+    }
+}
+
+/// `PyCapsule_IsValid`: 1 when the capsule is valid and its name matches.
+///
+/// A NULL `name` only matches an unnamed capsule. Unlike the getters this
+/// predicate never sets a pending error.
+#[no_mangle]
+pub extern "C" fn PyCapsule_IsValid(capsule: *mut ShimObject, name: *const c_char) -> c_int {
+    let Ok((pointer, stored, _)) = capsule_fields(capsule) else {
+        return 0;
+    };
+    if pointer == 0 {
+        return 0;
+    }
+    let matches = match (name.is_null(), stored) {
+        (true, None) => true,
+        (false, Some(stored)) => {
+            // SAFETY: the CPython contract requires a NUL-terminated name.
+            let requested = unsafe { CStr::from_ptr(name) };
+            requested == stored.as_c_str()
+        }
+        _ => false,
+    };
+    matches as c_int
+}
+
+/// `PyCapsule_SetPointer`: replaces the stored pointer; NULL is rejected.
+#[no_mangle]
+pub extern "C" fn PyCapsule_SetPointer(capsule: *mut ShimObject, pointer: *mut c_void) -> c_int {
+    if pointer.is_null() {
+        set_error("ValueError: PyCapsule_SetPointer called with a NULL pointer");
+        return -1;
+    }
+    if capsule.is_null() {
+        set_error("TypeError: a capsule object is required, got NULL");
+        return -1;
+    }
+    // SAFETY: every shim object lives in the arena for the process lifetime.
+    match unsafe { &mut (*capsule).kind } {
+        ShimKind::Capsule { ptr, .. } => {
+            *ptr = pointer as usize;
+            0
+        }
+        _ => {
+            set_error("TypeError: a capsule object is required");
+            -1
+        }
+    }
+}
+
+/// `PyObject_CheckBuffer`: 1 for a shim bytes object, 0 otherwise.
+///
+/// This slice implements only a read-only, contiguous bytes buffer.
+#[no_mangle]
+pub extern "C" fn PyObject_CheckBuffer(object: *mut ShimObject) -> c_int {
+    matches!(kind_ref(object), Some(ShimKind::Bytes { .. })) as c_int
+}
+
+/// `PyObject_GetBuffer`: fills a `Py_buffer` view over a shim bytes object.
+///
+/// Only bytes are supported. The view is one-dimensional, contiguous and
+/// read-only (`format = "B"`, `itemsize = 1`); shape/strides/suboffsets are
+/// NULL because `ndim == 1` needs none of them.
+#[no_mangle]
+pub extern "C" fn PyObject_GetBuffer(
+    object: *mut ShimObject,
+    view: *mut Py_buffer,
+    flags: c_int,
+) -> c_int {
+    if view.is_null() {
+        set_error("TypeError: PyObject_GetBuffer: view is NULL");
+        return -1;
+    }
+    if flags & PYBUF_WRITABLE != 0 {
+        set_error("BufferError: bytes buffers are read-only");
+        return -1;
+    }
+    let data = match bytes_data(object) {
+        Ok(data) => data,
+        Err(error) => {
+            set_error(error);
+            return -1;
+        }
+    };
+    // `len` is a `Py_ssize_t`; a bytes object longer than that cannot be
+    // represented, and `py_ssize_of` saturates instead of wrapping.
+    let length = py_ssize_of(data.len());
+    // SAFETY: `view` was checked for NULL and points at caller-owned storage
+    // of at least `sizeof(Py_buffer)` bytes, as required by the C API.
+    unsafe {
+        view.write(Py_buffer {
+            // The bytes payload lives in the arena for the process lifetime,
+            // so the pointer stays valid until `PyBuffer_Release` at the
+            // earliest. Casting away const is sound because `readonly` is 1
+            // and this host never writes through the view.
+            buf: data.as_ptr() as *mut c_void,
+            obj: object,
+            len: length,
+            itemsize: 1,
+            readonly: 1,
+            ndim: 1,
+            // `c"B"` is a static, NUL-terminated format string.
+            format: c"B".as_ptr() as *mut c_char,
+            shape: ptr::null_mut(),
+            strides: ptr::null_mut(),
+            suboffsets: ptr::null_mut(),
+            internal: ptr::null_mut(),
+        });
+    }
+    0
+}
+
+/// `PyBuffer_Release`: drops a view obtained from [`PyObject_GetBuffer`].
+///
+/// The bytes payload is arena-owned, so releasing only needs to clear the
+/// caller's fields; nothing is freed and no error can be pending.
+#[no_mangle]
+pub extern "C" fn PyBuffer_Release(view: *mut Py_buffer) {
+    if view.is_null() {
+        return;
+    }
+    // SAFETY: `view` is non-NULL and points at the caller's live `Py_buffer`.
+    unsafe {
+        view.write(Py_buffer {
+            buf: ptr::null_mut(),
+            obj: ptr::null_mut(),
+            len: 0,
+            itemsize: 0,
+            readonly: 0,
+            ndim: 0,
+            format: ptr::null_mut(),
+            shape: ptr::null_mut(),
+            strides: ptr::null_mut(),
+            suboffsets: ptr::null_mut(),
+            internal: ptr::null_mut(),
+        });
+    }
+}
+
 /// `PyList_New`: creates a list whose slots start out uninitialized.
 #[no_mangle]
 pub extern "C" fn PyList_New(size: isize) -> *mut ShimObject {
@@ -1593,18 +1998,20 @@ pub extern "C" fn PyErr_Occurred() -> *mut ShimObject {
     *SENTINEL as *mut ShimObject
 }
 
-/// `PyErr_SetString`: records the message of a pending error.
+/// `PyErr_SetString`: records the message of a pending error, tagged with the
+/// exception category taken from the `PyExc_*` singleton.
 ///
-/// The exception type is accepted for signature compatibility and ignored;
-/// this host only preserves the message.
+/// The loader classifier (`modules::extension::raised_error`) turns the
+/// `"<Type>: "` prefix into the matching PyX exception tag. A NULL or
+/// unknown exception object falls back to `RuntimeError`.
 #[no_mangle]
-pub extern "C" fn PyErr_SetString(_exception: *mut ShimObject, message: *const c_char) {
+pub extern "C" fn PyErr_SetString(exception: *mut ShimObject, message: *const c_char) {
     let text = if message.is_null() {
         "extension error".to_string()
     } else {
         read_c_string(message)
     };
-    set_error(text);
+    set_error(format!("{}: {text}", exception_prefix(exception)));
 }
 
 /// `PyErr_Clear`: drops the pending error.
@@ -1761,7 +2168,12 @@ extern "C" {
 /// linker would drop the otherwise unreachable object files, leaving
 /// `dlopen`ed extensions with unresolved `Py*` symbols.
 pub(crate) fn anchor() {
-    let symbols: [*const (); 45] = [
+    // Data symbols must already be non-NULL when an extension initializer
+    // evaluates `PyExc_*`, and the addresses must be referenced so the
+    // staticlib linker does not drop them.
+    initialize_exception_types();
+    anchor_exception_types();
+    let symbols: [*const (); 53] = [
         PyModule_Create2 as *const (),
         PyModule_AddStringConstant as *const (),
         PyModule_AddObject as *const (),
@@ -1774,6 +2186,14 @@ pub(crate) fn anchor() {
         PyBytes_FromStringAndSize as *const (),
         PyBytes_AsString as *const (),
         PyBytes_Size as *const (),
+        PyCapsule_New as *const (),
+        PyCapsule_GetPointer as *const (),
+        PyCapsule_GetName as *const (),
+        PyCapsule_IsValid as *const (),
+        PyCapsule_SetPointer as *const (),
+        PyObject_CheckBuffer as *const (),
+        PyObject_GetBuffer as *const (),
+        PyBuffer_Release as *const (),
         PyList_New as *const (),
         PyList_Size as *const (),
         PyList_GetItem as *const (),
@@ -1886,6 +2306,197 @@ mod tests {
             assert_eq!(*pointer.add(1), b'i' as c_char);
             assert_eq!(*pointer.add(2), 0);
         }
+    }
+
+    #[test]
+    fn capsule_roundtrip_preserves_pointer_and_name() {
+        clear_error();
+        static VALUE: i64 = 1234;
+        static OTHER: i64 = 99;
+        let pointer = &VALUE as *const i64 as *mut c_void;
+        let capsule = PyCapsule_New(pointer, c"pyx.demo".as_ptr(), ptr::null_mut());
+        assert!(!capsule.is_null());
+        assert!(!error_pending());
+
+        // The value round trip carries the same pointer and name.
+        match object_to_value(capsule) {
+            Ok(ShimValue::Capsule {
+                ptr: value,
+                name: Some(name),
+            }) => {
+                assert_eq!(value, pointer as usize);
+                assert_eq!(name, "pyx.demo");
+            }
+            other => panic!("unexpected capsule conversion: {other:?}"),
+        }
+
+        // The pointer and name are retrievable through the C API.
+        assert_eq!(PyCapsule_GetPointer(capsule, c"pyx.demo".as_ptr()), pointer);
+        assert!(!error_pending());
+        // SAFETY: the capsule owns a `CString` that lives in the arena.
+        let name = PyCapsule_GetName(capsule);
+        assert_eq!(unsafe { CStr::from_ptr(name) }, c"pyx.demo");
+        assert_eq!(PyCapsule_IsValid(capsule, c"pyx.demo".as_ptr()), 1);
+        assert_eq!(PyCapsule_IsValid(capsule, c"other".as_ptr()), 0);
+        assert_eq!(PyCapsule_IsValid(capsule, ptr::null()), 0);
+        assert!(!error_pending(), "IsValid must not leave an error behind");
+
+        // Name mismatches, unnamed lookups and NULL capsules are errors.
+        assert!(PyCapsule_GetPointer(capsule, c"other".as_ptr()).is_null());
+        assert!(error_pending());
+        clear_error();
+        assert!(PyCapsule_GetPointer(capsule, ptr::null()).is_null());
+        assert!(error_pending());
+        clear_error();
+        assert!(PyCapsule_GetPointer(ptr::null_mut(), c"pyx.demo".as_ptr()).is_null());
+        assert!(error_pending());
+        clear_error();
+        assert!(PyCapsule_New(ptr::null_mut(), c"pyx.demo".as_ptr(), ptr::null_mut()).is_null());
+        assert!(error_pending());
+        clear_error();
+
+        // SetPointer replaces the payload but keeps the name.
+        let replacement = &OTHER as *const i64 as *mut c_void;
+        assert_eq!(PyCapsule_SetPointer(capsule, replacement), 0);
+        assert_eq!(
+            PyCapsule_GetPointer(capsule, c"pyx.demo".as_ptr()),
+            replacement
+        );
+        assert_eq!(PyCapsule_SetPointer(capsule, ptr::null_mut()), -1);
+        assert!(error_pending());
+        clear_error();
+    }
+
+    #[test]
+    fn unnamed_capsules_report_a_null_name() {
+        clear_error();
+        static VALUE: i64 = 7;
+        let pointer = &VALUE as *const i64 as *mut c_void;
+        let capsule = PyCapsule_New(pointer, ptr::null(), ptr::null_mut());
+        assert!(!capsule.is_null());
+        assert!(PyCapsule_GetName(capsule).is_null());
+        assert_eq!(PyCapsule_GetPointer(capsule, ptr::null()), pointer);
+        assert_eq!(PyCapsule_IsValid(capsule, ptr::null()), 1);
+        assert_eq!(PyCapsule_IsValid(capsule, c"named".as_ptr()), 0);
+        match object_to_value(capsule) {
+            Ok(ShimValue::Capsule {
+                ptr: value,
+                name: None,
+            }) => {
+                assert_eq!(value, pointer as usize);
+            }
+            other => panic!("unexpected capsule conversion: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bytes_buffer_fields_match_cpython() {
+        clear_error();
+        let bytes = PyBytes_FromStringAndSize(b"hello".as_ptr() as *const c_char, 5);
+        assert!(!bytes.is_null());
+        assert_eq!(PyObject_CheckBuffer(bytes), 1);
+        assert_eq!(PyObject_CheckBuffer(PyLong_FromLong(1)), 0);
+
+        // SAFETY: a zeroed `Py_buffer` is a valid bit pattern for every field
+        // (raw pointers and integers); `GetBuffer` overwrites it completely.
+        let mut view: Py_buffer = unsafe { std::mem::zeroed() };
+        assert_eq!(PyObject_GetBuffer(bytes, &mut view, 0), 0);
+        assert!(!error_pending());
+        assert_eq!(view.obj, bytes);
+        assert_eq!(view.len, 5);
+        assert_eq!(view.itemsize, 1);
+        assert_eq!(view.readonly, 1);
+        assert_eq!(view.ndim, 1);
+        assert!(view.shape.is_null());
+        assert!(view.strides.is_null());
+        assert!(view.suboffsets.is_null());
+        assert!(view.internal.is_null());
+        assert!(!view.format.is_null());
+        // SAFETY: `format` points at the static `c"B"` literal.
+        assert_eq!(unsafe { CStr::from_ptr(view.format) }, c"B");
+        // SAFETY: `buf` addresses the bytes payload (5 readable bytes).
+        let copied = unsafe { std::slice::from_raw_parts(view.buf as *const u8, 5) };
+        assert_eq!(copied, b"hello");
+
+        PyBuffer_Release(&mut view);
+        assert!(view.buf.is_null());
+        assert!(view.obj.is_null());
+        assert_eq!(view.len, 0);
+        assert_eq!(view.itemsize, 0);
+        assert_eq!(view.readonly, 0);
+        assert_eq!(view.ndim, 0);
+        assert!(view.format.is_null());
+    }
+
+    #[test]
+    fn buffer_requests_reject_unsupported_objects() {
+        clear_error();
+        let mut view: Py_buffer = unsafe { std::mem::zeroed() };
+        assert_eq!(PyObject_GetBuffer(PyLong_FromLong(3), &mut view, 0), -1);
+        assert!(error_pending());
+        clear_error();
+        assert_eq!(PyObject_GetBuffer(ptr::null_mut(), &mut view, 0), -1);
+        assert!(error_pending());
+        clear_error();
+        let bytes = PyBytes_FromStringAndSize(b"x".as_ptr() as *const c_char, 1);
+        assert_eq!(PyObject_GetBuffer(bytes, ptr::null_mut(), 0), -1);
+        assert!(error_pending());
+        clear_error();
+        assert_eq!(PyObject_GetBuffer(bytes, &mut view, PYBUF_WRITABLE), -1);
+        assert!(error_pending());
+        clear_error();
+        // Releasing a NULL view is a no-op.
+        PyBuffer_Release(ptr::null_mut());
+    }
+
+    #[test]
+    fn exported_exception_singletons_are_initialized_once() {
+        anchor();
+        let symbols = unsafe {
+            [
+                PyExc_BaseException,
+                PyExc_Exception,
+                PyExc_TypeError,
+                PyExc_ValueError,
+                PyExc_RuntimeError,
+                PyExc_AttributeError,
+                PyExc_IndexError,
+                PyExc_KeyError,
+                PyExc_OverflowError,
+                PyExc_ZeroDivisionError,
+                PyExc_StopIteration,
+                PyExc_OSError,
+            ]
+        };
+        for symbol in symbols {
+            assert!(!symbol.is_null());
+        }
+        // A second anchor pass must not recreate the singletons.
+        let first = unsafe { PyExc_TypeError };
+        anchor();
+        assert_eq!(unsafe { PyExc_TypeError }, first);
+    }
+
+    #[test]
+    fn pyerr_setstring_prefixes_the_exception_name() {
+        anchor();
+        clear_error();
+        PyErr_SetString(unsafe { PyExc_ValueError }, c"bad value".as_ptr());
+        assert_eq!(take_error().as_deref(), Some("ValueError: bad value"));
+        PyErr_SetString(unsafe { PyExc_KeyError }, c"missing".as_ptr());
+        assert_eq!(take_error().as_deref(), Some("KeyError: missing"));
+        PyErr_SetString(unsafe { PyExc_OSError }, c"io".as_ptr());
+        assert_eq!(take_error().as_deref(), Some("OSError: io"));
+        // NULL, non-exception objects and the tag-less base types fall back.
+        PyErr_SetString(ptr::null_mut(), c"boom".as_ptr());
+        assert_eq!(take_error().as_deref(), Some("RuntimeError: boom"));
+        PyErr_SetString(unsafe { PyExc_BaseException }, c"base".as_ptr());
+        assert_eq!(take_error().as_deref(), Some("RuntimeError: base"));
+        PyErr_SetString(unsafe { PyExc_Exception }, c"generic".as_ptr());
+        assert_eq!(take_error().as_deref(), Some("RuntimeError: generic"));
+        PyErr_SetString(PyLong_FromLong(1), c"odd".as_ptr());
+        assert_eq!(take_error().as_deref(), Some("RuntimeError: odd"));
+        assert!(!error_pending());
     }
 
     #[test]

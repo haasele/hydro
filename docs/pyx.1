@@ -271,12 +271,19 @@ When set, colored diagnostics are disabled unless
 .B \-\-color=always
 is given.
 .TP
-.B PYX_EXTENSION_PATH
-A path list of directories searched for compiled extension modules
+.B PYX_EXTENSION_PATH, PYTHONPATH, PYX_SITE_PACKAGES
+Path lists of directories searched for compiled extension modules
 .RI ( name .so,
 .IR name .abi3.so ,
 .IR name .* .so)
 after the importing source file's own directory.
+.TP
+.B VIRTUAL_ENV, CONDA_PREFIX
+Prefixes of virtual environments whose
+.I lib/python*/site\-packages
+(or
+.IR Lib/site\-packages )
+directories are searched for compiled extension modules.
 .SH FILES
 .TP
 .B .pyx/cache
