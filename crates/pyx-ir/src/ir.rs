@@ -151,6 +151,11 @@ pub enum ExprKind {
         callee: Callee,
         args: Vec<Expr>,
     },
+    /// `await value` inside an `async def` body. The runtime drives the
+    /// awaitable and returns its result.
+    Await {
+        value: Box<Expr>,
+    },
 }
 
 /// Statement node with its source line.
@@ -250,6 +255,12 @@ pub enum StmtKind {
     Break,
     Continue,
     Pass,
+    /// `yield [value]` inside a generator function. Suspends the generator
+    /// fiber until the iterator is advanced again and stores `value` (or
+    /// `None` for a bare yield) as the currently yielded element.
+    Yield {
+        value: Option<Expr>,
+    },
     /// `raise` when both fields are `None` (bare re-raise), otherwise
     /// `raise ExcKind(msg)` or `raise ExcKind`.
     Raise {
@@ -300,6 +311,12 @@ pub struct Function {
     pub ret_ty: Type,
     pub locals: Vec<LocalInfo>,
     pub body: Vec<Stmt>,
+    /// `async def`: calling the function creates a coroutine object instead
+    /// of executing the body.
+    pub is_async: bool,
+    /// The body contains a `yield`: calling the function creates a generator
+    /// object instead of executing the body.
+    pub is_generator: bool,
 }
 
 impl Function {

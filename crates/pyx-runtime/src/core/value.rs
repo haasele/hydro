@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize}
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::container::DictData;
 use crate::exc::ExcData;
 
 /// Mask selecting the representation bits of a tagged value.
@@ -100,6 +101,14 @@ pub(crate) const KIND_SOCKET: u32 = 28;
 pub(crate) const KIND_CLASS: u32 = 29;
 /// Instance of a class. Traces its class and every instance attribute.
 pub(crate) const KIND_INSTANCE: u32 = 30;
+/// Stackful generator/coroutine fiber. Traces its arguments and result; the
+/// suspended stack is registered as a separate GC root.
+pub(crate) const KIND_FIBER: u32 = 31;
+
+/// Function flag: created by `async def`, a call produces a coroutine.
+pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
+/// Function flag: contains `yield`, a call produces a generator.
+pub(crate) const FUNCTION_FLAG_GENERATOR: u32 = 2;
 
 /// Largest integer representable in a tagged immediate (`2^60 - 1`).
 pub(crate) const MAX_INT: i64 = i64::MAX >> 3;
@@ -157,6 +166,9 @@ pub(crate) struct FunctionObj {
     pub(crate) body: FunctionBody,
     pub(crate) arity: usize,
     pub(crate) name: String,
+    /// [`FUNCTION_FLAG_ASYNC`] / [`FUNCTION_FLAG_GENERATOR`] bits for a
+    /// generated wrapper. Native and builtin bodies keep `0`.
+    pub(crate) flags: u32,
 }
 
 /// Ownership state of a runtime lock, guarded by one mutex.
@@ -1402,9 +1414,10 @@ pub(crate) enum ObjData {
     Exception(ExcData),
     /// Insertion-ordered list elements.
     List(Vec<i64>),
-    /// Insertion-ordered `(key, value)` pairs; duplicate keys are collapsed
-    /// by the constructor (last value, first position).
-    Dict(Vec<(i64, i64)>),
+    /// Insertion-ordered `(key, value)` pairs with a hash index over the
+    /// keys; duplicate keys are collapsed by the constructor (last value,
+    /// first position).
+    Dict(DictData),
     /// Active iterator over `target`.
     Iter(Box<IterState>),
     /// Immutable sequence of tagged elements.
@@ -1461,6 +1474,9 @@ pub(crate) enum ObjData {
     Class(ClassState),
     /// Class instance; traces its class and every attribute value.
     Instance(InstanceState),
+    /// Stackful generator/coroutine. Traces its arguments and result; the
+    /// suspended stack is registered as a separate conservative root.
+    Fiber(Box<crate::fiber::FiberState>),
 }
 
 // -------------------------------------------------------------------------
@@ -1875,7 +1891,8 @@ pub(crate) fn as_list(v: i64) -> Option<&'static [i64]> {
     }
 }
 
-pub(crate) fn as_dict(v: i64) -> Option<&'static [(i64, i64)]> {
+/// Borrows a dict's payload (entries plus key index).
+pub(crate) fn as_dict_data(v: i64) -> Option<&'static DictData> {
     if !is_heap(v) {
         return None;
     }
@@ -1886,9 +1903,13 @@ pub(crate) fn as_dict(v: i64) -> Option<&'static [(i64, i64)]> {
         return None;
     }
     match &obj.data {
-        ObjData::Dict(pairs) => Some(pairs.as_slice()),
+        ObjData::Dict(dict) => Some(dict),
         _ => None,
     }
+}
+
+pub(crate) fn as_dict(v: i64) -> Option<&'static [(i64, i64)]> {
+    as_dict_data(v).map(|dict| dict.entries())
 }
 
 pub(crate) fn as_tuple(v: i64) -> Option<&'static [i64]> {
@@ -2137,6 +2158,45 @@ pub(crate) fn as_iter(v: i64) -> Option<&'static IterState> {
     }
 }
 
+/// Borrows the fiber state behind a generator/coroutine object.
+pub(crate) fn as_fiber(v: i64) -> Option<&'static crate::fiber::FiberState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked above; the object is rooted for the duration of
+    // this call (the collector only frees unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_FIBER {
+        return None;
+    }
+    match &obj.data {
+        ObjData::Fiber(state) => Some(state.as_ref()),
+        _ => None,
+    }
+}
+
+/// Exclusive access to a fiber's state. Used by the driver and the iterator
+/// integration; the fiber is owned by the executing program.
+pub(crate) fn fiber_state_mut(v: i64) -> Option<&'static mut crate::fiber::FiberState> {
+    if !is_heap(v) || (v & !TAG_MASK) == 0 {
+        return None;
+    }
+    // SAFETY: heap tag checked above; the fiber is rooted by its caller.
+    let obj = unsafe { &mut *((v & !TAG_MASK) as *mut PyxObj) };
+    if obj.kind != KIND_FIBER {
+        return None;
+    }
+    match &mut obj.data {
+        ObjData::Fiber(state) => Some(state.as_mut()),
+        _ => None,
+    }
+}
+
+/// Raw address of a fiber payload, or `None` for non-fiber values.
+pub(crate) fn fiber_raw(v: i64) -> Option<*mut crate::fiber::FiberState> {
+    fiber_state_mut(v).map(|state| state as *mut crate::fiber::FiberState)
+}
+
 /// Exclusive, graph-locked access to a container payload.
 ///
 /// The guard holds the collector's graph lock for the whole borrow: container
@@ -2235,13 +2295,13 @@ pub(crate) fn list_items_mut(v: i64) -> Option<ContainerGuard<Vec<i64>>> {
     }
 }
 
-/// Returns exclusive access to a dict's pairs. See [`list_items_mut`].
-pub(crate) fn dict_pairs_mut(v: i64) -> Option<ContainerGuard<Vec<(i64, i64)>>> {
+/// Returns exclusive access to a dict's payload. See [`list_items_mut`].
+pub(crate) fn dict_pairs_mut(v: i64) -> Option<ContainerGuard<DictData>> {
     let graph = lock_container(v, KIND_DICT)?;
     // SAFETY: see `list_items_mut`.
     let obj: &'static mut PyxObj = unsafe { &mut *((v & !TAG_MASK) as *mut PyxObj) };
     match &mut obj.data {
-        ObjData::Dict(pairs) => Some(ContainerGuard::new(pairs, graph)),
+        ObjData::Dict(dict) => Some(ContainerGuard::new(dict, graph)),
         _ => None,
     }
 }
@@ -2481,7 +2541,13 @@ pub(crate) fn list_new(items: Vec<i64>) -> i64 {
 }
 
 pub(crate) fn dict_new(pairs: Vec<(i64, i64)>) -> i64 {
-    alloc(KIND_DICT, ObjData::Dict(pairs))
+    dict_new_data(DictData::new(pairs))
+}
+
+/// Allocates a dict from an already indexed payload (the constructor path,
+/// which deduplicates while building the index).
+pub(crate) fn dict_new_data(data: DictData) -> i64 {
+    alloc(KIND_DICT, ObjData::Dict(data))
 }
 
 pub(crate) fn tuple_new(items: Vec<i64>) -> i64 {
@@ -2506,6 +2572,16 @@ pub(crate) fn iter_new(target: i64) -> i64 {
 /// Allocates a function value. `wrapper` is the generated entry point and
 /// must be non-zero; `name` is the Python-visible name.
 pub(crate) fn function_new(wrapper: usize, arity: usize, name: String) -> i64 {
+    function_new_with_flags(wrapper, arity, name, 0)
+}
+
+/// Allocates a function value carrying the given generator/coroutine flags.
+pub(crate) fn function_new_with_flags(
+    wrapper: usize,
+    arity: usize,
+    name: String,
+    flags: u32,
+) -> i64 {
     alloc(
         KIND_FUNCTION,
         ObjData::Function(FunctionObj {
@@ -2515,13 +2591,19 @@ pub(crate) fn function_new(wrapper: usize, arity: usize, name: String) -> i64 {
             },
             arity,
             name,
+            flags,
         }),
     )
 }
 
-/// Allocates a closure value from a generated wrapper and the captured
-/// values. `arity` is the user-visible parameter count.
-pub(crate) fn closure_new(wrapper: usize, arity: usize, name: String, captures: Vec<i64>) -> i64 {
+/// Allocates a closure value carrying the given generator/coroutine flags.
+pub(crate) fn closure_new_with_flags(
+    wrapper: usize,
+    arity: usize,
+    name: String,
+    captures: Vec<i64>,
+    flags: u32,
+) -> i64 {
     alloc(
         KIND_FUNCTION,
         ObjData::Function(FunctionObj {
@@ -2531,6 +2613,7 @@ pub(crate) fn closure_new(wrapper: usize, arity: usize, name: String, captures: 
             },
             arity,
             name,
+            flags,
         }),
     )
 }
@@ -2545,6 +2628,7 @@ pub(crate) fn native_function_new(module: &'static str, name: &'static str, arit
             body: FunctionBody::Native { module, name },
             arity,
             name: name.to_string(),
+            flags: 0,
         }),
     )
 }
@@ -2558,8 +2642,30 @@ pub(crate) fn builtin_function_new(builtin: pyx_ir::Builtin) -> i64 {
             body: FunctionBody::Builtin(builtin),
             arity: usize::MAX,
             name: builtin.name().to_string(),
+            flags: 0,
         }),
     )
+}
+
+/// Creates a lazy generator object. No body code runs until the first
+/// `pyx_iter_next`.
+pub(crate) fn fiber_generator_new(entry: usize, name: String, args: Vec<i64>) -> Option<i64> {
+    fiber_alloc(crate::fiber::FiberKind::Generator, entry, name, args)
+}
+
+/// Creates a coroutine object. No body code runs until the first `await`.
+pub(crate) fn fiber_coroutine_new(entry: usize, name: String, args: Vec<i64>) -> Option<i64> {
+    fiber_alloc(crate::fiber::FiberKind::Coroutine, entry, name, args)
+}
+
+fn fiber_alloc(
+    kind: crate::fiber::FiberKind,
+    entry: usize,
+    name: String,
+    args: Vec<i64>,
+) -> Option<i64> {
+    let state = crate::fiber::FiberState::new(kind, entry, name, args)?;
+    Some(alloc(KIND_FIBER, ObjData::Fiber(state)))
 }
 
 pub(crate) fn exception_new(data: ExcData) -> i64 {
@@ -2785,6 +2891,10 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             Some(ObjData::Socket(_)) => "socket",
             Some(ObjData::Class(_)) => "type",
             Some(ObjData::Instance(_)) => "instance",
+            Some(ObjData::Fiber(state)) => match state.kind {
+                crate::fiber::FiberKind::Generator => "generator",
+                crate::fiber::FiberKind::Coroutine => "coroutine",
+            },
             None => "object",
         };
     }
@@ -2851,6 +2961,8 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjData::Socket(_)) => true,
             // Classes and instances are always truthy (there is no `__bool__`).
             Some(ObjData::Class(_)) | Some(ObjData::Instance(_)) => true,
+            // Generator and coroutine objects are always truthy.
+            Some(ObjData::Fiber(_)) => true,
             None => true,
         };
     }
@@ -2865,6 +2977,19 @@ fn instance_default_repr(state: &InstanceState) -> String {
         .map(|class| class.name.as_str())
         .unwrap_or("instance");
     format!("<{name} object>")
+}
+
+/// CPython-style identity rendering of a generator/coroutine object.
+fn fiber_repr(state: &crate::fiber::FiberState) -> String {
+    let (kind, fallback) = match state.kind {
+        crate::fiber::FiberKind::Generator => ("generator", "<generator object>"),
+        crate::fiber::FiberKind::Coroutine => ("coroutine", "<coroutine object>"),
+    };
+    if state.name.is_empty() {
+        fallback.to_string()
+    } else {
+        format!("<{} object {}>", kind, state.name)
+    }
 }
 
 /// `str()` of any runtime value (used by `print` and `pyx_to_str`).
@@ -2962,6 +3087,7 @@ pub(crate) fn to_string(v: i64) -> String {
                 ObjData::Socket(state) => state.render(),
                 ObjData::Class(state) => format!("<class '{}'>", state.name),
                 ObjData::Instance(state) => instance_default_repr(state),
+                ObjData::Fiber(state) => fiber_repr(state),
             };
         }
     }
@@ -3018,6 +3144,9 @@ fn repr_depth(v: i64, depth: usize) -> String {
     }
     if let Some(state) = as_instance(v) {
         return instance_default_repr(state);
+    }
+    if let Some(state) = as_fiber(v) {
+        return fiber_repr(state);
     }
     if depth >= MAX_REPR_DEPTH {
         return "...".to_string();

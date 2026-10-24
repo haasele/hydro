@@ -36,7 +36,7 @@ fn path(value: &str) -> i64 {
 }
 
 fn function(wrapper: extern "C" fn(*const i64) -> i64, arity: usize, name: &str) -> i64 {
-    pyx_function_new(wrapper as *const u8, arity, name.as_ptr(), name.len())
+    pyx_function_new(wrapper as *const u8, arity, name.as_ptr(), name.len(), 0)
 }
 
 extern "C" fn worker(_argv: *const i64) -> i64 {

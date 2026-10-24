@@ -754,6 +754,40 @@ fn builtin_arity_diagnostics() {
 }
 
 #[test]
+fn iter_and_next_result_types_and_arity() {
+    let source = "a = iter([1, 2])\nb = next(a)\nc = next(a, -1)\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    assert_eq!(assigned_type(&program, 0), Type::Any);
+    assert_eq!(assigned_type(&program, 1), Type::Any);
+    assert_eq!(assigned_type(&program, 2), Type::Any);
+
+    // A statically known non-iterable is rejected by `iter`.
+    assert_eq!(
+        check_errors("x = iter(1)\n"),
+        vec!["iter() argument must be iterable"]
+    );
+    assert_eq!(
+        check_errors("x = iter()\n"),
+        vec!["iter() takes exactly one argument (0 given)"]
+    );
+    assert_eq!(
+        check_errors("x = iter([1], [2])\n"),
+        vec!["iter() takes exactly one argument (2 given)"]
+    );
+    assert_eq!(
+        check_errors("x = next()\n"),
+        vec!["next() takes 1 or 2 positional arguments (0 given)"]
+    );
+    assert_eq!(
+        check_errors("x = next([1], 0, 1)\n"),
+        vec!["next() takes 1 or 2 positional arguments (3 given)"]
+    );
+    // `next` accepts any object statically; non-iterators are a runtime
+    // TypeError (`next([])`).
+    assert!(check_errors("x = next([])\n").is_empty());
+}
+
+#[test]
 fn range_arguments_must_be_ints() {
     assert_eq!(
         check_errors("x = range('x')\n"),
@@ -1117,54 +1151,78 @@ fn program_function<'a>(program: &'a pyx_ir::Program, name: &str) -> &'a pyx_ir:
 }
 
 #[test]
-fn generator_functions_typecheck_as_lists() {
+fn generator_functions_are_marked_and_call_results_are_dynamic() {
     let source = "def g():\n    yield 1\n    yield 2\nxs = list(g())\nprint(xs)\n";
     let program = crate::check_source(source, "test.py").expect("valid generator");
     let g = program_function(&program, "g");
-    assert_eq!(g.ret_ty, Type::List);
+    assert!(g.is_generator);
+    assert!(!g.is_async);
 
-    let last = g.body.last().expect("generator return");
-    assert!(matches!(
-        &last.kind,
-        pyx_ir::StmtKind::Return(Some(value))
-            if matches!(&value.kind, pyx_ir::ExprKind::Local(_))
-    ));
-    let mut appends = 0;
-    for stmt in &g.body {
-        if let pyx_ir::StmtKind::Expr(expr) = &stmt.kind {
-            if let pyx_ir::ExprKind::MethodCall { method, .. } = &expr.kind {
-                assert_eq!(method, "append");
-                appends += 1;
-            }
-        }
-    }
-    assert_eq!(appends, 2);
+    let yields = g
+        .body
+        .iter()
+        .filter(|stmt| matches!(&stmt.kind, pyx_ir::StmtKind::Yield { .. }))
+        .count();
+    assert_eq!(yields, 2, "{:?}", g.body);
+    assert!(
+        !g.body
+            .iter()
+            .any(|stmt| matches!(&stmt.kind, pyx_ir::StmtKind::Return(Some(_)))),
+        "no materialised list return: {:?}",
+        g.body
+    );
+
+    let module = program.main_function();
+    let pyx_ir::StmtKind::Assign { value, .. } = &module.body[0].kind else {
+        panic!("expected an assignment, got {:?}", module.body[0].kind);
+    };
+    let pyx_ir::ExprKind::Call { args, .. } = &value.kind else {
+        panic!("expected list(...), got {:?}", value.kind);
+    };
+    assert_eq!(args[0].ty, Type::Any, "g() is a generator object");
 }
 
 #[test]
-fn async_functions_return_their_value_eagerly() {
+fn async_functions_are_marked_and_call_results_are_dynamic() {
     let source = "import asyncio\nasync def f():\n    return 42\nx = asyncio.run(f())\nprint(x)\n";
     let program = crate::check_source(source, "test.py").expect("valid async function");
     let f = program_function(&program, "f");
+    assert!(f.is_async);
+    assert!(!f.is_generator);
     assert_eq!(f.ret_ty, Type::Int);
     assert!(matches!(&f.body[0].kind, pyx_ir::StmtKind::Return(Some(_))));
-    // `asyncio.run(...)` accepts the plain value the call returned.
+
     let module = program.main_function();
-    assert!(module
+    let assign = module
         .body
         .iter()
-        .any(|stmt| matches!(&stmt.kind, pyx_ir::StmtKind::Assign { .. })));
+        .find(|stmt| matches!(&stmt.kind, pyx_ir::StmtKind::Assign { .. }))
+        .expect("x = asyncio.run(...)");
+    let pyx_ir::StmtKind::Assign { value, .. } = &assign.kind else {
+        unreachable!("filtered above");
+    };
+    let pyx_ir::ExprKind::ModuleCall { function, args, .. } = &value.kind else {
+        panic!("expected asyncio.run(...), got {:?}", value.kind);
+    };
+    assert_eq!(function.as_str(), "run");
+    assert_eq!(args[0].ty, Type::Any, "f() is a coroutine object");
 }
 
 #[test]
-fn await_is_sequential_and_yields_its_operand() {
+fn await_emits_an_await_expression_typed_any() {
     let source = "import asyncio\nasync def inner():\n    return 5\nasync def outer():\n    return await inner()\nprint(asyncio.run(outer()))\n";
     let program = crate::check_source(source, "test.py").expect("valid await");
     let outer = program_function(&program, "outer");
+    assert!(outer.is_async);
     let pyx_ir::StmtKind::Return(Some(value)) = &outer.body[0].kind else {
-        panic!("expected a return statement");
+        panic!("expected a return statement, got {:?}", outer.body[0].kind);
     };
-    assert!(matches!(&value.kind, pyx_ir::ExprKind::Call { .. }));
+    let pyx_ir::ExprKind::Await { value: awaited } = &value.kind else {
+        panic!("expected an await expression, got {:?}", value.kind);
+    };
+    assert!(matches!(&awaited.kind, pyx_ir::ExprKind::Call { .. }));
+    assert_eq!(awaited.ty, Type::Any, "inner() is a coroutine object");
+    assert_eq!(value.ty, Type::Any, "await result is dynamic");
 }
 
 #[test]

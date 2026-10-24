@@ -10,6 +10,8 @@
 //! several threads requires a user lock (`_thread.allocate_lock`); the
 //! runtime only keeps its own registry and heap metadata mutex-protected.
 
+use std::collections::HashMap;
+
 use crate::exc::{self, INDEX_ERROR, KEY_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value::{self, Num, NONE};
 
@@ -58,7 +60,7 @@ pub(crate) fn dict_new(argc: usize, keys: *const i64, values: *const i64) -> i64
             std::slice::from_raw_parts(values, argc),
         )
     };
-    let mut pairs: Vec<(i64, i64)> = Vec::with_capacity(argc);
+    let mut pairs = DictData::new(Vec::new());
     for (key, val) in keys.iter().zip(values.iter()) {
         if let Some(name) = unhashable_name(*key) {
             return exc::raise_with_message(TYPE_ERROR, &unhashable_message(name));
@@ -67,7 +69,7 @@ pub(crate) fn dict_new(argc: usize, keys: *const i64, values: *const i64) -> i64
         // the complete pair list and is born grey while marking is active.
         dict_insert(&mut pairs, *key, *val);
     }
-    value::dict_new(pairs)
+    value::dict_new_data(pairs)
 }
 
 /// `set` literal: dedupes `argc` tagged items while preserving first
@@ -235,8 +237,261 @@ pub(crate) fn unpack(value: i64, expected: usize) -> i64 {
 }
 
 // -------------------------------------------------------------------------
-// Hashing (a linear scan using Python equality; Phase 2.0 has no hash table)
+// Dict payload: insertion-ordered entries plus a hash index
 // -------------------------------------------------------------------------
+
+/// Insertion-ordered `(key, value)` entries with an index over the key hashes.
+///
+/// `entries` is the observable order (iteration, `repr`, `keys()`/`values()`).
+/// `index` maps [`key_hash`] to the positions of the entries sharing that
+/// hash, so a lookup only compares keys inside one bucket. Positions are
+/// stable across overwrites; a removal shifts the later entries and therefore
+/// rebuilds the index.
+pub(crate) struct DictData {
+    entries: Vec<(i64, i64)>,
+    index: HashMap<u64, Vec<u32>>,
+}
+
+impl DictData {
+    /// Builds the payload from `entries`, deduplicating duplicate keys with
+    /// Python equality (first position, last value) so the index is
+    /// consistent with the observable order.
+    pub(crate) fn new(entries: Vec<(i64, i64)>) -> DictData {
+        let mut data = DictData {
+            entries: Vec::with_capacity(entries.len()),
+            index: HashMap::with_capacity(entries.len()),
+        };
+        for (key, value) in entries {
+            data.set(key, value);
+        }
+        data
+    }
+
+    pub(crate) fn entries(&self) -> &[(i64, i64)] {
+        &self.entries
+    }
+
+    /// Position of the entry whose key equals `key` under Python equality.
+    pub(crate) fn find(&self, key: i64) -> Option<usize> {
+        let bucket = self.index.get(&key_hash(key))?;
+        for &position in bucket {
+            let position = position as usize;
+            if equals(self.entries[position].0, key) {
+                return Some(position);
+            }
+        }
+        None
+    }
+
+    /// Overwrites the value of an existing key (keeping its position) or
+    /// appends a new entry. Returns `true` when a new entry was appended.
+    pub(crate) fn set(&mut self, key: i64, value: i64) -> bool {
+        let hash = key_hash(key);
+        if let Some(bucket) = self.index.get(&hash) {
+            for &position in bucket {
+                let entry = &mut self.entries[position as usize];
+                if equals(entry.0, key) {
+                    entry.1 = value;
+                    return false;
+                }
+            }
+        }
+        self.push_entry(hash, key, value);
+        true
+    }
+
+    /// Appends `key` (known to be absent) and indexes its position.
+    fn push_entry(&mut self, hash: u64, key: i64, value: i64) {
+        let position = self.entries.len() as u32;
+        self.entries.push((key, value));
+        self.index.entry(hash).or_default().push(position);
+    }
+
+    /// Removes the entry for `key`, rebuilding the index because the removal
+    /// shifts every later position.
+    pub(crate) fn remove(&mut self, key: i64) -> Option<(i64, i64)> {
+        let position = self.find(key)?;
+        let pair = self.entries.remove(position);
+        self.reindex();
+        Some(pair)
+    }
+
+    /// Drops every entry and clears the index.
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.index.clear();
+    }
+
+    /// Appends every pair with dict semantics (duplicates overwrite in place).
+    pub(crate) fn extend_from_slice(&mut self, pairs: &[(i64, i64)]) {
+        for &(key, value) in pairs {
+            self.set(key, value);
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn reindex(&mut self) {
+        self.index.clear();
+        self.index.reserve(self.entries.len());
+        for (position, (key, _)) in self.entries.iter().enumerate() {
+            self.index
+                .entry(key_hash(*key))
+                .or_default()
+                .push(position as u32);
+        }
+    }
+}
+
+/// Read side of a `(key, value)` table: the hashed [`DictData`] and the plain
+/// pair vectors used by `defaultdict` and structural equality.
+pub(crate) trait PairLookup {
+    /// Position of the entry equal to `key`.
+    fn find_pair(&self, key: i64) -> Option<usize>;
+}
+
+/// Mutation side of a `(key, value)` table.
+pub(crate) trait PairMut: PairLookup {
+    /// Overwrites an existing key in place or appends a new entry. Returns
+    /// `true` when a new entry was appended.
+    fn insert_pair(&mut self, key: i64, value: i64) -> bool;
+}
+
+impl PairLookup for [(i64, i64)] {
+    fn find_pair(&self, key: i64) -> Option<usize> {
+        self.iter().position(|(stored, _)| equals(*stored, key))
+    }
+}
+
+impl PairLookup for Vec<(i64, i64)> {
+    fn find_pair(&self, key: i64) -> Option<usize> {
+        self.iter().position(|(stored, _)| equals(*stored, key))
+    }
+}
+
+impl PairMut for Vec<(i64, i64)> {
+    fn insert_pair(&mut self, key: i64, value: i64) -> bool {
+        match self.find_pair(key) {
+            Some(position) => {
+                self[position].1 = value;
+                false
+            }
+            None => {
+                self.push((key, value));
+                true
+            }
+        }
+    }
+}
+
+impl PairLookup for DictData {
+    fn find_pair(&self, key: i64) -> Option<usize> {
+        self.find(key)
+    }
+}
+
+impl PairMut for DictData {
+    fn insert_pair(&mut self, key: i64, value: i64) -> bool {
+        self.set(key, value)
+    }
+}
+
+impl<T: PairLookup + 'static> PairLookup for value::ContainerGuard<T> {
+    fn find_pair(&self, key: i64) -> Option<usize> {
+        (**self).find_pair(key)
+    }
+}
+
+impl<T: PairMut + 'static> PairMut for value::ContainerGuard<T> {
+    fn insert_pair(&mut self, key: i64, value: i64) -> bool {
+        (**self).insert_pair(key, value)
+    }
+}
+
+// -------------------------------------------------------------------------
+// Key hashing
+// -------------------------------------------------------------------------
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Domain seeds keep values of different kinds in different bucket families.
+const HASH_NUMERIC: u64 = FNV_OFFSET ^ 0x01;
+const HASH_STR: u64 = FNV_OFFSET ^ 0x02;
+const HASH_BYTES: u64 = FNV_OFFSET ^ 0x03;
+const HASH_TUPLE: u64 = FNV_OFFSET ^ 0x04;
+const HASH_RANGE: u64 = FNV_OFFSET ^ 0x05;
+const HASH_NONE: u64 = FNV_OFFSET ^ 0x06;
+const HASH_IDENTITY: u64 = FNV_OFFSET ^ 0x07;
+
+#[inline]
+fn fnv_mix(hash: u64, word: u64) -> u64 {
+    (hash ^ word).wrapping_mul(FNV_PRIME)
+}
+
+fn fnv_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash = fnv_mix(hash, byte as u64);
+    }
+    hash
+}
+
+/// Hash of a dict key, consistent with [`equals`]: equal values always hash
+/// equally, so every Python-equal int/float/bool lands in the same bucket.
+///
+/// Unhashable values never reach a dict, but they are still hashed by identity
+/// defensively.
+pub(crate) fn key_hash(v: i64) -> u64 {
+    if let Some(hash) = numeric_hash(v) {
+        return hash;
+    }
+    if let Some(s) = value::as_str(v) {
+        return fnv_bytes(HASH_STR, s.as_bytes());
+    }
+    if let Some(bytes) = value::as_bytes(v) {
+        return fnv_bytes(HASH_BYTES, bytes);
+    }
+    if let Some(items) = value::as_tuple(v) {
+        let mut hash = fnv_mix(HASH_TUPLE, items.len() as u64);
+        for &item in items {
+            hash = fnv_mix(hash, key_hash(item));
+        }
+        return hash;
+    }
+    if let Some((start, stop, step)) = value::as_range(v) {
+        return fnv_mix(
+            fnv_mix(fnv_mix(HASH_RANGE, start as u64), stop as u64),
+            step as u64,
+        );
+    }
+    if v == NONE {
+        return HASH_NONE;
+    }
+    fnv_mix(HASH_IDENTITY, v as u64)
+}
+
+/// Numeric keys hash by the `f64` bit pattern: `1`, `1.0` and `True` share a
+/// bucket, and `-0.0` is canonicalised to `0.0`. Two equal ints always encode
+/// the same bits; ints that round to the same `f64` merely collide.
+fn numeric_hash(v: i64) -> Option<u64> {
+    let value = if let Some(i) = value::as_integer(v) {
+        i as f64
+    } else {
+        value::as_float(v)?
+    };
+    let bits = if value == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        value.to_bits()
+    };
+    Some(fnv_mix(HASH_NUMERIC, bits))
+}
 
 /// Type name of an unhashable object (`list`, `dict`, `iterator`, or a tuple
 /// containing one), if any. Tuples are hashable exactly when every element is.
@@ -260,17 +515,20 @@ pub(crate) fn unhashable_message(name: &str) -> String {
     format!("unhashable type: '{}'", name)
 }
 
-pub(crate) fn dict_find(pairs: &[(i64, i64)], key: i64) -> Option<usize> {
-    pairs.iter().position(|(k, _)| equals(*k, key))
+// -------------------------------------------------------------------------
+// Dict operations over a pair table
+// -------------------------------------------------------------------------
+
+/// Position of `key` in a pair table (`O(1)` for [`DictData`], a scan for the
+/// plain vectors used by `defaultdict`).
+pub(crate) fn dict_find<P: PairLookup + ?Sized>(pairs: &P, key: i64) -> Option<usize> {
+    pairs.find_pair(key)
 }
 
 /// Inserts or overwrites `key` while preserving its first insertion position
 /// (the same rule as the dict constructor).
-pub(crate) fn dict_insert(pairs: &mut Vec<(i64, i64)>, key: i64, new_value: i64) {
-    match dict_find(pairs, key) {
-        Some(pos) => pairs[pos].1 = new_value,
-        None => pairs.push((key, new_value)),
-    }
+pub(crate) fn dict_insert(pairs: &mut DictData, key: i64, new_value: i64) {
+    pairs.set(key, new_value);
 }
 
 /// [`dict_insert`] plus the insertion barriers for the edges it creates.
@@ -278,24 +536,21 @@ pub(crate) fn dict_insert(pairs: &mut Vec<(i64, i64)>, key: i64, new_value: i64)
 /// Must be called while `pairs` is borrowed through [`value::dict_pairs_mut`],
 /// so the barriers run under the graph lock. A new key publishes barriers for
 /// both the key (new edge) and the value; overwriting an existing key only
-/// publishes the new value, because the key edge already exists. The position
-/// is looked up once.
-pub(crate) fn dict_insert_barrier(
+/// publishes the new value, because the key edge already exists. The key is
+/// looked up once.
+pub(crate) fn dict_insert_barrier<P: PairMut + ?Sized>(
     dict: i64,
-    pairs: &mut Vec<(i64, i64)>,
+    pairs: &mut P,
     key: i64,
     new_value: i64,
 ) {
-    match dict_find(pairs, key) {
-        Some(pos) => {
-            pairs[pos].1 = new_value;
-            crate::heap::write_barrier_edge(dict, new_value);
-        }
-        None => {
-            pairs.push((key, new_value));
-            crate::heap::write_barrier_edge(dict, key);
-            crate::heap::write_barrier_edge(dict, new_value);
-        }
+    if pairs.insert_pair(key, new_value) {
+        // New key: both the key and the value are new edges.
+        crate::heap::write_barrier_edge(dict, key);
+        crate::heap::write_barrier_edge(dict, new_value);
+    } else {
+        // Overwrite: the key edge already exists.
+        crate::heap::write_barrier_edge(dict, new_value);
     }
 }
 
@@ -417,12 +672,12 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
             None => exc::raise_with_message(INDEX_ERROR, "tuple index out of range"),
         };
     }
-    if let Some(pairs) = value::as_dict(obj) {
+    if let Some(dict) = value::as_dict_data(obj) {
         if let Some(name) = unhashable_name(index) {
             return type_error(unhashable_message(name));
         }
-        return match dict_find(pairs, index) {
-            Some(pos) => pairs[pos].1,
+        return match dict.find(index) {
+            Some(position) => dict.entries()[position].1,
             // Python's `KeyError` message is the repr of the missing key.
             None => exc::raise_with_message(KEY_ERROR, &value::repr(index)),
         };
@@ -1336,5 +1591,173 @@ mod tests {
             value::to_string(exc::pending_value()),
             "'list' object does not support item assignment"
         );
+    }
+
+    fn invoke(obj: i64, method: &str, args: &[i64]) -> i64 {
+        crate::methods::call(
+            obj,
+            method.as_ptr(),
+            method.len(),
+            args.len(),
+            args.as_ptr(),
+        )
+    }
+
+    #[test]
+    fn dict_index_handles_ten_thousand_int_keys() {
+        exc::init();
+        let d = dict_new(0, std::ptr::null(), std::ptr::null());
+        for i in 0..10_000i64 {
+            assert_eq!(dict_set(d, int(i), int(i * 2)), NONE);
+        }
+        let pairs = value::as_dict(d).expect("dict");
+        assert_eq!(pairs.len(), 10_000);
+        assert_eq!(pairs[0], (int(0), int(0)));
+        assert_eq!(pairs[9_999], (int(9_999), int(19_998)));
+
+        // Hash-bucket lookups find every key directly (correctness, not
+        // timing): first, middle, last and a few in between.
+        for i in [0i64, 1, 2_500, 4_999, 9_998, 9_999] {
+            assert_eq!(subscript(d, int(i)), int(i * 2));
+            assert_eq!(invoke(d, "get", &[int(i)]), int(i * 2));
+        }
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn dict_overwrite_keeps_position_and_numeric_keys_collide() {
+        exc::init();
+        let d = dict_new(0, std::ptr::null(), std::ptr::null());
+        dict_set(d, int(1), int(10));
+        dict_set(d, string("k"), int(20));
+        dict_set(d, int(1), int(30));
+        let pairs = value::as_dict(d).expect("dict");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], (int(1), int(30)), "first position, last value");
+        assert!(equals(pairs[1].0, string("k")));
+
+        // 1 == 1.0 == True in Python: one entry, key object unchanged.
+        assert_eq!(dict_set(d, value::float_new(1.0), int(40)), NONE);
+        let pairs = value::as_dict(d).expect("dict");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], (int(1), int(40)));
+        assert_eq!(dict_set(d, value::TRUE, int(50)), NONE);
+        assert_eq!(value::as_dict(d).expect("dict")[0], (int(1), int(50)));
+        assert_eq!(subscript(d, value::float_new(1.0)), int(50));
+        assert_eq!(subscript(d, value::TRUE), int(50));
+        assert_eq!(invoke(d, "get", &[value::TRUE]), int(50));
+
+        // -0.0 and 0.0 share a bucket and compare equal.
+        let zero = dict_new(0, std::ptr::null(), std::ptr::null());
+        dict_set(zero, value::float_new(0.0), int(1));
+        dict_set(zero, value::float_new(-0.0), int(2));
+        assert_eq!(value::as_dict(zero).map(|p| p.len()), Some(1));
+        assert_eq!(subscript(zero, int(0)), int(2));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn dict_hashes_string_bytes_and_tuple_keys() {
+        exc::init();
+        let d = dict_new(0, std::ptr::null(), std::ptr::null());
+        dict_set(d, string("a"), int(1));
+        // A distinct string object with equal content overwrites in place.
+        dict_set(d, string("a"), int(2));
+        dict_set(d, value::bytes_new(vec![b'a']), int(3));
+        dict_set(d, tuple(&[int(1), string("x")]), int(4));
+        assert_eq!(value::as_dict(d).map(|p| p.len()), Some(3));
+        assert_eq!(subscript(d, string("a")), int(2));
+        assert_eq!(subscript(d, value::bytes_new(vec![b'a'])), int(3));
+        assert_eq!(subscript(d, tuple(&[int(1), string("x")])), int(4));
+        assert!(!exc::pending());
+
+        // A structurally different tuple is missing, and the message is the
+        // key's repr.
+        assert_eq!(subscript(d, tuple(&[int(1), int(1)])), NONE);
+        assert_eq!(exc::pending_tag(), KEY_ERROR as i64);
+        assert_eq!(value::to_string(exc::pending_value()), "(1, 1)");
+        crate::exc::clear();
+
+        // NaN never equals itself, so a stored NaN key is never found.
+        let nan = value::float_new(f64::NAN);
+        let n = dict_new(0, std::ptr::null(), std::ptr::null());
+        dict_set(n, nan, int(9));
+        assert_eq!(value::as_dict(n).map(|p| p.len()), Some(1));
+        assert_eq!(subscript(n, value::float_new(f64::NAN)), NONE);
+        assert_eq!(exc::pending_tag(), KEY_ERROR as i64);
+        crate::exc::clear();
+    }
+
+    #[test]
+    fn dict_constructor_index_dedupes_duplicates() {
+        exc::init();
+        let d = value::dict_new(vec![
+            (int(1), int(1)),
+            (string("a"), int(2)),
+            (value::float_new(1.0), int(3)),
+        ]);
+        let pairs = value::as_dict(d).expect("dict");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], (int(1), int(3)));
+        assert!(equals(pairs[1].0, string("a")));
+        assert_eq!(subscript(d, value::TRUE), int(3));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn dict_pop_clear_and_update_keep_index_consistent() {
+        exc::init();
+        let d = dict_new(0, std::ptr::null(), std::ptr::null());
+        for i in 0..64i64 {
+            dict_set(d, int(i), int(i));
+        }
+
+        assert_eq!(invoke(d, "pop", &[int(10)]), int(10));
+        let pairs = value::as_dict(d).expect("dict");
+        assert_eq!(pairs.len(), 63);
+        assert_eq!(pairs[10], (int(11), int(11)), "later entries shift left");
+        assert_eq!(pairs[62], (int(63), int(63)));
+        assert_eq!(pairs[0], (int(0), int(0)));
+        assert!(!exc::pending());
+
+        // The removed key is gone (KeyError) while the shifted keys are
+        // still reachable through the rebuilt index.
+        assert_eq!(subscript(d, int(10)), NONE);
+        assert_eq!(exc::pending_tag(), KEY_ERROR as i64);
+        assert_eq!(value::to_string(exc::pending_value()), "10");
+        crate::exc::clear();
+        assert_eq!(subscript(d, int(11)), int(11));
+        assert_eq!(subscript(d, int(63)), int(63));
+
+        // Re-inserting appends at the end.
+        dict_set(d, int(10), int(100));
+        let pairs = value::as_dict(d).expect("dict");
+        assert_eq!(pairs.len(), 64);
+        assert_eq!(pairs[63], (int(10), int(100)));
+
+        // update overwrites in place and appends new keys.
+        let source = dict_new(0, std::ptr::null(), std::ptr::null());
+        dict_set(source, int(5), int(55));
+        dict_set(source, int(999), int(9999));
+        invoke(d, "update", &[source]);
+        let pairs = value::as_dict(d).expect("dict");
+        assert_eq!(pairs.len(), 65);
+        assert_eq!(pairs[5], (int(5), int(55)));
+        assert_eq!(pairs[64], (int(999), int(9999)));
+        assert_eq!(subscript(d, int(5)), int(55));
+        assert_eq!(subscript(d, int(999)), int(9999));
+        assert!(!exc::pending());
+
+        invoke(d, "clear", &[]);
+        assert_eq!(value::as_dict(d).map(|p| p.len()), Some(0));
+        assert_eq!(subscript(d, int(5)), NONE);
+        assert_eq!(exc::pending_tag(), KEY_ERROR as i64);
+        crate::exc::clear();
+
+        // The index is consistent again after a clear.
+        dict_set(d, int(5), int(50));
+        assert_eq!(value::as_dict(d).map(|p| p.len()), Some(1));
+        assert_eq!(subscript(d, int(5)), int(50));
+        assert!(!exc::pending());
     }
 }

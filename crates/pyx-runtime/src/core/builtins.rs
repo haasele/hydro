@@ -603,6 +603,32 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             if *entry == 0 {
                 return exc::raise_with_message(RUNTIME_ERROR, "function has no code");
             }
+            // A generator/coroutine call does not run the body: it creates a
+            // lazy fiber object. The wrapper receives captures followed by
+            // the user arguments on its first resume.
+            if func.flags & (value::FUNCTION_FLAG_ASYNC | value::FUNCTION_FLAG_GENERATOR) != 0 {
+                let mut args: Vec<i64> = Vec::with_capacity(captures.len() + argc);
+                args.extend_from_slice(captures);
+                if argc > 0 {
+                    // SAFETY: checked above for NULL; caller contract.
+                    let rest = unsafe { std::slice::from_raw_parts(argv, argc) };
+                    args.extend_from_slice(rest);
+                }
+                let name = func.name.clone();
+                let entry = *entry;
+                let created = if func.flags & value::FUNCTION_FLAG_ASYNC != 0 {
+                    value::fiber_coroutine_new(entry, name, args)
+                } else {
+                    value::fiber_generator_new(entry, name, args)
+                };
+                return match created {
+                    Some(fiber) => fiber,
+                    None => exc::raise_with_message(
+                        RUNTIME_ERROR,
+                        "cannot allocate a generator/coroutine stack",
+                    ),
+                };
+            }
             // The generated wrapper takes captures followed by user
             // arguments. Avoid a copy for ordinary functions.
             let mut buffer: Vec<i64> = Vec::new();
@@ -698,7 +724,8 @@ fn builtin_arity_error(name: &str, expected: &str, argc: usize) -> i64 {
 /// Arity and semantics match the direct builtin calls lowered by codegen:
 /// `print` is variadic, `str`/`int`/`float`/`abs`/`len` take one argument,
 /// `set`/`list`/`dict` accept zero or one, `sum`/`enumerate` one or two,
-/// `range` one to three, `bytes` zero to two, and `map`/`filter` exactly two.
+/// `range` one to three, `bytes` zero to two, `map`/`filter` exactly two,
+/// `iter` exactly one and `next` one or two.
 pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -761,6 +788,15 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
         Builtin::Filter => match args {
             [function, iterable] => filter(*function, *iterable),
             _ => builtin_arity_error("filter", "exactly 2", argc),
+        },
+        Builtin::Iter => match args {
+            [obj] => iter::iter_of(*obj),
+            _ => builtin_arity_error("iter", "exactly 1", argc),
+        },
+        Builtin::Next => match args {
+            [obj] => iter::next_value(*obj, NONE, false),
+            [obj, default] => iter::next_value(*obj, *default, true),
+            _ => builtin_arity_error("next", "1 or 2", argc),
         },
         Builtin::Len => match args {
             [value] => len(*value),
@@ -1213,6 +1249,34 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(pending_message(), "'int' object is not iterable");
         exc::init();
+    }
+
+    #[test]
+    fn iter_and_next_as_first_class_values() {
+        exc::init();
+        let iter_fn = value::builtin_function_new(Builtin::Iter);
+        let next_fn = value::builtin_function_new(Builtin::Next);
+
+        let source = [value::list_new(vec![int(4), int(5)])];
+        let iterator = call(iter_fn, 1, source.as_ptr());
+        assert!(!exc::pending());
+        assert_eq!(value::type_name(iterator), "iterator");
+
+        assert_eq!(call(next_fn, 1, [iterator].as_ptr()), int(4));
+        let args = [iterator, int(-1)];
+        assert_eq!(call(next_fn, 2, args.as_ptr()), int(5));
+        // Exhausted: the first-class default suppresses StopIteration.
+        assert_eq!(call(next_fn, 2, args.as_ptr()), int(-1));
+        assert_eq!(call(next_fn, 1, [iterator].as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), exc::STOP_ITERATION as i64);
+
+        exc::init();
+        assert_eq!(call(iter_fn, 0, std::ptr::null()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "iter() takes exactly 1 argument(s) (0 given)"
+        );
     }
 
     #[test]

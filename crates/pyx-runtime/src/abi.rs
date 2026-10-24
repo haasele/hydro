@@ -1,6 +1,6 @@
 use std::os::raw::c_uchar;
 
-use crate::{builtins, container, exc, format, heap, iter, methods, modules, ops, value};
+use crate::{builtins, container, exc, fiber, format, heap, iter, methods, modules, ops, value};
 
 // ---------------------------------------------------------------------
 // Constants (tagged representation, see ARCHITECTURE §3.1)
@@ -250,25 +250,28 @@ pub extern "C" fn pyx_class_new(
 }
 
 /// Creates a function value from the generated wrapper entry point.
-/// A `NULL` wrapper is an internal error (`RuntimeError`).
+/// A `NULL` wrapper is an internal error (`RuntimeError`). `flags` bit 0
+/// marks an `async def` wrapper (calls create a coroutine) and bit 1 a
+/// generator wrapper (calls create a generator).
 #[no_mangle]
 pub extern "C" fn pyx_function_new(
     wrapper: *const c_uchar,
     arity: usize,
     name_ptr: *const c_uchar,
     name_len: usize,
+    flags: u32,
 ) -> i64 {
     if wrapper.is_null() {
         return exc::raise_with_message(exc::RUNTIME_ERROR, "function wrapper is NULL");
     }
     let name = function_name(name_ptr, name_len);
-    value::function_new(wrapper as usize, arity, name)
+    value::function_new_with_flags(wrapper as usize, arity, name, flags)
 }
 
 /// Creates a closure value from a generated wrapper entry point, the
 /// user-visible arity and `capture_count` captured tagged values. A `NULL`
 /// wrapper or a missing/oversized capture buffer is an internal error
-/// (`RuntimeError`).
+/// (`RuntimeError`). `flags` has the same meaning as in [`pyx_function_new`].
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn pyx_closure_new(
@@ -278,6 +281,7 @@ pub extern "C" fn pyx_closure_new(
     name_len: usize,
     capture_count: usize,
     captures_ptr: *const i64,
+    flags: u32,
 ) -> i64 {
     if wrapper.is_null() {
         return exc::raise_with_message(exc::RUNTIME_ERROR, "function wrapper is NULL");
@@ -294,7 +298,74 @@ pub extern "C" fn pyx_closure_new(
         unsafe { std::slice::from_raw_parts(captures_ptr, capture_count) }.to_vec()
     };
     let name = function_name(name_ptr, name_len);
-    value::closure_new(wrapper as usize, arity, name, captures)
+    value::closure_new_with_flags(wrapper as usize, arity, name, captures, flags)
+}
+
+/// Copies `argc` tagged arguments for a new fiber. `NULL` with `argc > 0` and
+/// over-long counts are reported as an internal error.
+fn copy_fiber_args(argc: usize, argv: *const i64) -> Option<Vec<i64>> {
+    if argc == 0 {
+        return Some(Vec::new());
+    }
+    if argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>() {
+        return None;
+    }
+    // SAFETY: the ABI contract requires `argv..argv+argc` to be readable; the
+    // length check keeps the slice representable.
+    Some(unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec())
+}
+
+/// Creates a lazy generator object from a generated wrapper entry point. The
+/// body does not run until the first `pyx_iter_next`.
+#[no_mangle]
+pub extern "C" fn pyx_generator_new(entry: *const c_uchar, argc: usize, argv: *const i64) -> i64 {
+    fiber_new(entry, argc, argv, fiber::FiberKind::Generator)
+}
+
+/// Creates a coroutine object from a generated wrapper entry point. The body
+/// does not run until the first `pyx_await`.
+#[no_mangle]
+pub extern "C" fn pyx_coroutine_new(entry: *const c_uchar, argc: usize, argv: *const i64) -> i64 {
+    fiber_new(entry, argc, argv, fiber::FiberKind::Coroutine)
+}
+
+fn fiber_new(entry: *const c_uchar, argc: usize, argv: *const i64, kind: fiber::FiberKind) -> i64 {
+    if entry.is_null() {
+        return exc::raise_with_message(exc::RUNTIME_ERROR, "fiber entry point is NULL");
+    }
+    let Some(args) = copy_fiber_args(argc, argv) else {
+        return exc::raise_with_message(exc::RUNTIME_ERROR, "fiber argument buffer is invalid");
+    };
+    let created = match kind {
+        fiber::FiberKind::Generator => {
+            value::fiber_generator_new(entry as usize, String::new(), args)
+        }
+        fiber::FiberKind::Coroutine => {
+            value::fiber_coroutine_new(entry as usize, String::new(), args)
+        }
+    };
+    match created {
+        Some(fiber) => fiber,
+        None => exc::raise_with_message(
+            exc::RUNTIME_ERROR,
+            "cannot allocate a generator/coroutine stack",
+        ),
+    }
+}
+
+/// `await value`: drives a coroutine object to completion. Values that are
+/// not fibers are returned unchanged.
+#[no_mangle]
+pub extern "C" fn pyx_await(value: i64) -> i64 {
+    fiber::await_value(value)
+}
+
+/// `yield value`: suspends the running generator and returns the value sent
+/// on resume (`None`; PyX supports plain resumption only). Outside a running
+/// generator this raises `RuntimeError`.
+#[no_mangle]
+pub extern "C" fn pyx_yield(value: i64) -> i64 {
+    fiber::yield_value(value)
 }
 
 /// Creates a function value for a builtin referenced as a first-class value.
@@ -469,7 +540,7 @@ pub extern "C" fn pyx_method_kw(
     methods::call_kw(obj, name, name_len, argc, argv, kwargc, kw_argv)
 }
 
-/// Creates an iterator over a list, string, dict or tuple.
+/// Creates an iterator over a list, string, dict, tuple or generator object.
 #[no_mangle]
 pub extern "C" fn pyx_iter_new(obj: i64) -> i64 {
     iter::iter_new(obj)
@@ -480,6 +551,21 @@ pub extern "C" fn pyx_iter_new(obj: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn pyx_iter_next(iterator: i64, out: *mut i64) -> i64 {
     iter::iter_next(iterator, out)
+}
+
+/// `iter(obj)`: an existing iterator/generator is returned unchanged,
+/// otherwise a new iterator is created. Non-iterables raise `TypeError`.
+#[no_mangle]
+pub extern "C" fn pyx_iter(obj: i64) -> i64 {
+    iter::iter_of(obj)
+}
+
+/// `next(obj[, default])`: the next element of an iterator/generator.
+/// `has_default` is `1` when the tagged `default` argument was supplied.
+/// Exhaustion raises `StopIteration` without a default.
+#[no_mangle]
+pub extern "C" fn pyx_next(obj: i64, default: i64, has_default: i64) -> i64 {
+    iter::next_value(obj, default, has_default != 0)
 }
 
 // ---------------------------------------------------------------------
@@ -1171,7 +1257,7 @@ mod tests {
     }
 
     fn function(wrapper: extern "C" fn(*const i64) -> i64, arity: usize, name: &str) -> i64 {
-        pyx_function_new(wrapper as *const u8, arity, name.as_ptr(), name.len())
+        pyx_function_new(wrapper as *const u8, arity, name.as_ptr(), name.len(), 0)
     }
 
     #[test]
@@ -1188,12 +1274,12 @@ mod tests {
         assert_eq!(pyx_exc_pending(), 0);
 
         // A zero-argument call passes `NULL` to the wrapper.
-        let zero = pyx_function_new(zero_wrapper as *const u8, 0, b"zero".as_ptr(), 4);
+        let zero = pyx_function_new(zero_wrapper as *const u8, 0, b"zero".as_ptr(), 4, 0);
         assert_eq!(pyx_call(zero, 0, std::ptr::null()), pyx_int(42));
         assert_eq!(pyx_exc_pending(), 0);
 
         // Missing name buffers fall back to `<function>`.
-        let unnamed = pyx_function_new(add_wrapper as *const u8, 2, std::ptr::null(), 0);
+        let unnamed = pyx_function_new(add_wrapper as *const u8, 2, std::ptr::null(), 0, 0);
         assert_eq!(value::to_string(unnamed), "<function <function>>");
 
         // Functions are ordinary heap values in containers.
@@ -1245,7 +1331,7 @@ mod tests {
 
         // A null wrapper is rejected at construction.
         assert_eq!(
-            pyx_function_new(std::ptr::null(), 0, b"bad".as_ptr(), 3),
+            pyx_function_new(std::ptr::null(), 0, b"bad".as_ptr(), 3, 0),
             pyx_none()
         );
         assert_eq!(pyx_exc_tag(), exc::RUNTIME_ERROR as i64);

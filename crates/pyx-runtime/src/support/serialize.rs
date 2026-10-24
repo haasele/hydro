@@ -496,7 +496,7 @@ pub(crate) fn from_hex(text: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let high = hex_digit(pair[0])?;
         let low = hex_digit(pair[1])?;
         out.push((high << 4) | low);

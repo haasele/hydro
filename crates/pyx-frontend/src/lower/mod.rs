@@ -5,6 +5,7 @@
 //! pass in `sema` fills in. Lowering never panics on user input; every rejected
 //! construct becomes a [`Diagnostic`].
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use pyx_ir::stdlib::{self, ConstantSpec, FunctionSpec, ModuleSpec};
@@ -17,7 +18,7 @@ use crate::sema::{Infer, Ty};
 
 pub const MODULE_NAME: &str = "<module>";
 
-const BUILTIN_NAMES: [&str; 16] = [
+const BUILTIN_NAMES: [&str; 18] = [
     "print",
     "len",
     "str",
@@ -34,6 +35,8 @@ const BUILTIN_NAMES: [&str; 16] = [
     "map",
     "filter",
     "bytes",
+    "iter",
+    "next",
 ];
 
 /// A resolved source unit prior to type inference.
@@ -52,6 +55,12 @@ pub struct HFunction {
     pub ret_ty: Ty,
     pub locals: Vec<HLocal>,
     pub body: Vec<HStmt>,
+    /// `async def`: calling the function creates a coroutine object instead
+    /// of running the body.
+    pub is_async: bool,
+    /// The body contains a `yield`: calling the function creates a generator
+    /// object instead of running the body.
+    pub is_generator: bool,
     pub is_module: bool,
     pub line: u32,
     pub col: u32,
@@ -146,6 +155,11 @@ pub enum HStmtKind {
     Break,
     Continue,
     Pass,
+    /// `yield [value]` inside a generator body: suspend the fiber and yield
+    /// `value` (or `None` for a bare yield).
+    Yield {
+        value: Option<HExpr>,
+    },
     Raise {
         exc: Option<ExcKind>,
         msg: Option<HExpr>,
@@ -229,7 +243,7 @@ pub enum HExprKind {
         value: Box<HExpr>,
         clauses: Vec<HCompClause>,
     },
-    /// `(element for ...)`, eagerly materialised as a list in Phase 2.8.
+    /// `(element for ...)`, materialised as a list in Phase 2.8.
     GeneratorExp {
         element: Box<HExpr>,
         clauses: Vec<HCompClause>,
@@ -280,16 +294,21 @@ pub enum HExprKind {
         callee: Callee,
         args: Vec<HExpr>,
     },
+    /// `await value` inside an `async def` body.
+    Await {
+        value: Box<HExpr>,
+    },
 }
 
 /// Signature-relevant fields shared by `def` and `async def`.
 ///
-/// `async def` lowers exactly like `def`: PyX has no coroutine objects, so the
-/// only difference is that `await` is a no-op and `async with`/`async for`
-/// reuse the synchronous lowerings.
+/// The only difference between the two forms is `is_async`: calling an async
+/// function creates a coroutine object, while `async with`/`async for` reuse
+/// the synchronous lowerings.
 struct FnDecl<'a> {
     range: TextRange,
     name: &'a str,
+    is_async: bool,
     args: &'a ast::Arguments,
     body: &'a [ast::Stmt],
     decorators: &'a [ast::Expr],
@@ -302,6 +321,7 @@ impl<'a> FnDecl<'a> {
         FnDecl {
             range: f.range,
             name: f.name.as_str(),
+            is_async: false,
             args: f.args.as_ref(),
             body: &f.body,
             decorators: &f.decorator_list,
@@ -314,6 +334,7 @@ impl<'a> FnDecl<'a> {
         FnDecl {
             range: f.range,
             name: f.name.as_str(),
+            is_async: true,
             args: f.args.as_ref(),
             body: &f.body,
             decorators: &f.decorator_list,
@@ -340,9 +361,10 @@ struct FuncState {
     loop_depth: u32,
     /// True while lowering a lambda body: only its parameters are visible.
     in_lambda: bool,
-    /// Hidden `$genN` list local of the generator function being lowered.
-    /// `None` outside generator function bodies.
-    generator: Option<LocalId>,
+    /// `async def` body being lowered: `await` is allowed.
+    is_async: bool,
+    /// Generator body being lowered: `yield` is allowed.
+    is_generator: bool,
 }
 
 impl FuncState {
@@ -416,9 +438,6 @@ pub struct Lowerer<'a> {
     /// Next synthetic `$augN` local holding a subscript augmented-assignment
     /// object or index so it is evaluated exactly once.
     aug_counter: u32,
-    /// Next synthetic `$genN` local materialising a generator function's
-    /// yielded values (eager mode).
-    gen_counter: u32,
     /// Registered class headers, keyed by the class statement's start offset.
     /// Method signatures exist before any body is lowered; the key lets
     /// `lower_stmt` find the plan without threading it through every call.
@@ -439,6 +458,8 @@ impl<'a> Lowerer<'a> {
                 ret_ty: Ty::Concrete(Type::None),
                 locals: Vec::new(),
                 body: Vec::new(),
+                is_async: false,
+                is_generator: false,
                 is_module: true,
                 line: 1,
                 col: 1,
@@ -457,7 +478,6 @@ impl<'a> Lowerer<'a> {
             comp_counter: 0,
             with_counter: 0,
             aug_counter: 0,
-            gen_counter: 0,
             class_defs: HashMap::new(),
             diags: Vec::new(),
         }
@@ -620,7 +640,8 @@ impl<'a> Lowerer<'a> {
             locals: module_locals,
             loop_depth: 0,
             in_lambda: false,
-            generator: None,
+            is_async: false,
+            is_generator: false,
         };
         let mut body = Vec::new();
         for stmt in &module.body {
@@ -1208,15 +1229,20 @@ impl<'a> Lowerer<'a> {
             );
         }
 
-        // Generator functions are materialised eagerly: the call returns a
-        // list of the yielded values, regardless of an annotation.
-        let ret_ty = if body_has_yield(decl.body) {
-            Ty::Concrete(Type::List)
-        } else {
-            match decl.returns {
-                Some(ann) => self.annotation_ty(ann),
-                None => self.infer.fresh(),
-            }
+        // A body containing `yield` makes the function a generator; `async def`
+        // plus `yield` would be an async generator, which is not implemented.
+        let is_generator = body_has_yield(decl.body);
+        if decl.is_async && is_generator {
+            self.error_at_code(
+                decl.range,
+                codes::UNSUPPORTED,
+                "async generators are not supported",
+            );
+        }
+
+        let ret_ty = match decl.returns {
+            Some(ann) => self.annotation_ty(ann),
+            None => self.infer.fresh(),
         };
 
         let (line, col) = self.span(decl.range);
@@ -1228,6 +1254,8 @@ impl<'a> Lowerer<'a> {
             ret_ty,
             locals,
             body: Vec::new(),
+            is_async: decl.is_async,
+            is_generator,
             is_module: false,
             line,
             col,
@@ -1380,15 +1408,11 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Lower a function body, materialising generator bodies eagerly.
+    /// Lower a function body and set up its [`FuncState`].
     ///
-    /// A function containing a `yield` statement gets a hidden `$genN` list
-    /// local that is initialised to `[]` at the top, receives every yielded
-    /// value via `append`, and is returned at the end. The function therefore
-    /// returns a materialised list; there is no suspension.
+    /// The `async`/generator flags were decided when the signature was
+    /// registered, so `await`/`yield` lowering only has to read them.
     fn lower_function_body(&mut self, fid: FunctionId, body: &[ast::Stmt]) -> Vec<HStmt> {
-        let is_generator = body_has_yield(body);
-
         let mut names = Vec::new();
         collect_names(body, &mut names, true);
 
@@ -1409,61 +1433,17 @@ impl<'a> Lowerer<'a> {
             local_map.insert(name, id);
         }
 
-        let generator_local = if is_generator {
-            let name = format!("$gen{}", self.gen_counter);
-            self.gen_counter += 1;
-            let id = self.functions[fid as usize].locals.len() as LocalId;
-            self.functions[fid as usize].locals.push(HLocal {
-                name: name.clone(),
-                ty: Ty::Concrete(Type::List),
-            });
-            local_map.insert(name, id);
-            Some(id)
-        } else {
-            None
-        };
-
+        let function = &self.functions[fid as usize];
         let mut fs = FuncState {
             fid,
             is_module: false,
             locals: local_map,
             loop_depth: 0,
             in_lambda: false,
-            generator: generator_local,
+            is_async: function.is_async,
+            is_generator: function.is_generator,
         };
-        let mut stmts = self.lower_block(body, &mut fs);
-
-        if let Some(generator) = generator_local {
-            let function = &self.functions[fid as usize];
-            let (line, col) = (function.line, function.col);
-            stmts.insert(
-                0,
-                HStmt {
-                    kind: HStmtKind::Assign {
-                        target: generator,
-                        value: HExpr {
-                            kind: HExprKind::List(Vec::new()),
-                            ty: Ty::Concrete(Type::List),
-                            line,
-                            col,
-                        },
-                    },
-                    line,
-                    col,
-                },
-            );
-            stmts.push(HStmt {
-                kind: HStmtKind::Return(Some(HExpr {
-                    kind: HExprKind::Local(generator),
-                    ty: Ty::Concrete(Type::List),
-                    line,
-                    col,
-                })),
-                line,
-                col,
-            });
-        }
-        stmts
+        self.lower_block(body, &mut fs)
     }
 
     /// Lower a `def`/`async def` nested inside another function body.
@@ -1582,7 +1562,7 @@ impl<'a> Lowerer<'a> {
                     self.error_at_code(
                         y.range,
                         codes::UNSUPPORTED,
-                        "yield from is not supported in eager mode",
+                        "yield from is not supported yet",
                     );
                     return None;
                 }
@@ -1703,8 +1683,21 @@ impl<'a> Lowerer<'a> {
             }
             ast::Stmt::If(s) => {
                 let cond = self.expr(&s.test, fs);
-                let then_body = self.lower_block(&s.body, fs);
-                let else_body = self.lower_block(&s.orelse, fs);
+                // `if True:`/`if False:` from a literal: lowering the branch
+                // that cannot run would only produce dead HIR (and spurious
+                // diagnostics for constructs the branch never reaches).
+                let (then_body, else_body) = match &cond.kind {
+                    HExprKind::Const(Const::Bool(true)) => {
+                        (self.lower_block(&s.body, fs), Vec::new())
+                    }
+                    HExprKind::Const(Const::Bool(false)) => {
+                        (Vec::new(), self.lower_block(&s.orelse, fs))
+                    }
+                    _ => (
+                        self.lower_block(&s.body, fs),
+                        self.lower_block(&s.orelse, fs),
+                    ),
+                };
                 HStmtKind::If {
                     cond,
                     then_body,
@@ -1716,6 +1709,11 @@ impl<'a> Lowerer<'a> {
                     self.error_at(s.range, "while-else is not supported in Phase 1");
                 }
                 let cond = self.expr(&s.test, fs);
+                // `while False:` never runs its body; drop the loop. `while
+                // True:` stays a real loop so `break` keeps working.
+                if matches!(&cond.kind, HExprKind::Const(Const::Bool(false))) {
+                    return None;
+                }
                 fs.loop_depth += 1;
                 let body = self.lower_block(&s.body, fs);
                 fs.loop_depth -= 1;
@@ -1725,14 +1723,6 @@ impl<'a> Lowerer<'a> {
             ast::Stmt::Return(s) => {
                 if fs.is_module {
                     self.error_at_code(s.range, codes::CONTROL, "return outside a function");
-                    return None;
-                }
-                if fs.generator.is_some() {
-                    self.error_at_code(
-                        s.range,
-                        codes::CONTROL,
-                        "explicit return in a generator is not supported in eager mode",
-                    );
                     return None;
                 }
                 match &s.value {
@@ -2189,11 +2179,12 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Lower a `yield value` statement in eager mode.
+    /// Lower a `yield value` statement.
     ///
-    /// The statement becomes `$genN.append(value)`; no suspension point is
-    /// created. Only the statement form is supported: `yield` in an expression
-    /// (assignment, argument, ...) is diagnosed in [`Lowerer::expr`].
+    /// The statement becomes [`HStmtKind::Yield`]; the generator fiber is
+    /// suspended by the runtime and resumed with `None` (plain resume).
+    /// `yield` in an expression position (assignment, argument, ...) is
+    /// diagnosed in [`Lowerer::expr`].
     fn lower_yield_stmt(
         &mut self,
         y: &ast::ExprYield,
@@ -2209,46 +2200,21 @@ impl<'a> Lowerer<'a> {
             self.error_at_code(
                 y.range,
                 codes::UNSUPPORTED,
-                "yield is not supported inside a lambda in eager mode",
+                "yield is not supported inside a lambda",
             );
             return None;
         }
-        let Some(generator) = fs.generator else {
+        if !fs.is_generator {
             self.error_at_code(
                 y.range,
                 codes::UNSUPPORTED,
                 "yield is only supported inside a generator function body",
             );
             return None;
-        };
-        let Some(value) = &y.value else {
-            self.error_at_code(
-                y.range,
-                codes::UNSUPPORTED,
-                "bare `yield` is not supported in eager mode; use `yield value`",
-            );
-            return None;
-        };
-        let value = self.expr(value, fs);
-        let object = HExpr {
-            kind: HExprKind::Local(generator),
-            ty: Ty::Concrete(Type::List),
-            line,
-            col,
-        };
-        let append = HExpr {
-            kind: HExprKind::MethodCall {
-                object: Box::new(object),
-                method: "append".to_string(),
-                args: vec![value],
-                keywords: Vec::new(),
-            },
-            ty: Ty::Concrete(Type::None),
-            line,
-            col,
-        };
+        }
+        let value = y.value.as_ref().map(|value| self.expr(value, fs));
         Some(HStmt {
-            kind: HStmtKind::Expr(append),
+            kind: HStmtKind::Yield { value },
             line,
             col,
         })
@@ -2895,6 +2861,17 @@ impl<'a> Lowerer<'a> {
                 };
                 let lhs = self.expr(&b.left, fs);
                 let rhs = self.expr(&b.right, fs);
+                // Fold only when both operands are literals and the operation
+                // cannot raise; anything fallible stays a runtime operation.
+                if let Some(constant) = fold_bin(op, &lhs, &rhs) {
+                    let ty = Ty::Concrete(constant.ty());
+                    return HExpr {
+                        kind: HExprKind::Const(constant),
+                        ty,
+                        line,
+                        col,
+                    };
+                }
                 let ty = self.infer.fresh();
                 HExpr {
                     kind: HExprKind::Bin {
@@ -2912,6 +2889,15 @@ impl<'a> Lowerer<'a> {
                     return self.error_expr(e.range());
                 };
                 let operand = self.expr(&u.operand, fs);
+                if let Some(constant) = fold_un(op, &operand) {
+                    let ty = Ty::Concrete(constant.ty());
+                    return HExpr {
+                        kind: HExprKind::Const(constant),
+                        ty,
+                        line,
+                        col,
+                    };
+                }
                 let ty = self.infer.fresh();
                 HExpr {
                     kind: HExprKind::Un {
@@ -2963,6 +2949,15 @@ impl<'a> Lowerer<'a> {
                 };
                 let lhs = self.expr(&c.left, fs);
                 let rhs = self.expr(&c.comparators[0], fs);
+                if let Some(constant) = fold_bin(op, &lhs, &rhs) {
+                    let ty = Ty::Concrete(constant.ty());
+                    return HExpr {
+                        kind: HExprKind::Const(constant),
+                        ty,
+                        line,
+                        col,
+                    };
+                }
                 let ty = self.infer.fresh();
                 HExpr {
                     kind: HExprKind::Bin {
@@ -3195,15 +3190,27 @@ impl<'a> Lowerer<'a> {
                 self.error_expr(e.range())
             }
             ast::Expr::Await(a) => {
-                // Eager mode: `await` is sequential, so it yields the value
-                // of its operand directly. No coroutine object exists.
-                self.expr(&a.value, fs)
+                if !fs.is_async {
+                    self.error_at_code(
+                        a.range,
+                        codes::CONTROL,
+                        "await is only allowed inside async functions",
+                    );
+                }
+                HExpr {
+                    kind: HExprKind::Await {
+                        value: Box::new(self.expr(&a.value, fs)),
+                    },
+                    ty: self.infer.fresh(),
+                    line,
+                    col,
+                }
             }
             ast::Expr::Yield(y) => {
                 self.error_at_code(
                     y.range,
                     codes::UNSUPPORTED,
-                    "yield inside an expression is not supported in eager mode; use a `yield value` statement",
+                    "yield expressions are not supported; use `yield value` as a statement",
                 );
                 self.error_expr(e.range())
             }
@@ -3211,7 +3218,7 @@ impl<'a> Lowerer<'a> {
                 self.error_at_code(
                     y.range,
                     codes::UNSUPPORTED,
-                    "yield from is not supported in eager mode",
+                    "yield from is not supported yet",
                 );
                 self.error_expr(e.range())
             }
@@ -3286,6 +3293,8 @@ impl<'a> Lowerer<'a> {
             ret_ty: Ty::Concrete(Type::Any),
             locals,
             body: Vec::new(),
+            is_async: false,
+            is_generator: false,
             is_module: false,
             line,
             col,
@@ -3297,7 +3306,8 @@ impl<'a> Lowerer<'a> {
             locals: local_map,
             loop_depth: 0,
             in_lambda: true,
-            generator: None,
+            is_async: false,
+            is_generator: false,
         };
         let value = self.expr(&l.body, &mut fs);
         let (body_line, body_col) = self.span(l.body.range());
@@ -3940,7 +3950,283 @@ fn is_docstring_expr(expr: &ast::Expr) -> bool {
     )
 }
 
-/// True when a function body contains a `yield value` statement.
+/// Numeric view of a literal operand used by constant folding.
+///
+/// The runtime treats `bool` as `0`/`1` for numeric operators, so `Bool`
+/// shares the `Int` representation here.
+#[derive(Clone, Copy)]
+enum FoldNum {
+    Int(i64),
+    Float(f64),
+}
+
+/// Bounds of the integers the runtime can encode as tagged immediates.
+///
+/// Arithmetic whose result leaves this range raises `OverflowError` at
+/// runtime, so such expressions must not be folded.
+const MIN_TAGGED_INT: i64 = i64::MIN >> 3;
+const MAX_TAGGED_INT: i64 = i64::MAX >> 3;
+
+/// `2^63` as `f64`; used for exact int/float comparisons near the i64 bounds.
+const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
+fn fold_num(constant: &Const) -> Option<FoldNum> {
+    match constant {
+        Const::Int(n) => Some(FoldNum::Int(*n)),
+        Const::Bool(b) => Some(FoldNum::Int(i64::from(*b))),
+        Const::Float(f) => Some(FoldNum::Float(*f)),
+        _ => None,
+    }
+}
+
+fn fold_num_to_f64(n: FoldNum) -> f64 {
+    match n {
+        FoldNum::Int(i) => i as f64,
+        FoldNum::Float(f) => f,
+    }
+}
+
+/// Wraps an integer result, rejecting values the runtime cannot represent.
+fn fold_int_result(n: i64) -> Option<Const> {
+    (MIN_TAGGED_INT..=MAX_TAGGED_INT)
+        .contains(&n)
+        .then_some(Const::Int(n))
+}
+
+/// Exact `i64`/`f64` comparison with Python semantics; `None` is unordered
+/// (a NaN operand). Mirrors the runtime's `cmp_int_float`.
+fn cmp_int_float(i: i64, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    if f == f64::INFINITY {
+        return Some(Ordering::Less);
+    }
+    if f == f64::NEG_INFINITY {
+        return Some(Ordering::Greater);
+    }
+    if f >= TWO_POW_63 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_POW_63 {
+        return Some(Ordering::Greater);
+    }
+    let truncated = f.trunc() as i64;
+    match i.cmp(&truncated) {
+        Ordering::Equal => {
+            if f.fract() > 0.0 {
+                Some(Ordering::Less)
+            } else if f.fract() < 0.0 {
+                Some(Ordering::Greater)
+            } else {
+                Some(Ordering::Equal)
+            }
+        }
+        other => Some(other),
+    }
+}
+
+fn cmp_fold_num(a: FoldNum, b: FoldNum) -> Option<Ordering> {
+    match (a, b) {
+        (FoldNum::Int(x), FoldNum::Int(y)) => Some(x.cmp(&y)),
+        (FoldNum::Float(x), FoldNum::Float(y)) => x.partial_cmp(&y),
+        (FoldNum::Int(x), FoldNum::Float(y)) => cmp_int_float(x, y),
+        (FoldNum::Float(x), FoldNum::Int(y)) => cmp_int_float(y, x).map(Ordering::reverse),
+    }
+}
+
+/// Folds a binary operation whose operands are both literals.
+///
+/// Returns `None` when the fold is not obviously safe: a non-literal operand,
+/// a type combination the sema does not accept, division/modulo by zero, or an
+/// integer result outside the runtime's immediate range. Those cases stay
+/// runtime operations so exceptions and evaluation order are unchanged.
+fn fold_bin(op: BinOp, lhs: &HExpr, rhs: &HExpr) -> Option<Const> {
+    let (HExprKind::Const(a), HExprKind::Const(b)) = (&lhs.kind, &rhs.kind) else {
+        return None;
+    };
+    match op {
+        BinOp::In | BinOp::NotIn => {
+            // Only `str in str` folds; container membership stays a runtime
+            // test (hashing, iteration and errors are runtime concerns).
+            let (Const::Str(needle), Const::Str(haystack)) = (a, b) else {
+                return None;
+            };
+            let found = haystack.contains(needle.as_str());
+            Some(Const::Bool(if op == BinOp::In { found } else { !found }))
+        }
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            fold_compare(op, a, b)
+        }
+        _ => fold_arith(op, a, b),
+    }
+}
+
+fn fold_compare(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
+    let ordering = match (fold_num(a), fold_num(b)) {
+        (Some(x), Some(y)) => cmp_fold_num(x, y),
+        _ => match (a, b) {
+            (Const::Str(x), Const::Str(y)) => Some(x.cmp(y)),
+            _ => return None,
+        },
+    };
+    let result = match ordering {
+        Some(ordering) => match op {
+            BinOp::Eq => ordering == Ordering::Equal,
+            BinOp::Ne => ordering != Ordering::Equal,
+            BinOp::Lt => ordering == Ordering::Less,
+            BinOp::Le => ordering != Ordering::Greater,
+            BinOp::Gt => ordering == Ordering::Greater,
+            BinOp::Ge => ordering != Ordering::Less,
+            _ => return None,
+        },
+        // NaN is unordered: only `!=` is true.
+        None => op == BinOp::Ne,
+    };
+    Some(Const::Bool(result))
+}
+
+fn fold_arith(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
+    if let (Const::Str(x), Const::Str(y)) = (a, b) {
+        // `str % ...` is printf-style formatting and stays a runtime call.
+        if op != BinOp::Add {
+            return None;
+        }
+        let mut out = String::with_capacity(x.len().checked_add(y.len())?);
+        out.push_str(x);
+        out.push_str(y);
+        return Some(Const::Str(out));
+    }
+    match (fold_num(a)?, fold_num(b)?) {
+        (FoldNum::Int(p), FoldNum::Int(q)) => fold_int_arith(op, p, q),
+        (x, y) => fold_float_arith(op, fold_num_to_f64(x), fold_num_to_f64(y)),
+    }
+}
+
+/// Integer arithmetic with the runtime's exact semantics, including Python's
+/// floor division/modulo and `int / int -> float`. Out-of-range results and
+/// undefined operations stay unfused (the runtime raises for them).
+fn fold_int_arith(op: BinOp, p: i64, q: i64) -> Option<Const> {
+    match op {
+        BinOp::Add => fold_int_result(p.checked_add(q)?),
+        BinOp::Sub => fold_int_result(p.checked_sub(q)?),
+        BinOp::Mul => fold_int_result(p.checked_mul(q)?),
+        BinOp::Div => {
+            if q == 0 {
+                return None;
+            }
+            Some(Const::Float(p as f64 / q as f64))
+        }
+        BinOp::FloorDiv => {
+            if q == 0 {
+                return None;
+            }
+            let quotient = p.checked_div(q)?;
+            let remainder = p.checked_rem(q)?;
+            let floored = if remainder != 0 && ((remainder < 0) != (q < 0)) {
+                quotient.checked_sub(1)?
+            } else {
+                quotient
+            };
+            fold_int_result(floored)
+        }
+        BinOp::Mod => {
+            if q == 0 {
+                return None;
+            }
+            let remainder = p.checked_rem(q)?;
+            let adjusted = if remainder != 0 && ((remainder < 0) != (q < 0)) {
+                remainder.checked_add(q)?
+            } else {
+                remainder
+            };
+            fold_int_result(adjusted)
+        }
+        BinOp::Pow => {
+            // Negative exponents produce a float (and can divide by zero);
+            // leave them to the runtime.
+            if q < 0 {
+                return None;
+            }
+            let mut exponent = q as u64;
+            let mut acc: i64 = 1;
+            let mut factor = p;
+            while exponent > 0 {
+                if exponent & 1 == 1 {
+                    acc = acc.checked_mul(factor)?;
+                }
+                exponent >>= 1;
+                if exponent > 0 {
+                    factor = factor.checked_mul(factor)?;
+                }
+            }
+            fold_int_result(acc)
+        }
+        _ => None,
+    }
+}
+
+/// Float arithmetic following the runtime's `pyx_binop` semantics. Division
+/// and modulo by zero raise at runtime and therefore stay unfused; the
+/// remaining operations cannot raise for finite or infinite f64 operands.
+fn fold_float_arith(op: BinOp, x: f64, y: f64) -> Option<Const> {
+    let result = match op {
+        BinOp::Add => x + y,
+        BinOp::Sub => x - y,
+        BinOp::Mul => x * y,
+        BinOp::Div => {
+            if y == 0.0 {
+                return None;
+            }
+            x / y
+        }
+        BinOp::FloorDiv => {
+            if y == 0.0 {
+                return None;
+            }
+            (x / y).floor()
+        }
+        BinOp::Mod => {
+            if y == 0.0 {
+                return None;
+            }
+            let mut remainder = x % y;
+            if remainder != 0.0 && ((remainder < 0.0) != (y < 0.0)) {
+                remainder += y;
+            }
+            remainder
+        }
+        BinOp::Pow => {
+            // `0.0 ** negative` raises at runtime.
+            if x == 0.0 && y < 0.0 {
+                return None;
+            }
+            x.powf(y)
+        }
+        _ => return None,
+    };
+    Some(Const::Float(result))
+}
+
+fn fold_un(op: pyx_ir::UnOp, operand: &HExpr) -> Option<Const> {
+    let HExprKind::Const(constant) = &operand.kind else {
+        return None;
+    };
+    match op {
+        pyx_ir::UnOp::Neg => match constant {
+            Const::Int(n) => fold_int_result(n.checked_neg()?),
+            Const::Float(f) => Some(Const::Float(-f)),
+            _ => None,
+        },
+        pyx_ir::UnOp::Not => match constant {
+            Const::Bool(b) => Some(Const::Bool(!b)),
+            _ => None,
+        },
+        pyx_ir::UnOp::Pos => None,
+    }
+}
+
+/// True when a function body contains a `yield`/`yield value` statement.
 ///
 /// The scan stays inside compound statements but never descends into nested
 /// functions, lambdas or classes: a `yield` there belongs to that nested scope

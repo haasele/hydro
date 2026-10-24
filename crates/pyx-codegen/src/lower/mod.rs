@@ -18,7 +18,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Linkage, Module};
 use pyx_ir::{
     BinOp, BoolOp, Builtin, Callee, CompClause, CompTarget, Const, ExcKind, Expr, ExprKind,
-    Function, FunctionId, Handler, LocalId, LocalInfo, Param, Program, Stmt, StmtKind,
+    Function, FunctionId, Handler, LocalId, LocalInfo, Param, Program, Stmt, StmtKind, Type,
 };
 
 use crate::CodegenError;
@@ -27,6 +27,17 @@ use crate::CodegenError;
 const NONE_TAG: i64 = 1;
 const FALSE_TAG: i64 = 9;
 const TRUE_TAG: i64 = 17;
+
+/// Tagged-immediate integers are `payload << 3`; the payload is recovered with
+/// an arithmetic shift right.
+const INT_TAG_SHIFT: i64 = 3;
+
+/// Payload bounds of a tagged immediate, mirroring `value::MIN_INT` and
+/// `value::MAX_INT` in `pyx-runtime` (`i64::MIN >> 3` and `i64::MAX >> 3`, i.e.
+/// `-2^60 ..= 2^60 - 1`). A result outside this range cannot be retagged and
+/// must go through `pyx_binop`, which raises `OverflowError`.
+const TAGGED_INT_MIN: i64 = i64::MIN >> INT_TAG_SHIFT;
+const TAGGED_INT_MAX: i64 = i64::MAX >> INT_TAG_SHIFT;
 
 /// Build the native target ISA with the flags appropriate for the backend.
 ///
@@ -109,6 +120,10 @@ struct Runtime {
     dict_from: FuncId,
     function_new: FuncId,
     closure_new: FuncId,
+    coroutine_new: FuncId,
+    generator_new: FuncId,
+    await_value: FuncId,
+    yield_value: FuncId,
     builtin_function: FuncId,
     call: FuncId,
     map: FuncId,
@@ -131,6 +146,8 @@ struct Runtime {
     method_kw: FuncId,
     iter_new: FuncId,
     iter_next: FuncId,
+    iter_of: FuncId,
+    next_value: FuncId,
     set_file: FuncId,
     set_line: FuncId,
     frame_enter: FuncId,
@@ -189,21 +206,43 @@ impl Runtime {
             list_from: declare_runtime(module, "pyx_list_from", &[i64t], Some(i64t))?,
             dict_from: declare_runtime(module, "pyx_dict_from", &[i64t], Some(i64t))?,
             // `wrapper` is an `i64` function pointer in the ABI; `arity` and
-            // `name_len` are `uint64_t`/`size_t`: pointer-width.
+            // `name_len` are `uint64_t`/`size_t`: pointer-width. `flags` is a
+            // `uint32_t` (bit0 async, bit1 generator).
             function_new: declare_runtime(
                 module,
                 "pyx_function_new",
-                &[i64t, ptr, ptr, ptr],
+                &[i64t, ptr, ptr, ptr, i32t],
                 Some(i64t),
             )?,
             // `wrapper` is an `i64`; `arity`, `name_len` and `capture_count`
-            // are `size_t` and `captures` is a pointer to tagged values.
+            // are `size_t`, `captures` is a pointer to tagged values and
+            // `flags` is a `uint32_t` (bit0 async, bit1 generator).
             closure_new: declare_runtime(
                 module,
                 "pyx_closure_new",
-                &[i64t, ptr, ptr, ptr, ptr, ptr],
+                &[i64t, ptr, ptr, ptr, ptr, ptr, i32t],
                 Some(i64t),
             )?,
+            // `entry` is the `__pyx_wrap_N` trampoline address passed as an
+            // `i64` (like `wrapper` above); `argc` is `size_t` and `argv`
+            // points to the tagged arguments.
+            coroutine_new: declare_runtime(
+                module,
+                "pyx_coroutine_new",
+                &[i64t, ptr, ptr],
+                Some(i64t),
+            )?,
+            generator_new: declare_runtime(
+                module,
+                "pyx_generator_new",
+                &[i64t, ptr, ptr],
+                Some(i64t),
+            )?,
+            // `pyx_await` takes the awaitable and returns its result;
+            // `pyx_yield` takes the yielded value and returns the value sent
+            // on resume.
+            await_value: declare_runtime(module, "pyx_await", &[i64t], Some(i64t))?,
+            yield_value: declare_runtime(module, "pyx_yield", &[i64t], Some(i64t))?,
             // `name_len` is a `size_t` in the ABI: pointer-width.
             builtin_function: declare_runtime(
                 module,
@@ -275,6 +314,9 @@ impl Runtime {
             )?,
             iter_new: declare_runtime(module, "pyx_iter_new", &[i64t], Some(i64t))?,
             iter_next: declare_runtime(module, "pyx_iter_next", &[i64t, ptr], Some(i64t))?,
+            iter_of: declare_runtime(module, "pyx_iter", &[i64t], Some(i64t))?,
+            // `has_default` is a plain `i64` flag (1/0).
+            next_value: declare_runtime(module, "pyx_next", &[i64t, i64t, i64t], Some(i64t))?,
             set_file: declare_runtime(module, "pyx_set_file", &[ptr, ptr], None)?,
             set_line: declare_runtime(module, "pyx_set_line", &[i32t], None)?,
             frame_enter: declare_runtime(module, "pyx_frame_enter", &[ptr, ptr], None)?,
@@ -685,6 +727,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
 
     fn tagged_int(&mut self, value: i64) -> Value {
         self.builder.ins().iconst(types::I64, value)
+    }
+
+    /// Encode the function kind as the runtime's `flags` word: bit0 marks an
+    /// `async def`, bit1 marks a generator. Both the coroutine and the
+    /// generator object are created from this flag word by the function
+    /// wrappers.
+    fn function_flags(&mut self, function: &Function) -> Value {
+        let flags = u32::from(function.is_async) | (u32::from(function.is_generator) << 1);
+        self.builder.ins().iconst(types::I32, i64::from(flags))
     }
 
     fn local_var(&self, id: LocalId) -> Result<Variable, CodegenError> {
@@ -1146,9 +1197,24 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             }
             StmtKind::AugAssign { target, op, value } => {
                 let var = self.local_var(*target)?;
-                let lhs = self.builder.use_var(var);
+                let value_ty = value.ty;
+                // Python evaluates the right-hand side before the read of the
+                // target; for a local the read has no side effects, but the
+                // value expression is still lowered exactly once here.
                 let rhs = self.lower_expr(value)?;
-                let result = self.lower_binop(*op, lhs, rhs)?;
+                let lhs = self.builder.use_var(var);
+                let target_ty = self.locals.get(*target as usize).map(|info| info.ty);
+                // `i += 1` is `i = i + 1`: with both sides statically `int`
+                // and an arithmetic operator the checked tagged-int path is
+                // exact; anything else keeps the dynamic operator.
+                let result = if target_ty == Some(Type::Int)
+                    && value_ty == Type::Int
+                    && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                {
+                    self.lower_int_arith(*op, lhs, rhs)?
+                } else {
+                    self.lower_binop(*op, lhs, rhs)?
+                };
                 self.builder.def_var(var, result);
             }
             StmtKind::If {
@@ -1292,6 +1358,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     .ins()
                     .iconst(self.ptr_ty, captures.len() as i64);
                 let captures_ptr = self.builder.ins().stack_addr(self.ptr_ty, captures_slot, 0);
+                let flags = self.function_flags(func);
                 let id = self.runtime.closure_new;
                 let closure = self.call_rt(
                     id,
@@ -1302,6 +1369,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         name_len,
                         capture_count,
                         captures_ptr,
+                        flags,
                     ],
                 )?;
                 self.emit_exc_check()?;
@@ -1420,6 +1488,17 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_continue()?;
             }
             StmtKind::Pass => {}
+            StmtKind::Yield { value } => {
+                let value = match value {
+                    Some(expr) => self.lower_expr(expr)?,
+                    None => self.none(),
+                };
+                // The value sent on resume (always `None` in PyX) is
+                // discarded; `yield` is only used for its suspension effect.
+                let id = self.runtime.yield_value;
+                self.call_rt(id, &[value])?;
+                self.emit_exc_check()?;
+            }
             StmtKind::Raise { exc, msg } => {
                 self.lower_raise(*exc, msg.as_ref())?;
             }
@@ -1456,6 +1535,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             ),
             None => false,
         };
+        // When the loop variable and every `range()` bound are statically
+        // `int`, the counter stays a tagged int and the backedge increment can
+        // use the checked fast path. Any other typing keeps the dynamic
+        // operator.
+        let int_counter = self.locals.get(var as usize).map(|info| info.ty) == Some(Type::Int)
+            && start.ty == Type::Int
+            && stop.ty == Type::Int
+            && step.is_none_or(|expr| expr.ty == Type::Int);
 
         let start_value = self.lower_expr(start)?;
         let stop_value = self.lower_expr(stop)?;
@@ -1514,11 +1601,21 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.jump(condition);
         self.switch_to(condition);
 
-        // Choose the comparison direction based on the sign of the step.
+        // Choose the comparison direction based on the sign of the step. A
+        // fully int loop compares tagged integers directly and branches on the
+        // sentinel, with no runtime operator or truthiness call.
         let step_current = self.builder.use_var(step_var);
         let zero = self.tagged_int(0);
-        let positive_step = self.lower_binop(BinOp::Gt, step_current, zero)?;
-        let direction = self.truthy_cond(positive_step)?;
+        let positive_step = if int_counter {
+            self.lower_int_comparison(BinOp::Gt, step_current, zero)?
+        } else {
+            self.lower_binop(BinOp::Gt, step_current, zero)?
+        };
+        let direction = if int_counter {
+            self.bool_cond(positive_step)
+        } else {
+            self.truthy_cond(positive_step)?
+        };
         self.builder
             .ins()
             .brif(direction, positive, &[], negative, &[]);
@@ -1526,15 +1623,31 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.switch_to(positive);
         let current = self.builder.use_var(local);
         let limit = self.builder.use_var(stop_var);
-        let comparison = self.lower_binop(BinOp::Lt, current, limit)?;
-        let branch = self.truthy_cond(comparison)?;
+        let comparison = if int_counter {
+            self.lower_int_comparison(BinOp::Lt, current, limit)?
+        } else {
+            self.lower_binop(BinOp::Lt, current, limit)?
+        };
+        let branch = if int_counter {
+            self.bool_cond(comparison)
+        } else {
+            self.truthy_cond(comparison)?
+        };
         self.builder.ins().brif(branch, body_block, &[], after, &[]);
 
         self.switch_to(negative);
         let current = self.builder.use_var(local);
         let limit = self.builder.use_var(stop_var);
-        let comparison = self.lower_binop(BinOp::Gt, current, limit)?;
-        let branch = self.truthy_cond(comparison)?;
+        let comparison = if int_counter {
+            self.lower_int_comparison(BinOp::Gt, current, limit)?
+        } else {
+            self.lower_binop(BinOp::Gt, current, limit)?
+        };
+        let branch = if int_counter {
+            self.bool_cond(comparison)
+        } else {
+            self.truthy_cond(comparison)?
+        };
         self.builder.ins().brif(branch, body_block, &[], after, &[]);
 
         self.loops.push(LoopTargets {
@@ -1553,7 +1666,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.emit_loop_safepoint();
         let current = self.builder.use_var(local);
         let step_current = self.builder.use_var(step_var);
-        let next = self.lower_binop(BinOp::Add, current, step_current)?;
+        let next = if int_counter {
+            self.lower_int_arith(BinOp::Add, current, step_current)?
+        } else {
+            self.lower_binop(BinOp::Add, current, step_current)?
+        };
         self.builder.def_var(local, next);
         self.jump(condition);
         self.loops.pop();
@@ -2097,8 +2214,26 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 Ok(self.builder.use_var(var))
             }
             ExprKind::Bin { op, lhs, rhs } => {
+                // Both operands are evaluated left to right before the
+                // operation itself, as in Python.
+                let lhs_ty = lhs.ty;
+                let rhs_ty = rhs.ty;
                 let lhs = self.lower_expr(lhs)?;
                 let rhs = self.lower_expr(rhs)?;
+                if lhs_ty == Type::Int && rhs_ty == Type::Int {
+                    match op {
+                        // The tagged-int fast path is only exact when the
+                        // result stays an `int`; other results (e.g. `/`)
+                        // go through the runtime operator.
+                        BinOp::Add | BinOp::Sub | BinOp::Mul if expr.ty == Type::Int => {
+                            return self.lower_int_arith(*op, lhs, rhs);
+                        }
+                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                            return self.lower_int_comparison(*op, lhs, rhs)
+                        }
+                        _ => {}
+                    }
+                }
                 self.lower_binop(*op, lhs, rhs)
             }
             ExprKind::Un { op, operand } => {
@@ -2211,6 +2346,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             ExprKind::BuiltinRef(builtin) => self.lower_builtin_ref(*builtin),
             ExprKind::IndirectCall { callee, args } => self.lower_indirect_call(callee, args),
             ExprKind::Call { callee, args } => self.lower_call(*callee, args),
+            ExprKind::Await { value } => {
+                let value = self.lower_expr(value)?;
+                let id = self.runtime.await_value;
+                let result = self.call_rt(id, &[value])?;
+                self.emit_exc_check()?;
+                Ok(result)
+            }
         }
     }
 
@@ -2220,6 +2362,131 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let result = self.call_rt(id, &[code, lhs, rhs])?;
         self.emit_exc_check()?;
         Ok(result)
+    }
+
+    /// Recover the payload of a tagged integer (`v >> 3`, arithmetic shift).
+    fn untag_int(&mut self, value: Value) -> Value {
+        self.builder.ins().sshr_imm(value, INT_TAG_SHIFT)
+    }
+
+    /// `int op int` for `+`, `-` and `*`.
+    ///
+    /// Both operands are known to be `int` and the result is `int`, so the
+    /// operation cannot dispatch on types or raise anything but
+    /// `OverflowError`. The fast path untags, computes with the checked
+    /// machine operation, verifies the payload still fits the 61-bit tagged
+    /// immediate and retags. Any overflow or out-of-range result branches to
+    /// the runtime operator, which raises the exact `OverflowError`.
+    fn lower_int_arith(
+        &mut self,
+        op: BinOp,
+        lhs: Value,
+        rhs: Value,
+    ) -> Result<Value, CodegenError> {
+        let a = self.untag_int(lhs);
+        let b = self.untag_int(rhs);
+        let (result, overflowed) = match op {
+            BinOp::Add => self.builder.ins().sadd_overflow(a, b),
+            BinOp::Sub => self.builder.ins().ssub_overflow(a, b),
+            BinOp::Mul => self.builder.ins().smul_overflow(a, b),
+            _ => {
+                return Err(CodegenError::new(
+                    "internal error: non-arithmetic operator on the int fast path",
+                ));
+            }
+        };
+
+        let no_i64_overflow = self.builder.ins().icmp_imm(IntCC::Equal, overflowed, 0);
+        let above_min =
+            self.builder
+                .ins()
+                .icmp_imm(IntCC::SignedGreaterThanOrEqual, result, TAGGED_INT_MIN);
+        let below_max =
+            self.builder
+                .ins()
+                .icmp_imm(IntCC::SignedLessThanOrEqual, result, TAGGED_INT_MAX);
+        let tagged_range = self.builder.ins().band(above_min, below_max);
+        let fast = self.builder.ins().band(no_i64_overflow, tagged_range);
+
+        let fast_block = self.builder.create_block();
+        let slow_block = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+        self.builder
+            .ins()
+            .brif(fast, fast_block, &[], slow_block, &[]);
+
+        self.switch_to(slow_block);
+        let code = self.builder.ins().iconst(types::I32, op.code() as i64);
+        let id = self.runtime.binop;
+        // The slow path sees the original tagged operands, so it raises the
+        // same `OverflowError` the generic operator always did.
+        let slow_value = self.call_rt(id, &[code, lhs, rhs])?;
+        self.emit_exc_check()?;
+        let slow_arg = [ir::BlockArg::from(slow_value)];
+        self.builder.ins().jump(join, &slow_arg);
+        self.terminated = true;
+
+        self.switch_to(fast_block);
+        let tagged = self.builder.ins().ishl_imm(result, INT_TAG_SHIFT);
+        let fast_arg = [ir::BlockArg::from(tagged)];
+        self.builder.ins().jump(join, &fast_arg);
+        self.terminated = true;
+
+        self.switch_to(join);
+        self.builder
+            .block_params(join)
+            .first()
+            .copied()
+            .ok_or_else(|| CodegenError::new("internal error: int arith join has no parameter"))
+    }
+
+    /// `int cmp int` for the six comparison operators.
+    ///
+    /// Ordering comparisons on two tagged immediates would already be exact
+    /// (the payload encoding is monotonic), but untagging keeps the rule
+    /// simple: compare payloads, then materialize the `True`/`False`
+    /// sentinels. Integer comparison never raises, so there is no exception
+    /// check.
+    fn lower_int_comparison(
+        &mut self,
+        op: BinOp,
+        lhs: Value,
+        rhs: Value,
+    ) -> Result<Value, CodegenError> {
+        let a = self.untag_int(lhs);
+        let b = self.untag_int(rhs);
+        let condition = match op {
+            BinOp::Eq => IntCC::Equal,
+            BinOp::Ne => IntCC::NotEqual,
+            BinOp::Lt => IntCC::SignedLessThan,
+            BinOp::Le => IntCC::SignedLessThanOrEqual,
+            BinOp::Gt => IntCC::SignedGreaterThan,
+            BinOp::Ge => IntCC::SignedGreaterThanOrEqual,
+            _ => {
+                return Err(CodegenError::new(
+                    "internal error: non-comparison operator on the int fast path",
+                ));
+            }
+        };
+        let condition = self.builder.ins().icmp(condition, a, b);
+        // `True` is 17 and `False` is 9 in the runtime's special immediates
+        // (`value::TRUE` / `value::FALSE`); both are plain constants.
+        let truthy = self.builder.ins().iconst(types::I64, TRUE_TAG);
+        let falsy = self.builder.ins().iconst(types::I64, FALSE_TAG);
+        Ok(self.builder.ins().select(condition, truthy, falsy))
+    }
+
+    /// Branch condition for a tagged `True`/`False` sentinel produced by the
+    /// typed int comparison path.
+    ///
+    /// Both `True` (17) and `False` (9) are non-zero, so a plain zero test
+    /// would always branch; compare against the `False` sentinel instead. This
+    /// avoids the `pyx_truthy` runtime call on the typed comparison path.
+    fn bool_cond(&mut self, value: Value) -> Value {
+        self.builder
+            .ins()
+            .icmp_imm(IntCC::NotEqual, value, FALSE_TAG)
     }
 
     fn lower_boolop(
@@ -2475,7 +2742,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     }
 
     /// Lower a reference to a program function to a first-class function
-    /// value via `pyx_function_new(wrapper, arity, name, name_len)`.
+    /// value via `pyx_function_new(wrapper, arity, name, name_len, flags)`.
     fn lower_function_ref(&mut self, id: FunctionId) -> Result<Value, CodegenError> {
         let program = self.program;
         let function = program
@@ -2503,8 +2770,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let (name_slot, name_len) = make_bytes_slot(&mut self.builder, function.name.as_bytes())?;
         let name = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
         let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
+        let flags = self.function_flags(function);
         let id = self.runtime.function_new;
-        let result = self.call_rt(id, &[wrapper_address, arity, name, name_len])?;
+        let result = self.call_rt(id, &[wrapper_address, arity, name, name_len, flags])?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -2565,54 +2833,104 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     }
 
     fn lower_call(&mut self, callee: Callee, args: &'a [Expr]) -> Result<Value, CodegenError> {
-        // F-string fields carry their static spec and conversion flag as
-        // trailing constant arguments; they become a direct runtime call
-        // instead of a first-class builtin invocation.
-        if callee == Callee::Builtin(Builtin::Format) {
-            return self.lower_format_call(args);
+        match callee {
+            Callee::Function(id) => self.lower_direct_call(id, args),
+            // F-string fields carry their static spec and conversion flag as
+            // trailing constant arguments; they become a direct runtime call
+            // instead of a first-class builtin invocation.
+            Callee::Builtin(Builtin::Format) => self.lower_format_call(args),
+            Callee::Builtin(builtin) => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.lower_expr(arg)?);
+                }
+                self.lower_builtin(builtin, &values)
+            }
         }
+    }
+
+    /// Lower a call to a program function.
+    ///
+    /// `async def` and generator functions are not executed inline: the
+    /// arguments are evaluated left to right into a stack array and handed to
+    /// `pyx_coroutine_new`/`pyx_generator_new`, which create the suspended
+    /// object without running the body. Plain functions keep the direct
+    /// `__pyx_fn_N` call.
+    fn lower_direct_call(
+        &mut self,
+        id: FunctionId,
+        args: &'a [Expr],
+    ) -> Result<Value, CodegenError> {
+        let function = self
+            .program
+            .functions
+            .get(id as usize)
+            .ok_or_else(|| CodegenError::new(format!("call to unknown function id {id}")))?;
+        if function.capture_count != 0 {
+            return Err(CodegenError::new(format!(
+                "internal error: function '{}' has captures and needs an indirect call",
+                function.name
+            )));
+        }
+        if function.params.len() != args.len() {
+            let name = &function.name;
+            let expected = function.params.len();
+            let actual = args.len();
+            return Err(CodegenError::new(format!(
+                "call to function {name} expects {expected} arguments, got {actual}"
+            )));
+        }
+        let deferred = function.is_async || function.is_generator;
+        let is_async = function.is_async;
+
+        if deferred {
+            // Each argument is stored as soon as it is evaluated so that an
+            // allocation in a later argument cannot observe a stale value.
+            let argv_slot = self.stack_array_slot(args.len(), "call arguments")?;
+            for (index, arg) in args.iter().enumerate() {
+                let value = self.lower_expr(arg)?;
+                self.builder
+                    .ins()
+                    .stack_store(value, argv_slot, (index * 8) as i32);
+            }
+            let wrapper = *self.wrappers.get(&id).ok_or_else(|| {
+                CodegenError::new(format!("call to undeclared wrapper for function id {id}"))
+            })?;
+            let reference = self.func_ref(wrapper);
+            let entry = self.builder.ins().func_addr(self.ptr_ty, reference);
+            let entry = self.pointer_to_i64(entry);
+            let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
+            // `argc == 0` still passes a valid pointer (the slot has one
+            // element).
+            let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+            let runtime_id = if is_async {
+                self.runtime.coroutine_new
+            } else {
+                self.runtime.generator_new
+            };
+            let result = self.call_rt(runtime_id, &[entry, argc, argv])?;
+            self.emit_exc_check()?;
+            return Ok(result);
+        }
+
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
             values.push(self.lower_expr(arg)?);
         }
-
-        match callee {
-            Callee::Function(id) => {
-                let function = self.program.functions.get(id as usize).ok_or_else(|| {
-                    CodegenError::new(format!("call to unknown function id {id}"))
-                })?;
-                if function.capture_count != 0 {
-                    return Err(CodegenError::new(format!(
-                        "internal error: function '{}' has captures and needs an indirect call",
-                        function.name
-                    )));
-                }
-                if function.params.len() != values.len() {
-                    let name = &function.name;
-                    let expected = function.params.len();
-                    let actual = values.len();
-                    return Err(CodegenError::new(format!(
-                        "call to function {name} expects {expected} arguments, got {actual}"
-                    )));
-                }
-                let target = *self.symbols.get(&id).ok_or_else(|| {
-                    CodegenError::new(format!("call to undeclared function id {id}"))
-                })?;
-                let reference = self.func_ref(target);
-                let call = self.builder.ins().call(reference, &values);
-                let result = self
-                    .builder
-                    .inst_results(call)
-                    .first()
-                    .copied()
-                    .ok_or_else(|| {
-                        CodegenError::new("internal error: user call returned no value")
-                    })?;
-                self.emit_exc_check()?;
-                Ok(result)
-            }
-            Callee::Builtin(builtin) => self.lower_builtin(builtin, &values),
-        }
+        let target = *self
+            .symbols
+            .get(&id)
+            .ok_or_else(|| CodegenError::new(format!("call to undeclared function id {id}")))?;
+        let reference = self.func_ref(target);
+        let call = self.builder.ins().call(reference, &values);
+        let result = self
+            .builder
+            .inst_results(call)
+            .first()
+            .copied()
+            .ok_or_else(|| CodegenError::new("internal error: user call returned no value"))?;
+        self.emit_exc_check()?;
+        Ok(result)
     }
 
     /// Lowers one f-string interpolation field to `pyx_format_value`.
@@ -2698,6 +3016,35 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let argc = self.builder.ins().iconst(self.ptr_ty, values.len() as i64);
                 let id = self.runtime.bytes_build;
                 let result = self.call_rt(id, &[argc, argv])?;
+                self.emit_exc_check()?;
+                Ok(result)
+            }
+            Builtin::Iter => {
+                if values.len() != 1 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin iter expects 1 argument, got {actual}"
+                    )));
+                }
+                let id = self.runtime.iter_of;
+                let result = self.call_rt(id, &values[..1])?;
+                self.emit_exc_check()?;
+                Ok(result)
+            }
+            Builtin::Next => {
+                let (obj, default, has_default) = match values {
+                    [obj] => (*obj, self.none(), 0i64),
+                    [obj, default] => (*obj, *default, 1i64),
+                    actual => {
+                        let actual = actual.len();
+                        return Err(CodegenError::new(format!(
+                            "builtin next expects 1 or 2 arguments, got {actual}"
+                        )));
+                    }
+                };
+                let has_default = self.builder.ins().iconst(types::I64, has_default);
+                let id = self.runtime.next_value;
+                let result = self.call_rt(id, &[obj, default, has_default])?;
                 self.emit_exc_check()?;
                 Ok(result)
             }
@@ -3070,6 +3417,8 @@ mod tests {
                     ty: Type::Bytes,
                 }],
                 body: vec![Stmt::new(StmtKind::Assign { target: 0, value }, 1)],
+                is_async: false,
+                is_generator: false,
             }],
             main: 0,
         }
@@ -3241,6 +3590,8 @@ mod tests {
                 StmtKind::Return(Some(Expr::new(ExprKind::Local(0), Type::Any, 1))),
                 1,
             )],
+            is_async: false,
+            is_generator: false,
         };
         let module_body = Function {
             name: "<module>".to_string(),
@@ -3293,6 +3644,8 @@ mod tests {
                     3,
                 ),
             ],
+            is_async: false,
+            is_generator: false,
         };
         let program = Program {
             source_name: "test.py".to_string(),
@@ -3344,6 +3697,8 @@ mod tests {
                 },
             ],
             body: vec![Stmt::new(StmtKind::Return(Some(add(0, 1))), 4)],
+            is_async: false,
+            is_generator: false,
         };
         let module_body = Function {
             name: "<module>".to_string(),
@@ -3388,6 +3743,8 @@ mod tests {
                     3,
                 ),
             ],
+            is_async: false,
+            is_generator: false,
         };
         let program = Program {
             source_name: "test.py".to_string(),
@@ -3396,5 +3753,438 @@ mod tests {
         };
         let object = crate::compile_object(&program).expect("closure definition must lower");
         assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn direct_call_to_async_function_creates_a_coroutine() {
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![LocalInfo {
+                name: "c".to_string(),
+                ty: Type::Any,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Assign {
+                    target: 0,
+                    value: Expr::new(
+                        ExprKind::Call {
+                            callee: Callee::Function(1),
+                            args: vec![Expr::new(ExprKind::Const(Const::Int(1)), Type::Int, 1)],
+                        },
+                        Type::Any,
+                        1,
+                    ),
+                },
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        // The body would be a `return` if the call executed it directly; the
+        // call must only build the coroutine object.
+        let coroutine = Function {
+            name: "work".to_string(),
+            params: vec![Param {
+                local: 0,
+                name: "n".to_string(),
+                ty: Type::Int,
+            }],
+            capture_count: 0,
+            ret_ty: Type::Any,
+            locals: vec![LocalInfo {
+                name: "n".to_string(),
+                ty: Type::Int,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Return(Some(Expr::new(ExprKind::Local(0), Type::Int, 2))),
+                2,
+            )],
+            is_async: true,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, coroutine],
+            main: 0,
+        };
+        let object =
+            crate::compile_object(&program).expect("direct call to an async function must lower");
+        assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn await_and_yield_lower_to_the_runtime_abi() {
+        let generator = Function {
+            name: "count".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::Any,
+            locals: Vec::new(),
+            body: vec![
+                Stmt::new(
+                    StmtKind::Yield {
+                        value: Some(Expr::new(ExprKind::Const(Const::Int(1)), Type::Int, 1)),
+                    },
+                    1,
+                ),
+                Stmt::new(StmtKind::Yield { value: None }, 2),
+            ],
+            is_async: false,
+            is_generator: true,
+        };
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![
+                LocalInfo {
+                    name: "c".to_string(),
+                    ty: Type::Any,
+                },
+                LocalInfo {
+                    name: "g".to_string(),
+                    ty: Type::Any,
+                },
+            ],
+            body: vec![
+                Stmt::new(
+                    StmtKind::Assign {
+                        target: 0,
+                        value: Expr::new(
+                            ExprKind::Call {
+                                callee: Callee::Function(1),
+                                args: vec![Expr::new(ExprKind::Const(Const::Int(1)), Type::Int, 1)],
+                            },
+                            Type::Any,
+                            1,
+                        ),
+                    },
+                    1,
+                ),
+                Stmt::new(
+                    StmtKind::Assign {
+                        target: 1,
+                        value: Expr::new(
+                            ExprKind::Call {
+                                callee: Callee::Function(2),
+                                args: Vec::new(),
+                            },
+                            Type::Any,
+                            2,
+                        ),
+                    },
+                    2,
+                ),
+            ],
+            is_async: false,
+            is_generator: false,
+        };
+        let async_body = Function {
+            name: "run".to_string(),
+            params: vec![Param {
+                local: 0,
+                name: "c".to_string(),
+                ty: Type::Any,
+            }],
+            capture_count: 0,
+            ret_ty: Type::Any,
+            locals: vec![LocalInfo {
+                name: "c".to_string(),
+                ty: Type::Any,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Return(Some(Expr::new(
+                    ExprKind::Await {
+                        value: Box::new(Expr::new(ExprKind::Local(0), Type::Any, 3)),
+                    },
+                    Type::Any,
+                    3,
+                ))),
+                3,
+            )],
+            is_async: true,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, async_body, generator],
+            main: 0,
+        };
+        let object = crate::compile_object(&program).expect("await/yield must lower");
+        assert!(!object.is_empty());
+    }
+
+    /// A module body containing `body` and no locals.
+    fn program_with_body(body: Vec<Stmt>) -> Program {
+        Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: Vec::new(),
+                body,
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+        }
+    }
+
+    #[test]
+    fn int_binop_fast_paths_emit_an_object_file() {
+        let int = || Expr::new(ExprKind::Const(Const::Int(2)), Type::Int, 1);
+        let binary = |op: BinOp, ty: Type| {
+            Expr::new(
+                ExprKind::Bin {
+                    op,
+                    lhs: Box::new(int()),
+                    rhs: Box::new(int()),
+                },
+                ty,
+                1,
+            )
+        };
+        // Every specialised shape must lower: the three checked-arithmetic
+        // paths (with their overflow slow block) and the six comparisons.
+        let operations = [
+            binary(BinOp::Add, Type::Int),
+            binary(BinOp::Sub, Type::Int),
+            binary(BinOp::Mul, Type::Int),
+            binary(BinOp::Eq, Type::Bool),
+            binary(BinOp::Ne, Type::Bool),
+            binary(BinOp::Lt, Type::Bool),
+            binary(BinOp::Le, Type::Bool),
+            binary(BinOp::Gt, Type::Bool),
+            binary(BinOp::Ge, Type::Bool),
+        ];
+        let body = operations
+            .into_iter()
+            .map(|expr| Stmt::new(StmtKind::Expr(expr), 1))
+            .collect();
+        let program = program_with_body(body);
+        let object = crate::compile_object(&program).expect("int binops must lower");
+        assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn any_operand_add_still_lowers_through_the_runtime_binop() {
+        let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![LocalInfo {
+                    name: "x".to_string(),
+                    ty: Type::Any,
+                }],
+                body: vec![
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 0,
+                            value: int(1),
+                        },
+                        1,
+                    ),
+                    Stmt::new(
+                        StmtKind::Expr(Expr::new(
+                            ExprKind::Bin {
+                                op: BinOp::Add,
+                                lhs: Box::new(Expr::new(ExprKind::Local(0), Type::Any, 2)),
+                                rhs: Box::new(int(2)),
+                            },
+                            Type::Any,
+                            2,
+                        )),
+                        2,
+                    ),
+                ],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+        };
+        let object = crate::compile_object(&program).expect("Any operand must lower");
+        assert!(!object.is_empty());
+        // The dynamic operator stays in the object's symbol/relocation table.
+        assert!(
+            object
+                .windows(b"pyx_binop".len())
+                .any(|window| window == &b"pyx_binop"[..]),
+            "the Any operand must call pyx_binop"
+        );
+    }
+
+    #[test]
+    fn int_aug_assign_and_range_loop_emit_an_object_file() {
+        let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let local = |id| Expr::new(ExprKind::Local(id), Type::Int, 1);
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![
+                    LocalInfo {
+                        name: "i".to_string(),
+                        ty: Type::Int,
+                    },
+                    LocalInfo {
+                        name: "total".to_string(),
+                        ty: Type::Int,
+                    },
+                ],
+                body: vec![
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 0,
+                            value: int(0),
+                        },
+                        1,
+                    ),
+                    // `while i < 3: i += 1` exercises the int aug-assign path.
+                    Stmt::new(
+                        StmtKind::While {
+                            cond: Expr::new(
+                                ExprKind::Bin {
+                                    op: BinOp::Lt,
+                                    lhs: Box::new(local(0)),
+                                    rhs: Box::new(int(3)),
+                                },
+                                Type::Bool,
+                                2,
+                            ),
+                            body: vec![Stmt::new(
+                                StmtKind::AugAssign {
+                                    target: 0,
+                                    op: BinOp::Add,
+                                    value: int(1),
+                                },
+                                3,
+                            )],
+                        },
+                        2,
+                    ),
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 1,
+                            value: int(0),
+                        },
+                        4,
+                    ),
+                    // `for i in range(0, 3, 1): total += i` exercises the
+                    // typed range counter and the aug-assign path together.
+                    Stmt::new(
+                        StmtKind::ForRange {
+                            var: 0,
+                            start: int(0),
+                            stop: int(3),
+                            step: Some(int(1)),
+                            body: vec![Stmt::new(
+                                StmtKind::AugAssign {
+                                    target: 1,
+                                    op: BinOp::Add,
+                                    value: local(0),
+                                },
+                                5,
+                            )],
+                        },
+                        4,
+                    ),
+                ],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+        };
+        let object =
+            crate::compile_object(&program).expect("int aug-assign and range loop must lower");
+        assert!(!object.is_empty());
+    }
+
+    /// Number of relocation entries in an object file that target the
+    /// `pyx_binop` import, i.e. the number of emitted calls to the dynamic
+    /// operator.
+    fn runtime_binop_call_sites(object: &[u8]) -> usize {
+        use cranelift_object::object::read::{Object, ObjectSection, ObjectSymbol};
+        use cranelift_object::object::RelocationTarget;
+
+        let file = cranelift_object::object::read::File::parse(object)
+            .expect("the AOT backend must emit a readable object file");
+        let Some(binop) = file
+            .symbols()
+            .find(|symbol| symbol.name().ok() == Some("pyx_binop"))
+            .map(|symbol| symbol.index())
+        else {
+            return 0;
+        };
+        let mut sites = 0;
+        for section in file.sections() {
+            for (_, relocation) in section.relocations() {
+                if relocation.target() == RelocationTarget::Symbol(binop) {
+                    sites += 1;
+                }
+            }
+        }
+        sites
+    }
+
+    #[test]
+    fn int_range_loop_condition_avoids_the_runtime_binop() {
+        let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        // `for i in range(0, 3, 1): pass` with the loop variable typed either
+        // `int` (specialised condition and increment) or `Any` (fully dynamic).
+        let range_program = |var_ty: Type| Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![LocalInfo {
+                    name: "i".to_string(),
+                    ty: var_ty,
+                }],
+                body: vec![Stmt::new(
+                    StmtKind::ForRange {
+                        var: 0,
+                        start: int(0),
+                        stop: int(3),
+                        step: Some(int(1)),
+                        body: Vec::new(),
+                    },
+                    1,
+                )],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+        };
+
+        let int_object =
+            crate::compile_object(&range_program(Type::Int)).expect("int range loop must lower");
+        let any_object =
+            crate::compile_object(&range_program(Type::Any)).expect("Any range loop must lower");
+
+        // The typed loop keeps `pyx_binop` only in the counter-increment
+        // overflow slow block; the dynamic loop additionally calls it for the
+        // step-direction test and both loop conditions.
+        let int_sites = runtime_binop_call_sites(&int_object);
+        let any_sites = runtime_binop_call_sites(&any_object);
+        assert!(any_sites > 0, "the Any range loop must call pyx_binop");
+        assert!(
+            int_sites < any_sites,
+            "the int loop condition must avoid pyx_binop: int={int_sites}, any={any_sites}"
+        );
     }
 }

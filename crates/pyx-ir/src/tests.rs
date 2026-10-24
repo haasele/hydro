@@ -37,7 +37,7 @@ fn asyncio_module_spec_is_registered() {
     let gather = stdlib::function("asyncio", "gather").expect("gather");
     assert_eq!(
         (gather.min_args, gather.max_args, gather.ret),
-        (1, 1, Type::List)
+        (0, usize::MAX, Type::List)
     );
     assert!(stdlib::module("asyncio").unwrap().constants.is_empty());
 }

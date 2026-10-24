@@ -1939,7 +1939,7 @@ fn comprehension_result_types_are_static_containers() {
     assert_eq!(
         types,
         vec![Type::List, Type::Set, Type::Dict, Type::List],
-        "generators are materialised eagerly as lists"
+        "generator expressions are materialised as lists"
     );
     assert!(
         matches!(&module[0].kind, pyx_ir::StmtKind::Assign { value, .. }
@@ -2466,133 +2466,101 @@ fn function<'a>(hir: &'a LHir, name: &str) -> &'a HFunction {
 }
 
 #[test]
-fn generator_function_appends_yields_and_returns_the_list() {
+fn generator_function_marks_the_function_and_emits_yield_statements() {
     let source = "def g():\n    yield 1\n    yield 2\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
 
     let g = function(&hir, "g");
-    assert!(matches!(g.ret_ty, Ty::Concrete(Type::List)));
+    assert!(g.is_generator);
+    assert!(!g.is_async);
+    assert!(!g.is_module);
+    assert!(
+        g.locals.is_empty(),
+        "no hidden generator local: {:?}",
+        g.locals
+    );
 
-    // `$gen = []` first, the two `yield`s as `append` calls, then `return $gen`.
-    let HStmtKind::Assign { target, value } = &g.body[0].kind else {
-        panic!("expected the hidden generator list initialisation");
-    };
-    let hidden = *target;
-    assert!(g.locals[hidden as usize].name.starts_with("$gen"));
-    assert!(matches!(&value.kind, HExprKind::List(items) if items.is_empty()));
-    assert!(matches!(
-        g.locals[hidden as usize].ty,
-        Ty::Concrete(Type::List)
-    ));
-
-    assert_eq!(g.body.len(), 4, "{:?}", g.body);
-    for (stmt, expected) in [(&g.body[1], 1), (&g.body[2], 2)] {
-        let HStmtKind::Expr(append) = &stmt.kind else {
-            panic!("expected an append statement, got {:?}", stmt.kind);
+    assert_eq!(g.body.len(), 2, "{:?}", g.body);
+    for (stmt, expected) in [(&g.body[0], 1), (&g.body[1], 2)] {
+        let HStmtKind::Yield { value: Some(value) } = &stmt.kind else {
+            panic!("expected a yield statement, got {:?}", stmt.kind);
         };
-        let HExprKind::MethodCall {
-            object,
-            method,
-            args,
-            ..
-        } = &append.kind
-        else {
-            panic!("expected a method call, got {:?}", append.kind);
-        };
-        assert_eq!(method, "append");
-        assert!(matches!(&object.kind, HExprKind::Local(local) if *local == hidden));
-        assert_eq!(args.len(), 1);
         assert!(matches!(
-            &args[0].kind,
+            &value.kind,
             HExprKind::Const(Const::Int(n)) if *n == expected
         ));
     }
-    let HStmtKind::Return(Some(value)) = &g.body[3].kind else {
-        panic!("expected the materialised list to be returned");
-    };
-    assert!(matches!(&value.kind, HExprKind::Local(local) if *local == hidden));
 }
 
 #[test]
-fn generator_yields_inside_control_flow_are_materialised() {
+fn generator_yields_inside_control_flow_are_statements() {
     let source = "def g(n):\n    if n > 0:\n        yield n\n    for i in range(n):\n        yield i\n    while n > 5:\n        yield 0\n        n = 5\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
 
     let g = function(&hir, "g");
-    let mut appends = 0;
-    fn count_appends(stmts: &[HStmt], count: &mut usize) {
+    assert!(g.is_generator);
+
+    fn count_yields(stmts: &[HStmt], count: &mut usize) {
         for stmt in stmts {
             match &stmt.kind {
-                HStmtKind::Expr(expr) if matches!(&expr.kind, HExprKind::MethodCall { method, .. } if method == "append") => {
-                    *count += 1
-                }
+                HStmtKind::Yield { .. } => *count += 1,
                 HStmtKind::If {
                     then_body,
                     else_body,
                     ..
                 } => {
-                    count_appends(then_body, count);
-                    count_appends(else_body, count);
+                    count_yields(then_body, count);
+                    count_yields(else_body, count);
                 }
                 HStmtKind::ForEach { body, .. } | HStmtKind::ForRange { body, .. } => {
-                    count_appends(body, count)
+                    count_yields(body, count)
                 }
-                HStmtKind::While { body, .. } => count_appends(body, count),
+                HStmtKind::While { body, .. } => count_yields(body, count),
                 HStmtKind::Try {
                     body,
                     handlers,
                     else_body,
                     finally_body,
                 } => {
-                    count_appends(body, count);
+                    count_yields(body, count);
                     for handler in handlers {
-                        count_appends(&handler.body, count);
+                        count_yields(&handler.body, count);
                     }
-                    count_appends(else_body, count);
-                    count_appends(finally_body, count);
+                    count_yields(else_body, count);
+                    count_yields(finally_body, count);
                 }
                 _ => {}
             }
         }
     }
-    count_appends(&g.body, &mut appends);
-    assert_eq!(appends, 3);
-    assert!(matches!(
-        g.body.last().map(|s| &s.kind),
-        Some(HStmtKind::Return(Some(_)))
-    ));
+
+    let mut yields = 0;
+    count_yields(&g.body, &mut yields);
+    assert_eq!(yields, 3);
 }
 
 #[test]
-fn generator_without_return_still_returns_the_materialised_list() {
-    let source = "def g():\n    yield 1\n";
-    let (hir, _, diags) = lower_source(source, &parse(source));
-    assert!(diags.is_empty(), "{diags:?}");
-    let g = function(&hir, "g");
-    assert!(matches!(
-        g.body.last().map(|s| &s.kind),
-        Some(HStmtKind::Return(Some(HExpr {
-            kind: HExprKind::Local(_),
-            ..
-        })))
-    ));
-}
-
-#[test]
-fn explicit_return_in_a_generator_is_rejected() {
-    for source in [
-        "def g():\n    yield 1\n    return 2\n",
-        "def g():\n    yield 1\n    return\n",
+fn generator_return_value_is_allowed() {
+    for (source, has_value) in [
+        ("def g():\n    yield 1\n    return 2\n", true),
+        ("def g():\n    yield 1\n    return\n", false),
     ] {
-        let diags = crate::check_source(source, "test.py").expect_err("return in generator");
-        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        assert!(
-            messages.contains(&"explicit return in a generator is not supported in eager mode"),
-            "{source}: {messages:?}"
-        );
-        assert_eq!(diags[0].code, codes::CONTROL, "{source}");
+        let (hir, _, diags) = lower_source(source, &parse(source));
+        assert!(diags.is_empty(), "{source}: {diags:?}");
+        let g = function(&hir, "g");
+        assert!(g.is_generator, "{source}");
+        match (&g.body.last().expect("last statement").kind, has_value) {
+            (HStmtKind::Return(Some(value)), true) => {
+                assert!(
+                    matches!(&value.kind, HExprKind::Const(Const::Int(2))),
+                    "{source}"
+                );
+            }
+            (HStmtKind::Return(None), false) => {}
+            (other, _) => panic!("unexpected return lowering for {source}: {other:?}"),
+        }
     }
 }
 
@@ -2605,8 +2573,7 @@ fn yield_inside_an_expression_is_rejected() {
         let (_, _, diags) = lower_source(source, &parse(source));
         assert!(
             diags.iter().any(|d| {
-                d.message
-                    == "yield inside an expression is not supported in eager mode; use a `yield value` statement"
+                d.message == "yield expressions are not supported; use `yield value` as a statement"
                     && d.code == codes::UNSUPPORTED
             }),
             "{source}: {diags:?}"
@@ -2615,21 +2582,23 @@ fn yield_inside_an_expression_is_rejected() {
 }
 
 #[test]
-fn bare_yield_and_yield_from_are_rejected() {
-    let (_, _, diags) = lower_source("def g():\n    yield\n", &parse("def g():\n    yield\n"));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(
-        diags[0].message,
-        "bare `yield` is not supported in eager mode; use `yield value`"
-    );
+fn bare_yield_lowers_to_a_yield_statement() {
+    let source = "def g():\n    yield\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let g = function(&hir, "g");
+    assert!(g.is_generator);
+    assert_eq!(g.body.len(), 1, "{:?}", g.body);
+    assert!(matches!(&g.body[0].kind, HStmtKind::Yield { value: None }));
+}
 
+#[test]
+fn yield_from_is_rejected() {
     let source = "def g():\n    yield from [1, 2]\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(
-        diags[0].message,
-        "yield from is not supported in eager mode"
-    );
+    assert_eq!(diags[0].message, "yield from is not supported yet");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
 }
 
 #[test]
@@ -2642,19 +2611,47 @@ fn yield_outside_a_function_is_rejected() {
 }
 
 #[test]
-fn async_def_lowers_like_a_regular_function() {
+fn async_def_marks_the_function_and_lowers_await() {
     let source =
         "import asyncio\nasync def f():\n    await 1\n    return 7\nx = asyncio.run(f())\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
     let f = function(&hir, "f");
-    // `await 1` is the literal `1`; only the `return 7` remains a statement.
+    assert!(f.is_async);
+    assert!(!f.is_generator);
     assert_eq!(f.body.len(), 2, "{:?}", f.body);
     let HStmtKind::Expr(awaited) = &f.body[0].kind else {
         panic!("expected the awaited expression");
     };
-    assert!(matches!(&awaited.kind, HExprKind::Const(Const::Int(1))));
+    let HExprKind::Await { value } = &awaited.kind else {
+        panic!("expected an await node, got {:?}", awaited.kind);
+    };
+    assert!(matches!(&value.kind, HExprKind::Const(Const::Int(1))));
     assert!(matches!(&f.body[1].kind, HStmtKind::Return(Some(_))));
+}
+
+#[test]
+fn await_outside_an_async_function_is_rejected() {
+    let source = "def f():\n    await 1\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(
+        diags[0].message,
+        "await is only allowed inside async functions"
+    );
+    assert_eq!(diags[0].code, codes::CONTROL);
+}
+
+#[test]
+fn async_generator_is_rejected() {
+    let source = "async def g():\n    yield 1\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].message, "async generators are not supported");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    let g = function(&hir, "g");
+    assert!(g.is_async);
+    assert!(g.is_generator);
 }
 
 #[test]
@@ -2673,6 +2670,8 @@ fn async_methods_are_registered_in_classes() {
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
     let method = function(&hir, "A.f");
+    assert!(method.is_async);
+    assert!(!method.is_generator);
     assert!(matches!(&method.body[0].kind, HStmtKind::Return(Some(_))));
 }
 
@@ -2840,4 +2839,229 @@ fn nested_function_does_not_capture_names_assigned_in_its_body() {
         1,
         "the assignment must create a nested local, not a capture"
     );
+}
+
+#[test]
+fn integer_arithmetic_folds_to_constants() {
+    let source = "a = 2 + 3\n\
+                  b = 7 - 10\n\
+                  c = 4 * 6\n\
+                  d = 7 // 2\n\
+                  e = -7 // 2\n\
+                  f = -7 % 3\n\
+                  g = 2 ** 10\n\
+                  h = 7 / 2\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    for (name, expected) in [
+        ("a", 5),
+        ("b", -3),
+        ("c", 24),
+        ("d", 3),
+        ("e", -4),
+        ("f", 2),
+        ("g", 1024),
+    ] {
+        let expr = assigned(&hir, name);
+        assert!(
+            matches!(&expr.kind, HExprKind::Const(Const::Int(v)) if *v == expected),
+            "{name}: {:?}",
+            expr.kind
+        );
+        assert_eq!(expr.ty, Ty::Concrete(Type::Int), "{name}");
+    }
+
+    let h = assigned(&hir, "h");
+    assert!(matches!(
+        &h.kind,
+        HExprKind::Const(Const::Float(v)) if *v == 3.5
+    ));
+    assert_eq!(h.ty, Ty::Concrete(Type::Float));
+}
+
+#[test]
+fn float_arithmetic_folds_to_constants() {
+    let source = "a = 1.5 + 2.5\n\
+                  b = 5.0 - 1.25\n\
+                  c = 2.0 * 3.5\n\
+                  d = 7.0 / 2.0\n\
+                  e = 7.5 // 2.0\n\
+                  f = 7.5 % 2.0\n\
+                  g = 2.0 ** 3.0\n\
+                  h = 1 + 2.5\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    for (name, expected) in [
+        ("a", 4.0),
+        ("b", 3.75),
+        ("c", 7.0),
+        ("d", 3.5),
+        ("e", 3.0),
+        ("f", 1.5),
+        ("g", 8.0),
+        ("h", 3.5),
+    ] {
+        let expr = assigned(&hir, name);
+        assert!(
+            matches!(&expr.kind, HExprKind::Const(Const::Float(v)) if *v == expected),
+            "{name}: {:?}",
+            expr.kind
+        );
+        assert_eq!(expr.ty, Ty::Concrete(Type::Float), "{name}");
+    }
+}
+
+#[test]
+fn string_concatenation_folds_to_a_constant() {
+    let source = "a = \"ab\" + \"cd\"\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let expr = assigned(&hir, "a");
+    assert!(matches!(
+        &expr.kind,
+        HExprKind::Const(Const::Str(s)) if s == "abcd"
+    ));
+    assert_eq!(expr.ty, Ty::Concrete(Type::Str));
+}
+
+#[test]
+fn constant_comparisons_fold_to_bools() {
+    let source = "a = 1 < 2\n\
+                  b = 2.5 >= 2\n\
+                  c = 1 == 1.0\n\
+                  d = \"abc\" == \"abc\"\n\
+                  e = \"a\" != \"b\"\n\
+                  f = 3 > 4\n\
+                  g = \"ell\" in \"hello\"\n\
+                  h = \"zz\" not in \"hello\"\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    for (name, expected) in [
+        ("a", true),
+        ("b", true),
+        ("c", true),
+        ("d", true),
+        ("e", true),
+        ("f", false),
+        ("g", true),
+        ("h", true),
+    ] {
+        let expr = assigned(&hir, name);
+        assert!(
+            matches!(&expr.kind, HExprKind::Const(Const::Bool(v)) if *v == expected),
+            "{name}: {:?}",
+            expr.kind
+        );
+        assert_eq!(expr.ty, Ty::Concrete(Type::Bool), "{name}");
+    }
+}
+
+#[test]
+fn constant_unary_operations_fold() {
+    let source = "a = -5\nb = -2.5\nc = not True\nd = -(2 + 3)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    assert!(matches!(
+        &assigned(&hir, "a").kind,
+        HExprKind::Const(Const::Int(-5))
+    ));
+    assert!(matches!(
+        &assigned(&hir, "b").kind,
+        HExprKind::Const(Const::Float(v)) if *v == -2.5
+    ));
+    assert!(matches!(
+        &assigned(&hir, "c").kind,
+        HExprKind::Const(Const::Bool(false))
+    ));
+    assert!(matches!(
+        &assigned(&hir, "d").kind,
+        HExprKind::Const(Const::Int(-5))
+    ));
+}
+
+#[test]
+fn raising_and_overflowing_operations_stay_unfused() {
+    let source = "a = 1 / 0\n\
+                  b = 1 // 0\n\
+                  c = 1 % 0\n\
+                  d = 9223372036854775807 + 1\n\
+                  e = 1152921504606846975 + 1\n\
+                  f = 2 ** 9223372036854775807\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    for name in ["a", "b", "c", "d", "e", "f"] {
+        let expr = assigned(&hir, name);
+        assert!(
+            matches!(&expr.kind, HExprKind::Bin { .. }),
+            "{name} folded: {:?}",
+            expr.kind
+        );
+    }
+}
+
+#[test]
+fn non_constant_operands_stay_unfused() {
+    let source = "a = 1\nb = a + 1\nc = a * 2.5\nd = a < 2\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    for name in ["b", "c", "d"] {
+        let expr = assigned(&hir, name);
+        assert!(
+            matches!(&expr.kind, HExprKind::Bin { .. }),
+            "{name} folded: {:?}",
+            expr.kind
+        );
+    }
+}
+
+#[test]
+fn literal_conditions_drop_dead_statements() {
+    let source = "if False:\n    x = 1\nelse:\n    y = 2\n\
+                  if True:\n    z = 3\nelse:\n    w = 4\n\
+                  while False:\n    q = 5\n\
+                  while True:\n    break\n\
+                  v = 6\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let body = &hir.functions[0].body;
+    assert_eq!(body.len(), 4, "dead while must be dropped");
+
+    let HStmtKind::If {
+        cond,
+        then_body,
+        else_body,
+    } = &body[0].kind
+    else {
+        panic!("expected the false if");
+    };
+    assert!(matches!(&cond.kind, HExprKind::Const(Const::Bool(false))));
+    assert!(then_body.is_empty(), "dead branch was lowered");
+    assert_eq!(else_body.len(), 1);
+    assert!(matches!(&else_body[0].kind, HStmtKind::Assign { .. }));
+
+    let HStmtKind::If {
+        cond,
+        then_body,
+        else_body,
+    } = &body[1].kind
+    else {
+        panic!("expected the true if");
+    };
+    assert!(matches!(&cond.kind, HExprKind::Const(Const::Bool(true))));
+    assert_eq!(then_body.len(), 1);
+    assert!(else_body.is_empty(), "dead branch was lowered");
+
+    // `while True` stays a loop so `break` is still emitted.
+    assert!(
+        matches!(&body[2].kind, HStmtKind::While { .. }),
+        "{:?}",
+        body[2].kind
+    );
+    assert!(matches!(&body[3].kind, HStmtKind::Assign { .. }));
 }

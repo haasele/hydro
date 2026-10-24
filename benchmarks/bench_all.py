@@ -56,6 +56,8 @@ BENCHES = [
           ["--duration", "2", "--warmup", "0.5", "--repeat", "3"]),
     Bench("fastapi", "bench_fastapi_throughput.py", "FastAPI-Durchsatz",
           ["--duration", "2", "--warmup", "0.5"]),
+    Bench("pyx", "bench_pyx.py", "PyX vs CPython (JIT/AOT)",
+          ["--n", "50000", "--repeat", "2"]),
 ]
 
 
@@ -401,7 +403,9 @@ def main():
 
     now = datetime.now()
     root = Path("bench_results")
-    outdir = Path(args.out) if args.out else root / now.strftime("%Y%m%d-%H%M%S")
+    # Absolute so the bench scripts (run with cwd=benchmarks/) and the runner
+    # agree on where raw/*.json is written, regardless of the caller's cwd.
+    outdir = (Path(args.out) if args.out else root / now.strftime("%Y%m%d-%H%M%S")).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
     # Baseline laden

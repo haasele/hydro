@@ -1,271 +1,317 @@
 # PyX
 
-PyX ist eine eigenständige Python-Runtime in Rust mit JIT- und AOT-Compiler und
-einer cargo-artigen Toolchain. Der Anspruch ist, normales Python ohne CPython
-als Standardlaufzeit auszuführen; die Kompatibilität ist derzeit bewusst auf
-eine klar definierte Teilmenge begrenzt (siehe
-[Sprachumfang](#sprach--und-stdlib-umfang) und [`docs/TODO.md`](docs/TODO.md)).
+PyX is a standalone Python runtime in Rust with a JIT and AOT compiler and a
+cargo-style toolchain. The goal is to run regular Python without CPython as the
+default runtime; compatibility is currently deliberately limited to a clearly
+defined subset (see [Language Scope](#language-and-stdlib-scope) and
+[`docs/TODO.md`](docs/TODO.md)).
 
-> **Status: frühe Entwicklung (0.1.0).** Compiler/Runtime, Container, Klassen,
-> Closures, Formatierung, Datei-I/O, User-Module, Stdlib-Kern und
-> Concurrency-Primitive laufen. Echte lazy Generatoren/Coroutinen, eine
-> vollständige CPython-Stdlib und C-Extensions fehlen weiterhin; PyX ist weder
-> vollständig Python-kompatibel noch produktionsreif.
+> **Status: early development (0.1.0).** Compiler/runtime, containers, classes,
+> closures, formatting, file I/O, user modules, the stdlib core, real lazy
+> generators and coroutines with an event loop as well as concurrency primitives
+> are working. A complete CPython stdlib and C extensions are still missing;
+> PyX is neither fully Python-compatible nor production-ready.
 
 ## Status
 
-| Bereich | Stand |
+| Area | State |
 |---|---|
-| Phase 1 — Compiler, Runtime-ABI, JIT/AOT | fertig, per `scripts/verify.sh` verifiziert |
-| Phase 2 — Runtime, GC, Module, Klassen, Concurrency | weitgehend fertig; Lazy-Generatoren/echte Async- und präzise GC-Roots offen |
-| Phase 3 — Toolchain (`new`/`init`/`test`/`fmt`/`lint`/`clean`, Build-Cache, uv-Passthrough) | Kern vorhanden; uv-Interpreter-Injektion/Packaging offen |
-| Phase 4 — Python-Kompatibilität, C-API/ABI | **blockiert** (P4-04: kein `python3-config`/`Python.h` in dieser Umgebung), siehe [`docs/C_API.md`](docs/C_API.md) |
-| Phase 5 — Performance | Baseline + lokales Regressionsgate vorhanden |
-| Phase 6 — Diagnostics/Developer Experience | weitgehend fertig; Completions/Manpage und ICE-Regressionstest offen |
+| Phase 1 — Compiler, runtime ABI, JIT/AOT | done, verified by `scripts/verify.sh` |
+| Phase 2 — Runtime, GC, modules, classes, concurrency | largely done; real lazy generators/coroutines + event loop available; precise GC roots and `send`/`throw`/`close` open |
+| Phase 3 — Toolchain (`new`/`init`/`test`/`fmt`/`lint`/`clean`, build cache, uv passthrough) | core available; uv interpreter injection/packaging open |
+| Phase 4 — Python compatibility, C API/ABI | **blocked** (P4-04: no `python3-config`/`Python.h` in this environment), see [`docs/C_API.md`](docs/C_API.md) |
+| Phase 5 — Performance | baseline + local regression gate available |
+| Phase 6 — Diagnostics/Developer Experience | largely done; completions/manpage and ICE regression test open |
 
-Aktueller Arbeitsstand (Cargo-Version 0.1.0, noch ohne öffentliches Release):
-**730 Tests** (Unit, Integration, E2E). JIT (`pyx run`) und AOT
-(`pyx build`) teilen sich dieselbe Runtime und IR. Details:
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), Arbeitsliste in
-[`docs/TODO.md`](docs/TODO.md), Quelltextbaum in
+Current state of work (Cargo version 0.1.0, no public release yet):
+**771 tests** (unit, integration, E2E). JIT (`pyx run`) and AOT
+(`pyx build`) share the same runtime and IR. Details:
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
+[`docs/TODO.md`](docs/TODO.md), source tree in
 [`docs/LAYOUT.md`](docs/LAYOUT.md).
 
-## Voraussetzungen
+## Performance
 
-- Linux, primär x86_64 (aarch64-Pfade sind vorhanden, aber nicht
-  CI-verifiziert); macOS/Windows werden noch nicht unterstützt.
-- Rust **1.85+** (Edition 2021).
-- Ein C-Compiler (`cc`), nur für `pyx build` (Linken des AOT-Binaries).
-- `uv` nur für `pyx add/remove/sync/lock` (dünner Passthrough).
-- Zur Laufzeit von PyX-Programmen wird **kein** CPython benötigt. Python 3 wird
-  ausschließlich für die Benchmark-Harnesse und Prüfskripte unter `benchmarks/`
-  bzw. `scripts/` verwendet.
+Medians over 5 runs, fresh process per run; AOT excludes build time. Measured on Linux x86_64 (Intel Core Ultra 7 255H, 16 cores, 24 GB), CPython 3.13.13, `n = 200000`, `pyx` release build. Command: `uv run benchmarks/bench_all.py --only pyx`; full report under `bench_results/`.
+
+| Workload | CPython | PyX JIT | PyX AOT | CPython/JIT | CPython/AOT |
+|---|---:|---:|---:|---:|---:|
+| hello | 7.87 ms | 1.63 ms | 1.04 ms | 4.82× | 7.56× |
+| while_sum | 19.40 ms | 3.28 ms | 1.47 ms | 5.92× | 13.19× |
+| for_range_sum | 14.97 ms | 2.06 ms | 1.28 ms | 7.25× | 11.65× |
+| list_append | 15.80 ms | 4.43 ms | 4.36 ms | 3.56× | 3.63× |
+| list_comp | 10.87 ms | 3.45 ms | 2.94 ms | 3.15× | 3.70× |
+| dict_insert | 9.58 ms | 2.91 ms | 1.80 ms | 3.30× | 5.33× |
+| string_concat | 8.33 ms | 5.55 ms | 4.52 ms | 1.50× | 1.84× |
+| json_roundtrip | 12.62 ms | 2.92 ms | 2.07 ms | 4.32× | 6.09× |
+| math_loop | 23.16 ms | 28.38 ms | 28.74 ms | 0.82× | 0.81× |
+| generator_sum | 11.09 ms | 9.02 ms | 8.11 ms | 1.23× | 1.37× |
+| async_gather | 60.60 ms | 22.91 ms | 21.30 ms | 2.65× | 2.85× |
+
+PyX AOT is faster than CPython on 10/11 workloads; `math_loop` remains slower because every `math.*` call goes through dynamic native-module dispatch. `async_gather` runs four coroutines with `asyncio.sleep(0.02)`; wall time is ≈ one sleep, confirming the cooperative event loop runs them concurrently. The 100k-element lazy generator (`sum(gen(100000))`) takes ~11.0 ms under CPython, ~7.7 ms under PyX JIT and ~6.8 ms under PyX AOT (register-switch fibers, no syscalls per yield).
+
+## Requirements
+
+- Linux, primarily x86_64 (aarch64 paths exist but are not
+  CI-verified); macOS/Windows are not yet supported.
+- Rust **1.85+** (edition 2021).
+- A C compiler (`cc`), only for `pyx build` (linking the AOT binary).
+- `uv` only for `pyx add/remove/sync/lock` (thin passthrough).
+- No CPython is required at runtime for PyX programs. Python 3 is
+  used exclusively for the benchmark harnesses and check scripts under
+  `benchmarks/` and `scripts/`.
 
 ## Quickstart
 
 ```bash
-# CLI + Runtime bauen
+# Build CLI + runtime
 cargo build --release -p pyx-cli -p pyx-runtime
 
-# Neues Projekt anlegen
+# Create a new project
 ./target/release/pyx new hello
 cd hello
 
-# JIT: kompilieren und direkt ausführen
+# JIT: compile and run directly
 ../target/release/pyx run main.py
 
-# AOT: natives Binary erzeugen und ausführen
+# AOT: produce a native binary and run it
 ../target/release/pyx build main.py -o hello-bin
 ./hello-bin
 
-# Vollständiges Gate (fmt, clippy, Tests, E2E, AOT, GC)
+# Full gate (fmt, clippy, tests, E2E, AOT, GC)
 cd .. && ./scripts/verify.sh
 ```
 
-`scripts/verify.sh` baut das Debug-Binary unter `target/debug/pyx`; die
-Beispiele und erwarteten Ausgaben liegen in `examples/` bzw.
-`examples/expected/`. Die CI führt denselben Ablauf aus (siehe
+`scripts/verify.sh` builds the debug binary at `target/debug/pyx`; the
+examples and expected outputs are located in `examples/` and
+`examples/expected/` respectively. CI runs the same procedure (see
 `.github/workflows/ci.yml`).
 
 ## CLI
 
 ```
-pyx new <path> [--force]           Projektverzeichnis mit Scaffold anlegen
-pyx init [path] [--force]          Projekt im aktuellen/vorgegebenen Verzeichnis anlegen
-pyx check <file.py> [options]      nur parsen und typprüfen
-pyx run <file.py> [options]        mit dem JIT kompilieren und ausführen
-pyx build <file.py> [options]      natives Binary kompilieren und linken
-pyx test [paths...] [options]      test_*.py / *_test.py mit `pyx run` ausführen
-pyx fmt [paths...] [--check]       Trailing-Whitespace + finalen Newline normalisieren
-pyx lint [paths...] [options]      alle .py-Dateien typprüfen
-pyx clean [--dry-run]              .pyx/cache und target/pyx-tmp entfernen
-pyx add <spec...> [uv options]     Abhängigkeiten mit uv hinzufügen
-pyx remove <spec...> [uv options]  Abhängigkeiten mit uv entfernen
-pyx sync [uv options]              Umgebung mit uv synchronisieren
-pyx lock [uv options]              Lockfile mit uv aktualisieren
-pyx doctor [--json]                Toolchain-/Umgebungsstatus melden
-pyx help | --help | -h             diese Hilfe
-pyx --version | -V                 Version
+pyx new <path> [--force]           create project directory with scaffold
+pyx init [path] [--force]          create project in current/given directory
+pyx check <file.py> [options]      parse and type-check only
+pyx run <file.py> [options]        compile and run with the JIT
+pyx build <file.py> [options]      compile and link a native binary
+pyx test [paths...] [options]      run test_*.py / *_test.py with `pyx run`
+pyx fmt [paths...] [--check]       normalize trailing whitespace + final newline
+pyx lint [paths...] [options]      type-check all .py files
+pyx clean [--dry-run]              remove .pyx/cache and target/pyx-tmp
+pyx gc [--json] <file.py>          run program, then print GC statistics
+pyx add <spec...> [uv options]     add dependencies with uv
+pyx remove <spec...> [uv options]  remove dependencies with uv
+pyx sync [uv options]              synchronize environment with uv
+pyx lock [uv options]              update lockfile with uv
+pyx doctor [--json]                report toolchain/environment status
+pyx help | --help | -h             this help
+pyx --version | -V                 version
 ```
 
-- Diagnose-Optionen (`check`, `run`, `build`, `test`, `lint`): `--json`,
+- Diagnostic options (`check`, `run`, `build`, `test`, `lint`): `--json`,
   `--color=<auto|always|never>`, `--no-color`.
-- `build`: `-o/--output <OUT>` (Default: Dateistamm im aktuellen Verzeichnis),
+- `build`: `-o/--output <OUT>` (default: file stem in the current directory),
   `--runtime-lib <PATH>`, `--no-cache`.
-- `test`: Erfolg = Exit-Code 0 des Programms (keine pytest-Assertions);
-  `--json` liefert eine Ergebnisliste. `fmt --check` schreibt nicht.
-- `clean` entfernt nur `.pyx/cache` und `target/pyx-tmp`, nicht den Rest von
+- `test`: success = exit code 0 of the program (no pytest assertions);
+  `--json` returns a result list. `fmt --check` does not write.
+- `clean` removes only `.pyx/cache` and `target/pyx-tmp`, not the rest of
   `target/`.
-- `new`/`init` erzeugen `main.py`, `pyproject.toml` und `.gitignore`;
-  existierende nicht-leere Dateien werden ohne `--force` nicht überschrieben.
-- `add`/`remove`/`sync`/`lock` reichen alle Argumente unverändert an `uv`
-  weiter und geben dessen Exitstatus zurück (`PYX_UV` wählt das Executable).
-- Exit-Codes: `0` Erfolg, `1` Nutzer-/Programmfehler, `2` interner/Setup-Fehler.
-- Umgebung: `CC` (Linker für AOT, Default `cc`), `PYX_RUNTIME_LIB`, `PYX_UV`,
-  `NO_COLOR`; zur Laufzeit zusätzlich `PYX_GC_THRESHOLD`, `PYX_GC_STRESS=1`
-  und `PYX_GC_STATS=1`.
+- `gc` runs the program like `run` and afterwards reports `collections`,
+  `live_objects`, `threshold`, `pause_total_us`, `pause_max_us`,
+  `mark_total_us`, `sweep_total_us`, `freed_total`, `stress`; `--json` prints
+  an object as the last stdout line.
+- `new`/`init` create `main.py`, `pyproject.toml` and `.gitignore`;
+  existing non-empty files are not overwritten without `--force`.
+- `add`/`remove`/`sync`/`lock` pass all arguments unchanged to `uv`
+  and return its exit status (`PYX_UV` selects the executable).
+- Exit codes: `0` success, `1` user/program error, `2` internal/setup error.
+- Environment: `CC` (linker for AOT, default `cc`), `PYX_RUNTIME_LIB`, `PYX_UV`,
+  `NO_COLOR`; additionally at runtime `PYX_GC_THRESHOLD`, `PYX_GC_STRESS=1`
+  and `PYX_GC_STATS=1`.
 
-`--` beendet die Optionsauswertung; zusätzliche Programmargumente werden von
-`run` derzeit noch nicht unterstützt.
+`--` ends option parsing; additional program arguments are currently not yet
+supported by `run`.
 
-## Sprach- und Stdlib-Umfang
+## Language and Stdlib Scope
 
-**Werte und Operatoren**
+**Values and operators**
 
-- `int` (i64, Überlauf → `OverflowError`), `float`, `bool`, `None`, `str`
-  (UTF-8, Unicode-Skalare), `bytes`; `list`, `tuple`, `dict`
-  (Einfügereihenfolge), `set`, `range`, Iteratoren, Funktions-/Klassenwerte.
-- Arithmetik inkl. `//`/`%`/`**`, Vergleiche, `and`/`or` (Short-Circuit),
-  `if`/`elif`/`else`, `while`, `for`, `break`, `continue`, Slices, Indexing
-  inkl. negativer Indizes, `in`/`not in`.
+- `int` (i64, overflow → `OverflowError`), `float`, `bool`, `None`, `str`
+  (UTF-8, Unicode scalar values), `bytes`; `list`, `tuple`, `dict`
+  (insertion order, O(1) lookup via hash index), `set`, `range`,
+  iterators, generator/coroutine objects, function/class values.
+  `iter(x)` and `next(it[, default])` are builtins.
+- Arithmetic incl. `//`/`%`/`**`, comparisons, `and`/`or` (short-circuit),
+  `if`/`elif`/`else`, `while`, `for`, `break`, `continue`, slices, indexing
+  incl. negative indices, `in`/`not in`.
 
-**Funktionen, Klassen, Closures**
+**Functions, classes, closures**
 
-- `def`, Parameter, Default-Return, Rekursion; Funktionen und Lambdas sind
-  Werte, Builtins ebenfalls (`f = int`); `map`/`filter` materialisieren Listen.
-- **Closures by value:** verschachtelte `def` erfassen die Werte der äußeren
-  Locals zum Definitionszeitpunkt. Rekursive verschachtelte Funktionen sind
-  eine Diagnose.
-- **Klassen:** `class Name(Base)` mit einer Basis, Methoden, `__init__`,
-  `self`-Attributen (`pyx_getattr`/`pyx_setattr`) und Vererbung/Overrides.
-  Keine Class-Attribute, Decorators, Metaclasses oder Multiple Inheritance.
-- Comprehensions: Listen/Sets/Dicts und Generatorausdrücke (letztere **eager
-  als Liste**), mehrere `for`-Klauseln, `if`-Filter.
+- `def`, parameters, default return, recursion; functions and lambdas are
+  values, builtins likewise (`f = int`); `map`/`filter` materialize lists.
+- **Closures by value:** nested `def` capture the values of the outer
+  locals at definition time. Recursive nested functions are
+  a diagnostic.
+- **Classes:** `class Name(Base)` with a single base, methods, `__init__`,
+  `self` attributes (`pyx_getattr`/`pyx_setattr`) and inheritance/overrides.
+  No class attributes, decorators, metaclasses or multiple inheritance.
+- Comprehensions: lists/sets/dicts and generator expressions (the latter
+  **eagerly as a list**), multiple `for` clauses, `if` filters.
 
-**Formatierung und Attribute**
+**Formatting and attributes**
 
-- f-Strings mit Format-Specs (`:.2f`, `:04d`, `:#x`, Ausrichtung/Füllzeichen)
-  sowie `!s`/`!r`/`!a`; `str.format(...)`; printf-Formatierung `"%s:%d" % (...)`;
-  zentrale Spec-Implementierung über `pyx_format_value`.
-- Datenattribute statt Methoden bei nativen Objekten: `path.name`,
-  `file.closed`, `thread.name`, `process.pid` usw.; Methoden-Keywords wie
+- f-strings with format specs (`:.2f`, `:04d`, `:#x`, alignment/fill characters)
+  as well as `!s`/`!r`/`!a`; `str.format(...)`; printf formatting `"%s:%d" % (...)`;
+  central spec implementation via `pyx_format_value`.
+- Data attributes instead of methods on native objects: `path.name`,
+  `file.closed`, `thread.name`, `process.pid` etc.; method keywords like
   `Path.mkdir(parents=True, exist_ok=True)`.
 
-**Kontrollfluss, Exceptions, Kontext**
+**Control flow, exceptions, context**
 
-- `raise`, `try`/`except [as]`/`else`/`finally`, Re-Raise, Python-artige
-  Tracebacks; unbehandelte Exceptions beenden mit Exit-Code 1.
-- `with a as x, b as y:` über das `__enter__`/`__exit__`-Protokoll (Dateien,
-  `Pool`, User-Klassen); Rückgabewerte von `__exit__` unterdrücken keine
-  Exceptions. `with`-Items werden in umgekehrter Reihenfolge verlassen.
-- Augmentierte Subscript-Zuweisung (`a[i] += x`) wertet Objekt und Index genau
-  einmal aus.
+- `raise`, `try`/`except [as]`/`else`/`finally`, re-raise, Python-style
+  tracebacks; unhandled exceptions exit with exit code 1.
+- `with a as x, b as y:` via the `__enter__`/`__exit__` protocol (files,
+  `Pool`, user classes); return values of `__exit__` do not suppress
+  exceptions. `with` items are exited in reverse order.
+- Augmented subscript assignment (`a[i] += x`) evaluates object and index
+  exactly once.
 
-**Generatoren und async (eager)**
+**Generators and async**
 
-- `yield value` in einer Funktion materialisiert eine Liste (eager); es gibt
-  **keine** lazy Generatorobjekte, `send`/`throw` oder `yield from`.
-- `async def`/`await` laufen sequenziell; `await expr` liefert `expr`. Es gibt
-  **keine** Coroutinen, Tasks oder Event-Loop. `asyncio.run/sleep/gather`
-  sind eine dokumentierte Kompatibilitätsschicht (`sleep` blockiert,
-  `gather` sammelt sequenziell).
+- **Lazy generators:** a function containing `yield` creates a
+  generator object when called; the body only runs on the first `next()`/`for`.
+  `yield value`, bare `yield`, `return` as the end and exception propagation
+  work; `for`/`list`/`sum`/`iter`/`next` operate on them. Each
+  object is independent (stackful fiber, its own 128 KiB stack). On x86_64
+  the context switch is a register-only `global_asm!` switch over the
+  callee-saved registers without syscalls (`ucontext` only as a fallback for other
+  targets).
+- **Coroutines/event loop:** `async def` creates a coroutine object;
+  `await` drives it. `asyncio.run` runs a cooperative single-thread loop,
+  `asyncio.sleep` suspends only the current fiber (blocking outside a loop),
+  `asyncio.gather` starts concurrent tasks, returns the
+  results in input order and propagates the first error.
+  Not supported: `send`/`throw`/`close`, `yield` expressions,
+  `yield from`, async generators, async comprehensions; `async for`/
+  `async with` use the synchronous protocol. Generator expressions are
+  still materialized eagerly as a list.
 
-**Module und Imports**
+**Modules and imports**
 
-- Native Module (siehe unten) und **User-Module**: `import foo` /
-  `from foo import f` lösen eine Geschwisterdatei `foo.py` auf; Funktionen
-  werden exportiert, der Loader cached pro kanonischem Pfad und erkennt
-  Zyklen. Importierte Module dürfen keine Top-Level-Seiteneffekte haben
-  (nur Imports, Funktionsdefinitionen, Docstring, `pass`). Pakete,
-  Punkte/relative Imports und `import *` fehlen.
-- `__name__` ist `"__main__"` in der Einstiegsdatei; ein Runtime-Modulobjekt
-  (`sys.modules`) gibt es nicht.
+- Native modules (see below) and **user modules**: `import foo` /
+  `from foo import f` resolve a sibling file `foo.py`; functions
+  are exported, the loader caches per canonical path and detects
+  cycles. Imported modules must not have top-level side effects
+  (only imports, function definitions, docstring, `pass`). Packages,
+  dotted/relative imports and `import *` are missing.
+- `__name__` is `"__main__"` in the entry file; there is no runtime module object
+  (`sys.modules`).
 
-**Mitgelieferte Module** (nativ, ohne CPython):
+**Bundled modules** (native, without CPython):
 
 `math`, `functools`, `operator`, `time`, `sys`, `json` (`dumps`/`loads`,
-`dump`/`load`), `os` (Basis, `remove`/`rename`, `fork`/`waitpid`/`_exit`),
+`dump`/`load`), `os` (basic, `remove`/`rename`, `fork`/`waitpid`/`_exit`),
 `os.path` (`join`, `basename`, `dirname`, `exists`, `isfile`, `isdir`,
-`abspath`, `splitext`, `split`), `io`/`open` (Text und Bytes), `csv`,
-`argparse` (Teilmenge, `Namespace`), `collections.defaultdict`, `re`
-(Rust-`regex`: `search`/`match`/`fullmatch`/`findall`/`sub`/`split`,
-`Pattern`/`Match`), `socket` (blockierendes TCP), `random`, `platform`,
+`abspath`, `splitext`, `split`), `io`/`open` (text and bytes), `csv`,
+`argparse` (subset, `Namespace`), `collections.defaultdict`, `re`
+(Rust `regex`: `search`/`match`/`fullmatch`/`findall`/`sub`/`split`,
+`Pattern`/`Match`), `socket` (blocking TCP), `random`, `platform`,
 `statistics`, `pathlib`, `_thread`, `threading`, `queue`, `multiprocessing`,
-`pickle`, `asyncio` (nur `run`/`sleep`/`gather`).
+`pickle`, `asyncio` (only `run`/`sleep`/`gather`).
 
-**Concurrency und Speicher**
+**Concurrency and memory**
 
-- Kein GIL; Threads teilen sich einen Heap mit konkurrierendem Mark-&-Sweep-GC
-  (kurze Stop-the-World-Fenster für Root-Snapshot/-Rescan).
+- No GIL; threads share a heap with a concurrent mark-&-sweep GC
+  (short stop-the-world windows for root snapshot/rescan).
 - `threading` (`Thread`, `Lock`, `RLock`, `Event`, `queue.Queue`),
-  `multiprocessing` (`Process`, `Queue`, `Pool`, fork und spawn, Context-
-  Manager für `Pool`), `pickle` mit eigenem, **nicht CPython-kompatiblem**
-  PYX1-Format.
-- Gemeinsam genutzte Container müssen von Nutzer-Locks geschützt werden;
-  ungeschützte Mutationen sind Datenraces.
+  `multiprocessing` (`Process`, `Queue`, `Pool`, fork and spawn, context
+  manager for `Pool`), `pickle` with its own, **not CPython-compatible**
+  PYX1 format.
+- Shared containers must be protected by user locks;
+  unprotected mutations are data races.
 
-**Nicht unterstützt (Auswahl)**
+**Not supported (selection)**
 
-Lazy-Generatoren/Coroutinen mit Event-Loop, `yield from`, echte
-`asyncio`-Tasks, Decorators, Pattern Matching, Metaclasses, Descriptor-/
-`__dunder__`-Protokolle, Multiple Inheritance, `bytearray`/`memoryview`,
-BigInt, Slice-Assignment, Exception-Chaining, `except*`; beliebige
-C-Extensions bzw. C-API/ABI, die vollständige CPython-Stdlib, Pakete/
-relative Imports, Importe innerhalb von Funktionen sowie Top-Level-Code in
-importierten Modulen. Präzise GC-Roots und ein eigener Größenklassen-Allokator
-fehlen. Paketverwaltung ist nur ein uv-Passthrough (keine
-Interpreter-Injektion/Packaging).
+`send`/`throw`/`close`, `yield` expressions, `yield from`, async generators
+and async comprehensions (`asyncio` only `run`/`sleep`/`gather`), decorators,
+pattern matching, metaclasses, descriptor/`__dunder__` protocols, multiple
+inheritance, `bytearray`/`memoryview`, BigInt, slice assignment,
+exception chaining, `except*`; arbitrary
+C extensions or the C API/ABI, the complete CPython stdlib, packages/
+relative imports, imports inside functions as well as top-level code in
+imported modules. Precise GC roots and a dedicated size-class allocator
+are missing. Package management is only a uv passthrough (no
+interpreter injection/packaging).
 
-## Architektur
+## Architecture
 
 ```
-Quelltext .py (+ Geschwistermodule) → rustpython-parser → pyx-frontend
+Source .py (+ sibling modules) → rustpython-parser → pyx-frontend
                                                           ↓
-                                          typisierte IR (pyx-ir)
+                                          typed IR (pyx-ir)
                                                           ↓
                      pyx-codegen (Cranelift) → JIT (pyx run)
-                                             → Object + cc-Link (pyx build)
+                                             → object + cc link (pyx build)
                                                           ↓
-                                pyx-runtime (libpyx_runtime.a, C-ABI)
+                                pyx-runtime (libpyx_runtime.a, C ABI)
 ```
 
-| Crate | Verantwortung |
+| Crate | Responsibility |
 |---|---|
-| `crates/pyx-ir` | typisiertes HIR, Vertrag zwischen Frontend und Codegen, Stdlib-Specs |
-| `crates/pyx-frontend` | Parsen, Modul-Loader/User-Module, Lowering, Typinferenz, Diagnosen |
-| `crates/pyx-runtime` | Wertmodell, Operatoren, Builtins, Exceptions, GC, I/O, Module, Concurrency |
-| `crates/pyx-codegen` | Cranelift-Codegen für JIT- und AOT-Pfad |
-| `crates/pyx-cli` | `pyx`-Binary (Projekt, Compiler, Test/Fmt/Lint/Clean, uv) |
+| `crates/pyx-ir` | typed HIR, contract between frontend and codegen, stdlib specs |
+| `crates/pyx-frontend` | parsing, module loader/user modules, lowering, type inference, diagnostics |
+| `crates/pyx-runtime` | value model, operators, builtins, exceptions, GC, I/O, modules, concurrency |
+| `crates/pyx-codegen` | Cranelift codegen for the JIT and AOT path |
+| `crates/pyx-cli` | `pyx` binary (project, compiler, test/fmt/lint/clean, uv) |
 
-Intern sind die Crates in `model`/`ir`/`stdlib`, `lower`/`sema`,
-`backend`/`lower`, `core`/`gc`/`modules`/`concurrency`/`support` und
-`cli/commands` gegliedert; der vollständige Baum steht in
-[`docs/LAYOUT.md`](docs/LAYOUT.md). Die ABI- und IR-Verträge sind in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) verbindlich dokumentiert.
+Internally the crates are structured into `model`/`ir`/`stdlib`, `lower`/`sema`,
+`backend`/`lower`, `core`/`gc`/`modules`/`concurrency`/`support` and
+`cli/commands`; the complete tree is in
+[`docs/LAYOUT.md`](docs/LAYOUT.md). The ABI and IR contracts are authoritatively
+documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Tests und Benchmarks
+## Tests and Benchmarks
 
-- `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), Build,
-  `cargo test --workspace` (730 Tests), E2E-Vergleich JIT vs. AOT,
-  Negative-Tests (Diagnosen/Tracebacks) und GC-Stresstests.
+- `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), build,
+  `cargo test --workspace` (771 tests), E2E comparison JIT vs. AOT,
+  negative tests (diagnostics/tracebacks) and GC stress tests.
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Ubuntu, stable
-  Rust, fmt/clippy/test/verify, keine Secrets).
-- Benchmarks: [`benchmarks/PYX.md`](benchmarks/PYX.md) beschreibt Readiness und
-  Integration der CPython-Harnesse; `benchmarks/pyx/run_micro.py` misst
-  CPython vs. PyX-JIT vs. PyX-AOT (inkl. Thread-/Prozess-/Pool-Scaling) und
-  schreibt `benchmarks/pyx/results/latest.json`.
-- Regressionsschwellen: `benchmarks/pyx/thresholds.json` prüfen die JIT-/AOT-
-  Medians der Kern-Workloads:
+  Rust, fmt/clippy/test/verify, no secrets).
+- Benchmarks: [`benchmarks/PYX.md`](benchmarks/PYX.md) describes readiness and
+  integration of the CPython harnesses; `benchmarks/pyx/run_micro.py` measures
+  CPython vs. PyX JIT vs. PyX AOT (incl. thread/process/pool scaling) and
+  writes `benchmarks/pyx/results/latest.json`. `benchmarks/bench_pyx.py`
+  compares 11 pure Python workloads (incl. lazy generator and async
+  `gather`) under CPython/JIT/AOT and is registered as `pyx` in `bench_all.py`
+  (`uv run benchmarks/bench_all.py --only pyx`). The measured
+  weak spot remains native module dispatch (`math_loop` ~0.8x); the
+  register-only fiber switch makes the lazy generator sum over 100k
+  elements faster than CPython (release: CPython 11.0 ms, JIT 7.7 ms,
+  AOT 6.8 ms; 94 syscalls total instead of 200,097).
+- Regression thresholds: `benchmarks/pyx/thresholds.json` check the JIT/AOT
+  medians of the core workloads:
 
   ```bash
   python3 benchmarks/pyx/run_micro.py
-  python3 scripts/check_benchmarks.py            # Exit 1 bei Überschreitung
-  python3 scripts/check_benchmarks.py --update   # Baseline neu schreiben
+  python3 scripts/check_benchmarks.py            # exit 1 when exceeded
+  python3 scripts/check_benchmarks.py --update   # rewrite baseline
   ```
 
-  Das Gate vergleicht nur Workloads, die in Ergebnis- und Schwellenwertdatei
-  vorhanden sind. Es ist bewusst nicht Teil der CI: Timing auf geteilten
-  Runnern ist zu starken Schwankungen unterworfen.
+  The gate compares only workloads that are present in both the result and
+  threshold file. It is deliberately not part of CI: timing on shared
+  runners is subject to strong variance.
 
-## Mitwirken
+## Contributing
 
-Setup, Gate und Commit-Regeln: [`CONTRIBUTING.md`](CONTRIBUTING.md). Vor
-größeren Änderungen lohnt ein Blick in [`AGENTS.md`](AGENTS.md) und
-[`docs/TODO.md`](docs/TODO.md) (dort steht der aktuelle Arbeitsstand).
+Setup, gate and commit rules: [`CONTRIBUTING.md`](CONTRIBUTING.md). Before
+larger changes, a look at [`AGENTS.md`](AGENTS.md) and
+[`docs/TODO.md`](docs/TODO.md) is worthwhile (the current state of work is documented there).
 
-## Lizenz
+## License
 
-Lizenziert unter **MIT OR Apache-2.0** (siehe `Cargo.toml`). Die
-vollständigen Texte liegen in [`LICENSE-MIT`](LICENSE-MIT) und
-[`LICENSE-APACHE`](LICENSE-APACHE); du darfst die Bedingungen einer der beiden
-Lizenzen wählen.
+Licensed under **MIT OR Apache-2.0** (see `Cargo.toml`). The
+full texts are in [`LICENSE-MIT`](LICENSE-MIT) and
+[`LICENSE-APACHE`](LICENSE-APACHE); you may choose the terms of either
+license.

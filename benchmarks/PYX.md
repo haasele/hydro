@@ -1,124 +1,158 @@
-# PyX-Benchmarks — Readiness & Integration
+# PyX Benchmarks — Readiness & Integration
 
-Die vorhandenen Harnesses (`bench_loops.py`, `bench_csv.py`, `bench_startup.py`,
-`bench_request_handling.py`, `bench_fastapi_throughput.py`) laufen unter
-CPython/uv und vergleichen CPython-Varianten (numpy, pandas, FastAPI, ...).
-PyX wird **nicht** in diese Dateien eingebaut; stattdessen gibt es:
+The existing harnesses (`bench_loops.py`, `bench_csv.py`, `bench_startup.py`,
+`bench_request_handling.py`, `bench_fastapi_throughput.py`) run under
+CPython/uv and compare CPython variants (numpy, pandas, FastAPI, ...).
+PyX is **not** built into these files; instead there is:
 
-- `benchmarks/PYX.md` (diese Datei): Readiness-Matrix und Integrationsplan.
-- `benchmarks/pyx/`: PyX-native Micro-Benchmarks + `run_micro.py`, das
-  CPython, PyX-JIT (`pyx run`) und PyX-AOT (`pyx build`) vergleicht.
+- `benchmarks/PYX.md` (this file): readiness matrix and integration plan.
+- `benchmarks/pyx/`: PyX-native micro-benchmarks + `run_micro.py`, which
+  compares CPython, PyX JIT (`pyx run`), and PyX AOT (`pyx build`).
 
-## Status der bestehenden Harnesses
+## Status of the existing harnesses
 
-| Harness | Benötigte PyX-Features | Status |
+| Harness | Required PyX features | Status |
 |---|---|---|
-| `bench_loops.py` | Importe (numpy, argparse, json, platform, statistics, pathlib), `reduce`/`operator.add`, Comprehensions/Lambdas/map/filter/Builtins/Strings | **teilweise**: Sprache, argparse/json/platform/statistics/pathlib, reduce/operator da; **numpy** (C-API) fehlt |
-| `bench_csv.py` | `csv`/`io`/`os`/`random`/`pandas`, Datei-I/O, `with`, f-Strings, Dict-Zugriff | **teilweise**: csv/io/with/json/os/random/pathlib/argparse/defaultdict da; **pandas** (C-API) fehlt |
-| `bench_startup.py` | Subprozess-Adapter, Import-System + Stdlib-Module; misst Interpreter/Imports/FastAPI-Start | **teilweise**: PyX-Start (JIT/AOT) und native/User-Module messbar; FastAPI/C-Extensions fehlen |
-| `bench_request_handling.py` | `asyncio`, `socket`, `json`, `bytes`, async/await, Klassen | **teilweise**: json/os/time/sys, bytes, threading/queue/multiprocessing, blocking socket, Klassen und eager async/await da; echte Coroutinen/Event-Loop fehlen |
-| `bench_fastapi_throughput.py` | FastAPI/Pydantic/uvicorn/httpx, Klassen/Decorators/typing, C-Extensions | **blockiert**: Phase 4 (C-API/ABI) + Decorators |
+| `bench_loops.py` | imports (numpy, argparse, json, platform, statistics, pathlib), `reduce`/`operator.add`, comprehensions/lambdas/map/filter/builtins/strings | **partial**: language, argparse/json/platform/statistics/pathlib, reduce/operator present; **numpy** (C API) missing |
+| `bench_csv.py` | `csv`/`io`/`os`/`random`/`pandas`, file I/O, `with`, f-strings, dict access | **partial**: csv/io/with/json/os/random/pathlib/argparse/defaultdict present; **pandas** (C API) missing |
+| `bench_startup.py` | subprocess adapter, import system + stdlib modules; measures interpreter/imports/FastAPI start | **partial**: PyX start (JIT/AOT) and native/user modules measurable; FastAPI/C extensions missing |
+| `bench_request_handling.py` | `asyncio`, `socket`, `json`, `bytes`, async/await, classes | **partial**: json/os/time/sys, bytes, threading/queue/multiprocessing, blocking socket, classes, real coroutines + event loop (`asyncio.run/sleep/gather`) present; non-blocking `select`-like I/O and `asyncio` beyond these three APIs missing |
+| `bench_fastapi_throughput.py` | FastAPI/Pydantic/uvicorn/httpx, classes/decorators/typing, C extensions | **blocked**: phase 4 (C API/ABI) + decorators |
 
-## Micro-Subset (jetzt lauffähig)
+## Micro subset (runnable now)
 
-`benchmarks/pyx/` enthält überwiegend importfreie PyX-Programme:
-While-/For-Summen, `sum(range(n))`, List-Append, Dict-Insert,
-String-Konkatenation, List-/Filter-Comprehension, Generator-Sum, leeres
-Programm/Startup. Seit dem Abschluss-Slice sind Comprehensions, Lambdas,
-Klassen und eager async/await sprachlich verfügbar; die Micro-Programme
-bleiben bewusst klein und importfrei.
-`run_micro.py` misst CPython vs. PyX-JIT vs. PyX-AOT (Wall-Time, optional RSS,
-Build-Zeit) und schreibt `benchmarks/pyx/results/latest.json`; enthalten sind
-auch Thread-Serial/Parallel-Läufe und Prozess-/Pool-Skalierung (siehe unten).
-Der konkurrierende GC lässt sich mit
-`PYX_GC_THRESHOLD`/`PYX_GC_STATS=1` (stderr: `pause_ms`, `mark_ms`, `freed`)
-beobachten.
+`benchmarks/pyx/` contains predominantly import-free PyX programs:
+while/for sums, `sum(range(n))`, list append, dict insert,
+string concatenation, list/filter comprehension, generator sum, empty
+program/startup. Since the closing slice, comprehensions, lambdas,
+classes as well as real lazy generators and coroutines are available in the
+language; the micro programs deliberately remain small and import-free.
+`run_micro.py` measures CPython vs. PyX JIT vs. PyX AOT (wall time, optional RSS,
+build time) and writes `benchmarks/pyx/results/latest.json`; included are
+also thread serial/parallel runs and process/pool scaling (see below).
+The concurrent GC can be observed with
+`PYX_GC_THRESHOLD`/`PYX_GC_STATS=1` (stderr: `pause_ms`, `mark_ms`, `freed`);
+`pyx gc [--json] <file.py>` prints the same counters in aggregate.
 
 ```bash
 cargo build --release -p pyx-cli -p pyx-runtime
 python3 benchmarks/pyx/run_micro.py
 ```
 
-Hinweise:
-- Dicts sind linear (O(n)); die Dict-Last ist bewusst klein.
-- String-Konkatenation ist O(n²); die Last ist bewusst klein.
-- Frühe Zahlen sind **Baselines**, keine Optimierungsziele; P5-02/P5-03 folgen.
-- Threading/Queue/Prozesse sind seit Phase 2.14/2.16 nutzbar; `multiprocessing`
-  unterstuetzt fork und echtes spawn (exec, Funktionsregistry) sowie `Pool`
-  mit fork/spawn-Workern. Pickle nutzt ein eigenes PYX1-Format. Der Micro-
-  Harness enthaelt `pool_map` (4 Worker) sowie die Skalierungs-Paare
-  `pool_serial`/`pool_parallel` und `process_queue` (siehe
-  „Prozess-/Pool-Skalierung“). Datei-I/O, `with`, `csv` und
-  `json.dump/load` sind seit Phase 2.18 vorhanden (UTF-8-Text).
-- Die User-Harnesses bleiben unverändert. Ein Adapter (P5-01a) ist noch nicht
-  implementiert; Sprachfeatures/Stdlib sind weitgehend da, aber numpy/pandas/
-  FastAPI (C-API) und echte Async-Infrastruktur bleiben Blocker.
+Notes:
+- Dicts use a hash index with Python equality (O(1) on average;
+  `pop` reindexes); the dict load is deliberately small.
+- String concatenation is O(n²); the load is deliberately small.
+- Early numbers are **baselines**, not optimization targets; P5-02/P5-03 follow.
+- Threading/queue/processes have been usable since phase 2.14/2.16; `multiprocessing`
+  supports fork and real spawn (exec, function registry) as well as `Pool`
+  with fork/spawn workers. Pickle uses its own PYX1 format. The micro
+  harness contains `pool_map` (4 workers) as well as the scaling pairs
+  `pool_serial`/`pool_parallel` and `process_queue` (see
+  "Process/Pool scaling"). File I/O, `with`, `csv`, and
+  `json.dump/load` have existed since phase 2.18 (UTF-8 text).
+- Environment: CPython's `multiprocessing` forkserver fails here
+  (`ConnectionResetError`). `run_micro.py` logs such
+  CPython reference errors as `error`, does not abort the baseline loop,
+  and skips the corresponding PyX rows in the baseline gate.
+- The user harnesses remain unchanged. An adapter (P5-01a) is not yet
+  implemented; language features/stdlib are largely there, but numpy/pandas/
+  FastAPI (C API) and non-blocking I/O remain blockers.
 
-## Prozess-/Pool-Skalierung (P2-20e)
+## `bench_pyx.py` and `bench_all.py --only pyx`
 
-Die Prozess-Workloads machen Startkosten und 1-vs-4-Worker-Skalierung
-sichtbar. Sie sind PyX-native Programme unter `benchmarks/pyx/`; die
-CPython/uv-Harnesses (`bench_*.py`) bleiben unverändert und werden nicht
-umgebogen.
+`benchmarks/bench_pyx.py` runs the same pure Python workloads under three
+runners (CPython, PyX JIT via `pyx run`, PyX AOT via `pyx build` + binary):
 
-| Workload | Aufbau | Nutzen |
+- 11 workloads: hello, while_sum, for_range_sum, list_append, list_comp,
+  dict_insert, string_concat, json_roundtrip, math_loop, generator_sum
+  (lazy generator), and async_gather (real coroutines).
+- Every run is a fresh process; a warmup run checks the output
+  against CPython, after which `--repeat` runs are measured (median). Deviating
+  or failing runs mark an error row and exit code 1.
+- AOT builds are excluded from the measured runs; the PyX binary
+  is found via `--pyx`, `$PYX_BIN`, `target/release/pyx`, or `target/debug/pyx`.
+- `benchmarks/bench_all.py` registers the script as `pyx` and resolves its
+  output directory absolutely so that child processes write into the same
+  directory. Invocation: `uv run benchmarks/bench_all.py --only pyx`.
+
+Measured speedups (release, n=200000, median): while_sum 8.6x JIT / 11.9x
+AOT, for_range_sum 7.0x/13.1x, list_append 3.2x/3.8x, list_comp 3.0x/4.0x,
+dict_insert 3.7x/6.6x, json_roundtrip 4.6x/7.2x, async_gather 2.6x/2.8x.
+For the lazy generator sum over 100k elements (release), CPython measures
+11.0 ms, JIT 7.7 ms, and AOT 6.8 ms; the x86_64 switch is register-only, and
+`strace -c` counts 94 syscalls in total instead of 200,097 (two `rt_sigprocmask`
+per yield). Remaining weakness: math_loop ~0.8x (native module dispatch),
+open performance work, no "solved" claims.
+The micro harness (`run_micro.py`) shows with the same release build, among others,
+while_sum AOT 2.4 ms vs. CPython 28.9 ms and for_sum AOT 2.0 ms vs. 27.5 ms.
+
+## Process/Pool scaling (P2-20e)
+
+The process workloads make startup costs and 1-vs-4-worker scaling
+visible. They are PyX-native programs under `benchmarks/pyx/`; the
+CPython/uv harnesses (`bench_*.py`) remain unchanged and are not
+bent.
+
+| Workload | Setup | Purpose |
 |---|---|---|
-| `threads_serial` | 4 Blöcke à 200k Iterationen im Main-Thread | Thread-Baseline ohne Nebenläufigkeit |
-| `threads_parallel` | 4 Threads, gleiche Arbeit, Lock/Flag-Sync | Thread-Queue-Baseline |
-| `pool_map` | `Pool(4)`, 4 Aufgaben à 50k | Pool-Overhead bei kleiner Last |
-| `pool_serial` | `Pool(1)`, 4 Aufgaben à 250k | Prozess-Overhead + serielle Arbeit |
-| `pool_parallel` | `Pool(4)`, identische 4 Aufgaben | Skalierung bei 4 Workern |
-| `process_queue` | 2 `Process`es, je eine `Queue`, `join` + Summe | Start-/IPC-Kosten pro Prozess |
+| `threads_serial` | 4 blocks of 200k iterations in the main thread | thread baseline without concurrency |
+| `threads_parallel` | 4 threads, same work, lock/flag sync | thread queue baseline |
+| `pool_map` | `Pool(4)`, 4 tasks of 50k | pool overhead at small load |
+| `pool_serial` | `Pool(1)`, 4 tasks of 250k | process overhead + serial work |
+| `pool_parallel` | `Pool(4)`, identical 4 tasks | scaling with 4 workers |
+| `process_queue` | 2 `Process`es, one `Queue` each, `join` + sum | startup/IPC cost per process |
 
-Auswertung:
+Evaluation:
 
-- `pool_serial` und `pool_parallel` berechnen exakt dieselben Chunks und
-  drucken dieselbe Summe; `run_micro.py` prüft die Ausgabe gegen CPython.
-  Der Speedup ist `median(pool_serial) / median(pool_parallel)` und enthält
-  bewusst die Prozess-Startkosten (fork, Worker-Aufbau, Ergebnis-Transport).
-- `process_queue` isoliert zwei Prozesse mit je einer Queue; die Summe ist
-  reihenfolgeunabhängig, die Ausgabe damit deterministisch.
-- `threads_*` dienen als Vergleichsbasis: CPython-Threads sind durch den GIL
-  bei CPU-Arbeit praktisch seriell, während Prozesse echte Kerne nutzen.
+- `pool_serial` and `pool_parallel` compute exactly the same chunks and
+  print the same sum; `run_micro.py` checks the output against CPython.
+  The speedup is `median(pool_serial) / median(pool_parallel)` and deliberately
+  includes the process startup costs (fork, worker setup, result transport).
+- `process_queue` isolates two processes with one queue each; the sum is
+  order-independent, making the output deterministic.
+- `threads_*` serve as a comparison basis: CPython threads are effectively
+  serial for CPU work due to the GIL, while processes use real cores.
 
-Einschränkungen:
+Limitations:
 
-- Der Harness nutzt die Default-Startmethode (`fork`) und vergleicht **nicht**
-  fork gegen spawn; die Zahlen sind daher keine Aussage über spawn-Startkosten.
-- Gemessen wird die gesamte Wall-Time inklusive Interpreter-/JIT-Start,
-  Prozess-Erzeugung und Serialisierung (PYX1). Kleine Arbeitsmengen werden
-  von diesen Fixkosten dominiert.
-- Concurrency-Messwerte schwanken mit der Maschinenlast; die Schwellen sind
-  deshalb großzügig (Faktor 3.0) und das Gate läuft nicht in der CI.
+- The harness uses the default start method (`fork`) and does **not** compare
+  fork against spawn; the numbers are therefore not a statement about spawn startup costs.
+- What is measured is the total wall time including interpreter/JIT start,
+  process creation, and serialization (PYX1). Small work amounts are
+  dominated by these fixed costs.
+- Concurrency measurements fluctuate with machine load; the thresholds are
+  therefore generous (factor 3.0) and the gate does not run in CI.
 
-## Regressionsschwellen (P5-01c)
+## Regression thresholds (P5-01c)
 
-`benchmarks/pyx/thresholds.json` hält für die Kern-Workloads die JIT-/AOT-
-Baseline-Medians und die erlaubte Obergrenze (`max_ms`) fest.
-`scripts/check_benchmarks.py` liest `benchmarks/pyx/results/latest.json`,
-vergleicht nur Workloads, die in beiden Dateien vorkommen, und beendet sich bei
-einer Überschreitung mit Exit-Code 1:
+`benchmarks/pyx/thresholds.json` records the JIT/AOT
+baseline medians and the permitted upper bound (`max_ms`) for the core workloads.
+`scripts/check_benchmarks.py` reads `benchmarks/pyx/results/latest.json`,
+compares only workloads that appear in both files, and exits with
+exit code 1 when a limit is exceeded:
 
 ```bash
 python3 benchmarks/pyx/run_micro.py
-python3 scripts/check_benchmarks.py            # Gate
-python3 scripts/check_benchmarks.py --update   # Baseline neu schreiben
+python3 scripts/check_benchmarks.py            # gate
+python3 scripts/check_benchmarks.py --update   # rewrite baseline
 ```
 
-Die Faktoren sind bewusst großzügig (Default 1.75; Threads, Pool und Prozesse
-3.0; Prozess-Startup 4.0) und werden zusätzlich durch `floor_ms` abgesichert. Das
-Gate läuft **nicht** in der CI, weil Timing auf geteilten Runnern zu stark
-schwankt; es ist als lokales/Release-Gate gedacht. CPython-Messwerte werden
-nicht gegated.
+The factors are deliberately generous (default 1.75; threads, pool, and processes
+3.0; process startup 4.0) and are additionally backed by `floor_ms`. The
+gate does **not** run in CI, because timing fluctuates too much on shared
+runners; it is intended as a local/release gate. CPython measurements are
+not gated.
 
 
-## Nächste Ausbaustufen für die vollen Harnesses
+## Next expansion stages for the full harnesses
 
-1. PyX-Adapter (`PYX_BIN`, Subprozess) für die unveränderten `bench_*.py`;
-   verbleibende Blocker je Harness stehen in der Tabelle oben.
-2. `numpy`/`pandas`/FastAPI brauchen C-API/ABI (P4-04, blockiert) sowie
-   Decorators/echte Async-Infrastruktur.
-3. Echte Coroutinen/Event-Loop und nicht-blockierendes `select`-artiges I/O
-   für `bench_request_handling.py`; blockierendes TCP und eager async sind da.
-4. Packaging/Cross-Platform, damit die Harnesses ohne manuellen Pfad-Setup
-   laufen (P3-08/Q-09).
+1. PyX adapter (`PYX_BIN`, subprocess) for the unchanged `bench_*.py`;
+   remaining blockers per harness are listed in the table above.
+2. `numpy`/`pandas`/FastAPI need the C API/ABI (P4-04, blocked) as well as
+   decorators; real async infrastructure is present for pure coroutines.
+3. Non-blocking `select`-like I/O and `asyncio` beyond
+   `run`/`sleep`/`gather` for `bench_request_handling.py`;
+   blocking TCP, real coroutines, and the event loop are there.
+4. Packaging/cross-platform so that the harnesses run without manual path
+   setup (P3-08/Q-09).

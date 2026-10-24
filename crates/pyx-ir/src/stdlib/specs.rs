@@ -311,19 +311,18 @@ pub static RE: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
-/// Eager asyncio compatibility layer.
+/// Cooperative asyncio layer over stackful coroutine fibers.
 ///
-/// There are no coroutines, tasks or suspension points: `async def` bodies run
-/// sequentially, `await` returns its operand, `run(value)` returns the value it
-/// was given, `sleep(seconds)` blocks the calling thread, and `gather(iterable)`
-/// materialises the elements in order. Unsupported APIs surface as
-/// `AttributeError` from the runtime.
+/// `run(coro)` drives the root coroutine, `sleep(seconds)` suspends only the
+/// calling fiber, and `gather(*awaitables)` starts every coroutine as a
+/// concurrent task and returns the results in input order. Unsupported APIs
+/// surface as `AttributeError` from the runtime.
 pub static ASYNCIO: ModuleSpec = ModuleSpec {
     name: "asyncio",
     functions: &[
         f("run", 1, 1, Type::Any),
         f("sleep", 1, 1, Type::None),
-        f("gather", 1, 1, Type::List),
+        f("gather", 0, usize::MAX, Type::List),
     ],
     constants: &[],
 };

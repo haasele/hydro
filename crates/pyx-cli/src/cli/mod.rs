@@ -52,6 +52,7 @@ pub(crate) fn usage_text() -> String {
          pyx init [path] [--force]          scaffold a project in an existing directory\n  \
          pyx check <file.py> [options]      parse and type-check only\n  \
          pyx run <file.py> [options]        compile with the JIT and run\n  \
+         pyx gc [--json] <file.py> [options]   run and report GC statistics\n  \
          pyx build <file.py> [options]      compile and link a native executable\n  \
          pyx test [paths...] [options]      run test_*.py / *_test.py files with `pyx run`\n  \
          pyx fmt [paths...] [--check]       strip trailing whitespace and fix the final newline\n  \
@@ -78,10 +79,15 @@ pub(crate) fn usage_text() -> String {
                                   (lint) print diagnostics as a JSON array on stderr\n  \
          --color=<WHEN>           colorize output: auto, always or never (default: auto)\n  \
          --no-color               disable colors (same as --color=never)\n\n\
-         diagnostic options (check, run, build, test, lint):\n  \
+         diagnostic options (check, run, gc, build, test, lint):\n  \
          --json                   print diagnostics as a JSON array on stderr\n  \
          --color=<WHEN>           colorize diagnostics: auto, always or never (default: auto)\n  \
          --no-color               disable colors (same as --color=never)\n\n\
+         gc:\n  \
+         the program is compiled and run exactly like `pyx run`; the GC\n  \
+         statistics are printed to stdout afterwards (after program output)\n  \
+         --json                   print the statistics as one JSON object on stdout\n  \
+                                  (also selects JSON diagnostics on stderr)\n\n\
          build options:\n  \
          -o, --output <OUT>       output path (default: <file stem> in the current directory)\n  \
          --runtime-lib <PATH>     path to libpyx_runtime.a\n  \

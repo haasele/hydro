@@ -175,7 +175,7 @@ impl KeywordArgs {
         // slice in range.
         let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
         let mut items = Vec::with_capacity(kwargc);
-        for pair in pairs.chunks_exact(2) {
+        for pair in pairs.as_chunks::<2>().0 {
             let Some(name) = value::as_str(pair[0]) else {
                 return Err(type_error(format!(
                     "keyword argument name must be str, not {}",
@@ -1636,9 +1636,12 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_hashable(args[0]) {
                 return err;
             }
-            let pairs = value::as_dict(obj).unwrap_or(&[]);
-            match container::dict_find(pairs, args[0]) {
-                Some(position) => pairs[position].1,
+            let found = value::as_dict_data(obj).and_then(|dict| {
+                dict.find(args[0])
+                    .map(|position| dict.entries()[position].1)
+            });
+            match found {
+                Some(value) => value,
                 None => {
                     if args.len() == 2 {
                         args[1]
@@ -1676,8 +1679,8 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 Some(pairs) => pairs,
                 None => return attribute_error(obj, method),
             };
-            match container::dict_find(&pairs, key) {
-                Some(position) => pairs.remove(position).1,
+            match pairs.remove(key) {
+                Some((_, value)) => value,
                 None => {
                     // Drop the graph lock before allocating the exception.
                     drop(pairs);

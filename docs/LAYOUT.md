@@ -1,87 +1,91 @@
-# PyX — Quelltext-Layout
+# PyX — Source Layout
 
-Stand 2026-10-24 (nach der Modul-Restrukturierung). Die Crates bleiben der
-einzige Frontend↔Codegen-Vertrag; innerhalb der Crates sind die früher flachen
-`src/*.rs`-Dateien in thematische Ordner aufgeteilt. Pfade sind relativ zum
-Repository-Wurzelverzeichnis.
+As of 2026-10-24 (after the module restructuring). The crates remain the
+only Frontend↔Codegen contract; inside the crates, the formerly flat
+`src/*.rs` files are split into topic folders. Paths are relative to the
+repository root.
 
 ```text
 .
-├── AGENTS.md                  Arbeitsstatus, Phasen, bekannte Grenzen
-├── PLAN.md                    Strategie/Leitentscheidungen
-├── README.md                  Überblick, Quickstart, CLI, Sprachumfang
-├── CHANGELOG.md               Keep-a-Changelog-Format
-├── CONTRIBUTING.md            Setup, Gate, Commit-Regeln
-├── Cargo.toml                 Workspace + gemeinsame Dependency-Versionen
+├── AGENTS.md                  work status, phases, known limits
+├── PLAN.md                    strategy/guiding decisions
+├── README.md                  overview, quickstart, CLI, language scope
+├── CHANGELOG.md               Keep-a-Changelog format
+├── CONTRIBUTING.md            setup, gate, commit rules
+├── Cargo.toml                 workspace + shared dependency versions
 ├── scripts/
-│   ├── verify.sh              vollständiges Gate (fmt/clippy/build/tests/E2E/AOT/GC)
-│   └── check_benchmarks.py    lokales Benchmark-Regressionsgate
+│   ├── verify.sh              full gate (fmt/clippy/build/tests/E2E/AOT/GC)
+│   └── check_benchmarks.py    local benchmark regression gate
 ├── benchmarks/
-│   ├── PYX.md                 Readiness-Matrix der externen Harnesses
-│   └── pyx/                   Micro-Benchmarks, run_micro.py, results/, thresholds.json
-├── examples/                  JIT-/AOT-Beispiele + expected/*.txt
+│   ├── PYX.md                 readiness matrix of the external harnesses
+│   ├── bench_pyx.py           CPython/JIT/AOT comparison, 11 workloads
+│   ├── bench_all.py           orchestrator (e.g. `--only pyx`)
+│   └── pyx/                   micro-benchmarks, run_micro.py, results/, thresholds.json
+├── examples/                  JIT/AOT examples + expected/*.txt
 ├── docs/
-│   ├── ARCHITECTURE.md        verbindlicher Vertrag (IR/ABI, GC, Module)
-│   ├── TODO.md                einzige Arbeitsliste
-│   ├── C_API.md               P4-04-Spike: Optionen, Umgebungsprobe, Blocker
-│   └── LAYOUT.md              diese Datei
+│   ├── ARCHITECTURE.md        binding contract (IR/ABI, GC, modules)
+│   ├── TODO.md                single work list
+│   ├── C_API.md               P4-04 spike: options, environment probe, blockers
+│   └── LAYOUT.md              this file
 └── crates/
-    ├── pyx-ir/                typisierte IR, einziger Frontend↔Codegen-Vertrag
+    ├── pyx-ir/                typed IR, only Frontend↔Codegen contract
     │   └── src/
-    │       ├── lib.rs         Re-Exports + Vertrags-Signaturen
-    │       ├── model.rs       Type, Const, Builtin, BinOp, Exception-Tags
-    │       ├── ir.rs          Programm/Funktion/Stmt/Expr/Class/Closure
-    │       ├── stdlib/        zentrale Modul-/Signaturtabelle
+    │       ├── lib.rs         re-exports + contract signatures
+    │       ├── model.rs       Type, Const, Builtin, BinOp, exception tags
+    │       ├── ir.rs          program/function/Stmt/Expr/Class/Closure
+    │       ├── stdlib/        central module/signature table
     │       │   ├── mod.rs
     │       │   └── specs.rs
     │       └── tests.rs
-    ├── pyx-frontend/          Parsen, Lowering, Typprüfung, User-Module
+    ├── pyx-frontend/          parsing, lowering, type checking, user modules
     │   └── src/
-    │       ├── lib.rs         check_file, Modul-Loader/Import-Auflösung
-    │       ├── diag.rs        Diagnosen, Spans, Codes
-    │       ├── lower/         AST → HIR/Lowering
-    │       └── sema/          Typinferenz, Constraints, IR-Emission
-    ├── pyx-codegen/           Cranelift-Backend
+    │       ├── lib.rs         check_file, module loader/import resolution
+    │       ├── diag.rs        diagnostics, spans, codes
+    │       ├── lower/         AST → HIR/lowering
+    │       └── sema/          type inference, constraints, IR emission
+    ├── pyx-codegen/           Cranelift backend
     │   └── src/
     │       ├── lib.rs
-    │       ├── backend/       JIT- und AOT-Treiber
-    │       └── lower/         IR → Cranelift (Frames, Cleanup-Stack, Safepoints)
-    ├── pyx-runtime/           Wertmodell, ABI, GC, Module (rlib + staticlib)
+    │       ├── backend/       JIT and AOT drivers
+    │       └── lower/         IR → Cranelift (frames, cleanup stack, safepoints)
+    ├── pyx-runtime/           value model, ABI, GC, modules (rlib + staticlib)
     │   ├── src/
     │   │   ├── lib.rs
-    │   │   ├── abi.rs         alle `extern "C"`-Symbole (docs/ARCHITECTURE §3)
+    │   │   ├── abi.rs         all `extern "C"` symbols (docs/ARCHITECTURE §3)
     │   │   ├── core/          value, ops, container, iter, builtins, methods,
-    │   │   │                  exc, format
-    │   │   ├── gc/            Heap, Farbe/Barrieren, Safepoints, Sweep
+    │   │   │                  exc, format, fiber (generators/coroutines;
+    │   │   │                  x86_64 register switch, ucontext fallback)
+    │   │   ├── gc/            heap, color/barriers, safepoints, sweep
     │   │   ├── modules/       math/io/json/os/... + argparse, collections,
     │   │   │                  re, socket, asyncio
-    │   │   ├── concurrency/   Threads/Locks/Queue/Prozesse/Pool/spawn
-    │   │   ├── support/       PYX1-Serialisierung (pickle/spawn/mp.Queue)
-    │   │   └── csv.rs         CSV-Reader/-Writer
-    │   └── tests/             Integrationstests je Feature (ABI-Ebene)
-    └── pyx-cli/               `pyx`-Binary
+    │   │   ├── concurrency/   threads/locks/queue/processes/pool/spawn
+    │   │   ├── support/       PYX1 serialization (pickle/spawn/mp.Queue)
+    │   │   └── csv.rs         CSV reader/writer
+    │   └── tests/             integration tests per feature (ABI level)
+    └── pyx-cli/               `pyx` binary
         ├── src/
-        │   ├── main.rs        ICE-Fang, Exit-Codes
+        │   ├── main.rs        ICE catching, exit codes
         │   └── cli/
-        │       ├── mod.rs     CliError, usage_text, Source-Laden
-        │       ├── args.rs    gemeinsame Options-Parser
-        │       ├── diag.rs    Snippet-/JSON-/Farb-Rendering
-        │       ├── dispatch.rs Subcommand-Tabelle
+        │       ├── mod.rs     CliError, usage_text, source loading
+        │       ├── args.rs    shared option parser
+        │       ├── diag.rs    snippet/JSON/color rendering
+        │       ├── dispatch.rs subcommand table
         │       └── commands/  new, init, check, run, build, test, fmt,
-        │                      lint, clean, doctor, help, uv, spawn, scan
-        └── tests/             E2E, Closures, User-Module
+        │                      lint, clean, doctor, help, uv, spawn, scan;
+        │                      `gc.rs` = `pyx gc` (run + GC statistics)
+        └── tests/             E2E, fibers, closures, user modules
 ```
 
-## Zuordnungsregeln
+## Mapping rules
 
-- `pyx-ir` enthält **keine** Logik außer Typtabellen und Vertragsstrukturen.
-  Änderungen an `ir.rs`/`model.rs` sind Vertragsänderungen.
-- `pyx-frontend::stdlib` (Re-Export aus `pyx-ir`) ist die einzige Stelle, an der
-  native Modul-Signaturen für Typprüfung und Runtime-Validierung stehen.
-- Runtime-Code liegt ausschließlich in `pyx-runtime`; `pyx-codegen` ruft nur
-  `pyx_runtime::abi`-Symbole auf.
-- Tests liegen bei der jeweiligen Verantwortung: Unit-Tests inline, ABI-
-  Integrationstests unter `crates/pyx-runtime/tests/`, Prozess-/CLI-E2E unter
+- `pyx-ir` contains **no** logic beyond type tables and contract structures.
+  Changes to `ir.rs`/`model.rs` are contract changes.
+- `pyx-frontend::stdlib` (re-export from `pyx-ir`) is the only place where
+  native module signatures for type checking and runtime validation live.
+- Runtime code lives exclusively in `pyx-runtime`; `pyx-codegen` only calls
+  `pyx_runtime::abi` symbols.
+- Tests live with their respective responsibility: unit tests inline, ABI
+  integration tests under `crates/pyx-runtime/tests/`, process/CLI E2E under
   `crates/pyx-cli/tests/`.
-- Neue CLI-Unterbefehle bekommen eine Datei unter `pyx-cli/src/cli/commands/`
-  und einen Eintrag in `dispatch.rs`, `args.rs` und `usage_text()`.
+- New CLI subcommands get a file under `pyx-cli/src/cli/commands/`
+  and an entry in `dispatch.rs`, `args.rs`, and `usage_text()`.

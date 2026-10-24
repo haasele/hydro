@@ -240,6 +240,12 @@ pub enum Builtin {
     Filter,
     /// `bytes()` / `bytes(int)` / `bytes(iterable)` / `bytes(str, encoding)`.
     Bytes,
+    /// `iter(obj)`: the object's iterator (an iterator/generator is returned
+    /// unchanged).
+    Iter,
+    /// `next(iterator[, default])`: the next element, `StopIteration` at the
+    /// end unless a default is given.
+    Next,
     /// Internal: one f-string interpolation field lowered to
     /// `pyx_format_value`. Arguments are the value, a constant format spec
     /// string and a constant conversion flag (`0` none, `1` `!s`, `2` `!r`,
@@ -266,6 +272,8 @@ impl Builtin {
             Builtin::Map => "map",
             Builtin::Filter => "filter",
             Builtin::Bytes => "bytes",
+            Builtin::Iter => "iter",
+            Builtin::Next => "next",
             Builtin::Format => "format",
         }
     }
@@ -290,6 +298,8 @@ impl Builtin {
             "map" => Builtin::Map,
             "filter" => Builtin::Filter,
             "bytes" => Builtin::Bytes,
+            "iter" => Builtin::Iter,
+            "next" => Builtin::Next,
             _ => return None,
         })
     }

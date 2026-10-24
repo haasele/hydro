@@ -36,6 +36,7 @@ fn new_closure(
         } else {
             captures.as_ptr()
         },
+        0,
     )
 }
 
@@ -114,6 +115,7 @@ fn null_capture_buffer_is_an_internal_error() {
         3,
         1,
         std::ptr::null(),
+        0,
     );
     assert_eq!(result, pyx_runtime_none());
     assert_ne!(pyx_exc_pending(), 0);

@@ -35,8 +35,11 @@ mod support;
 // The historical flat module paths (`crate::value`, `crate::heap`,
 // `crate::process`, ...) remain valid through these crate-root re-exports.
 pub(crate) use self::concurrency::{pool, process, spawn};
-pub(crate) use self::core::{builtins, container, exc, format, iter, methods, ops, value};
+pub(crate) use self::core::{builtins, container, exc, fiber, format, iter, methods, ops, value};
 pub(crate) use self::gc::heap;
+// Public collector statistics (used by `pyx gc`). The heap module itself
+// stays private; only the snapshot API is re-exported.
+pub use self::gc::heap::{gc_stats, reset_gc_stats, GcStats};
 pub(crate) use self::support::serialize;
 
 /// Records the canonical source path of the JIT-compiled program.

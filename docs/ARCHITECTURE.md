@@ -1,54 +1,56 @@
-# PyX — Architektur
+# PyX — Architecture
 
-Stand: **2026-10-24**. Phase 1 ist abgeschlossen; Phase 2 ist weitgehend
-implementiert (721 Tests, `scripts/verify.sh` ALL GREEN). Dieses Dokument ist
-der **verbindliche Vertrag** zwischen den Crates. Änderungen an ABI/IR nur mit
-Update dieses Dokuments und aller Nutzer. Der C-API-Spike (P4-04) ist blockiert
-und in [`C_API.md`](C_API.md) dokumentiert.
+As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
+implemented (771 tests, `scripts/verify.sh` ALL GREEN). This document is
+the **normative contract** between the crates. Changes to ABI/IR only with an
+update of this document and of all consumers. The C API spike (P4-04) is blocked
+and documented in [`C_API.md`](C_API.md).
 
-## 1. Zielbild
+## 1. Vision
 
-PyX ist eine eigenständige Python-Runtime mit AOT-Compiler und Toolchain
-(`pyx`), konzeptionell Bun für Python. CPython ist nicht die Standardlaufzeit.
-Ein Ziel ist weitgehende Python-Kompatibilität, zunächst über eine klar
-definierte Teilmenge (siehe `docs/TODO.md`).
+PyX is a standalone Python runtime with an AOT compiler and toolchain
+(`pyx`), conceptually Bun for Python. CPython is not the standard runtime.
+One goal is broad Python compatibility, initially via a clearly
+defined subset (see `docs/TODO.md`).
 
-**Unterstützt:** getaggte Werte, Container, Funktionen/Closures, Klassen
-(einzelne Basis), Comprehensions, f-Strings/Formatierung, Exceptions,
-Datei-I/O, User-Module, native Stdlib-Module, Threads/Prozesse/Pool, ein
-konservativer konkurrierender Mark-&-Sweep-GC.
+**Supported:** tagged values, containers, functions/closures, classes
+(single base), comprehensions, f-strings/formatting, exceptions,
+file I/O, user modules, native stdlib modules, lazy generators and coroutines
+with a cooperative event loop, threads/processes/pool, a conservative
+concurrent mark-&-sweep GC.
 
-**Bewusst nicht (Stand jetzt):** BigInt, echte lazy Generatoren/Coroutinen mit
-Event-Loop, vollständige CPython-Stdlib, C-Extensions/C-API, Decorators,
-Pattern Matching, Metaclasses, `bytearray`/`memoryview`, präzise GC-Roots und
-ein eigener Größenklassen-Allokator. Details in §10 und `docs/TODO.md`.
+**Deliberately not (as of now):** BigInt, `send`/`throw`/`close`, `yield from`,
+async generators/comprehensions, the complete CPython stdlib,
+C extensions/C API, decorators, pattern matching, metaclasses,
+`bytearray`/`memoryview`, precise GC roots and a dedicated
+size-class allocator. Details in §10 and `docs/TODO.md`.
 
-## 2. Komponenten & Datenfluss
+## 2. Components & Data Flow
 
 ```
-Quelltext .py (+ importierte Geschwistermodule)
-  │  rustpython-parser (Python-Grammatik, AST)
+Source .py (+ imported sibling modules)
+  │  rustpython-parser (Python grammar, AST)
   ▼
 pyx-frontend ── Lowering ──► typed IR (pyx-ir) ──► pyx-codegen
-  │ Typprüfung/Inferenz                          │
+  │ Type checking/inference                      │
   ▼                                              ├─ JIT (pyx run)
-Diagnosen (file:line:col)                        └─ Object + cc-Link (pyx build)
+Diagnostics (file:line:col)                      └─ Object + cc link (pyx build)
                                                         │
-                                                  pyx-runtime (libpyx_runtime.a, C-ABI)
+                                                  pyx-runtime (libpyx_runtime.a, C ABI)
 ```
 
-| Crate | Verantwortung | Abhängigkeiten |
+| Crate | Responsibility | Dependencies |
 |---|---|---|
-| `pyx-ir` | Typisiertes HIR; einziger Frontend↔Codegen-Vertrag; zentrale Stdlib-Spezifikation | – |
-| `pyx-frontend` | Parsen, Modul-Loader/Imports, Lowering, Typinferenz, Diagnosen | `pyx-ir`, `rustpython-parser` |
-| `pyx-runtime` | Value-Modell, Operatoren, Builtins, Exceptions, GC, Datei-I/O, Module, Concurrency; `rlib` + `staticlib` | `regex` u. a. |
-| `pyx-codegen` | Cranelift-Codegen, JIT- und AOT-Pfad | `pyx-ir`, `pyx-runtime`, Cranelift |
-| `pyx-cli` | `pyx`-Binary (Projekt, Compiler, Tests, Formatter, Lint, uv-Passthrough) | `pyx-frontend`, `pyx-codegen` |
+| `pyx-ir` | Typed HIR; the only frontend↔codegen contract; central stdlib specification | – |
+| `pyx-frontend` | Parsing, module loader/imports, lowering, type inference, diagnostics | `pyx-ir`, `rustpython-parser` |
+| `pyx-runtime` | Value model, operators, builtins, exceptions, GC, file I/O, modules, concurrency; `rlib` + `staticlib` | `regex` et al. |
+| `pyx-codegen` | Cranelift codegen, JIT and AOT path | `pyx-ir`, `pyx-runtime`, Cranelift |
+| `pyx-cli` | `pyx` binary (project, compiler, tests, formatter, lint, uv passthrough) | `pyx-frontend`, `pyx-codegen` |
 
-### 2.1 Ordnerlayout
+### 2.1 Directory Layout
 
-Die Crates sind seit dem Abschluss-Slice intern in thematische Ordner geteilt
-(vollständiger Baum in [`LAYOUT.md`](LAYOUT.md)):
+Since the completion slice the crates are internally split into thematic directories
+(full tree in [`LAYOUT.md`](LAYOUT.md)):
 
 ```
 crates/pyx-ir/src/{model.rs, ir.rs, stdlib/}
@@ -58,32 +60,32 @@ crates/pyx-runtime/src/{abi.rs, core/, gc/, modules/, concurrency/, support/, cs
 crates/pyx-cli/src/{main.rs, cli/, cli/commands/}
 ```
 
-`pyx-ir` bleibt logikfrei (Vertragsstrukturen + Typtabellen). Runtime-Code
-liegt ausschließlich in `pyx-runtime`; `pyx-codegen` ruft nur
-`pyx_runtime::abi`-Symbole auf.
+`pyx-ir` remains logic-free (contract structures + type tables). Runtime code
+lives exclusively in `pyx-runtime`; `pyx-codegen` only calls
+`pyx_runtime::abi` symbols.
 
-## 3. Runtime-ABI (verbindlich)
+## 3. Runtime ABI (Normative)
 
-Alle Werte sind `i64` (`PyxValue`). Alle Funktionen sind `extern "C"`,
-`#[no_mangle]`, im Modul `pyx_runtime::abi`, und dürfen **nicht** panicken
-(Nutzerfehler → pending Exception; interne Fehler → `process::abort`).
+All values are `i64` (`PyxValue`). All functions are `extern "C"`,
+`#[no_mangle]`, in the `pyx_runtime::abi` module, and **must not** panic
+(user error → pending exception; internal error → `process::abort`).
 
 ### 3.1 Tagging
 
-| Bits (`v & 7`) | Bedeutung |
+| Bits (`v & 7`) | Meaning |
 |---|---|
-| `000` | `int`: Wert = `v >> 3` (arithmetisch, i64) |
-| `001` | Spezial: `None = 1`, `False = 9`, `True = 17` (Payload `0/1/2`) |
-| `010` | Heap-Zeiger: `ptr = v & !7`, zeigt auf `PyxObj` |
-| Rest | reserviert |
+| `000` | `int`: value = `v >> 3` (arithmetic, i64) |
+| `001` | Special: `None = 1`, `False = 9`, `True = 17` (payload `0/1/2`) |
+| `010` | Heap pointer: `ptr = v & !7`, points to `PyxObj` |
+| Rest | reserved |
 
-Ints, Bools und None sind immediates; Floats/Strings/Container/native Objekte
-liegen auf dem Heap. Heap-Objekte besitzen einen Header mit `kind: u32` und
-sind an 8 Byte ausgerichtet.
+Ints, bools and None are immediates; floats/strings/containers/native objects
+live on the heap. Heap objects have a header with `kind: u32` and
+are aligned to 8 bytes.
 
-Objektarten (stabile `kind`-Werte):
+Object kinds (stable `kind` values):
 
-| Kind | Objekt | Kind | Objekt |
+| Kind | Object | Kind | Object |
 |---|---|---|---|
 | 0 | `Str` | 15 | `MpQueue` |
 | 1 | `Float` | 16 | `Pool` |
@@ -100,40 +102,43 @@ Objektarten (stabile `kind`-Werte):
 | 12 | `Event` | 27 | `Match` |
 | 13 | `Queue` | 28 | `Socket` |
 | 14 | `Process` | 29 | `Class` |
-| | | 30 | `Instance` |
+| 30 | `Instance` | 31 | `Fiber` |
 
-Listen/Dicts/Sets sind insertion-ordered (Sets deterministisch; Python
-garantiert keine Reihenfolge). `Iter` hält Ziel und Index. `Class` trägt Name,
-optionale Basis und eine unveränderliche Methodentabelle; `Instance` trägt
-Klasse und eine veränderliche Attributtabelle.
+Lists/dicts/sets are insertion-ordered (sets deterministically; Python
+guarantees no order). `Iter` holds target and index. `Class` carries name,
+optional base and an immutable method table; `Instance` carries the
+class and a mutable attribute table. `Fiber` is a generator
+or coroutine object (`kind`, own stack, architecture context, state,
+result/error; see §3.3). On x86_64 the context is a
+callee-saved register frame, otherwise a `ucontext_t`.
 
-### 3.2 Symbole
+### 3.2 Symbols
 
 ```c
-i64  pyx_none(void);                  // Konstante 1
+i64  pyx_none(void);                  // constant 1
 i64  pyx_true(void);                  // 17
 i64  pyx_false(void);                 // 9
 i64  pyx_bool(i64 b);                 // Truthiness -> True/False
-i64  pyx_int(i64 v);                  // identity (Bereichsprüfung)
-i64  pyx_str_new(const uint8_t* ptr, size_t len);   // kopiert UTF-8
+i64  pyx_int(i64 v);                  // identity (range check)
+i64  pyx_str_new(const uint8_t* ptr, size_t len);   // copies UTF-8
 i64  pyx_bytes_new(const uint8_t* ptr, size_t len);
 i64  pyx_bytes_build(uint64_t argc, const i64* argv); // bytes(...)
 i64  pyx_float_new(double f);
-i64  pyx_binop(uint32_t op, i64 a, i64 b);          // inkl. Vergleiche
+i64  pyx_binop(uint32_t op, i64 a, i64 b);          // incl. comparisons
 i64  pyx_unop(uint32_t op, i64 a);
-i64  pyx_truthy(i64 v);               // 1 wenn truthy, 0 wenn falsy (C-Stil)
-i64  pyx_print(uint64_t argc, const i64* argv);     // space-separiert + '\n'
+i64  pyx_truthy(i64 v);               // 1 if truthy, 0 if falsy (C style)
+i64  pyx_print(uint64_t argc, const i64* argv);     // space-separated + '\n'
 i64  pyx_len(i64 v);
 i64  pyx_to_str(i64 v);
 i64  pyx_to_int(i64 v);
 i64  pyx_to_float(i64 v);
 i64  pyx_abs(i64 v);
 i64  pyx_format_value(i64 value, const uint8_t* spec, size_t spec_len,
-                      uint8_t conversion);          // f-String-Feld
+                      uint8_t conversion);          // f-string field
 i64  pyx_list_new(uint64_t argc, const i64* items);
 i64  pyx_dict_new(uint64_t argc, const i64* keys, const i64* values);
 i64  pyx_tuple_new(uint64_t argc, const i64* items);
-i64  pyx_unpack(i64 value, uint64_t expected);      // None oder ValueError
+i64  pyx_unpack(i64 value, uint64_t expected);      // None or ValueError
 i64  pyx_set_new(uint64_t argc, const i64* items);
 i64  pyx_set_from(i64 iterable);
 i64  pyx_range_new(i64 start, i64 stop, i64 step);  // step != 0
@@ -142,19 +147,20 @@ i64  pyx_dict_from(i64 iterable);
 i64  pyx_sum(i64 iterable, i64 start);
 i64  pyx_enumerate(i64 iterable, i64 start);
 i64  pyx_zip(uint64_t argc, const i64* iterables);
-i64  pyx_list_append(i64 list, i64 value);          // None oder Fehler
+i64  pyx_list_append(i64 list, i64 value);          // None or error
 i64  pyx_set_add(i64 set, i64 value);
 i64  pyx_dict_set(i64 dict, i64 key, i64 value);
 i64  pyx_function_new(const uint8_t* wrapper, uint64_t arity,
-                      const uint8_t* name, size_t name_len);
+                      const uint8_t* name, size_t name_len, uint32_t flags);
 i64  pyx_builtin_function(const uint8_t* name, size_t name_len); // f = int
 i64  pyx_closure_new(const uint8_t* wrapper, uint64_t arity,
                      const uint8_t* name, size_t name_len,
-                     uint64_t capture_count, const i64* captures);
+                     uint64_t capture_count, const i64* captures,
+                     uint32_t flags);
 i64  pyx_class_new(const uint8_t* name, size_t name_len, i64 base,
                    uint64_t method_count, const i64* names, const i64* funcs);
 i64  pyx_call(i64 fn, uint64_t argc, const i64* argv);
-i64  pyx_map(i64 fn, i64 iterable);                 // materialisierte Liste
+i64  pyx_map(i64 fn, i64 iterable);                 // materialized list
 i64  pyx_filter(i64 fn_or_none, i64 iterable);
 i64  pyx_module_call(const uint8_t* module, size_t module_len,
                      const uint8_t* function, size_t function_len,
@@ -164,7 +170,7 @@ i64  pyx_module_get(const uint8_t* module, size_t module_len,
 i64  pyx_subscript(i64 obj, i64 index);
 i64  pyx_subscript_set(i64 obj, i64 index, i64 value);
 i64  pyx_slice(i64 obj, i64 start, i64 stop, i64 step);
-i64  pyx_getattr(i64 obj, const uint8_t* name, size_t name_len); // Datenattribut
+i64  pyx_getattr(i64 obj, const uint8_t* name, size_t name_len); // data attribute
 i64  pyx_setattr(i64 obj, const uint8_t* name, size_t name_len, i64 value);
 i64  pyx_method(i64 obj, const uint8_t* name, size_t name_len,
                 uint64_t argc, const i64* argv);
@@ -172,7 +178,13 @@ i64  pyx_method_kw(i64 obj, const uint8_t* name, size_t name_len,
                    uint64_t argc, const i64* argv,
                    uint64_t kwargc, const i64* kw_argv); // [name, value, ...]
 i64  pyx_iter_new(i64 obj);
-i64  pyx_iter_next(i64 iter, i64* out);             // 1=Wert, 0=Ende
+i64  pyx_iter_next(i64 iter, i64* out);             // 1=value, 0=end
+i64  pyx_iter(i64 obj);                             // iter(obj)
+i64  pyx_next(i64 obj, i64 default, i64 has_default); // next(obj[, default])
+i64  pyx_generator_new(const uint8_t* entry, uint64_t argc, const i64* argv);
+i64  pyx_coroutine_new(const uint8_t* entry, uint64_t argc, const i64* argv);
+i64  pyx_yield(i64 value);                          // suspends the fiber
+i64  pyx_await(i64 value);                          // drives a coroutine
 i64  pyx_gc_collect(void);
 i64  pyx_gc_objects(void);
 void pyx_safepoint(void);
@@ -191,277 +203,297 @@ i64  pyx_uncaught(void);
 void pyx_runtime_init(void);
 void pyx_register_function(const uint8_t* name, size_t name_len,
                            const uint8_t* wrapper, size_t arity); // spawn/Pool
-int32_t pyx_spawn_child(void);        // Kindmodus nach exec (-1 = normal)
+int32_t pyx_spawn_child(void);        // child mode after exec (-1 = normal)
 ```
 
-`op`-Codes (`pyx_binop`): `0 Add, 1 Sub, 2 Mul, 3 Div, 4 FloorDiv, 5 Mod,
+`op` codes (`pyx_binop`): `0 Add, 1 Sub, 2 Mul, 3 Div, 4 FloorDiv, 5 Mod,
 6 Pow, 7 Eq, 8 Ne, 9 Lt, 10 Le, 11 Gt, 12 Ge, 13 In, 14 NotIn`.
 `pyx_unop`: `0 Neg, 1 Pos, 2 Not`.
 
-Exception-Tags: `0 ValueError, 1 TypeError, 2 ZeroDivisionError,
+`flags` in `pyx_function_new`/`pyx_closure_new`: Bit 0 = `async`, Bit 1 =
+generator. If either of the bits is set, the generated wrapper calls
+`pyx_coroutine_new`/`pyx_generator_new`; `argv` contains the captures
+followed by the call arguments. The fiber starts only on the first
+`pyx_iter_next` (generator) or `pyx_await`/`asyncio.run` (coroutine).
+
+Exception tags: `0 ValueError, 1 TypeError, 2 ZeroDivisionError,
 3 RuntimeError, 4 OverflowError, 5 KeyboardInterrupt, 6 IndexError,
-7 KeyError, 8 StopIteration, 9 AttributeError, 10 OSError`. Namen 1:1 wie in
-Python; `IOError` ist ein Alias für `OSError`.
+7 KeyError, 8 StopIteration, 9 AttributeError, 10 OSError`. Names 1:1 as in
+Python; `IOError` is an alias for `OSError`.
 
-### 3.3 Semantik
+### 3.3 Semantics
 
-#### Numerik, Strings, Formatierung
+#### Numerics, Strings, Formatting
 
-- `int`/`int`-Arithmetik in i64; Overflow → `OverflowError` (dokumentierte
-  Grenze). Kein BigInt.
-- `/` liefert immer `float`; Division durch 0 → `ZeroDivisionError`.
-- `//`/`%` folgen Python (Boden-Division, Vorzeichen des Divisors).
-- `+` auf `str` ist Konkatenation; `==`/`!=`/`<`… auf Strings lexikografisch.
-- Gemischt `int`/`float` → `float`; `bool` ist numerisch `0/1`.
-- `print` ruft `str()` je Argument auf, trennt mit Leerzeichen, beendet mit
+- `int`/`int` arithmetic in i64; overflow → `OverflowError` (documented
+  limit). No BigInt.
+- `/` always returns `float`; division by 0 → `ZeroDivisionError`.
+- `//`/`%` follow Python (floor division, sign of the divisor).
+- `+` on `str` is concatenation; `==`/`!=`/`<`… on strings lexicographic.
+- Mixed `int`/`float` → `float`; `bool` is numerically `0/1`.
+- `print` calls `str()` per argument, separates with spaces, terminates with
   `\n`.
-- `str % args` ist printf-Formatierung, sobald die linke Seite ein String ist
-  (`%s`, `%d`, `%f`, `%x`, Flags/Breite/Präzision, `%%`, Tupel-Argumente).
-- f-Strings: `{expr}`, `{expr!s}`, `{expr!r}`, `{expr!a}` und Format-Specs
-  (`:.2f`, `:04d`, `:#x`, Ausrichtung/Füllzeichen/Vorzeichen/Gruppierung).
-  Der Codegen ruft `pyx_format_value`; Konvertierung und Spec werden vor der
-  Formatierung angewandt. Ungültige Specs → `ValueError`, falsche Typen →
-  `TypeError`.
-- `str.format(...)` unterstützt positionelle/benannte Felder, Index-/Attribut-
-  Pfade und Format-Specs. Die Spec-Logik liegt zentral in
-  `pyx-runtime/src/core/format.rs` und wird von f-Strings, `str.format` und
-  `%` gemeinsam genutzt.
-- `bytes` (Phase 2.19): Literale `b"..."`, `bytes()`-Konstruktor, Indexing
-  (Int 0..255), Slicing, Iteration, `+`/`*`, Vergleiche/Equality/Hash,
-  Subsequenz-Membership und Kernmethoden (`decode`, `hex`, `split`, `join`,
-  `strip`, `replace`, `upper`/`lower`, ...); `str.encode` liefert Bytes.
-  Kein `bytearray`/`memoryview`.
+- `str % args` is printf formatting as soon as the left side is a string
+  (`%s`, `%d`, `%f`, `%x`, flags/width/precision, `%%`, tuple arguments).
+- f-strings: `{expr}`, `{expr!s}`, `{expr!r}`, `{expr!a}` and format specs
+  (`:.2f`, `:04d`, `:#x`, alignment/fill/sign/grouping).
+  Codegen calls `pyx_format_value`; conversion and spec are applied before
+  formatting. Invalid specs → `ValueError`, wrong types → `TypeError`.
+- `str.format(...)` supports positional/named fields, index/attribute
+  paths and format specs. The spec logic lives centrally in
+  `pyx-runtime/src/core/format.rs` and is shared by f-strings, `str.format` and
+  `%`.
+- `bytes` (Phase 2.19): literals `b"..."`, `bytes()` constructor, indexing
+  (int 0..255), slicing, iteration, `+`/`*`, comparisons/equality/hash,
+  subsequence membership and core methods (`decode`, `hex`, `split`, `join`,
+  `strip`, `replace`, `upper`/`lower`, ...); `str.encode` returns bytes.
+  No `bytearray`/`memoryview`.
 
-#### Container
+#### Containers
 
-- Listen/Dicts: Indexing mit negativen Indizes; `IndexError` außerhalb des
-  Bereichs; `KeyError` mit repr(key) bei fehlendem Dict-Key; `len` zählt
-  Elemente; `for` iteriert Listen/Strings (Unicode-Skalare) und Dict-Keys in
-  Einfügereihenfolge; `str(list)`/`str(dict)` nutzen Python-Repräsentation
-  (`[1, 'a']`, `{'k': 1}`); `==`/`!=` sind strukturell (Dicts reihenfolge-
-  unabhängig); `list + list` konkateniert.
-- Slices (`s[a:b:c]`) folgen `slice.indices` (negative Indizes, Defaults,
-  `step == 0` → ValueError) und liefern neue Strings (Unicode-Skalare) bzw.
-  Listen; Dicts sind nicht slicebar (`TypeError`).
-- Tupel: unveränderlich, Indexing/Slicing wie Listen, `len`, Iteration,
-  strukturelle Gleichheit, `tuple + tuple` und `tuple * int`; Repräsentation
-  `(1, 'a')`, Singleton `(1,)`, leer `()`. Tupel aus hashbaren Elementen sind
-  als Dict-Keys erlaubt. Unpacking (`a, b = pair`) akzeptiert Listen/Tupel mit
-  exakter Länge; `dict.items()` liefert eine Liste von `(key, value)`-Tupeln
-  (dokumentierte Abweichung von der View). Nested/starred Unpacking ist eine
-  Diagnose.
-- `in`/`not in`: `list`/`tuple` via Python-Gleichheit, `dict` über Keys,
-  `str` als Substring (linker Operand muss `str` sein), `set` über Elemente;
-  andere rechte Operanden → TypeError. `set`-Literale deduplizieren, bewahren
-  aber die Einfügereihenfolge, unterstützen `len`/Iteration/Truthiness/
-  strukturelle Gleichheit und `repr` (`{1, 2}`, leer `set()`); unhashbare
-  Elemente → TypeError.
-- `range(...)` ist ein Wert (`range`-Objekt, Iteration/len/Membership/Repr);
-  `list()`/`dict()`/`sum()`/`enumerate()`/`zip()` sind Builtins.
-  `enumerate`/`zip` materialisieren Listen von Tupeln.
+- Lists/dicts: indexing with negative indices; `IndexError` outside
+  the range; `KeyError` with repr(key) on a missing dict key; `len` counts
+  elements; `for` iterates lists/strings (Unicode scalars), dict keys in
+  insertion order and generator objects;
+  `str(list)`/`str(dict)` use the Python representation
+  (`[1, 'a']`, `{'k': 1}`); `==`/`!=` are structural (dicts order-
+  independent); `list + list` concatenates.
+- Slices (`s[a:b:c]`) follow `slice.indices` (negative indices, defaults,
+  `step == 0` → ValueError) and return new strings (Unicode scalars) or
+  lists; dicts are not sliceable (`TypeError`).
+- Tuples: immutable, indexing/slicing like lists, `len`, iteration,
+  structural equality, `tuple + tuple` and `tuple * int`; representation
+  `(1, 'a')`, singleton `(1,)`, empty `()`. Tuples of hashable elements are
+  allowed as dict keys. Unpacking (`a, b = pair`) accepts lists/tuples with
+  exact length; `dict.items()` returns a list of `(key, value)` tuples
+  (documented deviation from the view). Nested/starred unpacking is a
+  diagnostic.
+- `in`/`not in`: `list`/`tuple` via Python equality, `dict` over keys,
+  `str` as substring (the left operand must be `str`), `set` over elements;
+  other right operands → TypeError. `set` literals deduplicate but preserve
+  insertion order, support `len`/iteration/truthiness/
+  structural equality and `repr` (`{1, 2}`, empty `set()`); unhashable
+  elements → TypeError.
+- `range(...)` is a value (`range` object, iteration/len/membership/repr);
+  `list()`/`dict()`/`sum()`/`enumerate()`/`zip()` are builtins.
+  `enumerate`/`zip` materialize lists of tuples.
 - Comprehensions (Phase 2.8): `[e for ...]`, `{e for ...}`, `{k: v for ...}`
-  und Generatorausdrücke; mehrere `for`-Klauseln und `if`-Filter werden
-  geschachtelt ausgewertet, Tupel-Targets entpackt. Generatorausdrücke werden
-  **eager als Liste** materialisiert (dokumentierte Abweichung bis echte
-  Generatorobjekte existieren); Comprehension-Variablen sind synthetische
-  Locals und leaken nicht.
-- Dict-Insertion ist linear (O(n) pro Lookup/Insert); Container-Mutation
-  während einer Iteration ist indexbasiert und undefiniert.
+  and generator expressions; multiple `for` clauses and `if` filters are
+  evaluated nested, tuple targets unpacked. Generator expressions are
+  still **materialized eagerly as a list** (documented deviation;
+  function generators are lazy since Phase 2.32); comprehension variables
+  are synthetic locals and do not leak.
+- Dicts store their insertion order in an entry list plus a
+  hash index over the key hashes (`DictData`). Buckets are verified with
+  Python equality (first position, last value); numeric
+  keys are int/float/bool-equivalent. Lookup/insert are therefore O(1) on
+  average; `pop` reindexes. Container mutation during an iteration is
+  index-based and undefined.
 
-#### Funktionen, Closures, Klassen
+#### Functions, Closures, Classes
 
-- Benannte Funktionen und Lambdas sind Werte (`FunctionRef`); indirekte Calls
-  laufen über `pyx_call` (Wrapper mit argv). Lambdas sind parameter-only; ein
-  Zugriff auf äußere Namen im Lambda ist eine Diagnose.
-- Builtins sind ebenfalls Werte: `f = int`, `map(f, xs)` etc. materialisieren
-  ein `FunctionBody::Builtin`-Objekt über `pyx_builtin_function`.
-- **Closures sind by value** (Phase 2.28): `def inner` innerhalb einer Funktion
-  erzeugt `pyx_closure_new` mit den *aktuellen Werten* der referenzierten
-  Locals. Spätere Änderungen der äußeren Variable sind für eine bereits
-  erzeugte Closure unsichtbar; jede Ausführung erzeugt eigene Captures (auch in
-  Schleifen). Captures werden als führende Parameter an den Wrapper übergeben
-  (`capture_count` in der Signatur). Rekursive verschachtelte Funktionen und
-  Closures in Lambdas werden diagnostiziert.
-- **Klassen** (Phase 2.27): `class Name(Base):` mit höchstens einer einfachen
-  Basis. Erlaubt sind Methoden, `__init__`, `pass` und ein Docstring; der
-  Klassen-Namespace ist nach der Erzeugung unveränderlich. `Name(...)` erzeugt
-  eine Instanz und ruft `__init__` (über die Klassen-/Basis-Kette) mit der
-  Instanz als `self`. Methoden werden über `pyx_method` dynamisch nach
-  Empfängertyp und Klassenkette aufgelöst; Attribute über
-  `pyx_getattr`/`pyx_setattr`. Nicht unterstützt: Class-Attribute,
-  Decorators, Metaclasses, `class`-Keywords, Multiple Inheritance,
-  `__repr__`/Descriptor-Protokolle. Instanzen rendern deterministisch als
-  `<ClassName object>` (keine Heap-Adresse), Klassen als `<class 'Name'>`.
-- **Attribute** (`pyx_getattr`): `pathlib.Path` (`name`, `stem`, `suffix`,
-  `parent`, `path`), Dateien (`name`, `mode`, `closed`, `encoding`),
-  `threading.Thread` (`name`, `ident`, `daemon`) und
-  `multiprocessing.Process` (`name`, `pid`, `exitcode`, `daemon`) liefern
-  Datenattribute. Für native Objekte sind Namen ohne Aufruf Datenattribute;
-  Methoden müssen aufgerufen werden. Unbekannte Namen → `AttributeError`.
-  `pyx_setattr` erlaubt nur Instanz-Attribute; Klassen sind unveränderlich.
-- **Methoden-Keywords** (`pyx_method_kw`): native Methoden mit benannten
-  Parametern akzeptieren Keywords. Implementiert sind `str.split`/
+- Named functions and lambdas are values (`FunctionRef`); indirect calls
+  go through `pyx_call` (wrapper with argv). Lambdas are parameter-only; an
+  access to outer names inside a lambda is a diagnostic.
+- Builtins are values as well: `f = int`, `map(f, xs)` etc. materialize
+  a `FunctionBody::Builtin` object via `pyx_builtin_function`.
+- **Closures are by value** (Phase 2.28): `def inner` inside a function
+  creates `pyx_closure_new` with the *current values* of the referenced
+  locals. Later changes of the outer variable are invisible to an already
+  created closure; every execution creates its own captures (also in
+  loops). Captures are passed as leading parameters to the wrapper
+  (`capture_count` in the signature). Recursive nested functions and
+  closures in lambdas are diagnosed.
+- **Classes** (Phase 2.27): `class Name(Base):` with at most one simple
+  base. Allowed are methods, `__init__`, `pass` and a docstring; the
+  class namespace is immutable after creation. `Name(...)` creates
+  an instance and calls `__init__` (via the class/base chain) with the
+  instance as `self`. Methods are resolved dynamically via `pyx_method` by
+  receiver type and class chain; attributes via
+  `pyx_getattr`/`pyx_setattr`. Not supported: class attributes,
+  decorators, metaclasses, `class` keywords, multiple inheritance,
+  `__repr__`/descriptor protocols. Instances render deterministically as
+  `<ClassName object>` (no heap address), classes as `<class 'Name'>`.
+- **Attributes** (`pyx_getattr`): `pathlib.Path` (`name`, `stem`, `suffix`,
+  `parent`, `path`), files (`name`, `mode`, `closed`, `encoding`),
+  `threading.Thread` (`name`, `ident`, `daemon`) and
+  `multiprocessing.Process` (`name`, `pid`, `exitcode`, `daemon`) provide
+  data attributes. For native objects, names without a call are data
+  attributes; methods must be called. Unknown names → `AttributeError`.
+  `pyx_setattr` allows only instance attributes; classes are immutable.
+- **Method keywords** (`pyx_method_kw`): native methods with named
+  parameters accept keywords. Implemented are `str.split`/
   `replace`/`startswith`/`endswith`, `pathlib.Path.mkdir`/`open`/
-  `read_text`/`write_text`/`read_bytes`/`write_bytes`/`glob` und
-  `argparse`-Methoden; z. B. `Path.mkdir(parents=True, exist_ok=True)`.
-  Native **Konstruktoren** (z. B. `Thread(target=..., args=...)`,
-  `queue.Queue(maxsize=...)`) binden Keywords über ihre
-  `FunctionSpec.params`. Andere native Methoden sowie User-Funktionen/
-  Methoden lehnen Keywords ab (Runtime-/Frontend-Diagnose).
+  `read_text`/`write_text`/`read_bytes`/`write_bytes`/`glob` and
+  `argparse` methods; e.g. `Path.mkdir(parents=True, exist_ok=True)`.
+  Native **constructors** (e.g. `Thread(target=..., args=...)`,
+  `queue.Queue(maxsize=...)`) bind keywords via their
+  `FunctionSpec.params`. Other native methods as well as user functions/
+  methods reject keywords (runtime/frontend diagnostic).
 
-#### Generatoren und async (eager)
+#### Generators and async
 
-- **Generatoren** (Phase 2.28): Eine Funktion mit `yield value` wird eager
-  loweriert: ein verstecktes `$gen`-Listenlocal wird mit `[]` initialisiert,
-  jeder `yield` wird zu `append`, die Funktion gibt die materialisierte Liste
-  zurück. `list(gen(...))` funktioniert damit, aber es gibt **keine**
-  Generatorobjekte, kein `send`/`throw`/`close`, keine Lazy-Auswertung.
-  `yield from`, `yield` in einem Ausdruck, bare `yield` und `return <wert>` im
-  Generator sind Diagnosen. Generator Expressions sind ebenfalls eager.
-- **async** (Phase 2.29): `async def` wird wie `def` loweriert; es gibt keine
-  Coroutine-Objekte und keinen Event-Loop. `await expr` liefert den Wert von
-  `expr` direkt (sequenziell), `async with`/`async for` verwenden dieselbe
-  synchrone Lowering-/Protokoll-Logik. `asyncio` stellt nur `run(value)`
-  (identisch), `sleep(seconds)` (blockierend, GC-sicher geparkt) und
-  `gather(iterable)` (sequenziell materialisierte Liste) bereit. Das ist
-  **keine** Nebenläufigkeit; echte Coroutinen/Tasks/Event-Loop bleiben offen.
+- **Generators** (Phase 2.32): A function with `yield` is compiled as a
+  fiber (`core/fiber.rs`). The call creates a `Fiber` object with its
+  own 128-KiB stack; on x86_64 the context switch is
+  `global_asm!`-`pyx_context_switch` over the callee-saved registers `rsp`,
+  `rbx`, `rbp`, `r12`–`r15` (`ret`-based, no syscalls); on other
+  targets libc `ucontext` remains the fallback. The wrapper runs only on the
+  first `pyx_iter_next`. `yield value`/bare `yield` suspend the fiber,
+  `return` ends the iteration, exceptions are propagated on the next resume.
+  Every object is independent; `for`, `list`, `sum`, `iter(x)` and
+  `next(it[, default])` work on it. Not supported: `send`/`throw`/
+  `close`, `yield` expressions, `yield from`, async generators (`async def` +
+  `yield` is a diagnostic) and async comprehensions. Generator expressions
+  remain eagerly materialized lists (documented deviation).
+- **async** (Phase 2.32): `async def` creates a coroutine object;
+  `await`/`pyx_await` drives it to completion (non-fiber values are
+  returned unchanged). `asyncio.run(coro)` runs a cooperative
+  single-thread event loop: `asyncio.sleep(secs)` suspends only the current
+  fiber (blocking outside a loop), `asyncio.gather(*awaitables)` starts all
+  tasks concurrently, returns the results in input order and propagates the
+  first error. Tasks switch only at explicit suspension points; there is no
+  GIL. `async for`/`async with` still use the synchronous
+  lowering/protocol logic. Beyond that, `asyncio` offers only
+  `run`/`sleep`/`gather`; real `__aiter__`/`__anext__` protocols and
+  non-blocking I/O are missing.
 
-#### `with`-Protokoll
+#### `with` Protocol
 
-`with a as x, b as y:` wird zu verschachtelten `try/finally`-Blöcken. Jeder
-Kontextausdruck wird genau einmal in ein verstecktes `$withN`-Local
-ausgewertet, dessen `__enter__()` an das `as`-Ziel gebunden wird. Das
-`finally` ruft `__exit__(None, None, None)` auf demselben Objekt auf, sodass
-`return`, `break`, `continue` und Exceptions jedes Objekt in umgekehrter
-Reihenfolge verlassen. Der Rückgabewert von `__exit__` wird ignoriert:
-Exceptions werden **nie** unterdrückt. Dateien, `Pool` und User-Klassen
-implementieren das Protokoll; ohne `as` läuft `__enter__` trotzdem.
+`with a as x, b as y:` becomes nested `try/finally` blocks. Every
+context expression is evaluated exactly once into a hidden `$withN` local,
+whose `__enter__()` is bound to the `as` target. The
+`finally` calls `__exit__(None, None, None)` on the same object, so that
+`return`, `break`, `continue` and exceptions leave every object in reverse
+order. The return value of `__exit__` is ignored:
+exceptions are **never** suppressed. Files, `Pool` and user classes
+implement the protocol; without `as`, `__enter__` still runs.
 
-#### Imports, User-Module, `__name__`
+#### Imports, User Modules, `__name__`
 
-- Native Module werden über `pyx_ir::stdlib` spezifiziert (siehe unten).
-  `import X [as Y]` und `from X import a [as b]` sind nur auf Modulebene
-  erlaubt; importierte Namen sind in Funktionen sichtbar. `X.f(...)` →
-  ModuleCall, `X.const`/`X.f` als Wert → ModuleAttr. Native Funktionen werden
-  als Function-Objekte materialisiert; Calls/Arity/Fehler laufen über die
-  gemeinsame Spezifikation. Unbekannte Module/Member und Modulwerte als
-  Variablen sind Diagnosen.
-- **User-Module** (Phase 2.30): `import foo` / `from foo import f` lösen
-  `foo.py` neben der importierenden Datei auf. Der Loader lädt jedes Modul
-  **einmal pro kanonischem Pfad** (Modul-Cache auf Compile-Zeit), lädt
-  Abhängigkeiten zuerst und erkennt Zyklen. Nur Funktionen werden exportiert;
-  importierte Module dürfen außer Imports, Funktionsdefinitionen, Docstring,
-  `pass` und der injizierten `__name__`-Zuweisung **keine** Top-Level-
-  Ausdrücke enthalten (keine Seiteneffekte beim Import). Pakete, Punkte/
-  relative Imports und `from x import *` sind nicht unterstützt. Alle
-  Funktionen landen in einem `Program`; JIT und AOT führen denselben Code aus
-  (AOT bettet die Module ins Binary ein).
-- `__name__` ist ein Modulbody-Local und wird nur injiziert, wenn der Body es
-  liest: `"__main__"` für die Einstiegsdatei, sonst der Modulname. Ein
-  Runtime-Modulobjekt (`sys.modules`, `module.__dict__`) gibt es nicht.
+- Native modules are specified via `pyx_ir::stdlib` (see below).
+  `import X [as Y]` and `from X import a [as b]` are allowed only at module
+  level; imported names are visible inside functions. `X.f(...)` →
+  ModuleCall, `X.const`/`X.f` as a value → ModuleAttr. Native functions are
+  materialized as function objects; calls/arity/errors go through the
+  shared specification. Unknown modules/members and module values as
+  variables are diagnostics.
+- **User modules** (Phase 2.30): `import foo` / `from foo import f` resolve
+  `foo.py` next to the importing file. The loader loads every module
+  **once per canonical path** (module cache at compile time), loads
+  dependencies first and detects cycles. Only functions are exported;
+  except for imports, function definitions, the docstring, `pass` and the
+  injected `__name__` assignment, imported modules **must not** contain any
+  top-level expressions (no side effects at import). Packages, dots/
+  relative imports and `from x import *` are not supported. All
+  functions end up in one `Program`; JIT and AOT execute the same code
+  (AOT embeds the modules into the binary).
+- `__name__` is a module body local and is injected only if the body
+  reads it: `"__main__"` for the entry file, otherwise the module name. A
+  runtime module object (`sys.modules`, `module.__dict__`) does not exist.
 
-#### Stdlib-Module
+#### Stdlib Modules
 
-Zentrale Spezifikation in `pyx_ir::stdlib` (`MODULES` in
+Central specification in `pyx_ir::stdlib` (`MODULES` in
 `stdlib/mod.rs`): `math`, `io`, `functools`, `operator`, `time`, `sys`,
 `random`, `platform`, `pathlib`, `statistics`, `json`, `csv`, `os`,
 `os.path`, `_thread`, `threading`, `queue`, `multiprocessing`, `pickle`,
 `argparse`, `collections`, `re`, `socket`, `asyncio`.
 
-- `json`: `dumps`/`loads` mit CPython-Defaults (ensure_ascii, Separatoren,
-  Escapes, Surrogate, Fehlerklassen, Depth-/Cycle-Guards) sowie `dump`/`load`
-  auf File-Objekten; Parser baut Container GC-sicher inkrementell.
+- `json`: `dumps`/`loads` with CPython defaults (ensure_ascii, separators,
+  escapes, surrogates, error classes, depth/cycle guards) as well as `dump`/`load`
+  on file objects; the parser builds containers incrementally in a GC-safe way.
 - `os`: `getpid`/`getppid`/`cpu_count`/`getcwd`/`getenv`, `name`/`sep`,
   `remove`/`rename`, `fork`/`waitpid`/`_exit`. `os.path`: `join`, `basename`,
   `dirname`, `exists`, `isfile`, `isdir`, `abspath`, `splitext`, `split`.
-- `io`/`open`: UTF-8-Text (`r/w/a/x`) und Bytes (`rb/wb/ab/xb`); kein
-  `+`-Modus. `read`/`readline`/`readlines`/`write`/`writelines`/`flush`/
-  `tell`/`seek`/`close`/Zeileniteration; Fehler `OSError`, geschlossene Datei
+- `io`/`open`: UTF-8 text (`r/w/a/x`) and bytes (`rb/wb/ab/xb`); no
+  `+` mode. `read`/`readline`/`readlines`/`write`/`writelines`/`flush`/
+  `tell`/`seek`/`close`/line iteration; errors `OSError`, closed file
   `ValueError`.
-- `csv`: `reader`/`writer` und `DictReader`/`DictWriter` (fieldnames),
-  RFC-4180-nahes Quoting/embedded newlines, `writerow(s)`/`writeheader`.
-  Reader materialisieren; kein Dialect/restkey, CSV ist kein Streaming.
-- `argparse` (Phase 2.25): ein `ArgumentParser` mit positionalen Argumenten,
-  langen/kurzen Optionen, `type`, `default`, `required`, `choices`, `help`,
-  `store_true`, `nargs="?"`; `parse_args` liefert ein `Namespace`. Fehler
-  sind `RuntimeError` (kein `SystemExit`); `-h` druckt Hilfe und setzt
+- `csv`: `reader`/`writer` and `DictReader`/`DictWriter` (fieldnames),
+  RFC-4180-like quoting/embedded newlines, `writerow(s)`/`writeheader`.
+  Readers materialize; no dialect/restkey, CSV is not streaming.
+- `argparse` (Phase 2.25): an `ArgumentParser` with positional arguments,
+  long/short options, `type`, `default`, `required`, `choices`, `help`,
+  `store_true`, `nargs="?"`; `parse_args` returns a `Namespace`. Errors
+  are `RuntimeError` (no `SystemExit`); `-h` prints help and sets
   `_help=True`.
-- `collections.defaultdict`: insertion-ordered `(key, value)`-Paare plus
-  `default_factory`; fehlender Key ruft die Factory auf, fügt ein und gibt
-  zurück; `None`-Factory → `KeyError`.
-- `re` (Phase 2.26): Wrapper um die `regex`-Crate mit `search`, `match`,
-  `fullmatch`, `findall`, `sub`, `split`, `escape`, `compile`; `Pattern` und
-  `Match` sind native Objekte mit `group`/`start`/`end`/`span`/`findall`/
-  `search`. Syntax ist Rust-`regex` (keine Lookarounds/Backreferences);
-  ungültige Patterns → `ValueError`.
-- `socket` (Phase 2.26): blockierendes TCP (`AF_INET`/`SOCK_STREAM`) über
+- `collections.defaultdict`: insertion-ordered `(key, value)` pairs plus
+  `default_factory`; a missing key calls the factory, inserts and returns;
+  `None` factory → `KeyError`.
+- `re` (Phase 2.26): wrapper around the `regex` crate with `search`, `match`,
+  `fullmatch`, `findall`, `sub`, `split`, `escape`, `compile`; `Pattern` and
+  `Match` are native objects with `group`/`start`/`end`/`span`/`findall`/
+  `search`. Syntax is Rust `regex` (no lookarounds/backreferences);
+  invalid patterns → `ValueError`.
+- `socket` (Phase 2.26): blocking TCP (`AF_INET`/`SOCK_STREAM`) via
   `std::net`: `socket`, `create_connection`, `bind`, `listen`, `accept`,
   `connect`, `send`/`sendall`, `recv`, `close`, `settimeout`, `gettimeout`,
   `shutdown`, `setsockopt`/`getsockopt`, `getsockname`/`getpeername`.
-  Blockierende Aufrufe parken den Thread für den GC. Kein TLS/UDP/`select`
-  und keine `socket.timeout`-Klasse (Timeout → `OSError`).
-- `random`: globaler SplitMix64-PRNG und seedbares `Random(seed=...)` mit
+  Blocking calls park the thread for the GC. No TLS/UDP/`select`
+  and no `socket.timeout` class (timeout → `OSError`).
+- `random`: global SplitMix64 PRNG and seedable `Random(seed=...)` with
   `seed`/`random`/`randint`/`randrange`/`choice`/`uniform`/`shuffle`;
-  deterministisch pro Seed, aber **nicht CPython-reproduzierbar**.
+  deterministic per seed, but **not CPython-reproducible**.
 - `platform`: `system`/`machine`/`release`/`version`/`node`/`platform`/
   `python_version`, `python_implementation = "PyX"`.
-- `statistics`: `mean`/`fmean`/`median`/`pstdev`/`stdev` inkl. Fehlerpfade.
-- `pathlib`: natives `Path` (`Path()`, `cwd()`, `home()`) mit
+- `statistics`: `mean`/`fmean`/`median`/`pstdev`/`stdev` including error paths.
+- `pathlib`: native `Path` (`Path()`, `cwd()`, `home()`) with
   `exists`/`is_file`/`is_dir`, `read_text`/`write_text`, `read_bytes`/
-  `write_bytes`, `open`, `mkdir`, sortiertem `iterdir`/`glob` (`*`/`?`, kein
-  `**`), `joinpath`/`resolve`/`absolute`/`as_posix`, `/`-Join und
-  Datenattributen `name`/`stem`/`suffix`/`parent`/`path`. `os.remove`/
-  `rename` akzeptieren Path-Objekte.
-- `asyncio`: siehe §3.3 „Generatoren und async“ (nur `run`/`sleep`/`gather`).
+  `write_bytes`, `open`, `mkdir`, sorted `iterdir`/`glob` (`*`/`?`, no
+  `**`), `joinpath`/`resolve`/`absolute`/`as_posix`, `/` join and
+  data attributes `name`/`stem`/`suffix`/`parent`/`path`. `os.remove`/
+  `rename` accept path objects.
+- `asyncio`: see §3.3 "Generators and async" (only `run`/`sleep`/`gather`).
 
-#### Methoden
+#### Methods
 
-`pyx_method`/`pyx_method_kw` dispatchen dynamisch nach Empfängertyp.
-`str`: `upper`, `lower`, `strip`, `lstrip`, `rstrip`, `split` (0/1 Arg),
-`join`, `replace` (2/3 Args), `startswith`, `endswith`, `find`, `count`,
-`isdigit`, `isalpha`, `isalnum`, `isspace`, `format`, `encode` (Bytes).
-`list`: `append`, `extend`, `insert`, `remove`, `pop` (0/1 Arg), `clear`,
-`reverse`, `copy`, `count`, `index`. `dict`: `get` (1/2 Args), `keys`,
-`values`, `items`, `pop` (1/2 Args), `update`, `clear`. `tuple`: `count`,
+`pyx_method`/`pyx_method_kw` dispatch dynamically by receiver type.
+`str`: `upper`, `lower`, `strip`, `lstrip`, `rstrip`, `split` (0/1 arg),
+`join`, `replace` (2/3 args), `startswith`, `endswith`, `find`, `count`,
+`isdigit`, `isalpha`, `isalnum`, `isspace`, `format`, `encode` (bytes).
+`list`: `append`, `extend`, `insert`, `remove`, `pop` (0/1 arg), `clear`,
+`reverse`, `copy`, `count`, `index`. `dict`: `get` (1/2 args), `keys`,
+`values`, `items`, `pop` (1/2 args), `update`, `clear`. `tuple`: `count`,
 `index`. `set`: `add`, `remove`, `discard`, `clear`, `copy`, `union`.
-`keys`/`values` liefern bewusst Listen (keine Views). Unbekannte Methoden →
-`AttributeError`; Attributzugriff ohne Aufruf auf nativen Typen ist entweder
-ein Datenattribut (siehe oben) oder `AttributeError`. Für `str`, `list`,
-`dict`, `tuple`, `set`, `bytes` prüft das Frontend Methoden/Arität statisch;
-`Any`-Empfänger werden zur Laufzeit geprüft.
+`keys`/`values` deliberately return lists (no views). Unknown methods →
+`AttributeError`; attribute access without a call on native types is either
+a data attribute (see above) or `AttributeError`. For `str`, `list`,
+`dict`, `tuple`, `set`, `bytes` the frontend checks methods/arity statically;
+`Any` receivers are checked at runtime.
 
-#### Datei-I/O und Concurrency
+#### File I/O and Concurrency
 
-- Dateien: siehe `io`; `with` nutzt das `__enter__`/`__exit__`-Protokoll.
-- **Kein GIL.** Der Heap wechselt beim ersten `_thread.start_new_thread` in
-  einen globalen Shared Heap (bestehende Objekte werden migriert). Threads
-  erhalten IDs; `_thread.join` ist eine PyX-Extension. Locks
-  (`_thread.allocate_lock`) sind native `Lock`-Objekte; `threading` liefert
-  `Thread`, `Lock`, `RLock` (Owner/Depth), `Event` und `queue.Queue`.
-- `multiprocessing` bietet fork-basierte `Process`-Objekte, `os.fork`/
-  `waitpid`/`_exit` und `multiprocessing.Queue` (socketpair, PYX1-
-  Serialisierung). `spawn` startet einen frischen Prozess per `exec`
-  (`pyx __spawn` bzw. AOT-Binary); `pyx_main` registriert alle Funktionen vor
-  dem Modulbody, ein Payload nennt Zielname + Args, und nur diese Funktion
-  läuft im Kind (Queue-FDs werden geerbt; kein Modulbody im Kind).
-  `Pool` nutzt je Worker private Task-/Result-Queues für fork und spawn und
-  implementiert `__enter__`/`__exit__` (Terminate).
-- `pickle.dumps/loads` nutzt ein eigenes, nicht CPython-kompatibles
-  PYX1-Hexformat (None/Bool/Int/Float/Str/List/Tuple/Dict/Set/Range/Bytes/
-  Function-Wrapper); zyklusfrei, Depth 128. Funktionen werden per
-  Wrapper-Adresse/Name nur im gleichen, geforkten oder per spawn
-  registrierten Adressraum rekonstruiert; native Objekte/Lambdas werden
-  abgelehnt.
-- Gemeinsam genutzte veränderliche Container erfordern User-Locks; ohne GIL
-  sind ungeschützte Mutationen Datenraces und kein unterstütztes Verhalten.
+- Files: see `io`; `with` uses the `__enter__`/`__exit__` protocol.
+- **No GIL.** On the first `_thread.start_new_thread` the heap switches to
+  a global shared heap (existing objects are migrated). Threads
+  receive IDs; `_thread.join` is a PyX extension. Locks
+  (`_thread.allocate_lock`) are native `Lock` objects; `threading` provides
+  `Thread`, `Lock`, `RLock` (owner/depth), `Event` and `queue.Queue`.
+- `multiprocessing` provides fork-based `Process` objects, `os.fork`/
+  `waitpid`/`_exit` and `multiprocessing.Queue` (socketpair, PYX1
+  serialization). `spawn` starts a fresh process via `exec`
+  (`pyx __spawn` resp. AOT binary); `pyx_main` registers all functions before
+  the module body, a payload names the target name + args, and only that function
+  runs in the child (queue FDs are inherited; no module body in the child).
+  `Pool` uses per-worker private task/result queues for fork and spawn and
+  implements `__enter__`/`__exit__` (terminate).
+- `pickle.dumps/loads` uses its own PYX1 hex format that is not CPython-compatible
+  (None/Bool/Int/Float/Str/List/Tuple/Dict/Set/Range/Bytes/
+  function wrapper); cycle-free, depth 128. Functions are reconstructed by
+  wrapper address/name only in the same, forked or spawn-
+  registered address space; native objects/lambdas are
+  rejected.
+- Shared mutable containers require user locks; without a GIL,
+  unprotected mutations are data races and not supported behavior.
 
-### 3.4 Fehlerprotokoll
+### 3.4 Error Protocol
 
-Fehlerfähige Runtime-Aufrufe setzen bei Fehler eine **pending Exception** und
-liefern einen Dummy-Wert. Der Codegen prüft nach *jeder* fehlerfähigen Operation
-`pyx_exc_pending()` und springt zum nächsten Handler (oder zum Uncaught-Pfad).
-Eine Exception trägt Tag, Message, Funktionsname und Zeile zum Zeitpunkt des
-`raise`. `pyx_uncaught()` druckt:
+Error-capable runtime calls set a **pending exception** on failure and
+return a dummy value. After *every* error-capable operation, codegen checks
+`pyx_exc_pending()` and jumps to the next handler (or to the uncaught path).
+An exception carries tag, message, function name and line at the time of the
+`raise`. `pyx_uncaught()` prints:
 
 ```
 Traceback (most recent call last):
@@ -469,275 +501,320 @@ Traceback (most recent call last):
 ZeroDivisionError: division by zero
 ```
 
-und liefert Exit-Code `1`.
+and returns exit code `1`.
 
-## 4. Backend-Entscheidung
+## 4. Backend Decision
 
-**Cranelift 0.120** (pure Rust) für Phase 1–3; LLVM optional später hinter
-Feature-Flag.
+**Cranelift 0.120** (pure Rust) for Phases 1–3; LLVM optionally later behind
+a feature flag.
 
-Begründung: kein System-LLVM/`llvm-config`/Header nötig, schnelle Builds,
-JIT und Object-Emission aus einer Codebasis, solide Baseline-Optimierung.
-Kosten: schwächere Optimierung als LLVM (PGO/Inlining, P5) und kein
-ORC-JIT-Tiering. Der Codegen bleibt in `pyx-codegen` gekapselt, sodass ein
-LLVM-Backend später dieselbe IR konsumieren kann. Entscheidung in P0-11
-dokumentiert.
+Rationale: no system LLVM/`llvm-config`/headers needed, fast builds,
+JIT and object emission from one codebase, solid baseline optimization.
+Costs: weaker optimization than LLVM (PGO/inlining, P5) and no
+ORC-JIT tiering. Codegen remains encapsulated in `pyx-codegen`, so an
+LLVM backend can later consume the same IR. The decision is documented in P0-11.
 
-### 4.1 AOT-Linking
+### 4.1 AOT Linking
 
-`pyx build` erzeugt eine Object-Datei (`.o`) und linkt sie mit `cc` gegen
-`libpyx_runtime.a` (staticlib des Workspace). Das erzeugte Binary exportiert
-`main(argc, argv) -> int`, welches `pyx_main() -> int` aufruft. `pyx_main`
-führt den Modulkörper (inkl. eingebetteter User-Module) aus und liefert den
-`pyx_uncaught()`-Exitcode bei pending Exception, sonst `0`. Das Binary
-benötigt weder CPython noch `pyx`.
+`pyx build` produces an object file (`.o`) and links it with `cc` against
+`libpyx_runtime.a` (staticlib of the workspace). The generated binary exports
+`main(argc, argv) -> int`, which calls `pyx_main() -> int`. `pyx_main`
+executes the module body (incl. embedded user modules) and returns the
+`pyx_uncaught()` exit code on a pending exception, otherwise `0`. The binary
+needs neither CPython nor `pyx`.
 
-Runtime-Library-Auflösung: `--runtime-lib <path>`, sonst `PYX_RUNTIME_LIB`,
-sonst relativ zur CLI-Executable (`target/<profile>/libpyx_runtime.a`).
-Fehlt sie, klare Fehlermeldung mit Bauhinweis.
+Runtime library resolution: `--runtime-lib <path>`, otherwise `PYX_RUNTIME_LIB`,
+otherwise relative to the CLI executable (`target/<profile>/libpyx_runtime.a`).
+If it is missing, a clear error message with a build hint.
 
-Der Build-Cache liegt unter `.pyx/cache` und ist eine reine lokale
-Optimierung. Der Schlüssel umfasst CLI-/Runtime-Version, Ziel-Architektur/OS,
-Quelltext, alle erreichbaren `.py`-Module (relativer Pfad + Inhalt) und die
-Identität der Runtime-Archive. `--no-cache` umgeht ihn; `pyx clean` entfernt
-ihn. Der Cache ist kein geteilter Artefakt-Store.
+The build cache lives under `.pyx/cache` and is a purely local
+optimization. The key covers CLI/runtime version, target architecture/OS,
+source text, all reachable `.py` modules (relative path + content) and the
+identity of the runtime archives. `--no-cache` bypasses it; `pyx clean` removes
+it. The cache is not a shared artifact store.
 
-## 5. IR-Vertrag
+## 5. IR Contract
 
-`pyx-ir` ist absichtlich klein und vollständig typisiert:
+`pyx-ir` is deliberately small and fully typed:
 
-- `Program { functions, main }`; `functions[0]` ist der Modulkörper `<module>`
-  der Einstiegsdatei. User-Module belegen zusammenhängende `FunctionId`-
-  Bereiche; alle Funktionen liegen in einem `Program`.
-- Jede `Function` besitzt `params`, `capture_count`, `ret_ty` und `locals`
-  (Index = `LocalId`). `capture_count` führende Parameter sind Closures-
-  Captures und werden vom Runtime-Wert geliefert; die sichtbare Arität ist
+- `Program { functions, main }`; `functions[0]` is the module body `<module>`
+  of the entry file. User modules occupy contiguous `FunctionId`
+  ranges; all functions live in one `Program`.
+- Every `Function` has `params`, `capture_count`, `ret_ty` and `locals`
+  (index = `LocalId`). The `capture_count` leading parameters are closure
+  captures and are supplied by the runtime value; the visible arity is
   `params.len() - capture_count`.
-- `Stmt`/`Expr` tragen `line` (1-basiert) für Tracebacks.
-- Ausdrücke: `Const`, `Local`, `Bin` (inkl. `In`/`NotIn`), `Un`, `BoolOp`
+- `Stmt`/`Expr` carry `line` (1-based) for tracebacks.
+- Expressions: `Const`, `Local`, `Bin` (incl. `In`/`NotIn`), `Un`, `BoolOp`
   (short-circuit), `List`, `Dict`, `Tuple`, `Set`, `Subscript`, `Slice`,
-  `ListComp`, `SetComp`, `DictComp`, `GeneratorExp` (eager), `FunctionRef`,
+  `ListComp`, `SetComp`, `DictComp`, `GeneratorExp` (eager), `Await`,
+  `FunctionRef`,
   `BuiltinRef` (`f = int`), `IndirectCall`, `ModuleCall`, `ModuleAttr`,
-  `GetAttr` (Datenattribut), `MethodCall { args, keywords }`, `Closure`
-  (Wert), `Call { callee: Function(id) | Builtin(b), args }`.
+  `GetAttr` (data attribute), `MethodCall { args, keywords }`, `Closure`
+  (value), `Call { callee: Function(id) | Builtin(b), args }`.
 - Statements: `Expr`, `Assign`, `AugAssign`, `If`, `While`, `ForRange`,
-  `ForEach`, `Unpack`, `SetSubscript`, `Closure` (nested def),
+  `ForEach`, `Unpack`, `SetSubscript`, `Closure` (nested def), `Yield`,
   `ClassDef { target, name, base, methods }`, `SetAttr`, `Return`, `Break`,
   `Continue`, `Pass`, `Raise`,
   `Try { body, handlers, else_body, finally_body }`.
-- `Handler.exc == None` ist ein bare `except:` (fängt jeden Tag). `else` läuft
-  nur nach fehlerfreiem Body; `finally` läuft auf jedem Pfad (normal, `return`,
-  `break`, `continue`, Exception) und kann die vorherige Aktion überschreiben
-  (Return/Break/Continue suppressen eine pending Exception; eine neue Exception
-  im finally ersetzt die alte). Exception-Chaining ist nicht implementiert.
-  `except*` wird nicht unterstützt.
-- `ForEach` iteriert Listen/Strings/Dicts über die Runtime-Iteratoren;
-  `ForRange` bleibt die syntaktisch spezialisierte `range(...)`-Form (seit
-  Phase 2.7 ist `range` zusätzlich ein Wert). Negative Schrittweite ist
-  erlaubt, Schritt `0` ist ein Laufzeit-`ValueError`.
-- `Raise { exc: None, msg: None }` ist bare Re-Raise.
-- **Eager-Lowering:** `yield value` in einer Funktion wird zu
-  `$gen.append(value)` plus Rückgabe der Liste; `await` ist der Operand;
-  `with`/`async with` werden zu nested `try/finally` mit
-  `__enter__`/`__exit__`; augmentierte Subscript-Zuweisung
-  (`a[i] += x`) wertet Objekt und Index genau einmal in `$aug`-Locals aus.
-- **User-Module:** Importe emittieren keine IR-Statements; der Loader ersetzt
-  sie durch `FunctionRef`s auf die exportierten Funktionen des Zielmoduls.
-  `__name__` ist ein optionaler Modulbody-Local.
+- `Handler.exc == None` is a bare `except:` (catches every tag). `else` runs
+  only after an error-free body; `finally` runs on every path (normal, `return`,
+  `break`, `continue`, exception) and can override the previous action
+  (return/break/continue suppress a pending exception; a new exception
+  in finally replaces the old one). Exception chaining is not implemented.
+  `except*` is not supported.
+- `ForEach` iterates lists/strings/dicts via the runtime iterators;
+  `ForRange` remains the syntactically specialized `range(...)` form (since
+  Phase 2.7, `range` is additionally a value). Negative step is
+  allowed, step `0` is a runtime `ValueError`.
+- `Raise { exc: None, msg: None }` is a bare re-raise.
+- Functions carry `is_generator` and `is_async`; codegen derives the
+  flags in `pyx_function_new`/`pyx_closure_new` from them (bit 0 async, bit 1
+  generator) and generates a wrapper that calls `pyx_coroutine_new` resp.
+  `pyx_generator_new`. `Yield` statements become `pyx_yield`,
+  `Await` becomes `pyx_await`.
+- **Lowering:** `with`/`async with` become nested `try/finally` with
+  `__enter__`/`__exit__`; augmented subscript assignment
+  (`a[i] += x`) evaluates object and index exactly once into `$aug` locals.
+  `async for` uses the synchronous `for` lowering logic.
+- **User modules:** imports emit no IR statements; the loader replaces
+  them with `FunctionRef`s to the exported functions of the target module.
+  `__name__` is an optional module body local.
 
-Typen: `Int, Float, Bool, Str, Bytes, None, Any, Never, List, Dict, Tuple,
+Types: `Int, Float, Bool, Str, Bytes, None, Any, Never, List, Dict, Tuple,
 Set, Range, Function`.
 
-## 6. Typinferenz (Frontend)
+## 6. Type Inference (Frontend)
 
-- Unifikationsbasiert über Typvariablen; keine Polymorphie.
-- Literale/Operatoren erzeugen Constraints; `int`/`float` unifizieren zu `float`
-  (Widening), `bool` ist mit `int` numerisch kompatibel.
-- Funktionssignaturen werden aus Rumpf und Aufrufstellen abgeleitet; nicht
-  auflösbare Variablen werden `Any`.
-- Widersprüche (z. B. `1 + "x"` ohne `Any`) sind Diagnosen, keine Panics.
-- Annotationen (`def f(x: int) -> int`) werden respektiert und geprüft.
-- Rückgabetyp: `None`, wenn kein `return` mit Wert existiert; `Never` bei
-  ausschließlich werfendem Rumpf. Generatorfunktionen liefern `List`.
-- Der Modulkörper ist `FunctionId 0` mit `ret_ty = None`.
-- Container sind unparameterisiert (Elemente `Any`). `len`, `str`, Indexing
-  und `for` akzeptieren sie; Index-Typ muss bei `List`/`Str`/`Bytes` `Int`/
-  `Bool` sein (bei `Dict` beliebig). `==`/`!=` auf gleichen Containertypen
-  ergibt `Bool`; Ordnungsvergleiche auf Containern werden abgelehnt, bis die
-  Runtime sie implementiert.
-- `Set` ist unparameterisiert; `In`/`NotIn` → Bool mit denselben Regeln wie
+- Unification-based over type variables; no polymorphism.
+- Literals/operators create constraints; `int`/`float` unify to `float`
+  (widening), `bool` is numerically compatible with `int`.
+- Function signatures are derived from body and call sites; unresolvable
+  variables become `Any`.
+- Contradictions (e.g. `1 + "x"` without `Any`) are diagnostics, not panics.
+- Annotations (`def f(x: int) -> int`) are respected and checked.
+- Return type: `None` if no `return` with a value exists; `Never` for an
+  exclusively throwing body. A call of a generator or
+  `async` function returns an object (generator/coroutine) and is typed as
+  `Any`; the annotation describes the yielded values.
+- The module body is `FunctionId 0` with `ret_ty = None`.
+- Containers are unparameterized (elements `Any`). `len`, `str`, indexing
+  and `for` accept them; the index type must be `Int`/
+  `Bool` for `List`/`Str`/`Bytes` (arbitrary for `Dict`). `==`/`!=` on equal
+  container types yields `Bool`; ordering comparisons on containers are
+  rejected until the runtime implements them.
+- `Set` is unparameterized; `In`/`NotIn` → Bool with the same rules as
   §3.3. `range()` → Range, `list()` → List, `dict()` → Dict, `sum()` → Int
-  bei Range sonst Any, `enumerate`/`zip`/`map`/`filter` → List.
+  for Range, otherwise Any, `enumerate`/`zip`/`map`/`filter` → List.
 - Comprehensions: ListComp → List, SetComp → Set, DictComp → Dict,
-  GeneratorExp → List (eager). Targets binden synthetische Locals.
-- Name/Lambda → Function; indirekter Call: Callee Function/Any, Ergebnis Any;
-  `f = int` ist eine Funktion (`BuiltinRef`). Closures erfassen ausschließlich
-  vorhandene Locals; `capture_count` wird aus der ersten Verwendung im
-  verschachtelten Body abgeleitet.
-- Module/Imports: native Modul-Attribute/Calls werden über
-  `pyx_ir::stdlib` typisiert; User-Modul-Importe binden exportierte
-  Funktionssignaturen. Importe sind global sichtbar, müssen aber auf
-  Modulebene stehen.
-- Klassen: `class` bindet einen dynamischen Klassenwert (kein statischer
-  Instanztyp); Methodenaufrufe über Instanzen werden dynamisch geprüft,
-  Aufrufe mit `Any` fallen auf Runtime-Checks zurück.
+  GeneratorExp → List (eager). Targets bind synthetic locals.
+- Name/Lambda → Function; indirect call: callee Function/Any, result Any;
+  `f = int` is a function (`BuiltinRef`). Closures capture exclusively
+  existing locals; `capture_count` is derived from the first use in the
+  nested body.
+- Modules/imports: native module attributes/calls are typed via
+  `pyx_ir::stdlib`; user module imports bind exported
+  function signatures. Imports are globally visible but must be at
+  module level.
+- Classes: `class` binds a dynamic class value (no static
+  instance type); method calls via instances are checked dynamically,
+  calls with `Any` fall back to runtime checks.
+- Statically `Int`-typed operands use checked int fast paths in codegen:
+  `+`/`-`/`*` (untag, `sadd_overflow`/`ssub_overflow`/
+  `smul_overflow`, range check, retag) and comparisons; on overflow or a
+  non-`Int` result it goes through `pyx_binop`. The same applies to `AugAssign`
+  and to fully `Int`-typed `for range` counters. Constant folding and
+  dead-`if`/`while False` already run in the frontend (only with guaranteed
+  identical semantics).
 
-## 7. Speicher & GC
+## 7. Memory & GC
 
-Phase 1/2.0 allokierte Heap-Objekte über `Box::into_raw` und leakte sie. Seit
-Phase 2.1/2.15 gibt es einen **konservativen, konkurrierenden Mark-&-Sweep-
-Collector als Interim**:
+Phase 1/2.0 allocated heap objects via `Box::into_raw` and leaked them. Since
+Phase 2.1/2.15 there is a **conservative, concurrent mark-&-sweep
+collector as an interim**:
 
-- Jede Heap-Allokation wird in einer Thread-lokalen Registry (Objektliste +
-  Adress-Set) registriert und mit einer Atomfarbe WEISS/GRAU/SCHWARZ
-  versehen.
-- Roots: konservativer Scan des nativen Stacks (Grenzen via
-  `pthread_getattr_np`), eines Register-Dumps (x86_64/aarch64) und der
-  pending Exception. Getaggte Heap-Werte werden nur akzeptiert, wenn ihre
-  Objektadresse exakt in der Registry liegt; Fehltreffer konservieren höchstens.
-- Der Register-Dump erfolgt in **einem** `asm!`-Block, der alle
-  General-Purpose-Register (x86_64: inkl. `rsp`; aarch64: `x0..x30` + `sp`)
-  in einen lokalen Puffer schreibt und der danach komplett als Roots markiert
-  wird. Wählt der Compiler ein Register für den Pufferzeiger, hat er dessen
-  vorherigen Live-Wert zuvor auf den Stack gespült; der Stack-Scan deckt ihn
-  ab.
-- Stack-Wörter werden per Inline-Asm geladen (x86_64 `mov`, aarch64 `ldr`),
-  nicht via `ptr::read_unaligned`: Stack-Slots oberhalb von `sp` können
-  uninitialisiert sein, und ein Maschinenload ist für den Compiler opak.
-  Andere Architekturen fallen auf `read_unaligned` zurück; dort akzeptiert der
-  Interim-Collector diese theoretische UB-Lücke (keine unterstützten Ziele).
-- Mark traversiert `List`-Elemente, `Dict`-Keys/Values, `Iter.target`,
-  Captures/Basisklassen/Instanz-Attribute und alle übrigen getraceten Kinder;
-  Sweep gibt unmarkierte Objekte frei und kompaktiert die Registry.
-- Ein Shared-Heap-Zyklus hat zwei kurze Stop-the-World-Fenster: initialer
-  Root-Snapshot (Stacks, Register, Pending, Thread-Roots) und finaler
-  Root-Rescan. Dazwischen markiert ein Collector-Thread konkurrierend; der
-  Sweep läuft nach dem Rescan ebenfalls konkurrierend (White-Partition kurz
-  unter Heap-Lock, `Box`-Freigabe außerhalb, neue Allokationen bleiben
-  geschützt).
-- **Insertion-Barrieren** pro neuer Kante (list/dict/set/queue/instance attr)
-  markieren das neue Kind, wenn der Parent bereits SCHWARZ ist;
-  Container-Mutation und Marker serialisiert ein Graph-Lock pro Payload. Im
-  local-Modus entfällt das Lock.
-- Auslösung bei Wachstum seit der letzten Sammlung: `live + PYX_GC_THRESHOLD`
-  (Default 10000), nicht bei absoluter Objektzahl. `PYX_GC_STRESS=1` sammelt
-  vor jeder Allokation. `PYX_GC_STATS=1` meldet Pause-, Mark- und Sweep-Zeit
-  sowie Freigaben.
-- `gc/alloc.rs` verwaltet feste `PyxObj`-Zellen in Slabs (64er-Chunks,
-  Free-List, Alignment, Reuse/Stats); variable Payload-Groessenklassen sind
-  eine eigene Heap-Architekturphase.
-- `pyx_gc_collect()` erzwingt eine Sammlung; `pyx_gc_objects()` liefert die
-  Live-Objektzahl. `pyx_runtime_init()` setzt Heap und Exception-Zustand zurück.
+- Every heap allocation is registered in a thread-local registry (object list +
+  address set) and given an atomic color WHITE/GREY/BLACK.
+- Roots: conservative scan of the native stack (bounds via
+  `pthread_getattr_np`), a register dump (x86_64/aarch64) and the
+  pending exception. Tagged heap values are accepted only if their
+  object address lies exactly in the registry; false hits can only cause
+  over-retention.
+- **Fiber roots:** While a generator/coroutine fiber runs, the
+  thread stack points to the fiber stack; `push_stack_bounds` overrides the
+  stack bounds so that the scan sees the running fiber stack. The
+  fiber stack as well as `ctx` and `caller_ctx` are registered as conservative
+  root areas from object creation for the entire lifetime (`Drop`
+  removes them). On x86_64 the two contexts contain the callee-saved
+  register words that may hold tagged values during a suspension;
+  a suspend/resume does not touch the registry. The outermost resume
+  publishes two aux ranges (native driver stack and `caller_ctx`)
+  via `set_aux_stack`; in shared mode both are mirrored into the `ThreadGc`,
+  in local mode it stays with thread-local ranges without atomics
+  per switch. Nested resumes publish nothing because the caller is a fiber
+  with already registered lifetime ranges. `PYX_GC_STRESS=1` covers
+  interleaved generators.
+- The register dump happens in **one** `asm!` block that writes all
+  general-purpose registers (x86_64: incl. `rsp`; aarch64: `x0..x30` + `sp`)
+  into a local buffer, which is then marked completely as roots. If the
+  compiler chooses a register for the buffer pointer, it has previously
+  spilled its prior live value to the stack; the stack scan covers it.
+- Stack words are loaded via inline asm (x86_64 `mov`, aarch64 `ldr`),
+  not via `ptr::read_unaligned`: stack slots above `sp` may be
+  uninitialized, and a machine load is opaque to the compiler.
+  Other architectures fall back to `read_unaligned`; there the
+  interim collector accepts this theoretical UB gap (no supported targets).
+- Mark traverses `List` elements, `Dict` keys/values, `Iter.target`,
+  captures/base classes/instance attributes and all other traced children;
+  sweep frees unmarked objects and compacts the registry.
+- A shared-heap cycle has two short stop-the-world windows: initial
+  root snapshot (stacks, registers, pending, thread roots) and final
+  root rescan. In between, a collector thread marks concurrently; the
+  sweep also runs concurrently after the rescan (white partition briefly
+  under the heap lock, `Box` release outside, new allocations stay
+  protected).
+- **Insertion barriers** per new edge (list/dict/set/queue/instance attr)
+  mark the new child if the parent is already BLACK;
+  container mutation and marker are serialized by a graph lock per payload. In
+  local mode the lock is omitted.
+- Trigger on growth since the last collection: `live + PYX_GC_THRESHOLD`
+  (default 10000), not on absolute object count. `PYX_GC_STRESS=1` collects
+  before every allocation. `PYX_GC_STATS=1` reports pause, mark and sweep time
+  as well as frees per collection on stderr.
+- `pyx_runtime::gc_stats()` returns a `GcStats` snapshot
+  (`collections`, `pause_total_us`, `pause_max_us`, `mark_total_us`,
+  `sweep_total_us`, `freed_total`, `live_objects`, `threshold`, `stress`);
+  `reset_gc_stats()` resets the counters. `pyx gc [--json] <file.py>`
+  runs the program like `pyx run` and prints the statistics afterwards;
+  with `--json` the last stdout line is an object with snake_case keys.
+- `gc/alloc.rs` manages fixed `PyxObj` cells in slabs (chunks of 64,
+  free list, alignment, reuse/stats); variable payload size classes are
+  a separate heap architecture phase.
+- `pyx_gc_collect()` forces a collection; `pyx_gc_objects()` returns the
+  live object count. `pyx_runtime_init()` resets heap and exception state.
 
-Das ist bewusst ein **Interim**: konservatives Scannen kann False Positives
-konservieren; der finale Root-Rescan ist STW, die White-Partition läuft kurz
-unter dem Heap-Lock. P2-05 (eigener Größenklassen-Allokator), P2-06/P2-07
-(präzise Shadow-Stack-Roots, feineres Safepoint-Polling) bleiben offen. Die
-`unsafe`-Policy: Die GC-Scan-/Free-Pfade sind in `pyx-runtime/src/gc/`
-gekapselt und begründen ihre Invarianten dort.
+This is deliberately an **interim**: conservative scanning can preserve false
+positives; the final root rescan is STW, the white partition runs briefly
+under the heap lock. P2-05 (dedicated size-class allocator), P2-06/P2-07
+(precise shadow-stack roots, finer safepoint polling) remain open. The
+`unsafe` policy: The GC scan/free paths are encapsulated in `pyx-runtime/src/gc/`
+and justify their invariants there.
 
 ### 7.1 Concurrency (P2-20)
 
-**Kein GIL.** Seit Phase 2.12 gibt es einen globalen Shared-Heap-Modus
-(Heap-Migration beim ersten Thread), Thread-Registry und native
-`_thread`-Primitive. Seit Phase 2.13/2.15 sammelt ein **konkurrierender
-Mark-&-Sweep-Collector** auch während Threads laufen: Der Codegen ruft
-`pyx_safepoint()` an Funktionseingängen und (seit Phase 2.15 nur jede 64.
-Loop-Iteration) an Loop-Backedges; jeder Thread registriert Stack-Grenzen,
-gespeicherte SP/Register, Thread-Roots und einen Pending-Exception-Spiegel.
-Der Collector setzt `GC_REQUESTED` nur für Root-Snapshot und finalen
-Rescan/Sweep, wartet dort auf geparkte/exited Threads und markiert dazwischen
-konkurrierend mit Insertion-Barrieren. Der Heap-Lock wird erst nach dem
-Parken genommen, `GC_LOCK` nur per try_lock. Blockierende
-Locks/join/sleep/Queue-/Socket-Waits parken den Thread während des Wartens;
-Container-Mutationen und Marker serialisiert ein Graph-Lock. Sweep und
-Markierung laufen konkurrierend. Mutierende Container müssen von User-Locks
-geschützt werden; ungeschützte Mutationen sind Datenraces. Safepoints kosten
-weiterhin Durchsatz (Baseline `threads_serial` AOT ca. 40–45 ms).
+**No GIL.** Since Phase 2.12 there is a global shared-heap mode
+(heap migration on the first thread), a thread registry and native
+`_thread` primitives. Since Phase 2.13/2.15 a **concurrent
+mark-&-sweep collector** collects even while threads run: Codegen calls
+`pyx_safepoint()` at function entries and (since Phase 2.15 only every 64th
+loop iteration) at loop backedges; every thread registers stack bounds,
+saved SP/registers, thread roots and a pending-exception mirror.
+The collector sets `GC_REQUESTED` only for the root snapshot and final
+rescan/sweep, waits there for parked/exited threads, and marks concurrently
+in between with insertion barriers. The heap lock is taken only after
+parking, `GC_LOCK` only via try_lock. Blocking
+locks/join/sleep/queue/socket waits park the thread while waiting;
+container mutations and markers are serialized by a graph lock. Sweep and
+marking run concurrently. Mutating containers must be protected by user locks;
+unprotected mutations are data races. Safepoints still cost
+throughput (baseline `threads_serial` AOT approx. 40–45 ms).
 
 ## 8. Toolchain / CLI / uv (Phase 3)
 
-Die CLI ist eine einzige Binary. Unterbefehle (vollständige Hilfe via
+The CLI is a single binary. Subcommands (full help via
 `pyx help`):
 
 `new`, `init`, `check`, `run`, `build`, `test`, `fmt`, `lint`, `clean`,
-`add`, `remove`, `sync`, `lock`, `doctor`, `help`, `--version`.
+`gc`, `add`, `remove`, `sync`, `lock`, `doctor`, `help`, `--version`.
 
-- `new`/`init` erzeugen `main.py`, `pyproject.toml` und `.gitignore`;
-  existierende nicht-leere Dateien werden ohne `--force` nicht überschrieben.
-- `test` führt `test_*.py`/`*_test.py` mit `pyx run` aus; Erfolg = Exit 0
-  (keine pytest-Assertions). `--json` liefert eine Ergebnisliste.
-- `fmt` normalisiert Trailing-Whitespace und genau einen finalen Newline
-  (kein AST-Formatter); `--check` schreibt nicht. `lint` typprüft alle
-  `.py`-Dateien; `--json` aggregiert Diagnosen.
-- `clean` entfernt `.pyx/cache` und `target/pyx-tmp` (`--dry-run`).
-- `add`/`remove`/`sync`/`lock` sind ein **Passthrough** an `uv`
-  (`PYX_UV` überschreibt das Executable). PyX interpretiert weder Specs noch
-  `pyproject.toml`; der uv-Exitstatus wird zurückgegeben.
-- Der Build-Cache (§4.1) ist implementiert; `--no-cache` umgeht ihn.
+- `new`/`init` create `main.py`, `pyproject.toml` and `.gitignore`;
+  existing non-empty files are not overwritten without `--force`.
+- `test` runs `test_*.py`/`*_test.py` with `pyx run`; success = exit 0
+  (no pytest assertions). `--json` returns a result list.
+- `fmt` normalizes trailing whitespace and exactly one final newline
+  (no AST formatter); `--check` does not write. `lint` type-checks all
+  `.py` files; `--json` aggregates diagnostics.
+- `clean` removes `.pyx/cache` and `target/pyx-tmp` (`--dry-run`).
+- `gc` compiles and starts a program like `run` and prints the
+  GC statistics afterwards (`--json` for a machine-readable last line).
+- `add`/`remove`/`sync`/`lock` are a **passthrough** to `uv`
+  (`PYX_UV` overrides the executable). PyX interprets neither specs nor
+  `pyproject.toml`; the uv exit status is returned.
+- The build cache (§4.1) is implemented; `--no-cache` bypasses it.
 
-`uv` bleibt zunächst externe Abhängigkeit: PyX nutzt uv für Resolution,
-Lockfiles und Venvs, injiziert aber **noch nicht** den PyX-Interpreter
-(`.python-version`, Venv-Marker, `sys.executable`-Äquivalent). Ein eigener
-Fork ist nur bei einem architektonischen Blocker vorgesehen. Eigene Dateien:
-`pyproject.toml` (kompatibel), `pyx.lock` (optional zusätzlich), Build-Cache
-unter `.pyx/cache/`.
+`uv` remains an external dependency for now: PyX uses uv for resolution,
+lockfiles and venvs, but does **not yet** inject the PyX interpreter
+(`.python-version`, venv markers, `sys.executable` equivalent). A dedicated
+fork is intended only in case of an architectural blocker. Own files:
+`pyproject.toml` (compatible), `pyx.lock` (optionally additional), build cache
+under `.pyx/cache/`.
 
-## 9. C-API-/ABI-Strategie (Phase 4)
+## 9. C API/ABI Strategy (Phase 4)
 
-Optionen: (a) CPython einbetten (`libpython`, gleiche ABI), (b) C-API-Shim auf
-PyX-Objekten (ABI3/limited API), (c) explizit begrenzte Kompatibilität.
+Options: (a) embed CPython (`libpython`, same ABI), (b) C API shim on
+PyX objects (ABI3/limited API), (c) explicitly limited compatibility.
 
-**Status: P4-04 ist blockiert.** Die Umgebungsprobe (2026-10-24) fand
-`python3` 3.12.3, aber kein `python3-config`, kein `Python.h` und keine
-linkbare `libpython3.12.so`/`.a` (nur die Laufzeit-SO
-`libpython3.12.so.1.0`). Ohne Entwicklungs-Header lässt sich weder ein
-Embedding- noch ein ABI3-Smoke-Test bauen. Details, Optionen und der
-Spike-Plan stehen in [`C_API.md`](C_API.md); es gibt **keine** erfundenen
-Messungen und keine getroffene Entscheidung. Der Spike entscheidet über
-Objektmodell, Refcounting und BigInt/Descriptor-Design, bevor diese
-eingefroren werden.
+**Status: P4-04 is blocked.** The environment probe (2026-10-24) found
+`python3` 3.12.3, but no `python3-config`, no `Python.h` and no
+linkable `libpython3.12.so`/`.a` (only the runtime SO
+`libpython3.12.so.1.0`). Without development headers, neither an
+embedding nor an ABI3 smoke test can be built. Details, options and the
+spike plan are in [`C_API.md`](C_API.md); there are **no** invented
+measurements and no decision has been made. The spike decides on the
+object model, refcounting and BigInt/descriptor design before these are
+frozen.
 
-## 10. Verifikation und dokumentierte Grenzen
+## 10. Verification and Documented Limits
 
-- `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), Build,
-  `cargo test --workspace`, E2E-Beispiele (JIT **und** AOT), Negative-Tests
-  (Diagnosen/Tracebacks), GC-Threshold/Stress.
-- Stand 2026-10-24: **721 Tests** (233 Frontend, 329 Runtime inkl. 169
-  ABI-Integrationstests, 11 Codegen, 3 IR, 145 CLI/E2E). Die E2E-Abdeckung
-  enthält u. a. Formatierung, Klassen, Closures, Generatoren/async,
-  User-Module, `argparse`/`defaultdict`/`re`, Socket-Echo, Pathlib,
-  Build-Cache und uv-Passthrough.
-- E2E vergleicht stdout/Exit-Code von `pyx run` und AOT-Binary; negative Tests
-  prüfen Diagnosen und Tracebacks (stderr, Exit-Code).
-- Keine stillen Fehlcompile: nicht unterstützte Syntax → Diagnose.
+- `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
+  `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
+  (diagnostics/tracebacks), GC threshold/stress.
+- As of 2026-10-24: **771 tests** (244 frontend, 353 runtime incl. 173
+  ABI integration tests, 17 codegen, 3 IR, 154 CLI/E2E). E2E coverage
+  includes, among others, formatting, classes, closures, lazy generators/coroutines
+  (`fibers.rs`), user modules, `argparse`/`defaultdict`/`re`, socket echo,
+  pathlib, build cache, `pyx gc` and uv passthrough.
+- New unit tests cover the dict hash index, the GC statistics and
+  fiber iteration; `examples/generators_async.py` runs under JIT and AOT.
+- E2E compares stdout/exit code of `pyx run` and the AOT binary; negative tests
+  check diagnostics and tracebacks (stderr, exit code).
+- No silent miscompilation: unsupported syntax → diagnostic.
 
-**Grenzen (bewusst, dokumentiert):**
+**Limits (deliberate, documented):**
 
-- **Sprache:** kein BigInt (i64), keine Decorators, Pattern Matching,
-  Metaclasses, Descriptor-/`__dunder__`-Protokolle, `except*`,
-  Exception-Chaining, `bytearray`/`memoryview`; kein Slice-Assignment; keine
-  Klassen-Attribute/Multiple Inheritance; Klassen-Namespace unveränderlich.
-- **Closures:** by value zum Definitionszeitpunkt; rekursive verschachtelte
-  Funktionen und Closures in Lambdas sind Diagnosen. Kein Zell-/Mutable-
-  Capture.
-- **Generatoren/async:** eager (Liste) bzw. sequenziell ohne Coroutinen,
-  Tasks oder Event-Loop; `yield from`/`yield`-Ausdrücke/`return value` im
-  Generator und echte `asyncio`-APIs fehlen.
-- **Module:** nur native Module und Geschwister-`.py`-Dateien; keine Pakete,
-  Punkte/relativen Imports, Top-Level-Seiteneffekte in importierten Modulen,
-  keine Runtime-Modulobjekte/`sys.modules`.
-- **Stdlib:** kuratierte Teilmenge (siehe §3.3); `re` nutzt die Rust-
-  `regex`-Syntax, `socket` nur blockierendes TCP, `argparse` ohne
-  `SystemExit`, `random` nicht CPython-reproduzierbar.
-- **GC:** konservativ, keine präzisen Roots/Stack-Maps, kein
-  Größenklassen-Allokator; STW-Root-Fenster. P2-05/06/07 offen.
-- **Concurrency:** kein GIL; ungeschützte Mutationen geteilter Container sind
-  Datenraces. Funktionsregistry für spawn/Pool nur nach Name/Arity
-  (Duplikate/Lambdas/native Targets abgelehnt); Queue-`maxsize` geht im
-  Spawn-Payload verloren.
-- **Datei-I/O:** UTF-8-Text und Bytes, kein `+`-Modus, `newline`/`errors`
-  ignoriert; CSV vollständig im Speicher.
-- **Plattform:** Linux x86_64 ist das verifizierte Ziel; aarch64-Pfade sind
-  vorhanden, aber nicht CI-verifiziert. macOS/Windows und Cross-Compilation
-  fehlen. C-API/C-Extensions sind blockiert (P4-04).
+- **Language:** no BigInt (i64), no decorators, pattern matching,
+  metaclasses, descriptor/`__dunder__` protocols, `except*`,
+  exception chaining, `bytearray`/`memoryview`; no slice assignment; no
+  class attributes/multiple inheritance; class namespace immutable.
+- **Closures:** by value at definition time; recursive nested
+  functions and closures in lambdas are diagnostics. No cell/mutable
+  capture.
+- **Generators/async:** real lazy generators (stackful fibers) and
+  coroutines with a cooperative event loop. Open: `send`/`throw`/`close`,
+  `yield` expressions, `yield from`, async generators, async comprehensions
+  and `asyncio` beyond `run`/`sleep`/`gather`; generator expressions
+  remain eagerly materialized, `async for`/`async with` use the synchronous
+  protocol.
+- **Performance:** native module dispatch (math_loop ~0.8x) is the
+  remaining open weak spot. The x86_64 fiber switch is register-only
+  (two switches per yield, no syscalls); a 100k generator sum
+  reaches release AOT 6.8 ms / JIT 7.7 ms versus CPython 11.0 ms
+  (`strace -c`: 94 syscalls total).
+- **Modules:** only native modules and sibling `.py` files; no packages,
+  dots/relative imports, top-level side effects in imported modules,
+  no runtime module objects/`sys.modules`.
+- **Stdlib:** curated subset (see §3.3); `re` uses the Rust
+  `regex` syntax, `socket` only blocking TCP, `argparse` without
+  `SystemExit`, `random` not CPython-reproducible.
+- **GC:** conservative, no precise roots/stack maps, no
+  size-class allocator; STW root window. P2-05/06/07 open.
+- **Concurrency:** no GIL; unprotected mutations of shared containers are
+  data races. Function registry for spawn/Pool only by name/arity
+  (duplicates/lambdas/native targets rejected); queue `maxsize` is lost in the
+  spawn payload.
+- **File I/O:** UTF-8 text and bytes, no `+` mode, `newline`/`errors`
+  ignored; CSV entirely in memory.
+- **Platform:** Linux x86_64 is the verified target; the x86_64 register
+  switch is measured here, the `ucontext` fallback for aarch64/other targets
+  exists but is not verified on this machine. macOS/Windows and
+  cross-compilation are missing. C API/C extensions are blocked (P4-04).

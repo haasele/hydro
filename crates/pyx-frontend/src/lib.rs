@@ -536,6 +536,8 @@ fn placeholder_function(function: &pyx_ir::Function) -> HFunction {
         ret_ty: Ty::Concrete(function.ret_ty),
         locals: Vec::new(),
         body: Vec::new(),
+        is_async: function.is_async,
+        is_generator: function.is_generator,
         is_module: true,
         line: 1,
         col: 1,

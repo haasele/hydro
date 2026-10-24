@@ -1,130 +1,130 @@
-# PyX — C-API-/ABI-Strategie (P4-04-Spike)
+# PyX — C API/ABI Strategy (P4-04 Spike)
 
-Stand: 2026-10-24. Dieses Dokument ist die **Entscheidungsgrundlage** für
-P4-04 und die nachfolgenden Punkte P4-05/P4-06. Es enthält bewusst **keine
-Messwerte**: Der Spike ist in dieser Umgebung blockiert (siehe unten), und
-erfundene Laufzeiten/Erfolgsquoten wären keine Grundlage.
+As of: 2026-10-24. This document is the **decision basis** for
+P4-04 and the subsequent items P4-05/P4-06. It deliberately contains **no
+measurements**: the spike is blocked in this environment (see below), and
+invented runtimes/success rates would not be a basis.
 
-## 1. Frage
+## 1. Question
 
-Sollen CPython-C-Extensions (NumPy, `pydantic-core`, …) unter PyX laufen, und
-wenn ja, über welchen Weg? Die Antwort bestimmt, ob PyX-Objekte langfristig
-ein CPython-kompatibles Layout brauchen oder ob eine Übersetzungsschicht
-genügt. Sie berührt Objektmodell, GC, Refcounting und die ABI-Stabilität.
+Should CPython C extensions (NumPy, `pydantic-core`, …) run under PyX, and
+if so, via which path? The answer determines whether PyX objects need a
+CPython-compatible layout in the long term or whether a translation layer
+suffices. It affects the object model, GC, refcounting, and ABI stability.
 
-## 2. Optionen
+## 2. Options
 
-### A — CPython einbetten (`libpython`)
+### A — Embed CPython (`libpython`)
 
-PyX lädt eine CPython-Bibliothek und führt C-Extensions in einer echten
-CPython-Interpreter-Instanz aus. PyX-Werte werden an der Grenze konvertiert
-(oder die Extension arbeitet nur mit CPython-Objekten, die PyX kapselt).
+PyX loads a CPython library and runs C extensions in a real
+CPython interpreter instance. PyX values are converted at the boundary
+(or the extension works only with CPython objects that PyX wraps).
 
-- **Vorteile:** volle C-API/ABI-Kompatibilität, `abi3`-Extensions laufen ohne
-  PyX-eigene Nachbauten; NumPy-Smoke-Test ist realistisch.
-- **Kosten:** CPython wird zur Laufzeitabhängigkeit (widerspricht D2 nur für
-  den Kompatibilitätsmodus, nicht für den Standardpfad); zwei Objektmodelle und
-  zwei GCs müssen koexistieren; Konvertierung/Refcounting an jeder Grenze;
-  Distributions-/Lizenzfragen; `libpython` muss zum PyX-Build passen.
-- **Voraussetzungen:** `Python.h`, `python3-config` bzw. `pkg-config python3`,
-  eine linkbare `libpython3.x` (shared oder static) und ein passender
-  Include-/Library-Pfad.
+- **Advantages:** full C API/ABI compatibility, `abi3` extensions run without
+  PyX-specific reimplementations; a NumPy smoke test is realistic.
+- **Costs:** CPython becomes a runtime dependency (contradicts D2 only for
+  the compatibility mode, not for the standard path); two object models and
+  two GCs must coexist; conversion/refcounting at every boundary;
+  distribution/licensing questions; `libpython` must match the PyX build.
+- **Prerequisites:** `Python.h`, `python3-config` or `pkg-config python3`,
+  a linkable `libpython3.x` (shared or static), and a matching
+  include/library path.
 
-### B — ABI3-Shim auf PyX-Objekten
+### B — ABI3 shim on PyX objects
 
-PyX implementiert die CPython-C-API (mindestens den `Py_LIMITED_API`/
-`abi3`-Umfang) selbst über seinen eigenen Objekten. Extensions werden gegen
-diesen Shim gelinkt.
+PyX implements the CPython C API (at least the `Py_LIMITED_API`/
+`abi3` scope) itself on top of its own objects. Extensions are linked against
+this shim.
 
-- **Vorteile:** CPython bleibt nicht Laufzeitabhängigkeit; ein Prozess, ein
-  GC; theoretisch schlanker als eine zweite VM.
-- **Kosten:** sehr hoch. `PyObject`/`PyTypeObject`-Layouts, Refcounting,
-  `PyArg_ParseTuple`, Buffer-Protokoll, Module-Init (`PyModuleDef`), GIL-
-  Erwartungen und `abi3`-Symbole müssen exakt passen. Der Shim muss zudem
-  Refcounts mit dem konservativen Mark-&-Sweep-GC koordinieren; ein
-  nachträglicher Einbau in das getaggte `i64`-Wertmodell ist ein Bruch der
-  ABI-Invarianten (Heap-Zeiger sind keine `PyObject*`).
-- **Voraussetzungen:** dieselben Header für die Kompilierung der Extensions
-  sowie eine eigene, testbare Shim-Bibliothek; ein `abi3`-Symbolabgleich ist
-  ohne Header/Toolchain nicht möglich.
+- **Advantages:** CPython does not remain a runtime dependency; one process, one
+  GC; theoretically leaner than a second VM.
+- **Costs:** very high. `PyObject`/`PyTypeObject` layouts, refcounting,
+  `PyArg_ParseTuple`, buffer protocol, module init (`PyModuleDef`), GIL
+  expectations, and `abi3` symbols must match exactly. The shim must also
+  coordinate refcounts with the conservative mark-and-sweep GC; retrofitting
+  it into the tagged `i64` value model is a breach of the ABI invariants
+  (heap pointers are not `PyObject*`).
+- **Prerequisites:** the same headers for compiling the extensions
+  as well as a separate, testable shim library; an `abi3` symbol comparison is
+  not possible without headers/toolchain.
 
-### C — Begrenzte Kompatibilität (keine C-Extensions)
+### C — Limited compatibility (no C extensions)
 
-PyX unterstützt nur pure-Python-Pakete und eine kuratierte native Stdlib.
-`ctypes`/`cffi` werden nicht als CPython-ABI-Brücke angeboten.
+PyX supports only pure-Python packages and a curated native stdlib.
+`ctypes`/`cffi` are not offered as a CPython ABI bridge.
 
-- **Vorteile:** kein Objektmodell-Risiko, keine zweite VM, klare Grenzen.
-- **Kosten:** kein NumPy/Pydantic/FastAPI-Ökosystem; FastAPI-Benchmark bleibt
-  blockiert. Für viele Skripte ausreichend, für „Bun für Python“ zu wenig.
+- **Advantages:** no object model risk, no second VM, clear boundaries.
+- **Costs:** no NumPy/Pydantic/FastAPI ecosystem; the FastAPI benchmark stays
+  blocked. Sufficient for many scripts, too little for "Bun for Python".
 
-**Empfehlung (vorläufig):** Option A als Kompatibilitätsmodus prototypisieren,
-Option B nur falls Messungen zeigen, dass der Einbettungs-Overhead oder die
-Distribution untragbar ist. Option C ist der Fallback, falls P4-04 dauerhaft
-nicht finanzierbar ist. Diese Empfehlung ist **keine** Entscheidung; sie wird
-erst nach dem Spike in `docs/ARCHITECTURE.md` §9 festgehalten.
+**Recommendation (provisional):** prototype option A as a compatibility mode,
+option B only if measurements show that the embedding overhead or
+distribution is untenable. Option C is the fallback if P4-04 is permanently
+unfundable. This recommendation is **not** a decision; it will be recorded
+only after the spike in `docs/ARCHITECTURE.md` §9.
 
-## 3. Umgebungsprobe (2026-10-24, Linux x86_64)
+## 3. Environment probe (2026-10-24, Linux x86_64)
 
-Ausgeführt im Repository, ohne Installation von Paketen:
+Executed in the repository, without installing packages:
 
-| Prüfung | Ergebnis |
+| Check | Result |
 |---|---|
 | `python3 -V` | `Python 3.12.3` |
-| `command -v python3-config` | nicht vorhanden (auch kein `python3.12-config`) |
-| `pkg-config --exists python3` | negativ; kein `python3.pc` |
+| `command -v python3-config` | not present (also no `python3.12-config`) |
+| `pkg-config --exists python3` | negative; no `python3.pc` |
 | `sysconfig.get_paths()["include"]` | `/usr/include/python3.12` |
-| `ls /usr/include/python3.12/Python.h` | **fehlt** (das Verzeichnis enthält fremde Header, u. a. `Imaging.h`) |
+| `ls /usr/include/python3.12/Python.h` | **missing** (the directory contains unrelated headers, e.g. `Imaging.h`) |
 | `LIBRARY`/`INSTSONAME` | `libpython3.12.a` / `libpython3.12.so.1.0` |
-| `ls libpython3.12.{so,a}` | beide **fehlen**; nur `libpython3.12.so.1.0` (Laufzeit-SO) ist vorhanden |
-| `cc`/`gcc` | vorhanden (`/usr/bin/cc`, `/usr/bin/gcc`) |
+| `ls libpython3.12.{so,a}` | both **missing**; only `libpython3.12.so.1.0` (runtime SO) is present |
+| `cc`/`gcc` | present (`/usr/bin/cc`, `/usr/bin/gcc`) |
 
-Ergebnis: Zwar ist ein CPython-3.12-Interpreter samt Laufzeit-SO installiert,
-aber **kein Entwicklungs-Paket**. Ohne `Python.h`, `python3-config` und eine
-linkbare `libpython3.12.so`/`.a` lässt sich weder ein Embedding-Smoke-Test noch
-ein `abi3`-Shim kompilieren. Die vorhandene Runtime-SO reicht nicht, weil der
-Linker den unversionierten SONAME-Eintrag (`libpython3.12.so`) erwartet.
+Result: Although a CPython 3.12 interpreter including the runtime SO is
+installed, there is **no development package**. Without `Python.h`,
+`python3-config`, and a linkable `libpython3.12.so`/`.a`, neither an
+embedding smoke test nor an `abi3` shim can be compiled. The existing
+runtime SO is not sufficient because the linker expects the unversioned
+SONAME entry (`libpython3.12.so`).
 
-**Status P4-04: `[!]` blockiert.** Der Blocker ist die Umgebung, nicht eine
-architektonische Unentscheidbarkeit. Sobald ein CPython-Entwicklungspaket
-(`python3-dev`/`python3.12-dev` oder ein äquivalentes Sysroot) bereitsteht,
-sind die folgenden Schritte ausführbar.
+**Status P4-04: `[!]` blocked.** The blocker is the environment, not an
+architectural indecision. As soon as a CPython development package
+(`python3-dev`/`python3.12-dev` or an equivalent sysroot) is available,
+the following steps become executable.
 
-## 4. Spike-Plan (sobald die Umgebung steht)
+## 4. Spike plan (once the environment is in place)
 
-1. **Embedding-Smoke (Option A):** minimales C-Programm, das
-   `Py_Initialize`, `PyRun_SimpleString("print(1)")` und `Py_Finalize` nutzt,
-   gegen `libpython` linkt und in einem PyX-JIT-Prozess läuft. Erfolgskriterium:
-   Exit 0, keine Symbol-/Linkerfehler.
-2. **`abi3`-Smoke:** ein C-Modul mit `#define Py_LIMITED_API 0x030C0000`,
-   `PyModuleDef` und einer trivialen Funktion; Import aus CPython und aus dem
-   Embedding-Kontext. Erfolgskriterium: Import + Aufruf.
-3. **NumPy-Smoke (nur wenn 1–2 grün):** `import numpy` im Embedding-Kontext,
-   eine kleine Array-Operation; protokolliert Importzeit, RSS und
-   Konvertierungsaufwand an der PyX↔CPython-Grenze.
-4. **Shim-Aufwand (Option B):** Symbol-/Header-Abgleich gegen den
-   `abi3`-Umfang; Liste der benötigten Typen/Funktionen und ein
-   Refcount-Konzept für den getaggten Heap. Kein Code, bevor 1–3 vermessen
-   sind.
-5. **Entscheidung:** Ergebnis, Messwerte und gewählte Option in
-   `docs/ARCHITECTURE.md` §9 und `docs/TODO.md` (P4-04/P4-05) eintragen.
+1. **Embedding smoke (option A):** a minimal C program that uses
+   `Py_Initialize`, `PyRun_SimpleString("print(1)")`, and `Py_Finalize`,
+   links against `libpython`, and runs in a PyX JIT process. Success criterion:
+   exit 0, no symbol/linker errors.
+2. **`abi3` smoke:** a C module with `#define Py_LIMITED_API 0x030C0000`,
+   `PyModuleDef`, and a trivial function; import from CPython and from the
+   embedding context. Success criterion: import + call.
+3. **NumPy smoke (only if 1–2 are green):** `import numpy` in the embedding
+   context, a small array operation; logs import time, RSS, and
+   conversion effort at the PyX↔CPython boundary.
+4. **Shim effort (option B):** symbol/header comparison against the
+   `abi3` scope; list of required types/functions and a
+   refcount concept for the tagged heap. No code before 1–3 are measured.
+5. **Decision:** enter the result, measurements, and chosen option in
+   `docs/ARCHITECTURE.md` §9 and `docs/TODO.md` (P4-04/P4-05).
 
-## 5. Auswirkungen auf andere offene Punkte
+## 5. Effects on other open items
 
-- **P4-05 (Extension Loading):** hängt vollständig an der Option; ohne
-  Entscheidung kein `.so`-Loader.
-- **P4-06 (`ctypes`/`cffi`):** Option C würde die Grenzen explizit
-  dokumentieren; Option A könnte `ctypes` über CPython mitliefern.
-- **P4-07 (Serialisierung/Numerik):** unabhängig; `pickle` bleibt das eigene,
-  nicht CPython-kompatible PYX1-Format, bis eine Kompatibilitätsschicht
-  beschlossen ist.
-- **Objektmodell/GC:** Option B würde Refcounting erzwingen; Option A erlaubt
-  den bestehenden konservativen GC im PyX-Pfad und CPython-Refcounting nur im
-  Kompatibilitätsmodus.
+- **P4-05 (Extension Loading):** depends entirely on the option; without a
+  decision, no `.so` loader.
+- **P4-06 (`ctypes`/`cffi`):** option C would document the boundaries
+  explicitly; option A could ship `ctypes` via CPython.
+- **P4-07 (Serialization/Numerics):** independent; `pickle` remains the own,
+  non-CPython-compatible PYX1 format until a compatibility layer
+  is decided.
+- **Object model/GC:** option B would force refcounting; option A allows
+  the existing conservative GC in the PyX path and CPython refcounting only in
+  compatibility mode.
 
-## 6. Was dieses Dokument nicht behauptet
+## 6. What this document does not claim
 
-- Keine Aussage, dass eine der Optionen bereits funktioniert.
-- Keine Laufzeit-, Speicher- oder Kompatibilitätsmessungen.
-- Keine Zusage, dass NumPy/FastAPI jemals unterstützt werden.
-- Keine Änderung an `Cargo.toml`/CI; der Spike bleibt ein isolierter
-  Prototyp, bis P4-04 entschieden ist.
+- No statement that any of the options already works.
+- No runtime, memory, or compatibility measurements.
+- No promise that NumPy/FastAPI will ever be supported.
+- No change to `Cargo.toml`/CI; the spike remains an isolated
+  prototype until P4-04 is decided.

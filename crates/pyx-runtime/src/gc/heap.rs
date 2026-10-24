@@ -116,9 +116,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::exc;
 use crate::value::{FunctionBody, ObjData, PyxObj, TAG_HEAP, TAG_MASK};
@@ -133,6 +133,89 @@ use self::alloc::ObjectPool;
 
 /// Default collection threshold (ARCHITECTURE §7).
 const DEFAULT_THRESHOLD: usize = 10_000;
+
+/// Point-in-time snapshot of the collector's cumulative statistics.
+///
+/// Counters are process-wide and cover both the local (single-threaded) and
+/// the shared collection path. Durations are microseconds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GcStats {
+    /// Completed collections since the last [`reset_gc_stats`].
+    pub collections: u64,
+    /// Sum of the stop-the-world pauses of those collections.
+    pub pause_total_us: u64,
+    /// Longest single stop-the-world pause.
+    pub pause_max_us: u64,
+    /// Sum of the marking phases.
+    pub mark_total_us: u64,
+    /// Sum of the sweeping phases.
+    pub sweep_total_us: u64,
+    /// Objects freed by those collections.
+    pub freed_total: u64,
+    /// Objects registered at snapshot time.
+    pub live_objects: u64,
+    /// Effective `PYX_GC_THRESHOLD` (or the built-in default).
+    pub threshold: u64,
+    /// Whether `PYX_GC_STRESS=1` is active.
+    pub stress: bool,
+}
+
+// Relaxed counters: they only feed a diagnostic snapshot and never
+// synchronise heap state, so a torn cross-thread view is acceptable and
+// cheap. Increments happen exactly once per completed collection.
+static STAT_COLLECTIONS: AtomicU64 = AtomicU64::new(0);
+static STAT_PAUSE_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static STAT_PAUSE_MAX_US: AtomicU64 = AtomicU64::new(0);
+static STAT_MARK_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static STAT_SWEEP_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static STAT_FREED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Saturating conversion of a measured phase into whole microseconds.
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Records one completed collection. `pause` is the stop-the-world time
+/// (local mode: the whole collection), `mark`/`sweep` are the phase times.
+fn record_collection(pause: Duration, mark: Duration, sweep: Duration, freed: usize) {
+    let pause_us = micros(pause);
+    STAT_COLLECTIONS.fetch_add(1, Ordering::Relaxed);
+    STAT_PAUSE_TOTAL_US.fetch_add(pause_us, Ordering::Relaxed);
+    STAT_PAUSE_MAX_US.fetch_max(pause_us, Ordering::Relaxed);
+    STAT_MARK_TOTAL_US.fetch_add(micros(mark), Ordering::Relaxed);
+    STAT_SWEEP_TOTAL_US.fetch_add(micros(sweep), Ordering::Relaxed);
+    STAT_FREED_TOTAL.fetch_add(u64::try_from(freed).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// Returns a snapshot of the collector statistics.
+///
+/// `live_objects` is read under the heap lock (shared mode) or from the
+/// thread-local registry, exactly like `objects()`. `threshold` and `stress`
+/// reflect the environment configuration in effect at snapshot time.
+pub fn gc_stats() -> GcStats {
+    let (threshold, stress) = read_config();
+    GcStats {
+        collections: STAT_COLLECTIONS.load(Ordering::Relaxed),
+        pause_total_us: STAT_PAUSE_TOTAL_US.load(Ordering::Relaxed),
+        pause_max_us: STAT_PAUSE_MAX_US.load(Ordering::Relaxed),
+        mark_total_us: STAT_MARK_TOTAL_US.load(Ordering::Relaxed),
+        sweep_total_us: STAT_SWEEP_TOTAL_US.load(Ordering::Relaxed),
+        freed_total: STAT_FREED_TOTAL.load(Ordering::Relaxed),
+        live_objects: objects() as u64,
+        threshold: threshold as u64,
+        stress,
+    }
+}
+
+/// Clears the cumulative counters without touching the heap itself.
+pub fn reset_gc_stats() {
+    STAT_COLLECTIONS.store(0, Ordering::Relaxed);
+    STAT_PAUSE_TOTAL_US.store(0, Ordering::Relaxed);
+    STAT_PAUSE_MAX_US.store(0, Ordering::Relaxed);
+    STAT_MARK_TOTAL_US.store(0, Ordering::Relaxed);
+    STAT_SWEEP_TOTAL_US.store(0, Ordering::Relaxed);
+    STAT_FREED_TOTAL.store(0, Ordering::Relaxed);
+}
 
 struct HeapState {
     /// Every live heap object, in allocation order.
@@ -470,8 +553,17 @@ const REG_WORDS: usize = 16;
 ///   the thread exits.
 pub(crate) struct ThreadGc {
     id: i64,
+    /// Unique OS-thread token used to associate suspended fiber root ranges.
+    token: u64,
     stack_low: AtomicUsize,
     stack_high: AtomicUsize,
+    /// Native caller range registered by the outermost fiber resume, plus
+    /// the resumed fiber's `caller_ctx` range; scanned as additional roots
+    /// while the fiber runs.
+    aux_low: AtomicUsize,
+    aux_high: AtomicUsize,
+    aux2_low: AtomicUsize,
+    aux2_high: AtomicUsize,
     parked: AtomicBool,
     exited: AtomicBool,
     saved_sp: AtomicUsize,
@@ -502,6 +594,56 @@ thread_local! {
     /// Registration of the calling thread; `None` outside the runtime (and in
     /// local-heap mode before `pyx_runtime_init` registered the main thread).
     static GC_SELF: RefCell<Option<Arc<ThreadGc>>> = const { RefCell::new(None) };
+    /// Stack-bound overrides pushed while a fiber runs. The bottom entry is
+    /// the native stack (or `(0, 0)` when it cannot be determined).
+    static STACK_BOUNDS_OVERRIDE: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+    /// Additional root ranges of the outermost fiber resume on this thread:
+    /// the native caller stack and the resumed fiber's `caller_ctx`. A
+    /// `(0, 0)` entry is unused.
+    static AUX_STACK: Cell<[(usize, usize); 2]> = const { Cell::new([(0, 0); 2]) };
+}
+
+/// Conservative root ranges of live fiber objects, keyed by the owning
+/// thread.
+///
+/// Every fiber registers its private stack and its two register contexts
+/// once, at creation, and removes them in `Drop`. Scanning a running fiber's
+/// stack is conservative but safe, so a resume performs no registry work.
+/// Registrations live outside the `ThreadGc` record because a fiber object
+/// may be collected by another thread.
+///
+/// In shared mode the ranges are scanned from the stop-the-world snapshot of
+/// their owner; in local mode the owner scans them itself. A fiber is assumed
+/// to stay on the thread that created it (the runtime's fiber contract).
+static SUSPENDED_STACKS: LazyLock<Mutex<Vec<(u64, usize, usize)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Source of the per-thread tokens that own suspended fiber root ranges.
+///
+/// Unlike [`current_thread_id`] (a Python-visible identity that every
+/// never-spawned thread claims as `1`, which makes parallel unit tests
+/// indistinguishable), a token is unique for the lifetime of the OS thread.
+static NEXT_GC_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static GC_TOKEN: Cell<u64> = const { Cell::new(0) };
+}
+
+fn current_gc_token() -> u64 {
+    GC_TOKEN.with(|token| {
+        let mut value = token.get();
+        if value == 0 {
+            value = NEXT_GC_TOKEN.fetch_add(1, Ordering::Relaxed);
+            token.set(value);
+        }
+        value
+    })
+}
+
+fn lock_suspended_stacks() -> MutexGuard<'static, Vec<(u64, usize, usize)>> {
+    SUSPENDED_STACKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Locks the thread registry, ignoring poisoning: a panic in user code must
@@ -778,6 +920,16 @@ pub(crate) fn enable_shared() {
         local.addresses.shrink_to_fit();
     });
     SHARED.store(true, Ordering::Release);
+    // `_thread` may be started from inside a fiber. The bound/aux mirroring
+    // was a no-op while the heap was local; publish the current state now so
+    // a shared safepoint can validate this thread's saved context.
+    if let Some((low, high)) = stack_bounds() {
+        update_thread_bounds(low, high);
+    }
+    let aux = AUX_STACK.with(Cell::get);
+    if aux != [(0, 0); 2] {
+        set_aux_stack(aux[0].0, aux[0].1, aux[1].0, aux[1].1);
+    }
 }
 
 /// Frees every registered object and clears the registry. Called by
@@ -806,6 +958,13 @@ pub(crate) fn reset() {
     MARKING.store(false, Ordering::SeqCst);
     clear_worklist();
     clear_local_worklist();
+    // No fiber is running or suspended across a runtime reset; this thread's
+    // conservative root ranges of the previous run are stale. Ranges of other
+    // threads (parallel unit tests) are left untouched.
+    let token = current_gc_token();
+    lock_suspended_stacks().retain(|&(owner, _, _)| owner != token);
+    STACK_BOUNDS_OVERRIDE.with(|bounds| bounds.borrow_mut().clear());
+    AUX_STACK.with(|slot| slot.set([(0, 0); 2]));
     ACTIVE_THREADS.store(1, Ordering::Release);
     THREAD_ID.with(|id| id.set(1));
     // Drop stale registrations from a previous run and register the main
@@ -841,6 +1000,8 @@ struct RootSnapshot {
     regs: [usize; REG_WORDS],
     pending: i64,
     roots: Vec<i64>,
+    /// Conservative root ranges of suspended fibers owned by this thread.
+    suspended: Vec<(usize, usize)>,
 }
 
 /// True when every registered thread other than the caller is parked or has
@@ -873,6 +1034,9 @@ fn all_threads_registered(registry: &HashMap<i64, Arc<ThreadGc>>) -> bool {
 /// freeing possibly reachable objects.
 fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnapshot>> {
     let self_id = current_thread_id();
+    // The world is stopped for the snapshot, so the global registry is
+    // stable while it is copied.
+    let all_suspended: Vec<(u64, usize, usize)> = lock_suspended_stacks().clone();
     let mut snapshots = Vec::with_capacity(registry.len());
     for (&id, gc) in registry.iter() {
         let pending = gc.pending.load(Ordering::Acquire);
@@ -884,15 +1048,37 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let mut suspended: Vec<(usize, usize)> = all_suspended
+            .iter()
+            .filter(|&&(owner, _, _)| owner == gc.token)
+            .map(|&(_, low, high)| (low, high))
+            .collect();
+        let aux = [
+            (
+                gc.aux_low.load(Ordering::Acquire),
+                gc.aux_high.load(Ordering::Acquire),
+            ),
+            (
+                gc.aux2_low.load(Ordering::Acquire),
+                gc.aux2_high.load(Ordering::Acquire),
+            ),
+        ];
+        for (low, high) in aux {
+            if high > low {
+                suspended.push((low, high));
+            }
+        }
         if id == self_id {
             // The caller's live stack/registers are scanned directly; only
-            // its pending mirror and roots contribute separately.
+            // its pending mirror, roots and suspended fiber ranges contribute
+            // separately.
             snapshots.push(RootSnapshot {
                 sp: 0,
                 high: 0,
                 regs: [0; REG_WORDS],
                 pending,
                 roots,
+                suspended,
             });
             continue;
         }
@@ -915,6 +1101,7 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
             regs,
             pending,
             roots,
+            suspended,
         });
     }
     Some(snapshots)
@@ -949,6 +1136,11 @@ fn mark_roots(
         }
         for &register in &thread.regs {
             mark_word(register, addresses);
+        }
+        for &(low, high) in &thread.suspended {
+            if high > low {
+                scan_stack(low, high, addresses);
+            }
         }
     }
 }
@@ -1158,13 +1350,16 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     clear_worklist();
     drop(_collector);
 
+    let sweep_time = sweep_start.elapsed();
+    record_collection(pause, mark_time, sweep_time, freed);
+
     if stats {
         eprintln!(
             "pyx-gc: pause_ms={:.3} mark_ms={:.3} sweep_ms={:.3} freed={} \
              slabs={} capacity={} live={} reused={}",
             pause.as_secs_f64() * 1000.0,
             mark_time.as_secs_f64() * 1000.0,
-            sweep_start.elapsed().as_secs_f64() * 1000.0,
+            sweep_time.as_secs_f64() * 1000.0,
             freed,
             pool_stats.slabs,
             pool_stats.capacity,
@@ -1216,8 +1411,13 @@ fn register_current_thread(id: i64, roots: Vec<i64>) {
     let (low, high) = stack_bounds().unwrap_or((0, 0));
     let gc = Arc::new(ThreadGc {
         id,
+        token: current_gc_token(),
         stack_low: AtomicUsize::new(low),
         stack_high: AtomicUsize::new(high),
+        aux_low: AtomicUsize::new(0),
+        aux_high: AtomicUsize::new(0),
+        aux2_low: AtomicUsize::new(0),
+        aux2_high: AtomicUsize::new(0),
         parked: AtomicBool::new(false),
         exited: AtomicBool::new(false),
         saved_sp: AtomicUsize::new(0),
@@ -1294,6 +1494,14 @@ pub(crate) fn after_fork_child() {
     MARKING.store(false, Ordering::SeqCst);
     clear_worklist();
     clear_local_worklist();
+    // The child has exactly one thread, so every inherited fiber range now
+    // belongs to it; re-tagging keeps roots of fibers created on vanished
+    // threads scannable.
+    let token = current_gc_token();
+    for entry in lock_suspended_stacks().iter_mut() {
+        entry.0 = token;
+    }
+    AUX_STACK.with(|slot| slot.set([(0, 0); 2]));
     reset_colors();
     GC_REQUESTED.store(false, Ordering::SeqCst);
     PARKED.store(0, Ordering::SeqCst);
@@ -1351,7 +1559,9 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
         return 0;
     }
 
+    let started = Instant::now();
     clear_local_worklist();
+    let mark_start = Instant::now();
     {
         let addresses = &heap.addresses;
 
@@ -1363,12 +1573,20 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
 
         scan_stack(sp, stack_high, addresses);
         mark_captured_registers(addresses);
+        scan_aux_stack(addresses);
+        scan_suspended_stacks(addresses);
     }
     drain_worklist();
+    let mark_time = mark_start.elapsed();
 
     // ---- sweep -----------------------------------------------------
+    let sweep_start = Instant::now();
     let freed = sweep(heap);
+    let sweep_time = sweep_start.elapsed();
     heap.last_collection_objects = heap.objects.len();
+    // Local mode has no separate stop-the-world window: the whole collection
+    // runs with the only thread stopped, so `pause` is the total time.
+    record_collection(started.elapsed(), mark_time, sweep_time, freed);
     freed
 }
 
@@ -1497,8 +1715,8 @@ unsafe fn trace(addr: usize) {
                         mark_value(item);
                     }
                 }
-                ObjData::Dict(pairs) => {
-                    for &(key, value) in pairs {
+                ObjData::Dict(dict) => {
+                    for &(key, value) in dict.entries() {
                         mark_value(key);
                         mark_value(value);
                     }
@@ -1630,6 +1848,12 @@ unsafe fn trace(addr: usize) {
                     }
                 }
                 ObjData::CsvWriter(writer) => mark_value(writer.file),
+                // A fiber owns its call arguments and result; its suspended
+                // stack is registered as a separate root range. Join requests
+                // reference the gathered tasks.
+                ObjData::Fiber(fiber) => {
+                    fiber.trace(mark_value);
+                }
                 // Wrapper functions own their captured values; native and
                 // builtin function bodies own no PyX values.
                 ObjData::Function(function) => {
@@ -1670,6 +1894,32 @@ unsafe fn trace(addr: usize) {
                 | ObjData::Instance(_) => {}
             }
             mark_black(addr);
+        }
+    }
+}
+
+/// Conservatively scans the native caller range of a running fiber, if any.
+fn scan_aux_stack(addresses: &HashSet<usize>) {
+    for (low, high) in AUX_STACK.with(Cell::get) {
+        if high > low {
+            scan_stack(low, high, addresses);
+        }
+    }
+}
+
+/// Conservatively scans every lifetime-registered fiber root range of this
+/// thread (private stack and both register contexts, including the running
+/// fiber's own stack).
+fn scan_suspended_stacks(addresses: &HashSet<usize>) {
+    let owner = current_gc_token();
+    let ranges: Vec<(usize, usize)> = lock_suspended_stacks()
+        .iter()
+        .filter(|&&(id, _, _)| id == owner)
+        .map(|&(_, low, high)| (low, high))
+        .collect();
+    for (low, high) in ranges {
+        if high > low {
+            scan_stack(low, high, addresses);
         }
     }
 }
@@ -1759,8 +2009,137 @@ unsafe fn load_stack_word(addr: usize) -> usize {
 // Stack bounds
 // -------------------------------------------------------------------------
 
+/// Redirects the collector's stack bounds to `low..high` while a fiber runs.
+///
+/// The override is a stack: a nested resume pushes the inner fiber's range on
+/// top of its caller's. In shared mode the thread registration's bounds are
+/// updated as well, so a safepoint reached on a fiber stack saves a context
+/// the shared collector can validate.
+pub(crate) fn push_stack_bounds(low: usize, high: usize) {
+    STACK_BOUNDS_OVERRIDE.with(|bounds| {
+        let mut bounds = bounds.borrow_mut();
+        if bounds.is_empty() {
+            let base = native_stack_bounds().unwrap_or((0, 0));
+            bounds.push(base);
+        }
+        bounds.push((low, high));
+    });
+    update_thread_bounds(low, high);
+}
+
+/// Undoes one [`push_stack_bounds`], restoring the enclosing context's bounds.
+pub(crate) fn pop_stack_bounds() {
+    let restored = STACK_BOUNDS_OVERRIDE.with(|bounds| {
+        let mut bounds = bounds.borrow_mut();
+        if bounds.len() > 1 {
+            bounds.pop();
+        }
+        bounds.last().copied().unwrap_or((0, 0))
+    });
+    let restored = if restored == (0, 0) {
+        native_stack_bounds().unwrap_or((0, 0))
+    } else {
+        restored
+    };
+    update_thread_bounds(restored.0, restored.1);
+}
+
+/// Runs `f` with the calling thread's collector registration, without the
+/// `Arc` clone of [`current_gc`] (this is on the per-resume path).
+fn with_current_gc(f: impl FnOnce(&ThreadGc)) {
+    GC_SELF.with(|cell| {
+        if let Some(gc) = cell.borrow().as_ref() {
+            f(gc);
+        }
+    });
+}
+
+fn update_thread_bounds(low: usize, high: usize) {
+    // Only the shared collector validates a parked thread against its saved
+    // bounds; local mode reads the thread-local override directly.
+    if !shared() {
+        return;
+    }
+    with_current_gc(|gc| {
+        gc.stack_low.store(low, Ordering::Release);
+        gc.stack_high.store(high, Ordering::Release);
+    });
+}
+
+/// Publishes the two extra root ranges of the outermost fiber resume.
+///
+/// While the fiber runs, the resumer's native stack frames (`low..high`) and
+/// the resumed fiber's `caller_ctx` (which the context switch fills with the
+/// resumer's callee-saved registers) are live but are not on the current
+/// stack. Both are scanned conservatively. Nested resumes do not publish
+/// anything: their caller is a fiber whose lifetime stack and context ranges
+/// are already registered.
+pub(crate) fn set_aux_stack(low: usize, high: usize, ctx_low: usize, ctx_high: usize) {
+    let ranges = [(low, high), (ctx_low, ctx_high)];
+    AUX_STACK.with(|slot| slot.set(ranges));
+    if !shared() {
+        return;
+    }
+    with_current_gc(|gc| {
+        gc.aux_low.store(ranges[0].0, Ordering::Release);
+        gc.aux_high.store(ranges[0].1, Ordering::Release);
+        gc.aux2_low.store(ranges[1].0, Ordering::Release);
+        gc.aux2_high.store(ranges[1].1, Ordering::Release);
+    });
+}
+
+/// Removes the aux ranges published by [`set_aux_stack`].
+pub(crate) fn clear_aux_stack() {
+    AUX_STACK.with(|slot| slot.set([(0, 0); 2]));
+    if !shared() {
+        return;
+    }
+    with_current_gc(|gc| {
+        gc.aux_low.store(0, Ordering::Release);
+        gc.aux_high.store(0, Ordering::Release);
+        gc.aux2_low.store(0, Ordering::Release);
+        gc.aux2_high.store(0, Ordering::Release);
+    });
+}
+
+/// Publishes `low..high` as a conservative GC root range for the lifetime of
+/// a fiber object (its private stack and its two register contexts).
+/// Registered once at creation and removed in `Drop`; the per-resume path
+/// does not touch this registry.
+pub(crate) fn register_suspended_stack(low: usize, high: usize) {
+    if low == 0 || high <= low {
+        return;
+    }
+    let owner = current_gc_token();
+    lock_suspended_stacks().push((owner, low, high));
+}
+
+/// Removes a range registered by [`register_suspended_stack`].
+pub(crate) fn unregister_suspended_stack(low: usize, high: usize) {
+    if low == 0 || high <= low {
+        return;
+    }
+    let mut stacks = lock_suspended_stacks();
+    if let Some(index) = stacks
+        .iter()
+        .rposition(|&(_, lo, hi)| lo == low && hi == high)
+    {
+        stacks.remove(index);
+    }
+}
+
+/// The calling thread's effective stack bounds: the innermost fiber override
+/// when one is active, the native stack otherwise.
+pub(crate) fn stack_bounds() -> Option<(usize, usize)> {
+    match STACK_BOUNDS_OVERRIDE.with(|bounds| bounds.borrow().last().copied()) {
+        Some(bounds) if bounds != (0, 0) => Some(bounds),
+        _ => native_stack_bounds(),
+    }
+}
+
+/// The OS thread's native stack bounds, ignoring any fiber override.
 #[cfg(unix)]
-fn stack_bounds() -> Option<(usize, usize)> {
+fn native_stack_bounds() -> Option<(usize, usize)> {
     // SAFETY: `attr` is initialized by `pthread_getattr_np`, queried with a
     // valid stackt pointer pair and destroyed exactly once. Failures are
     // reported as `None`; no pointers escape.
@@ -1784,7 +2163,7 @@ fn stack_bounds() -> Option<(usize, usize)> {
 }
 
 #[cfg(not(unix))]
-fn stack_bounds() -> Option<(usize, usize)> {
+fn native_stack_bounds() -> Option<(usize, usize)> {
     // Without a portable stack-bounds API the collector conservatively
     // declines to run (objects are simply leaked).
     None
@@ -1902,4 +2281,72 @@ fn spill_registers() -> [usize; 32] {
 fn spill_registers() -> [usize; 0] {
     // Unknown calling convention: rely on the stack scan only.
     []
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::KIND_STR;
+
+    /// Serialises the stats tests: they inspect process-wide counters, and
+    /// `reset_clears_counters` must not zero them while another stats test is
+    /// measuring a delta. Other unit tests may still collect concurrently;
+    /// the counters only ever grow, which the assertions tolerate.
+    static STATS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn stats_test_guard() -> MutexGuard<'static, ()> {
+        STATS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn collect_increments_counters() {
+        let _guard = stats_test_guard();
+        let before = gc_stats();
+        let _ = collect_with_root(None);
+        let after = gc_stats();
+        assert!(after.collections > before.collections);
+        assert!(after.pause_total_us >= before.pause_total_us);
+        assert!(after.mark_total_us >= before.mark_total_us);
+        assert!(after.sweep_total_us >= before.sweep_total_us);
+        // The maximum can never exceed the accumulated total.
+        assert!(after.pause_max_us <= after.pause_total_us);
+    }
+
+    #[test]
+    fn snapshot_reports_live_objects() {
+        let _guard = stats_test_guard();
+        let tagged = allocate(KIND_STR, ObjData::Str(String::from("live")));
+        let stats = gc_stats();
+        // The object was registered on this thread's heap and stays reachable
+        // through `tagged` for the rest of the test.
+        assert!(stats.live_objects >= 1);
+        assert_eq!(crate::value::as_str(tagged), Some("live"));
+    }
+
+    #[test]
+    fn reset_clears_counters() {
+        let _guard = stats_test_guard();
+        // Force collections on this thread's private heap so every counter
+        // has something to clear.
+        for _ in 0..3 {
+            let _ = collect_with_root(None);
+        }
+        let before = gc_stats();
+        assert!(before.collections >= 3);
+
+        reset_gc_stats();
+        let after = gc_stats();
+        // Other unit tests share the process-wide counters and run in
+        // parallel, so another test may complete a collection between the
+        // reset and this snapshot. The counters only ever grow; a reset must
+        // still erase the collections forced above.
+        assert!(
+            after.collections < before.collections,
+            "reset did not clear the collection counter: before={}, after={}",
+            before.collections,
+            after.collections
+        );
+    }
 }

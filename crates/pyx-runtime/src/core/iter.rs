@@ -14,8 +14,11 @@ use crate::exc::{self, TYPE_ERROR};
 use crate::value;
 
 /// `pyx_iter_new`: creates an iterator for a list, string, dict, tuple, set,
-/// range, text file or CSV reader.
+/// range, text file, CSV reader or a generator object.
 pub(crate) fn iter_new(obj: i64) -> i64 {
+    let generator = value::as_fiber(obj)
+        .map(|fiber| fiber.kind == crate::fiber::FiberKind::Generator)
+        .unwrap_or(false);
     if value::as_list(obj).is_some()
         || value::as_str(obj).is_some()
         || value::as_bytes(obj).is_some()
@@ -26,6 +29,7 @@ pub(crate) fn iter_new(obj: i64) -> i64 {
         || value::as_range(obj).is_some()
         || value::as_file(obj).is_some()
         || value::as_csv_reader(obj).is_some()
+        || generator
     {
         value::iter_new(obj)
     } else {
@@ -36,6 +40,56 @@ pub(crate) fn iter_new(obj: i64) -> i64 {
     }
 }
 
+/// `iter(obj)`: returns an existing iterator or generator unchanged (CPython
+/// semantics), otherwise creates an iterator like [`iter_new`].
+pub(crate) fn iter_of(obj: i64) -> i64 {
+    let generator = value::as_fiber(obj)
+        .map(|fiber| fiber.kind == crate::fiber::FiberKind::Generator)
+        .unwrap_or(false);
+    if generator || value::as_iter(obj).is_some() {
+        obj
+    } else {
+        iter_new(obj)
+    }
+}
+
+/// `next(obj[, default])`: advances an iterator or generator by one step.
+///
+/// Returns the element. At the end, raises `StopIteration` when no default was
+/// given and returns the default otherwise. An exception raised inside a
+/// generator propagates unchanged: it leaves a pending exception, which takes
+/// precedence over the exhausted/default path.
+pub(crate) fn next_value(obj: i64, default: i64, has_default: bool) -> i64 {
+    let generator = value::as_fiber(obj)
+        .map(|fiber| fiber.kind == crate::fiber::FiberKind::Generator)
+        .unwrap_or(false);
+    if !generator && value::as_iter(obj).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("'{}' object is not an iterator", value::type_name(obj)),
+        );
+    }
+    let mut out: i64 = value::NONE;
+    let produced = if generator {
+        generator_next(obj, &mut out) == 1
+    } else {
+        iter_next(obj, &mut out) == 1
+    };
+    if produced {
+        return out;
+    }
+    // A pending exception (from the iterator itself or a generator body) is
+    // the result; it must not be swallowed by a default.
+    if exc::pending() {
+        return value::NONE;
+    }
+    if has_default {
+        default
+    } else {
+        exc::raise_with_message(exc::STOP_ITERATION, "")
+    }
+}
+
 /// `pyx_iter_next`: writes the next element to `out` and returns `1`, or
 /// returns `0` at the end (no pending exception). An invalid iterator or a
 /// `NULL` out-pointer raises `TypeError` and returns `0`.
@@ -43,6 +97,21 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
     if out.is_null() {
         exc::raise_with_message(TYPE_ERROR, "iteration output pointer is NULL");
         return 0;
+    }
+    let target = match value::as_iter(iter) {
+        Some(state) => state.target,
+        None => {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("'{}' object is not an iterator", value::type_name(iter)),
+            );
+            return 0;
+        }
+    };
+    // A generator target runs user code on resume, so no iterator borrow is
+    // held across the switch.
+    if value::as_fiber(target).is_some() {
+        return generator_next(target, out);
     }
     let Some(state) = value::iter_state_mut(iter) else {
         exc::raise_with_message(
@@ -114,6 +183,42 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
             1
         }
         None => 0,
+    }
+}
+
+/// Resumes a generator object for `for` loops. The yielded value becomes the
+/// next element; a finished generator ends iteration; a pending exception
+/// inside the body is re-raised to the caller.
+fn generator_next(generator: i64, out: *mut i64) -> i64 {
+    if crate::fiber::is_done(generator) {
+        if crate::fiber::has_error(generator) {
+            crate::fiber::raise_error(generator);
+        }
+        return 0;
+    }
+    match crate::fiber::resume_value(generator) {
+        Some(true) => {
+            if crate::fiber::has_error(generator) {
+                crate::fiber::raise_error(generator);
+            }
+            0
+        }
+        Some(false) => {
+            let item = crate::fiber::yielded_value(generator);
+            // SAFETY: checked above.
+            unsafe { *out = item };
+            1
+        }
+        None => {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "'{}' object is not an iterator",
+                    value::type_name(generator)
+                ),
+            );
+            0
+        }
     }
 }
 
@@ -220,5 +325,109 @@ mod tests {
         let mut out = 0;
         assert_eq!(iter_next(iter, &mut out), 1);
         assert_eq!(out, int(1));
+    }
+
+    extern "C" fn yields_one_two(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(int(1));
+        crate::fiber::yield_value(int(2));
+        value::NONE
+    }
+
+    extern "C" fn fails_after_first(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(int(1));
+        crate::exc::raise_with_message(crate::exc::VALUE_ERROR, "boom")
+    }
+
+    fn generator(entry: extern "C" fn(*const i64) -> i64) -> i64 {
+        let created = value::fiber_generator_new(entry as usize, "gen".to_string(), Vec::new());
+        created.expect("generator stack")
+    }
+
+    #[test]
+    fn next_advances_generators_lazily() {
+        exc::init();
+        let gen = generator(yields_one_two);
+        // Nothing ran yet: the body starts on the first `next`.
+        assert_eq!(crate::fiber::yielded_value(gen), value::NONE);
+        assert!(!crate::fiber::is_done(gen));
+
+        assert_eq!(next_value(gen, value::NONE, false), int(1));
+        assert_eq!(crate::fiber::yielded_value(gen), int(1));
+        assert!(!crate::fiber::is_done(gen));
+
+        assert_eq!(next_value(gen, value::NONE, false), int(2));
+        assert!(!exc::pending());
+
+        // Exhausted: no default raises StopIteration.
+        assert_eq!(next_value(gen, value::NONE, false), value::NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::STOP_ITERATION as i64);
+    }
+
+    #[test]
+    fn next_default_suppresses_stop_iteration() {
+        exc::init();
+        let exhausted = iter_of(value::list_new(Vec::new()));
+        assert_eq!(next_value(exhausted, int(-1), true), int(-1));
+        assert!(!exc::pending());
+
+        let gen = generator(yields_one_two);
+        assert_eq!(next_value(gen, int(-1), true), int(1));
+        assert_eq!(next_value(gen, int(-1), true), int(2));
+        assert_eq!(next_value(gen, int(-1), true), int(-1));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn iter_then_next_over_a_list() {
+        exc::init();
+        let iterator = iter_of(value::list_new(vec![int(7), int(8)]));
+        assert_eq!(value::type_name(iterator), "iterator");
+        assert_eq!(next_value(iterator, value::NONE, false), int(7));
+        assert_eq!(next_value(iterator, value::NONE, false), int(8));
+        assert_eq!(next_value(iterator, value::NONE, false), value::NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::STOP_ITERATION as i64);
+    }
+
+    #[test]
+    fn iter_returns_existing_iterator_unchanged() {
+        exc::init();
+        let iterator = iter_of(value::list_new(vec![int(1)]));
+        assert_eq!(iter_of(iterator), iterator);
+
+        let gen = generator(yields_one_two);
+        assert_eq!(iter_of(gen), gen);
+        // The generator is accepted directly by `next`, without a wrapper.
+        assert_eq!(value::type_name(gen), "generator");
+        assert_eq!(next_value(gen, value::NONE, false), int(1));
+    }
+
+    #[test]
+    fn next_rejects_non_iterators_with_type_error() {
+        exc::init();
+        let list = value::list_new(vec![int(1)]);
+        assert_eq!(next_value(list, value::NONE, false), value::NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "'list' object is not an iterator"
+        );
+
+        // A default does not mask the TypeError.
+        exc::init();
+        assert_eq!(next_value(list, int(0), true), value::NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn next_propagates_generator_exceptions() {
+        exc::init();
+        let gen = generator(fails_after_first);
+        assert_eq!(next_value(gen, value::NONE, false), int(1));
+        assert!(!exc::pending());
+
+        // The body's ValueError wins over both StopIteration and the default.
+        assert_eq!(next_value(gen, int(-1), true), value::NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(value::to_string(exc::pending_value()), "boom");
     }
 }

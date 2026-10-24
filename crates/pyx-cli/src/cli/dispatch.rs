@@ -3,8 +3,8 @@
 use std::ffi::OsString;
 
 use super::commands::{
-    cmd_add, cmd_build, cmd_check, cmd_clean, cmd_doctor, cmd_fmt, cmd_help, cmd_init, cmd_lint,
-    cmd_lock, cmd_new, cmd_remove, cmd_run, cmd_spawn, cmd_sync, cmd_test, cmd_version,
+    cmd_add, cmd_build, cmd_check, cmd_clean, cmd_doctor, cmd_fmt, cmd_gc, cmd_help, cmd_init,
+    cmd_lint, cmd_lock, cmd_new, cmd_remove, cmd_run, cmd_spawn, cmd_sync, cmd_test, cmd_version,
 };
 use super::{CliError, CliResult};
 
@@ -18,6 +18,7 @@ pub(crate) fn dispatch(args: &[OsString]) -> CliResult {
         "init" => cmd_init(&args[1..]),
         "check" => cmd_check(&args[1..]),
         "run" => cmd_run(&args[1..]),
+        "gc" => cmd_gc(&args[1..]),
         "build" => cmd_build(&args[1..]),
         "test" => cmd_test(&args[1..]),
         "fmt" => cmd_fmt(&args[1..]),

@@ -174,13 +174,22 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="pyx-bench-") as tmp:
         tmpdir = Path(tmp)
         log("verifying outputs against CPython…")
-        baseline = {}
+        baseline: dict[str, str | None] = {}
         for key, filename, _ in [*WORKLOADS, STARTUP]:
-            out, _, _ = run_once([sys.executable, str(HERE / filename)], ROOT, args.timeout)
-            baseline[key] = out
+            try:
+                out, _, _ = run_once([sys.executable, str(HERE / filename)], ROOT, args.timeout)
+                baseline[key] = out
+            except Exception as exc:  # noqa: BLE001 - a broken CPython reference must not abort the report
+                log(f"  CPython reference failed for {key}: {exc}")
+                baseline[key] = None
 
         for key, filename, _ in WORKLOADS:
             source = HERE / filename
+            if baseline[key] is None:
+                log(f"skipping {key}: CPython reference failed")
+                results.append({"workload": key, "impl": "cpython", "build_ms": None,
+                                "status": "error", "error": "CPython reference failed"})
+                continue
             log(f"benchmarking {key}…")
             commands = [
                 ("cpython", [sys.executable, str(source)], None),
@@ -304,9 +313,10 @@ def main() -> int:
     lines.extend(
         [
             "",
-            "Early baseline for the import-free PyX subset; dict insertion is",
-            "linear (O(n)) and string concatenation is O(n²), so both use small",
-            "loads. Not comparable to the CPython/uv harnesses in benchmarks/.",
+            "Baseline for the import-free PyX subset; dicts use a hash index",
+            "(insertion order preserved), while string concatenation is still",
+            "O(n²), so that load stays small. Not comparable to the CPython/uv",
+            "harnesses in benchmarks/.",
         ]
     )
     text = "\n".join(lines)

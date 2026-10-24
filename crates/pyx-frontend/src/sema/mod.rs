@@ -665,6 +665,12 @@ impl<'a> Checker<'a> {
         if f.is_module {
             return;
         }
+        if f.is_generator {
+            // A generator's annotation describes the yielded values, and an
+            // explicit `return` value becomes the generator result, so the
+            // ordinary return checks do not apply.
+            return;
+        }
         if has_value {
             if has_bare {
                 self.error_code(
@@ -915,32 +921,39 @@ impl<'a> Checker<'a> {
                 Some(value) => {
                     *has_value = true;
                     self.check_expr(value, f);
-                    match f.ret_ty {
-                        Ty::Concrete(expected) => match self.inf.resolve(value.ty) {
-                            Ty::Concrete(got) => {
-                                if !annotation_accepts(expected, got) {
-                                    self.error(
-                                        value.line,
-                                        value.col,
-                                        format!(
-                                            "return type {} does not match declared return type {}",
-                                            got.name(),
-                                            expected.name()
-                                        ),
-                                    );
+                    if !f.is_generator {
+                        match f.ret_ty {
+                            Ty::Concrete(expected) => match self.inf.resolve(value.ty) {
+                                Ty::Concrete(got) => {
+                                    if !annotation_accepts(expected, got) {
+                                        self.error(
+                                            value.line,
+                                            value.col,
+                                            format!(
+                                                "return type {} does not match declared return type {}",
+                                                got.name(),
+                                                expected.name()
+                                            ),
+                                        );
+                                    }
                                 }
-                            }
+                                Ty::Var(_) => {
+                                    let _ = self.inf.unify(value.ty, Ty::Concrete(expected));
+                                }
+                            },
                             Ty::Var(_) => {
-                                let _ = self.inf.unify(value.ty, Ty::Concrete(expected));
+                                let _ = self.inf.unify(f.ret_ty, value.ty);
                             }
-                        },
-                        Ty::Var(_) => {
-                            let _ = self.inf.unify(f.ret_ty, value.ty);
                         }
                     }
                 }
                 None => *has_bare = true,
             },
+            HStmtKind::Yield { value } => {
+                if let Some(value) = value {
+                    self.check_expr(value, f);
+                }
+            }
             HStmtKind::Break | HStmtKind::Continue | HStmtKind::Pass => {}
             HStmtKind::Raise { exc: _, msg } => {
                 if let Some(msg) = msg {
@@ -1207,7 +1220,7 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Dict));
             }
             HExprKind::GeneratorExp { element, clauses } => {
-                // Phase 2.8 materialises generators eagerly as lists.
+                // Generator expressions are materialised as lists.
                 self.check_comp_clauses(clauses, f);
                 self.check_expr(element, f);
                 let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::List));
@@ -1326,6 +1339,8 @@ impl<'a> Checker<'a> {
                         if args.len() < spec.min_args || args.len() > spec.max_args {
                             let expected = if spec.min_args == spec.max_args {
                                 spec.min_args.to_string()
+                            } else if spec.max_args == usize::MAX {
+                                format!("at least {}", spec.min_args)
                             } else {
                                 format!("{} to {}", spec.min_args, spec.max_args)
                             };
@@ -1384,6 +1399,11 @@ impl<'a> Checker<'a> {
                 self.force_any(expr.ty);
             }
             HExprKind::Call { callee, args } => self.check_call(expr, *callee, args, f),
+            HExprKind::Await { value } => {
+                self.check_expr(value, f);
+                // The awaited result is only known at runtime.
+                self.force_any(expr.ty);
+            }
         }
     }
 
@@ -1393,12 +1413,13 @@ impl<'a> Checker<'a> {
         }
         match callee {
             Callee::Function(id) => {
-                let (name, params, ret_ty) = {
+                let (name, params, ret_ty, is_coroutine) = {
                     let function = &self.prog.functions[id as usize];
                     (
                         function.name.clone(),
                         function.params.iter().map(|p| p.ty).collect::<Vec<_>>(),
                         function.ret_ty,
+                        function.is_async || function.is_generator,
                     )
                 };
                 if args.len() != params.len() {
@@ -1443,7 +1464,15 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
-                let _ = self.inf.unify(expr.ty, ret_ty);
+                // Calling an async or generator function returns a coroutine or
+                // generator object whose element/result type is only known at
+                // runtime.
+                let result_ty = if is_coroutine {
+                    Ty::Concrete(Type::Any)
+                } else {
+                    ret_ty
+                };
+                let _ = self.inf.unify(expr.ty, result_ty);
             }
             Callee::Builtin(builtin) => {
                 // `range(...)` has a concrete result type, and callers check
@@ -1520,6 +1549,8 @@ impl<'a> Checker<'a> {
                 if !arity_ok {
                     let expected = if signature.min_args == signature.max_args {
                         signature.min_args.to_string()
+                    } else if signature.max_args == usize::MAX {
+                        format!("at least {}", signature.min_args)
                     } else {
                         format!("{} to {}", signature.min_args, signature.max_args)
                     };
@@ -1947,6 +1978,36 @@ impl<'a> Checker<'a> {
                     }
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Bytes));
+            }
+            Builtin::Iter => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("iter() takes exactly one argument ({count} given)"),
+                    );
+                    return;
+                }
+                let (ty, arg_line, arg_col) = args[0];
+                self.check_builtin_iterable(Builtin::Iter, ty, arg_line, arg_col);
+                // The element type is only known at runtime.
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
+            Builtin::Next => {
+                if count == 0 || count > 2 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("next() takes 1 or 2 positional arguments ({count} given)"),
+                    );
+                    return;
+                }
+                // Any object is accepted statically: whether it is an
+                // iterator is only known at runtime (`next([])` is a
+                // runtime `TypeError`, mirroring CPython).
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
             }
             Builtin::Range => {
                 if count == 0 || count > 3 {
@@ -2495,6 +2556,8 @@ fn emit_function(function: &HFunction, inf: &mut Infer) -> IrFunction {
         ret_ty,
         locals,
         body,
+        is_async: function.is_async,
+        is_generator: function.is_generator,
     }
 }
 
@@ -2598,6 +2661,9 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
             value: emit_expr(value, inf),
         },
         HStmtKind::Return(value) => StmtKind::Return(value.as_ref().map(|e| emit_expr(e, inf))),
+        HStmtKind::Yield { value } => StmtKind::Yield {
+            value: value.as_ref().map(|e| emit_expr(e, inf)),
+        },
         HStmtKind::Break => StmtKind::Break,
         HStmtKind::Continue => StmtKind::Continue,
         HStmtKind::Pass => StmtKind::Pass,
@@ -2733,6 +2799,9 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
         HExprKind::Call { callee, args } => ExprKind::Call {
             callee: *callee,
             args: args.iter().map(|a| emit_expr(a, inf)).collect(),
+        },
+        HExprKind::Await { value } => ExprKind::Await {
+            value: Box::new(emit_expr(value, inf)),
         },
     };
     IrExpr::new(kind, inf.type_of(expr.ty), expr.line)
