@@ -8,7 +8,7 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **1371 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25: **1373 tests**, `scripts/verify.sh` ALL GREEN. The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
@@ -22,6 +22,13 @@ heavier rich rendering. See the package-loader entry below.
 
 ### Added
 
+- **GC address-index optimization:** the local collector's address set now
+  uses a deterministic non-cryptographic SplitMix64 hasher instead of SipHash,
+  and sweep rebuilds the set in place with reused capacity instead of
+  allocating a fresh HashSet and shrinking both registries every collection.
+  A 300k-short-lived-list AOT workload drops from 44.95 ms to 40.91 ms median
+  (≈9%), with unchanged output and GC semantics; two GC unit tests cover the
+  address-set invariant and shrink policy.
 - **Full benchmark harness under PyX:** generator expressions now wrap their
   eager list in an iterator (so `next()`/single-pass use work), `*` call and
   display operands accept arbitrary iterables, and `str`/`bytes.join` accept

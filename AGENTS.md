@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1371 tests, JIT+AOT |
+| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1373 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -86,8 +86,8 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
 
 **Verification (as of 2026-10-25):**
 
-- `cargo test --workspace`: **1371 tests** — 413 frontend, 48 codegen, 18 IR,
-  492 runtime unit, 221 CLI/E2E (143 E2E incl. the abi3 extension fixture,
+- `cargo test --workspace`: **1373 tests** — 413 frontend, 48 codegen, 18 IR,
+  494 runtime unit, 221 CLI/E2E (143 E2E incl. the abi3 extension fixture,
   24 fibers, 6 closures, 11 user modules, 10 exception tests, 8
   completions, extension path/dotted/multi-phase, 2 unittest-runner tests,
   2 stdlib-batch-a, 2 stdlib-batch-b, 3 stdlib-bench-batch tests and 5 CLI
@@ -579,7 +579,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 1371 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 1373 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -873,7 +873,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (1371)
+cargo test                             # unit/integration tests (1373)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1333,3 +1333,21 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   FastAPI throughput, PyX comparison), rich report written. Default GC
   still needs the raised threshold; precise roots remain P2-06.
   **1371 tests**, clippy `-D warnings` and `scripts/verify.sh` green.
+
+- 2026-10-25 (continuation 55): GC address-index optimization + full
+  PyX/CPython benchmark comparison. `gc/heap.rs` now hashes the internal
+  address set with a deterministic SplitMix64 `AddressHasher` instead of
+  SipHash, and the local sweep rebuilds the set in place (`clear` + `extend`)
+  without per-collection `HashSet` allocation or unconditional
+  `shrink_to_fit`; capacity is returned only above `max(1024, 4 × live)`.
+  GC-heavy AOT workload (300k short-lived lists): median 44.95 → 40.91 ms
+  (≈9%), mark median 41 → 34 µs; sweep remains within run noise. Two unit
+  tests cover exact address membership and the shrink policy. Full
+  `bench_all.py` (no `--only`) ran under PyX (151.03 s, runner 3.14.9,
+  `PYX_GC_THRESHOLD=100000000`, site-packages) and under
+  `uv run benchmarks/bench_all.py` (152.61 s, CPython 3.13.13); all six
+  groups green in both. PyX workload medians: list_comp 4.36/2.79 ms,
+  dict_insert 2.64/1.71 ms, json 3.46/1.81 ms, generator 8.36/7.91 ms,
+  async_gather 23.38/21.62 ms, while_sum 29.34/31.48 ms, math_loop
+  48.50/47.05 ms (JIT/AOT). **1373 tests**, clippy `-D warnings` and
+  `scripts/verify.sh` green.

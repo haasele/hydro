@@ -116,6 +116,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -217,11 +218,72 @@ pub fn reset_gc_stats() {
     STAT_FREED_TOTAL.store(0, Ordering::Relaxed);
 }
 
+/// Finalises a 64-bit value with the SplitMix64 mixers: two xor-shift
+/// multiplies followed by a xor-shift, so every input bit affects every
+/// output bit.
+#[inline]
+fn mix64(value: u64) -> u64 {
+    let value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    let value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// Fast non-cryptographic hasher for the GC's internal address index.
+///
+/// The index is keyed only by aligned heap addresses that the runtime handed
+/// out itself (never by user-controlled bytes), so hash flooding and
+/// collision attacks are not part of the threat model: a seeded SipHash buys
+/// nothing here. Allocation-time `insert` and conservative stack-scan
+/// `contains` are hot, so the index uses this Fx-style accumulator plus a
+/// SplitMix64 finaliser instead of `RandomState`. This changes only the hash
+/// function; every lookup still compares whole `usize` keys, so membership is
+/// identical to a std `HashSet<usize>`.
+#[derive(Default)]
+struct AddressHasher(u64);
+
+impl AddressHasher {
+    #[inline]
+    fn mix(&mut self, value: u64) {
+        self.0 = mix64(self.0 ^ value);
+    }
+}
+
+impl Hasher for AddressHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        mix64(self.0)
+    }
+
+    /// Byte-oriented fallback for types this index never stores. Each chunk
+    /// is folded into the same accumulator, so equal byte strings still hash
+    /// equally.
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.mix(u64::from_ne_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.mix(value as u64);
+    }
+}
+
+/// Address index of the registered heap objects.
+type AddressSet = HashSet<usize, BuildHasherDefault<AddressHasher>>;
+
 struct HeapState {
     /// Every live heap object, in allocation order.
     objects: Vec<*mut PyxObj>,
     /// Addresses of the objects in `objects`, for O(1) conservative lookups.
-    addresses: HashSet<usize>,
+    addresses: AddressSet,
     /// Backing storage for `objects`. Every registered pointer was handed out
     /// by this pool and must be released through it exactly once.
     pool: ObjectPool,
@@ -241,7 +303,7 @@ impl HeapState {
         let (threshold, stress) = read_config();
         HeapState {
             objects: Vec::new(),
-            addresses: HashSet::new(),
+            addresses: AddressSet::default(),
             pool: ObjectPool::new(),
             threshold,
             last_collection_objects: 0,
@@ -1158,7 +1220,7 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
 fn mark_roots(
     snapshots: &[RootSnapshot],
     extra_root: Option<i64>,
-    addresses: &HashSet<usize>,
+    addresses: &AddressSet,
     self_sp: usize,
     self_high: usize,
 ) {
@@ -1647,7 +1709,17 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
     freed
 }
 
-/// Frees all white registered objects and rebuilds the address index.
+/// Whether a registry allocation is grossly oversized and worth giving back.
+///
+/// Collections are normally followed by roughly the same number of
+/// allocations, so the surviving allocation is reused and returning it would
+/// only cost a reallocation later. Only a collapsed live set (or a full
+/// `free_all`) leaves a capacity this far above the current length.
+fn capacity_is_oversized(capacity: usize, len: usize) -> bool {
+    capacity > len.saturating_mul(4).max(1024)
+}
+
+/// Frees all white registered objects and keeps the address index in sync.
 ///
 /// Only used by a single-threaded (local-heap) collection, where the sweep can
 /// release each cell into the pool in place. The shared collector partitions
@@ -1656,32 +1728,48 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
 /// Grey objects are kept as well (defensively: with the worklist drained they
 /// should not exist) and turned white together with the black ones, so the
 /// next collection starts from a clean heap.
+///
+/// The address index is rebuilt in place after the sweep: its allocation is
+/// cleared and refilled from the surviving registry, so the cost is linear in
+/// the live set instead of a hash removal per freed cell. Both registries keep
+/// their allocation unless it is grossly oversized relative to the live set.
 fn sweep(heap: &mut HeapState) -> usize {
     let mut freed = 0usize;
-    {
-        let pool = &mut heap.pool;
-        heap.objects.retain(|&obj| {
-            // SAFETY: `obj` is a live registered object. White objects are
-            // unreachable and released exactly once; every surviving colour
-            // is reset to white.
-            let color = unsafe { (*obj).marked.load(Ordering::Acquire) };
-            if color == WHITE {
-                // SAFETY: as above; the cell goes back to the free list.
-                unsafe { pool.release(obj) };
-                freed += 1;
-                false
-            } else {
-                unsafe { (*obj).marked.store(WHITE, Ordering::Release) };
-                true
-            }
-        });
-    }
-    heap.objects.shrink_to_fit();
+    let HeapState {
+        objects,
+        addresses,
+        pool,
+        ..
+    } = heap;
+    objects.retain(|&obj| {
+        // SAFETY: `obj` is a live registered object. White objects are
+        // unreachable and released exactly once; every surviving colour
+        // is reset to white.
+        let color = unsafe { (*obj).marked.load(Ordering::Acquire) };
+        if color == WHITE {
+            // SAFETY: as above; the cell goes back to the free list.
+            unsafe { pool.release(obj) };
+            freed += 1;
+            false
+        } else {
+            unsafe { (*obj).marked.store(WHITE, Ordering::Release) };
+            true
+        }
+    });
 
-    let mut addresses = HashSet::with_capacity(heap.objects.len());
-    addresses.extend(heap.objects.iter().map(|&obj| obj as usize));
-    heap.addresses = addresses;
-    heap.addresses.shrink_to_fit();
+    // Rebuild the index from the survivors. The existing allocation is reused
+    // (`reserve` is a no-op when the old capacity already covers the smaller
+    // live set), so no collection path allocates a fresh set.
+    addresses.clear();
+    addresses.reserve(objects.len());
+    addresses.extend(objects.iter().map(|&obj| obj as usize));
+
+    if capacity_is_oversized(objects.capacity(), objects.len()) {
+        objects.shrink_to_fit();
+    }
+    if capacity_is_oversized(addresses.capacity(), addresses.len()) {
+        addresses.shrink_to_fit();
+    }
 
     freed
 }
@@ -1721,7 +1809,8 @@ fn partition_whites(heap: &mut HeapState) -> Vec<*mut PyxObj> {
     heap.objects = live;
     heap.objects.shrink_to_fit();
 
-    let mut addresses = HashSet::with_capacity(heap.objects.len());
+    let mut addresses =
+        AddressSet::with_capacity_and_hasher(heap.objects.len(), BuildHasherDefault::default());
     addresses.extend(heap.objects.iter().map(|&obj| obj as usize));
     heap.addresses = addresses;
     heap.addresses.shrink_to_fit();
@@ -1730,7 +1819,7 @@ fn partition_whites(heap: &mut HeapState) -> Vec<*mut PyxObj> {
 }
 
 /// Marks `word` as a root if it looks like one of our tagged heap pointers.
-fn mark_word(word: usize, addresses: &HashSet<usize>) {
+fn mark_word(word: usize, addresses: &AddressSet) {
     if word & TAG_MASK as usize != TAG_HEAP as usize {
         return;
     }
@@ -2002,7 +2091,7 @@ unsafe fn trace(addr: usize) {
 }
 
 /// Conservatively scans the native caller range of a running fiber, if any.
-fn scan_aux_stack(addresses: &HashSet<usize>) {
+fn scan_aux_stack(addresses: &AddressSet) {
     for (low, high) in AUX_STACK.with(Cell::get) {
         if high > low {
             scan_stack(low, high, addresses);
@@ -2013,7 +2102,7 @@ fn scan_aux_stack(addresses: &HashSet<usize>) {
 /// Conservatively scans every lifetime-registered fiber root range of this
 /// thread (private stack and both register contexts, including the running
 /// fiber's own stack).
-fn scan_suspended_stacks(addresses: &HashSet<usize>) {
+fn scan_suspended_stacks(addresses: &AddressSet) {
     let owner = current_gc_token();
     let ranges: Vec<(usize, usize)> = lock_suspended_stacks()
         .iter()
@@ -2030,7 +2119,7 @@ fn scan_suspended_stacks(addresses: &HashSet<usize>) {
 /// Conservatively scans the native stack from `sp` (inclusive) up to `high`
 /// (exclusive). Every aligned word is inspected; only tagged values whose
 /// object is registered are marked.
-fn scan_stack(sp: usize, high: usize, addresses: &HashSet<usize>) {
+fn scan_stack(sp: usize, high: usize, addresses: &AddressSet) {
     let mut cursor = sp & !(std::mem::align_of::<usize>() - 1);
     while cursor + std::mem::size_of::<usize>() <= high {
         // SAFETY: `cursor` lies inside the current thread's stack mapping
@@ -2277,7 +2366,7 @@ fn native_stack_bounds() -> Option<(usize, usize)> {
 // -------------------------------------------------------------------------
 
 /// Marks every word of the register dump returned by [`spill_registers`].
-fn mark_captured_registers(addresses: &HashSet<usize>) {
+fn mark_captured_registers(addresses: &AddressSet) {
     for register in spill_registers() {
         mark_word(register, addresses);
     }
@@ -2440,6 +2529,89 @@ mod tests {
             crate::value::as_module(module).map(|state| state.name()),
             Some("unittest")
         );
+    }
+
+    /// Untags a heap value into the raw cell address used by the registries.
+    fn cell_address(value: i64) -> usize {
+        (value & !TAG_MASK) as usize
+    }
+
+    /// Marks a registered cell black so the sweep keeps it.
+    fn mark_survivor(value: i64) {
+        let obj = cell_address(value) as *mut PyxObj;
+        // SAFETY: the caller registered the object in its own heap.
+        unsafe { (*obj).marked.store(BLACK, Ordering::Release) };
+    }
+
+    /// Registers `label`'s string object in `heap` and returns its address.
+    fn register_test_object(heap: &mut HeapState, label: &str) -> usize {
+        let tagged = register_box(heap, KIND_STR, ObjData::Str(String::from(label)));
+        cell_address(tagged)
+    }
+
+    #[test]
+    fn capacity_shrink_policy_is_conservative() {
+        // Small registries never shrink: the next collection refills them.
+        assert!(!capacity_is_oversized(0, 0));
+        assert!(!capacity_is_oversized(1024, 0));
+        assert!(!capacity_is_oversized(1024, 100));
+        assert!(!capacity_is_oversized(4092, 1023));
+        // Four times the live length (or the 1024 floor) is still tolerable.
+        assert!(!capacity_is_oversized(4096, 1024));
+        assert!(!capacity_is_oversized(8192, 2048));
+        // Grossly oversized allocations are returned.
+        assert!(capacity_is_oversized(4097, 1024));
+        assert!(capacity_is_oversized(8193, 2048));
+        assert!(capacity_is_oversized(4096, 0));
+    }
+
+    #[test]
+    fn sweep_keeps_address_index_exact() {
+        let mut heap = HeapState::new();
+        // Two white (unreachable garbage) and two black (survivors).
+        let garbage_a = register_test_object(&mut heap, "garbage a");
+        let garbage_b = register_test_object(&mut heap, "garbage b");
+        let live_a_tagged = register_box(&mut heap, KIND_STR, ObjData::Str(String::from("live a")));
+        let live_b_tagged = register_box(&mut heap, KIND_STR, ObjData::Str(String::from("live b")));
+        let live_a = cell_address(live_a_tagged);
+        let live_b = cell_address(live_b_tagged);
+        mark_survivor(live_a_tagged);
+        mark_survivor(live_b_tagged);
+
+        let objects_capacity = heap.objects.capacity();
+        let addresses_capacity = heap.addresses.capacity();
+
+        let freed = sweep(&mut heap);
+        assert_eq!(freed, 2);
+        assert_eq!(heap.objects.len(), 2);
+        // The rebuilt index matches the live registry exactly: no freed
+        // address survives and no survivor lost its entry.
+        let registered: AddressSet = heap.objects.iter().map(|&obj| obj as usize).collect();
+        assert_eq!(
+            registered,
+            [live_a, live_b].into_iter().collect::<AddressSet>()
+        );
+        assert_eq!(heap.addresses, registered);
+        assert_eq!(heap.addresses.len(), heap.objects.len());
+        assert!(!heap.addresses.contains(&garbage_a));
+        assert!(!heap.addresses.contains(&garbage_b));
+        // Survivors were reset to white for the next cycle.
+        for &obj in &heap.objects {
+            // SAFETY: every registered pointer is live.
+            assert_eq!(unsafe { (*obj).marked.load(Ordering::Acquire) }, WHITE);
+        }
+        // The rebuild reuses both allocations; the normal path neither
+        // reallocates the index nor shrinks the registries.
+        assert_eq!(heap.objects.capacity(), objects_capacity);
+        assert_eq!(heap.addresses.capacity(), addresses_capacity);
+
+        // A collection where every object is garbage empties both registries;
+        // the index rebuild must not leave stale addresses behind.
+        let freed = sweep(&mut heap);
+        assert_eq!(freed, 2);
+        assert!(heap.objects.is_empty());
+        assert!(heap.addresses.is_empty());
+        assert_eq!(heap.addresses.capacity(), addresses_capacity);
     }
 
     #[test]

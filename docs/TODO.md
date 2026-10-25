@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** 1371 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** 1373 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -258,7 +258,7 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-25: 1371 tests total — 671 runtime (492 unit, 179 ABI
+      As of 2026-10-25: 1373 tests total — 673 runtime (494 unit, 179 ABI
       integration: among others 22 bytes, 19 IO, 18 stdlib modules, 16 stdlib
       utils, 12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
@@ -542,8 +542,11 @@ ecosystem benchmarks show where PyX is faster, equal or slower than CPython
       The dict hash index lowers insert/lookup costs (dict_insert AOT 2.1 ms
       vs. CPython 12.7 ms). Fiber `ctx`/`caller_ctx` are
       lifetime-registered roots; shared mode mirrors the two aux ranges,
-      local mode gets by without atomics per switch. Precise roots/allocator
-      (P2-05/06) and pause tuning remain open.
+      local mode gets by without atomics per switch. The address index uses a
+      fast non-cryptographic hasher and the local sweep rebuilds it in place
+      with reused capacity (300k-short-lived-list AOT: 44.95 → 40.91 ms
+      median, ≈9%). Precise roots/allocator (P2-05/06) and pause tuning
+      remain open.
 - [ ] P5-05 Profiling (CPU/heap) + trace integration.
 - [ ] P5-06 JIT decision **only** with measurement data; otherwise discard.
 - [ ] P5-07 If JIT: LLVM ORC or Cranelift, tiering, deopt strategy.

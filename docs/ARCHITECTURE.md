@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-25**. Phase 1 is complete; Phase 2 is largely
-implemented (1371 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (1373 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -855,7 +855,10 @@ Phase 2.1/2.15 there is a **conservative, concurrent mark-&-sweep
 collector as an interim**:
 
 - Every heap allocation is registered in a thread-local registry (object list +
-  address set) and given an atomic color WHITE/GREY/BLACK.
+  address set) and given an atomic color WHITE/GREY/BLACK. The address set
+  uses a deterministic non-cryptographic SplitMix64 hasher: its keys are
+  runtime-owned aligned heap addresses, never adversarial bytes, so SipHash
+  seeding is unnecessary while equality still compares the full address.
 - Roots: conservative scan of the native stack (bounds via
   `pthread_getattr_np`), a register dump (x86_64/aarch64) and the
   pending exception. Tagged heap values are accepted only if their
@@ -887,7 +890,12 @@ collector as an interim**:
   interim collector accepts this theoretical UB gap (no supported targets).
 - Mark traverses `List` elements, `Dict` keys/values, `Iter.target`,
   captures/base classes/instance attributes and all other traced children;
-  sweep frees unmarked objects and compacts the registry.
+  sweep frees unmarked objects and compacts the registry. The local sweep
+  rebuilds the address set **in place** (`clear` + `extend`) into its existing
+  allocation instead of allocating a fresh `HashSet` per collection; both
+  registries keep their capacity unless it is grossly oversized (`> max(1024,
+  4 × live)`). Measured on a 300k-short-lived-list AOT workload: median
+  runtime 44.95 ms → 40.91 ms (≈9% faster) with identical output.
 - A shared-heap cycle has two short stop-the-world windows: initial
   root snapshot (stacks, registers, pending, thread roots) and final
   root rescan. In between, a collector thread marks concurrently; the
@@ -1021,7 +1029,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **1371 tests** (413 frontend, 48 codegen, 18 IR, 492
+- As of 2026-10-25: **1373 tests** (413 frontend, 48 codegen, 18 IR, 494
   runtime unit, 179 runtime integration, 221 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
