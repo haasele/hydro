@@ -30,7 +30,7 @@ use crate::ops;
 use crate::pool;
 use crate::process;
 use crate::value::{self, NONE};
-use pyx_ir::MethodKind;
+use pyx_ir::{MethodKind, ParamKind};
 
 /// Dispatches `obj.<name>(args...)`.
 pub(crate) fn call(
@@ -167,7 +167,18 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
         return attribute_error(obj, method);
     };
     let class = state.class;
-    let Some(entry) = value::class_lookup(class, method) else {
+    let entry = value::class_lookup(class, method);
+    // An instance attribute shadows a normal method; only a property (a data
+    // descriptor) wins over the instance dictionary.
+    if !matches!(
+        entry,
+        Some(value::ClassEntry::Method(MethodKind::Property, _))
+    ) {
+        if let Some(attribute) = value::instance_attr(obj, method) {
+            return builtins::call(attribute, argc, argv);
+        }
+    }
+    let Some(entry) = entry else {
         return attribute_error(obj, method);
     };
     let (kind, function) = match entry {
@@ -175,6 +186,17 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
         value::ClassEntry::Attr(value) => return builtins::call(value, argc, argv),
         value::ClassEntry::Method(kind, function) => (kind, function),
     };
+    if !value::function_signature(function).is_empty() && value::function_full_entry(function) != 0
+    {
+        let args = if argc == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: checked above; caller contract.
+            unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+        };
+        let keywords = KeywordArgs { items: Vec::new() };
+        return call_user_method_kw(obj, class, kind, function, method, &args, &keywords);
+    }
     let receiver = match kind {
         MethodKind::Normal | MethodKind::Property => Some(obj),
         MethodKind::Classmethod => Some(class),
@@ -198,6 +220,11 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
 /// attributes of instances, not callables on the class, so they report an
 /// `AttributeError` here.
 fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
+    if method == "__new__" {
+        // `Cls.__new__(Cls)` allocates without running `__init__`. PyX has no
+        // custom `__new__` protocol; extra arguments are tolerated.
+        return value::instance_new(class);
+    }
     if argc > 0 && (argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>()) {
         return type_error(format!(
             "{}.{}() received {} argument(s) without an argument buffer",
@@ -216,6 +243,18 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
         }
         value::ClassEntry::Method(kind, function) => (kind, function),
     };
+    if matches!(kind, MethodKind::Classmethod | MethodKind::Staticmethod)
+        && !value::function_signature(function).is_empty()
+        && value::function_full_entry(function) != 0
+    {
+        let args = if argc == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: checked above; caller contract.
+            unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+        };
+        return call_user_method(class, class, kind, function, method, &args, &[]);
+    }
     let receiver = (kind == MethodKind::Classmethod).then_some(class);
     let mut call_args = Vec::with_capacity(argc + 1);
     call_args.extend(receiver);
@@ -247,6 +286,162 @@ fn native_instance_params(obj: i64, method: &str) -> Option<(&'static [&'static 
 
 /// Keyword arguments decoded from the `[name, value, ...]` buffer passed by
 /// generated code. Names are tagged strings.
+/// Runtime keyword binding for a generated user method.
+///
+/// The source signature is stored on the function value (all slots including
+/// the receiver). Positional arguments fill positional slots, a `*args` slot
+/// captures the remainder, keyword arguments fill positional/keyword-only
+/// slots by name, and unknown names go to `**kwargs`. Missing slots use the
+/// literal default or raise `TypeError`. The resulting full slot vector is
+/// forwarded through the generated uniform full-argv trampoline.
+/// Public wrapper used by class instantiation to bind constructor arguments
+/// through the same metadata path as method calls.
+pub(crate) fn call_user_method(
+    instance: i64,
+    class: i64,
+    kind: MethodKind,
+    function: i64,
+    method: &str,
+    args: &[i64],
+    keywords: &[(String, i64)],
+) -> i64 {
+    let keywords = KeywordArgs {
+        items: keywords.to_vec(),
+    };
+    call_user_method_kw(instance, class, kind, function, method, args, &keywords)
+}
+
+fn call_user_method_kw(
+    instance: i64,
+    class: i64,
+    kind: MethodKind,
+    function: i64,
+    method: &str,
+    args: &[i64],
+    keywords: &KeywordArgs,
+) -> i64 {
+    let signature = value::function_signature(function);
+    let entry = value::function_full_entry(function);
+    let receiver_name = value::class_display_name(class)
+        .unwrap_or("object")
+        .to_string();
+    let receiver_count = usize::from(kind != MethodKind::Staticmethod);
+    let mut slots: Vec<Option<i64>> = vec![None; signature.len()];
+    let receiver = match kind {
+        MethodKind::Normal | MethodKind::Property => Some(instance),
+        MethodKind::Classmethod => Some(class),
+        MethodKind::Staticmethod => None,
+    };
+    if let Some(receiver) = receiver {
+        if !slots.is_empty() {
+            // Normal methods bind the instance; classmethods bind the class.
+            slots[0] = Some(receiver);
+        }
+    }
+
+    let mut next_positional = 0usize;
+    let mut vararg_items: Vec<i64> = Vec::new();
+    for (index, param) in signature.iter().enumerate().skip(receiver_count) {
+        match param.kind {
+            ParamKind::Positional => {
+                if next_positional < args.len() {
+                    slots[index] = Some(args[next_positional]);
+                    next_positional += 1;
+                }
+            }
+            ParamKind::VarArg => {
+                vararg_items.extend_from_slice(&args[next_positional..]);
+                next_positional = args.len();
+            }
+            ParamKind::KwOnly | ParamKind::KwArg => {}
+        }
+    }
+    if next_positional < args.len() {
+        return type_error(format!(
+            "{receiver_name}.{method}() takes at most {} positional argument(s) ({} given)",
+            signature.len().saturating_sub(receiver_count),
+            args.len()
+        ));
+    }
+
+    let mut extra_keywords: Vec<(String, i64)> = Vec::new();
+    for (name, argument) in &keywords.items {
+        let mut matched = false;
+        for (index, param) in signature.iter().enumerate().skip(receiver_count) {
+            if param.kind != ParamKind::Positional && param.kind != ParamKind::KwOnly {
+                continue;
+            }
+            if param.name == *name {
+                if slots[index].is_some() {
+                    return type_error(format!(
+                        "{receiver_name}.{method}() got multiple values for argument '{name}'"
+                    ));
+                }
+                slots[index] = Some(*argument);
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            if signature.iter().any(|param| param.kind == ParamKind::KwArg) {
+                extra_keywords.push((name.clone(), *argument));
+            } else {
+                return type_error(format!(
+                    "{receiver_name}.{method}() got an unexpected keyword argument '{name}'"
+                ));
+            }
+        }
+    }
+
+    let vararg_index = signature
+        .iter()
+        .position(|param| param.kind == ParamKind::VarArg);
+    if let Some(index) = vararg_index {
+        slots[index] = Some(value::list_new(vararg_items));
+    }
+    let kwargs_index = signature
+        .iter()
+        .position(|param| param.kind == ParamKind::KwArg);
+    if let Some(index) = kwargs_index {
+        let pairs = extra_keywords
+            .iter()
+            .map(|(name, value)| (value::str_alloc(name.clone()), *value))
+            .collect();
+        slots[index] = Some(value::dict_new(pairs));
+    }
+
+    for (index, param) in signature.iter().enumerate().skip(receiver_count) {
+        if slots[index].is_some() {
+            continue;
+        }
+        match param.default {
+            Some(default) => slots[index] = Some(default),
+            None => {
+                return type_error(format!(
+                    "{receiver_name}.{method}() missing required argument '{}'",
+                    param.name
+                ))
+            }
+        }
+    }
+
+    let full: Vec<i64> = slots.into_iter().map(|slot| slot.unwrap_or(NONE)).collect();
+    if let Some(func) = value::as_function(function) {
+        if func.flags & (value::FUNCTION_FLAG_GENERATOR | value::FUNCTION_FLAG_ASYNC) != 0 {
+            if signature
+                .iter()
+                .all(|param| param.kind == ParamKind::Positional)
+            {
+                return builtins::call(function, full.len(), full.as_ptr());
+            }
+            return type_error(format!(
+                "{receiver_name}.{method}() cannot bind keywords for a generator"
+            ));
+        }
+    }
+    crate::core::builtins::call_full_entry(entry, &full)
+}
+
 pub(crate) struct KeywordArgs {
     pub(crate) items: Vec<(String, i64)>,
 }
@@ -402,7 +597,50 @@ pub(crate) fn call_kw(
     if value::as_arg_parser(obj).is_some() {
         return crate::modules::argparse::method_kw(obj, &method, &mut args, &keywords);
     }
+    if value::as_class(obj).is_some() {
+        if let Some(value::ClassEntry::Method(kind, function)) = value::class_lookup(obj, &method) {
+            if matches!(kind, MethodKind::Classmethod | MethodKind::Staticmethod)
+                && !value::function_signature(function).is_empty()
+                && value::function_full_entry(function) != 0
+            {
+                return call_user_method(obj, obj, kind, function, &method, &args, &keywords.items);
+            }
+        }
+        return keywords.reject("class", &method);
+    }
     if value::as_instance(obj).is_some() {
+        // Generated user methods carry full parameter metadata and a uniform
+        // full-argv trampoline. Bind all parameter kinds (including
+        // keyword-only slots and **kwargs) before falling back to the native
+        // class tables.
+        if let Some(state) = value::as_instance(obj) {
+            if let Some(value::ClassEntry::Method(kind, function)) =
+                value::class_lookup(state.class, &method)
+            {
+                if method == "add_column" {
+                    eprintln!(
+                        "ADD_COLUMN_META sig={} full={} kind={:?}",
+                        value::function_signature(function).len(),
+                        value::function_full_entry(function),
+                        kind
+                    );
+                }
+                if kind != MethodKind::Property
+                    && !value::function_signature(function).is_empty()
+                    && value::function_full_entry(function) != 0
+                {
+                    return call_user_method_kw(
+                        obj,
+                        state.class,
+                        kind,
+                        function,
+                        &method,
+                        &args,
+                        &keywords,
+                    );
+                }
+            }
+        }
         // Native class methods with declared parameter names bind keywords;
         // generated user methods have no names in this ABI.
         if let Some((params, min_args)) = native_instance_params(obj, &method) {
@@ -431,7 +669,7 @@ fn str_method_kw(
     keywords: &KeywordArgs,
 ) -> i64 {
     let (params, min_args): (&[&str], usize) = match method {
-        "split" => (&["sep", "maxsplit"], 0),
+        "split" | "rsplit" => (&["sep", "maxsplit"], 0),
         "splitlines" => (&["keepends"], 0),
         "replace" => (&["old", "new", "count"], 2),
         "startswith" => (&["prefix"], 1),
@@ -486,6 +724,53 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     if value::as_file(obj).is_some() {
         return file_attr(obj, &attr);
     }
+    if value::as_list(obj).is_some() {
+        if matches!(
+            attr.as_str(),
+            "append"
+                | "extend"
+                | "insert"
+                | "remove"
+                | "pop"
+                | "clear"
+                | "reverse"
+                | "copy"
+                | "count"
+                | "index"
+                | "sort"
+        ) {
+            return value::bound_method_new(obj, attr);
+        }
+        return attribute_error(obj, &attr);
+    }
+    if value::as_dict(obj).is_some() {
+        if matches!(
+            attr.as_str(),
+            "get"
+                | "keys"
+                | "values"
+                | "items"
+                | "pop"
+                | "update"
+                | "clear"
+                | "copy"
+                | "__getitem__"
+                | "__setitem__"
+                | "__contains__"
+                | "__len__"
+        ) {
+            return value::bound_method_new(obj, attr);
+        }
+        return attribute_error(obj, &attr);
+    }
+    if value::as_set(obj).is_some() {
+        // Native bound method values cover read-only set operations used as
+        // callbacks (`_SINGLE_CELLS.issuperset` in rich).
+        if matches!(attr.as_str(), "issubset" | "issuperset") {
+            return value::bound_method_new(obj, attr);
+        }
+        return attribute_error(obj, &attr);
+    }
     if value::as_thread(obj).is_some() {
         return thread_attr(obj, &attr);
     }
@@ -514,12 +799,24 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         return attribute_error(obj, &attr);
     }
     if value::as_pattern(obj).is_some() {
+        if matches!(
+            attr.as_str(),
+            "search" | "match" | "fullmatch" | "findall" | "finditer" | "sub" | "split"
+        ) {
+            return value::bound_method_new(obj, attr);
+        }
         if let Some(result) = crate::modules::re::pattern_attr(obj, &attr) {
             return result;
         }
         return attribute_error(obj, &attr);
     }
     if let Some(state) = value::as_instance(obj) {
+        if attr == "__dict__" {
+            return match value::instance_dict(obj) {
+                Some(pairs) => value::dict_new(pairs),
+                None => attribute_error(obj, &attr),
+            };
+        }
         // `__class__` is a data descriptor on every Python object, so it wins
         // over an instance attribute of the same name.
         if attr == "__class__" {
@@ -537,7 +834,13 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 let args = [obj];
                 return builtins::call(function, 1, args.as_ptr());
             }
-            Some(value::ClassEntry::Method(_, _)) | None => {}
+            Some(value::ClassEntry::Method(_, _)) => {
+                // Reading `obj.method` yields a callable bound to the
+                // receiver instead of raising; Python libraries store such
+                // callbacks (`datetime.now`, `self.render`).
+                return value::bound_method_new(obj, attr);
+            }
+            None => {}
         }
         return attribute_error(obj, &attr);
     }
@@ -547,8 +850,16 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         if attr == "__name__" {
             return value::str_alloc(class.name.clone());
         }
-        if let Some(value::ClassEntry::Attr(value)) = value::class_lookup(obj, &attr) {
-            return value;
+        if attr == "__new__" && value::class_lookup(obj, "__new__").is_none() {
+            return value::bound_method_new(obj, attr);
+        }
+        match value::class_lookup(obj, &attr) {
+            Some(value::ClassEntry::Attr(value)) => return value,
+            Some(value::ClassEntry::Method(MethodKind::Property, _)) => {}
+            Some(value::ClassEntry::Method(_, _)) => {
+                return value::bound_method_new(obj, attr);
+            }
+            None => {}
         }
         return attribute_error(obj, &attr);
     }
@@ -583,6 +894,12 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
         return attribute_error(obj, "");
     };
     if value::as_instance(obj).is_some() {
+        if attr == "__dict__" {
+            if value::instance_set_dict(obj, new_value) {
+                return NONE;
+            }
+            return type_error("__dict__ must be set to a dict".to_string());
+        }
         value::instance_setattr(obj, attr, new_value);
         return NONE;
     }
@@ -878,6 +1195,44 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
             };
             str_list(parts)
         }
+        "rsplit" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 2) {
+                return err;
+            }
+            let maxsplit = match args.get(1).copied() {
+                None => -1,
+                Some(arg) => match int_arg(arg) {
+                    Ok(n) => n,
+                    Err(err) => return err,
+                },
+            };
+            let parts: Vec<String> = if args.is_empty() || args[0] == NONE {
+                split_whitespace_limit(&s, maxsplit)
+            } else {
+                let Some(sep) = value::as_str(args[0]) else {
+                    return type_error(format!(
+                        "must be str or None, not {}",
+                        value::type_name(args[0])
+                    ));
+                };
+                let sep = sep.to_string();
+                if sep.is_empty() {
+                    return exc::raise_with_message(VALUE_ERROR, "empty separator");
+                }
+                if maxsplit < 0 {
+                    s.rsplit(sep.as_str()).map(str::to_owned).collect()
+                } else {
+                    let limit = usize::try_from(maxsplit)
+                        .unwrap_or(usize::MAX - 1)
+                        .saturating_add(1);
+                    let mut parts: Vec<String> =
+                        s.rsplitn(limit, sep.as_str()).map(str::to_owned).collect();
+                    parts.reverse();
+                    parts
+                }
+            };
+            str_list(parts)
+        }
         "join" => {
             if let Some(err) = check_arity("str", method, args.len(), 1, 1) {
                 return err;
@@ -901,6 +1256,39 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
                 out.push_str(part);
             }
             value::str_alloc(out)
+        }
+        "partition" | "rpartition" => {
+            if let Some(err) = check_arity("str", method, args.len(), 1, 1) {
+                return err;
+            }
+            let Some(sep) = value::as_str(args[0]) else {
+                return type_error(format!("must be str, not {}", value::type_name(args[0])));
+            };
+            if sep.is_empty() {
+                return exc::raise_with_message(VALUE_ERROR, "empty separator");
+            }
+            let split = if method == "partition" {
+                s.find(sep)
+            } else {
+                s.rfind(sep)
+            };
+            match split {
+                Some(index) => value::tuple_new(vec![
+                    value::str_alloc(s[..index].to_string()),
+                    value::str_alloc(sep.to_string()),
+                    value::str_alloc(s[index + sep.len()..].to_string()),
+                ]),
+                None if method == "partition" => value::tuple_new(vec![
+                    value::str_alloc(s),
+                    value::str_alloc(String::new()),
+                    value::str_alloc(String::new()),
+                ]),
+                None => value::tuple_new(vec![
+                    value::str_alloc(String::new()),
+                    value::str_alloc(String::new()),
+                    value::str_alloc(s),
+                ]),
+            }
         }
         "splitlines" => {
             if let Some(err) = check_arity("str", method, args.len(), 0, 1) {
@@ -1638,15 +2026,13 @@ fn list_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_arity("list", method, args.len(), 1, 1) {
                 return err;
             }
-            let Some(source) = value::as_list(args[0]) else {
-                return type_error(format!(
-                    "'{}' object is not iterable",
-                    value::type_name(args[0])
-                ));
+            // Any iterable is accepted; copy first because `xs.extend(xs)`
+            // must see the original items and the mutable borrow below must
+            // never alias the source.
+            let copied = match iterable_values(args[0]) {
+                Ok(values) => values,
+                Err(err) => return err,
             };
-            // Copy first: `xs.extend(xs)` must see the original items, and the
-            // mutable borrow below must never alias `source`.
-            let copied: Vec<i64> = source.to_vec();
             if let Some(mut items) = value::list_items_mut(obj) {
                 for item in copied {
                     items.push(item);
@@ -1827,6 +2213,109 @@ fn tuple_method(obj: i64, method: &str, args: &[i64]) -> i64 {
 // set
 // -------------------------------------------------------------------------
 
+/// `s.issuperset(other)` / `s.issubset(other)` for iterable operands.
+fn set_relation(obj: i64, other: i64, superset: bool) -> i64 {
+    let Some(items) = value::as_set(obj) else {
+        return attribute_error(obj, "issuperset");
+    };
+    let receiver = items.to_vec();
+    if superset {
+        match iterable_elements(other) {
+            Ok(elements) => {
+                if elements
+                    .into_iter()
+                    .all(|item| container::set_contains(&receiver, item))
+                {
+                    value::TRUE
+                } else {
+                    value::FALSE
+                }
+            }
+            Err(err) => err,
+        }
+    } else {
+        let other_items = match value::as_set(other)
+            .or_else(|| value::as_list(other))
+            .or_else(|| value::as_tuple(other))
+        {
+            Some(items) => items.to_vec(),
+            None => {
+                return type_error(format!(
+                    "'{}' object is not iterable",
+                    value::type_name(other)
+                ))
+            }
+        };
+        if receiver
+            .iter()
+            .all(|item| container::set_contains(&other_items, *item))
+        {
+            value::TRUE
+        } else {
+            value::FALSE
+        }
+    }
+}
+
+/// Extracts iteration values for set relations. Characters of a string and
+/// byte values are materialised one at a time; each temporary stays live on
+/// the caller's stack while the membership check runs.
+fn iterable_elements(value: i64) -> Result<Vec<i64>, i64> {
+    if let Some(items) = value::as_list(value)
+        .or_else(|| value::as_tuple(value))
+        .or_else(|| value::as_set(value))
+    {
+        return Ok(items.to_vec());
+    }
+    if let Some(text) = value::as_str(value) {
+        return Ok(text
+            .chars()
+            .map(|ch| value::str_alloc(ch.to_string()))
+            .collect());
+    }
+    if let Some(bytes) = value::as_bytes(value) {
+        return Ok(bytes
+            .iter()
+            .map(|byte| crate::ops::int_result(*byte as i64))
+            .collect());
+    }
+    if let Some(pairs) = value::as_dict(value) {
+        return Ok(pairs.iter().map(|(key, _)| *key).collect());
+    }
+    Err(type_error(format!(
+        "'{}' object is not iterable",
+        value::type_name(value)
+    )))
+}
+
+/// Materialises any iterable into a list of tagged values. Errors are returned
+/// as a pending-exception value from the iterator.
+fn iterable_values(value: i64) -> Result<Vec<i64>, i64> {
+    if let Some(items) = value::as_list(value)
+        .or_else(|| value::as_tuple(value))
+        .or_else(|| value::as_set(value))
+    {
+        return Ok(items.to_vec());
+    }
+    let iterator = crate::core::iter::iter_new(value);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    let mut out = Vec::new();
+    loop {
+        let mut item = NONE;
+        let produced = crate::core::iter::iter_next(iterator, &mut item);
+        if produced == 0 {
+            if exc::pending() {
+                return Err(NONE);
+            }
+            break;
+        }
+        out.push(item);
+    }
+    Ok(out)
+}
+
 fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     match method {
         "add" => {
@@ -1882,6 +2371,12 @@ fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 }
             }
             result
+        }
+        "issuperset" | "issubset" => {
+            if let Some(err) = check_arity("set", method, args.len(), 1, 1) {
+                return err;
+            }
+            set_relation(obj, args[0], method == "issuperset")
         }
         "union" => {
             if let Some(err) = check_arity("set", method, args.len(), 1, 1) {
@@ -1940,6 +2435,34 @@ fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
 
 fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     match method {
+        "__getitem__" => {
+            if let Some(err) = check_arity("dict", method, args.len(), 1, 1) {
+                return err;
+            }
+            container::subscript(obj, args[0])
+        }
+        "__setitem__" => {
+            if let Some(err) = check_arity("dict", method, args.len(), 2, 2) {
+                return err;
+            }
+            container::subscript_set(obj, args[0], args[1])
+        }
+        "__contains__" => {
+            if let Some(err) = check_arity("dict", method, args.len(), 1, 1) {
+                return err;
+            }
+            if let Some(err) = check_hashable(args[0]) {
+                return err;
+            }
+            let found = value::as_dict_data(obj).is_some_and(|dict| dict.find(args[0]).is_some());
+            value::bool_value(found)
+        }
+        "__len__" => {
+            if let Some(err) = check_arity("dict", method, args.len(), 0, 0) {
+                return err;
+            }
+            crate::ops::int_result(value::as_dict(obj).map_or(0, |pairs| pairs.len() as i64))
+        }
         "get" => {
             if let Some(err) = check_arity("dict", method, args.len(), 1, 2) {
                 return err;
@@ -2024,6 +2547,13 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             }
             NONE
         }
+        "copy" => {
+            if let Some(err) = check_arity("dict", method, args.len(), 0, 0) {
+                return err;
+            }
+            let pairs = value::as_dict(obj).unwrap_or(&[]).to_vec();
+            value::dict_new(pairs)
+        }
         "clear" => {
             if let Some(err) = check_arity("dict", method, args.len(), 0, 0) {
                 return err;
@@ -2081,6 +2611,22 @@ fn lock_method(obj: i64, method: &str, args: &[i64]) -> i64 {
         return attribute_error(obj, method);
     };
     match method {
+        "__enter__" => {
+            if let Some(err) = check_arity("lock", method, args.len(), 0, 0) {
+                return err;
+            }
+            lock.acquire(true);
+            obj
+        }
+        "__exit__" => {
+            if let Some(err) = check_arity("lock", method, args.len(), 3, 3) {
+                return err;
+            }
+            if !lock.release() {
+                return exc::raise_with_message(RUNTIME_ERROR, "release unlocked lock");
+            }
+            NONE
+        }
         "acquire" => {
             if let Some(err) = check_arity("lock", method, args.len(), 0, 1) {
                 return err;

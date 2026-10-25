@@ -803,6 +803,36 @@ pub(crate) fn add_thread_root(value: i64) {
     }
 }
 
+/// Pushes `values` onto the calling thread's out-of-stack roots and returns a
+/// marker for [`release_roots`]. Used by container builders whose payloads
+/// live in Rust heap memory that the conservative collector cannot scan.
+pub(crate) fn root_values(values: &[i64]) -> usize {
+    if let Some(gc) = current_gc() {
+        let mut roots = gc
+            .roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let start = roots.len();
+        roots.extend_from_slice(values);
+        start
+    } else {
+        0
+    }
+}
+
+/// Drops the roots added since `start`.
+pub(crate) fn release_roots(start: usize) {
+    if let Some(gc) = current_gc() {
+        let mut roots = gc
+            .roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if start <= roots.len() {
+            roots.truncate(start);
+        }
+    }
+}
+
 /// Locks the shared heap, ignoring poisoning: a panic in user code must not
 /// make the process unable to allocate. The registry is always consistent
 /// because no user code runs while the lock is held.
@@ -1887,35 +1917,45 @@ unsafe fn trace(addr: usize) {
                 // Wrapper functions own their captured values; item getters
                 // own their keys and partials own the callable and bound
                 // arguments. Names of attribute getters are plain strings.
-                ObjData::Function(function) => match &function.body {
-                    FunctionBody::Wrapper { captures, .. } => {
-                        for &capture in captures {
-                            mark_value(capture);
+                ObjData::Function(function) => {
+                    for param in &function.signature {
+                        if let Some(default) = param.default {
+                            mark_value(default);
                         }
                     }
-                    FunctionBody::ItemGetter { keys } => {
-                        for &key in keys {
-                            mark_value(key);
+                    match &function.body {
+                        FunctionBody::Wrapper { captures, .. } => {
+                            for &capture in captures {
+                                mark_value(capture);
+                            }
                         }
+                        FunctionBody::ItemGetter { keys } => {
+                            for &key in keys {
+                                mark_value(key);
+                            }
+                        }
+                        FunctionBody::Partial {
+                            function: inner,
+                            args,
+                            keywords,
+                        } => {
+                            mark_value(*inner);
+                            for &arg in args {
+                                mark_value(arg);
+                            }
+                            for (_, value) in keywords {
+                                mark_value(*value);
+                            }
+                        }
+                        FunctionBody::BoundMethod { receiver, .. } => {
+                            mark_value(*receiver);
+                        }
+                        FunctionBody::AttributeGetter { .. }
+                        | FunctionBody::Identity
+                        | FunctionBody::Native { .. }
+                        | FunctionBody::Builtin(_) => {}
                     }
-                    FunctionBody::Partial {
-                        function: inner,
-                        args,
-                        keywords,
-                    } => {
-                        mark_value(*inner);
-                        for &arg in args {
-                            mark_value(arg);
-                        }
-                        for (_, value) in keywords {
-                            mark_value(*value);
-                        }
-                    }
-                    FunctionBody::AttributeGetter { .. }
-                    | FunctionBody::Identity
-                    | FunctionBody::Native { .. }
-                    | FunctionBody::Builtin(_) => {}
-                },
+                }
                 // The explicit cause (`raise X from Y`) is a GC edge; `from
                 // None` stores no cause.
                 ObjData::Exception(exception) => {

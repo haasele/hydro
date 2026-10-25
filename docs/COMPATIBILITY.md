@@ -37,16 +37,16 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 13 | 39 |
-| pure | 174 | 41 | 133 |
+| pure | 174 | 42 | 132 |
 | extension | 63 | 4 | 59 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 58 | 239 |
+| **Total** | 297 | 59 | 238 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:PYX0002 | 230 |
+| compile_error:PYX0002 | 229 |
 | cpython_failed | 9 |
 
 ## Modules by layer
@@ -153,7 +153,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `compression` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'compression' not found: not supported on the import search path |
 | `concurrent` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'concurrent' not found: not supported on the import search path |
 | `configparser` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'configparser' not found: not supported on the import search path |
-| `contextlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'contextlib' not found: not supported on the import search path |
+| `contextlib` | ok | ok | ok | - |
 | `contextvars` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'contextvars' not found: not supported on the import search path |
 | `copy` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'copy' not found: not supported on the import search path |
 | `copyreg` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'copyreg' not found: not supported on the import search path |

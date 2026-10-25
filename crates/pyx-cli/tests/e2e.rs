@@ -2949,6 +2949,38 @@ fn typing_alias_subscripts_are_runtime_values() {
 }
 
 #[test]
+fn user_dunders_and_defaults_are_dispatched() {
+    let dir = TestDir::new("user-dunders");
+    let program = dir.path().join("dunders.py");
+    std::fs::write(
+        &program,
+        concat!(
+            "class C:\n",
+            "    def __init__(self, x=3):\n",
+            "        self.x = x\n",
+            "    def __call__(self, y=1):\n",
+            "        return self.x + y\n",
+            "    def __len__(self):\n",
+            "        return self.x\n",
+            "    def __contains__(self, value):\n",
+            "        return value == self.x\n",
+            "    def __str__(self):\n",
+            "        return 'C'\n",
+            "    def __add__(self, other):\n",
+            "        return self.x + other\n",
+            "c = C()\n",
+            "print(c(), len(c), 3 in c, str(c), c + 2)\n",
+        ),
+    )
+    .expect("failed to write temp program");
+    let program = program.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &program]);
+
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(stdout, "4 3 True C 5\n");
+}
+
+#[test]
 fn uncaught_system_exit_and_input_eof_fail_with_a_traceback() {
     let dir = TestDir::new("console-errors");
     let system_exit = dir.path().join("system_exit.py");

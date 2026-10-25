@@ -282,6 +282,18 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
         MethodSig::new(0, 2, &[ArgKind::Str, ArgKind::Int], Type::List),
     ),
     (
+        "rsplit",
+        MethodSig::new(0, 2, &[ArgKind::Str, ArgKind::Int], Type::List),
+    ),
+    (
+        "partition",
+        MethodSig::new(1, 1, &[ArgKind::Str], Type::Tuple),
+    ),
+    (
+        "rpartition",
+        MethodSig::new(1, 1, &[ArgKind::Str], Type::Tuple),
+    ),
+    (
         "splitlines",
         MethodSig::new(0, 1, &[ArgKind::Any], Type::List),
     ),
@@ -1673,6 +1685,28 @@ impl<'a> Checker<'a> {
                 self.force_any(expr.ty);
             }
             HExprKind::Call { callee, args } => self.check_call(expr, callee, args, f),
+            HExprKind::CallKw {
+                callee,
+                args,
+                keywords,
+            } => {
+                self.check_expr(callee, f);
+                for arg in args {
+                    self.check_expr(arg, f);
+                }
+                for (_, value) in keywords {
+                    self.check_expr(value, f);
+                }
+                self.force_any(expr.ty);
+            }
+            HExprKind::ClassCall { class, args, .. } => {
+                self.check_expr(class, f);
+                for arg in args {
+                    self.check_expr(arg, f);
+                }
+                // The class constructor's result has no static type.
+                self.force_any(expr.ty);
+            }
             HExprKind::DeferredCall { callee, args } => {
                 // Operands are still type-checked; the call itself only fails
                 // when it executes.
@@ -3340,6 +3374,10 @@ fn emit_function(function: &HFunction, inf: &mut Infer) -> IrFunction {
             name: p.name.clone(),
             ty: inf.type_of(p.ty),
             default: p.default.clone(),
+            default_expr: p
+                .default_expr
+                .as_ref()
+                .map(|value| Box::new(emit_expr(value, inf))),
             kind: p.kind,
         })
         .collect();
@@ -3760,6 +3798,37 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
         HExprKind::Call { callee, args } => ExprKind::Call {
             callee: callee.clone(),
             args: args.iter().map(|a| emit_expr(a, inf)).collect(),
+        },
+        HExprKind::CallKw {
+            callee,
+            args,
+            keywords,
+        } => ExprKind::CallKw {
+            callee: Box::new(emit_expr(callee, inf)),
+            args: args.iter().map(|a| emit_expr(a, inf)).collect(),
+            keywords: keywords
+                .iter()
+                .map(|(name, value)| (name.clone(), emit_expr(value, inf)))
+                .collect(),
+        },
+        HExprKind::ClassCall {
+            class,
+            init,
+            args,
+            dynamic_kwargs,
+            param_names,
+            kwarg_index,
+            class_name,
+        } => ExprKind::ClassCall {
+            class: Box::new(emit_expr(class, inf)),
+            init: *init,
+            args: args.iter().map(|a| emit_expr(a, inf)).collect(),
+            dynamic_kwargs: dynamic_kwargs
+                .as_ref()
+                .map(|value| Box::new(emit_expr(value, inf))),
+            param_names: param_names.clone(),
+            kwarg_index: *kwarg_index,
+            class_name: class_name.clone(),
         },
         HExprKind::DeferredCall { callee, args } => ExprKind::DeferredCall {
             callee: callee

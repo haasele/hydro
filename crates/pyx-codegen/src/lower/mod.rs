@@ -131,6 +131,7 @@ struct Runtime {
     function_new: FuncId,
     closure_new: FuncId,
     function_params: FuncId,
+    function_meta: FuncId,
     coroutine_new: FuncId,
     generator_new: FuncId,
     await_value: FuncId,
@@ -172,10 +173,16 @@ struct Runtime {
     setattr: FuncId,
     delete_attr: FuncId,
     class_new: FuncId,
+    /// Allocates an instance without calling `__init__` (class-call lowering
+    /// invokes the concrete initializer itself).
+    instance_new: FuncId,
+    /// Routes a dynamic `**mapping` into class-constructor slots.
+    bind_class_kwargs: FuncId,
     /// Hidden ABI: the cached native class object of a built-in exception.
     exception_class: FuncId,
     method: FuncId,
     method_kw: FuncId,
+    call_kw: FuncId,
     method_star: FuncId,
     iter_new: FuncId,
     iter_next: FuncId,
@@ -272,6 +279,12 @@ impl Runtime {
                 module,
                 "pyx_function_params",
                 &[i64t, ptr, ptr],
+                Some(i64t),
+            )?,
+            function_meta: declare_runtime(
+                module,
+                "pyx_function_meta",
+                &[i64t, i64t, ptr, ptr, ptr, ptr, ptr],
                 Some(i64t),
             )?,
             // `entry` is the `__pyx_wrap_N` trampoline address passed as an
@@ -459,6 +472,13 @@ impl Runtime {
                 &[ptr, ptr, i64t, ptr, ptr, ptr, ptr, ptr, ptr, ptr],
                 Some(i64t),
             )?,
+            instance_new: declare_runtime(module, "pyx_instance_new", &[i64t], Some(i64t))?,
+            bind_class_kwargs: declare_runtime(
+                module,
+                "pyx_bind_class_kwargs",
+                &[i64t, ptr, ptr, ptr, i64t, ptr, ptr],
+                Some(i64t),
+            )?,
             // `tag` is a `uint32_t`; the runtime returns the cached native
             // class object for that built-in exception.
             exception_class: declare_runtime(module, "pyx_exception_class", &[i32t], Some(i64t))?,
@@ -475,6 +495,12 @@ impl Runtime {
                 module,
                 "pyx_method_kw",
                 &[i64t, ptr, ptr, ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
+            call_kw: declare_runtime(
+                module,
+                "pyx_call_kw",
+                &[i64t, ptr, ptr, ptr, ptr],
                 Some(i64t),
             )?,
             // `name_len` and `kwargc` are pointer-width; `star` is the tagged
@@ -580,6 +606,19 @@ pub(crate) fn lower_program<M: Module>(
         wrappers.insert(index as FunctionId, id);
     }
 
+    // Uniform `(argv) -> i64` trampolines that forward every declared
+    // parameter slot. Runtime keyword binding builds the full slot vector and
+    // calls these, bypassing the generated default/vararg binder.
+    let mut full_wrappers: HashMap<FunctionId, FuncId> = HashMap::new();
+    for index in 0..program.functions.len() {
+        let signature = make_signature(module, &[ptr_ty], Some(types::I64));
+        let name = format!("__pyx_full_{index}");
+        let id = module
+            .declare_function(&name, Linkage::Local, &signature)
+            .map_err(|e| module_error(&format!("cannot declare full wrapper {name}"), e))?;
+        full_wrappers.insert(index as FunctionId, id);
+    }
+
     let pyx_main_sig = make_signature(module, &[], Some(types::I32));
     let pyx_main = module
         .declare_function("pyx_main", Linkage::Export, &pyx_main_sig)
@@ -589,18 +628,6 @@ pub(crate) fn lower_program<M: Module>(
     let c_main = module
         .declare_function("main", Linkage::Export, &main_sig)
         .map_err(|e| module_error("cannot declare main", e))?;
-
-    for (index, function) in program.functions.iter().enumerate() {
-        lower_function(
-            module,
-            program,
-            function,
-            index as FunctionId,
-            &symbols,
-            &wrappers,
-            &runtime,
-        )?;
-    }
 
     for (index, function) in program.functions.iter().enumerate() {
         define_wrapper(
@@ -617,12 +644,36 @@ pub(crate) fn lower_program<M: Module>(
         )?;
     }
 
+    for (index, function) in program.functions.iter().enumerate() {
+        define_full_wrapper(
+            module,
+            function,
+            index as FunctionId,
+            &symbols,
+            &full_wrappers,
+        )?;
+    }
+
+    for (index, function) in program.functions.iter().enumerate() {
+        lower_function(
+            module,
+            program,
+            function,
+            index as FunctionId,
+            &symbols,
+            &wrappers,
+            &full_wrappers,
+            &runtime,
+        )?;
+    }
+
     build_pyx_main(module, program, pyx_main, &symbols, &wrappers, &runtime)?;
     build_c_main(module, c_main, pyx_main)?;
 
     Ok(pyx_main)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_function<M: Module>(
     module: &mut M,
     program: &Program,
@@ -630,6 +681,7 @@ fn lower_function<M: Module>(
     index: FunctionId,
     symbols: &HashMap<FunctionId, FuncId>,
     wrappers: &HashMap<FunctionId, FuncId>,
+    full_wrappers: &HashMap<FunctionId, FuncId>,
     runtime: &Runtime,
 ) -> Result<(), CodegenError> {
     let func_id = *symbols.get(&index).ok_or_else(|| {
@@ -649,7 +701,15 @@ fn lower_function<M: Module>(
         let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
         let ptr_ty = module.target_config().pointer_type();
         let mut lower = Lower::new(
-            module, program, function, symbols, wrappers, runtime, builder, ptr_ty,
+            module,
+            program,
+            function,
+            symbols,
+            wrappers,
+            full_wrappers,
+            runtime,
+            builder,
+            ptr_ty,
         );
         lower.run()?;
         lower.finish();
@@ -733,6 +793,63 @@ fn define_wrapper<M: Module>(
         .map_err(|e| module_error(&format!("cannot define wrapper {index}"), e))
 }
 
+/// Defines the uniform `(argv: ptr) -> i64` trampoline used by runtime
+/// keyword binding. It forwards exactly one value per declared parameter.
+fn define_full_wrapper<M: Module>(
+    module: &mut M,
+    function: &Function,
+    index: FunctionId,
+    symbols: &HashMap<FunctionId, FuncId>,
+    full_wrappers: &HashMap<FunctionId, FuncId>,
+) -> Result<(), CodegenError> {
+    let ptr_ty = module.target_config().pointer_type();
+    let wrapper = *full_wrappers.get(&index).ok_or_else(|| {
+        CodegenError::new(format!(
+            "internal error: full wrapper {index} was not declared"
+        ))
+    })?;
+    let target = *symbols.get(&index).ok_or_else(|| {
+        CodegenError::new(format!("internal error: function {index} was not declared"))
+    })?;
+
+    let mut ctx = module.make_context();
+    ctx.func.signature = make_signature(module, &[ptr_ty], Some(types::I64));
+    let mut builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let argv = *builder.block_params(entry).first().ok_or_else(|| {
+            CodegenError::new(format!(
+                "internal error: full wrapper {index} has no argv parameter"
+            ))
+        })?;
+        let mut values = Vec::with_capacity(function.params.len());
+        for position in 0..function.params.len() {
+            let offset = wrapper_arg_offset(index, position)?;
+            values.push(
+                builder
+                    .ins()
+                    .load(types::I64, MemFlags::new(), argv, offset),
+            );
+        }
+        let reference = declare_ref(module, &mut builder, target);
+        let call = builder.ins().call(reference, &values);
+        let result = builder.inst_results(call).first().copied().ok_or_else(|| {
+            CodegenError::new(format!(
+                "internal error: full wrapper {index} target returned no value"
+            ))
+        })?;
+        builder.ins().return_(&[result]);
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+    module
+        .define_function(wrapper, &mut ctx)
+        .map_err(|e| module_error(&format!("cannot define full wrapper {index}"), e))
+}
+
 /// Byte offset of argument slot `position` in a wrapper's `argv` buffer.
 fn wrapper_arg_offset(index: FunctionId, position: usize) -> Result<i32, CodegenError> {
     position
@@ -789,6 +906,38 @@ fn wrapper_const<M: Module>(
             let len_value = builder.ins().iconst(types::I64, len as i64);
             let len = as_pointer_width(builder, ptr_ty, len_value);
             call_val_extern(module, builder, runtime.bytes_new, &[ptr, len])
+        }
+        Const::Global {
+            module: module_name,
+            name: global_name,
+        } => {
+            let (module_slot, module_len) = make_bytes_slot(builder, module_name.as_bytes())?;
+            let (name_slot, name_len) = make_bytes_slot(builder, global_name.as_bytes())?;
+            let module_ptr = builder.ins().stack_addr(ptr_ty, module_slot, 0);
+            let module_len = builder.ins().iconst(ptr_ty, module_len as i64);
+            let name_ptr = builder.ins().stack_addr(ptr_ty, name_slot, 0);
+            let name_len = builder.ins().iconst(ptr_ty, name_len as i64);
+            call_val_extern(
+                module,
+                builder,
+                runtime.global_get,
+                &[module_ptr, module_len, name_ptr, name_len],
+            )
+        }
+        Const::Tuple(items) => {
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (items.len() * 8) as u32,
+                3,
+            ));
+            for (index, item) in items.iter().enumerate() {
+                let value = wrapper_const(module, builder, ptr_ty, runtime, item)?;
+                builder.ins().stack_store(value, slot, (index * 8) as i32);
+            }
+            let ptr = builder.ins().stack_addr(ptr_ty, slot, 0);
+            let len = builder.ins().iconst(types::I64, items.len() as i64);
+            let len = as_pointer_width(builder, ptr_ty, len);
+            call_val_extern(module, builder, runtime.tuple_new, &[len, ptr])
         }
     })
 }
@@ -968,6 +1117,7 @@ struct Lower<'a, 'b, M: Module> {
     name: &'a str,
     symbols: &'a HashMap<FunctionId, FuncId>,
     wrappers: &'a HashMap<FunctionId, FuncId>,
+    full_wrappers: &'a HashMap<FunctionId, FuncId>,
     runtime: &'a Runtime,
     builder: FunctionBuilder<'b>,
     ptr_ty: ir::Type,
@@ -1004,6 +1154,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         function: &'a Function,
         symbols: &'a HashMap<FunctionId, FuncId>,
         wrappers: &'a HashMap<FunctionId, FuncId>,
+        full_wrappers: &'a HashMap<FunctionId, FuncId>,
         runtime: &'a Runtime,
         builder: FunctionBuilder<'b>,
         ptr_ty: ir::Type,
@@ -1019,6 +1170,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             name: &function.name,
             symbols,
             wrappers,
+            full_wrappers,
             runtime,
             builder,
             ptr_ty,
@@ -3112,6 +3264,28 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.lower_indirect_call(callee, args, star.as_deref())
             }
             ExprKind::Call { callee, args } => self.lower_call(callee, args),
+            ExprKind::CallKw {
+                callee,
+                args,
+                keywords,
+            } => self.lower_call_kw(callee, args, keywords),
+            ExprKind::ClassCall {
+                class,
+                init,
+                args,
+                dynamic_kwargs,
+                param_names,
+                kwarg_index,
+                class_name,
+            } => self.lower_class_call(
+                class,
+                *init,
+                args,
+                dynamic_kwargs.as_deref(),
+                param_names,
+                *kwarg_index,
+                class_name,
+            ),
             ExprKind::DeferredCall { callee, args } => {
                 self.lower_deferred_call(callee.as_deref(), args)
             }
@@ -3875,6 +4049,20 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             }
             Const::Str(text) => self.str_const(text),
             Const::Bytes(bytes) => self.bytes_const(bytes),
+            Const::Global { module, name } => self.lower_global_get(module, name),
+            Const::Tuple(items) => {
+                let slot = self.stack_array_slot(items.len(), "literal tuple default")?;
+                for (index, item) in items.iter().enumerate() {
+                    let value = self.lower_const(item)?;
+                    self.builder
+                        .ins()
+                        .stack_store(value, slot, (index * 8) as i32);
+                }
+                let ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+                let len = self.builder.ins().iconst(self.ptr_ty, items.len() as i64);
+                let id = self.runtime.tuple_new;
+                self.call_rt(id, &[len, ptr])
+            }
         }
     }
 
@@ -3908,10 +4096,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let name = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
         let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
         let flags = self.function_flags(function);
-        let id = self.runtime.function_new;
-        let result = self.call_rt(id, &[wrapper_address, arity, name, name_len, flags])?;
+        let call_id = self.runtime.function_new;
+        let result = self.call_rt(call_id, &[wrapper_address, arity, name, name_len, flags])?;
         self.emit_exc_check()?;
-        let result = self.attach_function_params(result, function)?;
+        let result = self.attach_function_signature(result, function, id)?;
         Ok(result)
     }
 
@@ -3923,6 +4111,96 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// have no positional slot and are therefore not listed; a dynamic
     /// signature is skipped entirely because its calls take the count-prefixed
     /// buffer the runtime cannot bind by name.
+    /// Attaches full parameter metadata and the full-argv trampoline to a
+    /// generated function value for runtime keyword binding.
+    fn attach_function_signature(
+        &mut self,
+        value: Value,
+        function: &'a Function,
+        id: FunctionId,
+    ) -> Result<Value, CodegenError> {
+        let full_wrapper = *self.full_wrappers.get(&id).ok_or_else(|| {
+            CodegenError::new(format!("full wrapper for function {id} was not declared"))
+        })?;
+        let reference = self.func_ref(full_wrapper);
+        let address = self.builder.ins().func_addr(self.ptr_ty, reference);
+        let address = self.pointer_to_i64(address);
+        let count = function.params.len();
+        let names = self.stack_array_slot(count * 2, "function parameter names")?;
+        let kinds = self.stack_array_slot(count, "function parameter kinds")?;
+        let defaults = self.stack_array_slot(count, "function parameter defaults")?;
+        let flags = self.stack_array_slot(count, "function parameter default flags")?;
+        for (index, param) in function.params.iter().enumerate() {
+            let (name_slot, name_len) = make_bytes_slot(&mut self.builder, param.name.as_bytes())?;
+            let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+            let name_ptr = self.pointer_to_i64(name_ptr);
+            self.builder
+                .ins()
+                .stack_store(name_ptr, names, (index * 16) as i32);
+            let len = self.builder.ins().iconst(types::I64, name_len as i64);
+            self.builder
+                .ins()
+                .stack_store(len, names, (index * 16 + 8) as i32);
+            let kind = match param.kind {
+                ParamKind::Positional => 0,
+                ParamKind::VarArg => 1,
+                ParamKind::KwOnly => 2,
+                ParamKind::KwArg => 3,
+            };
+            let kind = self.builder.ins().iconst(types::I64, kind);
+            self.builder
+                .ins()
+                .stack_store(kind, kinds, (index * 8) as i32);
+            let default = match &param.default_expr {
+                Some(expression) => Some(self.lower_expr(expression)?),
+                None => match &param.default {
+                    Some(default) => Some(self.lower_const(default)?),
+                    None => None,
+                },
+            };
+            match default {
+                Some(value) => {
+                    self.builder
+                        .ins()
+                        .stack_store(value, defaults, (index * 8) as i32);
+                    let one = self.builder.ins().iconst(types::I64, 1);
+                    self.builder
+                        .ins()
+                        .stack_store(one, flags, (index * 8) as i32);
+                }
+                None => {
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.builder
+                        .ins()
+                        .stack_store(zero, defaults, (index * 8) as i32);
+                    self.builder
+                        .ins()
+                        .stack_store(zero, flags, (index * 8) as i32);
+                }
+            }
+        }
+        let count_value = self.builder.ins().iconst(self.ptr_ty, count as i64);
+        let names_ptr = self.builder.ins().stack_addr(self.ptr_ty, names, 0);
+        let kinds_ptr = self.builder.ins().stack_addr(self.ptr_ty, kinds, 0);
+        let defaults_ptr = self.builder.ins().stack_addr(self.ptr_ty, defaults, 0);
+        let flags_ptr = self.builder.ins().stack_addr(self.ptr_ty, flags, 0);
+        let id = self.runtime.function_meta;
+        let _ = self.call_rt(
+            id,
+            &[
+                value,
+                address,
+                count_value,
+                names_ptr,
+                kinds_ptr,
+                defaults_ptr,
+                flags_ptr,
+            ],
+        )?;
+        self.emit_exc_check()?;
+        Ok(value)
+    }
+
     fn attach_function_params(
         &mut self,
         value: Value,
@@ -4100,6 +4378,160 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         }
     }
 
+    /// Lower `Class(args..., name=value, **kwargs)` for a dynamic constructor
+    /// signature: allocate the instance, then call the concrete `__init__`
+    /// entry with every parameter slot (the frontend already bound them).
+    #[allow(clippy::too_many_arguments)]
+    fn lower_class_call(
+        &mut self,
+        class: &'a Expr,
+        init: FunctionId,
+        args: &'a [Expr],
+        dynamic_kwargs: Option<&'a Expr>,
+        param_names: &[String],
+        kwarg_index: Option<usize>,
+        class_name: &str,
+    ) -> Result<Value, CodegenError> {
+        let function =
+            self.program.functions.get(init as usize).ok_or_else(|| {
+                CodegenError::new(format!("call to unknown init function {init}"))
+            })?;
+        if function.capture_count != 0 || function.is_async || function.is_generator {
+            return Err(CodegenError::new(format!(
+                "class initializer '{}' has an unsupported signature",
+                function.name
+            )));
+        }
+        if function.params.len() != args.len() + 1 {
+            return Err(CodegenError::new(format!(
+                "call to class initializer {} expects {} arguments, got {}",
+                function.name,
+                function.params.len(),
+                args.len() + 1
+            )));
+        }
+        if dynamic_kwargs.is_some() && param_names.len() != args.len() {
+            return Err(CodegenError::new(
+                "class constructor parameter metadata does not match its arguments",
+            ));
+        }
+        let class_value = self.lower_expr(class)?;
+        let class_holder = self.temp_var();
+        self.builder.def_var(class_holder, class_value);
+        let class_value = self.builder.use_var(class_holder);
+        let instance = self.call_rt(self.runtime.instance_new, &[class_value])?;
+        self.emit_exc_check()?;
+        let instance_holder = self.temp_var();
+        self.builder.def_var(instance_holder, instance);
+
+        if let Some(mapping) = dynamic_kwargs {
+            // Evaluate the arguments into a stack array first: the runtime
+            // router overwrites named slots in place and may allocate while
+            // merging the `**kwargs` dict.
+            let slot = self.stack_array_slot(args.len(), "class constructor arguments")?;
+            for (index, arg) in args.iter().enumerate() {
+                let value = self.lower_expr(arg)?;
+                self.builder
+                    .ins()
+                    .stack_store(value, slot, (index * 8) as i32);
+            }
+            let mapping = self.lower_expr(mapping)?;
+            let mapping_holder = self.temp_var();
+            self.builder.def_var(mapping_holder, mapping);
+            let names = self.stack_array_slot(param_names.len() * 2, "class parameter names")?;
+            for (index, name) in param_names.iter().enumerate() {
+                let (name_slot, name_len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
+                let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+                let name_ptr = self.pointer_to_i64(name_ptr);
+                self.builder
+                    .ins()
+                    .stack_store(name_ptr, names, (index * 16) as i32);
+                let len = self.builder.ins().iconst(types::I64, name_len as i64);
+                self.builder
+                    .ins()
+                    .stack_store(len, names, (index * 16 + 8) as i32);
+            }
+            let (class_slot, class_len) =
+                make_bytes_slot(&mut self.builder, class_name.as_bytes())?;
+            let class_ptr = self.builder.ins().stack_addr(self.ptr_ty, class_slot, 0);
+            let class_len = self.builder.ins().iconst(self.ptr_ty, class_len as i64);
+            let names_ptr = self.builder.ins().stack_addr(self.ptr_ty, names, 0);
+            let names_count = self
+                .builder
+                .ins()
+                .iconst(self.ptr_ty, param_names.len() as i64);
+            let slots_ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+            let kwarg_index = self
+                .builder
+                .ins()
+                .iconst(types::I64, kwarg_index.map_or(-1, |index| index as i64));
+            let mapping = self.builder.use_var(mapping_holder);
+            let id = self.runtime.bind_class_kwargs;
+            let _ = self.call_rt(
+                id,
+                &[
+                    mapping,
+                    names_ptr,
+                    names_count,
+                    slots_ptr,
+                    kwarg_index,
+                    class_ptr,
+                    class_len,
+                ],
+            )?;
+            self.emit_exc_check()?;
+
+            let mut values = Vec::with_capacity(args.len() + 1);
+            values.push(self.builder.use_var(instance_holder));
+            let slots_ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+            for index in 0..args.len() {
+                let value = self.builder.ins().load(
+                    types::I64,
+                    MemFlags::new(),
+                    slots_ptr,
+                    (index * 8) as i32,
+                );
+                values.push(value);
+            }
+            let target = *self.symbols.get(&init).ok_or_else(|| {
+                CodegenError::new(format!("class initializer {init} was not declared"))
+            })?;
+            let reference = self.func_ref(target);
+            let call = self.builder.ins().call(reference, &values);
+            let _ = self
+                .builder
+                .inst_results(call)
+                .first()
+                .copied()
+                .ok_or_else(|| {
+                    CodegenError::new("internal error: class initializer returned no value")
+                })?;
+            self.emit_exc_check()?;
+            return Ok(self.builder.use_var(instance_holder));
+        }
+
+        let mut values = Vec::with_capacity(args.len() + 1);
+        values.push(self.builder.use_var(instance_holder));
+        for arg in args {
+            values.push(self.lower_expr(arg)?);
+        }
+        let target = *self.symbols.get(&init).ok_or_else(|| {
+            CodegenError::new(format!("class initializer {init} was not declared"))
+        })?;
+        let reference = self.func_ref(target);
+        let call = self.builder.ins().call(reference, &values);
+        let _ = self
+            .builder
+            .inst_results(call)
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                CodegenError::new("internal error: class initializer returned no value")
+            })?;
+        self.emit_exc_check()?;
+        Ok(self.builder.use_var(instance_holder))
+    }
+
     /// Lower a call to a program function.
     ///
     /// `async def` and generator functions are not executed inline: the
@@ -4190,6 +4622,52 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             .first()
             .copied()
             .ok_or_else(|| CodegenError::new("internal error: user call returned no value"))?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
+    /// `f(args..., name=value...)` for a function value.
+    fn lower_call_kw(
+        &mut self,
+        callee: &'a Expr,
+        args: &'a [Expr],
+        keywords: &'a [(String, Expr)],
+    ) -> Result<Value, CodegenError> {
+        let function_slot = self.stack_array_slot(1, "call kw callee")?;
+        let function = self.lower_expr(callee)?;
+        self.builder.ins().stack_store(function, function_slot, 0);
+        let argv_slot = self.stack_array_slot(args.len(), "call kw arguments")?;
+        for (index, arg) in args.iter().enumerate() {
+            let value = self.lower_expr(arg)?;
+            self.builder
+                .ins()
+                .stack_store(value, argv_slot, (index * 8) as i32);
+        }
+        let pairs = keywords
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| CodegenError::new("call: too many keyword arguments"))?;
+        let kw_slot = self.stack_array_slot(pairs, "call keyword arguments")?;
+        for (index, (keyword, value)) in keywords.iter().enumerate() {
+            let keyword = self.str_const(keyword)?;
+            self.builder
+                .ins()
+                .stack_store(keyword, kw_slot, (index * 16) as i32);
+            let value = self.lower_expr(value)?;
+            self.builder
+                .ins()
+                .stack_store(value, kw_slot, (index * 16 + 8) as i32);
+        }
+        let function = self.builder.ins().stack_load(types::I64, function_slot, 0);
+        let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
+        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        let kwargc = self
+            .builder
+            .ins()
+            .iconst(self.ptr_ty, keywords.len() as i64);
+        let kw_argv = self.builder.ins().stack_addr(self.ptr_ty, kw_slot, 0);
+        let id = self.runtime.call_kw;
+        let result = self.call_rt(id, &[function, argc, argv, kwargc, kw_argv])?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -5195,6 +5673,7 @@ mod tests {
                 name: "self".to_string(),
                 ty: Type::Any,
                 default: None,
+                default_expr: None,
                 kind: ParamKind::Positional,
             }],
             capture_count: 0,
@@ -5362,6 +5841,7 @@ mod tests {
                     name: "x".to_string(),
                     ty: Type::Any,
                     default: None,
+                    default_expr: None,
                     kind: ParamKind::Positional,
                 },
                 Param {
@@ -5369,6 +5849,7 @@ mod tests {
                     name: "y".to_string(),
                     ty: Type::Any,
                     default: None,
+                    default_expr: None,
                     kind: ParamKind::Positional,
                 },
             ],
@@ -5482,6 +5963,7 @@ mod tests {
                 name: "n".to_string(),
                 ty: Type::Int,
                 default: None,
+                default_expr: None,
                 kind: ParamKind::Positional,
             }],
             capture_count: 0,
@@ -5583,6 +6065,7 @@ mod tests {
                 name: "c".to_string(),
                 ty: Type::Any,
                 default: None,
+                default_expr: None,
                 kind: ParamKind::Positional,
             }],
             capture_count: 0,
@@ -5685,6 +6168,7 @@ mod tests {
                 name: "args".to_string(),
                 ty: Type::List,
                 default: None,
+                default_expr: None,
                 kind: ParamKind::VarArg,
             }],
             capture_count: 0,
@@ -5743,6 +6227,7 @@ mod tests {
                     name: "a".to_string(),
                     ty: Type::Any,
                     default: Some(Const::Float(1.5)),
+                    default_expr: None,
                     kind: ParamKind::Positional,
                 },
                 Param {
@@ -5750,6 +6235,7 @@ mod tests {
                     name: "key".to_string(),
                     ty: Type::Any,
                     default: Some(Const::Str("k".to_string())),
+                    default_expr: None,
                     kind: ParamKind::KwOnly,
                 },
             ],
@@ -6517,6 +7003,7 @@ mod tests {
                             name: "self".to_string(),
                             ty: Type::Any,
                             default: None,
+                            default_expr: None,
                             kind: ParamKind::Positional,
                         },
                         Param {
@@ -6524,6 +7011,7 @@ mod tests {
                             name: "key".to_string(),
                             ty: Type::Str,
                             default: None,
+                            default_expr: None,
                             kind: ParamKind::Positional,
                         },
                     ],
@@ -6840,6 +7328,7 @@ mod tests {
             name: name.to_string(),
             ty: Type::Any,
             default: None,
+            default_expr: None,
             kind: ParamKind::Positional,
         };
         let target = Function {
@@ -6890,7 +7379,7 @@ mod tests {
             initializers: Vec::new(),
         };
         let object = crate::compile_object(&program).expect("function reference must lower");
-        assert!(runtime_call_sites(&object, "pyx_function_params") > 0);
+        assert!(runtime_call_sites(&object, "pyx_function_meta") > 0);
     }
 
     #[test]

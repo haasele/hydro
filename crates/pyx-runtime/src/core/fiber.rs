@@ -272,7 +272,7 @@ fn caller_stack_low() -> usize {
 
 /// Size of every fiber stack. Deep Python recursion inside a fiber is bounded
 /// by this; it matches the runtime's remaining recursion headroom assumption.
-pub(crate) const FIBER_STACK_SIZE: usize = 128 * 1024;
+pub(crate) const FIBER_STACK_SIZE: usize = 1024 * 1024;
 
 /// What a fiber object represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

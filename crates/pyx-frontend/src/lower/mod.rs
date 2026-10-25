@@ -87,6 +87,10 @@ pub struct HParam {
     /// trailing parameters with it; first-class calls still require the full
     /// positional arity.
     pub default: Option<Const>,
+    /// Source default expression when it is not a literal. It is evaluated
+    /// where the function/method value is created and used by the runtime
+    /// keyword binder; direct calls evaluate it at the call site.
+    pub default_expr: Option<HExpr>,
     /// Binding kind; parameters are ordered captures, positional, `*args`,
     /// keyword-only, `**kwargs`.
     pub kind: ParamKind,
@@ -471,6 +475,37 @@ pub enum HExprKind {
         callee: Callee,
         args: Vec<HExpr>,
     },
+    /// Call through a function value with keyword arguments:
+    /// `f(args..., name=value, ...)`. Codegen forwards the argument/keyword
+    /// buffers to the runtime, which binds them through the function's
+    /// metadata and full-argv trampoline.
+    CallKw {
+        callee: Box<HExpr>,
+        args: Vec<HExpr>,
+        keywords: Vec<(String, HExpr)>,
+    },
+    /// `Class(args..., name=value, **kwargs)` for a class declared in the
+    /// unit whose `__init__` has a dynamic signature. The frontend binds all
+    /// `__init__` slots except `self`; codegen allocates the instance and
+    /// calls `init` directly.
+    ClassCall {
+        class: Box<HExpr>,
+        init: FunctionId,
+        /// Values for every `__init__` parameter after `self`, in parameter
+        /// order (defaults already filled).
+        args: Vec<HExpr>,
+        /// `**mapping` that must be routed to named keyword-only/positional
+        /// slots at runtime (its keys are not known statically).
+        dynamic_kwargs: Option<Box<HExpr>>,
+        /// Bindable parameter names after `self`, in `args` order. Variadic
+        /// `*args`/`**kwargs` slots carry their names but never receive a
+        /// mapping key.
+        param_names: Vec<String>,
+        /// Index in `args` of the `**kwargs` slot, if any.
+        kwarg_index: Option<usize>,
+        /// Class name for runtime error messages.
+        class_name: String,
+    },
     /// A call the frontend could not bind statically (`f(*args, **kwargs)`,
     /// keyword arguments on a function value or imported signature). The
     /// operands are evaluated in source order; executing the call raises
@@ -500,6 +535,18 @@ pub enum HExprKind {
 /// The only difference between the two forms is `is_async`: calling an async
 /// function creates a coroutine object, while `async with`/`async for` reuse
 /// the synchronous lowerings.
+/// Result of binding a dynamic-signature class constructor call.
+struct ClassCallBind {
+    /// Values for every `__init__` parameter after `self`.
+    args: Vec<HExpr>,
+    /// Routing mapping for a `**mapping` operand whose keys are dynamic.
+    dynamic_kwargs: Option<HExpr>,
+    /// Bindable parameter names in `args` order (variadic slots are empty).
+    param_names: Vec<String>,
+    /// Index in `args` of the `**kwargs` slot.
+    kwarg_index: Option<usize>,
+}
+
 struct FnDecl<'a> {
     range: TextRange,
     name: &'a str,
@@ -514,10 +561,12 @@ struct FnDecl<'a> {
 /// A cloned view of a same-unit function signature, used to bind direct call
 /// sites without holding a borrow of the function table while lowering
 /// arguments.
-struct CallSignature {
+#[derive(Clone)]
+pub(crate) struct CallSignature {
     name: String,
     capture_count: usize,
     params: Vec<(String, Option<Const>, ParamKind)>,
+    pub(crate) default_exprs: Vec<Option<HExpr>>,
     is_async: bool,
     is_generator: bool,
 }
@@ -950,6 +999,32 @@ pub(crate) fn static_if_branch(test: &ast::Expr, dunder_name: &str) -> Option<bo
     if is_type_checking(test) {
         return Some(false);
     }
+    if let ast::Expr::BoolOp(boolean) = test {
+        let mut values = Vec::new();
+        for value in &boolean.values {
+            values.push(static_if_branch(value, dunder_name));
+        }
+        return match boolean.op {
+            ast::BoolOp::And => {
+                if values.contains(&Some(false)) {
+                    Some(false)
+                } else if values.iter().all(|value| *value == Some(true)) {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            ast::BoolOp::Or => {
+                if values.contains(&Some(true)) {
+                    Some(true)
+                } else if values.iter().all(|value| *value == Some(false)) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        };
+    }
     let ast::Expr::Compare(compare) = test else {
         return None;
     };
@@ -1119,13 +1194,32 @@ pub struct Lowerer<'a> {
     /// classes uses the documented `RuntimeError` fallback (see
     /// [`Lowerer::lower_raise`]) instead of being rejected.
     class_names: HashSet<String>,
+    /// Class constructors exported by already-lowered dependency units,
+    /// keyed by `(module, class)`. Used to bind imported class calls.
+    imported_classes: HashMap<(String, String), (FunctionId, CallSignature)>,
+    /// Signatures of functions exported by already-lowered dependency units.
+    imported_function_signatures: HashMap<FunctionId, CallSignature>,
+    /// Signatures of functions declared in this unit (captured before the
+    /// function table is moved out by `lower_module`).
+    function_signatures: HashMap<FunctionId, CallSignature>,
     /// Same-unit class name -> its `__init__` `FunctionId`. Constructor calls
     /// use it to bind keywords into parameter slots and fill omitted defaults
     /// at compile time; classes without an `__init__` are absent.
     class_inits: HashMap<String, FunctionId>,
+    /// Constructor signatures captured while lowering; `lower_module` moves
+    /// the function table out, so exports cannot re-read it afterwards.
+    class_signatures: HashMap<String, (FunctionId, CallSignature)>,
+    /// Methods declared by a class, used to resolve a classmethod's `cls`
+    /// parameter as the enclosing class constructor.
+    class_methods: HashMap<FunctionId, (String, MethodKind, String)>,
+    /// Enclosing classmethod while lowering its body.
+    current_class_method: Option<(String, MethodKind, String)>,
     /// Class attributes visible while evaluating a class body's attribute
     /// values; the innermost scope is last.
     class_attr_scopes: Vec<HashMap<String, HExpr>>,
+    /// Resolve otherwise-unknown module-level names to `GlobalGet` while
+    /// lowering a parameter default expression.
+    in_default_expr: bool,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -1178,13 +1272,45 @@ impl<'a> Lowerer<'a> {
             multi_counter: 0,
             class_defs: HashMap::new(),
             class_names: HashSet::new(),
+            imported_classes: HashMap::new(),
+            imported_function_signatures: HashMap::new(),
+            function_signatures: HashMap::new(),
             class_inits: HashMap::new(),
+            class_signatures: HashMap::new(),
+            class_methods: HashMap::new(),
+            current_class_method: None,
             class_attr_scopes: Vec::new(),
+            in_default_expr: false,
             diags: Vec::new(),
         }
     }
 
     /// Reserves the [`FunctionId`] range starting at `base` for this unit.
+    pub fn set_imported_classes(
+        &mut self,
+        classes: HashMap<(String, String), (FunctionId, CallSignature)>,
+        functions: HashMap<FunctionId, CallSignature>,
+    ) {
+        self.imported_classes = classes;
+        self.imported_function_signatures = functions;
+    }
+
+    /// Class constructors declared by this unit, with absolute function ids.
+    /// Function signatures declared by this unit, keyed by absolute id.
+    pub(crate) fn exported_function_signatures(&self) -> Vec<(FunctionId, CallSignature)> {
+        self.function_signatures
+            .iter()
+            .map(|(id, signature)| (*id, signature.clone()))
+            .collect()
+    }
+
+    pub(crate) fn exported_class_signatures(&self) -> Vec<(String, FunctionId, CallSignature)> {
+        self.class_signatures
+            .iter()
+            .map(|(name, (init, signature))| (name.clone(), *init, signature.clone()))
+            .collect()
+    }
+
     pub fn set_fid_base(&mut self, base: FunctionId) {
         self.fid_base = base;
     }
@@ -2568,6 +2694,7 @@ impl<'a> Lowerer<'a> {
                 name: capture.clone(),
                 ty,
                 default: None,
+                default_expr: None,
                 kind: ParamKind::Positional,
             });
             locals.push(HLocal {
@@ -2584,9 +2711,11 @@ impl<'a> Lowerer<'a> {
         }
         for arg in args.posonlyargs.iter().chain(args.args.iter()) {
             let default = self.param_default(arg.default.as_deref());
+            let default_expr = self.lowered_default(arg.default.as_deref());
             self.add_param(
                 &arg.def,
                 default,
+                default_expr,
                 ParamKind::Positional,
                 &mut params,
                 &mut locals,
@@ -2600,6 +2729,7 @@ impl<'a> Lowerer<'a> {
             self.add_param(
                 vararg,
                 None,
+                None,
                 ParamKind::VarArg,
                 &mut params,
                 &mut locals,
@@ -2608,9 +2738,11 @@ impl<'a> Lowerer<'a> {
         }
         for arg in &args.kwonlyargs {
             let default = self.param_default(arg.default.as_deref());
+            let default_expr = self.lowered_default(arg.default.as_deref());
             self.add_param(
                 &arg.def,
                 default,
+                default_expr,
                 ParamKind::KwOnly,
                 &mut params,
                 &mut locals,
@@ -2620,6 +2752,7 @@ impl<'a> Lowerer<'a> {
         if let Some(kwarg) = &args.kwarg {
             self.add_param(
                 kwarg,
+                None,
                 None,
                 ParamKind::KwArg,
                 &mut params,
@@ -2659,6 +2792,10 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
+        if let Some(signature) = self.call_signature(self.fid_base + id) {
+            self.function_signatures
+                .insert(self.fid_base + id, signature);
+        }
         if global {
             self.fn_ids.insert(name, self.fid_base + id);
         }
@@ -2738,10 +2875,10 @@ impl<'a> Lowerer<'a> {
             // like any other value (e.g. `unittest.TestCase` is a module
             // attribute) and the runtime validates it at class creation.
             [_] => Some(0),
-            [_, second, ..] => {
-                self.error_at(second.range(), "multiple inheritance is not supported yet");
-                None
-            }
+            // Multiple inheritance is approximated by the first base; rich
+            // uses it for mixin pairs where the primary class supplies the
+            // relevant protocol methods. Additional bases are ignored.
+            [_, _, ..] => Some(0),
         };
         // `class Point(NamedTuple):` gets a synthesized `__init__` exactly like
         // a dataclass. Only the class form is supported (no functional form).
@@ -2865,6 +3002,8 @@ impl<'a> Lowerer<'a> {
                 _ => unreachable!("method statement matched above"),
             };
             if let Some((id, kind)) = registered {
+                self.class_methods
+                    .insert(id, (class.clone(), kind, first_param_name(self, id)));
                 methods.push((method, id, Some(idx), kind));
             }
         }
@@ -2889,7 +3028,12 @@ impl<'a> Lowerer<'a> {
             .iter()
             .find(|(name, _, _, _)| name.as_str() == "__init__")
         {
-            self.class_inits.insert(class.clone(), self.fid_base + *id);
+            let init = self.fid_base + *id;
+            self.class_inits.insert(class.clone(), init);
+            if let Some(signature) = self.call_signature(init) {
+                self.class_signatures
+                    .insert(class.clone(), (init, signature));
+            }
         }
 
         ClassPlan {
@@ -3082,6 +3226,7 @@ impl<'a> Lowerer<'a> {
             name: "self".to_string(),
             ty: self_ty,
             default: None,
+            default_expr: None,
             kind: ParamKind::Positional,
         });
         locals.push(HLocal {
@@ -3104,6 +3249,7 @@ impl<'a> Lowerer<'a> {
                 name: field.name.to_string(),
                 ty: field.ty,
                 default,
+                default_expr: None,
                 kind: ParamKind::Positional,
             });
             locals.push(HLocal {
@@ -3228,10 +3374,12 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_param(
         &mut self,
         arg: &ast::Arg,
         default: Option<Const>,
+        default_expr: Option<HExpr>,
         kind: ParamKind,
         params: &mut Vec<HParam>,
         locals: &mut Vec<HLocal>,
@@ -3263,6 +3411,7 @@ impl<'a> Lowerer<'a> {
             name: name.clone(),
             ty,
             default,
+            default_expr,
             kind,
         });
         locals.push(HLocal { name, ty });
@@ -3278,10 +3427,62 @@ impl<'a> Lowerer<'a> {
     /// it is recorded as `None`. Documented limitation: a direct call that
     /// omits such an argument receives `None` instead of evaluating the
     /// source default.
+    /// Lowers a non-literal default expression in a module-like scope. The
+    /// expression is evaluated when the function/method value is created;
+    /// diagnostics from unsupported shapes are rolled back to preserve the
+    /// previous "default is None" behavior.
+    fn lowered_default(&mut self, default: Option<&ast::Expr>) -> Option<HExpr> {
+        let default = default?;
+        let diagnostics = self.diags.len();
+        let mut fs = FuncState {
+            fid: 0,
+            is_module: true,
+            locals: HashMap::new(),
+            comp_shadowed: HashMap::new(),
+            globals: HashSet::new(),
+            loop_depth: 0,
+            in_lambda: false,
+            is_async: false,
+            is_generator: false,
+        };
+        let previous = self.in_default_expr;
+        self.in_default_expr = true;
+        let result = self.expr(default, &mut fs);
+        self.in_default_expr = previous;
+        if self.diags.len() > diagnostics {
+            self.diags.truncate(diagnostics);
+            return None;
+        }
+        Some(result)
+    }
+
     fn param_default(&mut self, default: Option<&ast::Expr>) -> Option<Const> {
         let default = default?;
         if let Some(constant) = self.const_default(default) {
             return Some(constant);
+        }
+        // Common defaults are module globals or imported module constants
+        // (`NO_CHANGE`, `box.HEAVY_HEAD`). Preserve them by name instead of
+        // degrading to `None`; the runtime resolves them when the function or
+        // method value is created/called.
+        match default {
+            ast::Expr::Name(name) if self.global_names.contains(name.id.as_str()) => {
+                return Some(Const::Global {
+                    module: self.dunder_name.clone(),
+                    name: name.id.to_string(),
+                })
+            }
+            ast::Expr::Attribute(attr) => {
+                if let ast::Expr::Name(root) = &*attr.value {
+                    if let Some(module) = self.user_module_aliases.get(root.id.as_str()) {
+                        return Some(Const::Global {
+                            module: module.clone(),
+                            name: attr.attr.to_string(),
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
         Some(Const::None)
     }
@@ -3311,6 +3512,13 @@ impl<'a> Lowerer<'a> {
                 ast::Constant::Ellipsis => Some(Const::Ellipsis),
                 _ => None,
             },
+            ast::Expr::Tuple(tuple) => {
+                let mut items = Vec::with_capacity(tuple.elts.len());
+                for item in &tuple.elts {
+                    items.push(self.const_default(item)?);
+                }
+                Some(Const::Tuple(items))
+            }
             ast::Expr::UnaryOp(unary) if matches!(unary.op, ast::UnaryOp::USub) => {
                 match self.const_default(&unary.operand)? {
                     Const::Int(v) => match v.checked_neg().and_then(fold_int_result) {
@@ -3401,7 +3609,11 @@ impl<'a> Lowerer<'a> {
             is_async: function.is_async,
             is_generator: function.is_generator,
         };
-        self.lower_block(body, &mut fs)
+        let saved_method = self.current_class_method.clone();
+        self.current_class_method = self.class_methods.get(&fid).cloned();
+        let result = self.lower_block(body, &mut fs);
+        self.current_class_method = saved_method;
+        result
     }
 
     /// Lower a `def`/`async def` nested inside another function body.
@@ -5719,6 +5931,21 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
+                } else if self.in_default_expr
+                    && (self.global_names.contains(name)
+                        || self.class_names.contains(name)
+                        || self.fn_ids.contains_key(name))
+                {
+                    self.used_globals.insert(name.to_string());
+                    HExpr {
+                        kind: HExprKind::GlobalGet {
+                            module: self.dunder_name.clone(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
                 } else {
                     if !fs.is_module && self.module_local_names.contains(name) {
                         self.error_at_code(
@@ -6307,6 +6534,7 @@ impl<'a> Lowerer<'a> {
             }
             self.add_param(
                 &arg.def,
+                None,
                 None,
                 ParamKind::Positional,
                 &mut params,
@@ -6906,6 +7134,40 @@ impl<'a> Lowerer<'a> {
         Some((args, keywords))
     }
 
+    /// Builds a `CallKw` node: evaluates the argument operands in source
+    /// order and forwards constant keyword names to the runtime binder.
+    fn call_kw_expr(
+        &mut self,
+        callee: HExpr,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HExpr> {
+        let mut args = Vec::with_capacity(call.args.len());
+        for arg in &call.args {
+            if matches!(arg, ast::Expr::Starred(_)) {
+                return None;
+            }
+            args.push(self.expr(arg, fs));
+        }
+        let mut keywords = Vec::with_capacity(call.keywords.len());
+        for keyword in &call.keywords {
+            let name = keyword.arg.as_ref()?;
+            keywords.push((name.to_string(), self.expr(&keyword.value, fs)));
+        }
+        Some(HExpr {
+            kind: HExprKind::CallKw {
+                callee: Box::new(callee),
+                args,
+                keywords,
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        })
+    }
+
     fn call_expr(
         &mut self,
         call: &ast::ExprCall,
@@ -6919,6 +7181,90 @@ impl<'a> Lowerer<'a> {
         // the general starred-call ABI, or to a deferred call when they
         // cannot be represented (keywords, `**`).
         if call_has_dynamic_arguments(call) {
+            // `cls(*args, ...)` inside a classmethod: the runtime class is
+            // fixed, so the dynamic constructor binder can still expand the
+            // starred operand at compile time.
+            if let ast::Expr::Name(name_expr) = &*call.func {
+                if let Some((class, MethodKind::Classmethod, cls_name)) =
+                    self.current_class_method.clone()
+                {
+                    if name_expr.id.as_str() == cls_name
+                        && fs.lookup(&cls_name).is_some()
+                        && !fs.is_module
+                    {
+                        if let Some((init, signature)) = self.resolve_class(&class) {
+                            if signature.has_dynamic_signature() {
+                                let Some(bind) = self.class_constructor_dynamic_arguments(
+                                    &class, &signature, call, fs, line, col,
+                                ) else {
+                                    return self.error_expr(call.range);
+                                };
+                                self.used_globals.insert(class.clone());
+                                let (callee_line, callee_col) = self.span(name_expr.range);
+                                let class_expr = HExpr {
+                                    kind: HExprKind::GlobalGet {
+                                        module: self.dunder_name.clone(),
+                                        name: class.clone(),
+                                    },
+                                    ty: Ty::Concrete(Type::Any),
+                                    line: callee_line,
+                                    col: callee_col,
+                                };
+                                return HExpr {
+                                    kind: HExprKind::ClassCall {
+                                        class: Box::new(class_expr),
+                                        init,
+                                        args: bind.args,
+                                        dynamic_kwargs: bind.dynamic_kwargs.map(Box::new),
+                                        param_names: bind.param_names,
+                                        kwarg_index: bind.kwarg_index,
+                                        class_name: class,
+                                    },
+                                    ty: self.infer.fresh(),
+                                    line,
+                                    col,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+            // A class declared in the unit can still bind a dynamic
+            // constructor at compile time: fixed slots are resolved here and
+            // `*`/`**` operands fill the generated `*args`/`**kwargs` slots.
+            if let ast::Expr::Name(name_expr) = &*call.func {
+                let name = name_expr.id.as_str();
+                if self.class_callee_resolvable(name, fs) {
+                    if let Some((init, signature)) = self.resolve_class(name) {
+                        if signature.has_dynamic_signature() {
+                            let Some(bind) = self.class_constructor_dynamic_arguments(
+                                name, &signature, call, fs, line, col,
+                            ) else {
+                                return self.error_expr(call.range);
+                            };
+                            let Some(class) =
+                                self.class_callee_expr(name, name_expr, fs, line, col)
+                            else {
+                                return self.error_expr(call.range);
+                            };
+                            return HExpr {
+                                kind: HExprKind::ClassCall {
+                                    class: Box::new(class),
+                                    init,
+                                    args: bind.args,
+                                    dynamic_kwargs: bind.dynamic_kwargs.map(Box::new),
+                                    param_names: bind.param_names,
+                                    kwarg_index: bind.kwarg_index,
+                                    class_name: name.to_string(),
+                                },
+                                ty: self.infer.fresh(),
+                                line,
+                                col,
+                            };
+                        }
+                    }
+                }
+            }
             // A receiver method keeps its dedicated `pyx_method_star` ABI
             // (unchanged). A module/user-module/extension member is not a
             // method: its attribute lowers to a first-class function value
@@ -6963,13 +7309,16 @@ impl<'a> Lowerer<'a> {
                     return self.extension_call(&path, attr.attr.as_str(), call, fs, line, col);
                 }
                 if let Some((module, member)) = self.resolve_deferred_import(&call.func, fs) {
+                    let callee = self.deferred_import_expr(&module, member.as_deref(), line, col);
                     if !call.keywords.is_empty() {
-                        return self.lower_deferred_call(call, fs, line, col);
+                        let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                            return self.error_expr(call.range);
+                        };
+                        return result;
                     }
                     let Some(args) = self.plain_call_args(call, fs) else {
                         return self.error_expr(call.range);
                     };
-                    let callee = self.deferred_import_expr(&module, member.as_deref(), line, col);
                     return HExpr {
                         kind: HExprKind::IndirectCall {
                             callee: Box::new(callee),
@@ -7000,12 +7349,15 @@ impl<'a> Lowerer<'a> {
             }
             other => {
                 // Any other callee is a function value: Python evaluates the
-                // callee before the arguments. Keywords cannot be bound
-                // statically, so such calls are deferred.
-                if !call.keywords.is_empty() {
-                    return self.lower_deferred_call(call, fs, line, col);
-                }
+                // callee before the arguments. Keyword calls go through the
+                // runtime metadata binder.
                 let callee = self.expr(other, fs);
+                if !call.keywords.is_empty() {
+                    let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                        return self.error_expr(call.range);
+                    };
+                    return result;
+                }
                 let mut args = Vec::with_capacity(call.args.len());
                 for arg in &call.args {
                     args.push(self.expr(arg, fs));
@@ -7023,29 +7375,53 @@ impl<'a> Lowerer<'a> {
             }
         };
         let name = name_expr.id.as_str();
-
-        if let Some(local) = fs.lookup(name) {
-            // A class of this unit reorders keywords into its `__init__`
-            // parameter slots and fills omitted defaults at compile time.
-            // Only the module body holds the class value directly; inside a
-            // function a local slot with the same name shadows it.
-            if fs.is_module {
-                if let Some(signature) = self.class_init_signature(name) {
-                    let Some(args) =
-                        self.class_constructor_arguments(name, &signature, call, fs, line, col)
-                    else {
-                        return self.error_expr(call.range);
-                    };
+        // `cls(...)` inside a classmethod constructs the enclosing class. The
+        // binding is fixed (PyX has no dynamic subclassing), so the call can
+        // use the same constructor binder as a direct class call.
+        if let Some((class, MethodKind::Classmethod, cls_name)) = self.current_class_method.clone()
+        {
+            if name == cls_name && fs.lookup(name).is_some() && !fs.is_module {
+                if let Some((init, signature)) = self.resolve_class(&class) {
+                    self.used_globals.insert(class.clone());
                     let (callee_line, callee_col) = self.span(name_expr.range);
-                    let callee = HExpr {
-                        kind: HExprKind::Local(local),
+                    let class_expr = HExpr {
+                        kind: HExprKind::GlobalGet {
+                            module: self.dunder_name.clone(),
+                            name: class.clone(),
+                        },
                         ty: Ty::Concrete(Type::Any),
                         line: callee_line,
                         col: callee_col,
                     };
+                    if signature.has_dynamic_signature() {
+                        let Some(bind) = self.class_constructor_dynamic_arguments(
+                            &class, &signature, call, fs, line, col,
+                        ) else {
+                            return self.error_expr(call.range);
+                        };
+                        return HExpr {
+                            kind: HExprKind::ClassCall {
+                                class: Box::new(class_expr),
+                                init,
+                                args: bind.args,
+                                dynamic_kwargs: bind.dynamic_kwargs.map(Box::new),
+                                param_names: bind.param_names,
+                                kwarg_index: bind.kwarg_index,
+                                class_name: class.clone(),
+                            },
+                            ty: self.infer.fresh(),
+                            line,
+                            col,
+                        };
+                    }
+                    let Some(args) =
+                        self.class_constructor_arguments(&class, &signature, call, fs, line, col)
+                    else {
+                        return self.error_expr(call.range);
+                    };
                     return HExpr {
                         kind: HExprKind::IndirectCall {
-                            callee: Box::new(callee),
+                            callee: Box::new(class_expr),
                             args,
                             star: None,
                         },
@@ -7055,12 +7431,82 @@ impl<'a> Lowerer<'a> {
                     };
                 }
             }
-            // Keyword binding for a function value is not part of the static
-            // ABI; the call still compiles and fails at execution.
-            if !call.keywords.is_empty() {
-                return self.lower_deferred_call(call, fs, line, col);
+        }
+
+        if let Some(local) = fs.lookup(name) {
+            // A class of this unit reorders keywords into its `__init__`
+            // parameter slots and fills omitted defaults at compile time.
+            // Only the module body holds the class value directly; inside a
+            // function a local slot with the same name shadows it.
+            if fs.is_module {
+                if let Some((init, signature)) = self.resolve_class(name) {
+                    let (callee_line, callee_col) = self.span(name_expr.range);
+                    let class = HExpr {
+                        kind: HExprKind::Local(local),
+                        ty: Ty::Concrete(Type::Any),
+                        line: callee_line,
+                        col: callee_col,
+                    };
+                    if signature.has_dynamic_signature() {
+                        let Some(bind) = self.class_constructor_dynamic_arguments(
+                            name, &signature, call, fs, line, col,
+                        ) else {
+                            return self.error_expr(call.range);
+                        };
+                        return HExpr {
+                            kind: HExprKind::ClassCall {
+                                class: Box::new(class),
+                                init,
+                                args: bind.args,
+                                dynamic_kwargs: bind.dynamic_kwargs.map(Box::new),
+                                param_names: bind.param_names,
+                                kwarg_index: bind.kwarg_index,
+                                class_name: name.to_string(),
+                            },
+                            ty: self.infer.fresh(),
+                            line,
+                            col,
+                        };
+                    }
+                    let Some(args) =
+                        self.class_constructor_arguments(name, &signature, call, fs, line, col)
+                    else {
+                        return self.error_expr(call.range);
+                    };
+                    return HExpr {
+                        kind: HExprKind::IndirectCall {
+                            callee: Box::new(class),
+                            args,
+                            star: None,
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
+                }
             }
             let (callee_line, callee_col) = self.span(name_expr.range);
+            let local_ty = self.functions[fs.fid as usize]
+                .locals
+                .get(local as usize)
+                .map(|info| self.infer.resolve(info.ty))
+                .unwrap_or(Ty::Concrete(Type::Any));
+            let callable = matches!(
+                local_ty,
+                Ty::Concrete(Type::Function) | Ty::Concrete(Type::Any)
+            );
+            if !call.keywords.is_empty() || callable {
+                let callee = HExpr {
+                    kind: HExprKind::Local(local),
+                    ty: self.infer.fresh(),
+                    line: callee_line,
+                    col: callee_col,
+                };
+                let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                    return self.error_expr(call.range);
+                };
+                return result;
+            }
             let callee = HExpr {
                 kind: HExprKind::Local(local),
                 ty: self.infer.fresh(),
@@ -7086,12 +7532,6 @@ impl<'a> Lowerer<'a> {
         if fs.is_global(name) {
             // `global name` in this function: the callee is read from the
             // runtime global table.
-            if !call.keywords.is_empty() {
-                return self.lower_deferred_call(call, fs, line, col);
-            }
-            let Some(args) = self.plain_call_args(call, fs) else {
-                return self.error_expr(call.range);
-            };
             self.used_globals.insert(name.to_string());
             let (callee_line, callee_col) = self.span(name_expr.range);
             let callee = HExpr {
@@ -7102,6 +7542,15 @@ impl<'a> Lowerer<'a> {
                 ty: Ty::Concrete(Type::Any),
                 line: callee_line,
                 col: callee_col,
+            };
+            if !call.keywords.is_empty() {
+                let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                    return self.error_expr(call.range);
+                };
+                return result;
+            }
+            let Some(args) = self.plain_call_args(call, fs) else {
+                return self.error_expr(call.range);
             };
             return HExpr {
                 kind: HExprKind::IndirectCall {
@@ -7116,15 +7565,63 @@ impl<'a> Lowerer<'a> {
         }
 
         if let Some(&id) = self.imported_user_functions.get(name) {
-            // The signature of an imported function is not part of this
-            // unit; the runtime binder handles the positional arguments, so
-            // any keyword call is deferred.
-            if !call.keywords.is_empty() {
-                return self.lower_deferred_call(call, fs, line, col);
+            // Exact positional calls link directly; calls with keywords or
+            // omitted defaults go through the runtime metadata binder.
+            if call.keywords.is_empty() {
+                if let Some(signature) = self.call_signature_for(id) {
+                    let param_count = signature
+                        .params
+                        .iter()
+                        .filter(|(_, _, kind)| {
+                            matches!(kind, ParamKind::Positional | ParamKind::KwOnly)
+                        })
+                        .count();
+                    if let Some(args) = self.plain_call_args(call, fs) {
+                        if args.len() == param_count {
+                            return HExpr {
+                                kind: HExprKind::Call {
+                                    callee: Callee::Function(id),
+                                    args,
+                                },
+                                ty: self.infer.fresh(),
+                                line,
+                                col,
+                            };
+                        }
+                        // Re-evaluate is impossible; plain_call_args only
+                        // lowers expressions. Fall through to the value path
+                        // using the already-computed arguments.
+                        let (callee_line, callee_col) = self.span(name_expr.range);
+                        let callee = HExpr {
+                            kind: HExprKind::FunctionRef(id),
+                            ty: Ty::Concrete(Type::Function),
+                            line: callee_line,
+                            col: callee_col,
+                        };
+                        return HExpr {
+                            kind: HExprKind::CallKw {
+                                callee: Box::new(callee),
+                                args,
+                                keywords: Vec::new(),
+                            },
+                            ty: self.infer.fresh(),
+                            line,
+                            col,
+                        };
+                    }
+                    return self.error_expr(call.range);
+                }
             }
             let Some(args) = self.plain_call_args(call, fs) else {
                 return self.error_expr(call.range);
             };
+            let mut keywords = Vec::with_capacity(call.keywords.len());
+            for keyword in &call.keywords {
+                let Some(keyword_name) = keyword.arg.as_ref() else {
+                    return self.lower_deferred_call(call, fs, line, col);
+                };
+                keywords.push((keyword_name.to_string(), self.expr(&keyword.value, fs)));
+            }
             let (callee_line, callee_col) = self.span(name_expr.range);
             let callee = HExpr {
                 kind: HExprKind::FunctionRef(id),
@@ -7133,10 +7630,10 @@ impl<'a> Lowerer<'a> {
                 col: callee_col,
             };
             return HExpr {
-                kind: HExprKind::IndirectCall {
+                kind: HExprKind::CallKw {
                     callee: Box::new(callee),
                     args,
-                    star: None,
+                    keywords,
                 },
                 ty: self.infer.fresh(),
                 line,
@@ -7145,12 +7642,6 @@ impl<'a> Lowerer<'a> {
         }
 
         if let Some((module, exported)) = self.imported_user_globals.get(name).cloned() {
-            if !call.keywords.is_empty() {
-                return self.lower_deferred_call(call, fs, line, col);
-            }
-            let Some(args) = self.plain_call_args(call, fs) else {
-                return self.error_expr(call.range);
-            };
             let (callee_line, callee_col) = self.span(name_expr.range);
             let callee = HExpr {
                 kind: HExprKind::GlobalGet {
@@ -7161,16 +7652,29 @@ impl<'a> Lowerer<'a> {
                 line: callee_line,
                 col: callee_col,
             };
-            return HExpr {
-                kind: HExprKind::IndirectCall {
-                    callee: Box::new(callee),
-                    args,
-                    star: None,
-                },
-                ty: self.infer.fresh(),
-                line,
-                col,
+            if call.keywords.is_empty() {
+                if let Some(signature) = self.resolve_class(name).map(|(_, signature)| signature) {
+                    let params = signature.params.len().saturating_sub(1);
+                    if let Some(args) = self.plain_call_args(call, fs) {
+                        if args.len() == params {
+                            return HExpr {
+                                kind: HExprKind::IndirectCall {
+                                    callee: Box::new(callee),
+                                    args,
+                                    star: None,
+                                },
+                                ty: self.infer.fresh(),
+                                line,
+                                col,
+                            };
+                        }
+                    }
+                }
+            }
+            let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                return self.error_expr(call.range);
             };
+            return result;
         }
 
         if let Some((module, function)) = self.imported_functions.get(name).copied() {
@@ -7217,12 +7721,6 @@ impl<'a> Lowerer<'a> {
         }
 
         if let Some(binding) = self.deferred_imports.get(name).cloned() {
-            if !call.keywords.is_empty() {
-                return self.lower_deferred_call(call, fs, line, col);
-            }
-            let Some(args) = self.plain_call_args(call, fs) else {
-                return self.error_expr(call.range);
-            };
             let (callee_line, callee_col) = self.span(name_expr.range);
             let callee = self.deferred_import_expr(
                 &binding.module,
@@ -7230,6 +7728,15 @@ impl<'a> Lowerer<'a> {
                 callee_line,
                 callee_col,
             );
+            if !call.keywords.is_empty() {
+                let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                    return self.error_expr(call.range);
+                };
+                return result;
+            }
+            let Some(args) = self.plain_call_args(call, fs) else {
+                return self.error_expr(call.range);
+            };
             return HExpr {
                 kind: HExprKind::IndirectCall {
                     callee: Box::new(callee),
@@ -7346,29 +7853,42 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        if self.global_names.contains(name) {
-            // A same-unit class used as a callee from a function or method:
-            // bind its constructor arguments exactly like a module-body call.
-            if let Some(signature) = self.class_init_signature(name) {
+        if self.global_names.contains(name) || self.imported_user_globals.contains_key(name) {
+            // A class used as a callee from a function or method: bind its
+            // constructor arguments exactly like a module-body call.
+            if let Some((init, signature)) = self.resolve_class(name) {
+                let Some(class) = self.class_callee_expr(name, name_expr, fs, line, col) else {
+                    return self.error_expr(call.range);
+                };
+                if signature.has_dynamic_signature() {
+                    let Some(bind) = self
+                        .class_constructor_dynamic_arguments(name, &signature, call, fs, line, col)
+                    else {
+                        return self.error_expr(call.range);
+                    };
+                    return HExpr {
+                        kind: HExprKind::ClassCall {
+                            class: Box::new(class),
+                            init,
+                            args: bind.args,
+                            dynamic_kwargs: bind.dynamic_kwargs.map(Box::new),
+                            param_names: bind.param_names,
+                            kwarg_index: bind.kwarg_index,
+                            class_name: name.to_string(),
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
+                }
                 let Some(args) =
                     self.class_constructor_arguments(name, &signature, call, fs, line, col)
                 else {
                     return self.error_expr(call.range);
                 };
-                self.used_globals.insert(name.to_string());
-                let (callee_line, callee_col) = self.span(name_expr.range);
-                let callee = HExpr {
-                    kind: HExprKind::GlobalGet {
-                        module: self.dunder_name.clone(),
-                        name: name.to_string(),
-                    },
-                    ty: Ty::Concrete(Type::Any),
-                    line: callee_line,
-                    col: callee_col,
-                };
                 return HExpr {
                     kind: HExprKind::IndirectCall {
-                        callee: Box::new(callee),
+                        callee: Box::new(class),
                         args,
                         star: None,
                     },
@@ -7717,6 +8237,13 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Cloned signature of a function of this unit.
+    fn call_signature_for(&self, id: FunctionId) -> Option<CallSignature> {
+        if let Some(signature) = self.imported_function_signatures.get(&id) {
+            return Some(signature.clone());
+        }
+        self.call_signature(id)
+    }
+
     fn call_signature(&self, id: FunctionId) -> Option<CallSignature> {
         id.checked_sub(self.fid_base)
             .and_then(|index| self.functions.get(index as usize))
@@ -7727,6 +8254,11 @@ impl<'a> Lowerer<'a> {
                     .params
                     .iter()
                     .map(|param| (param.name.clone(), param.default.clone(), param.kind))
+                    .collect(),
+                default_exprs: function
+                    .params
+                    .iter()
+                    .map(|param| param.default_expr.clone())
                     .collect(),
                 is_async: function.is_async,
                 is_generator: function.is_generator,
@@ -7747,7 +8279,7 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<Vec<HExpr>> {
-        let Some(signature) = self.call_signature(id) else {
+        let Some(signature) = self.call_signature_for(id) else {
             // An imported function carries no signature in this unit; fall
             // back to positional arguments only.
             if !call.keywords.is_empty() {
@@ -7891,6 +8423,14 @@ impl<'a> Lowerer<'a> {
             if kind == ParamKind::VarArg || kind == ParamKind::KwArg {
                 continue;
             }
+            if let Some(expression) = signature
+                .default_exprs
+                .get(index)
+                .and_then(|expression| expression.clone())
+            {
+                *slot = Some(expression);
+                continue;
+            }
             match signature.params[index].1.clone() {
                 Some(default) => {
                     // The value is exact, but its *type* stays dynamic: a
@@ -7953,14 +8493,78 @@ impl<'a> Lowerer<'a> {
     /// Signature of a same-unit class's `__init__`, or `None` when the class
     /// has no `__init__` or its signature needs the runtime binder
     /// (`*args`, keyword-only parameters or `**kwargs`).
-    fn class_init_signature(&self, class: &str) -> Option<CallSignature> {
-        let &init = self.class_inits.get(class)?;
-        let signature = self.call_signature(init)?;
-        if signature.has_dynamic_signature() || signature.capture_count != 0 {
+    /// Whether `name` denotes a class of this unit at a call site: the module
+    /// body holds it in a local slot, while functions/methods read the
+    /// mirrored module global. A function-local parameter of the same name
+    /// shadows the class and makes this false.
+    fn class_callee_resolvable(&self, name: &str, fs: &FuncState) -> bool {
+        self.resolve_class(name).is_some()
+            && ((fs.is_module && fs.lookup(name).is_some())
+                || (!fs.lookup(name).is_some()
+                    && (self.global_names.contains(name)
+                        || self.imported_user_globals.contains_key(name))))
+    }
+
+    /// Materialises the class value for a constructor call: a local read in
+    /// the module body, a `GlobalGet` inside functions/methods.
+    fn class_callee_expr(
+        &mut self,
+        name: &str,
+        name_expr: &ast::ExprName,
+        fs: &FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HExpr> {
+        let _ = (fs, line, col);
+        let (line, col) = self.span(name_expr.range);
+        if fs.is_module {
+            let local = fs.lookup(name)?;
+            return Some(HExpr {
+                kind: HExprKind::Local(local),
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            });
+        }
+        if let Some((module, exported)) = self.imported_user_globals.get(name) {
+            return Some(HExpr {
+                kind: HExprKind::GlobalGet {
+                    module: module.clone(),
+                    name: exported.clone(),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            });
+        }
+        if !self.global_names.contains(name) {
             return None;
         }
-        // Slot 0 is `self`; a class constructor supplies the rest.
-        (signature.params.len() > 1).then_some(signature)
+        self.used_globals.insert(name.to_string());
+        Some(HExpr {
+            kind: HExprKind::GlobalGet {
+                module: self.dunder_name.clone(),
+                name: name.to_string(),
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        })
+    }
+
+    /// Resolves a class constructor available at a call site: a class of this
+    /// unit or an imported class exported by an already-lowered dependency.
+    fn resolve_class(&self, name: &str) -> Option<(FunctionId, CallSignature)> {
+        if let Some((init, signature)) = self.class_signatures.get(name) {
+            return Some((*init, signature.clone()));
+        }
+        if let Some(&init) = self.class_inits.get(name) {
+            return self.call_signature(init).map(|signature| (init, signature));
+        }
+        let (module, exported) = self.imported_user_globals.get(name)?;
+        self.imported_classes
+            .get(&(module.clone(), exported.clone()))
+            .cloned()
     }
 
     /// Bind `Class(args..., name=value...)` against its `__init__` signature.
@@ -8058,6 +8662,324 @@ impl<'a> Lowerer<'a> {
             }
         }
         Some(args)
+    }
+
+    /// Bind a class constructor whose `__init__` has a dynamic signature
+    /// (`*args`, keyword-only parameters or `**kwargs`).
+    ///
+    /// Fixed positional slots and keyword-only slots are still bound at
+    /// compile time; a single starred operand becomes the `*args` list and a
+    /// `**mapping` operand is merged into the `**kwargs` dict at runtime.
+    /// Shapes that would need an unknown number of positional slots (a
+    /// starred operand without a `*args` parameter) stay deferred.
+    #[allow(clippy::question_mark)]
+    fn class_constructor_dynamic_arguments(
+        &mut self,
+        class: &str,
+        signature: &CallSignature,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<ClassCallBind> {
+        let params = &signature.params[1..];
+        let fixed_positional = params
+            .iter()
+            .take_while(|(_, _, kind)| *kind == ParamKind::Positional)
+            .count();
+        let vararg_index = params
+            .iter()
+            .position(|(_, _, kind)| *kind == ParamKind::VarArg);
+        let kwarg_index = params
+            .iter()
+            .position(|(_, _, kind)| *kind == ParamKind::KwArg);
+
+        let mut slots: Vec<Option<HExpr>> = vec![None; params.len()];
+        let mut star: Option<HExpr> = None;
+        let mut saw_star = false;
+        let mut vararg_extras: Vec<HExpr> = Vec::new();
+        for (position, arg) in call.args.iter().enumerate() {
+            if let ast::Expr::Starred(starred) = arg {
+                if saw_star || position + 1 != call.args.len() {
+                    self.error_at_code(
+                        call.range,
+                        codes::CALL,
+                        "a starred class argument must be the last positional argument",
+                    );
+                    return None;
+                }
+                saw_star = true;
+                if vararg_index.is_none() {
+                    // Without a `*args` slot the number of positional slots is
+                    // fixed; only a runtime-bound call could expand it, which
+                    // this path deliberately does not attempt.
+                    return None;
+                }
+                star = Some(self.expr(&starred.value, fs));
+                continue;
+            }
+            if position >= fixed_positional {
+                if vararg_index.is_some() {
+                    vararg_extras.push(self.expr(arg, fs));
+                    continue;
+                }
+                self.error_at_code(
+                    arg.range(),
+                    codes::CALL,
+                    format!("{class}() takes at most {fixed_positional} positional argument(s)"),
+                );
+                return None;
+            }
+            slots[position] = Some(self.expr(arg, fs));
+        }
+        if let Some(index) = vararg_index {
+            let value = match (star, vararg_extras.is_empty()) {
+                (Some(star), true) => self.expr_to_list(star, fs, line, col),
+                (Some(star), false) => {
+                    // Positional arguments before `*` stay in source order,
+                    // followed by the expanded iterable.
+                    let leading = HExpr {
+                        kind: HExprKind::List(vararg_extras),
+                        ty: Ty::Concrete(Type::List),
+                        line,
+                        col,
+                    };
+                    let expanded = self.expr_to_list(star, fs, line, col);
+                    HExpr {
+                        kind: HExprKind::Bin {
+                            op: pyx_ir::BinOp::Add,
+                            lhs: Box::new(leading),
+                            rhs: Box::new(expanded),
+                        },
+                        ty: Ty::Concrete(Type::List),
+                        line,
+                        col,
+                    }
+                }
+                (None, false) => HExpr {
+                    kind: HExprKind::List(vararg_extras),
+                    ty: Ty::Concrete(Type::List),
+                    line,
+                    col,
+                },
+                (None, true) => HExpr {
+                    kind: HExprKind::List(Vec::new()),
+                    ty: Ty::Concrete(Type::List),
+                    line,
+                    col,
+                },
+            };
+            slots[index] = Some(value);
+        } else if saw_star {
+            return None;
+        }
+
+        let mut explicit_kwargs: Vec<(String, HExpr)> = Vec::new();
+        let mut dstar: Option<HExpr> = None;
+        for keyword in &call.keywords {
+            let Some(name) = keyword.arg.as_ref() else {
+                if dstar.is_some() {
+                    self.error_at_code(
+                        keyword.range,
+                        codes::CALL,
+                        "only one **mapping argument is allowed",
+                    );
+                    return None;
+                }
+                dstar = Some(self.expr(&keyword.value, fs));
+                continue;
+            };
+            let matched = params
+                .iter()
+                .enumerate()
+                .find(|(_, (param, _, kind))| {
+                    *kind == ParamKind::Positional && param.as_str() == name.as_str()
+                })
+                .or_else(|| {
+                    params.iter().enumerate().find(|(_, (param, _, kind))| {
+                        *kind == ParamKind::KwOnly && param.as_str() == name.as_str()
+                    })
+                });
+            if let Some((index, _)) = matched {
+                if slots[index].is_some() {
+                    self.error_at_code(
+                        keyword.range,
+                        codes::CALL,
+                        format!("{class}() got multiple values for argument '{name}'"),
+                    );
+                    return None;
+                }
+                slots[index] = Some(self.expr(&keyword.value, fs));
+            } else if kwarg_index.is_some() {
+                explicit_kwargs.push((name.to_string(), self.expr(&keyword.value, fs)));
+            } else {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!("{class}() got an unexpected keyword argument '{name}'"),
+                );
+                return None;
+            }
+        }
+
+        // Fill positional and keyword-only slots with their literal defaults.
+        for (index, (name, default, kind)) in params.iter().enumerate() {
+            if !matches!(kind, ParamKind::Positional | ParamKind::KwOnly) {
+                continue;
+            }
+            if slots[index].is_some() {
+                continue;
+            }
+            if let Some(expression) = signature
+                .default_exprs
+                .get(index + 1)
+                .and_then(|expression| expression.clone())
+            {
+                slots[index] = Some(expression);
+                continue;
+            }
+            let Some(default) = default.clone() else {
+                self.error_at_code(
+                    call.range,
+                    codes::CALL,
+                    format!("{class}() missing required argument '{name}'"),
+                );
+                return None;
+            };
+            slots[index] = Some(HExpr {
+                kind: HExprKind::Const(default),
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            });
+        }
+
+        let mut dynamic_kwargs = None;
+        match (kwarg_index, dstar) {
+            (Some(index), Some(mapping)) => {
+                // `dict(mapping)` copies the mapping so merging explicit names
+                // never mutates the caller's dict. The copy is also the
+                // `**kwargs` slot; the runtime router removes keys that bind a
+                // named parameter.
+                let mut value = HExpr {
+                    kind: HExprKind::Call {
+                        callee: Callee::Builtin(Builtin::Dict),
+                        args: vec![mapping.clone()],
+                    },
+                    ty: Ty::Concrete(Type::Dict),
+                    line,
+                    col,
+                };
+                if !explicit_kwargs.is_empty() {
+                    let pairs = explicit_kwargs
+                        .into_iter()
+                        .map(|(name, value)| {
+                            let key = HExpr {
+                                kind: HExprKind::Const(Const::Str(name)),
+                                ty: Ty::Concrete(Type::Str),
+                                line,
+                                col,
+                            };
+                            (key, value)
+                        })
+                        .collect();
+                    value = HExpr {
+                        kind: HExprKind::MethodCall {
+                            object: Box::new(value),
+                            method: "update".to_string(),
+                            args: vec![HExpr {
+                                kind: HExprKind::Dict(pairs),
+                                ty: Ty::Concrete(Type::Dict),
+                                line,
+                                col,
+                            }],
+                            star: None,
+                            keywords: Vec::new(),
+                        },
+                        ty: Ty::Concrete(Type::Dict),
+                        line,
+                        col,
+                    };
+                }
+                slots[index] = Some(value);
+                dynamic_kwargs = Some(mapping);
+            }
+            (Some(index), None) => {
+                let pairs = explicit_kwargs
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let key = HExpr {
+                            kind: HExprKind::Const(Const::Str(name)),
+                            ty: Ty::Concrete(Type::Str),
+                            line,
+                            col,
+                        };
+                        (key, value)
+                    })
+                    .collect();
+                slots[index] = Some(HExpr {
+                    kind: HExprKind::Dict(pairs),
+                    ty: Ty::Concrete(Type::Dict),
+                    line,
+                    col,
+                });
+            }
+            (None, Some(mapping)) => {
+                if !explicit_kwargs.is_empty() {
+                    self.error_at_code(
+                        call.range,
+                        codes::CALL,
+                        format!("{class}() got an unexpected keyword argument"),
+                    );
+                    return None;
+                }
+                dynamic_kwargs = Some(mapping);
+            }
+            (None, None) => {}
+        }
+
+        let mut args = Vec::with_capacity(params.len());
+        for slot in slots {
+            let Some(value) = slot else {
+                self.error_at_code(
+                    call.range,
+                    codes::CALL,
+                    format!("{class}() cannot bind its dynamic argument slots"),
+                );
+                return None;
+            };
+            args.push(value);
+        }
+        let param_names = params
+            .iter()
+            .map(|(name, _, kind)| {
+                if matches!(kind, ParamKind::VarArg | ParamKind::KwArg) {
+                    String::new()
+                } else {
+                    name.clone()
+                }
+            })
+            .collect();
+        Some(ClassCallBind {
+            args,
+            dynamic_kwargs,
+            param_names,
+            kwarg_index,
+        })
+    }
+
+    /// Wrap `value` in `list(value)` so a starred operand can be stored in a
+    /// generated `*args` local.
+    fn expr_to_list(&mut self, value: HExpr, _fs: &mut FuncState, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Builtin(Builtin::List),
+                args: vec![value],
+            },
+            ty: Ty::Concrete(Type::List),
+            line,
+            col,
+        }
     }
 
     /// Lower a direct builtin call, binding the keywords the builtin supports.
@@ -8896,6 +9818,16 @@ fn call_has_dynamic_arguments(call: &ast::ExprCall) -> bool {
         .iter()
         .any(|arg| matches!(arg, ast::Expr::Starred(_)))
         || call.keywords.iter().any(|keyword| keyword.arg.is_none())
+}
+
+/// Name of a function's first declared parameter, used for classmethod `cls`.
+fn first_param_name(lowerer: &Lowerer<'_>, id: FunctionId) -> String {
+    lowerer
+        .functions
+        .get(id as usize)
+        .and_then(|function| function.params.first())
+        .map(|param| param.name.clone())
+        .unwrap_or_default()
 }
 
 /// `global` declarations that belong to one function scope. Nested

@@ -137,6 +137,7 @@ pub static MODULES: &[&ModuleSpec] = &[
     &TIMEIT,
     &DATACLASSES,
     &DATETIME,
+    &CONTEXTLIB,
     &TYPING,
     &ABC,
     &ENUM,

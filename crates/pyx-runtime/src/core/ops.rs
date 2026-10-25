@@ -6,8 +6,10 @@
 use std::cmp::Ordering;
 
 use crate::container;
+use crate::core::builtins;
 use crate::exc::{self, OVERFLOW_ERROR, TYPE_ERROR, ZERO_DIVISION_ERROR};
 use crate::value::{self, Num};
+use pyx_ir::MethodKind;
 
 // `pyx_binop` op codes.
 pub(crate) const OP_ADD: u32 = 0;
@@ -267,6 +269,24 @@ fn contains(left: i64, right: i64, negate: bool) -> i64 {
         container::set_contains(items, left)
     } else if let Some((start, stop, step)) = value::as_range(right) {
         range_contains(start, stop, step, left)
+    } else if value::as_instance(right).is_some() {
+        match instance_method_call(right, "__contains__", &[right, left]) {
+            Some(result) => {
+                if exc::pending() {
+                    return result;
+                }
+                return value::bool_value(value::truthy(result) != negate);
+            }
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "argument of type '{}' is not iterable",
+                        value::type_name(right)
+                    ),
+                )
+            }
+        }
     } else {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -308,7 +328,38 @@ fn range_contains(start: i64, stop: i64, step: i64, needle: i64) -> bool {
     in_bounds && (candidate - start) % (step as i128) == 0
 }
 
+/// Calls `a.__op__(b)` (or `b.__rop__(a)` when the left operand has no
+/// implementation) for user-class operands. Returns `None` when neither side
+/// defines the dunder, so the native operator path can continue.
+fn instance_dunder_binop(a: i64, b: i64, op: &str, reflected: &str) -> Option<i64> {
+    if let Some(result) = instance_method_call(a, op, &[a, b]) {
+        if !exc::pending() && result == value::NOT_IMPLEMENTED {
+            // Fall through to the reflected method / native path.
+        } else {
+            return Some(result);
+        }
+    }
+    if let Some(result) = instance_method_call(b, reflected, &[b, a]) {
+        return Some(result);
+    }
+    None
+}
+
+/// Calls a normal user instance method with already-evaluated arguments.
+pub(crate) fn instance_method_call(instance: i64, name: &str, args: &[i64]) -> Option<i64> {
+    let state = value::as_instance(instance)?;
+    let value::ClassEntry::Method(MethodKind::Normal, function) =
+        value::class_lookup(state.class, name)?
+    else {
+        return None;
+    };
+    Some(builtins::call(function, args.len(), args.as_ptr()))
+}
+
 fn add(a: i64, b: i64) -> i64 {
+    if let Some(result) = instance_dunder_binop(a, b, "__add__", "__radd__") {
+        return result;
+    }
     if let (Some(x), Some(y)) = (value::num_of(a), value::num_of(b)) {
         return match (x, y) {
             (Num::Int(p), Num::Int(q)) => match p.checked_add(q) {
@@ -628,7 +679,37 @@ fn float_pow(base: f64, exp: f64) -> i64 {
 // Comparisons
 // -------------------------------------------------------------------------
 
+/// User-class rich comparisons. `__eq__`/`__ne__` also fall back to the
+/// reflected method, matching Python's budgeted method lookup for this slice.
+fn instance_comparison(op: u32, a: i64, b: i64) -> Option<i64> {
+    let (method, reflected, invert) = match op {
+        OP_EQ => ("__eq__", "__eq__", false),
+        OP_NE => ("__eq__", "__eq__", true),
+        OP_LT => ("__lt__", "__gt__", false),
+        OP_LE => ("__le__", "__ge__", false),
+        OP_GT => ("__gt__", "__lt__", false),
+        OP_GE => ("__ge__", "__le__", false),
+        _ => return None,
+    };
+    let result = instance_method_call(a, method, &[a, b])
+        .or_else(|| instance_method_call(b, reflected, &[b, a]))?;
+    if exc::pending() {
+        return Some(result);
+    }
+    if result == value::NOT_IMPLEMENTED {
+        return None;
+    }
+    if invert {
+        Some(value::bool_value(!value::truthy(result)))
+    } else {
+        Some(value::bool_value(value::truthy(result)))
+    }
+}
+
 fn compare(op: u32, a: i64, b: i64) -> i64 {
+    if let Some(result) = instance_comparison(op, a, b) {
+        return result;
+    }
     if let (Some(x), Some(y)) = (value::num_of(a), value::num_of(b)) {
         return ordered_result(op, cmp_num(x, y));
     }

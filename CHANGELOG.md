@@ -8,16 +8,17 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **1368 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25: **1369 tests**, `scripts/verify.sh` ALL GREEN. The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
-58/297 standard-library modules are importable (13 builtin/frozen, 41 pure,
+59/297 standard-library modules are importable (13 builtin/frozen, 42 pure,
 4 extension). `benchmarks/bench_all.py` does **not** yet run under PyX: the
-first observed blockers are native bound-method values and dynamic
-`*args`/`**kwargs` calls in the `rich` package (see the package-loader
-entry below).
+rich console/table/panel/rule report rendering works; the remaining
+`bench_all.py` blocker is `rich.status`/`Live` (native Thread subclassing
+and zero-argument `super()`), plus a conservative-GC retention issue under
+heavy rich allocation. See the package-loader entry below.
 
 ### Added
 
@@ -48,6 +49,23 @@ entry below).
   `get_terminal_size`, `sys.stdin`/`stdout`/`stderr` and
   `threading.local` are available; imported-module initializer exceptions
   now stop the program with the original error.
+
+- **Runtime dispatch and rich report rendering:** generated function values
+  now carry full parameter metadata (names, kinds, definition-time defaults)
+  and a uniform full-argv trampoline; `CallKw`/`pyx_call_kw`,
+  `ClassCall`/`pyx_instance_new`, `pyx_bind_class_kwargs`, bound native/user
+  methods, classmethod `cls(...)`, imported class constructors and deferred
+  imports are dispatched at runtime. User classes gain `__call__`, `__str__`,
+  `__repr__`, `__len__`, `__contains__`, `__dict__`, `__new__`, operator
+  dunders, keyword-only defaults and 1 MiB generator/coroutine stacks.
+  Nested imports of import-free site-packages modules are linked; CPython
+  regex bracket/lookaround forms are normalized (lookarounds are dropped),
+  callable `re.sub`, `Match` character offsets, `str.rsplit`/`partition`,
+  `argparse nargs='+'`, `contextlib.suppress` and io base classes are
+  available. Container builders and wrapper argument buffers are rooted
+  across GC allocation. With a raised GC threshold the official rich
+  console/table/panel/rule report renders; `bench_all.py` remains blocked at
+  `rich.status`/`Live`.
 
 - **Package/site-packages loader and official `rich` source:** `check_file`
   now resolves packages (`__init__.py`), dotted names, submodules and

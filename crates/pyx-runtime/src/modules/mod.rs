@@ -614,6 +614,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "timeit" => timeit::call(function, args),
         "datetime" => datetime::call(function, args),
         "dataclasses" => dataclasses_call(function, args),
+        "contextlib" => contextlib_call(function, args),
         "typing" => typing::call(function, args),
         "abc" => abc::call(function, args),
         "enum" => r#enum::call(function, args),
@@ -682,6 +683,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `os.PathLike` is the abstract base of path objects; PyX path values
         // are plain strings (`pathlib.Path` included), so the class carries no
         // members and exists for attribute/import compatibility.
+        ("io" | "_io", name @ ("IOBase" | "TextIOBase" | "BufferedIOBase")) => {
+            value::class_new(name.to_string(), NONE, Vec::new())
+        }
         ("os", "PathLike") => value::class_new("PathLike".to_string(), NONE, Vec::new()),
         ("os", "devnull") => {
             let devnull = if cfg!(windows) { "nul" } else { "/dev/null" };
@@ -732,6 +736,31 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // value only has to exist for the import.
         ("dataclasses", "dataclass") => NONE,
         _ => missing_attribute(module, name),
+    }
+}
+
+/// `contextlib.suppress`: returns a native context manager. The subset does
+/// not suppress exceptions; `__exit__` returns `None` and the normal block
+/// path is supported.
+fn contextlib_call(function: &str, args: &[i64]) -> i64 {
+    match function {
+        "suppress" => {
+            let methods = vec![
+                (
+                    "__enter__".to_string(),
+                    value::native_function_new("contextlib", "_suppress_enter", 1),
+                ),
+                (
+                    "__exit__".to_string(),
+                    value::native_function_new("contextlib", "_suppress_exit", 4),
+                ),
+            ];
+            let class = value::class_new("suppress".to_string(), NONE, methods);
+            let _ = args;
+            value::instance_new(class)
+        }
+        "_suppress_enter" | "_suppress_exit" => NONE,
+        _ => missing_attribute("contextlib", function),
     }
 }
 
@@ -1791,7 +1820,7 @@ fn spawn_arity_error(function: i64, argc: usize) -> Option<String> {
         | value::FunctionBody::ItemGetter { .. }
         | value::FunctionBody::Identity => (func.arity != argc)
             .then(|| format!("function takes {} arguments ({argc} given)", func.arity)),
-        value::FunctionBody::Partial { .. } => None,
+        value::FunctionBody::Partial { .. } | value::FunctionBody::BoundMethod { .. } => None,
         value::FunctionBody::Native { module, name } => {
             stdlib::function(module, name).and_then(|spec| {
                 if argc >= spec.min_args && argc <= spec.max_args {

@@ -233,7 +233,10 @@ pub extern "C" fn pyx_class_new(
     if base != value::NONE && value::as_class(base).is_none() {
         return exc::raise_with_message(
             exc::TYPE_ERROR,
-            "class base must be a class object or None",
+            &format!(
+                "class base of '{name}' must be a class object or None, got '{}'",
+                value::type_name(base)
+            ),
         );
     }
     let mut methods: Vec<(String, i64, pyx_ir::MethodKind)> = Vec::new();
@@ -339,6 +342,117 @@ pub extern "C" fn pyx_class_new(
     value::class_new_full(name, base, methods, attrs)
 }
 
+/// Routes a dynamic `**mapping` operand into a class-constructor slot array.
+///
+/// `slots` holds one tagged value per `__init__` parameter after `self`, in
+/// parameter order. `names` is an array of `name_count` `[ptr, len]` word
+/// pairs (variadic slots use an empty name). A key that matches a bindable
+/// name overwrites that slot and is removed from the `**kwargs` dict at
+/// `kwarg_index`; an unmatched key is inserted into that dict, or raises
+/// `TypeError` when the signature has no `**kwargs`. Returns `None`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[no_mangle]
+pub extern "C" fn pyx_bind_class_kwargs(
+    mapping: i64,
+    names_ptr: *const i64,
+    name_count: usize,
+    slots: *mut i64,
+    kwarg_index: i64,
+    class_ptr: *const c_uchar,
+    class_len: usize,
+) -> i64 {
+    let Some(class) = required_name(class_ptr, class_len) else {
+        return exc::raise_with_message(exc::TYPE_ERROR, "class name must be a non-empty string");
+    };
+    if name_count > 0 && (names_ptr.is_null() || slots.is_null()) {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "class constructor received parameters without a binding buffer",
+        );
+    }
+    let Some(dict) = value::as_dict_data(mapping) else {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            &format!(
+                "argument after ** must be a mapping, not '{}'",
+                value::type_name(mapping)
+            ),
+        );
+    };
+    // Snapshot before mutating: `slots`/the kwargs dict may be updated while
+    // iterating, and the mapping itself is merely a live argument.
+    let entries = dict.entries().to_vec();
+    let kwargs = if kwarg_index >= 0 {
+        Some(slots.wrapping_add(kwarg_index as usize))
+    } else {
+        None
+    };
+    for (key, value) in entries {
+        let Some(name) = value::as_str(key) else {
+            return exc::raise_with_message(
+                exc::TYPE_ERROR,
+                &format!(
+                    "class constructor keywords must be strings, not '{}'",
+                    value::type_name(key)
+                ),
+            );
+        };
+        let mut matched = None;
+        for index in 0..name_count {
+            // SAFETY: the ABI contract requires `2 * name_count` readable
+            // words; NULL and zero-length names are skipped.
+            let ptr = unsafe { *names_ptr.add(index * 2) } as *const c_uchar;
+            let len = unsafe { *names_ptr.add(index * 2 + 1) } as usize;
+            if len == 0 {
+                continue;
+            }
+            let candidate = unsafe { std::slice::from_raw_parts(ptr, len) };
+            if candidate == name.as_bytes() {
+                matched = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = matched {
+            // SAFETY: `name_count` slots were checked above.
+            unsafe { *slots.add(index) = value };
+            if let Some(kwargs_ptr) = kwargs {
+                let kwargs_dict = unsafe { *kwargs_ptr };
+                if value::as_dict_data(kwargs_dict)
+                    .and_then(|data| data.find(key))
+                    .is_some()
+                {
+                    let _ = crate::core::container::delete_subscript(kwargs_dict, key);
+                }
+            }
+        } else if let Some(kwargs_ptr) = kwargs {
+            let kwargs_dict = unsafe { *kwargs_ptr };
+            crate::core::container::dict_set(kwargs_dict, key, value);
+        } else {
+            return exc::raise_with_message(
+                exc::TYPE_ERROR,
+                &format!("{class}() got an unexpected keyword argument '{name}'"),
+            );
+        }
+    }
+    value::NONE
+}
+
+/// Allocates an instance of `class` without running `__init__`.
+///
+/// Used by generated class-constructor calls, which bind the initializer
+/// arguments themselves and then invoke the concrete `__init__` entry. A
+/// non-class value raises `TypeError` and returns `None`.
+#[no_mangle]
+pub extern "C" fn pyx_instance_new(class: i64) -> i64 {
+    if value::as_class(class).is_none() {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            &format!("class expected, got '{}'", value::type_name(class)),
+        );
+    }
+    value::instance_new(class)
+}
+
 /// Returns the built-in exception class object for `tag` as a first-class
 /// value (`x = ValueError`, `class E(Exception):`).
 ///
@@ -408,6 +522,79 @@ pub extern "C" fn pyx_closure_new(
 /// to its function value. `names` points at `2 * count` words in
 /// `[name_ptr, name_len, ...]` order, mirroring the keyword buffers of
 /// `pyx_method_kw`. Returns the function value; a malformed buffer is ignored
+/// Stores full parameter metadata and the uniform full-argv trampoline on a
+/// generated function value.
+///
+/// `names` is `[ptr, len]` word pairs, `kinds` uses 0=positional, 1=*args,
+/// 2=keyword-only, 3=**kwargs, and `defaults`/`default_flags` describe the
+/// literal default per slot. The values become GC edges of the function object.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[no_mangle]
+pub extern "C" fn pyx_function_meta(
+    function: i64,
+    full_entry: i64,
+    count: usize,
+    names: *const i64,
+    kinds: *const i64,
+    defaults: *const i64,
+    default_flags: *const i64,
+) -> i64 {
+    if count > 0
+        && (names.is_null() || kinds.is_null() || defaults.is_null() || default_flags.is_null())
+    {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "function metadata received parameters without a metadata buffer",
+        );
+    }
+    if count > isize::MAX as usize / std::mem::size_of::<i64>() {
+        return exc::raise_with_message(exc::TYPE_ERROR, "function metadata is too large");
+    }
+    let mut signature = Vec::with_capacity(count);
+    for index in 0..count {
+        let ptr = unsafe { *names.add(index * 2) } as *const c_uchar;
+        let len = unsafe { *names.add(index * 2 + 1) } as usize;
+        let name = if len == 0 {
+            String::new()
+        } else {
+            match required_name(ptr, len) {
+                Some(name) => name,
+                None => {
+                    return exc::raise_with_message(
+                        exc::TYPE_ERROR,
+                        "function parameter name must be a string",
+                    )
+                }
+            }
+        };
+        let kind = match unsafe { *kinds.add(index) } {
+            0 => pyx_ir::ParamKind::Positional,
+            1 => pyx_ir::ParamKind::VarArg,
+            2 => pyx_ir::ParamKind::KwOnly,
+            3 => pyx_ir::ParamKind::KwArg,
+            _ => {
+                return exc::raise_with_message(
+                    exc::TYPE_ERROR,
+                    "function parameter kind is invalid",
+                )
+            }
+        };
+        let default = if unsafe { *default_flags.add(index) } != 0 {
+            Some(unsafe { *defaults.add(index) })
+        } else {
+            None
+        };
+        signature.push(value::ParamMeta {
+            name,
+            kind,
+            default,
+        });
+    }
+    value::function_set_full_entry(function, full_entry as usize);
+    value::function_set_signature(function, signature);
+    value::NONE
+}
+
 /// (the names are only used to bind `functools.partial` keywords).
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -543,6 +730,19 @@ pub extern "C" fn pyx_call_star(function: i64, argc: usize, argv: *const i64, st
     builtins::call_star(function, argc, argv, star)
 }
 
+/// `f(args..., name=value...)` for a function value.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[no_mangle]
+pub extern "C" fn pyx_call_kw(
+    function: i64,
+    argc: usize,
+    argv: *const i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> i64 {
+    crate::core::builtins::call_kw(function, argc, argv, kwargc, kw_argv)
+}
+
 /// `f(*args, **kwargs)` at a call site the frontend could not bind statically.
 ///
 /// The generated code evaluates the callee and every operand (in source
@@ -550,8 +750,13 @@ pub extern "C" fn pyx_call_star(function: i64, argc: usize, argv: *const i64, st
 /// itself always raises `RuntimeError`. It returns `None` with a pending
 /// exception, which the codegen propagates like any other failing runtime
 /// call.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn pyx_deferred_call(argc: usize, argv: *const i64) -> i64 {
+    if argc > 0 && !argv.is_null() {
+        let first = unsafe { *argv };
+        eprintln!("DEFERRED_RT argc={argc} callee={}", value::repr(first));
+    }
     // The evaluated operands are intentionally unused: their evaluation
     // already happened, and the call cannot be represented by the static ABI.
     let _ = (argc, argv);

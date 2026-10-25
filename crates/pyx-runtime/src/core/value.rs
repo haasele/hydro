@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize}
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use pyx_ir::MethodKind;
+use pyx_ir::{MethodKind, ParamKind};
 
 use crate::container::DictData;
 use crate::exc::ExcData;
@@ -198,6 +198,9 @@ pub(crate) enum FunctionBody {
         args: Vec<i64>,
         keywords: Vec<(String, i64)>,
     },
+    /// Native bound method (`obj.method` without a call). The receiver is a
+    /// traced GC edge; keyword arguments are not supported by this value form.
+    BoundMethod { receiver: i64, method: String },
     /// Identity callable used by `functools.cache`/`wraps` and by the
     /// decorator values returned from `lru_cache`/`wraps`: returns its single
     /// argument. Holds no PyX values.
@@ -217,10 +220,24 @@ pub(crate) enum FunctionBody {
 /// own their captured values, item getters own their keys and partials own the
 /// target callable plus the bound arguments; the collector traces those edges
 /// (see `gc::heap`).
+pub(crate) struct ParamMeta {
+    pub(crate) name: String,
+    pub(crate) kind: ParamKind,
+    /// Default value for a positional/keyword-only slot, when the source
+    /// default was a literal (or materialisable tuple literal).
+    pub(crate) default: Option<i64>,
+}
+
 pub(crate) struct FunctionObj {
     pub(crate) body: FunctionBody,
     pub(crate) arity: usize,
     pub(crate) name: String,
+    /// Uniform `(argv) -> i64` trampoline that forwards every declared
+    /// parameter slot, used by runtime keyword binding.
+    pub(crate) full_entry: usize,
+    /// Full parameter metadata (including `self`/`cls`); empty for native and
+    /// derived callables.
+    pub(crate) signature: Vec<ParamMeta>,
     /// [`FUNCTION_FLAG_ASYNC`] / [`FUNCTION_FLAG_GENERATOR`] /
     /// [`FUNCTION_FLAG_VARARGS`] bits for a generated wrapper. Native and
     /// builtin bodies keep `0`.
@@ -1439,6 +1456,11 @@ impl Attributes {
         self.lock().clone()
     }
 
+    /// Drops every attribute (used when `instance.__dict__` is replaced).
+    pub(crate) fn clear(&self) {
+        self.lock().clear();
+    }
+
     /// Removes `name` and returns its value, or `None` when the attribute does
     /// not exist. The dropped edge is safe for an in-progress marking cycle:
     /// the value was already marked when the edge was published.
@@ -2010,6 +2032,26 @@ pub(crate) fn std_stream_new(fd: i32) -> i64 {
 }
 
 /// Borrows the state of a class instance.
+/// Field values of a `typing.NamedTuple` instance in attribute insertion
+/// order. NamedTuple classes are empty native classes whose base is the
+/// `NamedTuple` placeholder; only that class form is recognised.
+pub(crate) fn namedtuple_values(instance: i64) -> Option<Vec<i64>> {
+    let state = as_instance(instance)?;
+    let class = as_class(state.class)?;
+    let base = as_class(class.base)?;
+    if base.name != "NamedTuple" {
+        return None;
+    }
+    Some(
+        state
+            .attrs
+            .snapshot()
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect(),
+    )
+}
+
 pub(crate) fn as_instance(v: i64) -> Option<&'static InstanceState> {
     if !is_heap(v) {
         return None;
@@ -2091,6 +2133,40 @@ pub(crate) fn class_method(class: i64, name: &str) -> Option<i64> {
 
 /// Reads an instance data attribute. Method attributes are resolved by
 /// [`crate::methods::call`] instead.
+/// Snapshot of `instance.__dict__` in insertion order.
+pub(crate) fn instance_dict(instance: i64) -> Option<Vec<(i64, i64)>> {
+    let state = as_instance(instance)?;
+    Some(
+        state
+            .attrs
+            .snapshot()
+            .into_iter()
+            .map(|(name, value)| (str_alloc(name), value))
+            .collect(),
+    )
+}
+
+/// Replaces `instance.__dict__` from a mapping of string keys.
+pub(crate) fn instance_set_dict(instance: i64, mapping: i64) -> bool {
+    let Some(state) = as_instance(instance) else {
+        return false;
+    };
+    let Some(pairs) = as_dict(mapping) else {
+        return false;
+    };
+    let copy = pairs.to_vec();
+    state.attrs.clear();
+    for (key, value) in copy {
+        // `__dict__` keys must be strings; ignore foreign keys rather than
+        // rejecting the whole mapping, so a partially malformed mapping still
+        // restores the valid attribute set.
+        if let Some(name) = as_str(key) {
+            state.attrs.set(instance, name.to_string(), value);
+        }
+    }
+    true
+}
+
 pub(crate) fn instance_attr(instance: i64, name: &str) -> Option<i64> {
     as_instance(instance)?.attrs.get(name)
 }
@@ -2803,10 +2879,19 @@ pub(crate) fn instance_new(class: i64) -> i64 {
 }
 
 pub(crate) fn defaultdict_new(factory: i64, pairs: Vec<(i64, i64)>) -> i64 {
-    alloc(
+    let mut values = Vec::with_capacity(pairs.len() * 2 + 1);
+    values.push(factory);
+    for (key, value) in &pairs {
+        values.push(*key);
+        values.push(*value);
+    }
+    let roots = crate::gc::heap::root_values(&values);
+    let result = alloc(
         KIND_DEFAULTDICT,
         ObjData::DefaultDict(crate::modules::collections::DefaultDictState { factory, pairs }),
-    )
+    );
+    crate::gc::heap::release_roots(roots);
+    result
 }
 
 pub(crate) fn pattern_new(source: String, flags: i64) -> i64 {
@@ -2867,11 +2952,22 @@ pub(crate) fn bytes_from_ptr(ptr: *const u8, len: usize) -> i64 {
 }
 
 pub(crate) fn list_new(items: Vec<i64>) -> i64 {
-    alloc(KIND_LIST, ObjData::List(items))
+    let roots = crate::gc::heap::root_values(&items);
+    let result = alloc(KIND_LIST, ObjData::List(items));
+    crate::gc::heap::release_roots(roots);
+    result
 }
 
 pub(crate) fn dict_new(pairs: Vec<(i64, i64)>) -> i64 {
-    dict_new_data(DictData::new(pairs))
+    let mut values = Vec::with_capacity(pairs.len() * 2);
+    for (key, value) in &pairs {
+        values.push(*key);
+        values.push(*value);
+    }
+    let roots = crate::gc::heap::root_values(&values);
+    let result = dict_new_data(DictData::new(pairs));
+    crate::gc::heap::release_roots(roots);
+    result
 }
 
 /// Allocates a dict from an already indexed payload (the constructor path,
@@ -2881,11 +2977,17 @@ pub(crate) fn dict_new_data(data: DictData) -> i64 {
 }
 
 pub(crate) fn tuple_new(items: Vec<i64>) -> i64 {
-    alloc(KIND_TUPLE, ObjData::Tuple(items))
+    let roots = crate::gc::heap::root_values(&items);
+    let result = alloc(KIND_TUPLE, ObjData::Tuple(items));
+    crate::gc::heap::release_roots(roots);
+    result
 }
 
 pub(crate) fn set_new(items: Vec<i64>) -> i64 {
-    alloc(KIND_SET, ObjData::Set(items))
+    let roots = crate::gc::heap::root_values(&items);
+    let result = alloc(KIND_SET, ObjData::Set(items));
+    crate::gc::heap::release_roots(roots);
+    result
 }
 
 pub(crate) fn range_new(start: i64, stop: i64, step: i64) -> i64 {
@@ -2922,6 +3024,8 @@ pub(crate) fn function_new_with_flags(
             arity,
             name,
             flags,
+            full_entry: 0,
+            signature: Vec::new(),
             params: Vec::new(),
         }),
     )
@@ -2945,6 +3049,8 @@ pub(crate) fn closure_new_with_flags(
             arity,
             name,
             flags,
+            full_entry: 0,
+            signature: Vec::new(),
             params: Vec::new(),
         }),
     )
@@ -2961,6 +3067,8 @@ pub(crate) fn native_function_new(module: &'static str, name: &'static str, arit
             arity,
             name: name.to_string(),
             flags: 0,
+            full_entry: 0,
+            signature: Vec::new(),
             params: Vec::new(),
         }),
     )
@@ -2976,6 +3084,8 @@ pub(crate) fn builtin_function_new(builtin: pyx_ir::Builtin) -> i64 {
             arity: usize::MAX,
             name: builtin.name().to_string(),
             flags: 0,
+            full_entry: 0,
+            signature: Vec::new(),
             params: Vec::new(),
         }),
     )
@@ -2991,6 +3101,8 @@ pub(crate) fn attribute_getter_new(names: Vec<String>) -> i64 {
             arity: 1,
             name: "attrgetter".to_string(),
             flags: 0,
+            full_entry: 0,
+            signature: Vec::new(),
             params: Vec::new(),
         }),
     )
@@ -3006,6 +3118,8 @@ pub(crate) fn item_getter_new(keys: Vec<i64>) -> i64 {
             arity: 1,
             name: "itemgetter".to_string(),
             flags: 0,
+            full_entry: 0,
+            signature: Vec::new(),
             params: Vec::new(),
         }),
     )
@@ -3037,7 +3151,9 @@ pub(crate) fn partial_new_with_keywords(
     let bound = args.len().saturating_add(keywords.len());
     let remaining = match as_function(function) {
         Some(func) => match &func.body {
-            FunctionBody::Native { .. } | FunctionBody::Builtin(_) => usize::MAX,
+            FunctionBody::Native { .. }
+            | FunctionBody::Builtin(_)
+            | FunctionBody::BoundMethod { .. } => usize::MAX,
             // Generated wrappers count user-visible parameters; the derived
             // callables here take exactly one argument.
             FunctionBody::Wrapper { .. }
@@ -3059,6 +3175,8 @@ pub(crate) fn partial_new_with_keywords(
             arity: remaining,
             name: "partial".to_string(),
             flags: 0,
+            full_entry: 0,
+            signature: Vec::new(),
             params: Vec::new(),
         }),
     )
@@ -3084,6 +3202,53 @@ pub(crate) fn function_set_params(function: i64, params: Vec<String>) {
     }
 }
 
+/// Sets the uniform full-argv trampoline address for a function value.
+pub(crate) fn function_set_full_entry(function: i64, entry: usize) {
+    if !is_heap(function) || (function & !TAG_MASK) == 0 {
+        return;
+    }
+    let obj = unsafe { &mut *((function & !TAG_MASK) as *mut PyxObj) };
+    if obj.kind == KIND_FUNCTION {
+        if let ObjData::Function(func) = &mut obj.data {
+            func.full_entry = entry;
+        }
+    }
+}
+
+/// Stores full parameter metadata on a function value.
+pub(crate) fn function_set_signature(function: i64, signature: Vec<ParamMeta>) {
+    if !is_heap(function) || (function & !TAG_MASK) == 0 {
+        return;
+    }
+    let obj = unsafe { &mut *((function & !TAG_MASK) as *mut PyxObj) };
+    if obj.kind == KIND_FUNCTION {
+        if let ObjData::Function(func) = &mut obj.data {
+            func.params = signature
+                .iter()
+                .filter(|param| param.kind == ParamKind::Positional)
+                .map(|param| param.name.clone())
+                .collect();
+            func.signature = signature;
+        }
+    }
+}
+
+/// Full parameter metadata of a function value.
+pub(crate) fn function_signature(function: i64) -> &'static [ParamMeta] {
+    match as_function(function) {
+        Some(func) => &func.signature,
+        None => &[],
+    }
+}
+
+/// Uniform full-argv trampoline address, or `0` when unavailable.
+pub(crate) fn function_full_entry(function: i64) -> usize {
+    match as_function(function) {
+        Some(func) => func.full_entry,
+        None => 0,
+    }
+}
+
 /// The user-visible positional parameter names of a function value, or an
 /// empty slice for callables without them.
 pub(crate) fn function_params(function: i64) -> &'static [String] {
@@ -3091,6 +3256,25 @@ pub(crate) fn function_params(function: i64) -> &'static [String] {
         Some(func) => &func.params,
         None => &[],
     }
+}
+
+/// Allocates a native bound method value (`receiver.method`).
+pub(crate) fn bound_method_new(receiver: i64, method: String) -> i64 {
+    alloc(
+        KIND_FUNCTION,
+        ObjData::Function(FunctionObj {
+            body: FunctionBody::BoundMethod {
+                receiver,
+                method: method.clone(),
+            },
+            arity: usize::MAX,
+            name: method,
+            flags: 0,
+            full_entry: 0,
+            signature: Vec::new(),
+            params: Vec::new(),
+        }),
+    )
 }
 
 /// Allocates the identity callable returned by `functools.lru_cache` and
@@ -3103,6 +3287,8 @@ pub(crate) fn identity_function_new(name: &str) -> i64 {
             arity: 1,
             name: name.to_string(),
             flags: 0,
+            full_entry: 0,
+            signature: Vec::new(),
             params: Vec::new(),
         }),
     )
@@ -3605,7 +3791,20 @@ pub(crate) fn to_string(v: i64) -> String {
                 }
                 ObjData::Socket(state) => state.render(),
                 ObjData::Class(state) => format!("<class '{}'>", state.name),
-                ObjData::Instance(state) => instance_default_repr(state),
+                ObjData::Instance(state) => {
+                    let class = state.class;
+                    if let Some(ClassEntry::Method(pyx_ir::MethodKind::Normal, function)) =
+                        class_lookup(class, "__str__")
+                    {
+                        let result = crate::core::builtins::call(function, 1, [v].as_ptr());
+                        if !crate::exc::pending() {
+                            if let Some(text) = as_str(result) {
+                                return text.to_string();
+                            }
+                        }
+                    }
+                    instance_default_repr(state)
+                }
                 ObjData::Fiber(state) => fiber_repr(state),
                 ObjData::ExtFunction(state) => {
                     format!("<built-in function {}>", state.name)
@@ -3674,6 +3873,17 @@ fn repr_depth(v: i64, depth: usize) -> String {
         return format!("<module '{}'>", state.name);
     }
     if let Some(state) = as_instance(v) {
+        let class = state.class;
+        if let Some(ClassEntry::Method(pyx_ir::MethodKind::Normal, function)) =
+            class_lookup(class, "__repr__")
+        {
+            let result = crate::core::builtins::call(function, 1, [v].as_ptr());
+            if !crate::exc::pending() {
+                if let Some(text) = as_str(result) {
+                    return text.to_string();
+                }
+            }
+        }
         return instance_default_repr(state);
     }
     if let Some(state) = as_fiber(v) {

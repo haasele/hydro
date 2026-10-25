@@ -16,6 +16,40 @@ use crate::value;
 /// `pyx_iter_new`: creates an iterator for a list, string, dict, tuple, set,
 /// range, text file, CSV reader or a generator object.
 pub(crate) fn iter_new(obj: i64) -> i64 {
+    // Iterating an iterator returns it unchanged (`for` uses `iter(obj)`).
+    if value::as_iter(obj).is_some() {
+        return obj;
+    }
+    if let Some(instance) = value::as_instance(obj) {
+        if let Some(value::ClassEntry::Method(pyx_ir::MethodKind::Normal, function)) =
+            value::class_lookup(instance.class, "__iter__")
+        {
+            let arguments = [obj];
+            let result = crate::core::builtins::call(function, 1, arguments.as_ptr());
+            if exc::pending() {
+                return value::NONE;
+            }
+            if value::as_iter(result).is_some() || value::as_fiber(result).is_some() {
+                return result;
+            }
+            if value::as_instance(result).is_some() {
+                return value::iter_new(result);
+            }
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "iter() returned non-iterator of type '{}'",
+                    value::type_name(result)
+                ),
+            );
+        }
+        if value::class_lookup(instance.class, "__next__").is_some() {
+            return value::iter_new(obj);
+        }
+    }
+    if let Some(values) = value::namedtuple_values(obj) {
+        return value::iter_new(value::list_new(values));
+    }
     let generator = value::as_fiber(obj)
         .map(|fiber| fiber.kind == crate::fiber::FiberKind::Generator)
         .unwrap_or(false);
@@ -98,6 +132,12 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
         exc::raise_with_message(TYPE_ERROR, "iteration output pointer is NULL");
         return 0;
     }
+    if value::as_fiber(iter)
+        .map(|fiber| fiber.kind == crate::fiber::FiberKind::Generator)
+        .unwrap_or(false)
+    {
+        return generator_next(iter, out);
+    }
     let target = match value::as_iter(iter) {
         Some(state) => state.target,
         None => {
@@ -166,6 +206,28 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
     } else if value::as_csv_reader(target).is_some() {
         // The snapshot is native; a fresh list/dict is built per yielded row.
         crate::csv::reader_item(target)
+    } else if let Some(instance) = value::as_instance(target) {
+        let Some(value::ClassEntry::Method(pyx_ir::MethodKind::Normal, function)) =
+            value::class_lookup(instance.class, "__next__")
+        else {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("'{}' object is not iterable", value::type_name(target)),
+            );
+            return 0;
+        };
+        let arguments = [target];
+        let item = crate::core::builtins::call(function, 1, arguments.as_ptr());
+        if exc::pending() {
+            if exc::pending_tag() == exc::STOP_ITERATION as i64 {
+                exc::clear();
+                return 0;
+            }
+            return 0;
+        }
+        // SAFETY: the caller supplied a writable `i64` slot.
+        unsafe { *out = item };
+        return 1;
     } else {
         exc::raise_with_message(
             TYPE_ERROR,

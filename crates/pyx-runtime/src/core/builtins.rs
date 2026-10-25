@@ -5,7 +5,7 @@
 use std::io::Write as _;
 use std::num::IntErrorKind;
 
-use pyx_ir::{Builtin, MethodKind};
+use pyx_ir::{Builtin, MethodKind, ParamKind};
 
 use crate::container;
 use crate::exc::{
@@ -104,6 +104,27 @@ pub(crate) fn len(v: i64) -> i64 {
     }
     if let Some((start, stop, step)) = value::as_range(v) {
         return ops::int_result(value::range_len(start, stop, step));
+    }
+    if let Some(instance) = value::as_instance(v) {
+        if let Some(value::ClassEntry::Method(MethodKind::Normal, function)) =
+            value::class_lookup(instance.class, "__len__")
+        {
+            let arguments = [v];
+            let result = call(function, 1, arguments.as_ptr());
+            if exc::pending() {
+                return NONE;
+            }
+            if value::as_integer(result).is_some() {
+                return result;
+            }
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "'__len__' should return an integer, not {}",
+                    value::type_name(result)
+                ),
+            );
+        }
     }
     exc::raise_with_message(
         TYPE_ERROR,
@@ -841,6 +862,11 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
     if let Some(state) = value::as_ext_function(function) {
         return modules::extension::call_value(state, argc, argv);
     }
+    if let Some(instance) = value::as_instance(function) {
+        if value::class_lookup(instance.class, "__call__").is_some() {
+            return methods::call(function, b"__call__".as_ptr(), "__call__".len(), argc, argv);
+        }
+    }
     let Some(func) = value::as_function(function) else {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -911,11 +937,13 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
                 }
                 let name = func.name.clone();
                 let entry = *entry;
+                let roots = crate::heap::root_values(&args);
                 let created = if func.flags & value::FUNCTION_FLAG_ASYNC != 0 {
                     value::fiber_coroutine_new(entry, name, args)
                 } else {
                     value::fiber_generator_new(entry, name, args)
                 };
+                crate::heap::release_roots(roots);
                 return match created {
                     Some(fiber) => fiber,
                     None => exc::raise_with_message(
@@ -956,10 +984,17 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             let entry: unsafe extern "C" fn(*const i64) -> i64 =
                 unsafe { std::mem::transmute(*entry) };
             // SAFETY: the generated wrapper is called in-process with the
-            // calling convention it was emitted for.
-            unsafe { entry(argv) }
+            // calling convention it was emitted for. Root the copied buffer
+            // while callee code may allocate and trigger a collection.
+            let roots = crate::heap::root_values(&buffer);
+            let result = unsafe { entry(argv) };
+            crate::heap::release_roots(roots);
+            result
         }
         FunctionBody::Native { module, name } => modules::call_native(module, name, argc, argv),
+        FunctionBody::BoundMethod { receiver, method } => {
+            crate::core::methods::call(*receiver, method.as_ptr(), method.len(), argc, argv)
+        }
         FunctionBody::Builtin(builtin) => call_builtin(*builtin, argc, argv),
         FunctionBody::AttributeGetter { names } => attribute_getter_call(names, argc, argv),
         FunctionBody::ItemGetter { keys } => item_getter_call(keys, argc, argv),
@@ -982,13 +1017,16 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
                 let supplied = unsafe { std::slice::from_raw_parts(argv, argc) };
                 call_args.extend_from_slice(supplied);
             }
-            if keywords.is_empty() {
+            let roots = crate::heap::root_values(&call_args);
+            let result = if keywords.is_empty() {
                 call(*inner, call_args.len(), call_args.as_ptr())
             } else {
                 // The bound keyword values move into the target's positional
                 // slots in parameter order.
                 call_with_keywords(*inner, call_args, keywords)
-            }
+            };
+            crate::heap::release_roots(roots);
+            result
         }
         FunctionBody::Identity => {
             if argc != 1 || argv.is_null() {
@@ -1014,6 +1052,39 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
 /// parameter names (native function, builtin, getter or a dynamic signature)
 /// raises `TypeError` instead of dropping the keywords.
 fn call_with_keywords(target: i64, args: Vec<i64>, keywords: &[(String, i64)]) -> i64 {
+    if let Some(func) = value::as_function(target) {
+        if let FunctionBody::BoundMethod { receiver, method } = &func.body {
+            let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+            for (name, value) in keywords {
+                pairs.push(value::str_alloc(name.clone()));
+                pairs.push(*value);
+            }
+            return methods::call_kw(
+                *receiver,
+                method.as_ptr(),
+                method.len(),
+                args.len(),
+                args.as_ptr(),
+                keywords.len(),
+                pairs.as_ptr(),
+            );
+        }
+        if !value::function_signature(target).is_empty() && value::function_full_entry(target) != 0
+        {
+            let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+            for (name, value) in keywords {
+                pairs.push(value::str_alloc(name.clone()));
+                pairs.push(*value);
+            }
+            return call_kw(
+                target,
+                args.len(),
+                args.as_ptr(),
+                keywords.len(),
+                pairs.as_ptr(),
+            );
+        }
+    }
     let Some(func) = value::as_function(target) else {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -1123,7 +1194,316 @@ pub(crate) fn call_star(function: i64, argc: usize, argv: *const i64, star: i64)
         }
     }
     args.extend_from_slice(&items);
-    call(function, args.len(), args.as_ptr())
+    let roots = crate::heap::root_values(&args);
+    let result = call(function, args.len(), args.as_ptr());
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// `fn(args..., name=value...)`: runtime keyword binding for a function value.
+///
+/// Generated functions carry their full parameter metadata and a uniform
+/// full-argv trampoline. Native/builtin values validate their own positional
+/// arity and reject keywords here.
+pub(crate) fn call_kw(
+    function: i64,
+    argc: usize,
+    argv: *const i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> i64 {
+    if argc > 0 && argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("function call received {argc} argument(s) without an argument buffer"),
+        );
+    }
+    if kwargc == 0 {
+        // A generated function may still use its metadata for omitted
+        // defaults; only native/builtin values fall back to the positional
+        // call here.
+        if value::function_signature(function).is_empty()
+            || value::function_full_entry(function) == 0
+        {
+            return call(function, argc, argv);
+        }
+    }
+    if kw_argv.is_null() || kwargc > isize::MAX as usize / (2 * std::mem::size_of::<i64>()) {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "keyword arguments were passed without an argument buffer",
+        );
+    }
+    if value::as_class(function).is_some() {
+        let class = function;
+        let args = if argc == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: checked above; caller contract.
+            unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+        };
+        let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+        let mut keywords = Vec::with_capacity(kwargc);
+        for pair in pairs.as_chunks::<2>().0 {
+            let Some(keyword) = value::as_str(pair[0]) else {
+                return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+            };
+            keywords.push((keyword.to_string(), pair[1]));
+        }
+        let instance = value::instance_new(class);
+        let Some((kind, init)) = value::class_member(class, "__init__") else {
+            if !args.is_empty() || !keywords.is_empty() {
+                return exc::raise_with_message(TYPE_ERROR, "class takes no arguments");
+            }
+            return instance;
+        };
+        if value::function_signature(init).is_empty() || value::function_full_entry(init) == 0 {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "class constructor does not support keyword arguments",
+            );
+        }
+        let _ =
+            methods::call_user_method(instance, class, kind, init, "__init__", &args, &keywords);
+        return if exc::pending() { NONE } else { instance };
+    }
+    if let Some(func) = value::as_function(function) {
+        if let FunctionBody::BoundMethod { receiver, method } = &func.body {
+            return methods::call_kw(
+                *receiver,
+                method.as_ptr(),
+                method.len(),
+                argc,
+                argv,
+                kwargc,
+                kw_argv,
+            );
+        }
+    }
+    let Some(func) = value::as_function(function) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("'{}' object is not callable", value::type_name_of(function)),
+        );
+    };
+    let name = func.name.clone();
+    let signature = value::function_signature(function);
+    let entry = value::function_full_entry(function);
+    if signature.is_empty() {
+        // Closures have no full signature metadata, but their user-visible
+        // positional names are stored separately. Bind keyword arguments to
+        // those positions and let the wrapper prepend captured values.
+        let names = value::function_params(function);
+        if !names.is_empty() {
+            if argc > 0 && argv.is_null() {
+                return exc::raise_with_message(TYPE_ERROR, "missing argument buffer");
+            }
+            let mut slots: Vec<Option<i64>> = vec![None; names.len()];
+            let args = if argc == 0 {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+            };
+            if args.len() > names.len() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{name}() takes at most {} arguments", names.len()),
+                );
+            }
+            for (index, value) in args.into_iter().enumerate() {
+                slots[index] = Some(value);
+            }
+            let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+            for pair in pairs.as_chunks::<2>().0 {
+                let Some(keyword) = value::as_str(pair[0]) else {
+                    return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                };
+                let Some(index) = names.iter().position(|candidate| candidate == keyword) else {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("{name}() got an unexpected keyword argument '{keyword}'"),
+                    );
+                };
+                if slots[index].is_some() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("{name}() got multiple values for argument '{keyword}'"),
+                    );
+                }
+                slots[index] = Some(pair[1]);
+            }
+            let mut bound = Vec::with_capacity(names.len());
+            for (index, slot) in slots.into_iter().enumerate() {
+                match slot {
+                    Some(value) => bound.push(value),
+                    None => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("{name}() missing required argument '{}'", names[index]),
+                        )
+                    }
+                }
+            }
+            return call(function, bound.len(), bound.as_ptr());
+        }
+    }
+    if signature.is_empty() || entry == 0 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name}() does not accept keyword arguments"),
+        );
+    }
+    let args = if argc == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: checked above; caller contract.
+        unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+    };
+    let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+    let mut keywords: Vec<(String, i64)> = Vec::with_capacity(kwargc);
+    for pair in pairs.as_chunks::<2>().0 {
+        let Some(keyword) = value::as_str(pair[0]) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "keyword argument name must be str, not '{}'",
+                    value::type_name(pair[0])
+                ),
+            );
+        };
+        keywords.push((keyword.to_string(), pair[1]));
+    }
+
+    let mut slots: Vec<Option<i64>> = vec![None; signature.len()];
+    let mut next_positional = 0usize;
+    let mut vararg_items: Vec<i64> = Vec::new();
+    for (index, param) in signature.iter().enumerate() {
+        match param.kind {
+            ParamKind::Positional => {
+                if next_positional < args.len() {
+                    slots[index] = Some(args[next_positional]);
+                    next_positional += 1;
+                }
+            }
+            ParamKind::VarArg => {
+                vararg_items.extend_from_slice(&args[next_positional..]);
+                next_positional = args.len();
+            }
+            ParamKind::KwOnly | ParamKind::KwArg => {}
+        }
+    }
+    if next_positional < args.len() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{name}() takes at most {} positional argument(s) ({} given)",
+                signature
+                    .iter()
+                    .filter(|param| param.kind == ParamKind::Positional)
+                    .count(),
+                args.len()
+            ),
+        );
+    }
+
+    let mut extra_keywords: Vec<(String, i64)> = Vec::new();
+    for (keyword, argument) in keywords {
+        let mut matched = false;
+        for (index, param) in signature.iter().enumerate() {
+            if param.kind != ParamKind::Positional && param.kind != ParamKind::KwOnly {
+                continue;
+            }
+            if param.name == keyword {
+                if slots[index].is_some() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("{name}() got multiple values for argument '{keyword}'"),
+                    );
+                }
+                slots[index] = Some(argument);
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            if signature.iter().any(|param| param.kind == ParamKind::KwArg) {
+                extra_keywords.push((keyword, argument));
+            } else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{name}() got an unexpected keyword argument '{keyword}'"),
+                );
+            }
+        }
+    }
+
+    if let Some(index) = signature
+        .iter()
+        .position(|param| param.kind == ParamKind::VarArg)
+    {
+        slots[index] = Some(value::list_new(vararg_items));
+    }
+    if let Some(index) = signature
+        .iter()
+        .position(|param| param.kind == ParamKind::KwArg)
+    {
+        let pairs = extra_keywords
+            .iter()
+            .map(|(keyword, value)| (value::str_alloc(keyword.clone()), *value))
+            .collect();
+        slots[index] = Some(value::dict_new(pairs));
+    }
+    for (index, param) in signature.iter().enumerate() {
+        if slots[index].is_some() {
+            continue;
+        }
+        match param.default {
+            Some(default) => slots[index] = Some(default),
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{name}() missing required argument '{}'", param.name),
+                )
+            }
+        }
+    }
+    let full: Vec<i64> = slots.into_iter().map(|slot| slot.unwrap_or(NONE)).collect();
+    if func.flags & (value::FUNCTION_FLAG_ASYNC | value::FUNCTION_FLAG_GENERATOR) != 0 {
+        // Generator/coroutine calls must create a suspended fiber instead of
+        // running the concrete entry. Plain positional signatures can go
+        // through the regular wrapper with the fully bound slot vector.
+        if signature
+            .iter()
+            .all(|param| param.kind == ParamKind::Positional)
+        {
+            return call(function, full.len(), full.as_ptr());
+        }
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name}() does not accept keyword arguments"),
+        );
+    }
+    call_full_entry(entry, &full)
+}
+
+/// Calls a generated full-argv trampoline while keeping every argument value
+/// visible to the conservative collector. Small vectors are copied to a stack
+/// array; unusually large signatures fall back to permanent thread roots.
+pub(crate) fn call_full_entry(entry: usize, args: &[i64]) -> i64 {
+    // SAFETY: `entry` is the generated `extern "C" fn(*const i64) -> i64`
+    // trampoline for this exact argument count.
+    let trampoline: extern "C" fn(*const i64) -> i64 =
+        unsafe { std::mem::transmute::<usize, extern "C" fn(*const i64) -> i64>(entry) };
+    const STACK_ARGS: usize = 32;
+    if args.len() <= STACK_ARGS {
+        let mut buffer = [NONE; STACK_ARGS];
+        buffer[..args.len()].copy_from_slice(args);
+        return trampoline(buffer.as_ptr());
+    }
+    for &argument in args {
+        crate::heap::add_thread_root(argument);
+    }
+    trampoline(args.as_ptr())
 }
 
 /// Resolves a name bound by a function-local import.
@@ -1133,6 +1513,14 @@ pub(crate) fn call_star(function: i64, argc: usize, argv: *const i64, star: i64)
 /// and always raises `RuntimeError`; the returned `None` is only the pending
 /// exception placeholder for generated code.
 pub(crate) fn deferred_import(module: &str, member: Option<&str>) -> i64 {
+    // A nested import that names a value of an already-initialized module can
+    // be served from the mirrored module global table. The loader links every
+    // module that is part of the program, so no dynamic loading is needed.
+    if let Some(member) = member {
+        if let Some(value) = crate::core::globals::try_get(module, member) {
+            return value;
+        }
+    }
     let message = match member {
         Some(member) => format!("dynamic import of '{module}.{member}' is not supported"),
         None => format!("dynamic import of '{module}' is not supported"),
@@ -1240,6 +1628,16 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
         }
         return instance;
     };
+    if !value::function_signature(init).is_empty() && value::function_full_entry(init) != 0 {
+        let call_args = if argc == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: checked above; caller contract.
+            unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+        };
+        let _ = methods::call_user_method(instance, class, kind, init, "__init__", &call_args, &[]);
+        return if exc::pending() { NONE } else { instance };
+    }
     let mut args = Vec::with_capacity(argc + 1);
     match kind {
         MethodKind::Normal | MethodKind::Property => args.push(instance),
@@ -2254,6 +2652,43 @@ fn type_check(value: i64, target: i64) -> Option<bool> {
     None
 }
 
+/// Whether `class` ultimately derives from the runtime `typing.Protocol`
+/// placeholder. Such classes use structural checks in `isinstance`.
+fn is_protocol_class(class: i64) -> bool {
+    let mut current = class;
+    for _ in 0..64 {
+        let Some(state) = value::as_class(current) else {
+            return false;
+        };
+        if state.name == "Protocol" {
+            return true;
+        }
+        if state.base == NONE {
+            return false;
+        }
+        current = state.base;
+    }
+    false
+}
+
+/// Structural protocol check: every method declared by the protocol must be
+/// present on the value. Native scalar values never satisfy a rich protocol.
+fn protocol_instance_of(value: i64, class: i64) -> bool {
+    let Some(protocol) = value::as_class(class) else {
+        return false;
+    };
+    if protocol.methods.is_empty() {
+        return true;
+    }
+    let Some(instance) = value::as_instance(value) else {
+        return false;
+    };
+    protocol.methods.iter().all(|(name, _, _)| {
+        value::class_lookup(instance.class, name).is_some()
+            || value::instance_attr(value, name).is_some()
+    })
+}
+
 /// Matches `value` against a native type name (`int`, `bool`, `str`, ...).
 fn named_type_check(value: i64, name: &str) -> Option<bool> {
     Some(match name {
@@ -2269,12 +2704,16 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
         "set" | "frozenset" => value::as_set(value).is_some(),
         "NoneType" | "None" => value == NONE,
         "object" => true,
+        "type" => value::as_class(value).is_some(),
         _ => return None,
     })
 }
 
 /// Whether `value` is an instance of `class` (or one of its subclasses).
 fn instance_of(value: i64, class: i64) -> bool {
+    if is_protocol_class(class) {
+        return protocol_instance_of(value, class);
+    }
     let Some(instance) = value::as_instance(value) else {
         return false;
     };

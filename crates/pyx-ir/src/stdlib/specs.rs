@@ -356,7 +356,11 @@ const IO_FUNCTIONS: &[FunctionSpec] = &[kw(
 pub static IO: ModuleSpec = ModuleSpec {
     name: "io",
     functions: IO_FUNCTIONS,
-    constants: &[],
+    constants: &[
+        c("IOBase", Type::Any),
+        c("TextIOBase", Type::Any),
+        c("BufferedIOBase", Type::Any),
+    ],
 };
 
 /// `_io`: the accelerator alias of `io`.
@@ -1184,6 +1188,15 @@ pub static FRACTIONS: ModuleSpec = ModuleSpec {
 pub static IMPORTLIB: ModuleSpec = ModuleSpec {
     name: "importlib",
     functions: &[kw("import_module", 1, 2, Type::Any, &["name", "package"])],
+    constants: &[],
+};
+
+/// `contextlib`: the `suppress` context manager used by rich/ansi and other
+/// libraries. Its `__exit__` never suppresses exceptions in this subset; the
+/// common no-error path is supported.
+pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
+    name: "contextlib",
+    functions: &[f("suppress", 0, usize::MAX, Type::Any)],
     constants: &[],
 };
 

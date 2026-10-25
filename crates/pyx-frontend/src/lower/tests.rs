@@ -2817,7 +2817,7 @@ fn double_star_calls_defer_to_runtime() {
 }
 
 #[test]
-fn keyword_call_on_a_function_value_defers() {
+fn keyword_call_on_a_function_value_uses_the_runtime_binder() {
     let source = "def g(f):\n    return f(a=1)\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
@@ -2825,7 +2825,7 @@ fn keyword_call_on_a_function_value_defers() {
     assert!(matches!(
         &g.body[0].kind,
         HStmtKind::Return(Some(HExpr {
-            kind: HExprKind::DeferredCall { .. },
+            kind: HExprKind::CallKw { .. },
             ..
         }))
     ));
@@ -5181,15 +5181,19 @@ fn unittest_test_case_is_accepted_as_a_class_base() {
 }
 
 #[test]
-fn multiple_class_bases_are_still_rejected() {
-    let source = "class T(A, B):\n    pass\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert!(
-        diags[0].message.contains("multiple inheritance"),
-        "{:?}",
-        diags[0].message
-    );
+fn multiple_class_bases_use_the_first_base() {
+    let source = "class A:\n    pass\nclass B:\n    pass\nclass T(A, B):\n    pass\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let class = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::ClassDef { name, base, .. } if name == "T" => Some(base),
+            _ => None,
+        })
+        .expect("class T");
+    assert!(class.is_some(), "the first base must be kept");
 }
 
 #[test]

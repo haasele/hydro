@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-25**. Phase 1 is complete; Phase 2 is largely
-implemented (1368 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (1369 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -167,6 +167,13 @@ i64  pyx_function_new(const uint8_t* wrapper, uint64_t arity,
 i64  pyx_function_params(i64 fn, uint64_t count, const i64* names);
                                     // 2*count words [ptr, len, ...]:
                                     // user-visible positional parameter names
+i64  pyx_function_meta(i64 fn, i64 full_entry, uintptr_t count,
+                       const i64* names, const i64* kinds,
+                       const i64* defaults, const i64* default_flags);
+                                    // names: [ptr,len] pairs; kinds
+                                    // 0..3; definition-time defaults
+i64  pyx_call_kw(i64 fn, uintptr_t argc, const i64* argv,
+                 uintptr_t kwargc, const i64* kw_argv);
 i64  pyx_builtin_function(const uint8_t* name, size_t name_len); // f = int
 i64  pyx_closure_new(const uint8_t* wrapper, uint64_t arity,
                      const uint8_t* name, size_t name_len,
@@ -177,6 +184,11 @@ i64  pyx_class_new(const uint8_t* name, size_t name_len, i64 base,
                    const i64* kinds,
                    uint64_t attr_count, const i64* attr_names,
                    const i64* attr_values);
+i64  pyx_instance_new(i64 class);   // allocate without __init__
+i64  pyx_bind_class_kwargs(i64 mapping, const i64* names, uintptr_t count,
+                           i64* slots, i64 kwarg_index,
+                           const uint8_t* class_name, size_t class_len);
+                                    // route **mapping into constructor slots
 i64  pyx_exception_class(uint32_t tag);  // cached native class, e.g. ValueError
 i64  pyx_call(i64 fn, uint64_t argc, const i64* argv);
 i64  pyx_call_star(i64 fn, uint64_t argc, const i64* argv, i64 star);
@@ -197,7 +209,9 @@ i64  pyx_module_get(const uint8_t* module, size_t module_len,
 i64  pyx_module_value(const uint8_t* module, size_t module_len);
 i64  pyx_deferred_import(const uint8_t* module, size_t module_len,
                          const uint8_t* member, size_t member_len);
-                     // always raises RuntimeError; empty member = module alias
+                     // resolves an already-initialized module global when
+                     // possible; otherwise raises RuntimeError
+                     // (empty member = module alias)
 i64  pyx_global_get(const uint8_t* module, size_t module_len,
                     const uint8_t* name, size_t name_len);
 i64  pyx_global_set(const uint8_t* module, size_t module_len,
@@ -707,8 +721,10 @@ it. The cache is not a shared artifact store.
   (`callee(args, *star)`; `star` is one optional list/tuple operand),
   `ModuleCall`, `ModuleAttr`,
   `GetAttr` (data attribute), `MethodCall { args, star, keywords }`,
-  `Closure`
-  (value), `Call { callee: Function(id) | Builtin(b), args }`.
+  `Closure` (value), `Call { callee: Function(id) | Builtin(b), args }`,
+  `CallKw { callee, args, keywords }` (runtime keyword/default binder),
+  `ClassCall { class, init, args, dynamic_kwargs, param_names,
+  kwarg_index }` (class constructors, including `*args`/`**mapping`).
 - Statements: `Expr`, `Assign`, `AugAssign`, `If`, `While`, `ForRange`,
   `ForEach`, `Unpack`, `SetSubscript`, `SetSlice` (list slice assignment;
   omitted bounds are `Const::None`), `Closure` (nested def), `Yield`,
@@ -999,17 +1015,20 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **1368 tests** (413 frontend, 48 codegen, 18 IR, 492
-  runtime unit, 179 runtime integration, 218 CLI/E2E). E2E coverage
+- As of 2026-10-25: **1369 tests** (413 frontend, 48 codegen, 18 IR, 492
+  runtime unit, 179 runtime integration, 219 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
   socket echo, pathlib, build cache, `pyx gc` and uv passthrough.
-- Generated stdlib import matrix (2026-10-25): **58/297 importable** (13
-  builtin/frozen, 41 pure, 4 extension; report in
+- Generated stdlib import matrix (2026-10-25): **59/297 importable** (13
+  builtin/frozen, 42 pure, 4 extension; report in
   [`COMPATIBILITY.md`](COMPATIBILITY.md)). `benchmarks/bench_all.py` does
-  **not** yet run under PyX; the first observed blockers are native
-  bound-method values and dynamic `*args`/`**kwargs` calls in `rich`.
+  **not** yet run under PyX; rich console/table/panel/rule rendering works,
+  and the remaining blocker is `rich.status`/`Live` (native `Thread` cannot
+  be a class base; zero-argument `super()` is unsupported). The default
+  conservative collector also loses live values under heavier rich
+  rendering; a raised `PYX_GC_THRESHOLD` makes the smoke render pass.
 - New unit tests cover the dict hash index, the GC statistics and
   fiber iteration; `examples/generators_async.py` runs under JIT and AOT.
 - E2E compares stdout/exit code of `pyx run` and the AOT binary; negative tests
@@ -1023,8 +1042,11 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   `lru_cache`/`cache`/`wraps`/`abstractmethod`/`overload`/
   `runtime_checkable`), pattern matching,
   metaclasses, descriptor/`__dunder__` protocols, `except*`,
-  implicit exception context, `bytearray`/`memoryview`; no
-  multiple inheritance, zero-argument `super()`; class namespace immutable.
+  implicit exception context, `bytearray`/`memoryview`; zero-argument
+  `super()`; class namespace immutable. Multiple inheritance is approximated
+  by the first base (additional bases are ignored). General dynamic calls
+  combine at most one `*` operand; `*args` plus `**kwargs` together still
+  need a deferred call, while class constructors can bind `**mapping`.
 - **Closures:** by value at definition time; recursive nested
   functions and closures in lambdas are diagnostics. No cell/mutable
   capture.
@@ -1034,6 +1056,9 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   expressions remain eagerly materialized, `async for`/`async with` use the
   synchronous protocol. `throw` accepts exception instances only (no
   exception class objects) and has no three-argument form.
+- **GC:** the conservative collector roots container builders and generated
+  call buffers, but heavy rich rendering still exposes live values lost
+  under allocation (`P2-06` precise roots remain the fix).
 - **Performance:** native module dispatch is fixed (thread-local spec cache;
   math_loop at parity/faster, 50k micro harness AOT 6.2 ms vs. CPython
   13.6 ms). Remaining open weak spots: string concatenation (O(n²)) and float
@@ -1045,8 +1070,10 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   (`__init__.py`, dotted names, submodules, relative imports,
   site-packages). Imported module bodies run once as initializers. Stdlib
   module values work (with `getattr`), and simple module-level assignments
-  are visible inside functions. No general runtime module
-  objects/`sys.modules`, namespace packages or frozen modules; user-module
+  are visible inside functions. Nested imports resolve module globals when
+  the module is already initialized; import-free site-packages modules are
+  preloaded for this path. No general runtime module objects/`sys.modules`,
+  namespace packages or frozen modules; user-module
   values remain diagnostics.
 - **Stdlib:** curated subset (see §3.3); `re` uses the Rust
   `regex` syntax, `socket` only blocking TCP, `argparse` with a fixed help

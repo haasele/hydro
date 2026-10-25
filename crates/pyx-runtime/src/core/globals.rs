@@ -41,6 +41,11 @@ pub(crate) fn set(module: &str, name: &str, value: i64) {
     heap::add_thread_root(value);
 }
 
+/// Reads `module.name` without raising; used by runtime import fallbacks.
+pub(crate) fn try_get(module: &str, name: &str) -> Option<i64> {
+    GLOBALS.with(|globals| globals.borrow().get(&key(module, name)).copied())
+}
+
 /// Reads `module.name`. A missing entry raises `RuntimeError`, matching the
 /// runtime's use of `RuntimeError` for internal name-resolution failures.
 pub(crate) fn get(module: &str, name: &str) -> i64 {

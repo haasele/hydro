@@ -116,13 +116,161 @@ fn text_argument(value: i64, position: &str) -> Result<String, i64> {
 /// character class in verbose mode, while CPython keeps it literal
 /// (`[a b]` matches a space in Python only).
 fn compile_source(source: &str, flags: i64) -> Result<Regex, i64> {
-    RegexBuilder::new(source)
-        .case_insensitive(flags & IGNORECASE != 0)
-        .multi_line(flags & MULTILINE != 0)
-        .dot_matches_new_line(flags & DOTALL != 0)
-        .ignore_whitespace(flags & VERBOSE != 0)
-        .build()
-        .map_err(regex_error)
+    // CPython accepts an unescaped `[` inside a character class (`[^[]` means
+    // "not `[`"), while the Rust regex parser treats it as a nested class.
+    // Escape that form before handing the pattern to the parser.
+    let mut normalized = escape_class_brackets(source);
+    if flags & VERBOSE != 0 {
+        normalized = escape_verbose_class_chars(&normalized);
+    }
+    let build = |pattern: &str| {
+        RegexBuilder::new(pattern)
+            .case_insensitive(flags & IGNORECASE != 0)
+            .multi_line(flags & MULTILINE != 0)
+            .dot_matches_new_line(flags & DOTALL != 0)
+            .ignore_whitespace(flags & VERBOSE != 0)
+            .build()
+    };
+    match build(&normalized) {
+        Ok(regex) => Ok(regex),
+        Err(error) if error.to_string().contains("look-around") => {
+            // Rust's engine has no look-around. Highlighters and a few
+            // libraries use assertions only to narrow a match; dropping them
+            // keeps the expression usable (matching becomes more permissive).
+            build(&strip_lookarounds(&normalized)).map_err(regex_error)
+        }
+        Err(error) => Err(regex_error(error)),
+    }
+}
+
+/// Removes `(?<=...)`, `(?<!...)`, `(?=...)` and `(?!...)` assertions.
+/// The body may contain escaped parentheses; nested groups are skipped.
+fn strip_lookarounds(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '(' && chars.get(index + 1) == Some(&'?') {
+            let marker = chars.get(index + 2).copied();
+            let assertion = matches!(marker, Some('=') | Some('!'))
+                || (marker == Some('<') && matches!(chars.get(index + 3), Some('=') | Some('!')));
+            if assertion {
+                let mut depth = 1usize;
+                let mut escaped = false;
+                index += 3;
+                while index < chars.len() && depth > 0 {
+                    let ch = chars[index];
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '(' {
+                        depth += 1;
+                    } else if ch == ')' {
+                        depth -= 1;
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    out
+}
+
+/// Escapes an unescaped `[` inside a character class; CPython treats it as a
+/// literal, while the Rust parser tries to open a nested class.
+fn escape_class_brackets(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_class = false;
+    let mut class_started = false;
+    let mut after_caret = false;
+    let mut escaped = false;
+    for ch in source.chars() {
+        if escaped {
+            out.push(ch);
+            if in_class {
+                class_started = true;
+            }
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            out.push(ch);
+            escaped = true;
+            continue;
+        }
+        if in_class {
+            if !class_started {
+                if ch == '^' && !after_caret {
+                    after_caret = true;
+                    out.push(ch);
+                    continue;
+                }
+                if ch == ']' {
+                    out.push('\\');
+                    out.push(ch);
+                    class_started = true;
+                    continue;
+                }
+                class_started = true;
+            }
+            if ch == ']' {
+                in_class = false;
+                out.push(ch);
+            } else if ch == '[' {
+                out.push('\\');
+                out.push(ch);
+            } else {
+                out.push(ch);
+            }
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+            class_started = false;
+            after_caret = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Escapes `#` and whitespace inside character classes for Rust's verbose
+/// mode, which otherwise drops them as comments/insignificant whitespace.
+/// CPython keeps both literal inside `[...]`.
+fn escape_verbose_class_chars(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_class = false;
+    let mut escaped = false;
+    for ch in source.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            out.push(ch);
+            escaped = true;
+            continue;
+        }
+        if in_class {
+            if ch == ']' {
+                in_class = false;
+            } else if ch == '#' || ch.is_whitespace() {
+                out.push('\\');
+            }
+            out.push(ch);
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Compiles `source` with an anchored wrapper. The wrapper is non-capturing,
@@ -136,12 +284,53 @@ fn compile_anchored(source: &str, full: bool, flags: i64) -> Result<Regex, i64> 
     compile_source(&wrapped, flags)
 }
 
+/// Converts a UTF-8 byte offset to a Python character offset.
+fn char_offset(text: &str, byte: usize) -> usize {
+    text[..byte.min(text.len())].chars().count()
+}
+
+/// Converts a Python character offset to a UTF-8 byte offset.
+fn byte_offset(text: &str, character: usize) -> usize {
+    text.char_indices()
+        .nth(character)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
 fn make_match(pattern: &str, text: &str, captures: &regex::Captures<'_>) -> i64 {
+    make_match_at(pattern, text, captures, 0)
+}
+
+fn make_match_at(pattern: &str, text: &str, captures: &regex::Captures<'_>, base: usize) -> i64 {
     let groups = captures
         .iter()
-        .map(|group| group.map(|m| (m.start(), m.end())))
+        .map(|group| {
+            group.map(|m| {
+                (
+                    char_offset(text, m.start() + base),
+                    char_offset(text, m.end() + base),
+                )
+            })
+        })
         .collect();
     value::match_new(pattern.to_string(), text.to_string(), groups)
+}
+
+/// Converts Python character offsets into a UTF-8 byte range, returning the
+/// matched slice and its absolute byte base.
+fn slice_bounds(text: &str, pos: usize, endpos: usize) -> Option<(&str, usize)> {
+    let byte_at = |character: usize| -> Option<usize> {
+        if character == 0 {
+            return Some(0);
+        }
+        text.char_indices()
+            .nth(character)
+            .map(|(byte, _)| byte)
+            .or_else(|| (character == text.chars().count()).then_some(text.len()))
+    };
+    let start = byte_at(pos)?;
+    let end = byte_at(endpos)?;
+    (start <= end).then(|| (&text[start..end], start))
 }
 
 /// `re.search`/`re.match`/`re.fullmatch`.
@@ -311,15 +500,12 @@ fn count_argument(raw: i64, name: &str) -> Result<usize, i64> {
 }
 
 fn sub(source: &str, flags: i64, args: &[i64]) -> i64 {
-    let repl = match value::as_str(args[0]) {
-        Some(text) => replacement(text),
-        None => {
-            return type_error(&format!(
-                "replacement must be str, not {}",
-                value::type_name(args[0])
-            ))
-        }
-    };
+    if args.len() < 2 || args.len() > 3 {
+        return type_error(&format!(
+            "sub() takes 2 or 3 arguments ({} given)",
+            args.len()
+        ));
+    }
     let text = match text_argument(args[1], "string") {
         Ok(text) => text,
         Err(err) => return err,
@@ -336,8 +522,48 @@ fn sub(source: &str, flags: i64, args: &[i64]) -> i64 {
         Ok(regex) => regex,
         Err(err) => return err,
     };
-    let result = regex.replacen(&text, limit, repl.as_str());
-    value::str_alloc(result.into_owned())
+    if let Some(replacement_text) = value::as_str(args[0]) {
+        let repl = replacement(replacement_text);
+        let result = regex.replacen(&text, limit, repl.as_str());
+        return value::str_alloc(result.into_owned());
+    }
+    if value::as_function(args[0]).is_none() {
+        return type_error(&format!(
+            "replacement must be str or callable, not {}",
+            value::type_name(args[0])
+        ));
+    }
+    // Callable replacement (`re.sub(pattern, fn, text)`): the callback gets
+    // one Match object per non-overlapping match and its result is converted
+    // with `str()`.
+    let mut out = String::new();
+    let mut last = 0usize;
+    let mut replaced = 0usize;
+    for captures in regex.captures_iter(&text) {
+        if limit != 0 && replaced >= limit {
+            break;
+        }
+        let Some(whole) = captures.get(0) else {
+            continue;
+        };
+        out.push_str(&text[last..whole.start()]);
+        let match_object = make_match(source, &text, &captures);
+        let replacement_value = crate::core::builtins::call(args[0], 1, [match_object].as_ptr());
+        if exc::pending() {
+            return NONE;
+        }
+        out.push_str(&value::to_string(replacement_value));
+        last = whole.end();
+        replaced += 1;
+        if whole.start() == whole.end() && last < text.len() {
+            // Zero-width match: advance one character like CPython's engine.
+            let ch = text[last..].chars().next().unwrap_or('\0');
+            out.push(ch);
+            last += ch.len_utf8();
+        }
+    }
+    out.push_str(&text[last..]);
+    value::str_alloc(out)
 }
 
 fn split(source: &str, flags: i64, args: &[i64]) -> i64 {
@@ -469,14 +695,51 @@ pub(crate) fn pattern_method(obj: i64, name: &str, args: &[i64]) -> i64 {
     let flags = state.flags;
     match name {
         "search" | "match" | "fullmatch" => {
-            if let Some(err) = pattern_arity(name, args.len(), 1) {
-                return err;
+            if args.is_empty() || args.len() > 3 {
+                return type_error(&format!(
+                    "Pattern.{name}() takes 1 to 3 arguments ({} given)",
+                    args.len()
+                ));
             }
             let text = match text_argument(args[0], "string") {
                 Ok(text) => text,
                 Err(err) => return err,
             };
-            match_mode(&source, &text, name == "fullmatch", name != "search", flags)
+            let pos = match args.get(1).copied() {
+                None | Some(NONE) => 0,
+                Some(value) => match value::as_integer(value) {
+                    Some(position) if position >= 0 => position as usize,
+                    Some(_) => {
+                        return exc::raise_with_message(INDEX_ERROR, "position out of range")
+                    }
+                    None => return type_error("position must be an integer"),
+                },
+            };
+            let endpos = match args.get(2).copied() {
+                None | Some(NONE) => text.chars().count(),
+                Some(value) => match value::as_integer(value) {
+                    Some(position) if position >= 0 => position as usize,
+                    Some(_) => {
+                        return exc::raise_with_message(INDEX_ERROR, "position out of range")
+                    }
+                    None => return type_error("endpos must be an integer"),
+                },
+            };
+            let Some((slice, base)) = slice_bounds(&text, pos, endpos) else {
+                return exc::raise_with_message(INDEX_ERROR, "position out of range");
+            };
+            let regex = if name == "search" {
+                compile_source(&source, flags)
+            } else {
+                compile_anchored(&source, name == "fullmatch", flags)
+            };
+            let Ok(regex) = regex else {
+                return exc::raise_with_message(VALUE_ERROR, "invalid regular expression");
+            };
+            match regex.captures(slice) {
+                Some(captures) => make_match_at(&source, &text, &captures, base),
+                None => NONE,
+            }
         }
         "findall" => {
             if let Some(err) = pattern_arity(name, args.len(), 1) {
@@ -533,6 +796,28 @@ pub(crate) fn match_method(obj: i64, name: &str, args: &[i64]) -> i64 {
     let Some(state) = value::as_match(obj) else {
         return attribute_error("Match", name);
     };
+    if name == "groups" {
+        if args.len() > 1 {
+            return type_error(&format!(
+                "Match.groups() takes at most 1 argument ({} given)",
+                args.len()
+            ));
+        }
+        let default = args.first().copied().unwrap_or(NONE);
+        let groups = state
+            .groups
+            .iter()
+            .skip(1)
+            .map(|position| match position {
+                Some((start, end)) => value::str_alloc(
+                    state.text[byte_offset(&state.text, *start)..byte_offset(&state.text, *end)]
+                        .to_string(),
+                ),
+                None => default,
+            })
+            .collect();
+        return value::tuple_new(groups);
+    }
     if args.len() > 1 {
         return type_error(&format!(
             "Match.{name}() takes at most 1 argument ({} given)",
@@ -560,7 +845,10 @@ pub(crate) fn match_method(obj: i64, name: &str, args: &[i64]) -> i64 {
     let position = state.groups[group];
     match name {
         "group" => match position {
-            Some((start, end)) => value::str_alloc(state.text[start..end].to_string()),
+            Some((start, end)) => value::str_alloc(
+                state.text[byte_offset(&state.text, start)..byte_offset(&state.text, end)]
+                    .to_string(),
+            ),
             None => NONE,
         },
         "start" => match position {

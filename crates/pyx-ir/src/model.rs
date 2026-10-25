@@ -93,6 +93,15 @@ pub enum Const {
     /// as `def f(): ...` therefore behave exactly like `None`, but `... is
     /// None` is `True` instead of `False`.
     Ellipsis,
+    /// A fully literal tuple default (`padding=(0, 1)`). Codegen materialises
+    /// a fresh runtime tuple; nested tuples, strings and scalars are allowed.
+    Tuple(Vec<Const>),
+    /// A module-level value referenced by name, used for defaults such as
+    /// `NO_CHANGE` or `box.HEAVY_HEAD`. Codegen reads the module global table.
+    Global {
+        module: String,
+        name: String,
+    },
 }
 
 impl Const {
@@ -106,6 +115,8 @@ impl Const {
             Const::None => Type::None,
             Const::NotImplemented => Type::Any,
             Const::Ellipsis => Type::None,
+            Const::Tuple(_) => Type::Tuple,
+            Const::Global { .. } => Type::Any,
         }
     }
 }

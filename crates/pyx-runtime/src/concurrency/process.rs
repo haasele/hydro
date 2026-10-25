@@ -221,10 +221,12 @@ fn start_spawn(process: &ProcessState) -> Result<(), String> {
                 "cannot spawn a builtin function; use a named module-level function".to_string(),
             )
         }
-        // Getter, partial and identity callables have no stable code entry.
+        // Getter, partial, bound-method and identity callables have no stable
+        // code entry.
         FunctionBody::AttributeGetter { .. }
         | FunctionBody::ItemGetter { .. }
         | FunctionBody::Partial { .. }
+        | FunctionBody::BoundMethod { .. }
         | FunctionBody::Identity => {
             return Err(
                 "cannot spawn a derived callable; use a named module-level function".to_string(),

@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1368 tests, JIT+AOT |
+| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1369 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -57,31 +57,33 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   runs.
 - **`rich` progress:** the native `rich` implementation was removed. The
   official pure-Python `rich` distribution is resolved through the loader.
-  The console-compatibility surface now covers `del`, loop `else`,
-  `dataclasses.field` defaults/factories and keyword construction,
-  `...`, `input()`, `get_ipython()`, `SystemExit`, `os.PathLike`/
-  `devnull`/`open`/`dup2`/`get_terminal_size`, `sys.stdin`/`stdout`/
-  `stderr` (plus `__std*__`), `threading.local`, and runtime-evaluated
-  typing aliases (`Tuple[int, ...]`). `rich/console.py` compiles; the next
-  runtime blockers are native bound-method values (`rich/cells.py:35`,
-  `_SINGLE_CELLS.issuperset`) and dynamic `*args`/`**kwargs` calls
-  (`Style(..., **attributes)`). No working `rich` path exists under PyX
-  yet.
-- **Import matrix:** **58/297 modules importable** (13 builtin/frozen,
-  41 pure, 4 extension; 230 `PYX0002`, 9 modules where CPython 3.14.9
+  All console/dataclass/typing compile blockers and the first runtime
+  surfaces are implemented: bound native/user methods, dynamic class and
+  function keyword calls (`Class(**kwargs)`, `f(*args, **kwargs)`-shaped
+  constructors), runtime-evaluated defaults, `super().__init__`-free
+  dataclass construction, `del`, loop `else`, typing aliases, and the rich
+  console/table/panel/rule rendering path (table/panel/rule output matches
+  the CPython layout in smoke tests). The default conservative GC still
+  loses live values during heavier rich rendering; with
+  `PYX_GC_THRESHOLD` raised the table/panel/rule report renders. The
+  remaining official-package blocker for `bench_all.py` is `rich.status`/
+  `Live`: native `threading.Thread` is not a class base and zero-argument
+  `super()` is unsupported (`_RefreshThread`).
+- **Import matrix:** **59/297 modules importable** (13 builtin/frozen,
+  42 pure, 4 extension; 229 `PYX0002`, 9 modules where CPython 3.14.9
   itself fails). Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **`benchmarks/bench_all.py` under PyX: not yet green.** The console/
-  dataclass/typing compile blockers are implemented; the first observed
-  runtime blockers are native bound-method values (`rich/cells.py:35`) and
-  dynamic `*args`/`**kwargs` calls (`rich/style.py:560`). Further `rich`
-  modules will likely add more.
-  `bench_all.py --only pyx` still completes under CPython.
+- **`benchmarks/bench_all.py` under PyX: not yet green.** `rich.console`,
+  `rich.table`, `rich.panel` and `rich.rule` render; the benchmark report
+  header is produced. It stops at `Console.status` (`rich.status`/`Live`,
+  native Thread subclassing + `super()`), and default-GC rich rendering
+  still exposes the conservative-root retention issue. `bench_all.py
+  --only pyx` still completes under CPython.
 
 **Verification (as of 2026-10-25):**
 
-- `cargo test --workspace`: **1368 tests** — 413 frontend, 48 codegen, 18 IR,
-  492 runtime unit, 218 CLI/E2E (140 E2E incl. the abi3 extension fixture,
+- `cargo test --workspace`: **1369 tests** — 413 frontend, 48 codegen, 18 IR,
+  492 runtime unit, 219 CLI/E2E (141 E2E incl. the abi3 extension fixture,
   24 fibers, 6 closures, 11 user modules, 10 exception tests, 8
   completions, extension path/dotted/multi-phase, 2 unittest-runner tests,
   2 stdlib-batch-a, 2 stdlib-batch-b, 3 stdlib-bench-batch tests and 5 CLI
@@ -116,8 +118,8 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   `next`/`send` echo, `close` running `finally`, `throw(caught_exception)`
   re-raised inside the generator, StopIteration after completion.
 - **Stdlib compatibility baseline:** `python3 scripts/stdlib_compat.py`
-  (CPython 3.14.9, PyX 0.1.0): **58/297 modules importable** (13 builtin/frozen,
-  41 pure, 4 extension; 9 modules fail under CPython too). Batches A,
+  (CPython 3.14.9, PyX 0.1.0): **59/297 modules importable** (13 builtin/frozen,
+  42 pure, 4 extension; 9 modules fail under CPython too). Batches A,
   the native core of B, the benchmark-critical batch and the new native
   `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
   `__future__` modules are importable and API-tested; `dataclasses` and
@@ -573,7 +575,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 1368 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 1369 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -784,7 +786,9 @@ parallel benchmarks and race/stress tests.
 **Known, documented limits Phase 1/2:** i64 instead of BigInt; GC is a
 conservative collector (stack scan, STW root rescan; white partition briefly
 under heap lock, freeing concurrent); no precise roots/stack maps and
-no size-class allocator (P2-05/06/07 open); exception hierarchy/
+no size-class allocator (P2-05/06/07 open); heavy rich rendering still loses
+live values under allocation, so `bench_all.py` runs only with a raised
+`PYX_GC_THRESHOLD`; exception hierarchy/
 chaining/`except*` missing; `dict` views are materialized
 as lists; set order is deterministic (Python guarantees
 none); `and`/`or` return operands, types there may be `Any`. Dicts use
@@ -792,8 +796,10 @@ a hash index (O(1) on average, Python equality, numeric key equivalence).
 **Exceptions:** hierarchy matchers (`except Exception`/`BaseException`), tuple
 handlers and explicit `raise ... from` are implemented; implicit context
 chaining and `except*` remain open; tracebacks are simplified (one frame).
-**Classes:** only one base, no class attributes/decorators/metaclasses/
-descriptors; instance representation `<Name object>`; class namespace immutable.
+**Classes:** multiple bases are approximated by the first base; no class
+attributes/decorators/metaclasses/descriptors; zero-argument `super()` is
+unsupported; native `threading.Thread` cannot be subclassed; instance
+representation `<Name object>`; class namespace immutable.
 **Closures:** by value; no mutable captures, no recursive nested
 functions, no closures in lambdas.
 **Generators/async:** real lazy generators (stackful fibers) and coroutines
@@ -860,7 +866,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (1368)
+cargo test                             # unit/integration tests (1369)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1275,3 +1281,20 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   later entry-body failure. `rich/console.py` compiles; native bound-method
   values and dynamic `*args`/`**kwargs` calls are the next observed blockers.
   **1368 tests**, clippy `-D warnings` and `scripts/verify.sh` green.
+
+- 2026-10-25 (continuation 52): rich report rendering and runtime dispatch.
+  Added `pyx_function_meta` (full parameter signatures/defaults and a uniform
+  full-argv trampoline), `pyx_call_kw`/`CallKw`, runtime-bound class
+  constructors (`pyx_instance_new`, `pyx_bind_class_kwargs`), bound method
+  values, user `__call__`/`__str__`/`__repr__`/`__len__`/`__contains__`,
+  `__dict__`/`__new__` support, user operator dunders, classmethod `cls(...)`
+  construction, cross-unit class/function registries, nested-import linking
+  and deferred-import globals, CPython-style regex class normalization plus
+  lookaround stripping, callable `re.sub` and character-offset `Match`
+  spans, `str.rsplit`/`partition`/`rpartition`, argparse `nargs='+'`, native
+  `contextlib.suppress`/io base classes, GC rooting for container builders
+  and wrapper argument buffers, and 1 MiB fiber stacks. Rich
+  console/table/panel/rule output renders (with a raised GC threshold);
+  `bench_all.py` is blocked at `rich.status`/`Live` native Thread
+  subclassing + `super()`. **1369 tests**, clippy `-D warnings` and
+  `scripts/verify.sh` green.

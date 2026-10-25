@@ -395,6 +395,41 @@ impl ModuleLoader {
         }
     }
 
+    /// Whether the final module file for `name` has no imports of its own.
+    /// Such data-only modules can be preloaded safely for nested imports;
+    /// optional modules with dependencies stay deferred and never pollute the
+    /// diagnostic stream.
+    fn import_free_module(&self, name: &str, importer_dir: &Path, module_root: &Path) -> bool {
+        let roots = module_search_roots(importer_dir, module_root);
+        let Some(chain) = resolve_module(&roots, name) else {
+            return false;
+        };
+        let Some(final_module) = chain.last() else {
+            return false;
+        };
+        let site_package = final_module.path.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some("site-packages") | Some("dist-packages")
+            )
+        });
+        if !site_package {
+            return false;
+        }
+        let Ok(source) = fs::read_to_string(&final_module.path) else {
+            return false;
+        };
+        let Ok(ast::Mod::Module(module)) =
+            rustpython_parser::parse(&source, Mode::Module, &final_module.path.to_string_lossy())
+        else {
+            return false;
+        };
+        module
+            .body
+            .iter()
+            .all(|stmt| !matches!(stmt, ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_)))
+    }
+
     /// Whether `name` is the module currently being scanned or one of its
     /// ancestor packages. Both are on the load stack when a module-level
     /// import reaches back to the package that is initializing them.
@@ -467,9 +502,21 @@ impl ModuleLoader {
                 ast::Stmt::Import(s) => {
                     for alias in &s.names {
                         if deferred {
-                            // Native modules bind without loading anything;
-                            // user modules would need a dynamic import.
+                            // Native modules bind without loading anything.
+                            // Preload an existing user module quietly so the
+                            // lowerer can link it; an optional module that
+                            // fails to resolve stays deferred.
                             if pyx_ir::stdlib::module(alias.name.as_str()).is_none() {
+                                if self.import_free_module(alias.name.as_str(), importer_dir, root)
+                                {
+                                    if let Some(index) =
+                                        self.probe_named(alias.name.as_str(), importer_dir, root)
+                                    {
+                                        if !scan.deps.contains(&index) {
+                                            scan.deps.push(index);
+                                        }
+                                    }
+                                }
                                 scan.record_deferred(alias.name.as_str(), None);
                             }
                             continue;
@@ -503,8 +550,25 @@ impl ModuleLoader {
                         continue;
                     }
                     if deferred {
+                        if self.import_free_module(&module_name, importer_dir, root) {
+                            if let Some(index) = self.probe_named(&module_name, importer_dir, root)
+                            {
+                                if !scan.deps.contains(&index) {
+                                    scan.deps.push(index);
+                                }
+                            }
+                        }
                         for alias in &s.names {
                             if alias.name.as_str() != "*" {
+                                let full = format!("{module_name}.{}", alias.name);
+                                if self.import_free_module(&full, importer_dir, root) {
+                                    if let Some(index) = self.probe_named(&full, importer_dir, root)
+                                    {
+                                        if !scan.deps.contains(&index) {
+                                            scan.deps.push(index);
+                                        }
+                                    }
+                                }
                                 scan.record_deferred(&module_name, Some(alias.name.as_str()));
                             }
                         }
@@ -993,6 +1057,9 @@ fn lower_modules(units: &[LoadedModule]) -> Result<Program, Vec<Diagnostic>> {
     let mut exports: Vec<HashMap<String, lower::UserExport>> = vec![HashMap::new(); units.len()];
     let mut initializers: Vec<FunctionId> = Vec::new();
     let mut entry_main = 0;
+    let mut class_registry: HashMap<(String, String), (FunctionId, lower::CallSignature)> =
+        HashMap::new();
+    let mut function_registry: HashMap<FunctionId, lower::CallSignature> = HashMap::new();
 
     for (index, unit) in units.iter().enumerate() {
         let base = all_functions.len() as FunctionId;
@@ -1000,6 +1067,7 @@ fn lower_modules(units: &[LoadedModule]) -> Result<Program, Vec<Diagnostic>> {
         let mut lowerer = Lowerer::new(&unit.source, &unit.display, &mut infer);
         lowerer.set_fid_base(base);
         lowerer.set_mirror_all_globals(true);
+        lowerer.set_imported_classes(class_registry.clone(), function_registry.clone());
         if index != entry_index {
             lowerer.set_dunder_name(&unit.name);
             lowerer.set_package(&unit.package);
@@ -1043,8 +1111,18 @@ fn lower_modules(units: &[LoadedModule]) -> Result<Program, Vec<Diagnostic>> {
 
         let mut hir = lowerer.lower_module(&unit.module);
         let exported = lowerer.exported_names();
+        let exported_classes = lowerer.exported_class_signatures();
+        let exported_functions = lowerer.exported_function_signatures();
         let lower_diags = std::mem::take(&mut lowerer.diags);
         drop(lowerer);
+        for (class, init, mut signature) in exported_classes {
+            signature.default_exprs = vec![None; signature.default_exprs.len()];
+            class_registry.insert((unit.name.clone(), class), (init, signature));
+        }
+        for (id, mut signature) in exported_functions {
+            signature.default_exprs = vec![None; signature.default_exprs.len()];
+            function_registry.insert(id, signature);
+        }
         if !lower_diags.is_empty() {
             return Err(lower_diags);
         }
@@ -1099,6 +1177,7 @@ fn placeholder_function(function: &pyx_ir::Function) -> HFunction {
                 name: param.name.clone(),
                 ty: Ty::Concrete(param.ty),
                 default: param.default.clone(),
+                default_expr: None,
                 kind: param.kind,
             })
             .collect(),
@@ -1469,8 +1548,9 @@ mod tests {
                 _ => None,
             })
             .expect("make must return");
-        let ExprKind::IndirectCall { callee, .. } = &make_return.kind else {
-            panic!("expected an indirect call, got {:?}", make_return.kind);
+        let callee = match &make_return.kind {
+            ExprKind::IndirectCall { callee, .. } | ExprKind::CallKw { callee, .. } => callee,
+            other => panic!("expected a class call, got {other:?}"),
         };
         assert!(matches!(
             &callee.kind,
@@ -1869,8 +1949,9 @@ mod tests {
 
         let run = function_id(&program, "pkg.child.run");
         use pyx_ir::{ExprKind, StmtKind};
-        let ExprKind::IndirectCall { callee, .. } = &returned_expression(&program, run).kind else {
-            panic!("expected an indirect call to the package member");
+        let callee = match &returned_expression(&program, run).kind {
+            ExprKind::IndirectCall { callee, .. } | ExprKind::CallKw { callee, .. } => callee,
+            other => panic!("expected a call to the package member, got {other:?}"),
         };
         assert!(
             matches!(

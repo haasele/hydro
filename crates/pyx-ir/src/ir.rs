@@ -242,6 +242,38 @@ pub enum ExprKind {
         callee: Callee,
         args: Vec<Expr>,
     },
+    /// Call through a function value with keyword arguments:
+    /// `f(args..., name=value, ...)`. Codegen forwards the argument/keyword
+    /// buffers to the runtime, which binds them through the function's
+    /// metadata and full-argv trampoline.
+    CallKw {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        keywords: Vec<(String, Expr)>,
+    },
+    /// `Class(args..., name=value, **kwargs)` for a class declared in the
+    /// unit whose `__init__` has a dynamic signature. The frontend binds the
+    /// call into the concrete `__init__` parameter slots (`self` is supplied
+    /// by codegen); `init` is that function. `class` is evaluated first, then
+    /// the arguments in source order.
+    ClassCall {
+        class: Box<Expr>,
+        init: FunctionId,
+        /// Values for every `__init__` parameter after `self`, in parameter
+        /// order (defaults already filled).
+        args: Vec<Expr>,
+        /// `**mapping` that must be routed to named keyword-only/positional
+        /// slots at runtime (its keys are not known statically).
+        dynamic_kwargs: Option<Box<Expr>>,
+        /// Bindable parameter names after `self`, in `args` order. Variadic
+        /// `*args`/`**kwargs` slots carry their names but never receive a
+        /// mapping key.
+        param_names: Vec<String>,
+        /// Index in `args` of the `**kwargs` slot, if any.
+        kwarg_index: Option<usize>,
+        /// Class name for runtime error messages.
+        class_name: String,
+    },
     /// A call the frontend could not bind statically (`f(*args, **kwargs)` on
     /// a callee with a dynamic signature). Every operand is evaluated in
     /// source order, then the runtime raises
@@ -557,6 +589,9 @@ pub struct Param {
     /// with it; the runtime binder of a dynamic signature uses it for
     /// calls through a function value.
     pub default: Option<Const>,
+    /// Non-literal source default, evaluated where the function value is
+    /// created (and at direct call sites).
+    pub default_expr: Option<Box<Expr>>,
     /// Position of the parameter in the signature. Parameters are ordered
     /// captures, positional, `*args`, keyword-only, `**kwargs`.
     pub kind: ParamKind,

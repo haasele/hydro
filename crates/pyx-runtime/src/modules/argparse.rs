@@ -34,6 +34,7 @@ pub(crate) struct ArgSpec {
     pub(crate) required: bool,
     pub(crate) help: String,
     pub(crate) nargs_optional: bool,
+    pub(crate) nargs_plus: bool,
     /// Allowed converted values, in declaration order.
     pub(crate) choices: Option<Vec<i64>>,
 }
@@ -171,6 +172,7 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     let mut help = String::new();
     let mut dest: Option<String> = None;
     let mut nargs_optional = false;
+    let mut nargs_plus = false;
     let mut choices: Option<Vec<i64>> = None;
     for (name, argument) in keywords {
         if !seen_keywords.insert(name.as_str()) {
@@ -205,10 +207,14 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
             },
             "nargs" => match value::as_str(*argument) {
                 Some("?") => nargs_optional = true,
+                Some("+") => nargs_plus = true,
                 Some(text) => {
                     return value_error(&format!("unsupported nargs '{text}'"));
                 }
-                None if *argument == NONE => nargs_optional = false,
+                None if *argument == NONE => {
+                    nargs_optional = false;
+                    nargs_plus = false;
+                }
                 None => return type_error("add_argument() nargs must be str or None"),
             },
             "choices" => {
@@ -282,6 +288,7 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
         required,
         help,
         nargs_optional,
+        nargs_plus,
         choices,
     };
     if let Some(mut parser_state) = value::arg_parser_mut(parser) {
@@ -485,6 +492,34 @@ fn parse_args(parser: i64, args: &[i64]) -> i64 {
                 }
                 values[position] = Some(value::TRUE);
                 index += 1;
+                continue;
+            }
+            if spec.nargs_plus {
+                if inline.is_some() {
+                    return value_error(&format!("argument {name} does not take an inline value"));
+                }
+                let mut collected: Vec<i64> = Vec::new();
+                index += 1;
+                while index < argv.len() && !is_known_flag(&specs, argv[index]) {
+                    let converted = match convert(spec, argv[index]) {
+                        Ok(value) => value,
+                        Err(err) => return err,
+                    };
+                    if let Err(err) = validate_choice(spec, converted) {
+                        return err;
+                    }
+                    root_value(roots, converted);
+                    collected.push(converted);
+                    index += 1;
+                }
+                if collected.is_empty() {
+                    return runtime_error(&format!(
+                        "argument {name}: expected at least one argument"
+                    ));
+                }
+                let list = value::list_new(collected);
+                root_value(roots, list);
+                values[position] = Some(list);
                 continue;
             }
             let raw_value = if let Some(inline) = inline {
