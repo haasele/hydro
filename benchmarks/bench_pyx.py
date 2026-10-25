@@ -31,7 +31,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent  # Repo-Root (Elternverzeichnis von benchmarks/)
-TIMEOUT = 600.0
+TIMEOUT = 10.0
 
 
 # --------------------------------------------------------------------------- Workloads
@@ -390,9 +390,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--n", type=int, default=200_000, help="Basisgröße der Workloads")
     ap.add_argument("--repeat", type=int, default=5, help="gemessene Läufe je Runner/Workload")
+    ap.add_argument("--timeout", type=float, default=10.0,
+                    help="Sekunden je subprocess run (Standard: 10)")
     ap.add_argument("--pyx", help="Pfad zum PyX-Binary (sonst $PYX_BIN oder target/{release,debug}/pyx)")
     ap.add_argument("--json", help="Ergebnis als JSON in diese Datei schreiben")
     args = ap.parse_args()
+    if args.timeout <= 0:
+        sys.exit("--timeout muss > 0 sein")
+    global TIMEOUT
+    TIMEOUT = args.timeout
 
     repeat = max(1, args.repeat)
     if args.pyx:
