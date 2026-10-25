@@ -1154,12 +1154,45 @@ fn call_with_keywords(target: i64, args: Vec<i64>, keywords: &[(String, i64)]) -
     call(target, bound.len(), bound.as_ptr())
 }
 
+/// Materialises the operand of a starred call into positional values.
+///
+/// Lists and tuples are copied directly. Every other iterable is consumed
+/// through the iterator ABI: the collected values live in a temporary PyX list
+/// so a collection during generator resume or `next` cannot lose them.
+pub(crate) fn star_sequence(star: i64) -> Result<Vec<i64>, i64> {
+    if let Some(items) = value::as_list(star).or_else(|| value::as_tuple(star)) {
+        return Ok(items.to_vec());
+    }
+    let iterator = iter::iter_new(star);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    let collected = value::list_new(Vec::new());
+    loop {
+        let mut item = NONE;
+        let more = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return Err(NONE);
+        }
+        if more == 0 {
+            break;
+        }
+        container::list_append(collected, item);
+        if exc::pending() {
+            return Err(NONE);
+        }
+    }
+    Ok(value::as_list(collected)
+        .map(|items| items.to_vec())
+        .unwrap_or_default())
+}
+
 /// `fn(args..., *star)`: calls a function value with one starred positional
 /// operand.
 ///
-/// The elements of `star`, which must be a list or tuple, are appended to the
-/// `argc` positional operands in `argv` before dispatching through [`call`].
-/// Any other starred value raises `TypeError`; a NULL `argv` with a non-zero
+/// The elements of `star`, any iterable, are appended to the `argc` positional
+/// operands in `argv` before dispatching through [`call`]. Non-iterables raise
+/// the iterator `TypeError`; a NULL `argv` with a non-zero
 /// `argc` is rejected like [`call`] does.
 pub(crate) fn call_star(function: i64, argc: usize, argv: *const i64, star: i64) -> i64 {
     if argc > 0 && argv.is_null() {
@@ -1174,20 +1207,9 @@ pub(crate) fn call_star(function: i64, argc: usize, argv: *const i64, star: i64)
     // Copy the flattened elements before allocating the combined buffer: the
     // source list/tuple stays a live argument (and therefore a GC root) while
     // the call runs.
-    let items = match value::as_list(star)
-        .or_else(|| value::as_tuple(star))
-        .map(|items| items.to_vec())
-    {
-        Some(items) => items,
-        None => {
-            return exc::raise_with_message(
-                TYPE_ERROR,
-                &format!(
-                    "argument after * must be a list or tuple, not '{}'",
-                    value::type_name(star)
-                ),
-            )
-        }
+    let items = match star_sequence(star) {
+        Ok(items) => items,
+        Err(err) => return err,
     };
     let Some(total) = argc.checked_add(items.len()) else {
         return exc::raise_with_message(TYPE_ERROR, "function call has too many arguments");
@@ -2889,10 +2911,7 @@ mod tests {
         // Any other starred value raises TypeError.
         assert_eq!(call_star(function, 0, std::ptr::null(), int(1)), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
-        assert_eq!(
-            pending_message(),
-            "argument after * must be a list or tuple, not 'int'"
-        );
+        assert_eq!(pending_message(), "'int' object is not iterable");
     }
 
     #[test]

@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1370 tests, JIT+AOT |
+| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1371 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -77,16 +77,17 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   `benchmarks/compat/latest.json`.
 - **`benchmarks/bench_all.py` under PyX: green with a raised GC threshold.**
   `PYX_GC_THRESHOLD=100000000 PYX_SITE_PACKAGES=/usr/lib/python3.14/site-packages
-  target/release/pyx run benchmarks/bench_all.py --only pyx` exits 0,
-  builds the AOT binaries and writes `report.{md,html,txt}` +
-  `results.json`. The default GC threshold still loses live `Segment`
+  target/release/pyx run benchmarks/bench_all.py` exits 0 for the full
+  suite (startup, CSV, request handling, FastAPI throughput and the PyX
+  comparison), builds the AOT binaries and writes `report.{md,html,txt}` +
+  `results.json` (155 s). The default GC threshold still loses live `Segment`
   values during the final report rendering (`conservative-root retention
   issue`, P2-06).
 
 **Verification (as of 2026-10-25):**
 
-- `cargo test --workspace`: **1370 tests** — 413 frontend, 48 codegen, 18 IR,
-  492 runtime unit, 220 CLI/E2E (142 E2E incl. the abi3 extension fixture,
+- `cargo test --workspace`: **1371 tests** — 413 frontend, 48 codegen, 18 IR,
+  492 runtime unit, 221 CLI/E2E (143 E2E incl. the abi3 extension fixture,
   24 fibers, 6 closures, 11 user modules, 10 exception tests, 8
   completions, extension path/dotted/multi-phase, 2 unittest-runner tests,
   2 stdlib-batch-a, 2 stdlib-batch-b, 3 stdlib-bench-batch tests and 5 CLI
@@ -578,7 +579,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 1370 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 1371 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -737,7 +738,8 @@ parallel benchmarks and race/stress tests.
   independent object; `yield value`/bare `yield`, `return` as end,
   exception propagation, `for`/`list`/`sum` work. New builtins
   `iter(x)`/`next(it[, default])` (`pyx_iter`/`pyx_next`). Generator
-  expressions remain eagerly materialized.
+  expressions are eagerly materialised into an iterator (single-pass,
+  `next()` works).
 - **Coroutines/event loop:** `async def` creates a coroutine object;
   `await`/`pyx_await` drives it, `asyncio.run` runs the cooperative
   single-thread loop, `asyncio.sleep` suspends only the current fiber
@@ -809,7 +811,8 @@ functions, no closures in lambdas.
 **Generators/async:** real lazy generators (stackful fibers) and coroutines
 with a cooperative event loop. Open: async generators, async comprehensions
 and `asyncio` beyond `run`/`sleep`/`gather`; `async for`/`async with` use
-the synchronous protocol. Generator expressions remain eagerly materialized.
+the synchronous protocol. Generator expressions are eagerly materialised
+into an iterator (single-pass, `next()` works).
 **Performance:** native module dispatch is fixed (thread-local spec cache;
 math_loop at parity/faster). Remaining weak spots: string concatenation is
 O(n²) and CPython-extension boundaries will add conversion cost. The x86_64
@@ -870,7 +873,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (1370)
+cargo test                             # unit/integration tests (1371)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1320,3 +1323,13 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   8.04 ms, async gather 21.35 ms). Default GC still loses live `Segment`
   values in the final report (P2-06). **1370 tests**, clippy
   `-D warnings` and `scripts/verify.sh` green.
+
+- 2026-10-25 (continuation 54): full benchmark harness under PyX.
+  Reran `bench_all.py` without `--only`; fixed the three runtime gaps it
+  exposed: generator expressions now wrap their eager list in an iterator
+  (`next(genexp)` and single-pass joins work), `*` call/method/display
+  operands accept arbitrary iterables, and `str`/`bytes.join` accept
+  iterators. Full suite exit 0 in 155 s (startup, CSV, request handling,
+  FastAPI throughput, PyX comparison), rich report written. Default GC
+  still needs the raised threshold; precise roots remain P2-06.
+  **1371 tests**, clippy `-D warnings` and `scripts/verify.sh` green.

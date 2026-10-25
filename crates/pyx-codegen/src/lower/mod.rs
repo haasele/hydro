@@ -3193,8 +3193,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 clauses,
             } => self.lower_comprehension(clauses.as_slice(), CompEmit::Dict(key, value)),
             ExprKind::GeneratorExp { element, clauses } => {
-                // Materialised eagerly until real generator objects exist.
-                self.lower_comprehension(clauses.as_slice(), CompEmit::List(element))
+                // Materialised eagerly until lazy generator expressions exist,
+                // but wrapped in an iterator so `next()` and single-pass use
+                // match the Python protocol.
+                let list = self.lower_comprehension(clauses.as_slice(), CompEmit::List(element))?;
+                let iterator = self.call_rt(self.runtime.iter_new, &[list])?;
+                self.emit_exc_check()?;
+                Ok(iterator)
             }
             ExprKind::Subscript { object, index } => {
                 let object = self.lower_expr(object)?;

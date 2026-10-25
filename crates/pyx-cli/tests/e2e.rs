@@ -3000,6 +3000,30 @@ print(span(), m.group(1), m.groupdict())
 }
 
 #[test]
+fn generator_expressions_are_single_pass_iterators() {
+    let dir = TestDir::new("generator-expression");
+    let program = dir.path().join("main.py");
+    std::fs::write(
+        &program,
+        concat!(
+            "def gen():\n",
+            "    yield 'a'\n",
+            "    yield 'b'\n",
+            "print(next(x for x in [7, 8, 9]))\n",
+            "print(''.join(gen()))\n",
+            "print(''.join(x for x in ['c', 'd']))\n",
+            "print([0, *gen(), 3])\n",
+            "print(sum(x for x in range(4)))\n",
+        ),
+    )
+    .expect("failed to write temp program");
+    let program = program.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &program]);
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(stdout, "7\nab\ncd\n[0, 'a', 'b', 3]\n6\n");
+}
+
+#[test]
 fn user_dunders_and_defaults_are_dispatched() {
     let dir = TestDir::new("user-dunders");
     let program = dir.path().join("dunders.py");

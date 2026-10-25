@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-25**. Phase 1 is complete; Phase 2 is largely
-implemented (1370 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (1371 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -466,7 +466,8 @@ built-in kinds), so the fallback never matches a user handler.
   run. The expression evaluates to the delegate's return value (`None` for a
   plain iterator). Delegating to a running generator raises `RuntimeError`.
   Not supported: async generators (`async def` + `yield` is a diagnostic) and
-  async comprehensions. Generator expressions remain eagerly materialized
+  async comprehensions. Generator expressions are eagerly materialized into
+  an iterator (still not lazy)
   lists (documented deviation). Deviations: `send` into a plain-iterator
   delegate raises `AttributeError` naming the iterator as `'iterator'` (not
   e.g. `'list_iterator'`), and PEP 479 (converting a body-raised
@@ -1020,8 +1021,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **1370 tests** (413 frontend, 48 codegen, 18 IR, 492
-  runtime unit, 179 runtime integration, 220 CLI/E2E). E2E coverage
+- As of 2026-10-25: **1371 tests** (413 frontend, 48 codegen, 18 IR, 492
+  runtime unit, 179 runtime integration, 221 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
@@ -1056,7 +1057,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - **Generators/async:** real lazy generators (stackful fibers) and
   coroutines with a cooperative event loop. Open: async generators, async
   comprehensions and `asyncio` beyond `run`/`sleep`/`gather`; generator
-  expressions remain eagerly materialized, `async for`/`async with` use the
+  expressions are eagerly materialized into an iterator (not lazy),
+  `async for`/`async with` use the
   synchronous protocol. `throw` accepts exception instances only (no
   exception class objects) and has no three-argument form.
 - **GC:** the conservative collector roots container builders and generated

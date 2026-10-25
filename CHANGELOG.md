@@ -8,19 +8,24 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **1370 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25: **1371 tests**, `scripts/verify.sh` ALL GREEN. The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 60/297 standard-library modules are importable (13 builtin/frozen, 43 pure,
-4 extension). `benchmarks/bench_all.py --only pyx` runs under PyX with
-`PYX_GC_THRESHOLD` raised: the rich report renders, all AOT binaries build,
-and the default-GC path still exposes a conservative-root retention issue
-under heavier rich rendering. See the package-loader entry below.
+4 extension). The **full** `benchmarks/bench_all.py` suite (without
+`--only`) runs under PyX with `PYX_GC_THRESHOLD` raised: all five benchmark
+groups complete, the rich report renders, all AOT binaries build, and the
+default-GC path still exposes a conservative-root retention issue under
+heavier rich rendering. See the package-loader entry below.
 
 ### Added
 
+- **Full benchmark harness under PyX:** generator expressions now wrap their
+  eager list in an iterator (so `next()`/single-pass use work), `*` call and
+  display operands accept arbitrary iterables, and `str`/`bytes.join` accept
+  iterators. `bench_all.py` without `--only` completes under PyX.
 - **Runtime dispatch and rich report slice:** bound `Match` methods,
   user `__getitem__` dispatch, native `threading.Thread` subclass bases
   with `start`/`join`/`is_alive`, zero-argument `super().__init__(...)` dispatch to the direct base,

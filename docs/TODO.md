@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** 1370 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** 1371 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -27,9 +27,10 @@ generated stdlib compatibility baseline (`docs/COMPATIBILITY.md`,
 core, the benchmark-critical batch, the package/site-packages loader and the
 new native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
 `importlib`/`__future__` modules) and the first official CPython test pass
-(`test_errno.py`). `benchmarks/bench_all.py --only pyx` now runs under PyX
-with `PYX_GC_THRESHOLD` raised and writes its full report; default-GC
-rendering still exposes the conservative-root retention issue (see P7).
+(`test_errno.py`). The full `benchmarks/bench_all.py` suite now runs under
+PyX with `PYX_GC_THRESHOLD` raised and writes its complete report;
+default-GC rendering still exposes the conservative-root retention issue
+(see P7).
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -184,7 +185,8 @@ no CPython is needed at runtime.
       (stackful fibers, `yield [value]`, bare `yield`, `return` terminates,
       exceptions propagate, `iter`/`next`, `send`/`throw`/`close`,
       `yield` expressions and `yield from`) are done. Open: mutable captures.
-      Generator expressions remain eagerly materialized.
+      Generator expressions are eagerly materialized into an iterator
+      (single-pass, `next()` works; not lazy).
 - [~] P2-11 Exceptions complete: `else`, `finally`, exception hierarchy, chaining.
       `except Exception`/`BaseException`, tuple handlers
       (`except (A, B) as e`) and explicit `raise ... from ...` chaining
@@ -256,13 +258,13 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-25: 1370 tests total — 671 runtime (492 unit, 179 ABI
+      As of 2026-10-25: 1371 tests total — 671 runtime (492 unit, 179 ABI
       integration: among others 22 bytes, 19 IO, 18 stdlib modules, 16 stdlib
       utils, 12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 413 frontend, 48 codegen, 18 IR, 220 CLI/E2E (142 E2E incl.
+      tests), 413 frontend, 48 codegen, 18 IR, 221 CLI/E2E (143 E2E incl.
       the abi3 extension fixture, 24 fibers, 6 closures, 11 user modules,
       10 exceptions, 8 completions, extension path/dotted/multi-phase,
       2 unittest-runner, 2 stdlib-batch-a, 2 stdlib-batch-b,
@@ -826,9 +828,9 @@ ledger below is the per-layer checklist that tracks the actual work.
 - [x] P7-22 Benchmark-critical batch — 5 modules used by
       `benchmarks/bench_all.py` and the bench scripts: `subprocess`,
       `tempfile`, `shutil`, `textwrap`, `timeit`. Gate (under CPython): all
-      five import and their benchmark-used APIs pass; `bench_all.py --only
-      pyx` completes. Running `bench_all.py` itself under PyX now also
-      completes when `PYX_GC_THRESHOLD` is raised: the official pure-Python
+      five import and their benchmark-used APIs pass; the full
+      `bench_all.py` completes. Running `bench_all.py` itself under PyX now
+      also completes when `PYX_GC_THRESHOLD` is raised: the official pure-Python
       `rich` package renders console/table/panel/rule, a native
       `rich.status.Status` shim provides the progress context manager, and
       the AOT report is written. The default conservative GC still needs
@@ -1165,7 +1167,8 @@ numbers; no module is declared done on import alone.
 - R6: Dynamic features (monkey-patching, `eval`, metaclasses) vs. AOT — tiering
   or an explicit support scope needed.
 - R7: Generator/coroutine remainder: async generators/comprehensions.
-  Generator expressions remain eagerly materialized; `async for`/`async with`
+  Generator expressions are eagerly materialized into an iterator (not
+  lazy); `async for`/`async with`
   use the synchronous protocol.
 - R8: Performance weak spots: string concatenation remains O(n²)
   (`string_concat` ~1.3–1.5x faster than CPython only because of lower

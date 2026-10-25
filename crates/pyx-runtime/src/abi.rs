@@ -1172,17 +1172,9 @@ pub extern "C" fn pyx_method_star(
     kwargc: usize,
     kw_argv: *const i64,
 ) -> i64 {
-    let Some(items) = value::as_list(star)
-        .or_else(|| value::as_tuple(star))
-        .map(|items| items.to_vec())
-    else {
-        return exc::raise_with_message(
-            exc::TYPE_ERROR,
-            &format!(
-                "starred method argument must be a list or tuple, not '{}'",
-                value::type_name(star)
-            ),
-        );
+    let items = match crate::core::builtins::star_sequence(star) {
+        Ok(items) => items,
+        Err(err) => return err,
     };
     // The element copies stay reachable through `star`, which is a live
     // argument for the whole call, so a collection during dispatch cannot

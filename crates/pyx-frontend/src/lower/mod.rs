@@ -6751,6 +6751,10 @@ impl<'a> Lowerer<'a> {
                 self.flush_list_chunk(&mut result, &mut pending, line, col);
                 let value = self.expr(&starred.value, fs);
                 let (value_line, value_col) = self.span(starred.range);
+                // A display accepts any iterable after `*` (including an
+                // iterator or generator expression); list concatenation only
+                // accepts lists, so copy the operand through `list(...)`.
+                let value = self.expr_to_list(value, fs, value_line, value_col);
                 result = Some(self.concat_lists(result, value, value_line, value_col));
                 continue;
             }

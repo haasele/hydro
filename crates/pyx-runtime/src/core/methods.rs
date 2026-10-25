@@ -1289,10 +1289,13 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_arity("str", method, args.len(), 1, 1) {
                 return err;
             }
-            let Some(source) = value::as_list(args[0]) else {
-                return type_error("can only join an iterable".to_string());
+            let items = match crate::core::builtins::star_sequence(args[0]) {
+                Ok(items) => items,
+                Err(_) => {
+                    exc::clear();
+                    return type_error("can only join an iterable".to_string());
+                }
             };
-            let items: Vec<i64> = source.to_vec();
             let mut out = String::new();
             for (index, item) in items.iter().enumerate() {
                 let Some(part) = value::as_str(*item) else {
@@ -1984,11 +1987,13 @@ fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_arity("bytes", method, args.len(), 1, 1) {
                 return err;
             }
-            let source = value::as_list(args[0]).or_else(|| value::as_tuple(args[0]));
-            let Some(items) = source else {
-                return type_error("can only join an iterable".to_string());
+            let items = match crate::core::builtins::star_sequence(args[0]) {
+                Ok(items) => items,
+                Err(_) => {
+                    exc::clear();
+                    return type_error("can only join an iterable".to_string());
+                }
             };
-            let items = items.to_vec();
             let mut total = 0usize;
             for (index, item) in items.iter().enumerate() {
                 let Some(part) = value::as_bytes(*item) else {
