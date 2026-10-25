@@ -635,10 +635,21 @@ pub(crate) fn key_hash(v: i64) -> u64 {
 
 /// Numeric keys hash by the `f64` bit pattern: `1`, `1.0` and `True` share a
 /// bucket, and `-0.0` is canonicalised to `0.0`. Two equal ints always encode
-/// the same bits; ints that round to the same `f64` merely collide.
+/// the same bits; ints that round to the same `f64` merely collide. A heap
+/// `BigInt` uses its (rounded) `f64` view for the same reason: values equal to
+/// a float must land in that float's bucket, and equal integers always round
+/// identically.
 fn numeric_hash(v: i64) -> Option<u64> {
     let value = if let Some(i) = value::as_integer(v) {
         i as f64
+    } else if let Some(n) = value::as_bigint(v) {
+        value::bigint_to_f64(n).unwrap_or_else(|| {
+            if n.sign() == num_bigint::Sign::Minus {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
+        })
     } else {
         value::as_float(v)?
     };
@@ -1386,8 +1397,31 @@ const MAX_EQ_DEPTH: usize = 64;
 fn equals_depth(a: i64, b: i64, depth: usize) -> bool {
     match (value::num_of(a), value::num_of(b)) {
         (Some(x), Some(y)) => return num_eq(x, y),
-        (Some(_), None) | (None, Some(_)) => return false,
+        (Some(_), None) | (None, Some(_)) => {
+            // An integer outside `i64` yields no `Num`; fall through so the
+            // exact BigInt comparison below can still run.
+            if value::as_bigint(a).is_none() && value::as_bigint(b).is_none() {
+                return false;
+            }
+        }
         (None, None) => {}
+    }
+    // Integers too large for `num_of`: compare exact values, and compare
+    // exactly against a float as well (no lossy `f64` conversion).
+    if let (Some(x), Some(y)) = (value::as_bigint(a), value::as_bigint(b)) {
+        return x == y;
+    }
+    if let Some(x) = value::as_bigint(a) {
+        return match value::as_float(b) {
+            Some(f) => value::bigint_cmp_f64(x, f) == Some(std::cmp::Ordering::Equal),
+            None => false,
+        };
+    }
+    if let Some(y) = value::as_bigint(b) {
+        return match value::as_float(a) {
+            Some(f) => value::bigint_cmp_f64(y, f) == Some(std::cmp::Ordering::Equal),
+            None => false,
+        };
     }
     if let (Some(s), Some(t)) = (value::as_str(a), value::as_str(b)) {
         return s == t;

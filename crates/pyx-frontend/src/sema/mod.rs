@@ -147,18 +147,19 @@ fn join(a: Type, b: Type) -> Option<Type> {
         return Some(a);
     }
     if a.is_numeric() && b.is_numeric() {
-        return Some(if a == Type::Float || b == Type::Float {
-            Type::Float
-        } else {
-            Type::Int
-        });
+        return Some(numeric_result(a, b));
     }
     None
 }
 
+/// Result type of mixing two numeric types: `float` dominates, then the
+/// arbitrary-precision integer, then the tagged integer (`bool` behaves as an
+/// `int`).
 fn numeric_result(a: Type, b: Type) -> Type {
     if a == Type::Float || b == Type::Float {
         Type::Float
+    } else if a == Type::BigInt || b == Type::BigInt {
+        Type::BigInt
     } else {
         Type::Int
     }
@@ -173,7 +174,13 @@ fn annotation_accepts(expected: Type, got: Type) -> bool {
     }
     matches!(
         (expected, got),
-        (Type::Int, Type::Bool) | (Type::Float, Type::Int) | (Type::Float, Type::Bool)
+        (Type::Int, Type::Bool)
+            | (Type::Int, Type::BigInt)
+            | (Type::BigInt, Type::Int)
+            | (Type::BigInt, Type::Bool)
+            | (Type::Float, Type::Int)
+            | (Type::Float, Type::BigInt)
+            | (Type::Float, Type::Bool)
     )
 }
 
@@ -202,7 +209,7 @@ impl ArgKind {
             ArgKind::Any => true,
             ArgKind::Str => got == Type::Str,
             ArgKind::Bytes => got == Type::Bytes,
-            ArgKind::Int => got == Type::Int || got == Type::Bool,
+            ArgKind::Int => got == Type::Int || got == Type::BigInt || got == Type::Bool,
             ArgKind::List => got == Type::List,
             ArgKind::Dict => got == Type::Dict,
             // Detailed hashability is checked on the expression itself so
@@ -505,22 +512,22 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
                 Some(Type::Any)
             } else if a.is_numeric() && b.is_numeric() {
                 Some(numeric_result(a, b))
-            } else if (a == Type::Str && matches!(b, Type::Int | Type::Bool))
-                || (b == Type::Str && matches!(a, Type::Int | Type::Bool))
+            } else if (a == Type::Str && matches!(b, Type::Int | Type::BigInt | Type::Bool))
+                || (b == Type::Str && matches!(a, Type::Int | Type::BigInt | Type::Bool))
             {
                 // `str * int` repeats the string. `bool` is an `int` subtype.
                 Some(Type::Str)
-            } else if (a == Type::Bytes && matches!(b, Type::Int | Type::Bool))
-                || (b == Type::Bytes && matches!(a, Type::Int | Type::Bool))
+            } else if (a == Type::Bytes && matches!(b, Type::Int | Type::BigInt | Type::Bool))
+                || (b == Type::Bytes && matches!(a, Type::Int | Type::BigInt | Type::Bool))
             {
                 // `bytes * int` repeats the byte string.
                 Some(Type::Bytes)
-            } else if (a == Type::Tuple && matches!(b, Type::Int | Type::Bool))
-                || (b == Type::Tuple && matches!(a, Type::Int | Type::Bool))
+            } else if (a == Type::Tuple && matches!(b, Type::Int | Type::BigInt | Type::Bool))
+                || (b == Type::Tuple && matches!(a, Type::Int | Type::BigInt | Type::Bool))
             {
                 Some(Type::Tuple)
-            } else if (a == Type::List && matches!(b, Type::Int | Type::Bool))
-                || (b == Type::List && matches!(a, Type::Int | Type::Bool))
+            } else if (a == Type::List && matches!(b, Type::Int | Type::BigInt | Type::Bool))
+                || (b == Type::List && matches!(a, Type::Int | Type::BigInt | Type::Bool))
             {
                 Some(Type::List)
             } else {
@@ -552,7 +559,10 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
                 }
                 Type::List | Type::Tuple => Some(Type::Bool),
                 Type::Range => {
-                    if matches!(a, Type::Int | Type::Bool | Type::Any | Type::Never) {
+                    if matches!(
+                        a,
+                        Type::Int | Type::BigInt | Type::Bool | Type::Any | Type::Never
+                    ) {
                         Some(Type::Bool)
                     } else {
                         None
@@ -614,8 +624,10 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
         // subtype); every other operand combination is only known at runtime,
         // where it raises `TypeError`.
         BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-            if matches!(a, Type::Int | Type::Bool) && matches!(b, Type::Int | Type::Bool) {
-                Some(Type::Int)
+            if matches!(a, Type::Int | Type::BigInt | Type::Bool)
+                && matches!(b, Type::Int | Type::BigInt | Type::Bool)
+            {
+                Some(numeric_result(a, b))
             } else {
                 Some(Type::Any)
             }
@@ -1289,7 +1301,10 @@ impl<'a> Checker<'a> {
     fn check_range_arg(&mut self, name: &str, expr: &HExpr, f: &HFunction) {
         self.check_expr(expr, f);
         match self.inf.resolve(expr.ty) {
-            Ty::Concrete(Type::Int) | Ty::Concrete(Type::Bool) | Ty::Concrete(Type::Any) => {}
+            Ty::Concrete(Type::Int)
+            | Ty::Concrete(Type::BigInt)
+            | Ty::Concrete(Type::Bool)
+            | Ty::Concrete(Type::Any) => {}
             Ty::Var(_) => {
                 let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Int));
             }
@@ -1309,7 +1324,10 @@ impl<'a> Checker<'a> {
 
     fn check_int_index(&mut self, container: &str, index: Ty, line: u32, col: u32) {
         match self.inf.resolve(index) {
-            Ty::Concrete(Type::Int) | Ty::Concrete(Type::Bool) | Ty::Concrete(Type::Any) => {}
+            Ty::Concrete(Type::Int)
+            | Ty::Concrete(Type::BigInt)
+            | Ty::Concrete(Type::Bool)
+            | Ty::Concrete(Type::Any) => {}
             Ty::Var(_) => {
                 let _ = self.inf.unify(index, Ty::Concrete(Type::Int));
             }
@@ -1334,6 +1352,7 @@ impl<'a> Checker<'a> {
     fn check_slice_index(&mut self, expr: &HExpr) {
         match self.inf.resolve(expr.ty) {
             Ty::Concrete(Type::Int)
+            | Ty::Concrete(Type::BigInt)
             | Ty::Concrete(Type::Bool)
             | Ty::Concrete(Type::None)
             | Ty::Concrete(Type::Any) => {}
@@ -2213,6 +2232,7 @@ impl<'a> Checker<'a> {
                 if let Ty::Concrete(t) = self.inf.resolve(ty) {
                     let ok = t == Type::Any
                         || t == Type::Int
+                        || t == Type::BigInt
                         || t == Type::Float
                         || t == Type::Bool
                         || t == Type::Str;
@@ -2296,6 +2316,9 @@ impl<'a> Checker<'a> {
                     Ty::Concrete(Type::Any) => self.force_any(out),
                     Ty::Concrete(Type::Int) | Ty::Concrete(Type::Bool) => {
                         let _ = self.inf.unify(out, Ty::Concrete(Type::Int));
+                    }
+                    Ty::Concrete(Type::BigInt) => {
+                        let _ = self.inf.unify(out, Ty::Concrete(Type::BigInt));
                     }
                     Ty::Concrete(Type::Float) => {
                         let _ = self.inf.unify(out, Ty::Concrete(Type::Float));
@@ -2430,6 +2453,7 @@ impl<'a> Checker<'a> {
                             let _ = self.inf.unify(*ty, Ty::Concrete(Type::Int));
                         }
                         Ty::Concrete(Type::Int)
+                        | Ty::Concrete(Type::BigInt)
                         | Ty::Concrete(Type::Bool)
                         | Ty::Concrete(Type::Any)
                         | Ty::Concrete(Type::Never) => {}
@@ -2475,6 +2499,7 @@ impl<'a> Checker<'a> {
                             let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
                         }
                         Ty::Concrete(Type::Int)
+                        | Ty::Concrete(Type::BigInt)
                         | Ty::Concrete(Type::Bool)
                         | Ty::Concrete(Type::Str)
                         | Ty::Concrete(Type::List)
@@ -2637,6 +2662,7 @@ impl<'a> Checker<'a> {
                 for (name, (ty, arg_line, arg_col)) in names.iter().zip(args.iter()) {
                     match self.inf.resolve(*ty) {
                         Ty::Concrete(Type::Int)
+                        | Ty::Concrete(Type::BigInt)
                         | Ty::Concrete(Type::Bool)
                         | Ty::Concrete(Type::Any) => {}
                         Ty::Var(_) => {
@@ -2775,6 +2801,7 @@ impl<'a> Checker<'a> {
                 if let Some((ty, arg_line, arg_col)) = args.get(1) {
                     match self.inf.resolve(*ty) {
                         Ty::Concrete(Type::Int)
+                        | Ty::Concrete(Type::BigInt)
                         | Ty::Concrete(Type::Bool)
                         | Ty::Concrete(Type::Any) => {}
                         Ty::Var(_) => {
@@ -2917,6 +2944,7 @@ impl<'a> Checker<'a> {
                         let _ = self.inf.unify(ty, Ty::Concrete(Type::Int));
                     }
                     Ty::Concrete(Type::Int)
+                    | Ty::Concrete(Type::BigInt)
                     | Ty::Concrete(Type::Bool)
                     | Ty::Concrete(Type::Any)
                     | Ty::Concrete(Type::Never) => {}
@@ -3123,6 +3151,9 @@ impl<'a> Checker<'a> {
                 Ty::Concrete(Type::Int) | Ty::Concrete(Type::Bool) => {
                     self.bind_type(op.out, Type::Int, op.line, op.col);
                 }
+                Ty::Concrete(Type::BigInt) => {
+                    self.bind_type(op.out, Type::BigInt, op.line, op.col);
+                }
                 Ty::Concrete(t) => {
                     self.error(
                         op.line,
@@ -3138,6 +3169,8 @@ impl<'a> Checker<'a> {
                 Ty::Concrete(t) if t.is_numeric() => {
                     let result = if t == Type::Float {
                         Type::Float
+                    } else if t == Type::BigInt {
+                        Type::BigInt
                     } else {
                         Type::Int
                     };

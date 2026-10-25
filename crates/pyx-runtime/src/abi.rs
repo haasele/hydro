@@ -36,6 +36,16 @@ pub extern "C" fn pyx_int(v: i64) -> i64 {
     value::normalize_int(v)
 }
 
+/// Arbitrary-precision `int` literal: parses a decimal string (optional
+/// leading `-`, no underscores or whitespace in IR buffers) and returns a
+/// tagged immediate when the value fits, otherwise a heap `BigInt`.
+///
+/// Invalid text raises `ValueError` (the caller polls `pyx_exc_pending`).
+#[no_mangle]
+pub extern "C" fn pyx_bigint_from_str(ptr: *const c_uchar, len: usize) -> i64 {
+    value::bigint_from_ptr(ptr, len)
+}
+
 #[no_mangle]
 pub extern "C" fn pyx_str_new(ptr: *const c_uchar, len: usize) -> i64 {
     value::str_from_ptr(ptr, len)
@@ -1541,6 +1551,32 @@ mod tests {
         let s = pyx_str_new(b"hi".as_ptr(), 2);
         assert_eq!(value::as_str(s), Some("hi"));
         assert_eq!(value::as_float(pyx_float_new(1.5)), Some(1.5));
+    }
+
+    #[test]
+    fn bigint_literals_parse_through_the_abi() {
+        pyx_runtime_init();
+        let text = b"987654321098765432109876543210";
+        let huge = pyx_bigint_from_str(text.as_ptr(), text.len());
+        assert!(value::is_bigint(huge));
+        assert_eq!(value::to_string(huge), "987654321098765432109876543210");
+        assert_eq!(value::type_name(huge), "int");
+
+        // Values inside the tagged range become immediates.
+        assert_eq!(pyx_bigint_from_str(b"-42".as_ptr(), 3), pyx_int(-42));
+        let min = b"-1152921504606846976";
+        let tagged_min = pyx_bigint_from_str(min.as_ptr(), min.len());
+        assert_eq!(value::as_integer(tagged_min), Some(value::MIN_INT));
+        assert!(!value::is_bigint(tagged_min));
+
+        // Malformed text raises ValueError through the pending exception.
+        exc::init();
+        assert_eq!(pyx_bigint_from_str(b"oops".as_ptr(), 4), value::NONE);
+        assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "invalid literal for int() with base 10: 'oops'"
+        );
     }
 
     #[test]

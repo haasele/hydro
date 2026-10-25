@@ -3,7 +3,6 @@
 //! `callable` (ARCHITECTURE §3.2).
 
 use std::io::Write as _;
-use std::num::IntErrorKind;
 
 use pyx_ir::{Builtin, MethodKind, ParamKind};
 
@@ -189,6 +188,10 @@ pub(crate) fn to_int(v: i64) -> i64 {
     if let Some(n) = value::as_integer(v) {
         return ops::int_result(n);
     }
+    // Integers outside `i64` keep their exact value.
+    if let Some(n) = value::as_bigint(v) {
+        return value::bigint_new(n.clone());
+    }
     if let Some(f) = value::as_float(v) {
         if f.is_nan() {
             return exc::raise_with_message(VALUE_ERROR, "cannot convert float NaN to integer");
@@ -200,23 +203,22 @@ pub(crate) fn to_int(v: i64) -> i64 {
             );
         }
         if !(-TWO_POW_63..TWO_POW_63).contains(&f) {
-            return exc::raise_with_message(OVERFLOW_ERROR, "integer overflow");
+            // Large finite floats convert exactly instead of overflowing.
+            return match value::bigint_from_f64_trunc(f) {
+                Some(n) => value::bigint_new(n),
+                None => exc::raise_with_message(OVERFLOW_ERROR, "integer overflow"),
+            };
         }
         // `int()` truncates toward zero.
         return ops::int_result(f.trunc() as i64);
     }
     if let Some(s) = value::as_str(v) {
-        return match s.trim().parse::<i64>() {
-            Ok(n) => ops::int_result(n),
-            Err(err) => match err.kind() {
-                IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
-                    exc::raise_with_message(OVERFLOW_ERROR, "integer overflow")
-                }
-                _ => exc::raise_with_message(
-                    VALUE_ERROR,
-                    &format!("invalid literal for int() with base 10: '{}'", s),
-                ),
-            },
+        return match value::parse_decimal_int(s.trim()) {
+            Some(n) => value::bigint_new(n),
+            None => exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("invalid literal for int() with base 10: '{s}'"),
+            ),
         };
     }
     exc::raise_with_message(
@@ -289,32 +291,35 @@ fn to_int_base(value_arg: i64, base_arg: i64) -> i64 {
             &format!("invalid literal for int() with base {base}: '{text}'"),
         );
     }
-    let mut result: i64 = 0;
     for ch in digits.chars() {
-        let digit = match ch.to_digit(radix) {
-            Some(digit) => i64::from(digit),
-            None => {
-                return exc::raise_with_message(
-                    VALUE_ERROR,
-                    &format!("invalid literal for int() with base {base}: '{text}'"),
-                )
-            }
-        };
-        let Some(next) = result
-            .checked_mul(i64::from(radix))
-            .and_then(|value| value.checked_add(digit))
-        else {
-            return exc::raise_with_message(OVERFLOW_ERROR, "integer overflow");
-        };
-        result = next;
+        if ch.to_digit(radix).is_none() {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("invalid literal for int() with base {base}: '{text}'"),
+            );
+        }
     }
-    ops::int_result(if negative { -result } else { result })
+    // Accumulate with arbitrary precision: an explicit base no longer turns a
+    // large literal into `OverflowError`.
+    match value::bigint_from_radix(digits, radix, negative) {
+        Some(n) => value::bigint_new(n),
+        None => exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("invalid literal for int() with base {base}: '{text}'"),
+        ),
+    }
 }
 
 /// `float(v)`.
 pub(crate) fn to_float(v: i64) -> i64 {
     if let Some(n) = value::as_integer(v) {
         return value::float_new(n as f64);
+    }
+    if let Some(n) = value::as_bigint(v) {
+        return match value::bigint_to_f64(n) {
+            Some(f) => value::float_new(f),
+            None => exc::raise_with_message(OVERFLOW_ERROR, "int too large to convert to float"),
+        };
     }
     if let Some(f) = value::as_float(v) {
         return value::float_new(f);
@@ -342,8 +347,12 @@ pub(crate) fn abs(v: i64) -> i64 {
     if let Some(n) = value::as_integer(v) {
         return match n.checked_abs() {
             Some(a) => ops::int_result(a),
-            None => exc::raise_with_message(OVERFLOW_ERROR, "integer overflow"),
+            None => value::bigint_new(n.unsigned_abs().into()),
         };
+    }
+    if let Some(n) = value::as_bigint(v) {
+        // The magnitude of a BigInt is already the absolute value.
+        return value::bigint_new(n.magnitude().clone().into());
     }
     if let Some(f) = value::as_float(v) {
         return value::float_new(f.abs());
@@ -361,6 +370,9 @@ pub(crate) fn abs(v: i64) -> i64 {
 /// adjustment, so `divmod(-7.5, 2.0) == (-4.0, 0.5)`. A zero divisor raises
 /// `ZeroDivisionError` and a non-numeric operand raises `TypeError`.
 pub(crate) fn divmod(a: i64, b: i64) -> i64 {
+    if value::is_bigint(a) || value::is_bigint(b) {
+        return bigint_divmod(a, b);
+    }
     match (value::num_of(a), value::num_of(b)) {
         (Some(value::Num::Int(p)), Some(value::Num::Int(q))) => {
             if q == 0 {
@@ -385,31 +397,7 @@ pub(crate) fn divmod(a: i64, b: i64) -> i64 {
                 value::Num::Int(n) => n as f64,
                 value::Num::Float(f) => f,
             };
-            if divisor == 0.0 {
-                return exc::raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
-            }
-            let mut modulo = dividend % divisor;
-            if modulo != 0.0 {
-                // The remainder takes the divisor's sign.
-                if (divisor < 0.0) != (modulo < 0.0) {
-                    modulo += divisor;
-                }
-            } else {
-                // Preserve the divisor's sign on an exact zero, as CPython
-                // does (`divmod(4.0, 2.0) == (2.0, 0.0)`).
-                modulo = 0.0_f64.copysign(divisor);
-            }
-            // Derive the floored quotient from the adjusted remainder so the
-            // identity `dividend == quotient * divisor + modulo` holds.
-            let mut quotient = if modulo != 0.0 {
-                (dividend - modulo) / divisor
-            } else {
-                dividend / divisor
-            };
-            if quotient != 0.0 {
-                quotient = quotient.copysign(dividend / divisor);
-            }
-            value::tuple_new(vec![value::float_new(quotient), value::float_new(modulo)])
+            float_divmod(dividend, divisor)
         }
         _ => exc::raise_with_message(
             TYPE_ERROR,
@@ -420,6 +408,62 @@ pub(crate) fn divmod(a: i64, b: i64) -> i64 {
             ),
         ),
     }
+}
+
+/// `divmod` when at least one operand is a heap BigInt: exact integer
+/// division when both operands are integers, float semantics when either is a
+/// float.
+fn bigint_divmod(a: i64, b: i64) -> i64 {
+    if let (Some(left), Some(right)) = (value::to_bigint(a), value::to_bigint(b)) {
+        if right.sign() == num_bigint::Sign::NoSign {
+            return exc::raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
+        }
+        let (quotient, remainder) = ops::integer_floor_divmod(&left, &right);
+        return value::tuple_new(vec![
+            value::bigint_new(quotient),
+            value::bigint_new(remainder),
+        ]);
+    }
+    let convert = |operand: i64| -> Option<f64> {
+        match value::to_bigint(operand) {
+            Some(n) => value::bigint_to_f64(&n),
+            None => value::as_float(operand),
+        }
+    };
+    let (Some(dividend), Some(divisor)) = (convert(a), convert(b)) else {
+        return exc::raise_with_message(OVERFLOW_ERROR, "int too large to convert to float");
+    };
+    float_divmod(dividend, divisor)
+}
+
+/// Floating-point `divmod`: the remainder takes the divisor's sign and the
+/// floored quotient keeps the dividend's.
+fn float_divmod(dividend: f64, divisor: f64) -> i64 {
+    if divisor == 0.0 {
+        return exc::raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
+    }
+    let mut modulo = dividend % divisor;
+    if modulo != 0.0 {
+        // The remainder takes the divisor's sign.
+        if (divisor < 0.0) != (modulo < 0.0) {
+            modulo += divisor;
+        }
+    } else {
+        // Preserve the divisor's sign on an exact zero, as CPython does
+        // (`divmod(4.0, 2.0) == (2.0, 0.0)`).
+        modulo = 0.0_f64.copysign(divisor);
+    }
+    // Derive the floored quotient from the adjusted remainder so the identity
+    // `dividend == quotient * divisor + modulo` holds.
+    let mut quotient = if modulo != 0.0 {
+        (dividend - modulo) / divisor
+    } else {
+        dividend / divisor
+    };
+    if quotient != 0.0 {
+        quotient = quotient.copysign(dividend / divisor);
+    }
+    value::tuple_new(vec![value::float_new(quotient), value::float_new(modulo)])
 }
 
 /// `callable(v)`: whether `v` can be called like a function.
@@ -2732,7 +2776,9 @@ fn protocol_instance_of(value: i64, class: i64) -> bool {
 fn named_type_check(value: i64, name: &str) -> Option<bool> {
     Some(match name {
         // `bool` is a subclass of `int` in Python.
-        "int" => value::is_int(value) || value::type_name(value) == "bool",
+        "int" => {
+            value::is_int(value) || value::is_bigint(value) || value::type_name(value) == "bool"
+        }
         "bool" => value::type_name(value) == "bool",
         "float" => value::as_float(value).is_some(),
         "str" => value::as_str(value).is_some(),
@@ -4140,5 +4186,93 @@ mod tests {
         // The probe takes no arguments.
         assert_eq!(builtin_call(Builtin::GetIpython, &[int(1)]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    /// Arbitrary-precision literal through the normalizing constructor.
+    fn big(text: &str) -> i64 {
+        value::bigint_new(text.parse::<num_bigint::BigInt>().expect("big literal"))
+    }
+
+    #[test]
+    fn bigint_conversions_preserve_exact_values() {
+        exc::init();
+        // `int(BigInt)` and `int(str)` keep the exact value.
+        let huge = big("-123456789012345678901234567890");
+        assert_eq!(rendered(to_int(huge)), "-123456789012345678901234567890");
+
+        let from_text = to_int(string("123456789012345678901234567890"));
+        assert!(value::is_bigint(from_text));
+        assert_eq!(rendered(from_text), "123456789012345678901234567890");
+
+        // An explicit base stays exact as well.
+        let base16 = builtin_call(Builtin::Int, &[string("ffffffffffffffffffffffff"), int(16)]);
+        assert_eq!(rendered(base16), "79228162514264337593543950335");
+
+        // `int(float)` truncates large finite floats exactly.
+        assert_eq!(
+            rendered(to_int(value::float_new(1e30))),
+            "1000000000000000019884624838656"
+        );
+        // `int()`/`bool()`/`float()` agree with the tagged fast path.
+        assert_eq!(value::as_integer(to_int(TRUE)), Some(1));
+        assert_eq!(
+            value::as_float(to_float(big("100000000000000000000"))),
+            Some(1e20)
+        );
+        assert_eq!(value::bool_value(value::truthy(big("1"))), TRUE);
+        assert_eq!(value::bool_value(value::truthy(big("-1"))), TRUE);
+        assert!(!exc::pending());
+
+        // Floats that cannot hold the integer raise OverflowError.
+        let enormous = big("-100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(to_float(enormous), NONE);
+        assert_eq!(exc::pending_tag(), OVERFLOW_ERROR as i64);
+        assert_eq!(pending_message(), "int too large to convert to float");
+    }
+
+    #[test]
+    fn bigint_abs_divmod_and_hash() {
+        exc::init();
+        let negative = big("-123456789012345678901234567890");
+        assert_eq!(rendered(abs(negative)), "123456789012345678901234567890");
+
+        // divmod uses Python's floored quotient/remainder and stays exact.
+        let result = builtin_call(Builtin::Divmod, &[negative, int(3)]);
+        assert!(!exc::pending());
+        let items = value::as_tuple(result).expect("divmod returns a tuple");
+        assert_eq!(rendered(items[0]), "-41152263004115226300411522630");
+        assert_eq!(rendered(items[1]), "0");
+
+        let two_100 = big("1267650600228229401496703205376");
+        let result = builtin_call(Builtin::Divmod, &[two_100, int(3)]);
+        assert!(!exc::pending());
+        let items = value::as_tuple(result).expect("divmod returns a tuple");
+        assert_eq!(rendered(items[0]), "422550200076076467165567735125");
+        assert_eq!(rendered(items[1]), "1");
+
+        // Equal heap BigInts are interchangeable dict/set keys.
+        let key = big("123456789012345678901234567890");
+        let same = big("123456789012345678901234567890");
+        let dict = value::dict_new(vec![(key, int(1)), (same, int(2))]);
+        assert_eq!(value::as_dict(dict).map(|pairs| pairs.len()), Some(1));
+        assert!(container::dict_find(value::as_dict(dict).expect("dict"), same).is_some());
+        assert!(container::dict_find(value::as_dict(dict).expect("dict"), key).is_some());
+        assert!(!container::dict_find(
+            value::as_dict(dict).expect("dict"),
+            big("123456789012345678901234567891")
+        )
+        .is_some());
+        let set = value::set_new(vec![key]);
+        assert!(container::set_contains(
+            value::as_set(set).expect("set"),
+            same
+        ));
+
+        // `hash()` agrees for equal values and both fit tagged integers.
+        let heap_hash = hash(key);
+        assert!(value::is_int(heap_hash));
+        assert_eq!(heap_hash, hash(same));
+        assert_eq!(rendered(hash(int(7))), rendered(hash(big("7"))));
+        assert!(!exc::pending());
     }
 }

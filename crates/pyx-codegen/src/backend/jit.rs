@@ -26,6 +26,7 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         pyx_bool,
         pyx_int,
         pyx_str_new,
+        pyx_bigint_from_str,
         pyx_bytes_new,
         pyx_bytes_build,
         pyx_float_new,

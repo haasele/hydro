@@ -2665,6 +2665,11 @@ fn dumps_value(
         out.push_str(&n.to_string());
         return Ok(());
     }
+    if let Some(n) = value::as_bigint(v) {
+        // Arbitrary-precision integers keep their exact decimal form.
+        out.push_str(&n.to_string());
+        return Ok(());
+    }
     if let Some(s) = value::as_str(v) {
         write_json_string(s, options.ensure_ascii, out);
         return Ok(());
@@ -2763,6 +2768,8 @@ fn json_key(key: i64, ensure_ascii: bool) -> Result<String, i64> {
     } else if key == FALSE {
         Some("false".to_string())
     } else if let Some(n) = value::as_integer(key) {
+        Some(n.to_string())
+    } else if let Some(n) = value::as_bigint(key) {
         Some(n.to_string())
     } else {
         value::as_float(key).map(json_float)
@@ -3076,11 +3083,11 @@ impl JsonParser {
                 Err(_) => Err(json_parse_error("Expecting value")),
             }
         } else {
-            match text.parse::<i64>() {
-                Ok(n) => Ok(encode_int(n)),
-                // The runtime has no arbitrary-precision integers; values
-                // outside `i64` cannot be represented.
-                Err(_) => Err(exc::raise_with_message(OVERFLOW_ERROR, "integer overflow")),
+            match text.parse::<num_bigint::BigInt>() {
+                // `bigint_new` normalizes values inside the tagged range to
+                // immediates, so small integers keep the fast path.
+                Ok(n) => Ok(value::bigint_new(n)),
+                Err(_) => Err(json_parse_error("Expecting value")),
             }
         }
     }
@@ -4928,6 +4935,68 @@ mod tests {
         assert_eq!(dumps(value::float_new(f64::NAN)), "NaN");
         assert_eq!(dumps(string("")), "\"\"");
         assert_eq!(dumps(string("plain")), "\"plain\"");
+    }
+
+    /// Arbitrary-precision literal through the normalizing constructor.
+    fn big(text: &str) -> i64 {
+        value::bigint_new(text.parse::<num_bigint::BigInt>().expect("big literal"))
+    }
+
+    #[test]
+    fn json_bigint_round_trip() {
+        exc::init();
+        let two_100 = big("1267650600228229401496703205376");
+        assert!(value::is_bigint(two_100));
+        assert_eq!(dumps(two_100), "1267650600228229401496703205376");
+
+        let negative = big("-123456789012345678901234567890");
+        assert_eq!(dumps(negative), "-123456789012345678901234567890");
+
+        // `loads` restores the exact arbitrary-precision value.
+        let parsed = loads("1267650600228229401496703205376");
+        assert!(value::is_bigint(parsed));
+        assert_eq!(value::to_string(parsed), "1267650600228229401496703205376");
+        assert_eq!(
+            value::to_string(loads("-123456789012345678901234567890")),
+            "-123456789012345678901234567890"
+        );
+        // Small integers keep the tagged representation.
+        let small = loads("42");
+        assert!(value::is_int(small));
+        assert_eq!(value::as_integer(small), Some(42));
+
+        // Lists keep every element exact through the round trip.
+        let list = value::list_new(vec![two_100, negative, int(1)]);
+        let encoded = dumps(list);
+        assert_eq!(
+            encoded,
+            "[1267650600228229401496703205376, -123456789012345678901234567890, 1]"
+        );
+        let items = value::as_list(loads(&encoded)).expect("list");
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            value::to_string(items[0]),
+            "1267650600228229401496703205376"
+        );
+        assert_eq!(
+            value::to_string(items[1]),
+            "-123456789012345678901234567890"
+        );
+        assert_eq!(value::as_integer(items[2]), Some(1));
+
+        // Integer dict keys become quoted decimals, like CPython.
+        let dict = value::dict_new(vec![(two_100, string("v"))]);
+        let encoded = dumps(dict);
+        assert_eq!(encoded, "{\"1267650600228229401496703205376\": \"v\"}");
+        // `loads` restores the key as the equivalent decimal string.
+        let reloaded = value::as_dict(loads(&encoded)).expect("dict");
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(
+            value::as_str(reloaded[0].0),
+            Some("1267650600228229401496703205376")
+        );
+        assert_eq!(value::as_str(reloaded[0].1), Some("v"));
+        assert!(!exc::pending());
     }
 
     #[test]

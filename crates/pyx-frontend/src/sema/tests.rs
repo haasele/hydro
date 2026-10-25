@@ -1904,3 +1904,54 @@ fn hash_builtin_checks_arity_and_returns_int() {
         vec!["hash() takes exactly one argument (0 given)"]
     );
 }
+
+#[test]
+fn bigint_arithmetic_and_comparison_types() {
+    let source = "a = 1152921504606846976\n\
+                  b = a + 1\n\
+                  c = a + 1.5\n\
+                  d = a < 2\n\
+                  e = a & 1\n\
+                  f = a * True\n\
+                  g = -a\n\
+                  h = 1 + 2\n";
+    let program = crate::check_source(source, "test.py").expect("valid bigint expressions");
+    assert_eq!(assigned_type(&program, 0), Type::BigInt);
+    assert_eq!(assigned_type(&program, 1), Type::BigInt);
+    assert_eq!(assigned_type(&program, 2), Type::Float);
+    assert_eq!(assigned_type(&program, 3), Type::Bool);
+    assert_eq!(assigned_type(&program, 4), Type::BigInt);
+    assert_eq!(assigned_type(&program, 5), Type::BigInt);
+    assert_eq!(assigned_type(&program, 6), Type::BigInt);
+    // Tagged-only arithmetic stays tagged; the runtime promotes on overflow.
+    assert_eq!(assigned_type(&program, 7), Type::Int);
+}
+
+#[test]
+fn bigint_annotation_types_parameters_and_returns() {
+    let source = "def f(x: BigInt, y: int) -> BigInt:\n    return x\n";
+    let program = crate::check_source(source, "test.py").expect("BigInt annotation accepted");
+    let f = program
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .expect("function f");
+    assert_eq!(f.params[0].ty, Type::BigInt);
+    assert_eq!(f.params[1].ty, Type::Int);
+    assert_eq!(f.ret_ty, Type::BigInt);
+}
+
+#[test]
+fn bigint_annotation_names_itself_in_diagnostics() {
+    assert_eq!(
+        check_errors("def f() -> BigInt:\n    return 1.5\n"),
+        vec!["return type float does not match declared return type BigInt"]
+    );
+}
+
+#[test]
+fn bigint_literals_satisfy_numeric_annotations() {
+    assert!(check_errors("def f(x: BigInt = 1152921504606846976):\n    return x\n").is_empty());
+    assert!(check_errors("def f(x: int) -> int:\n    return 1152921504606846976\n").is_empty());
+    assert!(check_errors("def f(x: float):\n    return x\nf(1152921504606846976)\n").is_empty());
+}

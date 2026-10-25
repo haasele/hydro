@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1377 tests, JIT+AOT |
+| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1403 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -86,8 +86,8 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
 
 **Verification (as of 2026-10-25):**
 
-- `cargo test --workspace`: **1377 tests** — 417 frontend, 48 codegen, 18 IR,
-  494 runtime unit, 221 CLI/E2E (143 E2E incl. the abi3 extension fixture,
+- `cargo test --workspace`: **1403 tests** — 424 frontend, 51 codegen, 18 IR,
+  509 runtime unit, 222 CLI/E2E (144 E2E incl. the abi3 extension fixture,
   24 fibers, 6 closures, 11 user modules, 10 exception tests, 8
   completions, extension path/dotted/multi-phase, 2 unittest-runner tests,
   2 stdlib-batch-a, 2 stdlib-batch-b, 3 stdlib-bench-batch tests and 5 CLI
@@ -579,7 +579,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 1377 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 1403 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -788,7 +788,7 @@ parallel benchmarks and race/stress tests.
   --all-targets -- -D warnings` and `cargo test --workspace` green;
   micro baseline renewed (while_sum AOT 1.7 ms vs. CPython 23.5 ms).
 
-**Known, documented limits Phase 1/2:** i64 instead of BigInt; GC is a
+**Known, documented limits Phase 1/2:** arbitrary-precision integers use a 61-bit tagged fast path plus heap `BigInt` promotion; GC is a
 conservative collector (stack scan, STW root rescan; white partition briefly
 under heap lock, freeing concurrent); no precise roots/stack maps and
 no size-class allocator (P2-05/06/07 open); heavy rich rendering still loses
@@ -801,6 +801,12 @@ a hash index (O(1) on average, Python equality, numeric key equivalence).
 **Exceptions:** hierarchy matchers (`except Exception`/`BaseException`), tuple
 handlers and explicit `raise ... from` are implemented; implicit context
 chaining and `except*` remain open; tracebacks are simplified (one frame).
+**Integers:** tagged immediates cover `-2^60 ..= 2^60-1`; every arithmetic
+result outside that range promotes to a heap `BigInt` (`num-bigint`). The
+static type system distinguishes `Int` (fast path) and `BigInt`; mixed
+operations are exact (including `//`, `%`, `**`, shifts, bitwise ops,
+comparisons, formatting and JSON). Native i64-only boundaries (for example
+`getrandbits` above 60 bits or `range` bounds) remain documented limits.
 **Classes:** multiple bases are approximated by the first base; no class
 attributes/decorators/metaclasses/descriptors; zero-argument
 `super().__init__(...)` targets the direct base, other `super()` forms are
@@ -873,7 +879,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (1377)
+cargo test                             # unit/integration tests (1403)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1369,4 +1375,24 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   threshold) and CPython (151 s). AOT cache keys now include the compiler
   executable fingerprint (size + mtime), so frontend rebuilds invalidate
   stale binaries. **1377 tests**, clippy `-D warnings` and
+  `scripts/verify.sh` green.
+
+
+- 2026-10-25 (continuation 57): BigInt split + Cranelift tuning.
+  Python `int` now keeps a tagged 61-bit immediate fast path and promotes
+  exact arithmetic results to heap `BigInt` (`num-bigint`). Added
+  `Type::BigInt`, `Const::BigInt`, ABI `pyx_bigint_from_str`, runtime
+  conversion/promotion (`int_result`), exact `+ - * // % **`, bitwise/shift,
+  comparisons, divmod, `int()` parsing, formatting/JSON and dict/set key
+  equivalence. Codegen guards typed-int fast paths with a heap-tag check so a
+  promoted BigInt stays assignable to `Int`; BigInt operands use the generic
+  operator path. Differential BigInt scripts match CPython 3.14.9 under JIT
+  and AOT. Cranelift settings now explicitly use speed/alias analysis and keep
+  the verifier debug-only; JIT `is_pic=false`, AOT PIC/external libcalls
+  unchanged. `bench_pyx.py` (n=200000, repeat 5, default GC): hello
+  JIT/AOT 1.35/0.93 ms, while_sum 2.59/1.78, for_range 2.60/1.70,
+  list_append 4.56/4.40, math_loop 24.88/22.89. Full `bench_all.py`
+  (no `--only`) remains green under PyX (150 s, high GC threshold). Remaining
+  native i64 boundaries: `range` bounds, `getrandbits(k>60)`, some
+  math/pickle paths. **1403 tests**, clippy `-D warnings` and
   `scripts/verify.sh` green.

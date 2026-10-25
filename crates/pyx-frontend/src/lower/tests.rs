@@ -6865,3 +6865,68 @@ fn long_comparison_chains_use_one_temp_per_middle_operand() {
     assert!(matches!(&outer_lhs.kind, HExprKind::BoolOp { .. }));
     assert!(matches!(&third.kind, HExprKind::Bin { op: BinOp::Lt, .. }));
 }
+
+#[test]
+fn integer_literals_choose_tagged_or_bigint_constants() {
+    let source = "small = 7\n\
+                  big = 1152921504606846976\n\
+                  neg = -123456789012345678901234567890\n\
+                  lazy = 10 - 3\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    assert!(matches!(
+        &assigned(&hir, "small").kind,
+        HExprKind::Const(Const::Int(7))
+    ));
+    assert_eq!(assigned(&hir, "small").ty, Ty::Concrete(Type::Int));
+
+    assert!(matches!(
+        &assigned(&hir, "big").kind,
+        HExprKind::Const(Const::BigInt(text)) if text == "1152921504606846976"
+    ));
+    assert_eq!(assigned(&hir, "big").ty, Ty::Concrete(Type::BigInt));
+
+    assert!(matches!(
+        &assigned(&hir, "neg").kind,
+        HExprKind::Const(Const::BigInt(text))
+            if text == "-123456789012345678901234567890"
+    ));
+    assert_eq!(assigned(&hir, "neg").ty, Ty::Concrete(Type::BigInt));
+
+    assert!(matches!(
+        &assigned(&hir, "lazy").kind,
+        HExprKind::Const(Const::Int(7))
+    ));
+}
+
+#[test]
+fn bigint_defaults_keep_their_sign_and_type() {
+    let source =
+        "def f(a=1152921504606846976, b=-123456789012345678901234567890, c=3):\n    pass\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let f = function(&hir, "f");
+    assert_eq!(
+        f.params[0].default,
+        Some(Const::BigInt("1152921504606846976".to_string()))
+    );
+    assert_eq!(
+        f.params[1].default,
+        Some(Const::BigInt("-123456789012345678901234567890".to_string()))
+    );
+    assert_eq!(f.params[2].default, Some(Const::Int(3)));
+}
+
+#[test]
+fn negating_a_bigint_literal_that_fits_the_tagged_range_becomes_int() {
+    let source = "x = -1152921504606846976\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "x").kind,
+        HExprKind::Const(Const::Int(v)) if *v == -1152921504606846976
+    ));
+    assert_eq!(assigned(&hir, "x").ty, Ty::Concrete(Type::Int));
+}

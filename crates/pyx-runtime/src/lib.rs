@@ -12,7 +12,7 @@
 //! - Values are tagged `i64`s: `000` int (`v >> 3`), `001` special
 //!   (`None = 1`, `False = 9`, `True = 17`), `010` heap pointer (`v & !7`).
 //! - Integers use the 61 bits available to the tag; results outside that range
-//!   raise `OverflowError` (documented Phase-1 limit, no BigInt).
+//!   promote to a heap `BigInt` (`num-bigint`).
 //! - Every fallible ABI call reports errors through a thread-local pending
 //!   exception and returns a dummy value; it never panics on user input.
 //!

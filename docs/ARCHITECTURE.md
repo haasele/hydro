@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-25**. Phase 1 is complete; Phase 2 is largely
-implemented (1377 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (1403 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -21,7 +21,7 @@ and coroutines
 with a cooperative event loop, threads/processes/pool, a conservative
 concurrent mark-&-sweep GC.
 
-**Deliberately not (as of now):** BigInt, async generators/comprehensions, the
+**Deliberately not (as of now):** async generators/comprehensions, the
 complete CPython stdlib,
 C extensions/C API, decorators, pattern matching, metaclasses,
 `bytearray`/`memoryview`, precise GC roots and a dedicated
@@ -126,6 +126,7 @@ i64  pyx_str_new(const uint8_t* ptr, size_t len);   // copies UTF-8
 i64  pyx_bytes_new(const uint8_t* ptr, size_t len);
 i64  pyx_bytes_build(uint64_t argc, const i64* argv); // bytes(...)
 i64  pyx_float_new(double f);
+i64  pyx_bigint_from_str(const uint8_t* ptr, size_t len); // decimal literal
 i64  pyx_binop(uint32_t op, i64 a, i64 b);          // incl. comparisons
 i64  pyx_unop(uint32_t op, i64 a);
 i64  pyx_truthy(i64 v);               // 1 if truthy, 0 if falsy (C style)
@@ -301,8 +302,12 @@ built-in kinds), so the fallback never matches a user handler.
 
 #### Numerics, Strings, Formatting
 
-- `int`/`int` arithmetic in i64; overflow → `OverflowError` (documented
-  limit). No BigInt.
+- Python `int` is arbitrary precision. Tagged immediates (`payload << 3`)
+  cover `-2^60 ..= 2^60-1`; arithmetic results outside the tagged range
+  promote to `Type::BigInt`/`ObjData::BigInt` (heap, `num-bigint`) exactly.
+  Statically typed `Int` operations keep the checked tagged fast path and
+  guard heap operands before untagging; `BigInt` expressions use the generic
+  runtime operators.
 - `/` always returns `float`; division by 0 → `ZeroDivisionError`.
 - `//`/`%` follow Python (floor division, sign of the divisor).
 - `+` on `str` is concatenation; `==`/`!=`/`<`… on strings lexicographic.
@@ -596,7 +601,8 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
 - `random`: global SplitMix64 PRNG and seedable `Random(seed=...)` with
   `seed`/`random`/`randint`/`randrange`/`choice`/`uniform`/`shuffle`/
   `getrandbits`; `getrandbits(k)` returns a non-negative `k`-bit int and
-  raises `OverflowError` for `k > 60` (documented tagged-int limit).
+  raises `OverflowError` for `k > 60` (native i64 boundary; BigInt support
+  is still open for this helper).
   Deterministic per seed, but **not CPython-reproducible**.
 - `sys.stdout`/`sys.stderr`: small native text streams over fd 1/2 with
   `write(str)` (returns the character count, flushes), `flush()` and
@@ -686,6 +692,14 @@ JIT and object emission from one codebase, solid baseline optimization.
 Costs: weaker optimization than LLVM (PGO/inlining, P5) and no
 ORC-JIT tiering. Codegen remains encapsulated in `pyx-codegen`, so an
 LLVM backend can later consume the same IR. The decision is documented in P0-11.
+
+The shared `build_isa` enables `opt_level=speed` and `enable_alias_analysis`;
+the Cranelift IR verifier runs only in debug/test builds, so release JIT
+startup and AOT compilation do not pay for it. The JIT uses
+`is_pic=false`; AOT emits PIC (`is_pic=true`) because the produced object is
+linked into a PIE. `use_colocated_libcalls` stays `false`: runtime symbols
+are external, so assuming colocation would be incorrect. A future optional
+non-PIE AOT mode and Cranelift PGO/LLVM remain measurement-driven P5 work.
 
 ### 4.1 AOT Linking
 
@@ -1032,8 +1046,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **1377 tests** (417 frontend, 48 codegen, 18 IR, 494
-  runtime unit, 179 runtime integration, 221 CLI/E2E). E2E coverage
+- As of 2026-10-25: **1403 tests** (424 frontend, 51 codegen, 18 IR, 509
+  runtime unit, 179 runtime integration, 222 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
@@ -1053,7 +1067,9 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 
 **Limits (deliberate, documented):**
 
-- **Language:** no BigInt (i64), no general decorators (only
+- **Language:** arbitrary-precision `int` is implemented via a tagged fast
+  path plus `BigInt`; some native i64 boundaries (e.g. `getrandbits(k>60)`,
+  `range` bounds) remain. No general decorators (only
   `property`/`classmethod`/`staticmethod` on methods and the ignored
   `lru_cache`/`cache`/`wraps`/`abstractmethod`/`overload`/
   `runtime_checkable`), pattern matching,

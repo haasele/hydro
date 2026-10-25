@@ -5,6 +5,9 @@
 
 use std::cmp::Ordering;
 
+use num_bigint::{BigInt, Sign};
+use num_traits::ToPrimitive;
+
 use crate::container;
 use crate::core::builtins;
 use crate::exc::{self, OVERFLOW_ERROR, TYPE_ERROR, ZERO_DIVISION_ERROR};
@@ -64,13 +67,50 @@ fn arithmetic_type_error(op: &str, a: i64, b: i64) -> i64 {
     )
 }
 
-/// Encodes a Python integer result, raising `OverflowError` if it no longer
-/// fits into a tagged immediate.
+/// Encodes a Python integer result: a tagged immediate when it fits, otherwise
+/// a heap `BigInt` (promotion instead of `OverflowError`).
 pub(crate) fn int_result(n: i64) -> i64 {
     match value::encode_int(n) {
         Some(v) => v,
-        None => overflow(),
+        None => value::bigint_new(BigInt::from(n)),
     }
+}
+
+/// Raised when an exact `BigInt` operand cannot be represented as a float and
+/// the operation (mixed arithmetic or true division) would need one.
+fn float_overflow() -> i64 {
+    exc::raise_with_message(OVERFLOW_ERROR, "int too large to convert to float")
+}
+
+/// Practical size cap for promoted results (`pow`, left shift): 8 Mibit
+/// (~1 MiB of magnitude). Larger results raise `OverflowError` instead of
+/// exhausting memory, mirroring CPython's `int`-size guards.
+const MAX_BIGINT_BITS: u64 = 1 << 23;
+/// Practical exponent cap for `BigInt ** BigInt` when the base is not one of
+/// `0`, `1`, `-1`; larger exponents raise `OverflowError`.
+const MAX_POW_EXP: u32 = 1 << 20;
+/// Extra quotient bits kept by true division of out-of-`f64` integers.
+const DIV_SCALE: u32 = 54;
+
+/// Numeric operand of the exact-integer paths. Tagged ints, booleans and heap
+/// BigInts become `Int`; heap floats stay `Float`.
+enum BigOperand {
+    Int(BigInt),
+    Float(f64),
+}
+
+/// Numeric view used only by the BigInt-aware paths: unlike [`value::num_of`]
+/// it keeps integers that do not fit `i64`.
+fn big_operand(v: i64) -> Option<BigOperand> {
+    if let Some(n) = value::to_bigint(v) {
+        return Some(BigOperand::Int(n));
+    }
+    value::as_float(v).map(BigOperand::Float)
+}
+
+/// True when either operand needs the arbitrary-precision path.
+fn needs_bigint(a: i64, b: i64) -> bool {
+    value::is_bigint(a) || value::is_bigint(b)
 }
 
 fn to_f64(n: Num) -> f64 {
@@ -137,6 +177,9 @@ fn bitwise(op: u32, a: i64, b: i64) -> i64 {
         OP_BIT_OR => "|",
         _ => "^",
     };
+    if needs_bigint(a, b) {
+        return big_bitwise(op, a, b);
+    }
     let (Some(x), Some(y)) = (value::as_integer(a), value::as_integer(b)) else {
         return arithmetic_type_error(symbol, a, b);
     };
@@ -156,10 +199,14 @@ fn bitwise(op: u32, a: i64, b: i64) -> i64 {
 /// `left << right` and `left >> right` on integers (and booleans).
 ///
 /// A negative shift count raises `ValueError`. Left shifts that leave the
-/// runtime's tagged-integer range raise `OverflowError`; right shifts
-/// saturate like Python's arithmetic shift for arbitrarily large counts.
+/// tagged-integer range are promoted to a `BigInt` (larger than the practical
+/// size cap raises `OverflowError`); right shifts saturate like Python's
+/// arithmetic shift for arbitrarily large counts.
 fn shift(a: i64, b: i64, left: bool) -> i64 {
     let symbol = if left { "<<" } else { ">>" };
+    if needs_bigint(a, b) {
+        return big_shift(a, b, left);
+    }
     let (Some(base), Some(count)) = (value::as_integer(a), value::as_integer(b)) else {
         return arithmetic_type_error(symbol, a, b);
     };
@@ -167,18 +214,16 @@ fn shift(a: i64, b: i64, left: bool) -> i64 {
         return exc::raise_with_message(exc::VALUE_ERROR, "negative shift count");
     }
     if left {
+        // Results beyond the tagged range are promoted to a BigInt instead of
+        // raising; the BigInt path also enforces the practical size cap.
         let shifted = if count >= 64 {
-            if base == 0 {
-                0
-            } else {
-                return overflow();
-            }
+            return big_shift(a, b, true);
         } else {
             let amount = count as u32;
             match base.checked_shl(amount) {
                 // The reverse shift catches bits shifted out of the i64.
                 Some(shifted) if (shifted >> amount) == base => shifted,
-                _ => return overflow(),
+                _ => return big_shift(a, b, true),
             }
         };
         int_result(shifted)
@@ -360,11 +405,14 @@ fn add(a: i64, b: i64) -> i64 {
     if let Some(result) = instance_dunder_binop(a, b, "__add__", "__radd__") {
         return result;
     }
+    if needs_bigint(a, b) {
+        return big_add(a, b);
+    }
     if let (Some(x), Some(y)) = (value::num_of(a), value::num_of(b)) {
         return match (x, y) {
             (Num::Int(p), Num::Int(q)) => match p.checked_add(q) {
                 Some(n) => int_result(n),
-                None => overflow(),
+                None => big_add(a, b),
             },
             (x, y) => value::float_new(to_f64(x) + to_f64(y)),
         };
@@ -420,11 +468,14 @@ fn add(a: i64, b: i64) -> i64 {
 }
 
 fn sub(a: i64, b: i64) -> i64 {
+    if needs_bigint(a, b) {
+        return big_sub(a, b);
+    }
     if let (Some(x), Some(y)) = (value::num_of(a), value::num_of(b)) {
         return match (x, y) {
             (Num::Int(p), Num::Int(q)) => match p.checked_sub(q) {
                 Some(n) => int_result(n),
-                None => overflow(),
+                None => big_sub(a, b),
             },
             (x, y) => value::float_new(to_f64(x) - to_f64(y)),
         };
@@ -448,12 +499,31 @@ fn sub(a: i64, b: i64) -> i64 {
     arithmetic_type_error("-", a, b)
 }
 
+/// Sequence values whose `* int` repetition needs an index-sized count.
+fn is_repeatable(v: i64) -> bool {
+    value::as_str(v).is_some()
+        || value::as_bytes(v).is_some()
+        || value::as_list(v).is_some()
+        || value::as_tuple(v).is_some()
+}
+
 fn mul(a: i64, b: i64) -> i64 {
+    if needs_bigint(a, b) {
+        if let Some(result) = big_mul(a, b) {
+            return result;
+        }
+        // A sequence paired with a BigInt count cannot be repeated: the count
+        // does not fit an index-sized integer.
+        if is_repeatable(a) || is_repeatable(b) {
+            return overflow();
+        }
+        return arithmetic_type_error("*", a, b);
+    }
     if let (Some(x), Some(y)) = (value::num_of(a), value::num_of(b)) {
         return match (x, y) {
             (Num::Int(p), Num::Int(q)) => match p.checked_mul(q) {
                 Some(n) => int_result(n),
-                None => overflow(),
+                None => big_mul(a, b).unwrap_or_else(overflow),
             },
             (x, y) => value::float_new(to_f64(x) * to_f64(y)),
         };
@@ -558,6 +628,9 @@ fn repeat_tuple(items: &[i64], n: i64) -> i64 {
 }
 
 fn div(a: i64, b: i64) -> i64 {
+    if needs_bigint(a, b) {
+        return big_div(a, b);
+    }
     if let (Some(x), Some(y)) = (value::num_of(a), value::num_of(b)) {
         let denom = to_f64(y);
         if denom == 0.0 {
@@ -569,24 +642,29 @@ fn div(a: i64, b: i64) -> i64 {
 }
 
 fn floor_div(a: i64, b: i64) -> i64 {
+    if needs_bigint(a, b) {
+        return big_floor_div(a, b);
+    }
     match (value::num_of(a), value::num_of(b)) {
         (Some(Num::Int(p)), Some(Num::Int(q))) => {
             if q == 0 {
                 return zero_div("integer division or modulo by zero");
             }
             let (Some(quo), Some(rem)) = (p.checked_div(q), p.checked_rem(q)) else {
-                return overflow();
+                // `i64::MIN / -1` is the one truncated case that does not fit;
+                // the exact value is representable as a BigInt.
+                return big_floor_div(a, b);
             };
             // Python floors towards negative infinity; `Rust`'s `/` truncates.
             let floored = if rem != 0 && ((rem < 0) != (q < 0)) {
-                quo.checked_sub(1)
+                match quo.checked_sub(1) {
+                    Some(n) => n,
+                    None => return big_floor_div(a, b),
+                }
             } else {
-                Some(quo)
+                quo
             };
-            match floored {
-                Some(n) => int_result(n),
-                None => overflow(),
-            }
+            int_result(floored)
         }
         (Some(x), Some(y)) => {
             let denom = to_f64(y);
@@ -600,23 +678,27 @@ fn floor_div(a: i64, b: i64) -> i64 {
 }
 
 fn modulo(a: i64, b: i64) -> i64 {
+    if needs_bigint(a, b) {
+        return big_modulo(a, b);
+    }
     match (value::num_of(a), value::num_of(b)) {
         (Some(Num::Int(p)), Some(Num::Int(q))) => {
             if q == 0 {
                 return zero_div("integer modulo by zero");
             }
             let Some(rem) = p.checked_rem(q) else {
-                return overflow();
+                // `i64::MIN % -1` is zero although the primitive overflows.
+                return big_modulo(a, b);
             };
             let adjusted = if rem != 0 && ((rem < 0) != (q < 0)) {
-                rem.checked_add(q)
+                match rem.checked_add(q) {
+                    Some(n) => n,
+                    None => return big_modulo(a, b),
+                }
             } else {
-                Some(rem)
+                rem
             };
-            match adjusted {
-                Some(n) => int_result(n),
-                None => overflow(),
-            }
+            int_result(adjusted)
         }
         (Some(x), Some(y)) => {
             let denom = to_f64(y);
@@ -634,6 +716,9 @@ fn modulo(a: i64, b: i64) -> i64 {
 }
 
 fn pow(a: i64, b: i64) -> i64 {
+    if needs_bigint(a, b) {
+        return big_pow(a, b);
+    }
     match (value::num_of(a), value::num_of(b)) {
         (Some(Num::Int(base)), Some(Num::Int(exp))) => {
             if exp >= 0 {
@@ -647,21 +732,26 @@ fn pow(a: i64, b: i64) -> i64 {
     }
 }
 
-fn int_pow(base: i64, mut exp: u64) -> i64 {
+fn int_pow(base: i64, exp: u64) -> i64 {
+    // The exponent is shifted inside the loop; promotion needs the original.
+    let original_exp = BigInt::from(exp);
+    let mut exp = exp;
     let mut acc: i64 = 1;
     let mut factor = base;
     while exp > 0 {
         if exp & 1 == 1 {
             match acc.checked_mul(factor) {
                 Some(v) => acc = v,
-                None => return overflow(),
+                None => return big_int_pow(BigInt::from(base), original_exp.clone()),
             }
         }
         exp >>= 1;
         if exp > 0 {
             match factor.checked_mul(factor) {
                 Some(v) => factor = v,
-                None => return overflow(),
+                // The squared factor is a factor of the final result, so the
+                // exact product no longer fits the tagged range.
+                None => return big_int_pow(BigInt::from(base), original_exp.clone()),
             }
         }
     }
@@ -673,6 +763,328 @@ fn float_pow(base: f64, exp: f64) -> i64 {
         return zero_div("0.0 cannot be raised to a negative power");
     }
     value::float_new(base.powf(exp))
+}
+
+// -------------------------------------------------------------------------
+// Arbitrary-precision integer operations
+// -------------------------------------------------------------------------
+
+/// Converts a numeric operand to `f64`; `None` when an integer operand is too
+/// large (the caller raises `OverflowError`, like CPython).
+fn big_operand_to_f64(operand: &BigOperand) -> Option<f64> {
+    match operand {
+        BigOperand::Int(n) => value::bigint_to_f64(n),
+        BigOperand::Float(f) => Some(*f),
+    }
+}
+
+/// Truncating integer division and remainder (Rust/`C` semantics: the
+/// quotient rounds toward zero and the remainder takes the dividend's sign).
+fn big_trunc_div_rem(left: &BigInt, right: &BigInt) -> (BigInt, BigInt) {
+    (left / right, left % right)
+}
+
+/// Floored quotient and remainder for exact integers (Python's `divmod`
+/// sign rules): the quotient rounds toward negative infinity and the
+/// remainder takes the divisor's sign.
+pub(crate) fn integer_floor_divmod(left: &BigInt, right: &BigInt) -> (BigInt, BigInt) {
+    let (quotient, remainder) = big_trunc_div_rem(left, right);
+    if remainder.sign() != Sign::NoSign && remainder.sign() != right.sign() {
+        (quotient - BigInt::from(1), remainder + right)
+    } else {
+        (quotient, remainder)
+    }
+}
+
+fn big_add(a: i64, b: i64) -> i64 {
+    match (big_operand(a), big_operand(b)) {
+        (Some(BigOperand::Int(x)), Some(BigOperand::Int(y))) => value::bigint_new(x + y),
+        (Some(BigOperand::Int(x)), Some(BigOperand::Float(y))) => match value::bigint_to_f64(&x) {
+            Some(f) => value::float_new(f + y),
+            None => float_overflow(),
+        },
+        (Some(BigOperand::Float(x)), Some(BigOperand::Int(y))) => match value::bigint_to_f64(&y) {
+            Some(f) => value::float_new(x + f),
+            None => float_overflow(),
+        },
+        (Some(BigOperand::Float(x)), Some(BigOperand::Float(y))) => value::float_new(x + y),
+        _ => arithmetic_type_error("+", a, b),
+    }
+}
+
+fn big_sub(a: i64, b: i64) -> i64 {
+    match (big_operand(a), big_operand(b)) {
+        (Some(BigOperand::Int(x)), Some(BigOperand::Int(y))) => value::bigint_new(x - y),
+        (Some(BigOperand::Int(x)), Some(BigOperand::Float(y))) => match value::bigint_to_f64(&x) {
+            Some(f) => value::float_new(f - y),
+            None => float_overflow(),
+        },
+        (Some(BigOperand::Float(x)), Some(BigOperand::Int(y))) => match value::bigint_to_f64(&y) {
+            Some(f) => value::float_new(x - f),
+            None => float_overflow(),
+        },
+        (Some(BigOperand::Float(x)), Some(BigOperand::Float(y))) => value::float_new(x - y),
+        _ => arithmetic_type_error("-", a, b),
+    }
+}
+
+/// Exact product, or `None` when `a`/`b` is not numeric (the caller decides
+/// between the sequence-repetition error and `TypeError`).
+fn big_mul(a: i64, b: i64) -> Option<i64> {
+    Some(match (big_operand(a)?, big_operand(b)?) {
+        (BigOperand::Int(x), BigOperand::Int(y)) => value::bigint_new(x * y),
+        (BigOperand::Int(x), BigOperand::Float(y)) => match value::bigint_to_f64(&x) {
+            Some(f) => value::float_new(f * y),
+            None => float_overflow(),
+        },
+        (BigOperand::Float(x), BigOperand::Int(y)) => match value::bigint_to_f64(&y) {
+            Some(f) => value::float_new(x * f),
+            None => float_overflow(),
+        },
+        (BigOperand::Float(x), BigOperand::Float(y)) => value::float_new(x * y),
+    })
+}
+
+fn big_div(a: i64, b: i64) -> i64 {
+    match (big_operand(a), big_operand(b)) {
+        (Some(BigOperand::Int(x)), Some(BigOperand::Int(y))) => {
+            if y.sign() == Sign::NoSign {
+                return zero_div("division by zero");
+            }
+            let denominator = value::bigint_to_f64(&y).unwrap_or_else(|| {
+                if y.sign() == Sign::Minus {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }
+            });
+            let Some(numerator) = value::bigint_to_f64(&x) else {
+                // Both operands may exceed the `f64` range while their ratio
+                // does not (`10**400 / 10**400 == 1.0`). Scale the exact
+                // quotient by `2^54` so the result keeps full precision.
+                let scaled = (&x << DIV_SCALE) / &y;
+                let Some(quotient) = value::bigint_to_f64(&scaled) else {
+                    return float_overflow();
+                };
+                let scale = 2f64.powi(DIV_SCALE as i32);
+                return value::float_new(quotient / scale);
+            };
+            // A denominator too large for `f64` still divides exactly to a
+            // signed zero, so it becomes an infinity instead of an error.
+            value::float_new(numerator / denominator)
+        }
+        (Some(BigOperand::Int(x)), Some(BigOperand::Float(y))) => {
+            if y == 0.0 {
+                return zero_div("division by zero");
+            }
+            match value::bigint_to_f64(&x) {
+                Some(f) => value::float_new(f / y),
+                None => float_overflow(),
+            }
+        }
+        (Some(BigOperand::Float(x)), Some(BigOperand::Int(y))) => {
+            if y.sign() == Sign::NoSign {
+                return zero_div("division by zero");
+            }
+            let denominator = value::bigint_to_f64(&y).unwrap_or_else(|| {
+                if y.sign() == Sign::Minus {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }
+            });
+            value::float_new(x / denominator)
+        }
+        (Some(BigOperand::Float(x)), Some(BigOperand::Float(y))) => {
+            if y == 0.0 {
+                return zero_div("division by zero");
+            }
+            value::float_new(x / y)
+        }
+        _ => arithmetic_type_error("/", a, b),
+    }
+}
+
+fn big_floor_div(a: i64, b: i64) -> i64 {
+    match (big_operand(a), big_operand(b)) {
+        (Some(BigOperand::Int(p)), Some(BigOperand::Int(q))) => {
+            if q.sign() == Sign::NoSign {
+                return zero_div("integer division or modulo by zero");
+            }
+            let (quotient, _) = integer_floor_divmod(&p, &q);
+            value::bigint_new(quotient)
+        }
+        (Some(x), Some(y)) => {
+            let Some(denominator) = big_operand_to_f64(&y) else {
+                return float_overflow();
+            };
+            if denominator == 0.0 {
+                return zero_div("integer division or modulo by zero");
+            }
+            let Some(numerator) = big_operand_to_f64(&x) else {
+                return float_overflow();
+            };
+            value::float_new((numerator / denominator).floor())
+        }
+        _ => arithmetic_type_error("//", a, b),
+    }
+}
+
+fn big_modulo(a: i64, b: i64) -> i64 {
+    match (big_operand(a), big_operand(b)) {
+        (Some(BigOperand::Int(p)), Some(BigOperand::Int(q))) => {
+            if q.sign() == Sign::NoSign {
+                return zero_div("integer modulo by zero");
+            }
+            let (_, remainder) = integer_floor_divmod(&p, &q);
+            value::bigint_new(remainder)
+        }
+        (Some(x), Some(y)) => {
+            let Some(denominator) = big_operand_to_f64(&y) else {
+                return float_overflow();
+            };
+            if denominator == 0.0 {
+                return zero_div("integer modulo by zero");
+            }
+            let Some(numerator) = big_operand_to_f64(&x) else {
+                return float_overflow();
+            };
+            let mut remainder = numerator % denominator;
+            if remainder != 0.0 && ((remainder < 0.0) != (denominator < 0.0)) {
+                remainder += denominator;
+            }
+            value::float_new(remainder)
+        }
+        _ => arithmetic_type_error("%", a, b),
+    }
+}
+
+fn big_bitwise(op: u32, a: i64, b: i64) -> i64 {
+    let symbol = match op {
+        OP_BIT_AND => "&",
+        OP_BIT_OR => "|",
+        _ => "^",
+    };
+    match (big_operand(a), big_operand(b)) {
+        (Some(BigOperand::Int(x)), Some(BigOperand::Int(y))) => {
+            let result = match op {
+                OP_BIT_AND => x & y,
+                OP_BIT_OR => x | y,
+                _ => x ^ y,
+            };
+            value::bigint_new(result)
+        }
+        _ => arithmetic_type_error(symbol, a, b),
+    }
+}
+
+fn big_shift(a: i64, b: i64, left: bool) -> i64 {
+    let symbol = if left { "<<" } else { ">>" };
+    let (Some(base), Some(count)) = (value::to_bigint(a), value::to_bigint(b)) else {
+        return arithmetic_type_error(symbol, a, b);
+    };
+    if count.sign() == Sign::Minus {
+        return exc::raise_with_message(exc::VALUE_ERROR, "negative shift count");
+    }
+    if left {
+        if base.sign() == Sign::NoSign {
+            return int_result(0);
+        }
+        let Some(shift) = count.to_usize() else {
+            return overflow();
+        };
+        // Cap promoted results instead of exhausting memory; CPython raises
+        // `OverflowError`/`MemoryError` for shifts of this size as well.
+        if base.bits().saturating_add(shift as u64) > MAX_BIGINT_BITS {
+            return overflow();
+        }
+        value::bigint_new(base << shift)
+    } else {
+        // Right shifts saturate like Python's arithmetic shift when the count
+        // is enormous.
+        let Some(shift) = count.to_usize() else {
+            return int_result(if base.sign() == Sign::Minus { -1 } else { 0 });
+        };
+        value::bigint_new(base >> shift)
+    }
+}
+
+fn big_pow(a: i64, b: i64) -> i64 {
+    match (big_operand(a), big_operand(b)) {
+        (Some(BigOperand::Int(base)), Some(BigOperand::Int(exp))) => big_int_pow(base, exp),
+        (Some(x), Some(y)) => {
+            let Some(base) = big_operand_to_f64(&x) else {
+                return float_overflow();
+            };
+            let Some(exp) = big_operand_to_f64(&y) else {
+                return float_overflow();
+            };
+            float_pow(base, exp)
+        }
+        _ => arithmetic_type_error("**", a, b),
+    }
+}
+
+/// `base ** exp` for exact integers, with Python's rules: `n ** 0 == 1`,
+/// negative exponents produce a float and huge exponents raise
+/// `OverflowError` unless the base makes the result trivial.
+fn big_int_pow(base: BigInt, exp: BigInt) -> i64 {
+    if exp.sign() == Sign::NoSign {
+        return int_result(1);
+    }
+    if exp.sign() == Sign::Minus {
+        let Some(base) = value::bigint_to_f64(&base) else {
+            return float_overflow();
+        };
+        let exp = value::bigint_to_f64(&exp).unwrap_or(f64::NEG_INFINITY);
+        return float_pow(base, exp);
+    }
+    if base.sign() == Sign::NoSign {
+        return int_result(0);
+    }
+    let one = BigInt::from(1);
+    if base == one {
+        return int_result(1);
+    }
+    if base == -&one {
+        let odd = (&exp & &one) == one;
+        return int_result(if odd { -1 } else { 1 });
+    }
+    let Some(exp) = exp.to_u32() else {
+        return overflow();
+    };
+    if exp > MAX_POW_EXP || (base.bits() as u128) * (exp as u128) > MAX_BIGINT_BITS as u128 {
+        return overflow();
+    }
+    value::bigint_new(big_pow_small(base, exp))
+}
+
+/// Exponentiation by squaring over `BigInt`.
+fn big_pow_small(mut base: BigInt, mut exp: u32) -> BigInt {
+    let mut acc = BigInt::from(1);
+    while exp > 0 {
+        if exp & 1 == 1 {
+            acc *= &base;
+        }
+        exp >>= 1;
+        if exp > 0 {
+            base = &base * &base;
+        }
+    }
+    acc
+}
+
+/// Exact numeric ordering for operands that may exceed `i64`; `None` means
+/// unordered (NaN).
+fn cmp_big(a: BigOperand, b: BigOperand) -> Option<Ordering> {
+    match (a, b) {
+        (BigOperand::Int(x), BigOperand::Int(y)) => Some(x.cmp(&y)),
+        (BigOperand::Float(x), BigOperand::Float(y)) => x.partial_cmp(&y),
+        (BigOperand::Int(x), BigOperand::Float(y)) => value::bigint_cmp_f64(&x, y),
+        (BigOperand::Float(x), BigOperand::Int(y)) => {
+            value::bigint_cmp_f64(&y, x).map(Ordering::reverse)
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -709,6 +1121,11 @@ fn instance_comparison(op: u32, a: i64, b: i64) -> Option<i64> {
 fn compare(op: u32, a: i64, b: i64) -> i64 {
     if let Some(result) = instance_comparison(op, a, b) {
         return result;
+    }
+    if needs_bigint(a, b) {
+        if let (Some(x), Some(y)) = (big_operand(a), big_operand(b)) {
+            return ordered_result(op, cmp_big(x, y));
+        }
     }
     if let (Some(x), Some(y)) = (value::num_of(a), value::num_of(b)) {
         return ordered_result(op, cmp_num(x, y));
@@ -859,10 +1276,14 @@ fn cmp_int_float(i: i64, f: f64) -> Option<Ordering> {
 pub(crate) fn unop(op: u32, a: i64) -> i64 {
     match op {
         OP_NEG => {
+            if let Some(n) = value::as_bigint(a) {
+                return value::bigint_new(-n);
+            }
             if let Some(n) = value::as_integer(a) {
                 return match n.checked_neg() {
                     Some(v) => int_result(v),
-                    None => overflow(),
+                    // `i64::MIN` negated is only representable as a BigInt.
+                    None => value::bigint_new(-BigInt::from(n)),
                 };
             }
             if let Some(f) = value::as_float(a) {
@@ -871,6 +1292,9 @@ pub(crate) fn unop(op: u32, a: i64) -> i64 {
             unary_type_error("-", a)
         }
         OP_POS => {
+            if let Some(n) = value::as_bigint(a) {
+                return value::bigint_new(n.clone());
+            }
             if let Some(n) = value::as_integer(a) {
                 return int_result(n);
             }
@@ -881,11 +1305,15 @@ pub(crate) fn unop(op: u32, a: i64) -> i64 {
         }
         OP_NOT => value::bool_value(!value::truthy(a)),
         // `~x == -x - 1`; `as_integer` also accepts `bool`, matching Python.
-        // Tagged ints stay far inside `i64`, so the complement cannot overflow.
-        OP_INVERT => match value::as_integer(a) {
-            Some(n) => int_result(!n),
-            None => unary_type_error("~", a),
-        },
+        OP_INVERT => {
+            if let Some(n) = value::as_bigint(a) {
+                return value::bigint_new(-n - BigInt::from(1));
+            }
+            match value::as_integer(a) {
+                Some(n) => int_result(!n),
+                None => unary_type_error("~", a),
+            }
+        }
         _ => exc::raise_with_message(TYPE_ERROR, "unknown unary operator"),
     }
 }
@@ -980,12 +1408,28 @@ mod tests {
     }
 
     #[test]
-    fn overflow_is_reported() {
+    fn tagged_overflow_promotes_to_bigint() {
         exc::init();
-        let v = binop(OP_ADD, int(value::MAX_INT), int(1));
-        assert_eq!(v, NONE);
-        assert_eq!(exc::pending_tag(), OVERFLOW_ERROR as i64);
-        assert_eq!(pending_message(), "integer overflow");
+        let sum = binop(OP_ADD, int(value::MAX_INT), int(1));
+        assert!(!exc::pending());
+        assert!(value::is_bigint(sum));
+        assert_eq!(value::as_integer(sum), Some(value::MAX_INT + 1));
+        assert_eq!(value::type_name(sum), "int");
+        assert_eq!(value::to_string(sum), "1152921504606846976");
+
+        // Small results keep the tagged fast path.
+        let small = binop(OP_ADD, int(2), int(3));
+        assert!(value::is_int(small));
+        assert_eq!(value::as_integer(small), Some(5));
+
+        // Products that leave the tag range promote as well.
+        let product = binop(OP_MUL, int(value::MAX_INT), int(value::MAX_INT));
+        assert!(value::is_bigint(product));
+        assert_eq!(
+            value::to_string(product),
+            "1329227995784915870597964051066650625"
+        );
+        assert!(!exc::pending());
     }
 
     #[test]
@@ -1402,10 +1846,12 @@ mod tests {
         assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
         assert_eq!(pending_message(), "negative shift count");
 
+        // Leaving the tagged range promotes instead of raising.
         exc::init();
-        assert_eq!(binop(OP_SHL, int(value::MAX_INT), int(1)), NONE);
-        assert_eq!(exc::pending_tag(), OVERFLOW_ERROR as i64);
-        assert_eq!(pending_message(), "integer overflow");
+        let shifted = binop(OP_SHL, int(value::MAX_INT), int(1));
+        assert!(!exc::pending());
+        assert!(value::is_bigint(shifted));
+        assert_eq!(value::to_string(shifted), "2305843009213693950");
 
         // Huge right shifts saturate like Python.
         exc::init();
@@ -1433,5 +1879,233 @@ mod tests {
         exc::init();
         assert_eq!(unop(OP_INVERT, value::str_from_bytes(b"x")), NONE);
         assert_eq!(pending_message(), "bad operand type for unary ~: 'str'");
+    }
+
+    /// Arbitrary-precision literal through the normalizing constructor.
+    fn big(text: &str) -> i64 {
+        value::bigint_new(text.parse::<BigInt>().expect("big literal"))
+    }
+
+    #[test]
+    fn bigint_arithmetic_is_exact() {
+        exc::init();
+        let two_100 = binop(OP_POW, int(2), int(100));
+        assert!(value::is_bigint(two_100));
+        assert_eq!(value::to_string(two_100), "1267650600228229401496703205376");
+
+        let two_200 = binop(OP_MUL, two_100, two_100);
+        assert_eq!(
+            value::to_string(two_200),
+            "1606938044258990275541962092341162602522202993782792835301376"
+        );
+
+        let sum = binop(OP_ADD, two_200, two_100);
+        assert_eq!(
+            value::to_string(binop(OP_SUB, sum, two_100)),
+            value::to_string(two_200)
+        );
+        assert!(!exc::pending());
+
+        // Negative operands and subtraction across zero stay exact.
+        let negative = binop(OP_SUB, int(0), two_100);
+        assert_eq!(
+            value::as_bigint(negative),
+            Some(
+                &"-1267650600228229401496703205376"
+                    .parse::<BigInt>()
+                    .expect("literal")
+            )
+        );
+        assert_eq!(
+            value::to_string(unop(OP_NEG, negative)),
+            value::to_string(two_100)
+        );
+        assert_eq!(
+            value::to_string(unop(OP_POS, negative)),
+            value::to_string(negative)
+        );
+        assert!(!exc::pending());
+
+        // BigInt mixed with a tagged int.
+        let mixed = binop(OP_ADD, big("100000000000000000000"), int(1));
+        assert_eq!(value::to_string(mixed), "100000000000000000001");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn bigint_floor_division_and_modulo() {
+        exc::init();
+        let negative = big("-1000000000000000000000000000004");
+        assert_eq!(
+            value::to_string(binop(OP_FLOOR_DIV, negative, int(3))),
+            "-333333333333333333333333333335"
+        );
+        assert_eq!(value::to_string(binop(OP_MOD, negative, int(3))), "1");
+        assert_eq!(
+            value::to_string(binop(OP_FLOOR_DIV, negative, int(-3))),
+            "333333333333333333333333333334"
+        );
+        assert_eq!(value::to_string(binop(OP_MOD, negative, int(-3))), "-2");
+
+        let positive = big("1000000000000000000000000000000");
+        assert_eq!(
+            value::to_string(binop(OP_FLOOR_DIV, positive, int(3))),
+            "333333333333333333333333333333"
+        );
+        assert_eq!(value::to_string(binop(OP_MOD, positive, int(3))), "1");
+        assert!(!exc::pending());
+
+        // `i64::MIN`-style tagged edge promotes: MIN_INT // -1 == 2^60.
+        let promoted = binop(OP_FLOOR_DIV, int(value::MIN_INT), int(-1));
+        assert!(value::is_bigint(promoted));
+        assert_eq!(value::to_string(promoted), "1152921504606846976");
+        assert_eq!(
+            value::as_integer(binop(OP_MOD, int(value::MIN_INT), int(-1))),
+            Some(0)
+        );
+        assert!(!exc::pending());
+
+        exc::init();
+        assert_eq!(binop(OP_FLOOR_DIV, positive, int(0)), NONE);
+        assert_eq!(pending_message(), "integer division or modulo by zero");
+        exc::init();
+        assert_eq!(binop(OP_MOD, positive, int(0)), NONE);
+        assert_eq!(pending_message(), "integer modulo by zero");
+    }
+
+    #[test]
+    fn bigint_bitwise_shifts_and_pow_limits() {
+        exc::init();
+        let two_100 = binop(OP_SHL, int(1), int(100));
+        assert_eq!(value::to_string(two_100), "1267650600228229401496703205376");
+        assert_eq!(value::to_string(binop(OP_SHR, two_100, int(99))), "2");
+        assert_eq!(value::to_string(binop(OP_BIT_AND, two_100, int(0xff))), "0");
+        assert_eq!(
+            value::to_string(binop(OP_BIT_OR, two_100, int(1))),
+            "1267650600228229401496703205377"
+        );
+        assert_eq!(
+            value::to_string(binop(OP_BIT_XOR, two_100, int(1))),
+            "1267650600228229401496703205377"
+        );
+        assert_eq!(
+            value::to_string(unop(OP_INVERT, two_100)),
+            "-1267650600228229401496703205377"
+        );
+
+        // Negative operands use two's-complement bit patterns.
+        let negative = big("-1267650600228229401496703205376");
+        assert_eq!(
+            value::to_string(binop(OP_BIT_AND, negative, int(0xff))),
+            "0"
+        );
+        assert_eq!(value::to_string(binop(OP_SHR, negative, int(100))), "-1");
+        assert_eq!(
+            value::to_string(binop(OP_BIT_AND, negative, int(-1))),
+            "-1267650600228229401496703205376"
+        );
+        assert!(!exc::pending());
+
+        // Negative shift counts raise even with a BigInt base.
+        exc::init();
+        assert_eq!(binop(OP_SHR, negative, int(-1)), NONE);
+        assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(pending_message(), "negative shift count");
+
+        // Impractical exponents and shifts raise instead of exhausting memory.
+        exc::init();
+        assert_eq!(binop(OP_POW, int(2), big("100000000000000000000")), NONE);
+        assert_eq!(exc::pending_tag(), OVERFLOW_ERROR as i64);
+        assert_eq!(pending_message(), "integer overflow");
+        exc::init();
+        assert_eq!(binop(OP_SHL, int(1), big("100000000000000000000")), NONE);
+        assert_eq!(exc::pending_tag(), OVERFLOW_ERROR as i64);
+        exc::clear();
+
+        // Trivial bases stay cheap for any non-negative exponent.
+        assert_eq!(
+            as_int(binop(OP_POW, int(1), big("100000000000000000000"))),
+            1
+        );
+        assert_eq!(
+            as_int(binop(OP_POW, int(0), big("100000000000000000000"))),
+            0
+        );
+        assert_eq!(
+            as_int(binop(OP_POW, int(-1), big("100000000000000000001"))),
+            -1
+        );
+        assert_eq!(
+            as_int(binop(OP_POW, int(-1), big("100000000000000000000"))),
+            1
+        );
+        assert!(!exc::pending());
+
+        // Negative exponents keep the float result; an exponent too large for
+        // `f64` underflows to zero exactly like CPython.
+        assert_eq!(as_float(binop(OP_POW, int(2), int(-1))), 0.5);
+        assert_eq!(
+            as_float(binop(OP_POW, int(2), big("-100000000000000000000"))),
+            0.0
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn bigint_comparisons_are_exact() {
+        exc::init();
+        let two_100 = binop(OP_SHL, int(1), int(100));
+        let same = binop(OP_SHL, int(1), int(100));
+        assert_eq!(binop(OP_EQ, two_100, same), TRUE);
+        assert_eq!(binop(OP_NE, two_100, same), FALSE);
+        assert_eq!(binop(OP_LT, two_100, same), FALSE);
+        assert_eq!(binop(OP_LE, two_100, same), TRUE);
+
+        assert_eq!(binop(OP_GT, two_100, int(value::MAX_INT)), TRUE);
+        assert_eq!(binop(OP_LT, int(value::MAX_INT), two_100), TRUE);
+        assert_eq!(
+            binop(OP_GT, two_100, big("1267650600228229401496703205375")),
+            TRUE
+        );
+
+        // Comparing against a float is exact, not lossy.
+        assert_eq!(
+            binop(OP_EQ, two_100, value::float_new(2f64.powi(100))),
+            TRUE
+        );
+        assert_eq!(binop(OP_GT, two_100, value::float_new(2f64.powi(99))), TRUE);
+        assert_eq!(binop(OP_LT, two_100, value::float_new(f64::INFINITY)), TRUE);
+        assert_eq!(binop(OP_EQ, two_100, value::float_new(f64::NAN)), FALSE);
+        assert!(!exc::pending());
+
+        // Mismatched types keep Python's equality/ordering split.
+        let text = value::str_from_bytes(b"x");
+        assert_eq!(binop(OP_EQ, two_100, text), FALSE);
+        exc::init();
+        assert_eq!(binop(OP_LT, two_100, text), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn bigint_float_mixing_and_overflow() {
+        exc::init();
+        let two_100 = binop(OP_SHL, int(1), int(100));
+        assert_eq!(
+            as_float(binop(OP_MUL, two_100, value::float_new(0.5))),
+            2f64.powi(99)
+        );
+        assert_eq!(as_float(binop(OP_DIV, two_100, int(2))), 2f64.powi(99));
+        assert_eq!(
+            as_float(binop(OP_ADD, value::float_new(0.5), two_100)),
+            2f64.powi(100) + 0.5
+        );
+        assert!(!exc::pending());
+
+        // An integer beyond the f64 range cannot mix with floats.
+        exc::init();
+        let enormous = binop(OP_SHL, int(1), int(2000));
+        assert_eq!(binop(OP_ADD, enormous, value::float_new(1.0)), NONE);
+        assert_eq!(exc::pending_tag(), OVERFLOW_ERROR as i64);
+        assert_eq!(pending_message(), "int too large to convert to float");
     }
 }

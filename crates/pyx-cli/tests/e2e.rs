@@ -2949,6 +2949,42 @@ fn typing_alias_subscripts_are_runtime_values() {
 }
 
 #[test]
+fn bigint_literals_promote_and_format() {
+    let dir = TestDir::new("bigint");
+    let program = dir.path().join("main.py");
+    std::fs::write(
+        &program,
+        concat!(
+            "a = 2 ** 100\n",
+            "print(a)\n",
+            "print(a + 1, a - 1, a * 2)\n",
+            "print(a // 3, a % 3, divmod(a, 7))\n",
+            "print(-a, abs(-a))\n",
+            "print(a > 10 ** 29, a == 2 ** 100)\n",
+            "print(f\"{a:#x}\")\n",
+            "print(int(\"123456789012345678901234567890\"))\n",
+            "d = {a: 1}\n",
+            "print(d[a], len(d))\n",
+        ),
+    )
+    .expect("failed to write temp program");
+    let program = program.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &program]);
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(
+        stdout,
+        "1267650600228229401496703205376\n\
+         1267650600228229401496703205377 1267650600228229401496703205375 2535301200456458802993406410752\n\
+         422550200076076467165567735125 1 (181092942889747057356671886482, 2)\n\
+         -1267650600228229401496703205376 1267650600228229401496703205376\n\
+         True True\n\
+         0x10000000000000000000000000\n\
+         123456789012345678901234567890\n\
+         1 1\n"
+    );
+}
+
+#[test]
 fn thread_subclass_and_stdlib_helpers_run() {
     let dir = TestDir::new("thread-subclass");
     let source = dir.path().join("main.py");

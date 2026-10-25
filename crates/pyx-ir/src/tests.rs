@@ -62,12 +62,20 @@ fn op_codes_are_stable() {
 #[test]
 fn const_types() {
     assert_eq!(Const::Int(1).ty(), Type::Int);
+    assert_eq!(
+        Const::BigInt("1152921504606846976".to_string()).ty(),
+        Type::BigInt
+    );
     assert_eq!(Const::None.ty(), Type::None);
     assert_eq!(Const::NotImplemented.ty(), Type::Any);
     // Documented limitation: `...` has no distinct sentinel and is `None`.
     assert_eq!(Const::Ellipsis.ty(), Type::None);
     assert_eq!(UnOp::Invert.symbol(), "~");
     assert!(Type::Bool.is_numeric());
+    assert!(Type::BigInt.is_numeric());
+    assert_eq!(Type::BigInt.name(), "BigInt");
+    assert_eq!(Type::BigInt.to_string(), "BigInt");
+    assert_ne!(Type::BigInt, Type::Int);
     assert!(!Type::Str.is_numeric());
     assert_eq!(Type::List.name(), "list");
     assert_eq!(Type::Dict.name(), "dict");

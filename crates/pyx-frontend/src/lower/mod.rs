@@ -3522,17 +3522,7 @@ impl<'a> Lowerer<'a> {
     fn const_default(&mut self, expr: &ast::Expr) -> Option<Const> {
         match expr {
             ast::Expr::Constant(c) => match &c.value {
-                ast::Constant::Int(value) => match value.to_str_radix(10).parse::<i64>() {
-                    Ok(v) if (MIN_TAGGED_INT..=MAX_TAGGED_INT).contains(&v) => Some(Const::Int(v)),
-                    Ok(_) => {
-                        self.error_at(expr.range(), "integer literal is out of the tagged range");
-                        None
-                    }
-                    Err(_) => {
-                        self.error_at(expr.range(), "integer literal is out of the i64 range");
-                        None
-                    }
-                },
+                ast::Constant::Int(value) => Some(int_const_from_decimal(value.to_str_radix(10))),
                 ast::Constant::Float(v) => Some(Const::Float(*v)),
                 ast::Constant::Bool(v) => Some(Const::Bool(*v)),
                 ast::Constant::Str(v) => Some(Const::Str(v.clone())),
@@ -3550,16 +3540,8 @@ impl<'a> Lowerer<'a> {
             }
             ast::Expr::UnaryOp(unary) if matches!(unary.op, ast::UnaryOp::USub) => {
                 match self.const_default(&unary.operand)? {
-                    Const::Int(v) => match v.checked_neg().and_then(fold_int_result) {
-                        Some(value) => Some(value),
-                        None => {
-                            self.error_at(
-                                expr.range(),
-                                "integer literal is out of the tagged range",
-                            );
-                            None
-                        }
-                    },
+                    Const::Int(v) => Some(negate_int_const(&v.to_string())),
+                    Const::BigInt(v) => Some(negate_int_const(&v)),
                     Const::Float(v) => Some(Const::Float(-v)),
                     _ => None,
                 }
@@ -3579,6 +3561,7 @@ impl<'a> Lowerer<'a> {
             ast::Expr::Name(n) => match n.id.as_str() {
                 "Any" => Ty::Concrete(Type::Any),
                 "int" => Ty::Concrete(Type::Int),
+                "BigInt" => Ty::Concrete(Type::BigInt),
                 "float" => Ty::Concrete(Type::Float),
                 "bool" => Ty::Concrete(Type::Bool),
                 "str" => Ty::Concrete(Type::Str),
@@ -6937,13 +6920,11 @@ impl<'a> Lowerer<'a> {
         col: u32,
     ) -> HExpr {
         let (constant, ty) = match &c.value {
-            ast::Constant::Int(value) => match value.to_str_radix(10).parse::<i64>() {
-                Ok(v) => (Const::Int(v), Ty::Concrete(Type::Int)),
-                Err(_) => {
-                    self.error_at(range, "integer literal is out of the i64 range");
-                    (Const::Int(0), Ty::Concrete(Type::Int))
-                }
-            },
+            ast::Constant::Int(value) => {
+                let constant = int_const_from_decimal(value.to_str_radix(10));
+                let ty = Ty::Concrete(constant.ty());
+                (constant, ty)
+            }
             ast::Constant::Float(v) => (Const::Float(*v), Ty::Concrete(Type::Float)),
             ast::Constant::Bool(v) => (Const::Bool(*v), Ty::Concrete(Type::Bool)),
             ast::Constant::Str(v) => (Const::Str(v.clone()), Ty::Concrete(Type::Str)),
@@ -9425,11 +9406,33 @@ fn fold_num_to_f64(n: FoldNum) -> f64 {
     }
 }
 
-/// Wraps an integer result, rejecting values the runtime cannot represent.
+/// Wraps a tagged integer fold result, declining values outside the immediate
+/// range (the runtime computes those, promoting to a BigInt on overflow).
 fn fold_int_result(n: i64) -> Option<Const> {
     (MIN_TAGGED_INT..=MAX_TAGGED_INT)
         .contains(&n)
         .then_some(Const::Int(n))
+}
+
+/// Builds the constant for a canonical decimal integer literal.
+///
+/// Values inside the tagged immediate range stay [`Const::Int`]; every larger
+/// magnitude (including values that do not fit `i64`) becomes
+/// [`Const::BigInt`].
+fn int_const_from_decimal(text: String) -> Const {
+    match text.parse::<i64>() {
+        Ok(n) if (MIN_TAGGED_INT..=MAX_TAGGED_INT).contains(&n) => Const::Int(n),
+        _ => Const::BigInt(text),
+    }
+}
+
+/// Negates a canonical decimal literal, re-applying the tagged-range rule so
+/// `-(-9223372036854775808)`-style chains pick the right constant.
+fn negate_int_const(text: &str) -> Const {
+    match text.strip_prefix('-') {
+        Some(rest) => int_const_from_decimal(rest.to_string()),
+        None => int_const_from_decimal(format!("-{text}")),
+    }
 }
 
 /// Exact `i64`/`f64` comparison with Python semantics; `None` is unordered
@@ -9656,7 +9659,8 @@ fn fold_un(op: pyx_ir::UnOp, operand: &HExpr) -> Option<Const> {
     };
     match op {
         pyx_ir::UnOp::Neg => match constant {
-            Const::Int(n) => fold_int_result(n.checked_neg()?),
+            Const::Int(n) => Some(negate_int_const(&n.to_string())),
+            Const::BigInt(n) => Some(negate_int_const(n)),
             Const::Float(f) => Some(Const::Float(-f)),
             _ => None,
         },

@@ -36,10 +36,16 @@ const NOT_IMPLEMENTED_TAG: i64 = 25;
 /// an arithmetic shift right.
 const INT_TAG_SHIFT: i64 = 3;
 
+/// Low bits of every runtime value. Heap-allocated objects (including
+/// arbitrary-precision `int`s) carry `TAG_HEAP`; tagged integers keep them
+/// clear and the special immediates use `0b001`.
+const TAG_MASK: i64 = 0b111;
+const TAG_HEAP: i64 = 0b010;
+
 /// Payload bounds of a tagged immediate, mirroring `value::MIN_INT` and
 /// `value::MAX_INT` in `pyx-runtime` (`i64::MIN >> 3` and `i64::MAX >> 3`, i.e.
 /// `-2^60 ..= 2^60 - 1`). A result outside this range cannot be retagged and
-/// must go through `pyx_binop`, which raises `OverflowError`.
+/// must go through `pyx_binop`, which returns a heap `BigInt` instead.
 const TAGGED_INT_MIN: i64 = i64::MIN >> INT_TAG_SHIFT;
 const TAGGED_INT_MAX: i64 = i64::MAX >> INT_TAG_SHIFT;
 
@@ -62,6 +68,27 @@ pub(crate) fn build_isa(pic: bool) -> Result<OwnedTargetIsa, CodegenError> {
     flag_builder
         .set("opt_level", "speed")
         .map_err(|e| CodegenError::new(format!("invalid cranelift flag opt_level: {e}")))?;
+    // Alias analysis is part of the `speed` tier; keep it explicit so a
+    // future Cranelift default change cannot silently lose redundant-load
+    // elimination on the typed-int fast paths.
+    flag_builder
+        .set("enable_alias_analysis", "true")
+        .map_err(|e| {
+            CodegenError::new(format!("invalid cranelift flag enable_alias_analysis: {e}"))
+        })?;
+    // The IR verifier is a development/CI aid, not a runtime optimization.
+    // Debug/test builds keep it; release JIT startup and AOT compile time do
+    // not pay for it. Generated code is still verified by the test suite.
+    flag_builder
+        .set(
+            "enable_verifier",
+            if cfg!(debug_assertions) {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .map_err(|e| CodegenError::new(format!("invalid cranelift flag enable_verifier: {e}")))?;
     let flags = settings::Flags::new(flag_builder);
     let isa = cranelift_native::builder()
         .map_err(|e| CodegenError::new(format!("native target not supported: {e}")))?
@@ -100,6 +127,7 @@ fn declare_runtime<M: Module>(
 /// Declared runtime entry points used by the generated code.
 struct Runtime {
     str_new: FuncId,
+    bigint_from_str: FuncId,
     bytes_new: FuncId,
     bytes_build: FuncId,
     float_new: FuncId,
@@ -215,6 +243,14 @@ impl Runtime {
         let i32t = types::I32;
         Ok(Runtime {
             str_new: declare_runtime(module, "pyx_str_new", &[ptr, ptr], Some(i64t))?,
+            // Decimal literal bytes (the ABI parses an optional leading `-`);
+            // the result is a tagged `int` or a heap `BigInt` value.
+            bigint_from_str: declare_runtime(
+                module,
+                "pyx_bigint_from_str",
+                &[ptr, ptr],
+                Some(i64t),
+            )?,
             // Raw byte buffer plus length for `bytes` literals.
             bytes_new: declare_runtime(module, "pyx_bytes_new", &[ptr, ptr], Some(i64t))?,
             // `argc` is `uint64_t` in the ABI: pointer-width.
@@ -899,6 +935,16 @@ fn wrapper_const<M: Module>(
             let len_value = builder.ins().iconst(types::I64, len as i64);
             let len = as_pointer_width(builder, ptr_ty, len_value);
             call_val_extern(module, builder, runtime.str_new, &[ptr, len])
+        }
+        // A literal default is a valid decimal string, so the runtime parse
+        // cannot raise here; it returns a tagged int or a heap `BigInt`
+        // depending on the value's magnitude.
+        Const::BigInt(text) => {
+            let (slot, len) = make_bytes_slot(builder, text.as_bytes())?;
+            let ptr = builder.ins().stack_addr(ptr_ty, slot, 0);
+            let len_value = builder.ins().iconst(types::I64, len as i64);
+            let len = as_pointer_width(builder, ptr_ty, len_value);
+            call_val_extern(module, builder, runtime.bigint_from_str, &[ptr, len])
         }
         Const::Bytes(bytes) => {
             let (slot, len) = make_bytes_slot(builder, bytes)?;
@@ -1692,6 +1738,20 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.call_rt(id, &[ptr, len_value])
     }
 
+    /// Materialise an arbitrary-precision integer literal through
+    /// `pyx_bigint_from_str`. The helper returns a tagged immediate when the
+    /// value fits and a heap `BigInt` otherwise; a malformed literal raises
+    /// `ValueError`, so the result is exception-checked.
+    fn bigint_const(&mut self, text: &str) -> Result<Value, CodegenError> {
+        let (slot, len) = make_bytes_slot(&mut self.builder, text.as_bytes())?;
+        let ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+        let len_value = self.builder.ins().iconst(self.ptr_ty, len as i64);
+        let id = self.runtime.bigint_from_str;
+        let result = self.call_rt(id, &[ptr, len_value])?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
     fn bytes_const(&mut self, bytes: &[u8]) -> Result<Value, CodegenError> {
         let (slot, len) = make_bytes_slot(&mut self.builder, bytes)?;
         let ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
@@ -1745,8 +1805,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let lhs = self.builder.use_var(var);
                 let target_ty = self.locals.get(*target as usize).map(|info| info.ty);
                 // `i += 1` is `i = i + 1`: with both sides statically `int`
-                // and an arithmetic operator the checked tagged-int path is
-                // exact; anything else keeps the dynamic operator.
+                // and an arithmetic operator the checked tagged-int path
+                // applies, guarding heap `BigInt` operands and joining both
+                // outcomes as one tagged value; anything else keeps the
+                // dynamic operator.
                 let result = if target_ty == Some(Type::Int)
                     && value_ty == Type::Int
                     && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
@@ -3120,6 +3182,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let rhs_ty = rhs.ty;
                 let lhs = self.lower_expr(lhs)?;
                 let rhs = self.lower_expr(rhs)?;
+                // Only statically tagged operands use the specialised paths;
+                // `Type::BigInt` values are heap objects and always go through
+                // the dynamic operator.
                 if lhs_ty == Type::Int && rhs_ty == Type::Int {
                     match op {
                         // The tagged-int fast path is only exact when the
@@ -3338,31 +3403,64 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.builder.ins().sshr_imm(value, INT_TAG_SHIFT)
     }
 
+    /// Condition: `true` when `value` is a tagged immediate rather than a
+    /// heap object.
+    fn is_tagged_immediate(&mut self, value: Value) -> Value {
+        let tag = self.builder.ins().band_imm(value, TAG_MASK);
+        self.builder.ins().icmp_imm(IntCC::NotEqual, tag, TAG_HEAP)
+    }
+
+    /// Condition: `true` when neither operand needs the dynamic operator.
+    ///
+    /// A promoted arbitrary-precision `int` lives on the heap (`TAG_HEAP`), so
+    /// the tagged-int fast paths must branch around the untagging instead of
+    /// interpreting its pointer as a payload.
+    fn int_operands_tagged(&mut self, lhs: Value, rhs: Value) -> Value {
+        let lhs_tagged = self.is_tagged_immediate(lhs);
+        let rhs_tagged = self.is_tagged_immediate(rhs);
+        self.builder.ins().band(lhs_tagged, rhs_tagged)
+    }
+
     /// `int op int` for `+`, `-` and `*`.
     ///
-    /// Both operands are known to be `int` and the result is `int`, so the
-    /// operation cannot dispatch on types or raise anything but
-    /// `OverflowError`. The fast path untags, computes with the checked
-    /// machine operation, verifies the payload still fits the 61-bit tagged
-    /// immediate and retags. Any overflow or out-of-range result branches to
-    /// the runtime operator, which raises the exact `OverflowError`.
+    /// Both operands are statically `int` and the result is `int`, so the
+    /// operation cannot dispatch on types. The fast path untags, computes
+    /// with the checked machine operation, verifies the payload still fits
+    /// the 61-bit tagged immediate and retags. A heap operand (a promoted
+    /// `BigInt` bound to a statically-`int` local), i64 overflow or an
+    /// out-of-range result branches to `pyx_binop`, whose runtime
+    /// `value::int_result` promotes the result to a heap `BigInt`.
     fn lower_int_arith(
         &mut self,
         op: BinOp,
         lhs: Value,
         rhs: Value,
     ) -> Result<Value, CodegenError> {
+        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+            return Err(CodegenError::new(
+                "internal error: non-arithmetic operator on the int fast path",
+            ));
+        }
+        // Guard before untagging: a heap `BigInt` pointer must never be
+        // shifted as if it were a payload.
+        let operands_tagged = self.int_operands_tagged(lhs, rhs);
+
+        let fast_block = self.builder.create_block();
+        let slow_block = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+        self.builder
+            .ins()
+            .brif(operands_tagged, fast_block, &[], slow_block, &[]);
+
+        self.switch_to(fast_block);
         let a = self.untag_int(lhs);
         let b = self.untag_int(rhs);
         let (result, overflowed) = match op {
             BinOp::Add => self.builder.ins().sadd_overflow(a, b),
             BinOp::Sub => self.builder.ins().ssub_overflow(a, b),
             BinOp::Mul => self.builder.ins().smul_overflow(a, b),
-            _ => {
-                return Err(CodegenError::new(
-                    "internal error: non-arithmetic operator on the int fast path",
-                ));
-            }
+            _ => unreachable!("operator was checked above"),
         };
 
         let no_i64_overflow = self.builder.ins().icmp_imm(IntCC::Equal, overflowed, 0);
@@ -3377,29 +3475,31 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let tagged_range = self.builder.ins().band(above_min, below_max);
         let fast = self.builder.ins().band(no_i64_overflow, tagged_range);
 
-        let fast_block = self.builder.create_block();
-        let slow_block = self.builder.create_block();
-        let join = self.builder.create_block();
-        self.builder.append_block_param(join, types::I64);
+        let retag_block = self.builder.create_block();
+        // Overflow and out-of-range results join the heap-guard slow path, so
+        // the runtime promotion (`value::int_result`) is the single authority
+        // for values that do not fit a tagged immediate.
         self.builder
             .ins()
-            .brif(fast, fast_block, &[], slow_block, &[]);
+            .brif(fast, retag_block, &[], slow_block, &[]);
 
+        self.switch_to(retag_block);
+        let tagged = self.builder.ins().ishl_imm(result, INT_TAG_SHIFT);
+        let fast_arg = [ir::BlockArg::from(tagged)];
+        self.builder.ins().jump(join, &fast_arg);
+        self.terminated = true;
+
+        // Reached from the heap guard and from the overflow check. It sees the
+        // original tagged operands and returns either a tagged int or a heap
+        // `BigInt`, so the join is a single `i64` value assignable to the
+        // statically-`int` target.
         self.switch_to(slow_block);
         let code = self.builder.ins().iconst(types::I32, op.code() as i64);
         let id = self.runtime.binop;
-        // The slow path sees the original tagged operands, so it raises the
-        // same `OverflowError` the generic operator always did.
         let slow_value = self.call_rt(id, &[code, lhs, rhs])?;
         self.emit_exc_check()?;
         let slow_arg = [ir::BlockArg::from(slow_value)];
         self.builder.ins().jump(join, &slow_arg);
-        self.terminated = true;
-
-        self.switch_to(fast_block);
-        let tagged = self.builder.ins().ishl_imm(result, INT_TAG_SHIFT);
-        let fast_arg = [ir::BlockArg::from(tagged)];
-        self.builder.ins().jump(join, &fast_arg);
         self.terminated = true;
 
         self.switch_to(join);
@@ -3415,17 +3515,16 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// Ordering comparisons on two tagged immediates would already be exact
     /// (the payload encoding is monotonic), but untagging keeps the rule
     /// simple: compare payloads, then materialize the `True`/`False`
-    /// sentinels. Integer comparison never raises, so there is no exception
-    /// check.
+    /// sentinels. A heap operand (a promoted `BigInt` held in a statically
+    /// `int` local) instead branches to `pyx_binop`, since its pointer must
+    /// not be untagged.
     fn lower_int_comparison(
         &mut self,
         op: BinOp,
         lhs: Value,
         rhs: Value,
     ) -> Result<Value, CodegenError> {
-        let a = self.untag_int(lhs);
-        let b = self.untag_int(rhs);
-        let condition = match op {
+        let condition_code = match op {
             BinOp::Eq => IntCC::Equal,
             BinOp::Ne => IntCC::NotEqual,
             BinOp::Lt => IntCC::SignedLessThan,
@@ -3438,12 +3537,50 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 ));
             }
         };
-        let condition = self.builder.ins().icmp(condition, a, b);
+        let operands_tagged = self.int_operands_tagged(lhs, rhs);
+
+        let fast_block = self.builder.create_block();
+        let slow_block = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+        self.builder
+            .ins()
+            .brif(operands_tagged, fast_block, &[], slow_block, &[]);
+
+        self.switch_to(fast_block);
+        let a = self.untag_int(lhs);
+        let b = self.untag_int(rhs);
+        let condition = self.builder.ins().icmp(condition_code, a, b);
         // `True` is 17 and `False` is 9 in the runtime's special immediates
         // (`value::TRUE` / `value::FALSE`); both are plain constants.
         let truthy = self.builder.ins().iconst(types::I64, TRUE_TAG);
         let falsy = self.builder.ins().iconst(types::I64, FALSE_TAG);
-        Ok(self.builder.ins().select(condition, truthy, falsy))
+        let result = self.builder.ins().select(condition, truthy, falsy);
+        let fast_arg = [ir::BlockArg::from(result)];
+        self.builder.ins().jump(join, &fast_arg);
+        self.terminated = true;
+
+        // Both inputs are integers, so the runtime comparison returns the same
+        // `True`/`False` sentinels as the fast path; checking the pending
+        // exception keeps a malformed heap operand from being silently
+        // ignored.
+        self.switch_to(slow_block);
+        let code = self.builder.ins().iconst(types::I32, op.code() as i64);
+        let id = self.runtime.binop;
+        let slow_value = self.call_rt(id, &[code, lhs, rhs])?;
+        self.emit_exc_check()?;
+        let slow_arg = [ir::BlockArg::from(slow_value)];
+        self.builder.ins().jump(join, &slow_arg);
+        self.terminated = true;
+
+        self.switch_to(join);
+        self.builder
+            .block_params(join)
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                CodegenError::new("internal error: int comparison join has no parameter")
+            })
     }
 
     /// Branch condition for a tagged `True`/`False` sentinel produced by the
@@ -4053,6 +4190,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.call_rt(id, &[float])
             }
             Const::Str(text) => self.str_const(text),
+            Const::BigInt(text) => self.bigint_const(text),
             Const::Bytes(bytes) => self.bytes_const(bytes),
             Const::Global { module, name } => self.lower_global_get(module, name),
             Const::Tuple(items) => {
@@ -6344,6 +6482,121 @@ mod tests {
         assert!(!object.is_empty());
     }
 
+    /// Build a module body with a single statically-`int` local `x` and the
+    /// given statements.
+    fn program_with_int_local(body: Vec<Stmt>) -> Program {
+        Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![LocalInfo {
+                    name: "x".to_string(),
+                    ty: Type::Int,
+                }],
+                body,
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+            initializers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bigint_constant_lowers_through_pyx_bigint_from_str() {
+        // A literal beyond the tagged-immediate range still lowers through a
+        // runtime parse, which decides between a tagged int and a heap
+        // `BigInt`.
+        let literal = Expr::new(
+            ExprKind::Const(Const::BigInt("-123456789012345678901234567890".to_string())),
+            Type::BigInt,
+            1,
+        );
+        let program = program_with_int_local(vec![Stmt::new(
+            StmtKind::Assign {
+                target: 0,
+                value: literal,
+            },
+            1,
+        )]);
+        let object = crate::compile_object(&program).expect("a BigInt literal must lower");
+        assert!(!object.is_empty());
+        assert!(
+            runtime_call_sites(&object, "pyx_bigint_from_str") > 0,
+            "a BigInt literal must call pyx_bigint_from_str"
+        );
+    }
+
+    #[test]
+    fn int_arith_guards_heap_bigint_operands() {
+        // `x = <big literal>; y = x + x` with `x` statically `int`: at runtime
+        // `x` holds a heap `BigInt`, so the checked fast path must branch to
+        // `pyx_binop` before untagging. The heap guard and the overflow check
+        // share one slow block, hence exactly one call site.
+        let literal = Expr::new(
+            ExprKind::Const(Const::BigInt("123456789012345678901234567890".to_string())),
+            Type::BigInt,
+            1,
+        );
+        let sum = Expr::new(
+            ExprKind::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::new(ExprKind::Local(0), Type::Int, 2)),
+                rhs: Box::new(Expr::new(ExprKind::Local(0), Type::Int, 2)),
+            },
+            Type::Int,
+            2,
+        );
+        let program = program_with_int_local(vec![
+            Stmt::new(
+                StmtKind::Assign {
+                    target: 0,
+                    value: literal,
+                },
+                1,
+            ),
+            Stmt::new(
+                StmtKind::Assign {
+                    target: 0,
+                    value: sum,
+                },
+                2,
+            ),
+        ]);
+        let object = crate::compile_object(&program)
+            .expect("int arithmetic over a possibly-heap operand must lower");
+        assert_eq!(
+            runtime_binop_call_sites(&object),
+            1,
+            "the heap guard and the overflow check must share one pyx_binop slow block"
+        );
+    }
+
+    #[test]
+    fn int_comparison_guards_heap_bigint_operands() {
+        // A specialised comparison otherwise never calls `pyx_binop`; the
+        // heap guard is the only source of that call site here.
+        let comparison = Expr::new(
+            ExprKind::Bin {
+                op: BinOp::Eq,
+                lhs: Box::new(Expr::new(ExprKind::Local(0), Type::Int, 2)),
+                rhs: Box::new(Expr::new(ExprKind::Local(0), Type::Int, 2)),
+            },
+            Type::Bool,
+            2,
+        );
+        let program = program_with_int_local(vec![Stmt::new(StmtKind::Expr(comparison), 2)]);
+        let object = crate::compile_object(&program)
+            .expect("an int comparison over possibly-heap operands must lower");
+        assert!(
+            runtime_binop_call_sites(&object) > 0,
+            "the heap guard must route a promoted BigInt through pyx_binop"
+        );
+    }
+
     #[test]
     fn any_operand_add_still_lowers_through_the_runtime_binop() {
         let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
@@ -6762,15 +7015,18 @@ mod tests {
         let any_object =
             crate::compile_object(&range_program(Type::Any)).expect("Any range loop must lower");
 
-        // The typed loop keeps `pyx_binop` only in the counter-increment
-        // overflow slow block; the dynamic loop additionally calls it for the
-        // step-direction test and both loop conditions.
+        // The typed loop keeps `pyx_binop` only in cold slow blocks: the heap
+        // guard on each specialised comparison/increment plus the counter
+        // overflow promotion. The dynamic loop calls it on every condition and
+        // increment, so it cannot emit fewer static call sites than the typed
+        // loop, whose hot path still avoids all of them.
         let int_sites = runtime_binop_call_sites(&int_object);
         let any_sites = runtime_binop_call_sites(&any_object);
         assert!(any_sites > 0, "the Any range loop must call pyx_binop");
         assert!(
-            int_sites < any_sites,
-            "the int loop condition must avoid pyx_binop: int={int_sites}, any={any_sites}"
+            int_sites <= any_sites,
+            "the int loop fast path must not add runtime operator calls: \
+             int={int_sites}, any={any_sites}"
         );
     }
 

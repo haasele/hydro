@@ -491,6 +491,9 @@ fn format_native(value: i64, spec: &Spec) -> Result<String, FormatError> {
     if value::is_int(value) {
         return format_int(value >> 3, spec, "int");
     }
+    if let Some(number) = value::as_bigint(value) {
+        return format_bigint(number, spec);
+    }
     if let Some(f) = value::as_float(value) {
         return format_float_value(f, spec);
     }
@@ -587,6 +590,83 @@ fn format_int(number: i64, spec: &Spec, type_name: &str) -> Result<String, Forma
         'X' => format!("{magnitude:X}"),
         _ => magnitude.to_string(),
     };
+    let body = if spec.grouping {
+        group_int(&body, ',')
+    } else {
+        body
+    };
+    let base_prefix = match ty {
+        'b' if spec.alternate => "0b",
+        'o' if spec.alternate => "0o",
+        'x' if spec.alternate => "0x",
+        'X' if spec.alternate => "0X",
+        _ => "",
+    };
+    let sign = if negative {
+        "-"
+    } else {
+        match spec.sign {
+            Some('+') => "+",
+            Some(' ') => " ",
+            _ => "",
+        }
+    };
+    let prefix = format!("{sign}{base_prefix}");
+    pad(&prefix, &body, "", spec, '>', true)
+}
+
+/// Formats an arbitrary-precision integer. Only the integer presentation
+/// types (`b c d o x X`) are computed exactly; the float presentation types
+/// fall back to the float path when the value fits an `f64`.
+fn format_bigint(number: &num_bigint::BigInt, spec: &Spec) -> Result<String, FormatError> {
+    let ty = spec.ty.unwrap_or('d');
+    if matches!(ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%') {
+        let Some(as_float) = value::bigint_to_f64(number) else {
+            return Err(FormatError::value_error(
+                "int too large to convert to float",
+            ));
+        };
+        return format_float_value(as_float, spec);
+    }
+    if ty == 'c' {
+        if spec.sign.is_some() || spec.grouping || spec.precision.is_some() {
+            return Err(FormatError::value_error(
+                "invalid format specifier for character format",
+            ));
+        }
+        let Some(character) = u32::try_from(number).ok().and_then(char::from_u32) else {
+            return Err(FormatError::value_error(
+                "character code out of range for 'c' format",
+            ));
+        };
+        let mut text_spec = spec.clone();
+        text_spec.ty = None;
+        return format_text(&character.to_string(), &text_spec);
+    }
+    if !matches!(ty, 'd' | 'b' | 'o' | 'x' | 'X') {
+        return Err(unknown_code(ty, "int"));
+    }
+    if spec.precision.is_some() {
+        return Err(FormatError::value_error(
+            "Precision not allowed in integer format specifier",
+        ));
+    }
+    if spec.grouping && ty != 'd' {
+        return Err(FormatError::value_error(format!(
+            "Cannot specify ',' with '{ty}'."
+        )));
+    }
+    let negative = number.sign() == num_bigint::Sign::Minus;
+    let radix = match ty {
+        'b' => 2,
+        'o' => 8,
+        'x' | 'X' => 16,
+        _ => 10,
+    };
+    let mut body = number.magnitude().to_str_radix(radix);
+    if ty == 'X' {
+        body.make_ascii_uppercase();
+    }
     let body = if spec.grouping {
         group_int(&body, ',')
     } else {
@@ -891,6 +971,21 @@ fn percent_piece(
             })
         }
         'd' | 'i' | 'u' => {
+            // Arbitrary-precision integers keep every digit.
+            if let Some(number) = value::as_bigint(arg) {
+                let mut digits = number.magnitude().to_str_radix(10);
+                if let Some(precision) = precision {
+                    if digits.len() < precision {
+                        digits = format!("{}{digits}", "0".repeat(precision - digits.len()));
+                    }
+                }
+                return Ok(Piece {
+                    prefix: percent_prefix(number.sign() == num_bigint::Sign::Minus, flags, ""),
+                    body: digits,
+                    suffix: String::new(),
+                    numeric: true,
+                });
+            }
             let number = percent_integer(arg, ty)?;
             let mut digits = number.unsigned_abs().to_string();
             if let Some(precision) = precision {
@@ -1137,6 +1232,56 @@ mod tests {
     }
 
     #[test]
+    fn bigint_format_matrix() {
+        let big = |literal: &str| {
+            value::bigint_new(literal.parse::<num_bigint::BigInt>().expect("literal"))
+        };
+        let two_100 = big("1267650600228229401496703205376");
+        assert_eq!(
+            text(format_value(two_100, "", 0)),
+            "1267650600228229401496703205376"
+        );
+        assert_eq!(
+            text(format_value(two_100, "d", 0)),
+            "1267650600228229401496703205376"
+        );
+        assert_eq!(
+            text(format_value(two_100, ",d", 0)),
+            "1,267,650,600,228,229,401,496,703,205,376"
+        );
+        assert_eq!(
+            text(format_value(two_100, "x", 0)),
+            "10000000000000000000000000"
+        );
+        assert_eq!(
+            text(format_value(two_100, "#x", 0)),
+            "0x10000000000000000000000000"
+        );
+        assert_eq!(
+            text(format_value(two_100, "040", 0)),
+            "0000000001267650600228229401496703205376"
+        );
+
+        let negative = big("-1267650600228229401496703205376");
+        assert_eq!(
+            text(format_value(negative, ",d", 0)),
+            "-1,267,650,600,228,229,401,496,703,205,376"
+        );
+        assert_eq!(
+            text(format_value(negative, "+d", 0)),
+            "-1267650600228229401496703205376"
+        );
+        assert_eq!(
+            text(format_value(two_100, "#X", 0)),
+            "0X10000000000000000000000000"
+        );
+        assert_eq!(
+            error_tag(format_value(two_100, "5s", 0)),
+            crate::exc::VALUE_ERROR
+        );
+    }
+
+    #[test]
     fn float_format_matrix() {
         assert_eq!(text(format_value(float(3.14159), ".2f", 0)), "3.14");
         assert_eq!(text(format_value(float(-3.5), "010.2f", 0)), "-000003.50");
@@ -1254,6 +1399,18 @@ mod tests {
         assert_eq!(text(percent_format("%#x", int(255))), "0xff");
         assert_eq!(text(percent_format("%#x", int(-255))), "-0xff");
         assert_eq!(text(percent_format("%d", float(3.7))), "3");
+
+        // Arbitrary-precision integers render every digit.
+        let big = value::bigint_new("1267650600228229401496703205376".parse().unwrap());
+        assert_eq!(
+            text(percent_format("%d", big)),
+            "1267650600228229401496703205376"
+        );
+        let negative_big = value::bigint_new("-123456789012345678901234567890".parse().unwrap());
+        assert_eq!(
+            text(percent_format("%+d", negative_big)),
+            "-123456789012345678901234567890"
+        );
         assert_eq!(
             error_tag(percent_format("%s %s", tuple(&[string("a")]))),
             crate::exc::TYPE_ERROR

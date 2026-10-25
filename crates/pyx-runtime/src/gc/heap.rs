@@ -2072,7 +2072,8 @@ unsafe fn trace(addr: usize) {
                 | ObjData::ExtFunction(_)
                 | ObjData::Capsule { .. }
                 | ObjData::Module(_)
-                | ObjData::StdStream(_) => {}
+                | ObjData::StdStream(_)
+                | ObjData::BigInt(_) => {}
                 // The mutable containers were handled above; they cannot
                 // appear here.
                 ObjData::List(_)

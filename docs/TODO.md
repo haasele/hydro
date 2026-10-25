@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** 1377 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** 1403 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -258,13 +258,13 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-25: 1377 tests total — 673 runtime (494 unit, 179 ABI
+      As of 2026-10-25: 1403 tests total — 688 runtime (509 unit, 179 ABI
       integration: among others 22 bytes, 19 IO, 18 stdlib modules, 16 stdlib
       utils, 12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 417 frontend, 48 codegen, 18 IR, 221 CLI/E2E (143 E2E incl.
+      tests), 424 frontend, 51 codegen, 18 IR, 222 CLI/E2E (144 E2E incl.
       the abi3 extension fixture, 24 fibers, 6 closures, 11 user modules,
       10 exceptions, 8 completions, extension path/dotted/multi-phase,
       2 unittest-runner, 2 stdlib-batch-a, 2 stdlib-batch-b,
@@ -350,8 +350,9 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       iterators, exception hierarchy/chaining/`except*`, descriptors,
       properties, `__slots__`, metaclasses, pattern matching,
       positional-only parameters, dict views, `bytearray`/`memoryview`,
-      BigInt (parity for arbitrary-size integers), and the full format
-      mini-language. `del`, loop `else`, dataclass field defaults,
+      and the full format mini-language. Arbitrary-precision integers are
+      implemented via a tagged i64 fast path plus `BigInt`; native i64
+      boundaries remain documented. `del`, loop `else`, dataclass field defaults,
       keyword-only/`*args`/`**kwargs` binding, user `__iter__`/`__next__`
       and the common `__dunder__` operators/`__call__`/`__str__`/`__repr__`/
       `__len__`/`__contains__`/`__dict__`/`__new__` are implemented.
@@ -425,9 +426,9 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       conversion rules documented. Depends on P4-04a.
 - [~] P4-07 Pickle/serialization, encoding details, numeric limits.
       PYX1 is deliberately not CPython-compatible; `bytes`/UTF-8/string escapes
-      tested; i64 limit documented. Required: CPython pickle protocols 2–5,
-      `marshal` subset, `datetime`/`decimal` encodings, and BigInt (P4-02)
-      so numeric results match CPython.
+      tested; the tagged-int fast path and BigInt promotion are documented.
+      Required: CPython pickle protocols 2–5, `marshal` subset,
+      `datetime`/`decimal` encodings, and BigInt serialization (P4-02).
 - [ ] P4-08 Compatibility matrix and support policy.
       Generated matrix per module/library with CPython version, pass counts,
       unsupported reasons and startup/RSS numbers. Covers stdlib (P4-09),
@@ -765,7 +766,7 @@ ledger below is the per-layer checklist that tracks the actual work.
       `select`, `selectors`, `syslog`, `mmap`, `sched`, `webbrowser`
 
 - [~] P7-14 Batch E — 42 modules: data formats, datetime, serialization and
-      numerics. Needs BigInt (P4-02) and P7-04 for
+      numerics. Uses the implemented BigInt type and P7-04 for
       `_json`/`_struct`/`_pickle`/`_csv`. Importable now (3/42):
       `dataclasses` and `datetime` (native module specs, with frontend
       dataclass expansion) and `fractions` (native). Remaining (ledger
@@ -1159,7 +1160,7 @@ numbers; no module is declared done on import alone.
   option B (PyX-native ABI layer, no `libpython`); the remaining risk is the
   full 3.14 `PyTypeObject`/refcount/GC/GIL surface required by NumPy and
   `pydantic-core`.
-- R2: i64 instead of BigInt — documented limit; BigInt later behind a feature.
+- R2: tagged-int fast path plus BigInt promotion is implemented; remaining native i64 boundaries are documented.
 - R3: Cranelift instead of LLVM: faster startup, less optimization; LLVM optional.
 - R4: GC with native frames needs precise roots; conservative scanning is the
   interim (P2-06/P2-07). Fiber stack and the two context register frames

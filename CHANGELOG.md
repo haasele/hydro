@@ -8,7 +8,7 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **1377 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25: **1403 tests**, `scripts/verify.sh` ALL GREEN. The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
@@ -22,6 +22,18 @@ heavier rich rendering. See the package-loader entry below.
 
 ### Added
 
+- **Arbitrary-precision integers:** Python `int` now uses a tagged i64 fast
+  path with automatic exact promotion to a heap `BigInt` (`num-bigint`).
+  New IR/type `Type::BigInt`, `Const::BigInt`, ABI
+  `pyx_bigint_from_str`, checked tagged-int fast paths with Heap-tag guards,
+  exact mixed arithmetic (`+ - * // % **`, bitwise/shifts, comparisons,
+  divmod), `int()` parsing, formatting, JSON and dict/set key equivalence.
+  Typed `Int` loops keep the inline fast path; only genuinely big operands
+  take the heap path.
+- **Cranelift release tuning:** `opt_level=speed` and alias analysis are
+  explicit; the IR verifier is debug-only. The JIT keeps
+  `is_pic=false`; AOT stays PIC and external libcalls non-colocated for
+  correctness.
 - **GC address-index optimization:** the local collector's address set now
   uses a deterministic non-cryptographic SplitMix64 hasher instead of SipHash,
   and sweep rebuilds the set in place with reused capacity instead of

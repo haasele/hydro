@@ -20,11 +20,15 @@
 //! mutex-protected (see [`crate::heap`]).
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use num_bigint::{BigInt, Sign};
+use num_traits::{FromPrimitive, ToPrimitive};
 
 use pyx_ir::{MethodKind, ParamKind};
 
@@ -127,6 +131,9 @@ pub(crate) const KIND_MODULE: u32 = 34;
 /// Native text stream over a process file descriptor (`sys.stdout`,
 /// `sys.stderr`). Holds only the descriptor number, so it has no PyX children.
 pub(crate) const KIND_STD_STREAM: u32 = 35;
+/// Arbitrary-precision Python `int` outside the tagged-immediate range. The
+/// payload is immutable and holds no PyX values.
+pub(crate) const KIND_BIGINT: u32 = 36;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
 pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
@@ -1652,6 +1659,8 @@ pub(crate) enum ObjData {
     Module(ModuleState),
     /// Native text stream over fd 1/2; holds no PyX values.
     StdStream(StdStreamState),
+    /// Arbitrary-precision Python `int` (immutable, no PyX children).
+    BigInt(BigInt),
 }
 
 // -------------------------------------------------------------------------
@@ -1674,7 +1683,9 @@ pub(crate) fn is_heap(v: i64) -> bool {
 }
 
 /// Decodes an immediate integer, treating `True`/`False` as `1`/`0`
-/// (Python's `bool` is numerically an `int`). `None` and heap values yield
+/// (Python's `bool` is numerically an `int`). A heap `BigInt` payload that
+/// fits `i64` is decoded as well; larger BigInts yield `None` (use
+/// [`as_bigint`] for the full value). `None` and other heap values yield
 /// `None`.
 pub(crate) fn as_integer(v: i64) -> Option<i64> {
     if is_int(v) {
@@ -1687,7 +1698,98 @@ pub(crate) fn as_integer(v: i64) -> Option<i64> {
             _ => None,
         };
     }
-    None
+    as_bigint(v).and_then(|n| i64::try_from(n).ok())
+}
+
+/// True when `v` is a heap [`ObjData::BigInt`] payload.
+pub(crate) fn is_bigint(v: i64) -> bool {
+    if !is_heap(v) {
+        return false;
+    }
+    // SAFETY: heap tag checked above; the object is rooted/immutable for the
+    // duration of this call (the collector only frees unreachable objects).
+    matches!(unsafe { as_obj(v) }, Some(obj) if obj.kind == KIND_BIGINT)
+}
+
+/// Borrows the payload of a heap `BigInt`. Tagged ints are *not* converted;
+/// use [`to_bigint`] for a numeric operand that may be tagged.
+pub(crate) fn as_bigint(v: i64) -> Option<&'static BigInt> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked above; the object is rooted/immutable for the
+    // duration of this call (the collector only frees unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_BIGINT {
+        return None;
+    }
+    match &obj.data {
+        ObjData::BigInt(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// Exact integer operand as a `BigInt`: tagged ints, booleans and heap
+/// BigInts. Every other value (including floats) yields `None`.
+pub(crate) fn to_bigint(v: i64) -> Option<BigInt> {
+    if let Some(n) = as_integer(v) {
+        return Some(BigInt::from(n));
+    }
+    as_bigint(v).cloned()
+}
+
+/// Exact three-way comparison of an integer with a float. `None` means
+/// unordered (NaN). The float's integral part is converted exactly, so the
+/// comparison never loses precision, no matter how large the integer is.
+pub(crate) fn bigint_cmp_f64(n: &BigInt, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    if f == f64::INFINITY {
+        return Some(Ordering::Less);
+    }
+    if f == f64::NEG_INFINITY {
+        return Some(Ordering::Greater);
+    }
+    let truncated = BigInt::from_f64(f.trunc())?;
+    match n.cmp(&truncated) {
+        Ordering::Equal => {
+            if f.fract() > 0.0 {
+                Some(Ordering::Less)
+            } else if f.fract() < 0.0 {
+                Some(Ordering::Greater)
+            } else {
+                Some(Ordering::Equal)
+            }
+        }
+        other => Some(other),
+    }
+}
+
+/// `n` as an `f64`; `None` when its magnitude exceeds the `f64` range (the
+/// caller decides between `f64::INFINITY` and an `OverflowError`).
+pub(crate) fn bigint_to_f64(n: &BigInt) -> Option<f64> {
+    match n.to_f64() {
+        Some(f) if f.is_finite() => Some(f),
+        _ => None,
+    }
+}
+
+/// Truncates a finite float toward zero into an exact integer.
+pub(crate) fn bigint_from_f64_trunc(f: f64) -> Option<BigInt> {
+    BigInt::from_f64(f.trunc())
+}
+
+/// Parses a base-10 integer literal (`int(text)` grammar): an optional
+/// leading sign followed by decimal digits.
+pub(crate) fn parse_decimal_int(text: &str) -> Option<BigInt> {
+    text.parse::<BigInt>().ok()
+}
+
+/// Parses `digits` (already validated against `radix`) with an optional sign.
+pub(crate) fn bigint_from_radix(digits: &str, radix: u32, negative: bool) -> Option<BigInt> {
+    let magnitude = BigInt::parse_bytes(digits.as_bytes(), radix)?;
+    Some(if negative { -magnitude } else { magnitude })
 }
 
 /// Encodes a boolean as the `True`/`False` immediates.
@@ -2792,6 +2894,47 @@ pub(crate) fn float_new(f: f64) -> i64 {
     alloc(KIND_FLOAT, ObjData::Float(f))
 }
 
+/// Builds a Python `int` from an arbitrary-precision value: a tagged
+/// immediate when it fits the 61-bit tag range, otherwise a `BigInt` heap
+/// object. Callers that already hold an `i64` use
+/// [`crate::ops::int_result`], which preserves the tagged fast path without
+/// constructing a `BigInt` first.
+pub(crate) fn bigint_new(n: BigInt) -> i64 {
+    if let Ok(small) = i64::try_from(&n) {
+        if let Some(tagged) = encode_int(small) {
+            return tagged;
+        }
+    }
+    alloc(KIND_BIGINT, ObjData::BigInt(n))
+}
+
+/// Parses a decimal integer literal from an ABI `(ptr, len)` buffer, the
+/// `pyx_bigint_from_str` entry point. The result is a tagged `int` when it
+/// fits and a heap `BigInt` otherwise; malformed text raises `ValueError`
+/// and returns `None`.
+pub(crate) fn bigint_from_ptr(ptr: *const u8, len: usize) -> i64 {
+    if ptr.is_null() || len == 0 || len > isize::MAX as usize {
+        return invalid_int_literal("");
+    }
+    // SAFETY: the ABI contract requires `ptr..ptr+len` to be readable.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    match std::str::from_utf8(bytes) {
+        Ok(text) => match parse_decimal_int(text) {
+            Some(n) => bigint_new(n),
+            None => invalid_int_literal(text),
+        },
+        Err(_) => invalid_int_literal(&String::from_utf8_lossy(bytes)),
+    }
+}
+
+/// Raises `ValueError` for a malformed integer literal and returns `None`.
+fn invalid_int_literal(text: &str) -> i64 {
+    crate::exc::raise_with_message(
+        crate::exc::VALUE_ERROR,
+        &format!("invalid literal for int() with base 10: '{text}'"),
+    )
+}
+
 /// Allocates a `bytes` object from an owned buffer.
 pub(crate) fn bytes_new(bytes: Vec<u8>) -> i64 {
     alloc(KIND_BYTES, ObjData::Bytes(bytes))
@@ -3522,6 +3665,7 @@ pub(crate) fn type_name(v: i64) -> &'static str {
         return match unsafe { as_obj(v) }.map(|o| &o.data) {
             Some(ObjData::Str(_)) => "str",
             Some(ObjData::Float(_)) => "float",
+            Some(ObjData::BigInt(_)) => "int",
             Some(ObjData::Exception(e)) => e.name,
             Some(ObjData::List(_)) => "list",
             Some(ObjData::Dict(_)) => "dict",
@@ -3625,6 +3769,7 @@ pub(crate) fn truthy(v: i64) -> bool {
         return match unsafe { as_obj(v) }.map(|o| &o.data) {
             Some(ObjData::Str(s)) => !s.is_empty(),
             Some(ObjData::Float(f)) => *f != 0.0,
+            Some(ObjData::BigInt(n)) => n.sign() != Sign::NoSign,
             Some(ObjData::Exception(_)) => true,
             Some(ObjData::List(items)) => !items.is_empty(),
             Some(ObjData::Dict(pairs)) => !pairs.is_empty(),
@@ -3721,6 +3866,7 @@ pub(crate) fn to_string(v: i64) -> String {
             return match &obj.data {
                 ObjData::Str(s) => s.clone(),
                 ObjData::Float(f) => format_float(*f),
+                ObjData::BigInt(n) => n.to_string(),
                 // `str(exception)` is its message (Python behaviour).
                 ObjData::Exception(e) => e.msg.clone(),
                 ObjData::List(_) | ObjData::Dict(_) | ObjData::Tuple(_) | ObjData::Set(_) => {
@@ -4288,5 +4434,135 @@ mod tests {
         assert_eq!(as_set(s), Some(&[two, one, a][..]));
         assert_eq!(to_string(s), "{2, 1, 'a'}");
         assert_eq!(repr(s), "{2, 1, 'a'}");
+    }
+
+    /// Allocates a BigInt payload directly, bypassing the tagged
+    /// normalization that [`bigint_new`] performs for in-range values.
+    fn heap_big(text: &str) -> i64 {
+        let n: BigInt = text.parse().expect("big literal");
+        alloc(KIND_BIGINT, ObjData::BigInt(n))
+    }
+
+    #[test]
+    fn bigint_promotion_and_accessors() {
+        // Values inside the tagged range keep the immediate representation.
+        assert_eq!(bigint_new(BigInt::from(5)), encode_int(5).unwrap());
+        assert_eq!(
+            bigint_new(BigInt::from(MAX_INT)),
+            encode_int(MAX_INT).unwrap()
+        );
+
+        // One past the tagged range becomes a heap payload.
+        let promoted = bigint_new(BigInt::from(MAX_INT) + BigInt::from(1));
+        assert!(is_bigint(promoted));
+        assert!(!is_int(promoted));
+        assert_eq!(as_integer(promoted), Some(MAX_INT + 1));
+        assert_eq!(
+            as_bigint(promoted),
+            Some(&(BigInt::from(MAX_INT) + BigInt::from(1)))
+        );
+        assert_eq!(type_name(promoted), "int");
+        assert_eq!(type_name_of(promoted), "int");
+        assert_eq!(to_string(promoted), "1152921504606846976");
+        assert_eq!(repr(promoted), "1152921504606846976");
+        assert!(truthy(promoted));
+
+        // BigInts beyond `i64` only expose the arbitrary-precision accessor.
+        let huge = heap_big("123456789012345678901234567890");
+        assert_eq!(as_integer(huge), None);
+        assert!(as_bigint(huge).is_some());
+        assert_eq!(as_bigint(encode_int(1).unwrap()), None);
+        assert_eq!(
+            to_bigint(huge),
+            Some(
+                "123456789012345678901234567890"
+                    .parse::<BigInt>()
+                    .expect("literal")
+            )
+        );
+        assert_eq!(to_bigint(encode_int(7).unwrap()), Some(BigInt::from(7)));
+        assert_eq!(to_bigint(float_new(1.5)), None);
+    }
+
+    #[test]
+    fn bigint_parsing_repr_and_truthiness() {
+        let huge = heap_big("123456789012345678901234567890");
+        assert_eq!(to_string(huge), "123456789012345678901234567890");
+        assert_eq!(repr(huge), "123456789012345678901234567890");
+
+        let negative = heap_big("-123456789012345678901234567890");
+        assert_eq!(to_string(negative), "-123456789012345678901234567890");
+        assert_eq!(repr(negative), "-123456789012345678901234567890");
+        assert!(truthy(negative));
+
+        // Zero is falsy even as a heap payload; small payloads still decode.
+        assert!(!truthy(heap_big("0")));
+        assert_eq!(as_integer(heap_big("0")), Some(0));
+        assert_eq!(as_integer(heap_big("-42")), Some(-42));
+
+        // Printing a BigInt through the generic renderer stays decimal.
+        assert_eq!(
+            to_string(list_new(vec![huge])),
+            "[123456789012345678901234567890]"
+        );
+    }
+
+    #[test]
+    fn bigint_hashing_matches_equal_tagged_ints() {
+        // Equal values hash equally whether the payload is tagged or heap.
+        for text in ["0", "7", "-42", "1152921504606846976"] {
+            let heap = heap_big(text);
+            let normalized = bigint_new(text.parse::<BigInt>().expect("literal"));
+            assert_eq!(
+                crate::container::key_hash(heap),
+                crate::container::key_hash(normalized),
+                "hash mismatch for {text}"
+            );
+        }
+        // Independently allocated equal big values share one hash.
+        let a = heap_big("123456789012345678901234567890");
+        let b = heap_big("123456789012345678901234567890");
+        assert_eq!(crate::container::key_hash(a), crate::container::key_hash(b));
+    }
+
+    #[test]
+    fn bigint_exact_float_comparison() {
+        let huge = heap_big("1267650600228229401496703205376"); // 2^100
+        let n = as_bigint(huge).expect("bigint payload");
+        assert_eq!(bigint_cmp_f64(n, 2f64.powi(100)), Some(Ordering::Equal));
+        assert_eq!(bigint_cmp_f64(n, 2f64.powi(99)), Some(Ordering::Greater));
+        assert_eq!(bigint_cmp_f64(n, 2f64.powi(101)), Some(Ordering::Less));
+        assert_eq!(bigint_cmp_f64(n, f64::NAN), None);
+        assert_eq!(bigint_cmp_f64(n, f64::INFINITY), Some(Ordering::Less));
+        assert_eq!(
+            bigint_cmp_f64(n, f64::NEG_INFINITY),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn bigint_literal_parsing_from_abi_buffer() {
+        let text = b"987654321098765432109876543210";
+        let parsed = bigint_from_ptr(text.as_ptr(), text.len());
+        assert!(is_bigint(parsed));
+        assert_eq!(to_string(parsed), "987654321098765432109876543210");
+
+        // Tagged-range literals normalize to immediates.
+        assert_eq!(bigint_from_ptr(b"42".as_ptr(), 2), encode_int(42).unwrap());
+        let min = b"-1152921504606846976";
+        assert_eq!(bigint_from_ptr(min.as_ptr(), min.len()), MIN_INT << 3);
+
+        // Malformed text raises ValueError through the pending exception.
+        crate::exc::init();
+        let bad = b"12x";
+        assert_eq!(bigint_from_ptr(bad.as_ptr(), bad.len()), NONE);
+        assert_eq!(crate::exc::pending_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(
+            to_string(crate::exc::pending_value()),
+            "invalid literal for int() with base 10: '12x'"
+        );
+        crate::exc::clear();
+        assert_eq!(bigint_from_ptr(std::ptr::null(), 0), NONE);
+        assert_eq!(crate::exc::pending_tag(), crate::exc::VALUE_ERROR as i64);
     }
 }

@@ -20,6 +20,9 @@ pub type FunctionId = u32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Int,
+    /// Arbitrary-precision integer (values outside the tagged immediate
+    /// range). Numeric, but distinct from [`Type::Int`].
+    BigInt,
     Float,
     Bool,
     Str,
@@ -43,14 +46,16 @@ pub enum Type {
 }
 
 impl Type {
-    /// True for `Int` and `Float` (and `Bool`, which is numerically compatible).
+    /// True for `Int`, `BigInt` and `Float` (and `Bool`, which is numerically
+    /// compatible).
     pub fn is_numeric(self) -> bool {
-        matches!(self, Type::Int | Type::Float | Type::Bool)
+        matches!(self, Type::Int | Type::BigInt | Type::Float | Type::Bool)
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Type::Int => "int",
+            Type::BigInt => "BigInt",
             Type::Float => "float",
             Type::Bool => "bool",
             Type::Str => "str",
@@ -78,6 +83,9 @@ impl fmt::Display for Type {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Const {
     Int(i64),
+    /// Decimal literal (optional leading `-`) that does not fit the tagged
+    /// immediate range. Canonical: no leading zeroes beyond `0`, no `+`.
+    BigInt(String),
     Float(f64),
     Bool(bool),
     Str(String),
@@ -108,6 +116,7 @@ impl Const {
     pub fn ty(&self) -> Type {
         match self {
             Const::Int(_) => Type::Int,
+            Const::BigInt(_) => Type::BigInt,
             Const::Float(_) => Type::Float,
             Const::Bool(_) => Type::Bool,
             Const::Str(_) => Type::Str,
