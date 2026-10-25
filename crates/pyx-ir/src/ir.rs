@@ -5,8 +5,11 @@
 //! type inference; it only lowers this tree to machine code.
 //!
 //! Invariants:
-//! - `functions[0]` is the module body, named `<module>`, with no parameters
-//!   and return type [`Type::None`]. [`Program::main`] points at it.
+//! - [`Program::main`] points at the entry module body: a function named
+//!   `<module>` with no parameters and return type [`Type::None`]. Single-
+//!   source programs always have it at index `0`; multi-module programs emit
+//!   imported module bodies first and list them in
+//!   [`Program::initializers`].
 //! - Every [`LocalId`] indexes the enclosing function's `locals` vector.
 //!   Parameters are locals too and appear first in `locals`.
 //! - Each [`FunctionId`] indexes `Program::functions`.
@@ -14,17 +17,42 @@
 //!   [`Program::source_name`].
 //! - Nested functions are closures by value: [`StmtKind::Closure`] captures
 //!   the current values of enclosing locals. Classes are limited to a single
-//!   optional base and plain methods.
+//!   optional base, methods (plain, property, classmethod or staticmethod) and
+//!   attributes frozen at class creation.
 
 use crate::model::{
     BinOp, BoolOp, Builtin, Callee, Const, ExcKind, FunctionId, LocalId, Type, UnOp,
 };
 
+/// One binding target of a sequence assignment.
+///
+/// Nested targets and attribute/subscript targets are bound left to right in
+/// source order. Receiver expressions are evaluated when that target binds
+/// (never before the source), so codegen must keep the extracted element alive
+/// while the receiver expression runs.
+#[derive(Clone, Debug)]
+pub enum UnpackTarget {
+    /// Bind a local slot.
+    Name(LocalId),
+    /// `*name = element`: `element` is a fresh list holding the elements the
+    /// plain targets around it did not consume (`a, *rest, b = value`). At
+    /// most one starred target is allowed, and it never nests inside another
+    /// container target.
+    Star(Box<UnpackTarget>),
+    /// `object.name = element`.
+    Attr { object: Expr, name: String },
+    /// `object[index] = element`.
+    Subscript { object: Expr, index: Expr },
+    /// `a, (b, c) = ...` inside an outer sequence target.
+    Nested(Vec<UnpackTarget>),
+}
+
 /// Target binding inside a comprehension clause.
 #[derive(Clone, Debug)]
 pub enum CompTarget {
     Name(LocalId),
-    Unpack(Vec<LocalId>),
+    /// `for a, b in ...` (nested and attribute/subscript elements included).
+    Unpack(Vec<UnpackTarget>),
 }
 
 /// One `for target in iterable if cond ...` clause of a comprehension.
@@ -54,6 +82,15 @@ impl Expr {
 pub enum ExprKind {
     Const(Const),
     Local(LocalId),
+    /// `(target := value)` (an assignment expression). Evaluates `value`,
+    /// stores it in the local `target` and yields the same value. The local is
+    /// the enclosing function's slot, so later reads of the name in that scope
+    /// observe it. Chained comparisons use this node to evaluate each middle
+    /// operand exactly once.
+    NamedExpr {
+        target: LocalId,
+        value: Box<Expr>,
+    },
     Bin {
         op: BinOp,
         lhs: Box<Expr>,
@@ -67,6 +104,12 @@ pub enum ExprKind {
         op: BoolOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+    },
+    /// `then if test else orelse`. Only the selected branch is evaluated.
+    IfExp {
+        test: Box<Expr>,
+        then: Box<Expr>,
+        orelse: Box<Expr>,
     },
     /// List literal, e.g. `[1, 2, 3]`.
     List(Vec<Expr>),
@@ -94,16 +137,37 @@ pub enum ExprKind {
     FunctionRef(FunctionId),
     /// Reference to a builtin function as a first-class value (`f = int`).
     BuiltinRef(Builtin),
+    /// Reference to a built-in exception class as a first-class value
+    /// (`x = ValueError`, `class E(Exception):`). Codegen materialises the
+    /// runtime's cached native class object for `kind` through the hidden
+    /// `pyx_exception_class` ABI. `raise`/`except` keep their tag-based
+    /// lowering and never produce this node.
+    ExceptionClass(ExcKind),
     /// `module.function(args...)` resolved from a builtin module.
+    ///
+    /// `keywords` holds keyword arguments kept by name because the spec
+    /// accepts a dynamic keyword set (`functools.partial`). Calls whose spec
+    /// only lists fixed parameter names bind those keywords into `args` and
+    /// leave this empty.
     ModuleCall {
         module: String,
         function: String,
         args: Vec<Expr>,
+        keywords: Vec<(String, Expr)>,
     },
     /// Reference to a builtin module as a value (`m = errno`, `getattr(errno,
     /// ...)`). Codegen materializes the runtime module object.
     ModuleRef {
         module: String,
+    },
+    /// Name bound by an import nested inside a function/class/compound body
+    /// that was not linked at compile time. Evaluating it calls the runtime
+    /// `pyx_deferred_import` helper, which raises `RuntimeError`: PyX cannot
+    /// execute a dynamic import. `member` is the imported name (`None` for
+    /// `import x as y`, where the whole module is the binding).
+    DeferredImport {
+        module: String,
+        member: Option<String>,
     },
     /// `module.name` (constant or callable value) from a builtin module.
     ModuleAttr {
@@ -132,6 +196,11 @@ pub enum ExprKind {
     IndirectCall {
         callee: Box<Expr>,
         args: Vec<Expr>,
+        /// `callee(args..., *star)`: the single starred positional operand.
+        /// It is evaluated after `args` (which hold the operands that appear
+        /// before it) and the runtime flattens a list/tuple into positional
+        /// arguments, raising `TypeError` for any other value.
+        star: Option<Box<Expr>>,
     },
     /// `[element for ...]`.
     ListComp {
@@ -161,11 +230,29 @@ pub enum ExprKind {
         object: Box<Expr>,
         method: String,
         args: Vec<Expr>,
+        /// `object.method(*star, ...)`: the single starred positional operand.
+        /// It is evaluated after `args` (which must then be empty, see the
+        /// frontend restriction) and before `keywords`; the runtime flattens a
+        /// list/tuple into positional arguments.
+        star: Option<Box<Expr>>,
         /// Keyword arguments in source order; the runtime binds them.
         keywords: Vec<(String, Expr)>,
     },
     Call {
         callee: Callee,
+        args: Vec<Expr>,
+    },
+    /// A call the frontend could not bind statically (`f(*args, **kwargs)` on
+    /// a callee with a dynamic signature). Every operand is evaluated in
+    /// source order, then the runtime raises
+    /// `RuntimeError("dynamic call ... is not supported")`.
+    DeferredCall {
+        /// Callee expression when it has side effects worth preserving
+        /// (`obj.method(**kw)` evaluates `obj`). `None` when the callee is a
+        /// statically known name that evaluates to nothing.
+        callee: Option<Box<Expr>>,
+        /// Positional operands, the elements of a starred operand, and the
+        /// values of keyword arguments, in source order.
         args: Vec<Expr>,
     },
     /// `await value` inside an `async def` body. The runtime drives the
@@ -200,6 +287,11 @@ impl Stmt {
 }
 
 /// One `except [exc] [as <local>]:` arm. `exc == None` is a bare `except:`.
+///
+/// `exc` is always a runtime tag. The frontend approximates handlers that name
+/// a user exception class (declared in the unit, imported, or dotted such as
+/// `errors.StyleSyntaxError`) with [`ExcKind::RuntimeError`], because user
+/// classes have no runtime tag; builtin names keep their exact tag.
 #[derive(Clone, Debug)]
 pub struct Handler {
     pub exc: Option<ExcKind>,
@@ -252,11 +344,12 @@ pub enum StmtKind {
         iterable: Expr,
         body: Vec<Stmt>,
     },
-    /// `a, b, c = value`. The value must be a list or tuple of exactly
-    /// `targets.len()` elements; codegen checks the length once and then
-    /// reads the elements by index.
+    /// `a, b, c = value`. `value` may be any iterable; codegen materialises it
+    /// (lists and tuples are used as-is) and checks that it has exactly
+    /// `targets.len()` elements before binding the targets left to right.
+    /// Nested targets check their own element count when they bind.
     Unpack {
-        targets: Vec<LocalId>,
+        targets: Vec<UnpackTarget>,
         value: Expr,
     },
     /// `object[index] = value`. Python evaluates `value` first, then
@@ -264,6 +357,18 @@ pub enum StmtKind {
     SetSubscript {
         object: Expr,
         index: Expr,
+        value: Expr,
+    },
+    /// `target[start:stop:step] = value`. As with [`StmtKind::SetSubscript`],
+    /// Python evaluates `value` first, then the target expression, then the
+    /// bounds in source order (start, stop, step); codegen must preserve that
+    /// order. An omitted bound is represented by a `Const::None` expression,
+    /// which lowers to the runtime `None` sentinel.
+    SetSlice {
+        target: Expr,
+        start: Expr,
+        stop: Expr,
+        step: Expr,
         value: Expr,
     },
     /// `def inner(...)` inside a function: create a closure value from
@@ -274,13 +379,17 @@ pub enum StmtKind {
         function: FunctionId,
         captures: Vec<LocalId>,
     },
-    /// `class Name(Base):` with already-lowered method functions. The runtime
-    /// class object is stored in `target`.
+    /// `class Name(Base):` with already-lowered method functions and class
+    /// attribute values. The runtime class object is stored in `target`.
+    ///
+    /// Attribute values are evaluated in declaration order when the class
+    /// statement runs; the resulting class namespace is immutable.
     ClassDef {
         target: LocalId,
         name: String,
         base: Option<Expr>,
         methods: Vec<ClassMethod>,
+        attributes: Vec<ClassAttr>,
     },
     /// `object.name = value`.
     SetAttr {
@@ -308,6 +417,14 @@ pub enum StmtKind {
         /// constant expression, which suppresses chaining.
         cause: Option<Expr>,
     },
+    /// `assert test[, msg]`: when `test` is falsy, `AssertionError` is raised
+    /// with `msg` as its message. Python evaluates `test` first and `msg` only
+    /// when the test fails, so codegen must keep `msg` inside the failure
+    /// branch.
+    Assert {
+        test: Expr,
+        msg: Option<Expr>,
+    },
     /// `try: ... except ...: ... else: ... finally: ...`.
     /// At least one of `handlers` and `finally_body` is non-empty. `else_body`
     /// runs only after a normal, exception-free body; exceptions raised there
@@ -320,11 +437,57 @@ pub enum StmtKind {
     },
 }
 
+/// How a class-body method binds its receiver when it is called.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MethodKind {
+    /// `def method(self, ...)`: `instance.method(...)` binds the instance.
+    #[default]
+    Normal,
+    /// `@property`: `instance.name` calls the getter with the instance.
+    Property,
+    /// `@classmethod`: the class object is bound as the first argument.
+    Classmethod,
+    /// `@staticmethod`: no receiver is bound.
+    Staticmethod,
+}
+
+impl MethodKind {
+    /// Numeric tag used by the `pyx_class_new` ABI.
+    pub fn abi_tag(self) -> i64 {
+        match self {
+            MethodKind::Normal => 0,
+            MethodKind::Property => 1,
+            MethodKind::Classmethod => 2,
+            MethodKind::Staticmethod => 3,
+        }
+    }
+
+    /// Decodes a `pyx_class_new` method-kind tag; `None` for an unknown tag.
+    pub fn from_abi_tag(tag: i64) -> Option<MethodKind> {
+        match tag {
+            0 => Some(MethodKind::Normal),
+            1 => Some(MethodKind::Property),
+            2 => Some(MethodKind::Classmethod),
+            3 => Some(MethodKind::Staticmethod),
+            _ => None,
+        }
+    }
+}
+
 /// One method entry of a class definition.
 #[derive(Clone, Debug)]
 pub struct ClassMethod {
     pub name: String,
     pub function: FunctionId,
+    pub kind: MethodKind,
+}
+
+/// One class-level attribute frozen into the class namespace when the class
+/// statement runs.
+#[derive(Clone, Debug)]
+pub struct ClassAttr {
+    pub name: String,
+    pub value: Expr,
 }
 
 #[derive(Clone, Debug)]
@@ -332,6 +495,28 @@ pub struct Param {
     pub local: LocalId,
     pub name: String,
     pub ty: Type,
+    /// Literal default (`def f(x=1)`). Direct calls fill omitted parameters
+    /// with it; the runtime binder of a dynamic signature uses it for
+    /// calls through a function value.
+    pub default: Option<Const>,
+    /// Position of the parameter in the signature. Parameters are ordered
+    /// captures, positional, `*args`, keyword-only, `**kwargs`.
+    pub kind: ParamKind,
+}
+
+/// Binding kind of a [`Param`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParamKind {
+    /// Ordinary positional parameter (or a closure capture).
+    #[default]
+    Positional,
+    /// `*args`: the slot always receives a list.
+    VarArg,
+    /// Keyword-only parameter: its slot receives the keyword value or the
+    /// literal default.
+    KwOnly,
+    /// `**kwargs`: the slot always receives a dict.
+    KwArg,
 }
 
 #[derive(Clone, Debug)]
@@ -364,15 +549,89 @@ impl Function {
     pub fn local(&self, id: LocalId) -> &LocalInfo {
         &self.locals[id as usize]
     }
+
+    /// Absolute index of the first parameter that is not positional (the
+    /// `*args` slot, a keyword-only parameter, or the `**kwargs` slot).
+    pub fn positional_end(&self) -> usize {
+        self.params[self.capture_count.min(self.params.len())..]
+            .iter()
+            .position(|param| param.kind != ParamKind::Positional)
+            .map(|offset| self.capture_count + offset)
+            .unwrap_or(self.params.len())
+    }
+
+    /// Absolute index of the keyword-only range end (the `**kwargs` slot or
+    /// the parameter count).
+    pub fn kwonly_end(&self) -> usize {
+        self.params
+            .iter()
+            .position(|param| param.kind == ParamKind::KwArg)
+            .unwrap_or(self.params.len())
+    }
+
+    /// Absolute index of the `*args` slot.
+    pub fn vararg(&self) -> Option<usize> {
+        self.params
+            .iter()
+            .position(|param| param.kind == ParamKind::VarArg)
+    }
+
+    /// Absolute index of the `**kwargs` slot.
+    pub fn kwarg(&self) -> Option<usize> {
+        self.params
+            .iter()
+            .position(|param| param.kind == ParamKind::KwArg)
+    }
+
+    /// True when the signature cannot be bound by position alone: it has
+    /// `*args`, `**kwargs` or keyword-only parameters. Such functions are
+    /// called through the runtime binder when the caller only has a function
+    /// value.
+    pub fn has_dynamic_signature(&self) -> bool {
+        self.params
+            .iter()
+            .any(|param| param.kind != ParamKind::Positional)
+    }
+
+    /// Keyword-only parameter range.
+    pub fn kwonly_params(&self) -> impl Iterator<Item = &Param> {
+        let end = self.kwonly_end();
+        let start = self.params[..end]
+            .iter()
+            .position(|param| param.kind == ParamKind::KwOnly)
+            .unwrap_or(end);
+        self.params[start..end]
+            .iter()
+            .filter(|param| param.kind == ParamKind::KwOnly)
+    }
+
+    /// User-visible arity recorded in a function value. For a dynamic
+    /// signature this is the minimum number of positional arguments (the
+    /// runtime binder accepts more); otherwise it is the exact count.
+    pub fn call_arity(&self) -> usize {
+        if !self.has_dynamic_signature() {
+            return self.params.len().saturating_sub(self.capture_count);
+        }
+        let start = self.capture_count.min(self.positional_end());
+        self.params[start..self.positional_end()]
+            .iter()
+            .filter(|param| param.default.is_none())
+            .count()
+    }
 }
 
 /// A fully typed compilation unit.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Program {
     pub source_name: String,
     pub functions: Vec<Function>,
-    /// Always `0` in Phase 1; kept explicit for later module splitting.
+    /// The entry unit's module body. Always `0` in single-source programs;
+    /// multi-module programs use the entry unit's position.
     pub main: FunctionId,
+    /// Module bodies of every imported user module, in dependency order
+    /// (imports before importers, entry excluded). The runtime runs them once
+    /// before [`Program::main`].
+    pub initializers: Vec<FunctionId>,
 }
 
 impl Program {

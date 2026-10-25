@@ -129,7 +129,6 @@ grep -qi "AttributeError" "$tmp/check.err" || {
 }
 echo "ok: examples/errors/attribute_value.py"
 check_fails examples/errors/method_arg_type.py "wrong type"
-check_fails examples/errors/tuple_unpack_nested.py "nested unpacking"
 check_fails examples/errors/tuple_star.py "starred unpacking"
 check_fails examples/errors/tuple_assign.py "item assignment"
 check_fails examples/errors/tuple_unhashable_key.py "unhashable"
@@ -152,7 +151,18 @@ check_fails examples/errors/lambda_default.py "default"
 check_fails examples/errors/lambda_star.py "varargs"
 check_fails examples/errors/import_unsupported.py "not supported"
 check_fails examples/errors/module_member_unknown.py "no attribute"
-check_fails examples/errors/import_in_function.py "module level"
+# Function-local imports bind native modules; this fixture exercises it.
+"$PYX" run examples/errors/import_in_function.py >"$tmp/check.out" 2>"$tmp/check.err" || {
+    echo "FAIL: examples/errors/import_in_function.py must run" >&2
+    cat "$tmp/check.err" >&2
+    exit 1
+}
+grep -q "3.14" "$tmp/check.out" || {
+    echo "FAIL: examples/errors/import_in_function.py unexpected output" >&2
+    cat "$tmp/check.out" >&2
+    exit 1
+}
+echo "ok: examples/errors/import_in_function.py"
 check_fails examples/errors/from_member_unknown.py "no attribute"
 # Standard-library modules are first-class values now (getattr/argv cases).
 "$PYX" check examples/errors/module_value.py >"$tmp/check.out" 2>"$tmp/check.err" || {

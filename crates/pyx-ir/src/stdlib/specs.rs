@@ -1,7 +1,7 @@
 //! Concrete builtin module tables: functions, arities, return types and
 //! constants.
 
-use super::{c, f, kw, ConstantSpec, FunctionSpec, ModuleSpec};
+use super::{c, f, kw, kw_dynamic, ConstantSpec, FunctionSpec, ModuleSpec};
 use crate::Type;
 
 pub static MATH: ModuleSpec = ModuleSpec {
@@ -22,6 +22,9 @@ pub static MATH: ModuleSpec = ModuleSpec {
         f("ceil", 1, 1, Type::Int),
         f("trunc", 1, 1, Type::Int),
         f("fabs", 1, 1, Type::Float),
+        // `gcd(*integers)`: CPython accepts any number of integers (zero
+        // arguments return 0) and rejects floats.
+        f("gcd", 0, usize::MAX, Type::Int),
     ],
     constants: &[
         c("pi", Type::Float),
@@ -33,8 +36,17 @@ pub static MATH: ModuleSpec = ModuleSpec {
 };
 
 /// `functools` and `_functools` share the same function table: the C
-/// accelerator only exposes `reduce`.
-const FUNCTOOLS_FUNCTIONS: &[FunctionSpec] = &[f("reduce", 2, 3, Type::Any)];
+/// accelerator exposes `reduce` and `partial`, while the no-op decorator
+/// helpers live in the pure-Python module.
+const FUNCTOOLS_FUNCTIONS: &[FunctionSpec] = &[
+    f("reduce", 2, 3, Type::Any),
+    f("cache", 1, 1, Type::Any),
+    kw("lru_cache", 0, 2, Type::Any, &["maxsize", "typed"]),
+    f("wraps", 1, 1, Type::Any),
+    // `partial(func, *args, **kwargs)`: the extra keyword names are forwarded
+    // to the wrapped callee and therefore kept by name.
+    kw_dynamic("partial", 1, usize::MAX, Type::Any, &["func"]),
+];
 
 pub static FUNCTOOLS: ModuleSpec = ModuleSpec {
     name: "functools",
@@ -67,6 +79,8 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     f("neg", 1, 1, Type::Any),
     f("not_", 1, 1, Type::Bool),
     f("truth", 1, 1, Type::Bool),
+    f("attrgetter", 1, usize::MAX, Type::Function),
+    f("itemgetter", 1, usize::MAX, Type::Function),
 ];
 
 pub static OPERATOR: ModuleSpec = ModuleSpec {
@@ -117,6 +131,9 @@ pub static RANDOM: ModuleSpec = ModuleSpec {
         f("choice", 1, 1, Type::Any),
         f("uniform", 2, 2, Type::Float),
         f("shuffle", 1, 1, Type::None),
+        // `getrandbits(k)`: a non-negative random int with `k` bits drawn from
+        // the global SplitMix64 generator.
+        f("getrandbits", 1, 1, Type::Int),
         kw("Random", 0, 1, Type::Any, &["seed"]),
     ],
     constants: &[],
@@ -143,6 +160,7 @@ pub static PLATFORM: ModuleSpec = ModuleSpec {
         f("platform", 0, 0, Type::Str),
         f("python_version", 0, 0, Type::Str),
         f("python_implementation", 0, 0, Type::Str),
+        f("processor", 0, 0, Type::Str),
     ],
     constants: &[],
 };
@@ -162,9 +180,28 @@ pub static STATISTICS: ModuleSpec = ModuleSpec {
 pub static JSON: ModuleSpec = ModuleSpec {
     name: "json",
     functions: &[
-        f("dumps", 1, 1, Type::Str),
+        kw(
+            "dumps",
+            1,
+            5,
+            Type::Str,
+            &["obj", "indent", "ensure_ascii", "separators", "sort_keys"],
+        ),
         f("loads", 1, 1, Type::Any),
-        kw("dump", 2, 2, Type::None, &["obj", "file"]),
+        kw(
+            "dump",
+            2,
+            6,
+            Type::None,
+            &[
+                "obj",
+                "file",
+                "indent",
+                "ensure_ascii",
+                "separators",
+                "sort_keys",
+            ],
+        ),
         kw("load", 1, 1, Type::Any, &["file"]),
     ],
     constants: &[],
@@ -211,6 +248,8 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("remove", 1, 1, Type::None),
         f("rename", 2, 2, Type::None),
         f("access", 2, 2, Type::Bool),
+        f("sysconf", 1, 1, Type::Int),
+        f("getloadavg", 0, 0, Type::Tuple),
     ],
     constants: &[
         c("name", Type::Str),
@@ -273,6 +312,10 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("pyx_version", Type::Str),
         c("pyx_version_info", Type::Tuple),
         c("maxsize", Type::Int),
+        // Native text streams over fd 1/2 (`write`, `flush`, `isatty`). The
+        // static type is dynamic because PyX has no stream class hierarchy.
+        c("stdout", Type::Any),
+        c("stderr", Type::Any),
     ],
 };
 
@@ -350,9 +393,42 @@ pub static RE: ModuleSpec = ModuleSpec {
         f("sub", 3, 4, Type::Str),
         f("split", 2, 3, Type::List),
         f("escape", 1, 1, Type::Str),
-        f("compile", 1, 1, Type::Any),
+        // `compile(pattern, flags=0)`; the runtime forwards the flags to the
+        // regex builder.
+        f("compile", 1, 2, Type::Any),
+        // `finditer(pattern, string, flags=0)`: every non-overlapping match
+        // as a `Match` object in a list. `flags` may be passed by keyword,
+        // which rich does (`flags=re.MULTILINE`).
+        kw(
+            "finditer",
+            2,
+            3,
+            Type::List,
+            &["pattern", "string", "flags"],
+        ),
     ],
-    constants: &[],
+    // The `RegexFlag` members, with CPython's numeric values. They are plain
+    // tagged ints: the runtime reads the bits it understands.
+    constants: &[
+        c("NOFLAG", Type::Int),
+        c("TEMPLATE", Type::Int),
+        c("T", Type::Int),
+        c("IGNORECASE", Type::Int),
+        c("I", Type::Int),
+        c("LOCALE", Type::Int),
+        c("L", Type::Int),
+        c("MULTILINE", Type::Int),
+        c("M", Type::Int),
+        c("DOTALL", Type::Int),
+        c("S", Type::Int),
+        c("UNICODE", Type::Int),
+        c("U", Type::Int),
+        c("VERBOSE", Type::Int),
+        c("X", Type::Int),
+        c("ASCII", Type::Int),
+        c("A", Type::Int),
+        c("DEBUG", Type::Int),
+    ],
 };
 
 /// Cooperative asyncio layer over stackful coroutine fibers.
@@ -912,3 +988,384 @@ pub static TIMEIT: ModuleSpec = ModuleSpec {
     ],
     constants: &[],
 };
+
+/// `dataclasses`: the decorator is expanded by the frontend; only the import
+/// name needs a value at runtime.
+pub static DATACLASSES: ModuleSpec = ModuleSpec {
+    name: "dataclasses",
+    functions: &[],
+    constants: &[c("dataclass", Type::Any)],
+};
+
+/// `datetime`: the `datetime` singleton plus the `now`/`strftime` methods the
+/// runtime object exposes as native functions.
+pub static DATETIME: ModuleSpec = ModuleSpec {
+    name: "datetime",
+    functions: &[
+        f("_datetime_now", 1, 1, Type::Any),
+        f("_datetime_strftime", 2, 2, Type::Str),
+    ],
+    constants: &[
+        c("datetime", Type::Any),
+        c("MINYEAR", Type::Int),
+        c("MAXYEAR", Type::Int),
+    ],
+};
+
+/// `typing`: annotation placeholders. The runtime values are inert (`None`,
+/// `False`, or empty classes); the frontend consumes annotations itself. Class
+/// bases (`Generic`, `NamedTuple`, `Protocol`) are exposed as constants so a
+/// class definition can subclass them.
+pub static TYPING: ModuleSpec = ModuleSpec {
+    name: "typing",
+    functions: &[
+        kw("cast", 2, 2, Type::Any, &["typ", "val"]),
+        f("runtime_checkable", 1, 1, Type::Any),
+        f("overload", 1, 1, Type::Any),
+        f("TypeVar", 1, 3, Type::Any),
+        f("NewType", 2, 2, Type::Any),
+        f("get_type_hints", 0, 1, Type::Dict),
+        f("get_args", 1, 1, Type::Tuple),
+    ],
+    constants: &[
+        c("TYPE_CHECKING", Type::Bool),
+        c("Any", Type::Any),
+        c("AnyStr", Type::Any),
+        c("BinaryIO", Type::Any),
+        c("Callable", Type::Any),
+        c("ClassVar", Type::Any),
+        c("Collection", Type::Any),
+        c("ContextManager", Type::Any),
+        c("DefaultDict", Type::Any),
+        c("Deque", Type::Any),
+        c("Dict", Type::Any),
+        c("Final", Type::Any),
+        c("ForwardRef", Type::Any),
+        c("Generator", Type::Any),
+        c("Generic", Type::Any),
+        c("IO", Type::Any),
+        c("Iterable", Type::Any),
+        c("Iterator", Type::Any),
+        c("List", Type::Any),
+        c("Literal", Type::Any),
+        c("Mapping", Type::Any),
+        c("Match", Type::Any),
+        c("NamedTuple", Type::Any),
+        c("NoReturn", Type::Any),
+        c("Optional", Type::Any),
+        c("Pattern", Type::Any),
+        c("Protocol", Type::Any),
+        c("Sequence", Type::Any),
+        c("Set", Type::Any),
+        c("TextIO", Type::Any),
+        c("Tuple", Type::Any),
+        c("Type", Type::Any),
+        c("Union", Type::Any),
+    ],
+};
+
+/// `abc`: the `ABC` base and the `abstractmethod` decorator.
+pub static ABC: ModuleSpec = ModuleSpec {
+    name: "abc",
+    functions: &[f("abstractmethod", 1, 1, Type::Any)],
+    constants: &[c("ABC", Type::Any)],
+};
+
+/// `enum`: placeholder enum bases and `auto()`.
+pub static ENUM: ModuleSpec = ModuleSpec {
+    name: "enum",
+    functions: &[f("auto", 0, 0, Type::Any)],
+    constants: &[c("Enum", Type::Any), c("IntEnum", Type::Any)],
+};
+
+/// `__future__`: the compile-time feature flags as booleans. The parser handles
+/// the actual feature semantics; the values only serve direct lookups.
+pub static FUTURE: ModuleSpec = ModuleSpec {
+    name: "__future__",
+    functions: &[],
+    constants: &[
+        c("annotations", Type::Bool),
+        c("barry_as_FLUFL", Type::Bool),
+        c("division", Type::Bool),
+        c("absolute_import", Type::Bool),
+        c("print_function", Type::Bool),
+        c("generator_stop", Type::Bool),
+        c("unicode_literals", Type::Bool),
+    ],
+};
+
+/// `types`: annotation/`isinstance` placeholders and `SimpleNamespace`.
+///
+/// `SimpleNamespace` takes one optional mapping; native module calls have no
+/// `**kwargs` lowering yet, so the mapping is the runtime spelling of
+/// CPython's keyword constructor.
+pub static TYPES: ModuleSpec = ModuleSpec {
+    name: "types",
+    functions: &[f("SimpleNamespace", 0, 1, Type::Any)],
+    constants: &[
+        c("CodeType", Type::Any),
+        c("FrameType", Type::Any),
+        c("FunctionType", Type::Any),
+        c("GenericAlias", Type::Any),
+        c("MappingProxyType", Type::Any),
+        c("ModuleType", Type::Any),
+        c("NoneType", Type::Any),
+        c("TracebackType", Type::Any),
+    ],
+};
+
+/// `itertools`: combinators materialised as lists (see the runtime module for
+/// the documented limitations).
+pub static ITERTOOLS: ModuleSpec = ModuleSpec {
+    name: "itertools",
+    functions: &[
+        f("islice", 2, 4, Type::List),
+        f("filterfalse", 2, 2, Type::List),
+        f("chain", 0, usize::MAX, Type::List),
+        f("zip_longest", 0, usize::MAX, Type::List),
+        f("count", 0, 2, Type::Any),
+        f("repeat", 1, 2, Type::List),
+        f("cycle", 1, 1, Type::List),
+        f("accumulate", 1, 3, Type::List),
+        f("tee", 1, 2, Type::Any),
+    ],
+    constants: &[],
+};
+
+/// `ast`: literal parsing for markup parameters.
+pub static AST: ModuleSpec = ModuleSpec {
+    name: "ast",
+    functions: &[f("literal_eval", 1, 1, Type::Any)],
+    constants: &[],
+};
+
+/// `fractions`: `Fraction` evaluates to a float quotient in this runtime.
+pub static FRACTIONS: ModuleSpec = ModuleSpec {
+    name: "fractions",
+    functions: &[f("Fraction", 1, 2, Type::Float)],
+    constants: &[],
+};
+
+/// `importlib`: dynamic imports of native modules and the Unicode-table shim.
+pub static IMPORTLIB: ModuleSpec = ModuleSpec {
+    name: "importlib",
+    functions: &[kw("import_module", 1, 2, Type::Any, &["name", "package"])],
+    constants: &[],
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stdlib::{constant, function};
+
+    #[test]
+    fn json_keyword_defaults_are_declared() {
+        let dumps = function("json", "dumps").expect("json.dumps");
+        assert_eq!(dumps.max_args, 5);
+        assert_eq!(
+            dumps.params,
+            &["obj", "indent", "ensure_ascii", "separators", "sort_keys"][..]
+        );
+        let dump = function("json", "dump").expect("json.dump");
+        assert_eq!(dump.max_args, 6);
+        assert_eq!(dump.params.last().copied(), Some("sort_keys"));
+    }
+
+    #[test]
+    fn datetime_and_dataclasses_constants_are_registered() {
+        assert_eq!(constant("datetime", "MINYEAR").unwrap().ty, Type::Int);
+        assert_eq!(constant("datetime", "MAXYEAR").unwrap().ty, Type::Int);
+        assert_eq!(constant("datetime", "datetime").unwrap().ty, Type::Any);
+        assert_eq!(function("datetime", "_datetime_now").unwrap().max_args, 1);
+        assert_eq!(
+            function("datetime", "_datetime_strftime").unwrap().min_args,
+            2
+        );
+        assert_eq!(constant("dataclasses", "dataclass").unwrap().ty, Type::Any);
+    }
+
+    #[test]
+    fn os_and_platform_new_entries() {
+        assert_eq!(function("os", "sysconf").unwrap().ret, Type::Int);
+        assert_eq!(function("os", "getloadavg").unwrap().ret, Type::Tuple);
+        assert_eq!(function("platform", "processor").unwrap().ret, Type::Str);
+    }
+
+    #[test]
+    fn typing_surface_is_registered() {
+        assert_eq!(
+            function("typing", "cast").unwrap().params,
+            &["typ", "val"][..]
+        );
+        assert_eq!(function("typing", "cast").unwrap().min_args, 2);
+        assert_eq!(function("typing", "runtime_checkable").unwrap().max_args, 1);
+        assert_eq!(function("typing", "overload").unwrap().min_args, 1);
+        let typevar = function("typing", "TypeVar").unwrap();
+        assert_eq!((typevar.min_args, typevar.max_args), (1, 3));
+        assert_eq!(function("typing", "NewType").unwrap().min_args, 2);
+        assert_eq!(
+            function("typing", "get_type_hints").unwrap().ret,
+            Type::Dict
+        );
+        assert_eq!(constant("typing", "TYPE_CHECKING").unwrap().ty, Type::Bool);
+        for name in [
+            "Any",
+            "Callable",
+            "Optional",
+            "Union",
+            "Dict",
+            "Iterable",
+            "List",
+            "Literal",
+            "Mapping",
+            "TextIO",
+            "Tuple",
+            "Type",
+            "IO",
+            "Sequence",
+            "ClassVar",
+            "Final",
+            "NoReturn",
+            "Generic",
+            "NamedTuple",
+            "Protocol",
+        ] {
+            assert_eq!(constant("typing", name).unwrap().ty, Type::Any, "{name}");
+        }
+    }
+
+    #[test]
+    fn abc_and_enum_surfaces_are_registered() {
+        assert_eq!(constant("abc", "ABC").unwrap().ty, Type::Any);
+        assert_eq!(function("abc", "abstractmethod").unwrap().max_args, 1);
+        assert_eq!(constant("enum", "Enum").unwrap().ty, Type::Any);
+        assert_eq!(constant("enum", "IntEnum").unwrap().ty, Type::Any);
+        let auto = function("enum", "auto").unwrap();
+        assert_eq!((auto.min_args, auto.max_args), (0, 0));
+    }
+
+    #[test]
+    fn future_and_types_surfaces_are_registered() {
+        for name in [
+            "annotations",
+            "generator_stop",
+            "barry_as_FLUFL",
+            "division",
+            "absolute_import",
+            "print_function",
+            "unicode_literals",
+        ] {
+            assert_eq!(
+                constant("__future__", name).unwrap().ty,
+                Type::Bool,
+                "{name}"
+            );
+        }
+        for name in [
+            "FrameType",
+            "ModuleType",
+            "TracebackType",
+            "FunctionType",
+            "CodeType",
+            "GenericAlias",
+            "MappingProxyType",
+            "NoneType",
+        ] {
+            assert_eq!(constant("types", name).unwrap().ty, Type::Any, "{name}");
+        }
+        let namespace = function("types", "SimpleNamespace").unwrap();
+        assert_eq!((namespace.min_args, namespace.max_args), (0, 1));
+    }
+
+    #[test]
+    fn itertools_surface_is_registered() {
+        let islice = function("itertools", "islice").unwrap();
+        assert_eq!((islice.min_args, islice.max_args), (2, 4));
+        assert_eq!(function("itertools", "filterfalse").unwrap().min_args, 2);
+        assert_eq!(function("itertools", "chain").unwrap().max_args, usize::MAX);
+        assert_eq!(
+            function("itertools", "zip_longest").unwrap().max_args,
+            usize::MAX
+        );
+        assert_eq!(function("itertools", "count").unwrap().max_args, 2);
+        assert_eq!(function("itertools", "repeat").unwrap().max_args, 2);
+        assert_eq!(function("itertools", "cycle").unwrap().max_args, 1);
+        assert_eq!(function("itertools", "accumulate").unwrap().max_args, 3);
+        assert_eq!(function("itertools", "tee").unwrap().max_args, 2);
+    }
+
+    #[test]
+    fn ast_fractions_and_importlib_are_registered() {
+        assert_eq!(function("ast", "literal_eval").unwrap().max_args, 1);
+        let fraction = function("fractions", "Fraction").unwrap();
+        assert_eq!((fraction.min_args, fraction.max_args), (1, 2));
+        assert_eq!(fraction.ret, Type::Float);
+        let import_module = function("importlib", "import_module").unwrap();
+        assert_eq!(import_module.params, &["name", "package"][..]);
+    }
+
+    #[test]
+    fn functools_and_operator_helpers_are_registered() {
+        assert_eq!(function("functools", "cache").unwrap().min_args, 1);
+        let lru_cache = function("functools", "lru_cache").unwrap();
+        assert_eq!(lru_cache.params, &["maxsize", "typed"][..]);
+        assert_eq!(function("functools", "wraps").unwrap().max_args, 1);
+        let partial = function("functools", "partial").unwrap();
+        assert_eq!(partial.max_args, usize::MAX);
+        assert_eq!(partial.params, &["func"][..]);
+        assert!(partial.dynamic_keywords);
+        assert!(!lru_cache.dynamic_keywords);
+        assert_eq!(
+            function("operator", "attrgetter").unwrap().max_args,
+            usize::MAX
+        );
+        assert_eq!(
+            function("operator", "itemgetter").unwrap().max_args,
+            usize::MAX
+        );
+        assert_eq!(
+            function("operator", "attrgetter").unwrap().ret,
+            Type::Function
+        );
+    }
+
+    #[test]
+    fn re_flags_are_registered_as_ints() {
+        for name in [
+            "NOFLAG",
+            "TEMPLATE",
+            "T",
+            "IGNORECASE",
+            "I",
+            "LOCALE",
+            "L",
+            "MULTILINE",
+            "M",
+            "DOTALL",
+            "S",
+            "UNICODE",
+            "U",
+            "VERBOSE",
+            "X",
+            "ASCII",
+            "A",
+            "DEBUG",
+        ] {
+            assert_eq!(constant("re", name).expect(name).ty, Type::Int, "{name}");
+        }
+        // `compile(pattern, flags=0)` takes the optional flag argument.
+        let compile = function("re", "compile").expect("re.compile");
+        assert_eq!((compile.min_args, compile.max_args), (1, 2));
+        let finditer = function("re", "finditer").expect("re.finditer");
+        assert_eq!((finditer.min_args, finditer.max_args), (2, 3));
+        assert_eq!(finditer.params, &["pattern", "string", "flags"][..]);
+        assert_eq!(finditer.ret, Type::List);
+    }
+
+    #[test]
+    fn math_gcd_is_registered_as_a_variadic_int_function() {
+        let gcd = function("math", "gcd").expect("math.gcd");
+        assert_eq!((gcd.min_args, gcd.max_args), (0, usize::MAX));
+        assert_eq!(gcd.ret, Type::Int);
+    }
+}

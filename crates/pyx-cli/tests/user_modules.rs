@@ -149,3 +149,86 @@ fn check_reports_circular_import() {
         "missing cycle diagnostic:\n{stderr}"
     );
 }
+
+#[test]
+fn function_local_import_not_called_runs() {
+    let dir = TestDir::new("deferred-import-uncalled");
+    dir.write("helper.py", "def add(a, b):\n    return a + b\n");
+    let main = dir.write(
+        "main.py",
+        "def run():\n    from helper import add\n    return add(1, 2)\n\nprint('ok')\n",
+    );
+    let main = main.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", main.as_str()]);
+    assert_eq!(code, 0, "pyx run failed:\n{stderr}");
+    assert_eq!(stdout, "ok\n");
+}
+
+#[test]
+fn function_local_import_call_raises_at_runtime() {
+    let dir = TestDir::new("deferred-import");
+    dir.write("helper.py", "def add(a, b):\n    return a + b\n");
+    let main = dir.write(
+        "main.py",
+        "def run():\n    from helper import add\n    return add(1, 2)\n\nprint(run())\n",
+    );
+    let main = main.to_string_lossy().into_owned();
+    let (code, _stdout, stderr) = run(&["run", main.as_str()]);
+    assert_ne!(code, 0, "the deferred call must fail:\n{stderr}");
+    assert!(
+        stderr.contains("RuntimeError: dynamic import of 'helper.add' is not supported"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn top_level_import_still_initializes_next_to_a_nested_import() {
+    let dir = TestDir::new("deferred-top-level");
+    dir.write("helper.py", "VALUE = 5\n");
+    let main = dir.write(
+        "main.py",
+        "import helper\n\ndef unused():\n    from nowhere import thing\n    return thing()\n\nprint(helper.VALUE)\n",
+    );
+    let main = main.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", main.as_str()]);
+    assert_eq!(code, 0, "pyx run failed:\n{stderr}");
+    assert_eq!(stdout, "5\n");
+}
+
+#[test]
+fn function_local_package_import_call_raises_at_runtime() {
+    let dir = TestDir::new("deferred-package");
+    std::fs::create_dir_all(dir.path().join("pkg")).expect("create package dir");
+    dir.write("pkg/__init__.py", "");
+    dir.write("pkg/sub.py", "def value():\n    return 7\n");
+    let main = dir.write(
+        "main.py",
+        "def run():\n    from pkg import sub\n    return sub.value()\n\nprint(run())\n",
+    );
+    let main = main.to_string_lossy().into_owned();
+    let (code, _stdout, stderr) = run(&["run", main.as_str()]);
+    assert_ne!(code, 0, "the deferred call must fail:\n{stderr}");
+    assert!(
+        stderr.contains("RuntimeError: dynamic import of 'pkg.sub.value' is not supported"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn submodule_imports_initializing_package_member_at_runtime() {
+    let dir = TestDir::new("initializing-parent");
+    std::fs::create_dir_all(dir.path().join("pkg")).expect("create package dir");
+    dir.write(
+        "pkg/__init__.py",
+        "from .child import run\n\ndef greeting():\n    return 'hi'\n",
+    );
+    dir.write(
+        "pkg/child.py",
+        "from . import greeting\n\ndef run():\n    return greeting()\n",
+    );
+    let main = dir.write("main.py", "from pkg.child import run\nprint(run())\n");
+    let main = main.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", main.as_str()]);
+    assert_eq!(code, 0, "pyx run failed:\n{stderr}");
+    assert_eq!(stdout, "hi\n");
+}

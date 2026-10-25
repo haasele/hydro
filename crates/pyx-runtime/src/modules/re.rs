@@ -1,12 +1,14 @@
 //! `re`: thin wrappers over the `regex` crate with Python-like semantics.
 //!
-//! Supported: `search`, `match`, `fullmatch`, `findall`, `sub`, `split`,
-//! `escape` and `compile` (patterns and matches are native objects with the
-//! corresponding methods). Patterns and match objects are immutable and hold
-//! no PyX values. Invalid patterns raise `ValueError`; non-string inputs raise
-//! `TypeError`.
+//! Supported: `search`, `match`, `fullmatch`, `findall`, `finditer`, `sub`,
+//! `split`, `escape` and `compile` (patterns and matches are native objects
+//! with the corresponding methods). `compile` accepts the `re.RegexFlag` bits
+//! it can honour (`IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE` and their
+//! short aliases); the compiled pattern keeps them for every method call.
+//! Patterns and match objects are immutable and hold no PyX values. Invalid
+//! patterns raise `ValueError`; non-string inputs raise `TypeError`.
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use crate::exc::{self, ATTRIBUTE_ERROR, INDEX_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value::{self, NONE};
@@ -14,6 +16,45 @@ use crate::value::{self, NONE};
 /// State of an `re.compile()` result.
 pub(crate) struct PatternState {
     pub(crate) source: String,
+    /// The `re.RegexFlag` bits the pattern was compiled with, so every
+    /// `Pattern` method recompiles with the same options.
+    pub(crate) flags: i64,
+}
+
+/// `re.RegexFlag` bits, with CPython's numeric values.
+pub(crate) const TEMPLATE: i64 = 1;
+pub(crate) const IGNORECASE: i64 = 2;
+pub(crate) const LOCALE: i64 = 4;
+pub(crate) const MULTILINE: i64 = 8;
+pub(crate) const DOTALL: i64 = 16;
+pub(crate) const UNICODE: i64 = 32;
+pub(crate) const VERBOSE: i64 = 64;
+pub(crate) const DEBUG: i64 = 128;
+pub(crate) const ASCII: i64 = 256;
+
+/// Module-level `re.RegexFlag` members (they are plain ints here).
+pub(crate) fn constant(name: &str) -> i64 {
+    let bits = match name {
+        "NOFLAG" => 0,
+        "TEMPLATE" | "T" => TEMPLATE,
+        "IGNORECASE" | "I" => IGNORECASE,
+        "LOCALE" | "L" => LOCALE,
+        "MULTILINE" | "M" => MULTILINE,
+        "DOTALL" | "S" => DOTALL,
+        "UNICODE" | "U" => UNICODE,
+        "VERBOSE" | "X" => VERBOSE,
+        "DEBUG" => DEBUG,
+        "ASCII" | "A" => ASCII,
+        // The spec table only announces the names above; anything else is
+        // still reported like a missing module attribute.
+        _ => {
+            return exc::raise_with_message(
+                ATTRIBUTE_ERROR,
+                &format!("module 're' has no attribute '{name}'"),
+            )
+        }
+    };
+    value::encode_int(bits).unwrap_or(NONE)
 }
 
 /// State of a successful match: the searched text and byte positions of the
@@ -63,19 +104,36 @@ fn text_argument(value: i64, position: &str) -> Result<String, i64> {
     }
 }
 
-fn compile_source(source: &str) -> Result<Regex, i64> {
-    Regex::new(source).map_err(regex_error)
+/// Compiles `source` with the Python flag bits in `flags`.
+///
+/// `VERBOSE`/`X` enables verbose mode (whitespace ignored and `#` starts a
+/// comment), `IGNORECASE`/`I` folds case, `MULTILINE`/`M` makes `^` and `$`
+/// match at line breaks, and `DOTALL`/`S` lets `.` match a newline. `ASCII`,
+/// `UNICODE`, `LOCALE`, `TEMPLATE` and `DEBUG` do not change how the patterns
+/// this runtime supports are parsed, so they are accepted and ignored.
+///
+/// One documented divergence: the `regex` crate also drops whitespace inside a
+/// character class in verbose mode, while CPython keeps it literal
+/// (`[a b]` matches a space in Python only).
+fn compile_source(source: &str, flags: i64) -> Result<Regex, i64> {
+    RegexBuilder::new(source)
+        .case_insensitive(flags & IGNORECASE != 0)
+        .multi_line(flags & MULTILINE != 0)
+        .dot_matches_new_line(flags & DOTALL != 0)
+        .ignore_whitespace(flags & VERBOSE != 0)
+        .build()
+        .map_err(regex_error)
 }
 
 /// Compiles `source` with an anchored wrapper. The wrapper is non-capturing,
 /// so user group numbers are unchanged.
-fn compile_anchored(source: &str, full: bool) -> Result<Regex, i64> {
+fn compile_anchored(source: &str, full: bool, flags: i64) -> Result<Regex, i64> {
     let wrapped = if full {
         format!(r"\A(?:{source})\z")
     } else {
         format!(r"\A(?:{source})")
     };
-    Regex::new(&wrapped).map_err(regex_error)
+    compile_source(&wrapped, flags)
 }
 
 fn make_match(pattern: &str, text: &str, captures: &regex::Captures<'_>) -> i64 {
@@ -87,14 +145,14 @@ fn make_match(pattern: &str, text: &str, captures: &regex::Captures<'_>) -> i64 
 }
 
 /// `re.search`/`re.match`/`re.fullmatch`.
-fn match_mode(source: &str, text: &str, full: bool, anchored: bool) -> i64 {
+fn match_mode(source: &str, text: &str, full: bool, anchored: bool, flags: i64) -> i64 {
     let regex = if anchored {
-        match compile_anchored(source, full) {
+        match compile_anchored(source, full, flags) {
             Ok(regex) => regex,
             Err(err) => return err,
         }
     } else {
-        match compile_source(source) {
+        match compile_source(source, flags) {
             Ok(regex) => regex,
             Err(err) => return err,
         }
@@ -107,8 +165,8 @@ fn match_mode(source: &str, text: &str, full: bool, anchored: bool) -> i64 {
 
 /// `re.findall`: whole matches, the single group, or a tuple of groups when
 /// the pattern has more than one group (CPython semantics).
-fn findall(source: &str, text: &str) -> i64 {
-    let regex = match compile_source(source) {
+fn findall(source: &str, text: &str, flags: i64) -> i64 {
+    let regex = match compile_source(source, flags) {
         Ok(regex) => regex,
         Err(err) => return err,
     };
@@ -136,6 +194,27 @@ fn findall(source: &str, text: &str) -> i64 {
                 .collect();
             value::tuple_new(parts)
         };
+        if let Some(mut items) = value::list_items_mut(result) {
+            items.push(item);
+            crate::heap::write_barrier_edge(result, item);
+        }
+    }
+    result
+}
+
+/// `re.finditer`: every non-overlapping match as a `Match` object in a list.
+///
+/// The list is materialised eagerly so the result behaves like an iterable
+/// for `for` loops, `list()` and indexing; each match keeps the same group
+/// layout as [`match_mode`].
+fn finditer(source: &str, text: &str, flags: i64) -> i64 {
+    let regex = match compile_source(source, flags) {
+        Ok(regex) => regex,
+        Err(err) => return err,
+    };
+    let result = value::list_new(Vec::new());
+    for captures in regex.captures_iter(text) {
+        let item = make_match(source, text, &captures);
         if let Some(mut items) = value::list_items_mut(result) {
             items.push(item);
             crate::heap::write_barrier_edge(result, item);
@@ -196,6 +275,27 @@ fn replacement(text: &str) -> String {
     out
 }
 
+/// Reads the optional `flags` argument of `re.compile`/`re.finditer`.
+///
+/// CPython accepts an integer bit set (a `RegexFlag` member or the OR of
+/// several); `None` fills an omitted optional parameter in the lowered call,
+/// so it maps to the default flag set.
+fn flags_argument(raw: Option<i64>) -> Result<i64, i64> {
+    let Some(raw) = raw else {
+        return Ok(0);
+    };
+    if raw == NONE {
+        return Ok(0);
+    }
+    match value::as_integer(raw) {
+        Some(flags) => Ok(flags),
+        None => Err(type_error(&format!(
+            "flags must be an integer, not {}",
+            value::type_name(raw)
+        ))),
+    }
+}
+
 fn count_argument(raw: i64, name: &str) -> Result<usize, i64> {
     if raw == NONE {
         return Ok(0);
@@ -210,7 +310,7 @@ fn count_argument(raw: i64, name: &str) -> Result<usize, i64> {
     }
 }
 
-fn sub(source: &str, args: &[i64]) -> i64 {
+fn sub(source: &str, flags: i64, args: &[i64]) -> i64 {
     let repl = match value::as_str(args[0]) {
         Some(text) => replacement(text),
         None => {
@@ -232,7 +332,7 @@ fn sub(source: &str, args: &[i64]) -> i64 {
     } else {
         0
     };
-    let regex = match compile_source(source) {
+    let regex = match compile_source(source, flags) {
         Ok(regex) => regex,
         Err(err) => return err,
     };
@@ -240,7 +340,7 @@ fn sub(source: &str, args: &[i64]) -> i64 {
     value::str_alloc(result.into_owned())
 }
 
-fn split(source: &str, args: &[i64]) -> i64 {
+fn split(source: &str, flags: i64, args: &[i64]) -> i64 {
     let text = match text_argument(args[0], "string") {
         Ok(text) => text,
         Err(err) => return err,
@@ -253,7 +353,7 @@ fn split(source: &str, args: &[i64]) -> i64 {
     } else {
         0
     };
-    let regex = match compile_source(source) {
+    let regex = match compile_source(source, flags) {
         Ok(regex) => regex,
         Err(err) => return err,
     };
@@ -283,20 +383,26 @@ fn push_part(result: i64, part: &str) {
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "compile" => {
+            // Already-compiled patterns are returned unchanged; their own
+            // flags travel with them.
             if value::as_pattern(args[0]).is_some() {
                 return args[0];
             }
+            let flags = match flags_argument(args.get(1).copied()) {
+                Ok(flags) => flags,
+                Err(err) => return err,
+            };
             let source = match pattern_source(args[0]) {
                 Ok(source) => source,
                 Err(err) => return err,
             };
-            let regex = match compile_source(&source) {
+            let regex = match compile_source(&source, flags) {
                 Ok(regex) => regex,
                 Err(err) => return err,
             };
             {
                 let _ = regex;
-                value::pattern_new(source)
+                value::pattern_new(source, flags)
             }
         }
         "escape" => match value::as_str(args[0]) {
@@ -322,6 +428,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                         &text,
                         function == "fullmatch",
                         function != "search",
+                        0,
                     )
                 }
                 "findall" => {
@@ -329,10 +436,21 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                         Ok(text) => text,
                         Err(err) => return err,
                     };
-                    findall(&source, &text)
+                    findall(&source, &text, 0)
                 }
-                "sub" => sub(&source, &args[1..]),
-                "split" => split(&source, &args[1..]),
+                "finditer" => {
+                    let text = match text_argument(args[1], "string") {
+                        Ok(text) => text,
+                        Err(err) => return err,
+                    };
+                    let flags = match flags_argument(args.get(2).copied()) {
+                        Ok(flags) => flags,
+                        Err(err) => return err,
+                    };
+                    finditer(&source, &text, flags)
+                }
+                "sub" => sub(&source, 0, &args[1..]),
+                "split" => split(&source, 0, &args[1..]),
                 _ => exc::raise_with_message(
                     ATTRIBUTE_ERROR,
                     &format!("module 're' has no attribute '{function}'"),
@@ -348,6 +466,7 @@ pub(crate) fn pattern_method(obj: i64, name: &str, args: &[i64]) -> i64 {
         return attribute_error("Pattern", name);
     };
     let source = state.source.clone();
+    let flags = state.flags;
     match name {
         "search" | "match" | "fullmatch" => {
             if let Some(err) = pattern_arity(name, args.len(), 1) {
@@ -357,7 +476,7 @@ pub(crate) fn pattern_method(obj: i64, name: &str, args: &[i64]) -> i64 {
                 Ok(text) => text,
                 Err(err) => return err,
             };
-            match_mode(&source, &text, name == "fullmatch", name != "search")
+            match_mode(&source, &text, name == "fullmatch", name != "search", flags)
         }
         "findall" => {
             if let Some(err) = pattern_arity(name, args.len(), 1) {
@@ -367,7 +486,17 @@ pub(crate) fn pattern_method(obj: i64, name: &str, args: &[i64]) -> i64 {
                 Ok(text) => text,
                 Err(err) => return err,
             };
-            findall(&source, &text)
+            findall(&source, &text, flags)
+        }
+        "finditer" => {
+            if let Some(err) = pattern_arity(name, args.len(), 1) {
+                return err;
+            }
+            let text = match text_argument(args[0], "string") {
+                Ok(text) => text,
+                Err(err) => return err,
+            };
+            finditer(&source, &text, flags)
         }
         "sub" => {
             if args.len() < 2 || args.len() > 3 {
@@ -376,7 +505,7 @@ pub(crate) fn pattern_method(obj: i64, name: &str, args: &[i64]) -> i64 {
                     args.len()
                 ));
             }
-            sub(&source, args)
+            sub(&source, flags, args)
         }
         "split" => {
             if args.is_empty() || args.len() > 2 {
@@ -385,7 +514,7 @@ pub(crate) fn pattern_method(obj: i64, name: &str, args: &[i64]) -> i64 {
                     args.len()
                 ));
             }
-            split(&source, args)
+            split(&source, flags, args)
         }
         _ => attribute_error("Pattern", name),
     }
@@ -453,11 +582,12 @@ pub(crate) fn match_method(obj: i64, name: &str, args: &[i64]) -> i64 {
     }
 }
 
-/// `pattern` data attribute of a compiled pattern.
+/// `pattern` and `flags` data attributes of a compiled pattern.
 pub(crate) fn pattern_attr(obj: i64, attr: &str) -> Option<i64> {
     let state = value::as_pattern(obj)?;
     match attr {
         "pattern" => Some(value::str_alloc(state.source.clone())),
+        "flags" => Some(crate::ops::int_result(state.flags)),
         _ => None,
     }
 }

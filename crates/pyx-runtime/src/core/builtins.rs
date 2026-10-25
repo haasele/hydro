@@ -1,13 +1,17 @@
 //! Builtin functions: `print`, `len`, `str`, `int`, `float`, `abs`, `range`,
-//! `list`, `dict`, `sum`, `enumerate`, `zip` (ARCHITECTURE §3.2).
+//! `list`, `dict`, `sum`, `enumerate`, `zip`, `ord`, `chr`, `divmod`,
+//! `callable` (ARCHITECTURE §3.2).
 
 use std::io::Write as _;
 use std::num::IntErrorKind;
 
-use pyx_ir::Builtin;
+use pyx_ir::{Builtin, MethodKind};
 
 use crate::container;
-use crate::exc::{self, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{
+    self, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
+};
+use crate::format;
 use crate::iter;
 use crate::methods;
 use crate::modules;
@@ -53,6 +57,27 @@ pub(crate) fn to_str(v: i64) -> i64 {
     value::str_alloc(value::to_string(v))
 }
 
+/// `repr(v)` as a fresh string object.
+pub(crate) fn to_repr(v: i64) -> i64 {
+    value::str_alloc(value::repr(v))
+}
+
+/// `hash(v)`: the runtime's dict-key hash mapped into a non-negative tagged
+/// integer.
+///
+/// Equal values hash equally (`1`, `1.0` and `True` share a hash) and
+/// unhashable values raise `TypeError`, matching their use as dict keys. The
+/// value is deterministic per process but implementation-defined and not
+/// reproducible against CPython.
+pub(crate) fn hash(v: i64) -> i64 {
+    if let Some(name) = container::unhashable_name(v) {
+        return exc::raise_with_message(TYPE_ERROR, &container::unhashable_message(name));
+    }
+    // Drop the low 4 bits so the 64-bit hash always fits the 61-bit tagged
+    // integer as a non-negative value.
+    ops::int_result((container::key_hash(v) >> 4) as i64)
+}
+
 /// `len(v)`: strings count Unicode scalar values, lists/tuples their elements
 /// and dicts their keys.
 pub(crate) fn len(v: i64) -> i64 {
@@ -84,6 +109,58 @@ pub(crate) fn len(v: i64) -> i64 {
         TYPE_ERROR,
         &format!("object of type '{}' has no len()", value::type_name(v)),
     )
+}
+
+/// `ord(c)`: the Unicode scalar value of a one-character string.
+///
+/// A string with any other length (including the empty string) raises
+/// `TypeError`, as does a non-string argument.
+pub(crate) fn ord_value(v: i64) -> i64 {
+    let Some(s) = value::as_str(v) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "ord() expected string of length 1, but {} found",
+                value::type_name(v)
+            ),
+        );
+    };
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => ops::int_result(ch as i64),
+        _ => {
+            let len = s.chars().count();
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("ord() expected a character, but string of length {len} found"),
+            )
+        }
+    }
+}
+
+/// `chr(i)`: the one-character string for a Unicode scalar value.
+///
+/// `i` must be an integer in `0..=0x10FFFF`; surrogate code points are
+/// rejected because PyX strings are UTF-8 and cannot represent them. A
+/// non-integer argument raises `TypeError`, a rejected code point
+/// `ValueError`.
+pub(crate) fn chr_value(v: i64) -> i64 {
+    let Some(code) = value::as_integer(v) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "chr() argument must be an int, not '{}'",
+                value::type_name(v)
+            ),
+        );
+    };
+    if !(0..=0x10FFFF).contains(&code) {
+        return exc::raise_with_message(VALUE_ERROR, "chr() arg not in range(0x110000)");
+    }
+    match char::from_u32(code as u32) {
+        Some(ch) => value::str_alloc(ch.to_string()),
+        None => exc::raise_with_message(VALUE_ERROR, "chr() arg cannot be a surrogate code point"),
+    }
 }
 
 /// `int(v)`.
@@ -130,6 +207,89 @@ pub(crate) fn to_int(v: i64) -> i64 {
     )
 }
 
+/// `int(string, base)` for an explicit base (2..36, or 0 with prefixes).
+fn to_int_base(value_arg: i64, base_arg: i64) -> i64 {
+    if base_arg == NONE {
+        return to_int(value_arg);
+    }
+    let Some(base) = value::as_integer(base_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "int() base must be an integer, not '{}'",
+                value::type_name(base_arg)
+            ),
+        );
+    };
+    if base == 10 {
+        return to_int(value_arg);
+    }
+    if !(base == 0 || (2..=36).contains(&base)) {
+        return exc::raise_with_message(VALUE_ERROR, "int() base must be >= 2 and <= 36, or 0");
+    }
+    let Some(text) = value::as_str(value_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "int() can't convert non-string with explicit base",
+        );
+    };
+    let text = text.trim();
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (radix, digits) = if base == 0 {
+        if let Some(rest) = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            (16, rest)
+        } else if let Some(rest) = digits
+            .strip_prefix("0o")
+            .or_else(|| digits.strip_prefix("0O"))
+        {
+            (8, rest)
+        } else if let Some(rest) = digits
+            .strip_prefix("0b")
+            .or_else(|| digits.strip_prefix("0B"))
+        {
+            (2, rest)
+        } else if digits.len() > 1 && digits.starts_with('0') {
+            (8, &digits[1..])
+        } else {
+            (10, digits)
+        }
+    } else {
+        (base as u32, digits)
+    };
+    if digits.is_empty() {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("invalid literal for int() with base {base}: '{text}'"),
+        );
+    }
+    let mut result: i64 = 0;
+    for ch in digits.chars() {
+        let digit = match ch.to_digit(radix) {
+            Some(digit) => i64::from(digit),
+            None => {
+                return exc::raise_with_message(
+                    VALUE_ERROR,
+                    &format!("invalid literal for int() with base {base}: '{text}'"),
+                )
+            }
+        };
+        let Some(next) = result
+            .checked_mul(i64::from(radix))
+            .and_then(|value| value.checked_add(digit))
+        else {
+            return exc::raise_with_message(OVERFLOW_ERROR, "integer overflow");
+        };
+        result = next;
+    }
+    ops::int_result(if negative { -result } else { result })
+}
+
 /// `float(v)`.
 pub(crate) fn to_float(v: i64) -> i64 {
     if let Some(n) = value::as_integer(v) {
@@ -170,6 +330,87 @@ pub(crate) fn abs(v: i64) -> i64 {
     exc::raise_with_message(
         TYPE_ERROR,
         &format!("bad operand type for abs(): '{}'", value::type_name(v)),
+    )
+}
+
+/// `divmod(a, b)`: Python's floored quotient and remainder as a 2-tuple.
+///
+/// Integers use floor division (the remainder takes the divisor's sign and
+/// division towards negative infinity). Floats follow CPython's `fmod`
+/// adjustment, so `divmod(-7.5, 2.0) == (-4.0, 0.5)`. A zero divisor raises
+/// `ZeroDivisionError` and a non-numeric operand raises `TypeError`.
+pub(crate) fn divmod(a: i64, b: i64) -> i64 {
+    match (value::num_of(a), value::num_of(b)) {
+        (Some(value::Num::Int(p)), Some(value::Num::Int(q))) => {
+            if q == 0 {
+                return exc::raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
+            }
+            let (Some(mut quotient), Some(mut remainder)) = (p.checked_div(q), p.checked_rem(q))
+            else {
+                return exc::raise_with_message(OVERFLOW_ERROR, "integer overflow");
+            };
+            if remainder != 0 && ((remainder < 0) != (q < 0)) {
+                remainder += q;
+                quotient -= 1;
+            }
+            value::tuple_new(vec![ops::int_result(quotient), ops::int_result(remainder)])
+        }
+        (Some(x), Some(y)) => {
+            let dividend = match x {
+                value::Num::Int(n) => n as f64,
+                value::Num::Float(f) => f,
+            };
+            let divisor = match y {
+                value::Num::Int(n) => n as f64,
+                value::Num::Float(f) => f,
+            };
+            if divisor == 0.0 {
+                return exc::raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
+            }
+            let mut modulo = dividend % divisor;
+            if modulo != 0.0 {
+                // The remainder takes the divisor's sign.
+                if (divisor < 0.0) != (modulo < 0.0) {
+                    modulo += divisor;
+                }
+            } else {
+                // Preserve the divisor's sign on an exact zero, as CPython
+                // does (`divmod(4.0, 2.0) == (2.0, 0.0)`).
+                modulo = 0.0_f64.copysign(divisor);
+            }
+            // Derive the floored quotient from the adjusted remainder so the
+            // identity `dividend == quotient * divisor + modulo` holds.
+            let mut quotient = if modulo != 0.0 {
+                (dividend - modulo) / divisor
+            } else {
+                dividend / divisor
+            };
+            if quotient != 0.0 {
+                quotient = quotient.copysign(dividend / divisor);
+            }
+            value::tuple_new(vec![value::float_new(quotient), value::float_new(modulo)])
+        }
+        _ => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "unsupported operand type(s) for divmod(): '{}' and '{}'",
+                value::type_name(a),
+                value::type_name(b)
+            ),
+        ),
+    }
+}
+
+/// `callable(v)`: whether `v` can be called like a function.
+///
+/// This mirrors the values [`call`] accepts: functions (including builtins,
+/// native module functions, getters and partials), classes and extension
+/// functions.
+pub(crate) fn callable(v: i64) -> i64 {
+    value::bool_value(
+        value::as_function(v).is_some()
+            || value::as_class(v).is_some()
+            || value::as_ext_function(v).is_some(),
     )
 }
 
@@ -348,6 +589,23 @@ pub(crate) fn list_from(iterable: i64) -> i64 {
         }
     }
     result
+}
+
+/// `tuple(iterable)`: materialises the elements in iteration order.
+///
+/// A list is copied into a fresh tuple; other iterables are consumed through
+/// the iterator protocol, so generators work. The intermediate list roots the
+/// consumed values while the tuple is allocated.
+pub(crate) fn tuple_from(iterable: i64) -> i64 {
+    let list = list_from(iterable);
+    if exc::pending() {
+        return NONE;
+    }
+    let items = match value::as_list(list) {
+        Some(items) => items.to_vec(),
+        None => Vec::new(),
+    };
+    value::tuple_new(items)
 }
 
 /// Returns the elements of a list/tuple pair candidate.
@@ -598,7 +856,19 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
     match &func.body {
         FunctionBody::Wrapper { entry, captures } => {
             let arity = func.arity;
-            if arity != argc {
+            // A dynamic signature stores the minimum positional arity and
+            // lets the generated wrapper bind defaults, `*args` and
+            // `**kwargs`; an ordinary wrapper takes exactly `arity`
+            // arguments.
+            let varargs = func.flags & value::FUNCTION_FLAG_VARARGS != 0;
+            if varargs {
+                if argc < arity {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("function takes at least {arity} arguments ({argc} given)"),
+                    );
+                }
+            } else if arity != argc {
                 return exc::raise_with_message(
                     TYPE_ERROR,
                     &format!("function takes {arity} arguments ({argc} given)"),
@@ -607,11 +877,32 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             if *entry == 0 {
                 return exc::raise_with_message(RUNTIME_ERROR, "function has no code");
             }
+            // The wrapper's argument buffer for a dynamic signature starts
+            // with the tagged total count (captures + user arguments), so the
+            // wrapper can tell how many positional arguments the caller
+            // supplied.
+            let total = captures.len() + argc;
+            let count_value = if varargs {
+                match value::encode_int(total as i64) {
+                    Some(count) => Some(count),
+                    None => {
+                        return exc::raise_with_message(
+                            RUNTIME_ERROR,
+                            "too many arguments for the call frame",
+                        )
+                    }
+                }
+            } else {
+                None
+            };
             // A generator/coroutine call does not run the body: it creates a
             // lazy fiber object. The wrapper receives captures followed by
             // the user arguments on its first resume.
             if func.flags & (value::FUNCTION_FLAG_ASYNC | value::FUNCTION_FLAG_GENERATOR) != 0 {
-                let mut args: Vec<i64> = Vec::with_capacity(captures.len() + argc);
+                let mut args: Vec<i64> = Vec::with_capacity(usize::from(varargs) + total);
+                if let Some(count) = count_value {
+                    args.push(count);
+                }
                 args.extend_from_slice(captures);
                 if argc > 0 {
                     // SAFETY: checked above for NULL; caller contract.
@@ -636,14 +927,18 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             // The generated wrapper takes captures followed by user
             // arguments. Avoid a copy for ordinary functions.
             let mut buffer: Vec<i64> = Vec::new();
-            let argv = if captures.is_empty() {
+            let argv = if !varargs && captures.is_empty() {
                 if argc == 0 {
                     std::ptr::null()
                 } else {
                     argv
                 }
             } else {
-                buffer.reserve(captures.len() + argc);
+                let prefix = usize::from(varargs);
+                buffer.reserve(prefix + total);
+                if let Some(count) = count_value {
+                    buffer.push(count);
+                }
                 buffer.extend_from_slice(captures);
                 if argc > 0 {
                     // SAFETY: the caller passed a valid buffer for `argc`
@@ -666,6 +961,254 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
         }
         FunctionBody::Native { module, name } => modules::call_native(module, name, argc, argv),
         FunctionBody::Builtin(builtin) => call_builtin(*builtin, argc, argv),
+        FunctionBody::AttributeGetter { names } => attribute_getter_call(names, argc, argv),
+        FunctionBody::ItemGetter { keys } => item_getter_call(keys, argc, argv),
+        FunctionBody::Partial {
+            function: inner,
+            args: bound,
+            keywords,
+        } => {
+            if argc > 0 && argv.is_null() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "partial call received arguments without an argument buffer",
+                );
+            }
+            let mut call_args = Vec::with_capacity(bound.len() + argc);
+            call_args.extend_from_slice(bound);
+            if argc > 0 {
+                // SAFETY: checked above for NULL; the caller's ABI contract
+                // makes `argv..argv+argc` readable.
+                let supplied = unsafe { std::slice::from_raw_parts(argv, argc) };
+                call_args.extend_from_slice(supplied);
+            }
+            if keywords.is_empty() {
+                call(*inner, call_args.len(), call_args.as_ptr())
+            } else {
+                // The bound keyword values move into the target's positional
+                // slots in parameter order.
+                call_with_keywords(*inner, call_args, keywords)
+            }
+        }
+        FunctionBody::Identity => {
+            if argc != 1 || argv.is_null() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{}() takes exactly one argument", func.name),
+                );
+            }
+            // SAFETY: exactly one argument was checked above.
+            unsafe { *argv }
+        }
+    }
+}
+
+/// Calls `target` with `args` plus keyword pairs bound by parameter name.
+///
+/// Used by `functools.partial`: only a generated wrapper with a plain
+/// positional signature carries its parameter names (codegen attaches them
+/// through `pyx_function_params`). Every keyword must name a parameter that is
+/// not already filled by a positional argument; a hole before a named
+/// parameter would need the target's defaults, which are applied by the
+/// wrapper, so it is reported as a missing argument. A callable without
+/// parameter names (native function, builtin, getter or a dynamic signature)
+/// raises `TypeError` instead of dropping the keywords.
+fn call_with_keywords(target: i64, args: Vec<i64>, keywords: &[(String, i64)]) -> i64 {
+    let Some(func) = value::as_function(target) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("'{}' object is not callable", value::type_name_of(target)),
+        );
+    };
+    let name = func.name.clone();
+    let varargs = func.flags & value::FUNCTION_FLAG_VARARGS != 0;
+    if varargs || !matches!(&func.body, FunctionBody::Wrapper { .. }) {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name}() does not accept keyword arguments"),
+        );
+    }
+    let params = value::function_params(target);
+    let mut slots: Vec<Option<i64>> = vec![None; params.len()];
+    for (index, &arg) in args.iter().enumerate() {
+        let Some(slot) = slots.get_mut(index) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "{name}() takes {} positional arguments ({} given)",
+                    params.len(),
+                    args.len()
+                ),
+            );
+        };
+        *slot = Some(arg);
+    }
+    for (keyword, value) in keywords {
+        let Some(index) = params.iter().position(|param| param == keyword) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("{name}() got an unexpected keyword argument '{keyword}'"),
+            );
+        };
+        if slots[index].is_some() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("{name}() got multiple values for argument '{keyword}'"),
+            );
+        }
+        slots[index] = Some(*value);
+    }
+    let mut bound: Vec<i64> = Vec::with_capacity(slots.len());
+    for (index, slot) in slots.into_iter().enumerate() {
+        match slot {
+            Some(value) => bound.push(value),
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "{name}() missing required positional argument '{}'",
+                        params[index]
+                    ),
+                )
+            }
+        }
+    }
+    call(target, bound.len(), bound.as_ptr())
+}
+
+/// `fn(args..., *star)`: calls a function value with one starred positional
+/// operand.
+///
+/// The elements of `star`, which must be a list or tuple, are appended to the
+/// `argc` positional operands in `argv` before dispatching through [`call`].
+/// Any other starred value raises `TypeError`; a NULL `argv` with a non-zero
+/// `argc` is rejected like [`call`] does.
+pub(crate) fn call_star(function: i64, argc: usize, argv: *const i64, star: i64) -> i64 {
+    if argc > 0 && argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("function call received {argc} argument(s) without an argument buffer"),
+        );
+    }
+    if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
+        return exc::raise_with_message(TYPE_ERROR, "function call has too many arguments");
+    }
+    // Copy the flattened elements before allocating the combined buffer: the
+    // source list/tuple stays a live argument (and therefore a GC root) while
+    // the call runs.
+    let items = match value::as_list(star)
+        .or_else(|| value::as_tuple(star))
+        .map(|items| items.to_vec())
+    {
+        Some(items) => items,
+        None => {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "argument after * must be a list or tuple, not '{}'",
+                    value::type_name(star)
+                ),
+            )
+        }
+    };
+    let Some(total) = argc.checked_add(items.len()) else {
+        return exc::raise_with_message(TYPE_ERROR, "function call has too many arguments");
+    };
+    // SAFETY: the ABI contract requires `argv` to point at `argc` readable
+    // tagged values; the length checks above keep the slice in range.
+    let mut args: Vec<i64> = Vec::with_capacity(total);
+    if argc > 0 {
+        unsafe {
+            args.extend_from_slice(std::slice::from_raw_parts(argv, argc));
+        }
+    }
+    args.extend_from_slice(&items);
+    call(function, args.len(), args.as_ptr())
+}
+
+/// Resolves a name bound by a function-local import.
+///
+/// PyX links imports at compile time, so a deferred import that is reached at
+/// runtime cannot be executed. This reports the unresolved module (and member)
+/// and always raises `RuntimeError`; the returned `None` is only the pending
+/// exception placeholder for generated code.
+pub(crate) fn deferred_import(module: &str, member: Option<&str>) -> i64 {
+    let message = match member {
+        Some(member) => format!("dynamic import of '{module}.{member}' is not supported"),
+        None => format!("dynamic import of '{module}' is not supported"),
+    };
+    exc::raise_with_message(RUNTIME_ERROR, &message)
+}
+
+/// Applies an `operator.attrgetter` value to its single argument.
+///
+/// One stored name yields the attribute value; several yield a tuple in
+/// declaration order. A missing attribute leaves the `AttributeError` raised by
+/// [`methods::getattr`] pending.
+fn attribute_getter_call(names: &[String], argc: usize, argv: *const i64) -> i64 {
+    if argc != 1 || argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("attrgetter() takes exactly one argument ({argc} given)"),
+        );
+    }
+    // SAFETY: exactly one argument was checked above.
+    let object = unsafe { *argv };
+    if names.len() == 1 {
+        let name = &names[0];
+        return methods::getattr(object, name.as_ptr(), name.len());
+    }
+    // Root the results in a list while later attribute reads allocate, then
+    // copy the snapshot into the tuple CPython returns.
+    let collected = value::list_new(Vec::new());
+    for name in names {
+        let item = methods::getattr(object, name.as_ptr(), name.len());
+        if exc::pending() {
+            return NONE;
+        }
+        push_item(collected, item);
+    }
+    let items = value::as_list(collected)
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    value::tuple_new(items)
+}
+
+/// Applies an `operator.itemgetter` value to its single argument.
+///
+/// One stored key yields the subscripted value; several yield a tuple. Keys are
+/// traced by the function body, so they stay alive across the call.
+fn item_getter_call(keys: &[i64], argc: usize, argv: *const i64) -> i64 {
+    if argc != 1 || argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("itemgetter() takes exactly one argument ({argc} given)"),
+        );
+    }
+    // SAFETY: exactly one argument was checked above.
+    let object = unsafe { *argv };
+    if keys.len() == 1 {
+        return container::subscript(object, keys[0]);
+    }
+    let collected = value::list_new(Vec::new());
+    for &key in keys {
+        let item = container::subscript(object, key);
+        if exc::pending() {
+            return NONE;
+        }
+        push_item(collected, item);
+    }
+    let items = value::as_list(collected)
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    value::tuple_new(items)
+}
+
+/// Appends `item` to the list rooted at `list`, recording the GC edge.
+fn push_item(list: i64, item: i64) {
+    if let Some(mut items) = value::list_items_mut(list) {
+        items.push(item);
+        crate::heap::write_barrier_edge(list, item);
     }
 }
 
@@ -691,14 +1234,18 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
         .unwrap_or("type")
         .to_string();
     let instance = value::instance_new(class);
-    let Some(init) = value::class_method(class, "__init__") else {
+    let Some((kind, init)) = value::class_member(class, "__init__") else {
         if argc > 0 {
             return exc::raise_with_message(TYPE_ERROR, &format!("{name}() takes no arguments"));
         }
         return instance;
     };
     let mut args = Vec::with_capacity(argc + 1);
-    args.push(instance);
+    match kind {
+        MethodKind::Normal | MethodKind::Property => args.push(instance),
+        MethodKind::Classmethod => args.push(class),
+        MethodKind::Staticmethod => {}
+    }
     if argc > 0 {
         // SAFETY: the ABI contract requires `argv` to point at `argc` readable
         // tagged values; `argv` is non-NULL because `argc > 0`.
@@ -716,6 +1263,24 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
 
 /// Reports a builtin arity mismatch as `TypeError`, mirroring the message
 /// generated code produces for direct builtin calls.
+/// Shared `getattr(obj, name)` lookup used by the 2- and 3-argument forms.
+fn getattr_builtin(object: i64, name: i64) -> i64 {
+    let Some(name) = value::as_str(name) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "attribute name must be string, not '{}'",
+                value::type_name(name)
+            ),
+        );
+    };
+    if let Some(module) = value::as_module(object) {
+        modules::module_get_by_name(module.name(), name)
+    } else {
+        methods::getattr(object, name.as_ptr(), name.len())
+    }
+}
+
 fn builtin_arity_error(name: &str, expected: &str, argc: usize) -> i64 {
     exc::raise_with_message(
         TYPE_ERROR,
@@ -726,10 +1291,16 @@ fn builtin_arity_error(name: &str, expected: &str, argc: usize) -> i64 {
 /// Calls a builtin referenced as a first-class value (`f = int; f("42")`).
 ///
 /// Arity and semantics match the direct builtin calls lowered by codegen:
-/// `print` is variadic, `str`/`int`/`float`/`abs`/`len` take one argument,
+/// `print` is variadic, `str`/`repr`/`int`/`float`/`abs`/`len` take one
+/// argument,
 /// `set`/`list`/`dict` accept zero or one, `sum`/`enumerate` one or two,
 /// `range` one to three, `bytes` zero to two, `map`/`filter` exactly two,
-/// `iter` exactly one and `next` one or two.
+/// `iter` exactly one, `next` one or two, `max`/`min` at least one (their
+/// final argument is the key slot), `sorted` one to three
+/// `(iterable, key, reverse)`, `round` one or two, `format` two (or
+/// three for the internal conversion flag), `isinstance` exactly two,
+/// `all` exactly one, `ord`/`chr` exactly one, `divmod` exactly two,
+/// `callable` exactly one and the internal dict merge exactly two.
 pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -767,23 +1338,17 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             _ => builtin_arity_error("frozenset", "0 or 1", argc),
         },
         Builtin::Getattr => match args {
-            [object, name] => match value::as_str(*name) {
-                Some(name) => {
-                    if let Some(module) = value::as_module(*object) {
-                        modules::module_get_by_name(module.name(), name)
-                    } else {
-                        methods::getattr(*object, name.as_ptr(), name.len())
-                    }
+            [object, name] => getattr_builtin(*object, *name),
+            [object, name, default] => {
+                let result = getattr_builtin(*object, *name);
+                if exc::pending() && exc::pending_tag() == exc::ATTRIBUTE_ERROR as i64 {
+                    exc::clear();
+                    *default
+                } else {
+                    result
                 }
-                None => exc::raise_with_message(
-                    TYPE_ERROR,
-                    &format!(
-                        "attribute name must be string, not '{}'",
-                        value::type_name(*name)
-                    ),
-                ),
-            },
-            _ => builtin_arity_error("getattr", "exactly 2", argc),
+            }
+            _ => builtin_arity_error("getattr", "2 or 3", argc),
         },
         Builtin::Range => match args {
             [stop] => range_new(ops::int_result(0), *stop, ops::int_result(1)),
@@ -795,6 +1360,24 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [] => container::list_new(0, std::ptr::null()),
             [iterable] => list_from(*iterable),
             _ => builtin_arity_error("list", "0 or 1", argc),
+        },
+        Builtin::Tuple => match args {
+            [] => container::tuple_new(0, std::ptr::null()),
+            [iterable] => tuple_from(*iterable),
+            _ => builtin_arity_error("tuple", "0 or 1", argc),
+        },
+        Builtin::Hasattr => match args {
+            [object, name] => match value::as_str(*name) {
+                Some(name) => methods::hasattr(*object, name.as_ptr(), name.len()),
+                None => exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "attribute name must be string, not '{}'",
+                        value::type_name(*name)
+                    ),
+                ),
+            },
+            _ => builtin_arity_error("hasattr", "exactly 2", argc),
         },
         Builtin::Dict => match args {
             [] => value::dict_new(Vec::new()),
@@ -836,9 +1419,19 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [value] => to_str(*value),
             _ => builtin_arity_error("str", "exactly 1", argc),
         },
+        Builtin::Repr => match args {
+            [value] => to_repr(*value),
+            _ => builtin_arity_error("repr", "exactly 1", argc),
+        },
+        Builtin::Hash => match args {
+            [value] => hash(*value),
+            _ => builtin_arity_error("hash", "exactly 1", argc),
+        },
         Builtin::Int => match args {
+            [] => ops::int_result(0),
             [value] => to_int(*value),
-            _ => builtin_arity_error("int", "exactly 1", argc),
+            [value, base] => to_int_base(*value, *base),
+            _ => builtin_arity_error("int", "at most 2", argc),
         },
         Builtin::Float => match args {
             [value] => to_float(*value),
@@ -848,10 +1441,73 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [value] => abs(*value),
             _ => builtin_arity_error("abs", "exactly 1", argc),
         },
-        Builtin::Format => exc::raise_with_message(
+        Builtin::Bool => match args {
+            [] => value::FALSE,
+            [value] => value::bool_value(value::truthy(*value)),
+            _ => builtin_arity_error("bool", "at most 1", argc),
+        },
+        Builtin::Type => match args {
+            [value] => value::type_class(*value),
+            _ => builtin_arity_error("type", "exactly 1", argc),
+        },
+        Builtin::Reversed => match args {
+            [value] => reversed(*value),
+            _ => builtin_arity_error("reversed", "exactly 1", argc),
+        },
+        Builtin::Import => exc::raise_with_message(
             RUNTIME_ERROR,
-            "format() is an internal f-string helper and is not callable",
+            "dynamic imports are not supported at runtime",
         ),
+        Builtin::Max => max(argc, argv),
+        Builtin::Min => min(argc, argv),
+        Builtin::Sorted => sorted(argc, argv),
+        Builtin::Round => match args {
+            [value] => round_value(*value, NONE),
+            [value, ndigits] => round_value(*value, *ndigits),
+            _ => builtin_arity_error("round", "1 or 2", argc),
+        },
+        Builtin::Format => match args {
+            [value, spec] => format_builtin(*value, *spec, 0),
+            [value, spec, conversion] => match value::as_integer(*conversion) {
+                Some(flag @ 0..=3) => format_builtin(*value, *spec, flag as u8),
+                _ => exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "format() conversion must be an integer flag, not '{}'",
+                        value::type_name(*conversion)
+                    ),
+                ),
+            },
+            _ => builtin_arity_error("format", "2 or 3", argc),
+        },
+        Builtin::Isinstance => match args {
+            [object, target] => isinstance(*object, *target),
+            _ => builtin_arity_error("isinstance", "exactly 2", argc),
+        },
+        Builtin::All => match args {
+            [iterable] => all(*iterable),
+            _ => builtin_arity_error("all", "exactly 1", argc),
+        },
+        Builtin::Ord => match args {
+            [value] => ord_value(*value),
+            _ => builtin_arity_error("ord", "exactly 1", argc),
+        },
+        Builtin::Chr => match args {
+            [value] => chr_value(*value),
+            _ => builtin_arity_error("chr", "exactly 1", argc),
+        },
+        Builtin::Divmod => match args {
+            [a, b] => divmod(*a, *b),
+            _ => builtin_arity_error("divmod", "exactly 2", argc),
+        },
+        Builtin::Callable => match args {
+            [value] => callable(*value),
+            _ => builtin_arity_error("callable", "exactly 1", argc),
+        },
+        Builtin::DictMerge => match args {
+            [left, right] => dict_merge(*left, *right),
+            _ => builtin_arity_error("dict merge", "exactly 2", argc),
+        },
     }
 }
 
@@ -934,6 +1590,620 @@ pub(crate) fn filter(function: i64, iterable: i64) -> i64 {
     result
 }
 
+// -------------------------------------------------------------------------
+// `all` and dict unpacking
+// -------------------------------------------------------------------------
+
+/// `all(iterable)`: `True` when every element is truthy, `False` otherwise.
+/// An empty iterable is `True`, like CPython. A pending exception from the
+/// iteration or a falsy element short-circuits the result.
+pub(crate) fn all(iterable: i64) -> i64 {
+    let iterator = iter::iter_new(iterable);
+    if exc::pending() {
+        return NONE;
+    }
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            return value::bool_value(true);
+        }
+        if !value::truthy(item) {
+            return value::bool_value(false);
+        }
+    }
+}
+
+/// `{**left, **right}`: a fresh dict with `left`'s entries first, then
+/// `right`'s. Duplicate keys keep their first position and take the right
+/// value (Python's display and `dict.update` semantics).
+///
+/// Non-dict operands raise `TypeError`. The result is allocated empty and
+/// filled through [`container::dict_insert_barrier`], so every inserted key
+/// and value gets its GC edge.
+pub(crate) fn dict_merge(left: i64, right: i64) -> i64 {
+    let Some(left_pairs) = value::as_dict(left) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "dict unpacking requires a mapping, not '{}'",
+                value::type_name(left)
+            ),
+        );
+    };
+    let Some(right_pairs) = value::as_dict(right) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "dict unpacking requires a mapping, not '{}'",
+                value::type_name(right)
+            ),
+        );
+    };
+    // Copy both payloads before allocating: a reference into a heap object
+    // must not be read after an allocation that may collect.
+    let left_pairs = left_pairs.to_vec();
+    let right_pairs = right_pairs.to_vec();
+    let result = value::dict_new(Vec::new());
+    if let Some(mut pairs) = value::dict_pairs_mut(result) {
+        for (key, item) in left_pairs {
+            container::dict_insert_barrier(result, &mut pairs, key, item);
+        }
+        for (key, item) in right_pairs {
+            container::dict_insert_barrier(result, &mut pairs, key, item);
+        }
+    }
+    result
+}
+
+// -------------------------------------------------------------------------
+// `max` / `min` / `round` / `format` / `isinstance`
+// -------------------------------------------------------------------------
+
+/// `max(*args)`: the largest candidate, or the largest element of a single
+/// iterable. The final argument is always the key slot: `None` or a callable.
+///
+/// Direct lowering always appends the key slot; calls through a first-class
+/// `max` value pass the user arguments unchanged. A trailing argument that is
+/// `None` or callable is therefore treated as the key, which covers both
+/// shapes.
+pub(crate) fn max(argc: usize, argv: *const i64) -> i64 {
+    extremum("max", argc, argv, true)
+}
+
+/// `min(*args)`: the counterpart of [`max`].
+pub(crate) fn min(argc: usize, argv: *const i64) -> i64 {
+    extremum("min", argc, argv, false)
+}
+
+/// Shared `max`/`min` implementation. Ties keep the first element seen, like
+/// CPython.
+fn extremum(name: &str, argc: usize, argv: *const i64, want_max: bool) -> i64 {
+    if argc > 0 && argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name}() received {argc} argument(s) without an argument buffer"),
+        );
+    }
+    if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
+        return builtin_arity_error(name, "a supported number of", argc);
+    }
+    // SAFETY: the ABI contract requires `argv` to point at `argc` readable
+    // tagged values; the checks above keep the slice in range.
+    let args: &[i64] = if argc == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    };
+
+    let keyed =
+        argc >= 2 && (args[argc - 1] == NONE || value::as_function(args[argc - 1]).is_some());
+    let (candidates, key) = if keyed {
+        (&args[..argc - 1], args[argc - 1])
+    } else {
+        (args, NONE)
+    };
+    if key != NONE && value::as_function(key).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("'{}' object is not callable", value::type_name(key)),
+        );
+    }
+    if candidates.is_empty() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name} expected at least 1 argument, got 0"),
+        );
+    }
+
+    let mut best = NONE;
+    let mut best_key = NONE;
+    let mut found = false;
+
+    // One candidate is an iterable; two or more are compared directly.
+    let iterable = candidates.len() == 1;
+    let mut iterator = NONE;
+    if iterable {
+        iterator = iter::iter_new(candidates[0]);
+        if exc::pending() {
+            return NONE;
+        }
+    }
+
+    let mut index = 0usize;
+    loop {
+        let mut item = NONE;
+        if iterable {
+            let status = iter::iter_next(iterator, &mut item);
+            if exc::pending() {
+                return NONE;
+            }
+            if status == 0 {
+                break;
+            }
+        } else {
+            item = candidates[index];
+            index += 1;
+        }
+
+        let item_key = if key == NONE {
+            item
+        } else {
+            let produced = call(key, 1, &item);
+            if exc::pending() {
+                return NONE;
+            }
+            produced
+        };
+
+        if !found {
+            best = item;
+            best_key = item_key;
+            found = true;
+        } else {
+            let op = if want_max { ops::OP_GT } else { ops::OP_LT };
+            let verdict = ops::binop(op, item_key, best_key);
+            if exc::pending() {
+                return NONE;
+            }
+            if value::truthy(verdict) {
+                best = item;
+                best_key = item_key;
+            }
+        }
+
+        if !iterable && index == candidates.len() {
+            break;
+        }
+    }
+
+    if !found {
+        return exc::raise_with_message(VALUE_ERROR, &format!("{name}() arg is an empty sequence"));
+    }
+    best
+}
+
+/// `sorted(iterable, key=None, reverse=None)`: a new list with the elements
+/// in ascending order, or descending when `reverse` is truthy.
+///
+/// Direct lowering always supplies the `key` and `reverse` slots (`None`
+/// when omitted); a first-class `sorted` value forwards the user arguments,
+/// so one to three arguments are accepted. Ordering uses Python's `<` and the
+/// sort is stable, so equal keys keep their source order in either direction.
+/// Keys are evaluated once per element before any comparison, and both the
+/// elements and the keys stay reachable from rooted lists throughout.
+/// `reversed(iterable)`: materialise and reverse a sequence (the rich/stdlib
+/// surface only needs a list result).
+fn reversed(value: i64) -> i64 {
+    let mut items: Vec<i64> = if let Some(items) = value::as_list(value) {
+        items.to_vec()
+    } else if let Some(items) = value::as_tuple(value) {
+        items.to_vec()
+    } else if let Some(text) = value::as_str(value) {
+        text.chars()
+            .map(|ch| value::str_alloc(ch.to_string()))
+            .collect()
+    } else if let Some(bytes) = value::as_bytes(value) {
+        bytes
+            .iter()
+            .map(|byte| ops::int_result(i64::from(*byte)))
+            .collect()
+    } else if let Some((start, stop, step)) = value::as_range(value) {
+        let mut items = Vec::new();
+        let mut current = start;
+        if step > 0 {
+            while current < stop {
+                items.push(ops::int_result(current));
+                current = match current.checked_add(step) {
+                    Some(next) => next,
+                    None => break,
+                };
+            }
+        } else if step < 0 {
+            while current > stop {
+                items.push(ops::int_result(current));
+                current = match current.checked_add(step) {
+                    Some(next) => next,
+                    None => break,
+                };
+            }
+        }
+        items
+    } else {
+        let iterator = crate::iter::iter_new(value);
+        if exc::pending() {
+            return iterator;
+        }
+        let mut items = Vec::new();
+        loop {
+            let mut item = NONE;
+            if crate::iter::iter_next(iterator, &mut item) == 0 {
+                break;
+            }
+            if exc::pending() {
+                return item;
+            }
+            items.push(item);
+        }
+        items
+    };
+    items.reverse();
+    value::list_new(items)
+}
+
+pub(crate) fn sorted(argc: usize, argv: *const i64) -> i64 {
+    if argc > 0 && argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("sorted() received {argc} argument(s) without an argument buffer"),
+        );
+    }
+    if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
+        return builtin_arity_error("sorted", "a supported number of", argc);
+    }
+    // SAFETY: the ABI contract requires `argv` to point at `argc` readable
+    // tagged values; the length checks above keep the slice in range.
+    let args: &[i64] = if argc == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    };
+    let (iterable, key, reverse) = match args {
+        [iterable] => (*iterable, NONE, NONE),
+        [iterable, key] => (*iterable, *key, NONE),
+        [iterable, key, reverse] => (*iterable, *key, *reverse),
+        _ => return builtin_arity_error("sorted", "1 to 3", argc),
+    };
+    if key != NONE
+        && value::as_function(key).is_none()
+        && value::as_class(key).is_none()
+        && value::as_ext_function(key).is_none()
+    {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("'{}' object is not callable", value::type_name(key)),
+        );
+    }
+
+    // Materialise the source into a rooted list: the key calls below and the
+    // comparisons allocate, so every element must stay reachable.
+    let items = value::list_new(Vec::new());
+    let iterator = iter::iter_new(iterable);
+    if exc::pending() {
+        return NONE;
+    }
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        if let Some(mut stored) = value::list_items_mut(items) {
+            stored.push(item);
+            crate::heap::write_barrier_edge(items, item);
+        }
+    }
+    let count = value::as_list(items).map_or(0, |stored| stored.len());
+
+    // Evaluate the key exactly once per element, in source order.
+    let keys = if key == NONE {
+        items
+    } else {
+        let keys = value::list_new(Vec::new());
+        for index in 0..count {
+            let item = value::as_list(items).and_then(|stored| stored.get(index).copied());
+            let Some(item) = item else {
+                break;
+            };
+            let produced = call(key, 1, &item);
+            if exc::pending() {
+                return NONE;
+            }
+            if let Some(mut stored) = value::list_items_mut(keys) {
+                stored.push(produced);
+                crate::heap::write_barrier_edge(keys, produced);
+            }
+        }
+        keys
+    };
+
+    let descending = value::truthy(reverse);
+    let order = match merge_sort_indices((0..count).collect(), keys, descending) {
+        Ok(order) => order,
+        Err(error) => return error,
+    };
+
+    let result = value::list_new(Vec::new());
+    for index in order {
+        let item = value::as_list(items).and_then(|stored| stored.get(index).copied());
+        let Some(item) = item else {
+            continue;
+        };
+        if let Some(mut stored) = value::list_items_mut(result) {
+            stored.push(item);
+            crate::heap::write_barrier_edge(result, item);
+        }
+    }
+    result
+}
+
+/// Reads one key from the rooted keys list.
+fn sort_key(keys: i64, index: usize) -> i64 {
+    value::as_list(keys)
+        .and_then(|stored| stored.get(index).copied())
+        .unwrap_or(NONE)
+}
+
+/// Stable merge sort of element indices ordered by their keys.
+///
+/// The keys stay rooted in `keys`, so comparisons may allocate freely. A
+/// pending comparison error stops the sort and returns the pending value.
+fn merge_sort_indices(
+    mut indices: Vec<usize>,
+    keys: i64,
+    descending: bool,
+) -> Result<Vec<usize>, i64> {
+    let len = indices.len();
+    if len <= 1 {
+        return Ok(indices);
+    }
+    let right_half = indices.split_off(len / 2);
+    let left = merge_sort_indices(indices, keys, descending)?;
+    let right = merge_sort_indices(right_half, keys, descending)?;
+    let mut merged = Vec::with_capacity(len);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < left.len() && j < right.len() {
+        // Only a strict `<` moves the right element ahead of the left one, so
+        // equal keys keep their source order in both directions.
+        let (a, b) = if descending {
+            (sort_key(keys, left[i]), sort_key(keys, right[j]))
+        } else {
+            (sort_key(keys, right[j]), sort_key(keys, left[i]))
+        };
+        let verdict = ops::binop(ops::OP_LT, a, b);
+        if exc::pending() {
+            return Err(verdict);
+        }
+        if value::truthy(verdict) {
+            merged.push(right[j]);
+            j += 1;
+        } else {
+            merged.push(left[i]);
+            i += 1;
+        }
+    }
+    merged.extend_from_slice(&left[i..]);
+    merged.extend_from_slice(&right[j..]);
+    Ok(merged)
+}
+
+/// `round(value[, ndigits])`. `ndigits` is `NONE` for the one-argument form.
+pub(crate) fn round_value(value: i64, ndigits: i64) -> i64 {
+    let digits = if ndigits == NONE {
+        None
+    } else {
+        match value::as_integer(ndigits) {
+            Some(digits) => Some(digits),
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        value::type_name(ndigits)
+                    ),
+                );
+            }
+        }
+    };
+
+    if let Some(n) = value::as_integer(value) {
+        return match digits {
+            None => ops::int_result(n),
+            Some(digits) if digits >= 0 => ops::int_result(n),
+            Some(digits) => round_int_digits(n, digits),
+        };
+    }
+    if let Some(f) = value::as_float(value) {
+        return round_float(f, digits);
+    }
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "type {} doesn't define __round__ method",
+            value::type_name(value)
+        ),
+    )
+}
+
+/// Rounds an integer to a negative number of decimal digits with CPython's
+/// round-half-to-even rule.
+fn round_int_digits(n: i64, digits: i64) -> i64 {
+    // Every tagged integer is far below 5 * 10^18, so 19 places already
+    // rounds to zero.
+    if digits.unsigned_abs() >= 19 {
+        return ops::int_result(0);
+    }
+    let place = 10i128.pow(digits.unsigned_abs() as u32);
+    let value = n as i128;
+    let quotient = value / place;
+    let remainder = value % place;
+    let twice = remainder.abs() * 2;
+    let round_up = twice > place || (twice == place && quotient % 2 != 0);
+    let rounded = if round_up {
+        quotient + if value < 0 { -1 } else { 1 }
+    } else {
+        quotient
+    };
+    ops::int_result((rounded * place) as i64)
+}
+
+/// Rounds a float. Without `ndigits` the result is an `int` (ties to even);
+/// with `ndigits` it stays a float. The fixed-precision formatter rounds the
+/// exact decimal expansion half-to-even, so `round(2.675, 2) == 2.67`.
+fn round_float(x: f64, digits: Option<i64>) -> i64 {
+    let Some(digits) = digits else {
+        if x.is_nan() {
+            return exc::raise_with_message(VALUE_ERROR, "cannot convert float NaN to integer");
+        }
+        if x.is_infinite() {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                "cannot convert float infinity to integer",
+            );
+        }
+        if !(-TWO_POW_63..TWO_POW_63).contains(&x) {
+            return exc::raise_with_message(OVERFLOW_ERROR, "integer overflow");
+        }
+        return ops::int_result(x.round_ties_even() as i64);
+    };
+
+    if x.is_nan() || x.is_infinite() {
+        return value::float_new(x);
+    }
+    if digits > 323 {
+        return value::float_new(x);
+    }
+    if digits < -323 {
+        // Preserve the sign of zero, as CPython does.
+        return value::float_new(x * 0.0);
+    }
+    let rounded = if digits >= 0 {
+        format!("{:.*}", digits as usize, x)
+            .parse::<f64>()
+            .unwrap_or(x)
+    } else {
+        let factor = 10f64.powi(-(digits as i32));
+        (x / factor).round_ties_even() * factor
+    };
+    value::float_new(rounded)
+}
+
+/// `format(value, spec)`: Python's built-in formatting with no conversion.
+/// `conversion` is the f-string flag (`0` none, `1` `!s`, `2` `!r`, `3` `!a`).
+pub(crate) fn format_builtin(value: i64, spec: i64, conversion: u8) -> i64 {
+    let Some(spec_text) = value::as_str(spec) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "format() argument 2 must be str, not '{}'",
+                value::type_name(spec)
+            ),
+        );
+    };
+    match format::format_value(value, spec_text, conversion) {
+        Ok(text) => value::str_alloc(text),
+        Err(error) => exc::raise_with_message(error.tag, &error.message),
+    }
+}
+
+/// `isinstance(value, target)`: `target` is a native type (an `int`, `float`,
+/// `str`, ... builtin value), `None` for `NoneType`, a class, or a tuple of
+/// those. Anything else is a `TypeError`.
+pub(crate) fn isinstance(value: i64, target: i64) -> i64 {
+    match type_check(value, target) {
+        Some(result) => value::bool_value(result),
+        None => exc::raise_with_message(
+            TYPE_ERROR,
+            "isinstance() arg 2 must be a type or tuple of types",
+        ),
+    }
+}
+
+/// Tri-state check: `Some(true/false)` for a recognized type object, `None`
+/// when `target` is not a type. Tuples are checked element by element.
+fn type_check(value: i64, target: i64) -> Option<bool> {
+    if let Some(types) = value::as_tuple(target) {
+        for &candidate in types {
+            match type_check(value, candidate) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => return None,
+            }
+        }
+        return Some(false);
+    }
+    // `None` itself names `NoneType`.
+    if target == NONE {
+        return Some(value == NONE);
+    }
+    if value::as_class(target).is_some() {
+        return Some(instance_of(value, target));
+    }
+    if let Some(function) = value::as_function(target) {
+        if let FunctionBody::Builtin(builtin) = &function.body {
+            return named_type_check(value, builtin.name());
+        }
+    }
+    None
+}
+
+/// Matches `value` against a native type name (`int`, `bool`, `str`, ...).
+fn named_type_check(value: i64, name: &str) -> Option<bool> {
+    Some(match name {
+        // `bool` is a subclass of `int` in Python.
+        "int" => value::is_int(value) || value::type_name(value) == "bool",
+        "bool" => value::type_name(value) == "bool",
+        "float" => value::as_float(value).is_some(),
+        "str" => value::as_str(value).is_some(),
+        "bytes" => value::as_bytes(value).is_some(),
+        "list" => value::as_list(value).is_some(),
+        "dict" => value::as_dict(value).is_some() || value::as_defaultdict(value).is_some(),
+        "tuple" => value::as_tuple(value).is_some(),
+        "set" | "frozenset" => value::as_set(value).is_some(),
+        "NoneType" | "None" => value == NONE,
+        "object" => true,
+        _ => return None,
+    })
+}
+
+/// Whether `value` is an instance of `class` (or one of its subclasses).
+fn instance_of(value: i64, class: i64) -> bool {
+    let Some(instance) = value::as_instance(value) else {
+        return false;
+    };
+    let mut current = instance.class;
+    for _ in 0..1024 {
+        if current == class {
+            return true;
+        }
+        let Some(base_state) = value::as_class(current) else {
+            // `instance.class` is always a class; defensive only.
+            return current == class;
+        };
+        if base_state.base == NONE {
+            return false;
+        }
+        current = base_state.base;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,6 +2229,123 @@ mod tests {
         let args = [int(1), string("x"), TRUE, NONE, value::float_new(1.0)];
         assert_eq!(render_args(&args), "1 x True None 1.0");
         assert_eq!(render_args(&[]), "");
+    }
+
+    /// Stand-in for a generated dynamic wrapper: reads the tagged total count
+    /// from `argv[0]` and returns the argument values as a tuple.
+    extern "C" fn varargs_probe(argv: *const i64) -> i64 {
+        let total = unsafe { *argv } >> 3;
+        let mut values = Vec::with_capacity(total as usize);
+        for index in 0..total as usize {
+            values.push(unsafe { *argv.add(1 + index) });
+        }
+        value::tuple_new(values)
+    }
+
+    #[test]
+    fn varargs_calls_pass_a_tagged_count_and_the_arguments() {
+        exc::init();
+        let function = value::function_new_with_flags(
+            varargs_probe as *const () as usize,
+            0,
+            "probe".to_string(),
+            value::FUNCTION_FLAG_VARARGS,
+        );
+        let args = [int(7), int(8)];
+        let result = call(function, 2, args.as_ptr());
+        assert!(!exc::pending(), "unexpected exception");
+        let items = value::as_tuple(result).expect("probe returns a tuple");
+        assert_eq!(items, &[int(7), int(8)]);
+
+        // A dynamic signature stores the minimum arity.
+        let required = value::function_new_with_flags(
+            varargs_probe as *const () as usize,
+            2,
+            "required".to_string(),
+            value::FUNCTION_FLAG_VARARGS,
+        );
+        let _ = call(required, 1, args.as_ptr());
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn varargs_closures_prefix_the_captured_values() {
+        exc::init();
+        let closure = value::closure_new_with_flags(
+            varargs_probe as *const () as usize,
+            0,
+            "closure".to_string(),
+            vec![int(5)],
+            value::FUNCTION_FLAG_VARARGS,
+        );
+        let args = [int(9)];
+        let result = call(closure, 1, args.as_ptr());
+        assert!(!exc::pending(), "unexpected exception");
+        let items = value::as_tuple(result).expect("probe returns a tuple");
+        assert_eq!(items, &[int(5), int(9)]);
+        exc::clear();
+    }
+
+    #[test]
+    fn repr_uses_python_representation() {
+        exc::init();
+        let quoted = builtin_call(Builtin::Repr, &[string("a'b")]);
+        assert_eq!(value::as_str(quoted), Some("\"a'b\""));
+        let list = value::list_new(vec![int(1), string("a")]);
+        let rendered_list = builtin_call(Builtin::Repr, &[list]);
+        assert_eq!(value::as_str(rendered_list), Some("[1, 'a']"));
+        assert_eq!(
+            value::as_str(builtin_call(Builtin::Repr, &[int(5)])),
+            Some("5")
+        );
+        assert!(!exc::pending());
+
+        assert_eq!(builtin_call(Builtin::Repr, &[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "repr() takes exactly 1 argument(s) (0 given)"
+        );
+    }
+
+    #[test]
+    fn starred_calls_flatten_lists_and_tuples() {
+        exc::init();
+        let function = value::function_new_with_flags(
+            varargs_probe as *const () as usize,
+            0,
+            "probe".to_string(),
+            value::FUNCTION_FLAG_VARARGS,
+        );
+        let star = value::tuple_new(vec![int(7), int(8)]);
+        let leading = [int(1)];
+        let result = call_star(function, 1, leading.as_ptr(), star);
+        assert!(!exc::pending(), "unexpected exception");
+        let items = value::as_tuple(result).expect("probe returns a tuple");
+        assert_eq!(items, &[int(1), int(7), int(8)]);
+
+        // A list flattens the same way, with no leading operands.
+        let star = value::list_new(vec![int(3)]);
+        let result = call_star(function, 0, std::ptr::null(), star);
+        assert!(!exc::pending(), "unexpected exception");
+        let items = value::as_tuple(result).expect("probe returns a tuple");
+        assert_eq!(items, &[int(3)]);
+
+        // Builtin values receive the flattened positional arguments too.
+        let abs = value::builtin_function_new(Builtin::Abs);
+        let star = value::tuple_new(vec![int(-5)]);
+        let result = call_star(abs, 0, std::ptr::null(), star);
+        assert_eq!(value::as_integer(result), Some(5));
+        assert!(!exc::pending());
+
+        // Any other starred value raises TypeError.
+        assert_eq!(call_star(function, 0, std::ptr::null(), int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "argument after * must be a list or tuple, not 'int'"
+        );
     }
 
     #[test]
@@ -1385,7 +2772,7 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
             pending_message(),
-            "getattr() takes exactly 2 argument(s) (1 given)"
+            "getattr() takes 2 or 3 argument(s) (1 given)"
         );
     }
 
@@ -1398,6 +2785,7 @@ mod tests {
         let zipped = zip(1, sources.as_ptr());
         let listed = list_from(ranged(0, 4, 1));
         let summed = sum(ranged(0, 4, 1), int(0));
+        let ordered = sorted(3, [source, NONE, TRUE].as_ptr());
 
         for _ in 0..128 {
             let _ = string("garbage");
@@ -1407,7 +2795,741 @@ mod tests {
         assert_eq!(rendered(enumerated), "[(0, 'a'), (1, 'b')]");
         assert_eq!(rendered(zipped), "[('a',), ('b',)]");
         assert_eq!(integers(listed), vec![0, 1, 2, 3]);
+        assert_eq!(rendered(ordered), "['b', 'a']");
         assert_eq!(value::as_integer(summed), Some(6));
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn max_min_over_candidates_and_iterables() {
+        exc::init();
+        let variadic = [int(1), int(5), int(3), NONE];
+        assert_eq!(
+            value::as_integer(max(variadic.len(), variadic.as_ptr())),
+            Some(5)
+        );
+        assert_eq!(
+            value::as_integer(min(variadic.len(), variadic.as_ptr())),
+            Some(1)
+        );
+
+        // First-class calls do not append a key slot.
+        let bare = [int(1), int(5), int(3)];
+        assert_eq!(value::as_integer(max(bare.len(), bare.as_ptr())), Some(5));
+        assert_eq!(value::as_integer(min(bare.len(), bare.as_ptr())), Some(1));
+
+        // A single candidate is iterated.
+        let list = value::list_new(vec![int(4), int(9), int(2)]);
+        let single = [list, NONE];
+        assert_eq!(value::as_integer(max(2, single.as_ptr())), Some(9));
+        assert_eq!(value::as_integer(min(2, single.as_ptr())), Some(2));
+
+        let tuple = value::tuple_new(vec![int(-1), int(-7)]);
+        let single_tuple = [tuple, NONE];
+        assert_eq!(value::as_integer(max(2, single_tuple.as_ptr())), Some(-1));
+
+        // Ties keep the first candidate.
+        let ties = [int(2), int(2), int(1), NONE];
+        let tied = value::list_new(vec![int(2), int(2), int(1)]);
+        let first = max(3, [int(2), int(2), NONE].as_ptr());
+        assert_eq!(value::as_integer(first), Some(2));
+        assert_eq!(value::as_integer(max(4, ties.as_ptr())), Some(2));
+        assert_eq!(value::as_integer(len(tied)), Some(3));
+
+        // Empty iterables raise ValueError.
+        let empty = value::list_new(Vec::new());
+        let empty_args = [empty, NONE];
+        assert_eq!(max(2, empty_args.as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(pending_message(), "max() arg is an empty sequence");
+        exc::init();
+        assert_eq!(min(2, empty_args.as_ptr()), NONE);
+        assert_eq!(pending_message(), "min() arg is an empty sequence");
+
+        // Non-iterable single candidates are reported by the iterator.
+        exc::init();
+        let scalar = [int(1), NONE];
+        assert_eq!(max(2, scalar.as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    extern "C" fn negating_key(argv: *const i64) -> i64 {
+        // SAFETY: `call` passes a pointer to one live tagged argument.
+        let item = unsafe { *argv };
+        let n = value::as_integer(item).expect("integer argument");
+        ops::int_result(-n)
+    }
+
+    #[test]
+    fn max_min_apply_the_key_function() {
+        exc::init();
+        let list = value::list_new(vec![int(1), int(5), int(3)]);
+        let key = value::function_new(negating_key as *const () as usize, 1, "key".to_string());
+        let args = [list, key];
+        assert_eq!(value::as_integer(max(2, args.as_ptr())), Some(1));
+        assert_eq!(value::as_integer(min(2, args.as_ptr())), Some(5));
+
+        // The key also applies to variadic candidates.
+        let variadic = [int(1), int(5), key];
+        assert_eq!(value::as_integer(max(3, variadic.as_ptr())), Some(1));
+        assert_eq!(value::as_integer(min(3, variadic.as_ptr())), Some(5));
+    }
+
+    #[test]
+    fn sorted_orders_numbers_and_strings() {
+        exc::init();
+        let numbers = value::list_new(vec![int(3), int(1), int(2)]);
+        let result = sorted(3, [numbers, NONE, NONE].as_ptr());
+        assert_eq!(integers(result), vec![1, 2, 3]);
+        // A fresh list is returned; the source keeps its order.
+        assert_eq!(integers(numbers), vec![3, 1, 2]);
+        assert_ne!(result, numbers);
+
+        // One-argument (first-class) calls work too, and any iterable is
+        // accepted.
+        let words = value::list_new(vec![string("pear"), string("apple"), string("fig")]);
+        let result = sorted(1, [words].as_ptr());
+        assert_eq!(rendered(result), "['apple', 'fig', 'pear']");
+
+        let countdown = ranged(3, 0, -1);
+        assert_eq!(integers(sorted(1, [countdown].as_ptr())), vec![1, 2, 3]);
+
+        let empty = value::list_new(Vec::new());
+        assert_eq!(rendered(sorted(3, [empty, NONE, NONE].as_ptr())), "[]");
+    }
+
+    extern "C" fn length_key(argv: *const i64) -> i64 {
+        // SAFETY: `call` passes a pointer to one live tagged argument.
+        let item = unsafe { *argv };
+        len(item)
+    }
+
+    #[test]
+    fn sorted_applies_the_key_once_and_honours_reverse() {
+        exc::init();
+        let list = value::list_new(vec![int(1), int(5), int(3)]);
+        let key = value::function_new(negating_key as *const () as usize, 1, "key".to_string());
+        let ascending = sorted(3, [list, key, NONE].as_ptr());
+        assert_eq!(integers(ascending), vec![5, 3, 1]);
+        let descending = sorted(3, [list, key, TRUE].as_ptr());
+        assert_eq!(integers(descending), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn sorted_is_stable_in_both_directions() {
+        exc::init();
+        // Keys are string lengths: "a"/"d" tie at 1 and "bb"/"cc" tie at 2.
+        let items = value::list_new(vec![string("bb"), string("a"), string("cc"), string("d")]);
+        let key = value::function_new(length_key as *const () as usize, 1, "key".to_string());
+        let ascending = sorted(3, [items, key, NONE].as_ptr());
+        assert_eq!(rendered(ascending), "['a', 'd', 'bb', 'cc']");
+        // `reverse=True` reverses the order while equal keys keep their
+        // source order.
+        let descending = sorted(3, [items, key, TRUE].as_ptr());
+        assert_eq!(rendered(descending), "['bb', 'cc', 'a', 'd']");
+    }
+
+    #[test]
+    fn sorted_reports_non_iterables_and_bad_keys() {
+        exc::init();
+        assert_eq!(sorted(3, [int(1), NONE, NONE].as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+
+        exc::init();
+        let list = value::list_new(vec![int(1)]);
+        assert_eq!(sorted(3, [list, int(2), NONE].as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "'int' object is not callable");
+
+        // Comparisons use Python's `<`, so mismatched element types raise.
+        exc::init();
+        let mixed = value::list_new(vec![int(1), string("a")]);
+        assert_eq!(sorted(3, [mixed, NONE, NONE].as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Sorted, &[]), NONE);
+        assert_eq!(
+            pending_message(),
+            "sorted() takes 1 to 3 argument(s) (0 given)"
+        );
+    }
+
+    #[test]
+    fn round_uses_python_ties_to_even() {
+        exc::init();
+        assert_eq!(value::as_integer(round_value(int(5), NONE)), Some(5));
+        assert_eq!(value::as_integer(round_value(TRUE, NONE)), Some(1));
+        assert_eq!(value::as_integer(round_value(int(15), int(-1))), Some(20));
+        assert_eq!(value::as_integer(round_value(int(25), int(-1))), Some(20));
+        assert_eq!(value::as_integer(round_value(int(-25), int(-1))), Some(-20));
+        assert_eq!(value::as_integer(round_value(int(5), int(-1))), Some(0));
+        assert_eq!(
+            value::as_integer(round_value(int(1234), int(-2))),
+            Some(1200)
+        );
+
+        // Floats without ndigits become ints, ties to even.
+        assert_eq!(
+            value::as_integer(round_value(value::float_new(2.5), NONE)),
+            Some(2)
+        );
+        assert_eq!(
+            value::as_integer(round_value(value::float_new(3.5), NONE)),
+            Some(4)
+        );
+        assert_eq!(
+            value::as_integer(round_value(value::float_new(-2.5), NONE)),
+            Some(-2)
+        );
+
+        // With ndigits the result stays a float, rounded on the exact decimal
+        // expansion of the float.
+        assert_eq!(
+            value::as_float(round_value(value::float_new(2.675), int(2))),
+            Some(2.67)
+        );
+        assert_eq!(
+            value::as_float(round_value(value::float_new(0.125), int(2))),
+            Some(0.12)
+        );
+        assert_eq!(
+            value::as_float(round_value(value::float_new(2.5), int(0))),
+            Some(2.0)
+        );
+        assert_eq!(
+            value::as_float(round_value(value::float_new(2.5), int(5))),
+            Some(2.5)
+        );
+
+        assert_eq!(round_value(value::float_new(f64::NAN), NONE), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::init();
+        assert_eq!(round_value(string("x"), NONE), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "type str doesn't define __round__ method"
+        );
+        exc::init();
+        assert_eq!(round_value(int(1), string("2")), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn format_builtin_uses_the_shared_formatter() {
+        exc::init();
+        assert_eq!(
+            value::as_str(format_builtin(int(255), string("#x"), 0)),
+            Some("0xff")
+        );
+        assert_eq!(
+            value::as_str(format_builtin(int(42), string("04d"), 0)),
+            Some("0042")
+        );
+        assert_eq!(
+            value::as_str(format_builtin(value::float_new(3.14159), string(".2f"), 0)),
+            Some("3.14")
+        );
+        assert_eq!(
+            value::as_str(format_builtin(string("x"), string(">3"), 0)),
+            Some("  x")
+        );
+        assert!(!exc::pending());
+
+        assert_eq!(format_builtin(int(1), int(1), 0), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
+        assert_eq!(format_builtin(value::float_new(1.5), string("d"), 0), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+    }
+
+    #[test]
+    fn isinstance_native_types_and_tuples() {
+        exc::init();
+        let int_type = value::builtin_function_new(Builtin::Int);
+        let float_type = value::builtin_function_new(Builtin::Float);
+        let str_type = value::builtin_function_new(Builtin::Str);
+        let list_type = value::builtin_function_new(Builtin::List);
+        let dict_type = value::builtin_function_new(Builtin::Dict);
+        let set_type = value::builtin_function_new(Builtin::Set);
+        let bytes_type = value::builtin_function_new(Builtin::Bytes);
+
+        assert_eq!(isinstance(int(3), int_type), TRUE);
+        // Python's bool is an int subclass.
+        assert_eq!(isinstance(TRUE, int_type), TRUE);
+        assert_eq!(isinstance(string("x"), int_type), FALSE);
+        assert_eq!(isinstance(value::float_new(1.0), float_type), TRUE);
+        assert_eq!(isinstance(int(1), float_type), FALSE);
+        assert_eq!(isinstance(string("x"), str_type), TRUE);
+        assert_eq!(isinstance(value::list_new(Vec::new()), list_type), TRUE);
+        assert_eq!(isinstance(value::dict_new(Vec::new()), dict_type), TRUE);
+        assert_eq!(
+            isinstance(container::set_new(0, std::ptr::null()), set_type),
+            TRUE
+        );
+        assert_eq!(isinstance(value::bytes_new(vec![1, 2]), bytes_type), TRUE);
+
+        // `None` names NoneType.
+        assert_eq!(isinstance(NONE, NONE), TRUE);
+        assert_eq!(isinstance(int(1), NONE), FALSE);
+
+        let union = value::tuple_new(vec![float_type, str_type]);
+        assert_eq!(isinstance(string("x"), union), TRUE);
+        assert_eq!(isinstance(value::float_new(0.5), union), TRUE);
+        assert_eq!(isinstance(int(1), union), FALSE);
+
+        assert_eq!(isinstance(int(1), int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "isinstance() arg 2 must be a type or tuple of types"
+        );
+        exc::init();
+        assert_eq!(
+            isinstance(string("x"), value::tuple_new(vec![int_type, int(2)])),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn isinstance_walks_class_bases() {
+        exc::init();
+        let base = value::class_new("Animal".to_string(), NONE, Vec::new());
+        let derived = value::class_new("Dog".to_string(), base, Vec::new());
+        let sibling = value::class_new("Cat".to_string(), base, Vec::new());
+        let dog = value::instance_new(derived);
+        let cat = value::instance_new(sibling);
+
+        assert_eq!(isinstance(dog, derived), TRUE);
+        assert_eq!(isinstance(dog, base), TRUE);
+        assert_eq!(isinstance(cat, derived), FALSE);
+        assert_eq!(isinstance(cat, base), TRUE);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn all_uses_truthiness_and_accepts_empty_iterables() {
+        exc::init();
+        assert_eq!(all(value::list_new(vec![int(1), string("x"), TRUE])), TRUE);
+        assert_eq!(all(value::list_new(vec![int(1), NONE])), FALSE);
+        assert_eq!(all(value::list_new(Vec::new())), TRUE);
+        assert_eq!(all(value::set_new(Vec::new())), TRUE);
+        assert!(!exc::pending());
+
+        assert_eq!(all(int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn dict_merge_preserves_order_and_overwrites() {
+        exc::init();
+        let left = value::dict_new(vec![(string("a"), int(1)), (string("b"), int(2))]);
+        let right = value::dict_new(vec![(string("b"), int(3)), (string("c"), int(4))]);
+        let merged = dict_merge(left, right);
+        assert_eq!(rendered(merged), "{'a': 1, 'b': 3, 'c': 4}");
+        // The operands are never mutated.
+        assert_eq!(rendered(left), "{'a': 1, 'b': 2}");
+        assert_eq!(rendered(right), "{'b': 3, 'c': 4}");
+        assert!(!exc::pending());
+
+        assert_eq!(dict_merge(value::list_new(Vec::new()), right), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "dict unpacking requires a mapping, not 'list'"
+        );
+        exc::init();
+        assert_eq!(dict_merge(left, int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn attribute_getter_reads_one_or_many_attributes() {
+        exc::init();
+        let namespace = value::namespace_new(vec![
+            ("start".to_string(), int(3)),
+            ("end".to_string(), int(9)),
+        ]);
+        let single = value::attribute_getter_new(vec!["end".to_string()]);
+        let argument = namespace;
+        assert_eq!(call(single, 1, &argument), int(9));
+
+        let multiple = value::attribute_getter_new(vec!["start".to_string(), "end".to_string()]);
+        let pair = call(multiple, 1, &argument);
+        let items = value::as_tuple(pair).expect("tuple result");
+        assert_eq!(items.len(), 2);
+        assert_eq!(value::as_integer(items[0]), Some(3));
+        assert_eq!(value::as_integer(items[1]), Some(9));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn attribute_getter_reports_missing_attributes() {
+        exc::init();
+        let namespace = value::namespace_new(Vec::new());
+        let getter = value::attribute_getter_new(vec!["missing".to_string()]);
+        assert_eq!(call(getter, 1, &namespace), NONE);
+        assert_eq!(exc::pending_tag(), exc::ATTRIBUTE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn item_getter_subscripts_one_or_many_keys() {
+        exc::init();
+        let list = value::list_new(vec![int(10), int(20)]);
+        let single = value::item_getter_new(vec![int(1)]);
+        assert_eq!(call(single, 1, &list), int(20));
+
+        let multiple = value::item_getter_new(vec![int(0), int(1)]);
+        let pair = call(multiple, 1, &list);
+        let items = value::as_tuple(pair).expect("tuple result");
+        assert_eq!(value::as_integer(items[0]), Some(10));
+        assert_eq!(value::as_integer(items[1]), Some(20));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn partial_binds_leading_arguments() {
+        exc::init();
+        let target = value::builtin_function_new(Builtin::Str);
+        let partial = value::partial_new(target, vec![int(7)]);
+        assert_eq!(value::as_str(call(partial, 0, std::ptr::null())), Some("7"));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn identity_returns_its_argument() {
+        exc::init();
+        let decorator = value::identity_function_new("decorator");
+        let argument = string("payload");
+        assert_eq!(call(decorator, 1, &argument), argument);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn tuple_from_materialises_iterables() {
+        exc::init();
+        let list = value::list_new(vec![int(1), int(2)]);
+        assert_eq!(
+            value::as_tuple(tuple_from(list)).map(|items| items.to_vec()),
+            Some(vec![int(1), int(2)])
+        );
+        let tuple = value::tuple_new(vec![int(3)]);
+        assert_eq!(
+            value::as_tuple(tuple_from(tuple)).map(|items| items.to_vec()),
+            Some(vec![int(3)])
+        );
+        // Strings iterate by character; other iterables become a fresh tuple.
+        let chars = tuple_from(string("ab"));
+        assert_eq!(value::as_tuple(chars).map(|items| items.len()), Some(2));
+        assert!(!exc::pending());
+
+        assert_eq!(tuple_from(int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "'int' object is not iterable");
+        exc::init();
+    }
+
+    #[test]
+    fn hasattr_swallows_only_attribute_errors() {
+        exc::init();
+        let math = value::module_value("math".to_string());
+        assert_eq!(builtin_call(Builtin::Hasattr, &[math, string("pi")]), TRUE);
+        assert_eq!(
+            builtin_call(Builtin::Hasattr, &[math, string("missing")]),
+            FALSE
+        );
+        assert!(!exc::pending());
+
+        // A non-string name is a TypeError, not `False`.
+        assert_eq!(builtin_call(Builtin::Hasattr, &[math, int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "attribute name must be string, not 'int'"
+        );
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Hasattr, &[math]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
+    }
+
+    /// Stand-in for a generated wrapper taking two positional parameters.
+    extern "C" fn pair_probe(argv: *const i64) -> i64 {
+        // SAFETY: the runtime only enters a wrapper after checking its arity.
+        let (left, right) = unsafe { (*argv, *argv.add(1)) };
+        value::tuple_new(vec![left, right])
+    }
+
+    #[test]
+    fn partial_applies_keywords_by_parameter_name() {
+        exc::init();
+        let target = value::function_new(pair_probe as *const () as usize, 2, "pair".to_string());
+        value::function_set_params(target, vec!["left".to_string(), "right".to_string()]);
+        let partial = value::partial_new_with_keywords(
+            target,
+            Vec::new(),
+            vec![("right".to_string(), int(9))],
+        );
+        let left = int(1);
+        let result = call(partial, 1, &left);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(rendered(result), "(1, 9)");
+
+        // A hole before the named parameter cannot be filled without the
+        // target's defaults, so it is reported instead of passing `None`.
+        let hole = value::partial_new_with_keywords(
+            target,
+            Vec::new(),
+            vec![("right".to_string(), int(9))],
+        );
+        assert_eq!(call(hole, 0, std::ptr::null()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "pair() missing required positional argument 'left'"
+        );
+        exc::init();
+
+        // Unknown names are never dropped.
+        let unknown = value::partial_new_with_keywords(
+            target,
+            Vec::new(),
+            vec![("missing".to_string(), int(1))],
+        );
+        let both = [int(1), int(2)];
+        assert_eq!(call(unknown, 2, both.as_ptr()), NONE);
+        assert_eq!(
+            pending_message(),
+            "pair() got an unexpected keyword argument 'missing'"
+        );
+        exc::init();
+
+        // A callable without parameter names rejects the keywords.
+        let native = value::builtin_function_new(Builtin::Str);
+        let rejected = value::partial_new_with_keywords(
+            native,
+            Vec::new(),
+            vec![("name".to_string(), int(1))],
+        );
+        assert_eq!(call(rejected, 0, std::ptr::null()), NONE);
+        assert_eq!(pending_message(), "str() does not accept keyword arguments");
+        exc::init();
+    }
+
+    #[test]
+    fn hash_matches_equal_values_and_rejects_unhashables() {
+        exc::init();
+        let one = builtin_call(Builtin::Hash, &[int(1)]);
+        assert_eq!(one, builtin_call(Builtin::Hash, &[value::float_new(1.0)]));
+        assert_eq!(one, builtin_call(Builtin::Hash, &[TRUE]));
+        assert_eq!(
+            builtin_call(
+                Builtin::Hash,
+                &[value::tuple_new(vec![int(1), string("x")])]
+            ),
+            builtin_call(
+                Builtin::Hash,
+                &[value::tuple_new(vec![int(1), string("x")])]
+            )
+        );
+        assert!(value::as_integer(one).is_some_and(|hash| hash >= 0));
+        assert!(!exc::pending());
+
+        exc::init();
+        assert_eq!(
+            builtin_call(Builtin::Hash, &[value::list_new(Vec::new())]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "unhashable type: 'list'");
+
+        exc::init();
+        assert_eq!(
+            builtin_call(Builtin::Hash, &[value::dict_new(Vec::new())]),
+            NONE
+        );
+        assert_eq!(pending_message(), "unhashable type: 'dict'");
+
+        // A tuple containing an unhashable element is unhashable too.
+        exc::init();
+        assert_eq!(
+            builtin_call(
+                Builtin::Hash,
+                &[value::tuple_new(vec![value::list_new(Vec::new())])]
+            ),
+            NONE
+        );
+        assert_eq!(pending_message(), "unhashable type: 'list'");
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Hash, &[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn ord_returns_the_scalar_value() {
+        exc::init();
+        assert_eq!(
+            value::as_integer(builtin_call(Builtin::Ord, &[string("A")])),
+            Some(65)
+        );
+        assert_eq!(
+            value::as_integer(builtin_call(Builtin::Ord, &[string("é")])),
+            Some(233)
+        );
+        assert_eq!(
+            value::as_integer(builtin_call(Builtin::Ord, &[string("😀")])),
+            Some(0x1F600)
+        );
+        assert!(!exc::pending());
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Ord, &[string("ab")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "ord() expected a character, but string of length 2 found"
+        );
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Ord, &[string("")]), NONE);
+        assert_eq!(
+            pending_message(),
+            "ord() expected a character, but string of length 0 found"
+        );
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Ord, &[int(65)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "ord() expected string of length 1, but int found"
+        );
+    }
+
+    #[test]
+    fn chr_returns_a_one_character_string() {
+        exc::init();
+        for (code, expected) in [(0, "\u{0}"), (65, "A"), (233, "é"), (0x1F600, "😀")] {
+            let text = builtin_call(Builtin::Chr, &[int(code)]);
+            assert!(!exc::pending());
+            assert_eq!(value::as_str(text), Some(expected));
+        }
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Chr, &[int(-1)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(pending_message(), "chr() arg not in range(0x110000)");
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Chr, &[int(0x110000)]), NONE);
+        assert_eq!(pending_message(), "chr() arg not in range(0x110000)");
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Chr, &[int(0xD800)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "chr() arg cannot be a surrogate code point"
+        );
+
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Chr, &[string("A")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "chr() argument must be an int, not 'str'"
+        );
+    }
+
+    #[test]
+    fn ord_and_chr_round_trip() {
+        exc::init();
+        for text in ["A", "é", "😀"] {
+            let ordinal = builtin_call(Builtin::Ord, &[string(text)]);
+            let code = value::as_integer(ordinal).expect("ord returns an int");
+            let round_tripped = builtin_call(Builtin::Chr, &[int(code)]);
+            assert!(!exc::pending());
+            assert_eq!(value::as_str(round_tripped), Some(text));
+        }
+    }
+
+    #[test]
+    fn divmod_returns_floored_quotient_and_remainder() {
+        exc::init();
+        for ((a, b), (quotient, remainder)) in [
+            ((7, 3), (2, 1)),
+            ((7, -3), (-3, -2)),
+            ((-7, 3), (-3, 2)),
+            ((-7, -3), (2, -1)),
+            ((6, 3), (2, 0)),
+        ] {
+            let result = builtin_call(Builtin::Divmod, &[int(a), int(b)]);
+            assert!(!exc::pending(), "divmod({a}, {b}) raised");
+            let items = value::as_tuple(result).expect("divmod returns a tuple");
+            assert_eq!(items.len(), 2);
+            assert_eq!(value::as_integer(items[0]), Some(quotient));
+            assert_eq!(value::as_integer(items[1]), Some(remainder));
+        }
+
+        // Floats keep CPython's fmod adjustment and produce floats.
+        let result = builtin_call(Builtin::Divmod, &[value::float_new(-7.5), int(2)]);
+        assert!(!exc::pending());
+        let items = value::as_tuple(result).expect("divmod returns a tuple");
+        assert_eq!(value::as_float(items[0]), Some(-4.0));
+        assert_eq!(value::as_float(items[1]), Some(0.5));
+
+        // A zero divisor is ZeroDivisionError for both numeric kinds.
+        assert_eq!(builtin_call(Builtin::Divmod, &[int(1), int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), ZERO_DIVISION_ERROR as i64);
+        assert_eq!(pending_message(), "division by zero");
+        exc::clear();
+        assert_eq!(
+            builtin_call(Builtin::Divmod, &[value::float_new(1.0), int(0)]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), ZERO_DIVISION_ERROR as i64);
+        exc::clear();
+
+        // Non-numeric operands use Python's divmod() message.
+        assert_eq!(builtin_call(Builtin::Divmod, &[string("a"), int(2)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for divmod(): 'str' and 'int'"
+        );
+
+        exc::clear();
+        assert_eq!(builtin_call(Builtin::Divmod, &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "divmod() takes exactly 2 argument(s) (1 given)"
+        );
+    }
+
+    #[test]
+    fn callable_recognises_function_values_and_classes() {
+        exc::init();
+        let function = value::builtin_function_new(Builtin::Len);
+        assert_eq!(builtin_call(Builtin::Callable, &[function]), value::TRUE);
+        let class = value::class_new("Thing".to_string(), NONE, Vec::new());
+        assert_eq!(builtin_call(Builtin::Callable, &[class]), value::TRUE);
+
+        for value in [int(1), string("text"), NONE, value::list_new(Vec::new())] {
+            assert_eq!(builtin_call(Builtin::Callable, &[value]), value::FALSE);
+            assert!(!exc::pending());
+        }
+
+        assert_eq!(builtin_call(Builtin::Callable, &[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "callable() takes exactly 1 argument(s) (0 given)"
+        );
     }
 }

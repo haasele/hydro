@@ -57,6 +57,51 @@ fn assert_after(haystack: &str, needle: &str, from: usize) -> usize {
 }
 
 #[test]
+fn builtin_exception_classes_are_first_class_values() {
+    let source = "\
+print(ValueError.__name__)
+print(ValueError)
+print(ValueError is ValueError)
+def pick():
+    return ValueError
+print(pick() is ValueError)
+print(BaseException.__name__, Exception.__name__, AssertionError.__name__, GeneratorExit.__name__)
+";
+    let (code, stdout, stderr) = run_source("exception_class_values", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(
+        stdout,
+        "ValueError\n<class 'ValueError'>\nTrue\nTrue\n\
+         BaseException Exception AssertionError GeneratorExit\n"
+    );
+}
+
+#[test]
+fn user_classes_inherit_builtin_exception_classes() {
+    let source = "\
+class E(Exception):
+    def describe(self):
+        return 'E:' + self.__class__.__name__
+class F(E):
+    pass
+print(E.__name__, F.__name__)
+print(E)
+e = E()
+f = F()
+print(isinstance(e, E), isinstance(e, Exception), isinstance(e, F))
+print(e.describe())
+f.extra = 7
+print(f.extra)
+class G(ValueError):
+    pass
+print(G.__name__)
+";
+    let (code, stdout, stderr) = run_source("exception_class_inheritance", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(stdout, "E F\n<class 'E'>\nTrue True False\nE:E\n7\nG\n");
+}
+
+#[test]
 fn except_exception_catches_standard_errors() {
     let source = "\
 def fail(kind):

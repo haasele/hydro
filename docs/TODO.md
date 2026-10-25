@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** 1064 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** 1329 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -23,8 +23,12 @@ ecosystem suites (NumPy, pandas, pydantic, FastAPI, Django, …) and their
 benchmarks. **New in this slice:** generator `send`/`throw`/`close` and
 `yield` expressions; C-API container/unicode/float/bytes accessors; a
 generated stdlib compatibility baseline (`docs/COMPATIBILITY.md`,
-42/297 modules importable on 2026-10-25 with Batch A and the Batch B native
-core of P7) and the first official CPython test pass (`test_errno.py`).
+58/297 modules importable on 2026-10-25 with Batch A, the Batch B native
+core, the benchmark-critical batch, the package/site-packages loader and the
+new native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
+`importlib`/`__future__` modules) and the first official CPython test pass
+(`test_errno.py`). `benchmarks/bench_all.py` does **not** yet run under PyX;
+the first blocker is `rich/console.py` (see P7).
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -251,17 +255,20 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-25: 1064 tests total — 544 runtime (371 unit, 173 ABI
-      integration: among others 22 bytes, 19 IO, 14 stdlib modules, 14 stdlib utils,
-      12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
+      As of 2026-10-25: 1329 tests total — 658 runtime (479 unit, 179 ABI
+      integration: among others 22 bytes, 19 IO, 18 stdlib modules, 16 stdlib
+      utils, 12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 289 frontend, 23 codegen, 4 IR, 204 CLI/E2E (135 E2E incl. the
-      abi3 extension fixture, 22 fibers, 6 closures, 5 user modules,
-      extension/path/dotted/multi-phase, completions, exceptions,
-      unittest-runner, stdlib-batch-a, stdlib-batch-b and
-      stdlib-bench-batch suites).
+      tests), 395 frontend, 47 codegen, 16 IR, 213 CLI/E2E (136 E2E incl.
+      the abi3 extension fixture, 24 fibers, 6 closures, 10 user modules,
+      10 exceptions, 8 completions, extension path/dotted/multi-phase,
+      2 unittest-runner, 2 stdlib-batch-a, 2 stdlib-batch-b,
+      3 stdlib-bench-batch and 5 CLI argument-parser unit tests; new suites
+      cover slice assignment, starred unpacking/calls, deferred imports,
+      exception classes as values, the package/site-packages loader and the
+      shared `rich` surface).
       Property tests open. The CPython official-test manifest is checked offline by
       `scripts/verify.sh`/CI; the full suite is a release gate.
 
@@ -313,14 +320,17 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
       Manifest `tests/compat/cpython-3.14.9.json` records **1** pass
       (`test_errno.py`); it grows only from real `pyx_pass` results.
-      Stdlib import baseline 2026-10-25: **47/297 importable** (11
-      builtin/frozen, 32 pure, 4 extension; 8 `cpython_failed`); Batch A of
+      Stdlib import baseline 2026-10-25: **58/297 importable** (13
+      builtin/frozen, 41 pure, 4 extension; 9 `cpython_failed`). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
-      `_operator`, `_functools`, `_io`) and the Batch B native core
-      (`binascii`, `base64`, `quopri`, `fnmatch`, `getopt`, `mimetypes`)
-      are importable and API-tested, together with the benchmark-critical
-      `subprocess`, `tempfile`, `shutil`, `textwrap` and `timeit` batch.
+      `_operator`, `_functools`, `_io`), the Batch B native core
+      (`binascii`, `base64`, `quopri`, `fnmatch`, `getopt`, `mimetypes`),
+      the benchmark-critical
+      `subprocess`, `tempfile`, `shutil`, `textwrap` and `timeit` batch, the
+      package/site-packages loader and the native
+      `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
+      `__future__` modules are importable and API-tested.
       Official-suite
       baseline 2026-10-25: **1/398 passing** (334 `pyx_fail`, 63
       `expected_fail` where CPython also fails; 0 timeouts). No test is marked
@@ -337,7 +347,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       iterators, exception hierarchy/chaining/`except*`, descriptors,
       properties, `__slots__`, metaclasses, user-defined `__iter__`/`__next__`,
       `__dunder__` protocols, pattern matching, positional-only/keyword-only/
-      `*args`/`**kwargs`, `del`, slice assignment, dict views, `bytearray`/
+      `*args`/`**kwargs`, `del`, dict views, `bytearray`/
       `memoryview`, BigInt (parity for arbitrary-size integers), and the full
       format mini-language.
       Acceptance: the CPython language-feature tests in scope pass; every
@@ -609,9 +619,24 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the PyX runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-25: **47/297 modules importable**, **250 missing**
-(41 builtin/frozen, 142 pure Python, 59 extension, 8 unknown/platform),
-with 8 modules where CPython 3.14.9 itself fails on this host.
+from it). Status 2026-10-25: **58/297 modules importable**, **239 missing**
+(39 builtin/frozen, 133 pure Python, 59 extension, 8 unknown/platform),
+with 9 modules where CPython 3.14.9 itself fails on this host.
+
+The package/site-packages loader (P7-01) is in place: packages with
+`__init__.py`, dotted names, submodules and relative imports resolve through
+sibling files, the package-chain root, `PYX_SITE_PACKAGES`, the
+`VIRTUAL_ENV`/`CONDA_PREFIX` site-packages trees and `PYTHONPATH`.
+Imported module bodies run once as initializers, and nested imports stay
+deferred. No native `rich` is shipped: the official pure-Python `rich`
+distribution is resolved through this loader.
+
+**`bench_all.py` under PyX: not yet green.** The first concrete blocker is
+`rich/console.py`: `dataclasses.field`, `os.PathLike`, ellipsis, `del`,
+`get_ipython`, `sys.stdin`/`__stdin__`/`__stdout__`/`__stderr__`,
+`os.get_terminal_size`/`open`/`dup2`, `SystemExit`, `input()` and
+`threading.local`. Further `rich` modules will likely add more; do not claim
+the benchmark harness runs until it actually does.
 
 Acceptance: 297/297 modules accounted for on CPython 3.14.9 — every module
 is either importable **and** green in its CPython `Lib/test/test_*.py`
@@ -624,10 +649,17 @@ goal P4-09; P4-09 keeps the policy and the dependency on P4-03/P4-04.
 
 ### Workstreams
 
-- [ ] P7-01 Import and package foundation: packages with `__init__.py`,
+- [~] P7-01 Import and package foundation: packages with `__init__.py`,
       dotted and relative imports, `sys.path`/`sys.modules` handling,
       namespace packages, frozen modules, circular imports, and top-level
       module execution (import side effects). Depends on P4-03.
+      **Delivered:** packages (dotted names, submodules, relative imports),
+      the search path (sibling files, package-chain root, `PYX_SITE_PACKAGES`,
+      `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages, `PYTHONPATH`), load-once per
+      canonical path, cycle diagnostics for module-level import cycles, and
+      imported module bodies as one-time initializers. **Open:** namespace
+      packages, frozen modules, a general `sys.path`/`sys.modules` runtime
+      model and multiple-module `from x import *`.
 - [ ] P7-02 Pure-Python stdlib source and shim pipeline: consume the CPython
       3.14 stdlib tree unmodified (PSF license, optional sysroot), resolve
       imports through PyX shims, never fork sources; per-module provenance
@@ -653,8 +685,8 @@ goal P4-09; P4-09 keeps the policy and the dependency on P4-03/P4-04.
 
 ### Batches (dependency-ordered)
 
-Each module below is assigned to exactly one batch; Batch A (11 modules) is
-importable now, the remaining 261 are open. Later
+Each module below is assigned to exactly one batch; 33 ledger entries are
+importable now, 231 remain open and 8 are platform-blocked. Later
 batches may start only when their prerequisites are importable; the module
 ledger below is the per-layer checklist that tracks the actual work.
 
@@ -697,52 +729,55 @@ ledger below is the per-layer checklist that tracks the actual work.
       `shlex`, `reprlib`, `pprint`, `difflib`, `linecache`, `html`,
       `_markupbase`, `cmd`, `mailbox`, `email`, `wave`
 
-- [ ] P7-12 Batch C — 45 modules: import, builtins and object model. Needs P7-01;
-      unblocks every remaining batch.
-      Modules (all `[ ]` in the ledger):
+- [~] P7-12 Batch C — 45 modules: import, builtins and object model. Needs P7-01;
+      unblocks every remaining batch. Importable now (7/45): `abc`,
+      `itertools`, `types`, `typing`, `enum`, `importlib`, `__future__`.
+      Remaining (ledger entries start unchecked):
       `_abc`, `_codecs`, `_collections`, `_collections_abc`,
       `_frozen_importlib`, `_frozen_importlib_external`, `_imp`, `_sre`,
       `tracemalloc`, `_tracemalloc`, `_types`, `_typing`, `_warnings`,
-      `_py_warnings`, `_weakref`, `_weakrefset`, `abc`, `_py_abc`, `atexit`,
-      `builtins`, `codecs`, `encodings`, `faulthandler`, `gc`, `itertools`,
-      `runpy`, `site`, `_sitebuiltins`, `zipimport`, `types`, `typing`,
-      `warnings`, `weakref`, `copy`, `contextlib`, `enum`, `importlib`,
-      `pkgutil`, `modulefinder`, `__future__`, `_suggestions`, `_colorize`,
+      `_py_warnings`, `_weakref`, `_weakrefset`, `_py_abc`, `atexit`,
+      `builtins`, `codecs`, `encodings`, `faulthandler`, `gc`,
+      `runpy`, `site`, `_sitebuiltins`, `zipimport`,
+      `warnings`, `weakref`, `copy`, `contextlib`,
+      `pkgutil`, `modulefinder`, `_suggestions`, `_colorize`,
       `sre_compile`, `sre_constants`, `sre_parse`
 
 - [~] P7-13 Batch D — 24 modules: filesystem and process. Needs P7-01/P7-03
       (`posix`, `genericpath`). `subprocess` is done as part of the
       benchmark-critical batch; the remaining modules need the import
       foundation.
-      Modules (all `[ ]` in the ledger):
+      Modules (remaining; `subprocess` is checked in the ledger):
       `genericpath`, `posixpath`, `ntpath`, `nturl2path`, `posix`, `pwd`,
-      `_signal`, `signal`, `getpass`, `subprocess`, `_posixsubprocess`,
+      `_signal`, `signal`, `getpass`, `_posixsubprocess`,
       `_pyio`, `fcntl`, `grp`, `resource`, `pty`, `tty`, `termios`,
       `select`, `selectors`, `syslog`, `mmap`, `sched`, `webbrowser`
 
-- [ ] P7-14 Batch E — 42 modules: data formats, datetime, serialization and
+- [~] P7-14 Batch E — 42 modules: data formats, datetime, serialization and
       numerics. Needs BigInt (P4-02) and P7-04 for
-      `_json`/`_struct`/`_pickle`/`_csv`.
-      Modules (all `[ ]` in the ledger):
-      `datetime`, `_datetime`, `_pydatetime`, `_strptime`, `calendar`,
+      `_json`/`_struct`/`_pickle`/`_csv`. Importable now (3/42):
+      `dataclasses` and `datetime` (native module specs, with frontend
+      dataclass expansion) and `fractions` (native). Remaining (ledger
+      entries start unchecked):
+      `_datetime`, `_pydatetime`, `_strptime`, `calendar`,
       `struct`, `_struct`, `marshal`, `pickletools`, `copyreg`,
-      `_compat_pickle`, `plistlib`, `tomllib`, `dataclasses`, `decimal`,
-      `_decimal`, `_pydecimal`, `_pylong`, `fractions`, `numbers`,
+      `_compat_pickle`, `plistlib`, `tomllib`, `decimal`,
+      `_decimal`, `_pydecimal`, `_pylong`, `numbers`,
       `_statistics`, `uuid`, `_uuid`, `ipaddress`, `zoneinfo`, `_zoneinfo`,
       `dbm`, `_dbm`, `_gdbm`, `shelve`, `sqlite3`, `_sqlite3`, `_json`,
       `_csv`, `_pickle`, `array`, `cmath`, `graphlib`, `xml`,
       `_elementtree`, `pyexpat`, `_random`
 
 - [~] P7-15 Batch F — 39 modules: introspection, REPL and developer tooling.
-      Needs C (import/`ast`) and code-object metadata. `timeit` is done as part
-      of the benchmark-critical batch.
-      Modules (all `[ ]` in the ledger):
-      `_ast`, `_ast_unparse`, `ast`, `_opcode`, `_opcode_metadata`,
+      Needs C (import) and code-object metadata. `timeit` is done as part
+      of the benchmark-critical batch; `ast` is importable now (2/39).
+      Remaining (ledger entries start unchecked):
+      `_ast`, `_ast_unparse`, `_opcode`, `_opcode_metadata`,
       `opcode`, `dis`, `_symtable`, `symtable`, `_tokenize`, `token`,
       `tokenize`, `inspect`, `annotationlib`, `_pyrepl`, `code`, `codeop`,
       `compileall`, `py_compile`, `tabnanny`, `doctest`, `pydoc`,
       `pydoc_data`, `pyclbr`, `rlcompleter`, `idlelib`, `bdb`, `cProfile`,
-      `profile`, `pstats`, `pdb`, `trace`, `timeit`, `traceback`, `_lsprof`,
+      `profile`, `pstats`, `pdb`, `trace`, `traceback`, `_lsprof`,
       `_remote_debugging`, `readline`, `this`, `antigravity`
 
 - [ ] P7-16 Batch G — 11 modules: logging, configuration and site/packaging
@@ -760,10 +795,11 @@ ledger below is the per-layer checklist that tracks the actual work.
       `_socket`, `_ssl`, `ssl`
 
 - [ ] P7-18 Batch I — 11 modules: compression and archives. Needs P7-04 (`zlib`,
-      `_bz2`, `_lzma`, `_zstd`).
-      Modules (all `[ ]` in the ledger):
+      `_bz2`, `_lzma`, `_zstd`). `binascii` is implemented in Batch B and is
+      not repeated here.
+      Modules (remaining; all `[ ]` in the ledger):
       `bz2`, `_bz2`, `gzip`, `lzma`, `_lzma`, `zlib`, `_zstd`,
-      `compression`, `binascii`, `zipfile`, `tarfile`
+      `compression`, `zipfile`, `tarfile`
 
 - [ ] P7-19 Batch J — 11 modules: concurrency, async and subinterpreters. Needs P2
       scheduler/GC work and P7-04.
@@ -773,7 +809,7 @@ ledger below is the per-layer checklist that tracks the actual work.
       `_interpreters`, `_multiprocessing`, `_posixshmem`, `_queue`
 
 - [ ] P7-20 Batch K — 17 modules: large native extension surfaces (Tk, curses,
-      Unicode data, multibyte codecs, `ctypes`, `_random`). Needs P4-04c and
+      Unicode data, multibyte codecs and `ctypes`). Needs P4-04c and
       P7-04.
       Modules (all `[ ]` in the ledger):
       `ctypes`, `_ctypes`, `curses`, `_curses`, `_curses_panel`,
@@ -783,13 +819,18 @@ ledger below is the per-layer checklist that tracks the actual work.
 
 - [x] P7-22 Benchmark-critical batch — 5 modules used by
       `benchmarks/bench_all.py` and the bench scripts: `subprocess`,
-      `tempfile`, `shutil`, `textwrap`, `timeit`. Gate: all five import and
-      their benchmark-used APIs pass; `bench_all.py --only pyx` completes.
-      `bench_pyx.py` itself is not yet a PyX target because it uses
-      unsupported language features (`__doc__`/`__file__`, ternary/identity
-      expressions, `max`/`round`/`format`/`isinstance`, keyword arguments and
-      a lambda closure); `bench_all.py` under PyX additionally needs `rich`
-      and decorators. These remain P4-02/P7-01 work.
+      `tempfile`, `shutil`, `textwrap`, `timeit`. Gate (under CPython): all
+      five import and their benchmark-used APIs pass; `bench_all.py --only
+      pyx` completes. Running `bench_all.py` itself under PyX is **not** part
+      of this gate and is **not yet green**: the official pure-Python `rich`
+      package now resolves through the loader, but `rich/console.py` still
+      fails on `dataclasses.field`, `os.PathLike`, ellipsis, `del`,
+      `get_ipython`, `sys.stdin`/`__stdin__`/`__stdout__`/`__stderr__`,
+      `os.get_terminal_size`/`open`/`dup2`, `SystemExit`, `input()` and
+      `threading.local`; further `rich` modules will likely add more.
+      `bench_pyx.py` runs under CPython and drives `pyx run`/`pyx build`
+      over embedded workloads; the harness scripts themselves are not PyX
+      targets in this gate. The remaining `rich` work is P4-02/P7-01.
       Modules: `subprocess`, `tempfile`, `shutil`, `textwrap`, `timeit`.
 
 - [ ] P7-21 Batch L — 13 modules: platform-specific modules. The 8
@@ -803,8 +844,12 @@ ledger below is the per-layer checklist that tracks the actual work.
 ### Module ledger (272 originally missing)
 
 Derived from the 272-module baseline in `benchmarks/compat/latest.json`.
-The 11 Batch A entries are checked; `[x]` means importable and
-representative-API tested, not CPython test-subset parity (P7-05). `[!]` marks a module CPython ships only for a
+33 entries are checked; `[x]` means importable (plus representative-API
+testing where the batch notes say so), not CPython test-subset parity
+(P7-05). The 11 newly checked entries (`abc`, `itertools`, `types`,
+`typing`, `enum`, `importlib`, `__future__`, `ast`, `dataclasses`,
+`datetime`, `fractions`) are checked from real `latest.json` imports. `[!]`
+marks a module CPython ships only for a
 platform PyX does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
@@ -839,14 +884,14 @@ platform-unsupported rather than implemented.
 - [ ] `_typing`
 - [ ] `_warnings`
 - [ ] `_weakref`
-- [ ] `abc`
+- [x] `abc`
 - [ ] `atexit`
 - [ ] `builtins`
 - [ ] `codecs`
 - [ ] `faulthandler`
 - [ ] `gc`
 - [ ] `genericpath`
-- [ ] `itertools`
+- [x] `itertools`
 - [ ] `marshal`
 - [ ] `ntpath`
 - [ ] `posix`
@@ -859,7 +904,7 @@ platform-unsupported rather than implemented.
 
 #### Pure Python (156)
 
-- [ ] `__future__`
+- [x] `__future__`
 - [ ] `_aix_support`
 - [ ] `_android_support`
 - [ ] `_apple_support`
@@ -882,7 +927,7 @@ platform-unsupported rather than implemented.
 - [ ] `_weakrefset`
 - [ ] `annotationlib`
 - [ ] `antigravity`
-- [ ] `ast`
+- [x] `ast`
 - [x] `base64`
 - [ ] `bdb`
 - [x] `bisect`
@@ -903,8 +948,8 @@ platform-unsupported rather than implemented.
 - [ ] `copyreg`
 - [ ] `ctypes`
 - [ ] `curses`
-- [ ] `dataclasses`
-- [ ] `datetime`
+- [x] `dataclasses`
+- [x] `datetime`
 - [ ] `dbm`
 - [ ] `decimal`
 - [ ] `difflib`
@@ -913,11 +958,11 @@ platform-unsupported rather than implemented.
 - [ ] `email`
 - [ ] `encodings`
 - [ ] `ensurepip`
-- [ ] `enum`
+- [x] `enum`
 - [ ] `filecmp`
 - [ ] `fileinput`
 - [x] `fnmatch`
-- [ ] `fractions`
+- [x] `fractions`
 - [ ] `ftplib`
 - [x] `getopt`
 - [ ] `getpass`
@@ -932,7 +977,7 @@ platform-unsupported rather than implemented.
 - [ ] `http`
 - [ ] `idlelib`
 - [ ] `imaplib`
-- [ ] `importlib`
+- [x] `importlib`
 - [ ] `inspect`
 - [ ] `ipaddress`
 - [x] `keyword`
@@ -1000,8 +1045,8 @@ platform-unsupported rather than implemented.
 - [ ] `tty`
 - [ ] `turtle`
 - [ ] `turtledemo`
-- [ ] `types`
-- [ ] `typing`
+- [x] `types`
+- [x] `typing`
 - [ ] `urllib`
 - [ ] `uuid`
 - [ ] `venv`

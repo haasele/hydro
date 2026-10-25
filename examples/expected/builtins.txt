@@ -18,3 +18,19 @@ True False False
 0 1
 zero range() arg 3 must not be zero
 sum unsupported operand type(s) for +: 'int' and 'str'
+65 233 A é 😀
+z
+ord ord() expected a character, but string of length 2 found
+chr chr() arg not in range(0x110000)
+chr chr() arg cannot be a surrogate code point
+walrus 10
+10
+loop 1
+loop 2
+after 3
+[2, 4, 6]
+6
+True 1
+False 2
+True 4
+False 3

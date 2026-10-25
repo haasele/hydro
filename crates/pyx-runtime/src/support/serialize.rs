@@ -213,6 +213,14 @@ fn encode_value(
             FunctionBody::Native { .. } | FunctionBody::Builtin(_) => {
                 return Err(PickleError::Unsupported("function"));
             }
+            // Derived callables (getters, partials, identity decorators) have
+            // no registry entry to reconstruct them from.
+            FunctionBody::AttributeGetter { .. }
+            | FunctionBody::ItemGetter { .. }
+            | FunctionBody::Partial { .. }
+            | FunctionBody::Identity => {
+                return Err(PickleError::Unsupported("function"));
+            }
         };
         let Ok(arity) = u32::try_from(function.arity) else {
             return Err(PickleError::Unsupported("function"));
@@ -566,6 +574,10 @@ mod tests {
             crate::value::FunctionBody::Native { .. } | crate::value::FunctionBody::Builtin(_) => {
                 panic!("expected a wrapper")
             }
+            crate::value::FunctionBody::AttributeGetter { .. }
+            | crate::value::FunctionBody::ItemGetter { .. }
+            | crate::value::FunctionBody::Partial { .. }
+            | crate::value::FunctionBody::Identity => panic!("expected a wrapper"),
         }
         assert_eq!(decoded.arity, 2);
         assert_eq!(decoded.name, "worker");

@@ -31,10 +31,11 @@ fn function(wrapper: extern "C" fn(*const i64) -> i64, arity: usize, name: &str)
 fn class(name: &str, base: i64, methods: &[(&str, i64)]) -> i64 {
     let names: Vec<i64> = methods.iter().map(|(name, _)| text(name)).collect();
     let funcs: Vec<i64> = methods.iter().map(|(_, func)| *func).collect();
-    let (names_ptr, funcs_ptr) = if methods.is_empty() {
-        (std::ptr::null(), std::ptr::null())
+    let kinds: Vec<i64> = vec![0; methods.len()];
+    let (names_ptr, funcs_ptr, kinds_ptr) = if methods.is_empty() {
+        (std::ptr::null(), std::ptr::null(), std::ptr::null())
     } else {
-        (names.as_ptr(), funcs.as_ptr())
+        (names.as_ptr(), funcs.as_ptr(), kinds.as_ptr())
     };
     pyx_class_new(
         name.as_ptr(),
@@ -43,6 +44,10 @@ fn class(name: &str, base: i64, methods: &[(&str, i64)]) -> i64 {
         methods.len(),
         names_ptr,
         funcs_ptr,
+        kinds_ptr,
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
     )
 }
 
@@ -362,6 +367,7 @@ fn class_without_init_rejects_arguments() {
 #[test]
 fn class_definition_validation() {
     pyx_runtime_init();
+    let kinds = [0i64];
 
     // Base must be a class or None.
     let names = [text("who")];
@@ -373,6 +379,10 @@ fn class_definition_validation() {
         names.len(),
         names.as_ptr(),
         funcs.as_ptr(),
+        kinds.as_ptr(),
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
     );
     assert_error_tag(TYPE_ERROR);
 
@@ -386,6 +396,10 @@ fn class_definition_validation() {
         bad_names.len(),
         bad_names.as_ptr(),
         funcs.as_ptr(),
+        kinds.as_ptr(),
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
     );
     assert_error_tag(TYPE_ERROR);
 
@@ -399,6 +413,10 @@ fn class_definition_validation() {
         names.len(),
         names.as_ptr(),
         bad_funcs.as_ptr(),
+        kinds.as_ptr(),
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
     );
     assert_error_tag(TYPE_ERROR);
 }

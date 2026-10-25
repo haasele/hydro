@@ -143,7 +143,7 @@ fn test_method_names(class: i64) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut current = class;
     while let Some(state) = value::as_class(current) {
-        for (name, _) in &state.methods {
+        for (name, _, _) in &state.methods {
             if name.starts_with("test") && !names.iter().any(|existing| existing == name) {
                 names.push(name.clone());
             }
@@ -338,7 +338,7 @@ mod tests {
         let names: Vec<&str> = class
             .methods
             .iter()
-            .map(|(name, _)| name.as_str())
+            .map(|(name, _, _)| name.as_str())
             .collect();
         assert_eq!(
             names,

@@ -7,6 +7,7 @@ use pyx_runtime::abi::*;
 
 const VALUE_ERROR: i64 = 0;
 const TYPE_ERROR: i64 = 1;
+const ZERO_DIVISION_ERROR: i64 = 2;
 const INDEX_ERROR: i64 = 6;
 const ATTRIBUTE_ERROR: i64 = 9;
 
@@ -243,6 +244,40 @@ fn random_choice_by_sequence_kind() {
     module("random", "choice", &[text("")]);
     expect_error(INDEX_ERROR);
     module("random", "choice", &[int(1)]);
+    expect_error(TYPE_ERROR);
+}
+
+// -------------------------------------------------------------------------
+// getrandbits and sys streams
+// -------------------------------------------------------------------------
+
+#[test]
+fn random_getrandbits_and_sys_streams_through_the_abi() {
+    let _random = lock_global_random();
+    pyx_runtime_init();
+    module("random", "seed", &[int(1)]);
+    assert_no_error();
+    assert_int(module("random", "getrandbits", &[int(0)]), 0);
+    for _ in 0..8 {
+        let value = raw(module("random", "getrandbits", &[int(24)]));
+        assert_no_error();
+        assert!((0..(1 << 24)).contains(&value), "24-bit draw out of range");
+    }
+    module("random", "getrandbits", &[int(-1)]);
+    expect_error(VALUE_ERROR);
+
+    let stdout = get("sys", "stdout");
+    assert_no_error();
+    // An empty write flushes without producing output and returns 0.
+    assert_int(method(stdout, "write", &[text("")]), 0);
+    assert_eq!(method(stdout, "flush", &[]), pyx_none());
+    assert_no_error();
+    let tty = method(stdout, "isatty", &[]);
+    assert_no_error();
+    assert!(tty == pyx_true() || tty == pyx_false());
+
+    // Writing a non-string is a TypeError.
+    method(stdout, "write", &[int(1)]);
     expect_error(TYPE_ERROR);
 }
 
@@ -577,6 +612,38 @@ fn builtin_function_values_call_through_pyx_call() {
     expect_error(TYPE_ERROR);
     call(builtin("int"), &[int(1), int(2)]);
     expect_error(TYPE_ERROR);
+}
+
+#[test]
+fn divmod_and_callable_work_as_builtin_values() {
+    pyx_runtime_init();
+    // `divmod(a, b)` returns Python's floored quotient and remainder.
+    let result = call(builtin("divmod"), &[int(7), int(3)]);
+    assert_no_error();
+    assert_int(pyx_subscript(result, int(0)), 2);
+    assert_int(pyx_subscript(result, int(1)), 1);
+
+    let negative = call(builtin("divmod"), &[int(-7), int(3)]);
+    assert_no_error();
+    assert_int(pyx_subscript(negative, int(0)), -3);
+    assert_int(pyx_subscript(negative, int(1)), 2);
+
+    let floats = call(builtin("divmod"), &[pyx_float_new(-7.5), int(2)]);
+    assert_no_error();
+    assert_float(pyx_subscript(floats, int(0)), -4.0);
+    assert_float(pyx_subscript(floats, int(1)), 0.5);
+
+    call(builtin("divmod"), &[int(1), int(0)]);
+    expect_error(ZERO_DIVISION_ERROR);
+
+    // `callable` accepts function values and rejects plain data.
+    let callable = builtin("callable");
+    assert_eq!(call(callable, &[builtin("len")]), pyx_true());
+    assert_no_error();
+    assert_eq!(call(callable, &[int(1)]), pyx_false());
+    assert_no_error();
+    assert_eq!(call(callable, &[list(&[int(1)])]), pyx_false());
+    assert_no_error();
 }
 
 #[test]

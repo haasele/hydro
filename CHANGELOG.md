@@ -8,14 +8,132 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **1064 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25: **1329 tests**, `scripts/verify.sh` ALL GREEN. The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
+58/297 standard-library modules are importable (13 builtin/frozen, 41 pure,
+4 extension). `benchmarks/bench_all.py` does **not** yet run under PyX: its
+first blocker is `rich/console.py` (see the package-loader entry below).
 
 ### Added
 
+- **Package/site-packages loader and official `rich` source:** `check_file`
+  now resolves packages (`__init__.py`), dotted names, submodules and
+  relative imports, in this order: sibling files, the package-chain root,
+  `PYX_SITE_PACKAGES`, the `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages trees
+  and `PYTHONPATH`. Every unit loads once per canonical path; imported
+  module bodies run once as initializers, and nested imports remain deferred
+  until the enclosing code runs. A native `rich` implementation is no longer
+  shipped: the official pure-Python `rich` distribution resolves through
+  this loader. `benchmarks/bench_all.py` still does not run under PyX; the
+  first concrete failure is `rich/console.py` (`dataclasses.field`,
+  `os.PathLike`, ellipsis, `del`, `get_ipython`, `sys.stdin`/`__stdin__`/
+  `__stdout__`/`__stderr__`, `os.get_terminal_size`/`open`/`dup2`,
+  `SystemExit`, `input()`, `threading.local`), and further `rich` modules
+  will likely add more.
+- **List slice assignment:** `xs[start:stop:step] = value` lowers to the new
+  `StmtKind::SetSlice` (omitted bounds are `Const::None`) and the
+  `pyx_slice_set` ABI. Python's evaluation order is preserved (right-hand
+  side first, then the target expression, then the bounds in source order).
+  A `step` of 1 splices any iterable into the list (growing, shrinking or
+  inserting); extended slices replace the visited positions and raise
+  `ValueError` on a length mismatch. Bounds follow `slice.indices`, the
+  right-hand side is materialised before mutation (so `xs[:] = xs` works),
+  and inserted edges publish GC insertion barriers while the list is locked.
+  Immutable `str`/`bytes`/`tuple` targets raise `TypeError` (statically for
+  known types), a dict target reports `unhashable type: 'slice'`, and
+  augmented slice assignment (`xs[a:b] += v`) remains a clear diagnostic.
+  `examples/slices.py` and the runtime/frontend/codegen suites cover head,
+  middle, tail, empty and full slices, negative bounds, extended steps,
+  length errors, non-list targets and evaluation order.
+- **`ord`/`chr`, assignment expressions and chained comparisons:**
+  `ord(character)` returns the Unicode scalar value of a one-character `str`
+  (`TypeError` for any other length or a non-`str`) and `chr(codepoint)`
+  returns the one-character `str` for an integer in `0..=0x10FFFF`
+  (`TypeError` for a non-integer, `ValueError` for an out-of-range or
+  surrogate code point, which PyX's UTF-8 strings cannot represent). Direct
+  calls use the new ABI entries `pyx_ord`/`pyx_chr`, so they allocate nothing.
+  `(name := value)` lowers to the new `ExprKind::NamedExpr`, which stores the
+  value in the enclosing function's local and yields it; a walrus inside a
+  comprehension binds the enclosing scope (rebinding the iteration variable
+  is rejected), and a name bound only by a walrus is not part of the
+  statement-target pre-pass, so reads before it or captures of it from
+  earlier nested functions stay unresolved (documented limitation). `a < b <
+  c` lowers to a short-circuit `And` of pairwise comparisons; every middle
+  operand is evaluated exactly once through a hidden `$cmpN` local, for
+  arbitrary chain length and every comparison operator.
+- **Shared `rich/style.py` surface:** `random.getrandbits(k)` (SplitMix64,
+  `0 <= k <= 60`), `hash(value)` (`pyx_hash`; dict-key hash, unhashable
+  values raise `TypeError`), unary `~` on `int`/`bool` (`UnOp::Invert`,
+  `pyx_unop` code 3), the reserved `NotImplemented` singleton constant,
+  native `sys.stdout`/`sys.stderr` streams (`write`, `flush`, `isatty`), and
+  user-class exception handlers: `raise module.Class(...)` and non-builtin
+  `except` targets (including dotted and imported classes) use the existing
+  `RuntimeError` fallback, documented as approximate. Non-literal parameter
+  defaults (`color_system=ColorSystem.TRUECOLOR`) now compile with `None`
+  metadata instead of being rejected.
+- **`assert`, `re` flags and the `@rich_repr` class decorator:**
+  `assert test[, msg]` lowers to a new `StmtKind::Assert`; codegen branches on
+  the test and evaluates `msg` only on failure, raising `AssertionError`
+  (tag 14, catchable by `except Exception`). `re` exposes the `RegexFlag`
+  members (`VERBOSE`/`X`, `IGNORECASE`/`I`, `MULTILINE`/`M`, `DOTALL`/`S`,
+  `ASCII`/`A`, `UNICODE`/`U`, `TEMPLATE`, `LOCALE`, `DEBUG`, `NOFLAG`) as
+  ints with CPython's values, `re.compile(pattern, flags=0)` forwards the
+  bits it honours to the regex builder, and a compiled pattern keeps them
+  for every method call (plus a `.flags` attribute). `@rich_repr`
+  (`rich.repr.rich_repr`) is accepted as a no-op class decorator, like
+  `@dataclass`: the class keeps the methods it declares and only the
+  generated `__repr__` is absent.
+- **`tuple`/`hasattr`, starred unpack targets, user-class raises and
+  `functools.partial` keywords:** `tuple()`/`tuple(iterable)` build a tuple
+  (new ABI `pyx_tuple_from`) and `hasattr(obj, name)` reports attribute
+  existence, swallowing only `AttributeError` (`pyx_hasattr`). `a, *rest, b
+  = value` binds a fresh list of the middle elements through
+  `pyx_unpack_star`; one star is allowed and nested or duplicated stars are
+  compile errors. `raise ReprError("msg")` for a class declared in the unit
+  lowers to `RuntimeError("ReprError: msg")` (cause preserved, message
+  `str()`-rendered); `except ReprError` now matches that `RuntimeError` tag
+  (approximate; see the shared style surface entry). Generator
+  functions carry their positional parameter names (`pyx_function_params`),
+  so `functools.partial(f, kw=value)` forwards keyword names through the new
+  `pyx_module_call_kw` ABI and binds them by parameter name when the partial
+  is called; targets without names raise `TypeError` instead of dropping the
+  keywords.
+- **`repr`, general starred calls and bitwise operators:** `repr(value)`
+  returns the runtime's Python representation (`pyx_to_repr`); a general
+  call with one starred positional operand (`f(a, *items)`) lowers to
+  `IndirectCall { star }` and runs through the new ABI
+  `pyx_call_star(fn, argc, argv, star)`, which flattens a list/tuple and
+  raises `TypeError` otherwise (method calls keep `pyx_method_star`);
+  `&`, `|`, `^`, `<<` and `>>` are compiled (`BinOp` codes 17–21) with
+  Python int/bool semantics, `TypeError` for other operands and
+  `ValueError`/`OverflowError` for negative or out-of-range shifts.
+- **Exception classes as values:** built-in exception names (`BaseException`,
+  `Exception`, `ValueError`, `TypeError`, `RuntimeError`, `OSError`,
+  `FileNotFoundError`, `AssertionError`, `GeneratorExit`, ...) are first-class
+  class objects, so `class E(Exception):` and `class F(E):` work, and
+  `E.__name__`, inheritance, instantiation and `isinstance` behave like any
+  user class. The names resolve in expression contexts after locals, imports,
+  functions and module globals; `raise`/`except` keep their tag-based
+  lowering. The hidden ABI `pyx_exception_class(tag)` returns one cached
+  native class per tag (thread-local cache cleared by `pyx_runtime_init`).
+- **Unpacking targets:** `a, b = ...` accepts any iterable source (including
+  `iter(...)`, generators, dicts and ranges) and supports nested tuple/list
+  targets as well as attribute and subscript targets such as
+  `self.left, items[0] = pair`. Binding stays left to right with Python's
+  evaluation order; mismatched lengths keep their `ValueError` messages. The
+  new ABI `pyx_unpack_seq` returns the sequence to bind (materialising it only
+  for general iterables) so codegen can read the elements safely.
+- **Deferred imports:** imports nested in functions, classes or compound
+  bodies are recorded but no longer loaded while compiling. Names that can be
+  linked to an already-visible dependency bind normally; all other bindings
+  lower to `DeferredImport`, which calls the new ABI `pyx_deferred_import` and
+  raises `RuntimeError: dynamic import of '<module>.<member>' is not
+  supported` only if the enclosing code runs. Top-level imports still load
+  and initialize eagerly, and optional dependency graphs (for example
+  `rich/_extension.py`) stay out of programs that never call them.
 - **Formatting:** f-string format specs (`:.2f`, `:04d`, `:#x`, alignment/
   fill character/sign/grouping) as well as `!s`/`!r`/`!a`; `str.format(...)`;
   printf formatting (`"%s:%d" % (...)`); shared spec implementation and
@@ -29,7 +147,13 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   `map(f, xs)`).
 - **Classes:** `class Name(Base)` with one base, methods, `__init__`,
   inheritance/overrides, instance attributes, and dynamic method dispatch;
-  instances/classes have deterministic representations.
+  instances/classes have deterministic representations. Class bodies also
+  support frozen class attributes (`x = value`, annotated `x: T = value`,
+  `__slots__` accepted and ignored), `@property`/`@classmethod`/
+  `@staticmethod` binding kinds, ignored `lru_cache`/`cache`/`wraps`/
+  `abstractmethod`/`overload`/`runtime_checkable` decorators, class-form
+  `typing.NamedTuple` field synthesis, and `instance.__class__` /
+  `Class.__name__`.
 - **Closures:** nested `def` captures outer locals **by value**;
   ABI `pyx_closure_new`, captures as leading wrapper parameters.
 - **Lazy generators:** `yield value`/bare `yield` run in a stackful
@@ -75,6 +199,14 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 - **User modules:** `import foo` / `from foo import f` via sibling files,
   module cache per canonical path, cycle detection, `__name__`, and
   AOT embedding; imported modules must not have top-level side effects.
+- **Nested imports:** imports inside function bodies and compound blocks
+  (`if`/`for`/`while`/`try`/`with`/class bodies) are resolved while
+  compiling, so `rich/_extension.py`'s `from rich.pretty import install`
+  links directly and imported names stay order-independent. A deferred
+  import that closes a cycle, or a member of an ancestor package that is
+  still initializing, binds late through the runtime global table; cycles
+  made only of module-level imports stay errors, and `if TYPE_CHECKING:` /
+  `if __name__ == "__main__":` blocks are not linked.
 - **Stdlib:** `os.path`, `argparse` (subset, `Namespace`),
   `collections.defaultdict`, `re` (Rust `regex`, `Pattern`/`Match`),
   `socket` (blocking TCP), `asyncio` (`run`/`sleep`/`gather`).
@@ -165,11 +297,12 @@ API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
   `textwrap` and `timeit` are native and API-tested; `pyx run` now forwards
   program arguments into `sys.argv`, with `sys.executable`, `sys.exit`,
   `os.environ`/`os.access` and argparse default-argv/help support.
-  `bench_all.py --only pyx` completes; import baseline 47/297.
+  `bench_all.py --only pyx` completes under CPython; import baseline at that
+  point 47/297 (now 58/297).
 - **Batch B native codec/text core:** `binascii`, `base64`, `quopri`,
   `fnmatch`, `getopt` and `mimetypes` are native and API-tested, bringing the
-  import baseline to 42/297. The remaining Batch B modules still need the
-  pure-Python pipeline.
+  import baseline to 42/297 (now 58/297). The remaining Batch B modules still
+  need the pure-Python pipeline.
 - **Standard-library program (P7) and Batch A:** added a complete
   module-by-module plan for all 272 missing stdlib modules with dependency
   batches and a per-layer ledger. First slice implements native

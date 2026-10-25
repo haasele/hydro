@@ -9,13 +9,15 @@
 
 use pyx_ir::stdlib;
 use pyx_ir::{
-    BinOp, Builtin, Callee, ClassMethod, CompClause, CompTarget, Expr as IrExpr, ExprKind,
-    Function as IrFunction, Handler as IrHandler, LocalInfo, Param, Program, Stmt as IrStmt,
-    StmtKind, Type, UnOp,
+    BinOp, Builtin, Callee, ClassAttr, ClassMethod, CompClause, CompTarget, Const, Expr as IrExpr,
+    ExprKind, Function as IrFunction, Handler as IrHandler, LocalInfo, Param, Program,
+    Stmt as IrStmt, StmtKind, Type, UnOp, UnpackTarget,
 };
 
 use crate::diag::{self, codes, Diagnostic};
-use crate::lower::{HCompClause, HCompTarget, HExpr, HExprKind, HFunction, HStmt, HStmtKind, LHir};
+use crate::lower::{
+    HCompClause, HCompTarget, HExpr, HExprKind, HFunction, HStmt, HStmtKind, HUnpackTarget, LHir,
+};
 
 /// A type slot: either a concrete type or an inference variable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -278,6 +280,10 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
         "split",
         MethodSig::new(0, 2, &[ArgKind::Str, ArgKind::Int], Type::List),
     ),
+    (
+        "splitlines",
+        MethodSig::new(0, 1, &[ArgKind::Any], Type::List),
+    ),
     ("join", MethodSig::new(1, 1, &[ArgKind::List], Type::Str)),
     (
         "replace",
@@ -294,6 +300,10 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
     ("find", MethodSig::new(1, 1, &[ArgKind::Str], Type::Int)),
     ("count", MethodSig::new(1, 1, &[ArgKind::Str], Type::Int)),
     ("encode", MethodSig::new(0, 1, &[ArgKind::Str], Type::Bytes)),
+    (
+        "translate",
+        MethodSig::new(1, 1, &[ArgKind::Any], Type::Str),
+    ),
     // `str.format(*args)` accepts any number of positional arguments; field
     // count and types are validated at runtime by the format parser.
     ("format", MethodSig::new(0, usize::MAX, &[], Type::Str)),
@@ -324,6 +334,10 @@ const BYTES_METHODS: &[(&str, MethodSig)] = &[
         ),
     ),
     ("split", MethodSig::new(1, 1, &[ArgKind::Bytes], Type::List)),
+    (
+        "splitlines",
+        MethodSig::new(0, 1, &[ArgKind::Any], Type::List),
+    ),
     ("join", MethodSig::new(1, 1, &[ArgKind::List], Type::Bytes)),
     (
         "strip",
@@ -343,6 +357,10 @@ const BYTES_METHODS: &[(&str, MethodSig)] = &[
 
 const LIST_METHODS: &[(&str, MethodSig)] = &[
     ("append", MethodSig::new(1, 1, &[ArgKind::Any], Type::None)),
+    (
+        "sort",
+        MethodSig::new(0, 2, &[ArgKind::Any, ArgKind::Any], Type::None),
+    ),
     ("extend", MethodSig::new(1, 1, &[ArgKind::List], Type::None)),
     (
         "insert",
@@ -428,10 +446,21 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
                 || (a.is_numeric() && b.is_numeric())
                 || (a == Type::Str && b == Type::Str)
                 || (a == Type::Bytes && b == Type::Bytes)
+                || (a == Type::Tuple && b == Type::Tuple)
+                || (a == Type::List && b == Type::List)
             {
                 Some(Type::Bool)
             } else {
                 None
+            }
+        }
+        // `is`/`is not` accept any pair of values: the runtime compares the
+        // tagged representation, so no operand type combination is invalid.
+        BinOp::Is | BinOp::IsNot => {
+            if a == Type::Never || b == Type::Never {
+                None
+            } else {
+                Some(Type::Bool)
             }
         }
         BinOp::Add => {
@@ -470,6 +499,10 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
                 || (b == Type::Tuple && matches!(a, Type::Int | Type::Bool))
             {
                 Some(Type::Tuple)
+            } else if (a == Type::List && matches!(b, Type::Int | Type::Bool))
+                || (b == Type::List && matches!(a, Type::Int | Type::Bool))
+            {
+                Some(Type::List)
             } else {
                 None
             }
@@ -555,6 +588,16 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
                 Some(Type::Float)
             } else {
                 None
+            }
+        }
+        // Bitwise operators are defined for integers (and the `bool`
+        // subtype); every other operand combination is only known at runtime,
+        // where it raises `TypeError`.
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+            if matches!(a, Type::Int | Type::Bool) && matches!(b, Type::Int | Type::Bool) {
+                Some(Type::Int)
+            } else {
+                Some(Type::Any)
             }
         }
     }
@@ -763,9 +806,17 @@ impl<'a> Checker<'a> {
             HStmtKind::Unpack { targets, value } => {
                 self.check_expr(value, f);
                 match self.inf.resolve(value.ty) {
+                    // The runtime accepts every iterable; lists, tuples,
+                    // strings and bytes are unpacked without materialisation.
                     Ty::Concrete(Type::List)
                     | Ty::Concrete(Type::Tuple)
-                    | Ty::Concrete(Type::Any) => {}
+                    | Ty::Concrete(Type::Set)
+                    | Ty::Concrete(Type::Str)
+                    | Ty::Concrete(Type::Bytes)
+                    | Ty::Concrete(Type::Dict)
+                    | Ty::Concrete(Type::Range)
+                    | Ty::Concrete(Type::Any)
+                    | Ty::Concrete(Type::Never) => {}
                     Ty::Var(_) => {
                         let _ = self.inf.unify(value.ty, Ty::Concrete(Type::Any));
                     }
@@ -779,8 +830,7 @@ impl<'a> Checker<'a> {
                 }
                 // Unpacked elements are only known at runtime.
                 for target in targets {
-                    let ty = f.locals[*target as usize].ty;
-                    let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
+                    self.check_unpack_target(target, f);
                 }
             }
             HStmtKind::AugAssign { target, op, value } => {
@@ -804,23 +854,21 @@ impl<'a> Checker<'a> {
                 self.check_expr(value, f);
                 self.check_expr(object, f);
                 self.check_expr(index, f);
-                match self.inf.resolve(object.ty) {
-                    Ty::Concrete(Type::List) => {
-                        self.check_int_index("list", index.ty, index.line, index.col);
-                    }
-                    Ty::Concrete(Type::Dict) | Ty::Concrete(Type::Any) => {}
-                    Ty::Var(_) => {
-                        let _ = self.inf.unify(object.ty, Ty::Concrete(Type::Any));
-                    }
-                    Ty::Concrete(got) => {
-                        self.error_code(
-                            object.line,
-                            object.col,
-                            codes::INDEX,
-                            format!("'{}' object does not support item assignment", got.name()),
-                        );
-                    }
-                }
+                self.check_subscript_assignment(object, index);
+            }
+            HStmtKind::SetSlice {
+                object,
+                start,
+                stop,
+                step,
+                value,
+            } => {
+                self.check_expr(value, f);
+                self.check_expr(object, f);
+                self.check_slice_bound(start, f);
+                self.check_slice_bound(stop, f);
+                self.check_slice_bound(step, f);
+                self.check_slice_assignment_target(object);
             }
             HStmtKind::Closure { target, .. } => {
                 // The closure value is a runtime function object without a
@@ -828,9 +876,19 @@ impl<'a> Checker<'a> {
                 let local_ty = f.locals[*target as usize].ty;
                 let _ = self.inf.unify(local_ty, Ty::Concrete(Type::Any));
             }
-            HStmtKind::ClassDef { target, base, .. } => {
+            HStmtKind::ClassDef {
+                target,
+                base,
+                attributes,
+                ..
+            } => {
                 if let Some(base) = base {
                     self.check_expr(base, f);
+                }
+                // Attribute values are ordinary expressions evaluated when the
+                // class statement runs; they do not need a static type.
+                for (_, value) in attributes {
+                    self.check_expr(value, f);
                 }
                 // A class object is a runtime value without a static type.
                 let local_ty = f.locals[*target as usize].ty;
@@ -976,6 +1034,14 @@ impl<'a> Checker<'a> {
                     self.check_expr(cause, f);
                 }
             }
+            HStmtKind::Assert { test, msg } => {
+                self.check_expr(test, f);
+                // The message may be any value: `assert x, [1, 2]` is legal
+                // Python, so unlike `raise` it is not restricted to `str`.
+                if let Some(msg) = msg {
+                    self.check_expr(msg, f);
+                }
+            }
             HStmtKind::Try {
                 body,
                 handlers,
@@ -994,6 +1060,81 @@ impl<'a> Checker<'a> {
                 }
                 self.check_stmts(else_body, f, has_value, has_bare);
                 self.check_stmts(finally_body, f, has_value, has_bare);
+            }
+        }
+    }
+
+    /// Validate the receiver and index of an assignment-style subscript after
+    /// both expressions were checked.
+    fn check_subscript_assignment(&mut self, object: &HExpr, index: &HExpr) {
+        match self.inf.resolve(object.ty) {
+            Ty::Concrete(Type::List) => {
+                self.check_int_index("list", index.ty, index.line, index.col);
+            }
+            Ty::Concrete(Type::Dict) | Ty::Concrete(Type::Any) => {}
+            Ty::Var(_) => {
+                let _ = self.inf.unify(object.ty, Ty::Concrete(Type::Any));
+            }
+            Ty::Concrete(got) => {
+                self.error_code(
+                    object.line,
+                    object.col,
+                    codes::INDEX,
+                    format!("'{}' object does not support item assignment", got.name()),
+                );
+            }
+        }
+    }
+
+    /// Validate the receiver of a slice assignment (`a[i:j] = v`). Only lists
+    /// support item assignment through a slice; a statically known dict fails
+    /// like a dict slice read (a `slice` is unhashable) and every other known
+    /// type rejects item assignment, matching the runtime errors.
+    fn check_slice_assignment_target(&mut self, object: &HExpr) {
+        match self.inf.resolve(object.ty) {
+            Ty::Concrete(Type::List) | Ty::Concrete(Type::Any) => {}
+            Ty::Var(_) => {
+                let _ = self.inf.unify(object.ty, Ty::Concrete(Type::Any));
+            }
+            Ty::Concrete(Type::Dict) => {
+                self.error_code(
+                    object.line,
+                    object.col,
+                    codes::INDEX,
+                    "unhashable type: 'slice'".to_string(),
+                );
+            }
+            Ty::Concrete(got) => {
+                self.error_code(
+                    object.line,
+                    object.col,
+                    codes::INDEX,
+                    format!("'{}' object does not support item assignment", got.name()),
+                );
+            }
+        }
+    }
+
+    /// Validate one binding target of a sequence assignment. Names become
+    /// dynamically typed; attribute and subscript targets check their receiver
+    /// expressions; nested targets recurse.
+    fn check_unpack_target(&mut self, target: &HUnpackTarget, f: &HFunction) {
+        match target {
+            HUnpackTarget::Name(id) => {
+                let ty = f.locals[*id as usize].ty;
+                let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
+            }
+            HUnpackTarget::Attr { object, .. } => self.check_expr(object, f),
+            HUnpackTarget::Subscript { object, index } => {
+                self.check_expr(object, f);
+                self.check_expr(index, f);
+                self.check_subscript_assignment(object, index);
+            }
+            HUnpackTarget::Star(inner) => self.check_unpack_target(inner, f),
+            HUnpackTarget::Nested(targets) => {
+                for target in targets {
+                    self.check_unpack_target(target, f);
+                }
             }
         }
     }
@@ -1049,10 +1190,9 @@ impl<'a> Checker<'a> {
                     let ty = f.locals[*id as usize].ty;
                     let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
                 }
-                HCompTarget::Unpack(ids) => {
-                    for id in ids {
-                        let ty = f.locals[*id as usize].ty;
-                        let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
+                HCompTarget::Unpack(targets) => {
+                    for target in targets {
+                        self.check_unpack_target(target, f);
                     }
                 }
             }
@@ -1132,6 +1272,17 @@ impl<'a> Checker<'a> {
                 let local_ty = f.locals[*id as usize].ty;
                 let _ = self.inf.unify(local_ty, expr.ty);
             }
+            HExprKind::NamedExpr { target, value } => {
+                self.check_expr(value, f);
+                // The slot may receive any value; only a still-open slot is
+                // widened to `Any`, so an annotated local keeps its type.
+                let slot = f.locals[*target as usize].ty;
+                if matches!(self.inf.resolve(slot), Ty::Var(_)) {
+                    let _ = self.inf.unify(slot, Ty::Concrete(Type::Any));
+                }
+                // The expression evaluates to the assigned value.
+                let _ = self.inf.unify(expr.ty, value.ty);
+            }
             HExprKind::Bin { op, lhs, rhs } => {
                 self.check_expr(lhs, f);
                 self.check_expr(rhs, f);
@@ -1179,6 +1330,20 @@ impl<'a> Checker<'a> {
                     Err(_) => {
                         let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
                     }
+                }
+            }
+            HExprKind::IfExp { test, then, orelse } => {
+                self.check_expr(test, f);
+                self.check_expr(then, f);
+                self.check_expr(orelse, f);
+                // Python's conditional expression may mix branch types (the
+                // static result is then dynamic); only a shared branch type
+                // narrows the result.
+                match self.inf.unify(then.ty, orelse.ty) {
+                    Ok(ty) => {
+                        let _ = self.inf.unify(expr.ty, ty);
+                    }
+                    Err(_) => self.force_any(expr.ty),
                 }
             }
             HExprKind::List(elems) => {
@@ -1329,25 +1494,35 @@ impl<'a> Checker<'a> {
                 object,
                 method,
                 args,
+                star,
                 keywords,
-            } => self.check_method(expr, object, method, args, keywords, f),
+            } => self.check_method(expr, object, method, args, star.as_deref(), keywords, f),
             HExprKind::FunctionRef(_) => {
                 let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Function));
             }
             HExprKind::BuiltinRef(_) => {
                 let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Function));
             }
+            // A class object is a runtime value without a static type.
+            HExprKind::ExceptionClass(_) => {
+                let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
+            }
             HExprKind::ModuleCall {
                 module,
                 function,
                 args,
+                keywords,
             } => {
                 for arg in args {
                     self.check_expr(arg, f);
                 }
+                for (_, value) in keywords {
+                    self.check_expr(value, f);
+                }
                 match stdlib::function(module, function) {
                     Some(spec) => {
-                        if args.len() < spec.min_args || args.len() > spec.max_args {
+                        let supplied = args.len() + keywords.len();
+                        if args.len() < spec.min_args || supplied > spec.max_args {
                             let expected = if spec.min_args == spec.max_args {
                                 spec.min_args.to_string()
                             } else if spec.max_args == usize::MAX {
@@ -1360,11 +1535,8 @@ impl<'a> Checker<'a> {
                                 expr.col,
                                 codes::CALL,
                                 format!(
-                                    "{}.{}() takes {} positional argument(s) ({} given)",
-                                    module,
-                                    function,
-                                    expected,
-                                    args.len()
+                                    "{}.{}() takes {} argument(s) ({} given)",
+                                    module, function, expected, supplied
                                 ),
                             );
                         }
@@ -1391,6 +1563,11 @@ impl<'a> Checker<'a> {
                 // Module-level values are dynamically typed at the read site.
                 self.force_any(expr.ty);
             }
+            HExprKind::DeferredImport { .. } => {
+                // The value only exists to raise at runtime; it is dynamic and
+                // may be used as a callable or as a value.
+                self.force_any(expr.ty);
+            }
             HExprKind::ExtensionAttr { .. } => self.force_any(expr.ty),
             HExprKind::GetAttr { object, .. } => {
                 // Attributes are resolved at runtime by receiver kind, so the
@@ -1398,10 +1575,13 @@ impl<'a> Checker<'a> {
                 self.check_expr(object, f);
                 self.force_any(expr.ty);
             }
-            HExprKind::IndirectCall { callee, args } => {
+            HExprKind::IndirectCall { callee, args, star } => {
                 self.check_expr(callee, f);
                 for arg in args {
                     self.check_expr(arg, f);
+                }
+                if let Some(star) = star {
+                    self.check_expr(star, f);
                 }
                 match self.inf.resolve(callee.ty) {
                     Ty::Concrete(Type::Function) | Ty::Concrete(Type::Any) => {}
@@ -1420,6 +1600,17 @@ impl<'a> Checker<'a> {
                 self.force_any(expr.ty);
             }
             HExprKind::Call { callee, args } => self.check_call(expr, callee, args, f),
+            HExprKind::DeferredCall { callee, args } => {
+                // Operands are still type-checked; the call itself only fails
+                // when it executes.
+                if let Some(callee) = callee {
+                    self.check_expr(callee, f);
+                }
+                for arg in args {
+                    self.check_expr(arg, f);
+                }
+                self.force_any(expr.ty);
+            }
             HExprKind::Await { value } => {
                 self.check_expr(value, f);
                 // The awaited result is only known at runtime.
@@ -1535,18 +1726,23 @@ impl<'a> Checker<'a> {
     /// Receivers whose type is not statically known (or `Any`) are executed
     /// dynamically: every method name and arity is accepted and the result is
     /// `Any`, leaving the checks to the runtime.
+    #[allow(clippy::too_many_arguments)]
     fn check_method(
         &mut self,
         expr: &HExpr,
         object: &HExpr,
         method: &str,
         args: &[HExpr],
+        star: Option<&HExpr>,
         keywords: &[(String, HExpr)],
         f: &HFunction,
     ) {
         self.check_expr(object, f);
         for arg in args {
             self.check_expr(arg, f);
+        }
+        if let Some(star) = star {
+            self.check_expr(star, f);
         }
         for (_, value) in keywords {
             self.check_expr(value, f);
@@ -1575,11 +1771,14 @@ impl<'a> Checker<'a> {
                 };
                 let signature = &entry.1;
 
-                // Keywords fill the remaining slots at runtime, so only the
-                // positional upper bound can be checked here when any keyword
-                // is present. Unknown and duplicate keywords are diagnosed by
-                // the runtime binder.
-                let arity_ok = if keywords.is_empty() {
+                // A starred operand expands to an unknown number of
+                // positional arguments at runtime, so only the static
+                // positional count is checked here. Keywords fill the
+                // remaining slots at runtime; the runtime binder diagnoses
+                // unknown and duplicate keywords.
+                let arity_ok = if star.is_some() {
+                    args.len() <= signature.max_args
+                } else if keywords.is_empty() {
                     args.len() >= signature.min_args && args.len() <= signature.max_args
                 } else {
                     args.len() <= signature.max_args
@@ -1844,23 +2043,53 @@ impl<'a> Checker<'a> {
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Str));
             }
+            Builtin::Repr => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("repr() takes exactly one argument ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Str));
+            }
             Builtin::Int | Builtin::Float => {
                 let target = if builtin == Builtin::Int {
                     Type::Int
                 } else {
                     Type::Float
                 };
-                if count != 1 {
+                let allowed = if builtin == Builtin::Int {
+                    0..=2
+                } else {
+                    1..=1
+                };
+                if !allowed.contains(&count) {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
                         format!(
-                            "{}() takes exactly one argument ({} given)",
+                            "{}() takes {} argument(s) ({} given)",
                             builtin.name(),
+                            if builtin == Builtin::Int {
+                                "0 to 2"
+                            } else {
+                                "exactly 1"
+                            },
                             count
                         ),
                     );
+                    return;
+                }
+                if args.is_empty() {
+                    let _ = self.inf.unify(out, Ty::Concrete(target));
+                    return;
+                }
+                if args.is_empty() {
+                    let _ = self.inf.unify(out, Ty::Concrete(target));
                     return;
                 }
                 let (ty, arg_line, arg_col) = args[0];
@@ -1883,6 +2112,54 @@ impl<'a> Checker<'a> {
                     }
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(target));
+            }
+            Builtin::Import => {
+                if count == 0 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        " __import__() missing required argument 'name'".to_string(),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
+            Builtin::Reversed => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("reversed() takes exactly 1 argument ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::List));
+            }
+            Builtin::Type => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("type() takes exactly 1 argument ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
+            Builtin::Bool => {
+                if count > 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("bool() takes at most 1 argument ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Bool));
             }
             Builtin::Abs => {
                 if count != 1 {
@@ -1946,18 +2223,123 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Set));
             }
             Builtin::Format => {
-                // Internal f-string field: value, constant spec, constant
-                // conversion flag. The constants are validated by codegen.
-                if count != 3 {
+                // Source-level `format(value, spec)` and the internal f-string
+                // field (value, constant spec, constant conversion flag)
+                // share this builtin. The constants are validated by codegen.
+                if !(2..=3).contains(&count) {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
-                        format!("internal format field expects 3 arguments ({count} given)"),
+                        format!("format() takes 2 arguments ({count} given)"),
                     );
                     return;
                 }
+                let (ty, arg_line, arg_col) = args[1];
+                match self.inf.resolve(ty) {
+                    Ty::Var(_) => {
+                        let _ = self.inf.unify(ty, Ty::Concrete(Type::Str));
+                    }
+                    Ty::Concrete(Type::Str)
+                    | Ty::Concrete(Type::Any)
+                    | Ty::Concrete(Type::Never) => {}
+                    Ty::Concrete(t) => self.error(
+                        arg_line,
+                        arg_col,
+                        format!("format() argument 2 must be str, not {}", t.name()),
+                    ),
+                }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Str));
+            }
+            Builtin::Max | Builtin::Min => {
+                if count == 0 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("{}() expects at least 1 argument (0 given)", builtin.name()),
+                    );
+                    return;
+                }
+                // The extremum keeps the element type only at runtime.
+                self.force_any(out);
+            }
+            Builtin::Sorted => {
+                // The frontend materialises the `key` and `reverse` slots, so
+                // a direct call carries two or three arguments; hand-built IR
+                // may pass the iterable alone.
+                if count == 0 || count > 3 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("sorted() takes 1 to 3 positional arguments ({count} given)"),
+                    );
+                    return;
+                }
+                let (ty, arg_line, arg_col) = args[0];
+                self.check_builtin_iterable(Builtin::Sorted, ty, arg_line, arg_col);
+                if let Some((ty, arg_line, arg_col)) = args.get(1) {
+                    match self.inf.resolve(*ty) {
+                        Ty::Var(_) => {
+                            let _ = self.inf.unify(*ty, Ty::Concrete(Type::Any));
+                        }
+                        Ty::Concrete(Type::Function)
+                        | Ty::Concrete(Type::None)
+                        | Ty::Concrete(Type::Any)
+                        | Ty::Concrete(Type::Never) => {}
+                        Ty::Concrete(t) => self.error(
+                            *arg_line,
+                            *arg_col,
+                            format!("sorted() key must be callable or None, not {}", t.name()),
+                        ),
+                    }
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::List));
+            }
+            Builtin::Round => {
+                if count == 0 || count > 2 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("round() takes 1 or 2 arguments ({count} given)"),
+                    );
+                    return;
+                }
+                if let Some((ty, arg_line, arg_col)) = args.get(1) {
+                    match self.inf.resolve(*ty) {
+                        Ty::Var(_) => {
+                            let _ = self.inf.unify(*ty, Ty::Concrete(Type::Int));
+                        }
+                        Ty::Concrete(Type::Int)
+                        | Ty::Concrete(Type::Bool)
+                        | Ty::Concrete(Type::Any)
+                        | Ty::Concrete(Type::Never) => {}
+                        Ty::Concrete(Type::None) => {}
+                        Ty::Concrete(t) => self.error(
+                            *arg_line,
+                            *arg_col,
+                            format!("round() ndigits must be int, not {}", t.name()),
+                        ),
+                    }
+                }
+                // `round(x)` returns int, `round(x, n)` a float; the static
+                // type depends on the argument count and operand type.
+                self.force_any(out);
+            }
+            Builtin::Isinstance => {
+                if count != 2 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("isinstance() takes exactly 2 arguments ({count} given)"),
+                    );
+                    return;
+                }
+                // The target type is validated at runtime.
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Bool));
             }
             Builtin::Bytes => {
                 if count > 2 {
@@ -2081,18 +2463,42 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Set));
             }
             Builtin::Getattr => {
-                if count != 2 {
+                if count != 2 && count != 3 {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
-                        format!("getattr() takes exactly 2 arguments ({count} given)"),
+                        format!("getattr() takes 2 or 3 arguments ({count} given)"),
                     );
                     return;
                 }
                 // The attribute name is resolved at runtime; a missing
                 // attribute raises `AttributeError`.
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
+            Builtin::Hasattr => {
+                if count != 2 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("hasattr() takes exactly 2 arguments ({count} given)"),
+                    );
+                    return;
+                }
+                let (name_ty, name_line, name_col) = args[1];
+                match self.inf.resolve(name_ty) {
+                    Ty::Var(_) => {
+                        let _ = self.inf.unify(name_ty, Ty::Concrete(Type::Str));
+                    }
+                    Ty::Concrete(Type::Str) | Ty::Concrete(Type::Any) => {}
+                    Ty::Concrete(got) => self.error(
+                        name_line,
+                        name_col,
+                        format!("attribute name must be string, not '{}'", got.name()),
+                    ),
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Bool));
             }
             Builtin::Range => {
                 if count == 0 || count > 3 {
@@ -2147,6 +2553,22 @@ impl<'a> Checker<'a> {
                     self.check_builtin_iterable(Builtin::List, ty, arg_line, arg_col);
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::List));
+            }
+            Builtin::Tuple => {
+                if count > 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("tuple() takes 0 to 1 positional argument(s) ({count} given)"),
+                    );
+                    return;
+                }
+                if count == 1 {
+                    let (ty, arg_line, arg_col) = args[0];
+                    self.check_builtin_iterable(Builtin::Tuple, ty, arg_line, arg_col);
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Tuple));
             }
             Builtin::Dict => {
                 if count > 1 {
@@ -2310,6 +2732,142 @@ impl<'a> Checker<'a> {
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::List));
             }
+            Builtin::All => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("all() takes exactly one argument ({count} given)"),
+                    );
+                    return;
+                }
+                let (ty, arg_line, arg_col) = args[0];
+                self.check_builtin_iterable(builtin, ty, arg_line, arg_col);
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Bool));
+            }
+            Builtin::Ord => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("ord() takes exactly one argument ({count} given)"),
+                    );
+                    return;
+                }
+                let (ty, arg_line, arg_col) = args[0];
+                match self.inf.resolve(ty) {
+                    Ty::Var(_) => {
+                        let _ = self.inf.unify(ty, Ty::Concrete(Type::Str));
+                    }
+                    Ty::Concrete(Type::Str)
+                    | Ty::Concrete(Type::Any)
+                    | Ty::Concrete(Type::Never) => {}
+                    Ty::Concrete(t) => self.error(
+                        arg_line,
+                        arg_col,
+                        format!("ord() argument must be str, not {}", t.name()),
+                    ),
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Int));
+            }
+            Builtin::Chr => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("chr() takes exactly one argument ({count} given)"),
+                    );
+                    return;
+                }
+                let (ty, arg_line, arg_col) = args[0];
+                match self.inf.resolve(ty) {
+                    Ty::Var(_) => {
+                        let _ = self.inf.unify(ty, Ty::Concrete(Type::Int));
+                    }
+                    Ty::Concrete(Type::Int)
+                    | Ty::Concrete(Type::Bool)
+                    | Ty::Concrete(Type::Any)
+                    | Ty::Concrete(Type::Never) => {}
+                    Ty::Concrete(t) => self.error(
+                        arg_line,
+                        arg_col,
+                        format!("chr() argument must be an int, not {}", t.name()),
+                    ),
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Str));
+            }
+            Builtin::Divmod => {
+                if count != 2 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("divmod() takes exactly two arguments ({count} given)"),
+                    );
+                    return;
+                }
+                // Both operands are checked at runtime: the numeric types
+                // flow through the same dynamic tags as `//` and `%`.
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Tuple));
+            }
+            Builtin::Callable => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("callable() takes exactly one argument ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Bool));
+            }
+            Builtin::Hash => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("hash() takes exactly one argument ({count} given)"),
+                    );
+                    return;
+                }
+                // Hashability is checked at runtime so values whose static type
+                // is dynamic (the common case) are never rejected early.
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Int));
+            }
+            Builtin::DictMerge => {
+                // Internal node produced by a dict display with `**`; both
+                // operands must be mappings.
+                if count != 2 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("internal dict merge expects 2 arguments ({count} given)"),
+                    );
+                    return;
+                }
+                for (ty, arg_line, arg_col) in &args {
+                    match self.inf.resolve(*ty) {
+                        Ty::Var(_) => {
+                            let _ = self.inf.unify(*ty, Ty::Concrete(Type::Dict));
+                        }
+                        Ty::Concrete(Type::Dict)
+                        | Ty::Concrete(Type::Any)
+                        | Ty::Concrete(Type::Never) => {}
+                        Ty::Concrete(t) => self.error(
+                            *arg_line,
+                            *arg_col,
+                            format!("dict unpacking requires a mapping, not {}", t.name()),
+                        ),
+                    }
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Dict));
+            }
         }
     }
 
@@ -2391,6 +2949,23 @@ impl<'a> Checker<'a> {
         let operand = self.inf.resolve(op.a);
         match unary {
             UnOp::Not => self.bind_type(op.out, Type::Bool, op.line, op.col),
+            // `~` is defined for ints only (`bool` is numerically an int);
+            // floats and every other type raise `TypeError` at runtime.
+            UnOp::Invert => match operand {
+                Ty::Var(_) => return false,
+                Ty::Concrete(Type::Any) => self.force_any(op.out),
+                Ty::Concrete(Type::Int) | Ty::Concrete(Type::Bool) => {
+                    self.bind_type(op.out, Type::Int, op.line, op.col);
+                }
+                Ty::Concrete(t) => {
+                    self.error(
+                        op.line,
+                        op.col,
+                        format!("bad operand type for unary ~: '{}'", t.name()),
+                    );
+                    self.force_any(op.out);
+                }
+            },
             _ => match operand {
                 Ty::Var(_) => return false,
                 Ty::Concrete(Type::Any) => self.force_any(op.out),
@@ -2503,15 +3078,27 @@ impl<'a> Checker<'a> {
             return;
         }
 
+        // Identity accepts any pair of values and must not constrain the
+        // unknown operand: `x is None` says nothing about `x`'s type.
+        if matches!(binary, BinOp::Is | BinOp::IsNot) {
+            self.bind_type(op.out, Type::Bool, op.line, op.col);
+            return;
+        }
+
         let compatible = match binary {
-            BinOp::Eq | BinOp::Ne => true,
+            BinOp::Eq | BinOp::Ne | BinOp::Is | BinOp::IsNot => true,
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                known.is_numeric() || known == Type::Str || known == Type::Bytes
+                known.is_numeric()
+                    || known == Type::Str
+                    || known == Type::Bytes
+                    || known == Type::Tuple
+                    || known == Type::List
             }
             BinOp::Add => {
                 known.is_numeric()
                     || known == Type::Str
                     || known == Type::Bytes
+                    || known == Type::List
                     || known == Type::Tuple
             }
             BinOp::Mul => {
@@ -2519,10 +3106,15 @@ impl<'a> Checker<'a> {
                     || known == Type::Str
                     || known == Type::Bytes
                     || known == Type::Tuple
+                    || known == Type::List
             }
             BinOp::Sub | BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
                 known.is_numeric()
             }
+            // Bitwise operators accept integers; any other known operand is
+            // rejected by the runtime with `TypeError`, so the unknown side
+            // does not constrain the type.
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => true,
             // Handled above; membership accepts any unknown side.
             BinOp::In | BinOp::NotIn => true,
         };
@@ -2607,6 +3199,7 @@ pub fn emit(prog: &LHir, inf: &mut Infer) -> Program {
         source_name: prog.source_name.clone(),
         functions,
         main: 0,
+        initializers: Vec::new(),
     }
 }
 
@@ -2618,6 +3211,8 @@ fn emit_function(function: &HFunction, inf: &mut Infer) -> IrFunction {
             local: p.local,
             name: p.name.clone(),
             ty: inf.type_of(p.ty),
+            default: p.default.clone(),
+            kind: p.kind,
         })
         .collect();
     let locals = function
@@ -2667,7 +3262,10 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
             value: emit_expr(value, inf),
         },
         HStmtKind::Unpack { targets, value } => StmtKind::Unpack {
-            targets: targets.clone(),
+            targets: targets
+                .iter()
+                .map(|target| emit_unpack_target(target, inf))
+                .collect(),
             value: emit_expr(value, inf),
         },
         HStmtKind::AugAssign { target, op, value } => StmtKind::AugAssign {
@@ -2689,15 +3287,24 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
             name,
             base,
             methods,
+            attributes,
         } => StmtKind::ClassDef {
             target: *target,
             name: name.clone(),
             base: base.as_ref().map(|b| emit_expr(b, inf)),
             methods: methods
                 .iter()
-                .map(|(name, function)| ClassMethod {
+                .map(|(name, function, kind)| ClassMethod {
                     name: name.clone(),
                     function: *function,
+                    kind: *kind,
+                })
+                .collect(),
+            attributes: attributes
+                .iter()
+                .map(|(name, value)| ClassAttr {
+                    name: name.clone(),
+                    value: emit_expr(value, inf),
                 })
                 .collect(),
         },
@@ -2754,6 +3361,27 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
             index: emit_expr(index, inf),
             value: emit_expr(value, inf),
         },
+        HStmtKind::SetSlice {
+            object,
+            start,
+            stop,
+            step,
+            value,
+        } => {
+            // Omitted bounds lower to the runtime `None` sentinel; the IR keeps
+            // them as plain expressions.
+            let target = emit_expr(object, inf);
+            let start = emit_slice_bound(start, inf, stmt.line);
+            let stop = emit_slice_bound(stop, inf, stmt.line);
+            let step = emit_slice_bound(step, inf, stmt.line);
+            StmtKind::SetSlice {
+                target,
+                start,
+                stop,
+                step,
+                value: emit_expr(value, inf),
+            }
+        }
         HStmtKind::Return(value) => StmtKind::Return(value.as_ref().map(|e| emit_expr(e, inf))),
         HStmtKind::Yield { value } => StmtKind::Yield {
             value: value.as_ref().map(|e| emit_expr(e, inf)),
@@ -2765,6 +3393,10 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
             exc: *exc,
             msg: msg.as_ref().map(|e| emit_expr(e, inf)),
             cause: cause.as_ref().map(|e| emit_expr(e, inf)),
+        },
+        HStmtKind::Assert { test, msg } => StmtKind::Assert {
+            test: emit_expr(test, inf),
+            msg: msg.as_ref().map(|e| emit_expr(e, inf)),
         },
         HStmtKind::Try {
             body,
@@ -2788,10 +3420,47 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
     IrStmt::new(kind, stmt.line)
 }
 
+fn emit_unpack_target(target: &HUnpackTarget, inf: &mut Infer) -> UnpackTarget {
+    match target {
+        HUnpackTarget::Name(id) => UnpackTarget::Name(*id),
+        HUnpackTarget::Attr { object, name } => UnpackTarget::Attr {
+            object: emit_expr(object, inf),
+            name: name.clone(),
+        },
+        HUnpackTarget::Subscript { object, index } => UnpackTarget::Subscript {
+            object: emit_expr(object, inf),
+            index: emit_expr(index, inf),
+        },
+        HUnpackTarget::Nested(targets) => UnpackTarget::Nested(
+            targets
+                .iter()
+                .map(|target| emit_unpack_target(target, inf))
+                .collect(),
+        ),
+        HUnpackTarget::Star(target) => {
+            UnpackTarget::Star(Box::new(emit_unpack_target(target, inf)))
+        }
+    }
+}
+
+/// Emits one bound of a slice assignment: an omitted bound becomes the
+/// runtime `None` sentinel (`Const::None`), as `ExprKind::Slice` does in
+/// codegen.
+fn emit_slice_bound(bound: &Option<Box<HExpr>>, inf: &mut Infer, line: u32) -> IrExpr {
+    match bound {
+        Some(bound) => emit_expr(bound, inf),
+        None => IrExpr::new(ExprKind::Const(Const::None), Type::None, line),
+    }
+}
+
 fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
     let kind = match &expr.kind {
         HExprKind::Const(c) => ExprKind::Const(c.clone()),
         HExprKind::Local(id) => ExprKind::Local(*id),
+        HExprKind::NamedExpr { target, value } => ExprKind::NamedExpr {
+            target: *target,
+            value: Box::new(emit_expr(value, inf)),
+        },
         HExprKind::Bin { op, lhs, rhs } => ExprKind::Bin {
             op: *op,
             lhs: Box::new(emit_expr(lhs, inf)),
@@ -2805,6 +3474,11 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
             op: *op,
             lhs: Box::new(emit_expr(lhs, inf)),
             rhs: Box::new(emit_expr(rhs, inf)),
+        },
+        HExprKind::IfExp { test, then, orelse } => ExprKind::IfExp {
+            test: Box::new(emit_expr(test, inf)),
+            then: Box::new(emit_expr(then, inf)),
+            orelse: Box::new(emit_expr(orelse, inf)),
         },
         HExprKind::List(elems) => ExprKind::List(elems.iter().map(|e| emit_expr(e, inf)).collect()),
         HExprKind::Tuple(elems) => {
@@ -2858,11 +3532,13 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
             object,
             method,
             args,
+            star,
             keywords,
         } => ExprKind::MethodCall {
             object: Box::new(emit_expr(object, inf)),
             method: method.clone(),
             args: args.iter().map(|a| emit_expr(a, inf)).collect(),
+            star: star.as_ref().map(|star| Box::new(emit_expr(star, inf))),
             keywords: keywords
                 .iter()
                 .map(|(name, value)| (name.clone(), emit_expr(value, inf)))
@@ -2870,14 +3546,20 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
         },
         HExprKind::FunctionRef(id) => ExprKind::FunctionRef(*id),
         HExprKind::BuiltinRef(builtin) => ExprKind::BuiltinRef(*builtin),
+        HExprKind::ExceptionClass(kind) => ExprKind::ExceptionClass(*kind),
         HExprKind::ModuleCall {
             module,
             function,
             args,
+            keywords,
         } => ExprKind::ModuleCall {
             module: module.clone(),
             function: function.clone(),
             args: args.iter().map(|a| emit_expr(a, inf)).collect(),
+            keywords: keywords
+                .iter()
+                .map(|(name, value)| (name.clone(), emit_expr(value, inf)))
+                .collect(),
         },
         HExprKind::ModuleAttr { module, name } => ExprKind::ModuleAttr {
             module: module.clone(),
@@ -2890,6 +3572,10 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
             module: module.clone(),
             name: name.clone(),
         },
+        HExprKind::DeferredImport { module, member } => ExprKind::DeferredImport {
+            module: module.clone(),
+            member: member.clone(),
+        },
         HExprKind::ExtensionAttr { path, member } => ExprKind::ExtensionAttr {
             path: path.clone(),
             member: member.clone(),
@@ -2898,13 +3584,20 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
             object: Box::new(emit_expr(object, inf)),
             name: name.clone(),
         },
-        HExprKind::IndirectCall { callee, args } => ExprKind::IndirectCall {
+        HExprKind::IndirectCall { callee, args, star } => ExprKind::IndirectCall {
             callee: Box::new(emit_expr(callee, inf)),
             args: args.iter().map(|a| emit_expr(a, inf)).collect(),
+            star: star.as_ref().map(|star| Box::new(emit_expr(star, inf))),
         },
         HExprKind::Call { callee, args } => ExprKind::Call {
             callee: callee.clone(),
             args: args.iter().map(|a| emit_expr(a, inf)).collect(),
+        },
+        HExprKind::DeferredCall { callee, args } => ExprKind::DeferredCall {
+            callee: callee
+                .as_ref()
+                .map(|callee| Box::new(emit_expr(callee, inf))),
+            args: args.iter().map(|arg| emit_expr(arg, inf)).collect(),
         },
         HExprKind::Await { value } => ExprKind::Await {
             value: Box::new(emit_expr(value, inf)),
@@ -2925,7 +3618,12 @@ fn emit_comp_clauses(clauses: &[HCompClause], inf: &mut Infer) -> Vec<CompClause
         .map(|clause| CompClause {
             target: match &clause.target {
                 HCompTarget::Name(id) => CompTarget::Name(*id),
-                HCompTarget::Unpack(ids) => CompTarget::Unpack(ids.clone()),
+                HCompTarget::Unpack(targets) => CompTarget::Unpack(
+                    targets
+                        .iter()
+                        .map(|target| emit_unpack_target(target, inf))
+                        .collect(),
+                ),
             },
             iterable: emit_expr(&clause.iterable, inf),
             conditions: clause

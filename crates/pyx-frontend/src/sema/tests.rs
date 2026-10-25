@@ -1,4 +1,5 @@
 use super::*;
+use pyx_ir::ExcKind;
 
 fn empty_prog() -> LHir {
     LHir {
@@ -187,6 +188,64 @@ fn slice_and_subscript_errors_use_the_index_code() {
 }
 
 #[test]
+fn slice_assignment_emits_set_slice_with_none_bounds() {
+    let source = "xs = [1, 2, 3]\nxs[:] = [4]\nxs[1:] = xs\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    let body = &program.functions[0].body;
+
+    let pyx_ir::StmtKind::SetSlice {
+        target,
+        start,
+        stop,
+        step,
+        value,
+    } = &body[1].kind
+    else {
+        panic!("expected a slice assignment, got {:?}", body[1].kind);
+    };
+    assert!(matches!(&target.kind, ExprKind::Local(_)));
+    assert!(matches!(&start.kind, ExprKind::Const(Const::None)));
+    assert!(matches!(&stop.kind, ExprKind::Const(Const::None)));
+    assert!(matches!(&step.kind, ExprKind::Const(Const::None)));
+    assert!(matches!(&value.kind, ExprKind::List(_)));
+
+    // A partial slice keeps the explicit bound and fills the rest with `None`.
+    let pyx_ir::StmtKind::SetSlice {
+        start, stop, step, ..
+    } = &body[2].kind
+    else {
+        panic!("expected a slice assignment, got {:?}", body[2].kind);
+    };
+    assert!(matches!(&start.kind, ExprKind::Const(Const::Int(1))));
+    assert!(matches!(&stop.kind, ExprKind::Const(Const::None)));
+    assert!(matches!(&step.kind, ExprKind::Const(Const::None)));
+}
+
+#[test]
+fn slice_assignment_requires_a_list_target() {
+    for (source, expected) in [
+        (
+            "s = 'abc'\ns[0:1] = 'x'\n",
+            "'str' object does not support item assignment",
+        ),
+        (
+            "t = (1, 2)\nt[0:1] = [3]\n",
+            "'tuple' object does not support item assignment",
+        ),
+        ("d = {'a': 1}\nd[0:1] = [2]\n", "unhashable type: 'slice'"),
+    ] {
+        let errors = check_errors(source);
+        assert_eq!(errors, vec![expected.to_string()], "{source}");
+    }
+
+    // Lists and dynamically typed receivers are accepted; the right-hand side
+    // is only checked dynamically.
+    assert!(check_errors("xs = [1, 2]\nxs[0:1] = [3]\n").is_empty());
+    assert!(check_errors("def f(xs, v):\n    xs[0:1] = v\n").is_empty());
+    assert!(check_errors("xs = [1, 2]\nxs[:] = 5\n").is_empty());
+}
+
+#[test]
 fn augmented_subscript_assignment_typechecks_and_emits_stores() {
     let source = "d = {'a': 1}\nd['a'] += 2\nxs = [1, 2]\nxs[1] *= 3\n";
     let program = crate::check_source(source, "test.py").expect("valid program");
@@ -214,7 +273,11 @@ fn augmented_subscript_assignment_typechecks_and_emits_stores() {
 fn call_arity_uses_the_call_code() {
     let diags = check_diags("def f(x: int) -> int:\n    return x\nprint(f())\n");
     assert_eq!(diags[0].code, codes::CALL);
-    assert!(diags[0].message.contains("takes 1 positional argument(s)"));
+    assert!(
+        diags[0].message.contains("missing required argument 'x'"),
+        "{}",
+        diags[0].message
+    );
 }
 
 #[test]
@@ -342,7 +405,7 @@ fn module_call_arity_is_checked_from_the_spec() {
     assert_eq!(diags[0].code, codes::CALL);
     assert_eq!(
         diags[0].message,
-        "math.sqrt() takes 1 positional argument(s) (0 given)"
+        "math.sqrt() takes 1 argument(s) (0 given)"
     );
 
     let diags = check_diags("from functools import reduce\nreduce(lambda a, b: a)\n");
@@ -350,7 +413,7 @@ fn module_call_arity_is_checked_from_the_spec() {
     assert_eq!(diags[0].code, codes::CALL);
     assert_eq!(
         diags[0].message,
-        "functools.reduce() takes 2 to 3 positional argument(s) (1 given)"
+        "functools.reduce() takes 2 to 3 argument(s) (1 given)"
     );
 }
 
@@ -408,12 +471,9 @@ fn tuple_concat_and_repeat_types() {
 }
 
 #[test]
-fn tuple_ordering_is_rejected() {
-    let errors = check_errors("print((1, 2) < (3, 4))\n");
-    assert_eq!(
-        errors,
-        vec!["unsupported operand type(s) for <: 'tuple' and 'tuple'"]
-    );
+fn tuple_ordering_typechecks_as_bool() {
+    let program = crate::check_source("x = (1, 2) < (3, 4)\n", "test.py").expect("valid program");
+    assert_eq!(assigned_type(&program, 0), Type::Bool);
 }
 
 #[test]
@@ -461,6 +521,44 @@ fn unpack_requires_a_sequence() {
     let errors = check_errors("x = 1\na, b = x\n");
     assert_eq!(errors, vec!["cannot unpack int"]);
     assert!(check_errors("t = (1, 2)\na, b = t\n").is_empty());
+}
+
+#[test]
+fn unpack_accepts_iterable_sources() {
+    for source in [
+        "a, b = 'xy'\n",
+        "a, b = {1, 2}\n",
+        "a, b = {'x': 1, 'y': 2}\n",
+        "a, b = range(2)\n",
+        "a, b = iter((1, 2))\n",
+    ] {
+        let errors = check_errors(source);
+        assert!(errors.is_empty(), "{source}: {errors:?}");
+    }
+}
+
+#[test]
+fn duplicate_underscore_unpack_target_is_allowed() {
+    assert!(check_errors("t = (1, 2)\n_, _ = t\n").is_empty());
+}
+
+#[test]
+fn unpack_targets_emit_attributes_subscripts_and_nesting() {
+    let source =
+        "class C:\n    pass\nobj = C()\nitems = [0]\nt = (1, (2, 3))\nobj.x, (a, items[0]) = t\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    let pyx_ir::StmtKind::Unpack { targets, .. } = &program.functions[0].body[4].kind else {
+        panic!("expected an unpack statement");
+    };
+    match &targets[0] {
+        pyx_ir::UnpackTarget::Attr { name, .. } => assert_eq!(name, "x"),
+        other => panic!("expected an attribute target, got {other:?}"),
+    }
+    let pyx_ir::UnpackTarget::Nested(inner) = &targets[1] else {
+        panic!("expected a nested target, got {:?}", targets[1]);
+    };
+    assert!(matches!(inner[0], pyx_ir::UnpackTarget::Name(_)));
+    assert!(matches!(inner[1], pyx_ir::UnpackTarget::Subscript { .. }));
 }
 
 #[test]
@@ -554,9 +652,72 @@ fn membership_diagnostics_follow_operand_types() {
         check_errors("print((1, [2]) in {1})\n"),
         vec!["unhashable type: 'list'"]
     );
+}
+
+#[test]
+fn chained_comparisons_type_as_bool() {
+    let source = "x = 1\n\
+                  a = 0 < x < 3\n\
+                  b = 0 <= x <= 3\n\
+                  c = 0 < x < 2 < 3\n\
+                  d = x is not None\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    for index in 1..=4 {
+        assert_eq!(assigned_type(&program, index), Type::Bool);
+    }
+}
+
+#[test]
+fn assignment_expressions_are_visible_later_in_the_scope() {
+    // The comprehension binds `y` in the enclosing (module) scope, so the
+    // later read resolves and the walrus result feeds the comparison.
+    let source = "if (n := 3) > 0:\n    m = n\n\
+                  values = [y := x for x in [1, 2]]\n\
+                  after = y\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    let locals = &program.functions[0].locals;
+    assert!(locals.iter().any(|local| local.name == "n"), "{locals:?}");
+    assert!(locals.iter().any(|local| local.name == "y"), "{locals:?}");
+    let after = &program.functions[0].body[2];
+    let pyx_ir::StmtKind::Assign { value, .. } = &after.kind else {
+        panic!("expected the final assignment");
+    };
+    assert!(
+        matches!(&value.kind, pyx_ir::ExprKind::Local(_)),
+        "{:?}",
+        value.kind
+    );
+}
+
+#[test]
+fn assignment_expression_to_a_comprehension_target_is_rejected() {
     assert_eq!(
-        check_errors("print(1 in [2] in [3])\n"),
-        vec!["chained comparisons are not supported in Phase 1"]
+        check_errors("values = [(x := 1) for x in [1, 2]]\n"),
+        vec!["assignment expression cannot rebind comprehension iteration variable 'x'"]
+    );
+}
+
+#[test]
+fn ord_and_chr_have_concrete_result_types() {
+    let source = "a = ord('A')\nb = chr(65)\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    assert_eq!(assigned_type(&program, 0), Type::Int);
+    assert_eq!(assigned_type(&program, 1), Type::Str);
+}
+
+#[test]
+fn ord_and_chr_reject_mismatched_argument_types() {
+    assert_eq!(
+        check_errors("print(ord(1))\n"),
+        vec!["ord() argument must be str, not int"]
+    );
+    assert_eq!(
+        check_errors("print(chr('x'))\n"),
+        vec!["chr() argument must be an int, not str"]
+    );
+    assert_eq!(
+        check_errors("print(ord())\n"),
+        vec!["ord() takes exactly one argument (0 given)"]
     );
 }
 
@@ -1092,6 +1253,7 @@ fn class_definitions_emit_the_class_statement_and_self_attribute_stores() {
         name,
         base,
         methods,
+        ..
     } = &body[0].kind
     else {
         panic!("expected a class statement, got {:?}", body[0].kind);
@@ -1138,6 +1300,63 @@ fn subclass_emits_its_base_expression() {
     assert!(
         matches!(&base.kind, ExprKind::Local(_)),
         "base must reference the C local: {:?}",
+        base.kind
+    );
+}
+
+#[test]
+fn exception_class_values_are_emitted_and_usable_as_bases() {
+    let source = "\
+x = ValueError
+def make():
+    return Exception
+class E(Exception):
+    pass
+class F(E):
+    pass
+";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    let body = &program.functions[0].body;
+    assert!(
+        matches!(
+            &body[0].kind,
+            StmtKind::Assign { value, .. }
+                if matches!(&value.kind, ExprKind::ExceptionClass(ExcKind::ValueError))
+        ),
+        "{:?}",
+        body[0].kind
+    );
+    let make = program_function(&program, "make");
+    assert!(
+        matches!(
+            &make.body[0].kind,
+            StmtKind::Return(Some(value))
+                if matches!(&value.kind, ExprKind::ExceptionClass(ExcKind::Exception))
+        ),
+        "{:?}",
+        make.body[0].kind
+    );
+    let StmtKind::ClassDef {
+        base: Some(base), ..
+    } = &body[1].kind
+    else {
+        panic!("expected class E with a base, got {:?}", body[1].kind);
+    };
+    assert!(
+        matches!(&base.kind, ExprKind::ExceptionClass(ExcKind::Exception)),
+        "base must be the Exception class: {:?}",
+        base.kind
+    );
+    // `class F(E)` keeps referring to the class local created by `class E`.
+    let StmtKind::ClassDef {
+        base: Some(base), ..
+    } = &body[2].kind
+    else {
+        panic!("expected class F with a base, got {:?}", body[2].kind);
+    };
+    assert!(
+        matches!(&base.kind, ExprKind::Local(_)),
+        "base must reference the E local: {:?}",
         base.kind
     );
 }
@@ -1411,6 +1630,44 @@ fn raise_from_none_emits_a_none_constant_cause() {
 }
 
 #[test]
+fn assert_emits_the_test_and_message() {
+    let source = "def f(value):\n    assert value, 'value is required'\n";
+    let program = crate::check_source(source, "test.py").expect("valid assert");
+    let f = program_function(&program, "f");
+    let StmtKind::Assert { test, msg } = &f.body[0].kind else {
+        panic!("expected an assert statement, got {:?}", f.body[0].kind);
+    };
+    assert!(
+        matches!(&test.kind, ExprKind::Local(_)),
+        "the test must reference the parameter: {:?}",
+        test.kind
+    );
+    assert!(
+        matches!(
+            msg.as_ref().map(|msg| &msg.kind),
+            Some(ExprKind::Const(pyx_ir::Const::Str(text))) if text == "value is required"
+        ),
+        "the message must be emitted: {msg:?}"
+    );
+}
+
+#[test]
+fn assert_without_a_message_and_with_any_message_value_is_valid() {
+    let bare = crate::check_source("def f(value):\n    assert value\n", "test.py")
+        .expect("a bare assert is valid");
+    let f = program_function(&bare, "f");
+    let StmtKind::Assert { msg, .. } = &f.body[0].kind else {
+        panic!("expected an assert statement, got {:?}", f.body[0].kind);
+    };
+    assert!(msg.is_none(), "a bare assert has no message");
+
+    // `assert x, <non-str>` is legal Python: the value becomes the exception
+    // argument, so it is not restricted to `str`.
+    crate::check_source("def f(value):\n    assert value, [1, 2]\n", "test.py")
+        .expect("a non-str assert message is valid");
+}
+
+#[test]
 fn tuple_handler_emits_one_handler_per_type_in_source_order() {
     let source = "def f():\n    try:\n        pass\n    except (TypeError, ValueError) as e:\n        print(e)\n";
     let program = crate::check_source(source, "test.py").expect("valid tuple handler");
@@ -1441,5 +1698,128 @@ fn exception_hierarchy_handlers_survive_emission() {
             Some(pyx_ir::ExcKind::Exception),
             Some(pyx_ir::ExcKind::BaseException)
         ]
+    );
+}
+
+#[test]
+fn identity_comparisons_are_boolean_for_any_operand_pair() {
+    assert_eq!(
+        op_result(BinOp::Is, Type::Int, Type::None),
+        Some(Type::Bool)
+    );
+    assert_eq!(
+        op_result(BinOp::IsNot, Type::List, Type::Str),
+        Some(Type::Bool)
+    );
+    assert_eq!(
+        op_result(BinOp::Is, Type::Bool, Type::Bool),
+        Some(Type::Bool)
+    );
+    // A call that never returns cannot be compared.
+    assert_eq!(op_result(BinOp::Is, Type::Never, Type::Int), None);
+}
+
+#[test]
+fn identity_comparison_does_not_narrow_the_operand() {
+    let source = "def f(x):\n    return x is None\n";
+    let program = crate::check_source(source, "test.py").expect("valid identity comparison");
+    let f = program.functions.iter().find(|f| f.name == "f").expect("f");
+    assert_eq!(f.ret_ty, Type::Bool);
+    // `x is None` must leave `x` dynamically typed, not force it to None.
+    assert_eq!(f.locals[0].ty, Type::Any);
+}
+
+#[test]
+fn new_builtins_have_the_documented_result_types() {
+    let source = "a = max(1, 2)\nb = min(1, 2)\nc = round(1.5)\nd = format(1, \"d\")\ne = isinstance(1, int)\n";
+    let program = crate::check_source(source, "test.py").expect("valid builtin program");
+    assert_eq!(assigned_type(&program, 0), Type::Any);
+    assert_eq!(assigned_type(&program, 1), Type::Any);
+    assert_eq!(assigned_type(&program, 2), Type::Any);
+    assert_eq!(assigned_type(&program, 3), Type::Str);
+    assert_eq!(assigned_type(&program, 4), Type::Bool);
+}
+
+#[test]
+fn sorted_returns_a_list_and_validates_its_slots() {
+    let source = "a = sorted([3, 1])\nb = sorted((1, 2), reverse=True)\nc = sorted([1], key=str)\n";
+    let program = crate::check_source(source, "test.py").expect("valid sorted program");
+    for index in 0..3 {
+        assert_eq!(assigned_type(&program, index), Type::List);
+    }
+
+    assert_eq!(
+        check_errors("a = sorted(1)\n"),
+        vec!["sorted() argument must be iterable"]
+    );
+    assert_eq!(
+        check_errors("a = sorted([1], key=1)\n"),
+        vec!["sorted() key must be callable or None, not int"]
+    );
+}
+
+#[test]
+fn conditional_expression_joins_the_branch_types() {
+    let source = "a = 1 if True else 2\nb = 1 if True else \"x\"\n";
+    let program = crate::check_source(source, "test.py").expect("valid conditional expressions");
+    assert_eq!(assigned_type(&program, 0), Type::Int);
+    // Mixed branch types fall back to a dynamic result.
+    assert_eq!(assigned_type(&program, 1), Type::Any);
+}
+
+#[test]
+fn bitwise_operands_produce_int_or_dynamic_results() {
+    for op in [
+        BinOp::BitAnd,
+        BinOp::BitOr,
+        BinOp::BitXor,
+        BinOp::Shl,
+        BinOp::Shr,
+    ] {
+        assert_eq!(op_result(op, Type::Int, Type::Int), Some(Type::Int));
+        assert_eq!(op_result(op, Type::Bool, Type::Int), Some(Type::Int));
+        assert_eq!(op_result(op, Type::Bool, Type::Bool), Some(Type::Int));
+        assert_eq!(op_result(op, Type::Any, Type::Int), Some(Type::Any));
+        // Non-integer operands are only rejected at runtime.
+        assert_eq!(op_result(op, Type::Str, Type::Str), Some(Type::Any));
+        assert_eq!(op_result(op, Type::Float, Type::Int), Some(Type::Any));
+    }
+}
+
+#[test]
+fn bitwise_expressions_typecheck_as_int() {
+    let source = "a = 6 & 3\nb = 1 << 4\nc = 8 >> 1\nd = True | False\n";
+    let program = crate::check_source(source, "test.py").expect("valid bitwise expressions");
+    for index in 0..4 {
+        assert_eq!(assigned_type(&program, index), Type::Int);
+    }
+}
+
+#[test]
+fn repr_returns_a_str() {
+    let source = "a = repr(1)\n";
+    let program = crate::check_source(source, "test.py").expect("valid repr call");
+    assert_eq!(assigned_type(&program, 0), Type::Str);
+}
+
+#[test]
+fn invert_requires_an_int_operand() {
+    assert!(check_errors("x = ~1\ny = ~True\n").is_empty());
+    assert_eq!(
+        check_errors("x = ~1.5\n"),
+        vec!["bad operand type for unary ~: 'float'"]
+    );
+    assert_eq!(
+        check_errors("x = ~'s'\n"),
+        vec!["bad operand type for unary ~: 'str'"]
+    );
+}
+
+#[test]
+fn hash_builtin_checks_arity_and_returns_int() {
+    assert!(check_errors("x = hash(1)\ny = hash((1, 2))\n").is_empty());
+    assert_eq!(
+        check_errors("x = hash()\n"),
+        vec!["hash() takes exactly one argument (0 given)"]
     );
 }

@@ -1,6 +1,6 @@
 # PyX — Source Layout
 
-As of 2026-10-24 (after the module restructuring). The crates remain the
+As of 2026-10-25 (after the module restructuring). The crates remain the
 only Frontend↔Codegen contract; inside the crates, the formerly flat
 `src/*.rs` files are split into topic folders. Paths are relative to the
 repository root.
@@ -48,6 +48,7 @@ repository root.
     ├── pyx-frontend/          parsing, lowering, type checking, user modules
     │   └── src/
     │       ├── lib.rs         check_file, module loader/import resolution
+    │       │                  (siblings, packages, site-packages, PYTHONPATH)
     │       ├── diag.rs        diagnostics, spans, codes
     │       ├── lower/         AST → HIR/lowering
     │       └── sema/          type inference, constraints, IR emission
@@ -68,7 +69,9 @@ repository root.
     │   │   │                  x86_64 register switch, ucontext fallback)
     │   │   ├── gc/            heap, color/barriers, safepoints, sweep
     │   │   ├── modules/       math/io/json/os/... + argparse, collections,
-    │   │   │                  re, socket, asyncio; extension.rs (abi3 loader)
+    │   │   │                  re, socket, asyncio, typing, abc, enum, types,
+    │   │   │                  itertools, ast, fractions, importlib,
+    │   │   │                  __future__; extension.rs (abi3 loader)
     │   │   ├── concurrency/   threads/locks/queue/processes/pool/spawn
     │   │   ├── support/       PYX1 serialization (pickle/spawn/mp.Queue)
     │   │   └── csv.rs         CSV reader/writer

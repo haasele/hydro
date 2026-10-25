@@ -20,3 +20,19 @@ ab
 [0, 1, 2, 3, 4, 5]
 zero slice step cannot be zero
 él olléh
+[0, 9, 8, 3, 4, 5]
+[0, 7, 6, 5, 8, 3, 4, 5]
+[0, 8, 3, 4, 5]
+[4, 3, 4, 5]
+[4, 3, 4, 8, 9]
+[4, 3, 5, 4, 8, 9]
+[0, 3, 0, 4, 0, 9]
+[6, 5, 4, 3, 2, 1]
+[6, 5, 4, 3, 2, 1]
+[6, 'a', 'b', 4, 3, 2, 1]
+eval value
+eval start
+eval stop
+[0, 9, 2]
+extended attempt to assign sequence of size 1 to extended slice of size 4
+immutable 'str' object does not support item assignment

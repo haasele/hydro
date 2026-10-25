@@ -13,6 +13,11 @@ pub struct FunctionSpec {
     /// call with keywords is rejected by the frontend. Constructors use
     /// this to support the common Python spelling (`Thread(target=...)`).
     pub params: &'static [&'static str],
+    /// The call also accepts keyword names that are not listed in `params`:
+    /// `functools.partial(func, *args, **kwargs)` keeps the extra names for
+    /// the wrapped callee. Without this flag an unknown keyword name is a
+    /// compile-time error.
+    pub dynamic_keywords: bool,
 }
 
 pub struct ConstantSpec {
@@ -33,6 +38,7 @@ pub(crate) const fn f(name: &'static str, min: usize, max: usize, ret: Type) -> 
         max_args: max,
         ret,
         params: &[],
+        dynamic_keywords: false,
     }
 }
 
@@ -50,6 +56,26 @@ pub(crate) const fn kw(
         max_args: max,
         ret,
         params,
+        dynamic_keywords: false,
+    }
+}
+
+/// A function that accepts the listed parameters plus arbitrary keyword
+/// names it forwards to the callee (`functools.partial`'s `**kwargs`).
+pub(crate) const fn kw_dynamic(
+    name: &'static str,
+    min: usize,
+    max: usize,
+    ret: Type,
+    params: &'static [&'static str],
+) -> FunctionSpec {
+    FunctionSpec {
+        name,
+        min_args: min,
+        max_args: max,
+        ret,
+        params,
+        dynamic_keywords: true,
     }
 }
 
@@ -109,6 +135,17 @@ pub static MODULES: &[&ModuleSpec] = &[
     &SHUTIL,
     &TEXTWRAP,
     &TIMEIT,
+    &DATACLASSES,
+    &DATETIME,
+    &TYPING,
+    &ABC,
+    &ENUM,
+    &FUTURE,
+    &TYPES,
+    &ITERTOOLS,
+    &AST,
+    &FRACTIONS,
+    &IMPORTLIB,
 ];
 
 pub fn module(name: &str) -> Option<&'static ModuleSpec> {

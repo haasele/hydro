@@ -1,7 +1,7 @@
 # PyX — Architecture
 
-As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
-implemented (1064 tests, `scripts/verify.sh` ALL GREEN). This document is
+As of: **2026-10-25**. Phase 1 is complete; Phase 2 is largely
+implemented (1329 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -16,7 +16,8 @@ defined subset (see `docs/TODO.md`).
 
 **Supported:** tagged values, containers, functions/closures, classes
 (single base), comprehensions, f-strings/formatting, exceptions,
-file I/O, user modules, native stdlib modules, lazy generators and coroutines
+file I/O, user modules and packages, native stdlib modules, lazy generators
+and coroutines
 with a cooperative event loop, threads/processes/pool, a conservative
 concurrent mark-&-sweep GC.
 
@@ -29,7 +30,7 @@ size-class allocator. Details in §10 and `docs/TODO.md`.
 ## 2. Components & Data Flow
 
 ```
-Source .py (+ imported sibling modules)
+Source .py (+ imported modules and packages)
   │  rustpython-parser (Python grammar, AST)
   ▼
 pyx-frontend ── Lowering ──► typed IR (pyx-ir) ──► pyx-codegen
@@ -131,9 +132,12 @@ i64  pyx_truthy(i64 v);               // 1 if truthy, 0 if falsy (C style)
 i64  pyx_print(uint64_t argc, const i64* argv);     // space-separated + '\n'
 i64  pyx_len(i64 v);
 i64  pyx_to_str(i64 v);
+i64  pyx_to_repr(i64 v);                            // repr(v)
+i64  pyx_hash(i64 v);                              // hash(v)
 i64  pyx_to_int(i64 v);
 i64  pyx_to_float(i64 v);
 i64  pyx_abs(i64 v);
+i64  pyx_all(i64 iterable);                         // all(): True/False
 i64  pyx_format_value(i64 value, const uint8_t* spec, size_t spec_len,
                       uint8_t conversion);          // f-string field
 i64  pyx_list_new(uint64_t argc, const i64* items);
@@ -143,7 +147,13 @@ i64  pyx_unpack(i64 value, uint64_t expected);      // None or ValueError
 i64  pyx_set_new(uint64_t argc, const i64* items);
 i64  pyx_set_from(i64 iterable);
 i64  pyx_range_new(i64 start, i64 stop, i64 step);  // step != 0
+i64  pyx_unpack_seq(i64 value, uint64_t expected);
+                                    // sequence to bind (fresh list if needed)
+i64  pyx_unpack_star(i64 value, uint64_t before, uint64_t after);
+                                    // a, *rest, b = value: fresh list with
+                                    // slot `before` holding the middle list
 i64  pyx_list_from(i64 iterable);
+i64  pyx_tuple_from(i64 iterable);  // tuple(iterable)
 i64  pyx_dict_from(i64 iterable);
 i64  pyx_sum(i64 iterable, i64 start);
 i64  pyx_enumerate(i64 iterable, i64 start);
@@ -151,24 +161,43 @@ i64  pyx_zip(uint64_t argc, const i64* iterables);
 i64  pyx_list_append(i64 list, i64 value);          // None or error
 i64  pyx_set_add(i64 set, i64 value);
 i64  pyx_dict_set(i64 dict, i64 key, i64 value);
+i64  pyx_dict_merge(i64 left, i64 right);           // {**left, **right} copy
 i64  pyx_function_new(const uint8_t* wrapper, uint64_t arity,
                       const uint8_t* name, size_t name_len, uint32_t flags);
+i64  pyx_function_params(i64 fn, uint64_t count, const i64* names);
+                                    // 2*count words [ptr, len, ...]:
+                                    // user-visible positional parameter names
 i64  pyx_builtin_function(const uint8_t* name, size_t name_len); // f = int
 i64  pyx_closure_new(const uint8_t* wrapper, uint64_t arity,
                      const uint8_t* name, size_t name_len,
                      uint64_t capture_count, const i64* captures,
                      uint32_t flags);
 i64  pyx_class_new(const uint8_t* name, size_t name_len, i64 base,
-                   uint64_t method_count, const i64* names, const i64* funcs);
+                   uint64_t method_count, const i64* names, const i64* funcs,
+                   const i64* kinds,
+                   uint64_t attr_count, const i64* attr_names,
+                   const i64* attr_values);
+i64  pyx_exception_class(uint32_t tag);  // cached native class, e.g. ValueError
 i64  pyx_call(i64 fn, uint64_t argc, const i64* argv);
+i64  pyx_call_star(i64 fn, uint64_t argc, const i64* argv, i64 star);
+                            // fn(args..., *star); star is a list/tuple
 i64  pyx_map(i64 fn, i64 iterable);                 // materialized list
 i64  pyx_filter(i64 fn_or_none, i64 iterable);
 i64  pyx_module_call(const uint8_t* module, size_t module_len,
                      const uint8_t* function, size_t function_len,
                      uint64_t argc, const i64* argv);
+i64  pyx_module_call_kw(const uint8_t* module, size_t module_len,
+                        const uint8_t* function, size_t function_len,
+                        uint64_t argc, const i64* argv,
+                        uint64_t kwargc, const i64* kw_argv);
+                                    // [name, value, ...]; only specs with
+                                    // dynamic keywords (functools.partial)
 i64  pyx_module_get(const uint8_t* module, size_t module_len,
                     const uint8_t* name, size_t name_len);
 i64  pyx_module_value(const uint8_t* module, size_t module_len);
+i64  pyx_deferred_import(const uint8_t* module, size_t module_len,
+                         const uint8_t* member, size_t member_len);
+                     // always raises RuntimeError; empty member = module alias
 i64  pyx_global_get(const uint8_t* module, size_t module_len,
                     const uint8_t* name, size_t name_len);
 i64  pyx_global_set(const uint8_t* module, size_t module_len,
@@ -176,13 +205,20 @@ i64  pyx_global_set(const uint8_t* module, size_t module_len,
 i64  pyx_subscript(i64 obj, i64 index);
 i64  pyx_subscript_set(i64 obj, i64 index, i64 value);
 i64  pyx_slice(i64 obj, i64 start, i64 stop, i64 step);
+i64  pyx_slice_set(i64 obj, i64 start, i64 stop, i64 step, i64 value);
+                     // list slice assignment; returns None, errors via pending
+                     // exception
 i64  pyx_getattr(i64 obj, const uint8_t* name, size_t name_len); // data attribute
+i64  pyx_hasattr(i64 obj, const uint8_t* name, size_t name_len); // True/False
 i64  pyx_setattr(i64 obj, const uint8_t* name, size_t name_len, i64 value);
 i64  pyx_method(i64 obj, const uint8_t* name, size_t name_len,
                 uint64_t argc, const i64* argv);
 i64  pyx_method_kw(i64 obj, const uint8_t* name, size_t name_len,
                    uint64_t argc, const i64* argv,
                    uint64_t kwargc, const i64* kw_argv); // [name, value, ...]
+i64  pyx_method_star(i64 obj, const uint8_t* name, size_t name_len,
+                     i64 star, uint64_t kwargc,
+                     const i64* kw_argv);  // obj.m(*list_or_tuple, k=v)
 i64  pyx_iter_new(i64 obj);
 i64  pyx_iter_next(i64 iter, i64* out);             // 1=value, 0=end
 i64  pyx_iter(i64 obj);                             // iter(obj)
@@ -217,8 +253,9 @@ int32_t pyx_spawn_child(void);        // child mode after exec (-1 = normal)
 ```
 
 `op` codes (`pyx_binop`): `0 Add, 1 Sub, 2 Mul, 3 Div, 4 FloorDiv, 5 Mod,
-6 Pow, 7 Eq, 8 Ne, 9 Lt, 10 Le, 11 Gt, 12 Ge, 13 In, 14 NotIn`.
-`pyx_unop`: `0 Neg, 1 Pos, 2 Not`.
+6 Pow, 7 Eq, 8 Ne, 9 Lt, 10 Le, 11 Gt, 12 Ge, 13 In, 14 NotIn, 15 Is,
+16 IsNot, 17 BitAnd, 18 BitOr, 19 BitXor, 20 Shl, 21 Shr`.
+`pyx_unop`: `0 Neg, 1 Pos, 2 Not, 3 Invert` (`~` is int/bool only).
 
 `flags` in `pyx_function_new`/`pyx_closure_new`: Bit 0 = `async`, Bit 1 =
 generator. If either of the bits is set, the generated wrapper calls
@@ -228,11 +265,23 @@ followed by the call arguments. The fiber starts only on the first
 
 Exception tags: `0 ValueError, 1 TypeError, 2 ZeroDivisionError,
 3 RuntimeError, 4 OverflowError, 5 KeyboardInterrupt, 6 IndexError,
-7 KeyError, 8 StopIteration, 9 AttributeError, 10 OSError, 11 GeneratorExit`
-(internal), `12 Exception`, `13 BaseException`, `14 AssertionError`. Names 1:1 as in Python;
-`IOError` is an alias for `OSError`. `except Exception` matches every tag
-except 5/11; `except BaseException` matches every tag. Explicit causes are
-stored on the exception and traced by the GC.
+7 KeyError, 8 StopIteration, 9 AttributeError, 10 OSError, 11 GeneratorExit,
+12 Exception, 13 BaseException, 14 AssertionError, 15 FileNotFoundError`.
+Names are 1:1 as in Python; `IOError` is an alias for `OSError`.
+`except Exception` matches every tag except 5/11; `except BaseException`
+matches every tag. `raise`/`except` resolve tags from names directly, while
+an unqualified exception name used as a value lowers to
+`pyx_exception_class(tag)`, which returns one cached empty class object per
+tag. Explicit causes are stored on the exception and traced by the GC.
+
+**User exception classes are a documented limitation.** `class ReprError(
+Exception): ...` creates an ordinary class (its instances are class
+instances, not native exception objects). `raise ReprError("msg")` is not
+dropped: the frontend lowers it to `RuntimeError` whose message is
+`"ReprError: msg"` (the message is rendered with `str()`), keeping an
+explicit `from` cause; a bare `raise ReprError` uses `"ReprError"`. A later
+`except ReprError:` is rejected at compile time (handlers only accept
+built-in kinds), so the fallback never matches a user handler.
 
 ### 3.3 Semantics
 
@@ -246,6 +295,13 @@ stored on the exception and traced by the GC.
 - Mixed `int`/`float` → `float`; `bool` is numerically `0/1`.
 - `print` calls `str()` per argument, separates with spaces, terminates with
   `\n`.
+- `hash(v)` reuses the dict-key hash (so `1`, `1.0` and `True` hash equally)
+  mapped into a non-negative tagged int; unhashable values raise `TypeError`.
+  The value is process-deterministic but not CPython-reproducible.
+- Unary `~` is defined for `int`/`bool` (`~x == -x - 1`); any other operand
+  raises `TypeError`. `NotImplemented` is a reserved singleton constant usable
+  in expressions (e.g. `return NotImplemented`); no `__eq__` fallback protocol
+  consumes it yet.
 - `str % args` is printf formatting as soon as the left side is a string
   (`%s`, `%d`, `%f`, `%x`, flags/width/precision, `%%`, tuple arguments).
 - f-strings: `{expr}`, `{expr!s}`, `{expr!r}`, `{expr!a}` and format specs
@@ -273,7 +329,10 @@ stored on the exception and traced by the GC.
   independent); `list + list` concatenates.
 - Slices (`s[a:b:c]`) follow `slice.indices` (negative indices, defaults,
   `step == 0` → ValueError) and return new strings (Unicode scalars) or
-  lists; dicts are not sliceable (`TypeError`).
+  lists; dicts are not sliceable (`TypeError`). List slice assignment
+  (`xs[a:b:c] = iterable`) splices for `step == 1`, replaces the visited
+  positions for extended slices (length mismatch → ValueError) and rejects
+  immutable `str`/`bytes`/`tuple` targets (`TypeError`).
 - Tuples: immutable, indexing/slicing like lists, `len`, iteration,
   structural equality, `tuple + tuple` and `tuple * int`; representation
   `(1, 'a')`, singleton `(1,)`, empty `()`. Tuples of hashable elements are
@@ -318,15 +377,28 @@ stored on the exception and traced by the GC.
   (`capture_count` in the signature). Recursive nested functions and
   closures in lambdas are diagnosed.
 - **Classes** (Phase 2.27): `class Name(Base):` with at most one simple
-  base. Allowed are methods, `__init__`, `pass` and a docstring; the
-  class namespace is immutable after creation. `Name(...)` creates
+  base. Allowed are methods, `__init__`, class attributes (`x = value`,
+  `x: type = value`, including `__slots__`, which is accepted and ignored),
+  bare field declarations (`name: type`), `pass` and a docstring; class
+  attributes are evaluated when the class statement runs and the namespace
+  is immutable after creation. `@property`, `@classmethod` and
+  `@staticmethod` select the method binding kind (property setters/deleters
+  are ignored; assignment stores an instance attribute); the no-op decorators
+  `lru_cache`, `cache`, `wraps`, `abstractmethod`, `overload` and
+  `runtime_checkable` (including parametrized forms) are accepted without
+  being evaluated. `@dataclass` (the imported `dataclasses.dataclass` name)
+  and `class X(typing.NamedTuple)` synthesize an ordinary
+  `__init__(self, <annotated fields...>)` that assigns every declared field
+  in order unless the class defines its own. `Name(...)` creates
   an instance and calls `__init__` (via the class/base chain) with the
-  instance as `self`. Methods are resolved dynamically via `pyx_method` by
-  receiver type and class chain; attributes via
-  `pyx_getattr`/`pyx_setattr`. Not supported: class attributes,
+  receiver selected by the method kind. Methods are resolved dynamically via
+  `pyx_method` by receiver type and class chain; attributes via
+  `pyx_getattr`/`pyx_setattr`. Instances expose `__class__`; classes expose
+  their frozen attributes and `__name__`. Not supported: other class
   decorators, metaclasses, `class` keywords, multiple inheritance,
-  `__repr__`/descriptor protocols. Instances render deterministically as
-  `<ClassName object>` (no heap address), classes as `<class 'Name'>`.
+  zero-argument `super()`, `__repr__`/descriptor protocols. Instances render
+  deterministically as `<ClassName object>` (no heap address), classes as
+  `<class 'Name'>`.
 - **Attributes** (`pyx_getattr`): `pathlib.Path` (`name`, `stem`, `suffix`,
   `parent`, `path`), files (`name`, `mode`, `closed`, `encoding`),
   `threading.Thread` (`name`, `ident`, `daemon`) and
@@ -341,8 +413,18 @@ stored on the exception and traced by the GC.
   `argparse` methods; e.g. `Path.mkdir(parents=True, exist_ok=True)`.
   Native **constructors** (e.g. `Thread(target=..., args=...)`,
   `queue.Queue(maxsize=...)`) bind keywords via their
-  `FunctionSpec.params`. Other native methods as well as user functions/
-  methods reject keywords (runtime/frontend diagnostic).
+  `FunctionSpec.params`. User **functions** bind keywords at compile time
+  against their parameter names (`md_table(rows, left=2)`), diagnose
+  unknown/duplicate names and fill omitted trailing parameters from their
+  literal defaults (`def bar(f, width=18)`); a first-class call still needs
+  the full positional arity. A non-literal default (e.g.
+  `color_system=ColorSystem.TRUECOLOR`) is accepted so library signatures
+  compile; parameter metadata records `None`, so a direct call that omits it
+  receives `None` instead of the source default (documented limitation).
+  `max`/`min` pass `key=` as the runtime's
+  trailing key slot. `pyx_method_star` flattens one list/tuple operand
+  (`t.add_row(*cells, style=style)`). Other native methods reject keywords
+  (runtime/frontend diagnostic).
 
 #### Generators and async
 
@@ -400,8 +482,14 @@ implement the protocol; without `as`, `__enter__` still runs.
 #### Imports, User Modules, `__name__`
 
 - Native modules are specified via `pyx_ir::stdlib` (see below).
-  `import X [as Y]` and `from X import a [as b]` are allowed only at module
-  level; imported names are visible inside functions. `X.f(...)` →
+  `import X [as Y]` and `from X import a [as b]` bind eagerly at module
+  level; imported names are visible inside functions. Imports nested in a
+  function, class or compound body are **deferred**: the loader records them
+  without loading the module, names that can still be linked to an
+  already-visible dependency bind normally, and every other binding lowers to
+  `DeferredImport`, which calls `pyx_deferred_import` and raises
+  `RuntimeError` (`dynamic import ... is not supported`) when evaluated.
+  `X.f(...)` →
   ModuleCall, `X.const`/`X.f` as a value → ModuleAttr. Native functions are
   materialized as function objects; calls/arity/errors go through the
   shared specification. A stdlib module used as a value lowers to
@@ -412,18 +500,27 @@ implement the protocol; without `as`, `__enter__` still runs.
   mirrored into a keyed global store (`GlobalSet`/`GlobalGet`,
   `pyx_global_set`/`pyx_global_get`); other module locals remain invisible
   inside functions.
-- **User modules** (Phase 2.30): `import foo` / `from foo import f` resolve
-  `foo.py` next to the importing file. The loader loads every module
-  **once per canonical path** (module cache at compile time), loads
-  dependencies first and detects cycles. Only functions are exported;
-  except for imports, function definitions, the docstring, `pass` and the
-  injected `__name__` assignment, imported modules **must not** contain any
-  top-level expressions (no side effects at import). Packages, dots/
-  relative imports and `from x import *` are not supported. All
-  functions end up in one `Program`; JIT and AOT execute the same code
-  (AOT embeds the modules into the binary).
-- `__name__` is a module body local and is injected only if the body
+- **User modules and packages** (Phase 2.30; package loader extended in the
+  P7 checkpoint): `import foo` / `from foo import f` resolve `foo.py` and
+  packages (`foo/__init__.py`), including dotted names, submodules and
+  relative imports. Search order: sibling files, the package-chain root,
+  `PYX_SITE_PACKAGES`, the `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages trees,
+  then `PYTHONPATH`. The loader loads every unit **once per canonical path**
+  (module cache at compile time), loads dependencies first and diagnoses
+  cycles made only of module-level imports. Imported module bodies are
+  compiled into the `Program` and run once as initializers, so import side
+  effects execute in dependency order; top-level functions, classes and
+  mirrored module-level values are exported, while `from x import *` is not
+  supported. Module-level bindings are also mirrored into the runtime global
+  table, so importers read them regardless of lowering order. All units end
+  up in one `Program`; JIT and AOT execute the same code (AOT embeds the
+  modules into the binary).
+- `__name__` is a module body local and is injected only if the unit
   reads it: `"__main__"` for the entry file, otherwise the module name.
+  The entry file additionally binds `__file__` (its source path) and
+  `__doc__` (the module docstring, or `None`); references from functions and
+  methods are detected too. Each binding is an `Assign` plus the matching
+  `GlobalSet`, so functions read it with `GlobalGet`.
   There is no general runtime module object or `sys.modules`; stdlib module
   values are a native `module` kind, and `errno` exposes a synthetic
   `__dict__` for compatibility.
@@ -434,7 +531,9 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
 `stdlib/mod.rs`): `math`, `io`, `functools`, `operator`, `time`, `sys`,
 `random`, `platform`, `pathlib`, `statistics`, `json`, `csv`, `os`,
 `os.path`, `_thread`, `threading`, `queue`, `multiprocessing`, `pickle`,
-`argparse`, `collections`, `re`, `socket`, `asyncio`.
+`argparse`, `collections`, `re`, `socket`, `asyncio`, `errno`, `unittest`,
+`dataclasses`, `datetime`, `typing`, `abc`, `enum`, `types`, `itertools`,
+`ast`, `fractions`, `importlib` and `__future__`.
 
 - `json`: `dumps`/`loads` with CPython defaults (ensure_ascii, separators,
   escapes, surrogates, error classes, depth/cycle guards) as well as `dump`/`load`
@@ -470,8 +569,14 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
   Blocking calls park the thread for the GC. No TLS/UDP/`select`
   and no `socket.timeout` class (timeout → `OSError`).
 - `random`: global SplitMix64 PRNG and seedable `Random(seed=...)` with
-  `seed`/`random`/`randint`/`randrange`/`choice`/`uniform`/`shuffle`;
-  deterministic per seed, but **not CPython-reproducible**.
+  `seed`/`random`/`randint`/`randrange`/`choice`/`uniform`/`shuffle`/
+  `getrandbits`; `getrandbits(k)` returns a non-negative `k`-bit int and
+  raises `OverflowError` for `k > 60` (documented tagged-int limit).
+  Deterministic per seed, but **not CPython-reproducible**.
+- `sys.stdout`/`sys.stderr`: small native text streams over fd 1/2 with
+  `write(str)` (returns the character count, flushes), `flush()` and
+  `isatty()`. They are fresh GC-safe objects per resolution (no PyX
+  children) and expose no other attributes.
 - `platform`: `system`/`machine`/`release`/`version`/`node`/`platform`/
   `python_version`, `python_implementation() == "PyX"`.
 - `statistics`: `mean`/`fmean`/`median`/`pstdev`/`stdev` including error paths.
@@ -530,7 +635,13 @@ Error-capable runtime calls set a **pending exception** on failure and
 return a dummy value. After *every* error-capable operation, codegen checks
 `pyx_exc_pending()` and jumps to the next handler (or to the uncaught path).
 An exception carries tag, message, function name and line at the time of the
-`raise`. `pyx_uncaught()` prints:
+`raise`. User exception classes have no runtime tag: `raise UserClass(msg)`
+and `raise module.UserClass(msg)` lower to `RuntimeError` with a
+`"<class name>: <message>"` string, and handlers for those classes (by name
+or dotted name, including imported classes) match `RuntimeError`. This
+handler matching is documented as approximate: every user class shares the
+`RuntimeError` tag, so unrelated user-class raises are caught too.
+`pyx_uncaught()` prints:
 
 ```
 Traceback (most recent call last):
@@ -582,16 +693,23 @@ it. The cache is not a shared artifact store.
   captures and are supplied by the runtime value; the visible arity is
   `params.len() - capture_count`.
 - `Stmt`/`Expr` carry `line` (1-based) for tracebacks.
-- Expressions: `Const`, `Local`, `Bin` (incl. `In`/`NotIn`), `Un`, `BoolOp`
-  (short-circuit), `List`, `Dict`, `Tuple`, `Set`, `Subscript`, `Slice`,
+- Expressions: `Const`, `Local`, `Bin` (incl. `In`/`NotIn`,
+  `Is`/`IsNot` and the bitwise operators), `Un`, `BoolOp` (short-circuit),
+  `IfExp` (`a if c else b`,
+  only the selected branch evaluates), `List`, `Dict`, `Tuple`, `Set`,
+  `Subscript`, `Slice`,
   `ListComp`, `SetComp`, `DictComp`, `GeneratorExp` (eager), `Await`,
   `Yield` (expression form; evaluates to the sent value), `YieldFrom`
   (delegation; evaluates to the delegate's result), `FunctionRef`,
-  `BuiltinRef` (`f = int`), `IndirectCall`, `ModuleCall`, `ModuleAttr`,
-  `GetAttr` (data attribute), `MethodCall { args, keywords }`, `Closure`
+  `BuiltinRef` (`f = int`), `IndirectCall { callee, args, star }`
+  (`callee(args, *star)`; `star` is one optional list/tuple operand),
+  `ModuleCall`, `ModuleAttr`,
+  `GetAttr` (data attribute), `MethodCall { args, star, keywords }`,
+  `Closure`
   (value), `Call { callee: Function(id) | Builtin(b), args }`.
 - Statements: `Expr`, `Assign`, `AugAssign`, `If`, `While`, `ForRange`,
-  `ForEach`, `Unpack`, `SetSubscript`, `Closure` (nested def), `Yield`,
+  `ForEach`, `Unpack`, `SetSubscript`, `SetSlice` (list slice assignment;
+  omitted bounds are `Const::None`), `Closure` (nested def), `Yield`,
   `ClassDef { target, name, base, methods }`, `SetAttr`, `Return`, `Break`,
   `Continue`, `Pass`, `Raise`,
   `Try { body, handlers, else_body, finally_body }`.
@@ -608,7 +726,21 @@ it. The cache is not a shared artifact store.
   Phase 2.7, `range` is additionally a value). Negative step is
   allowed, step `0` is a runtime `ValueError`.
 - `Raise { exc, msg, cause }`: `exc == msg == None` is a bare re-raise;
-  `cause` is the optional explicit chaining expression.
+  `cause` is the optional explicit chaining expression. A raise of a class
+  declared in the unit lowers to `RuntimeError` with a
+  `"<ClassName>: <message>"` message (see the exception-tag notes above).
+- `tuple()`/`tuple(iterable)` materialise a tuple (`pyx_tuple_from`), and
+  `hasattr(obj, name)` runs the attribute lookup, swallowing only
+  `AttributeError`. Starred unpack targets (`a, *rest, b = value`) bind a
+  fresh list of the middle elements through `pyx_unpack_star`; one star is
+  allowed and it may not nest inside another container target.
+- `functools.partial(func, *args, **kwargs)` keeps keyword names: the
+  frontend forwards them through `pyx_module_call_kw`, the runtime stores
+  `(name, value)` pairs in the partial and applies them at call time using
+  the parameter names codegen attaches to every generated function value
+  (`pyx_function_params`). A callable without parameter names rejects
+  keywords with `TypeError`; a hole before a named parameter is reported
+  instead of silently passing `None`.
 - Functions carry `is_generator` and `is_async`; codegen derives the
   flags in `pyx_function_new`/`pyx_closure_new` from them (bit 0 async, bit 1
   generator) and generates a wrapper that calls `pyx_coroutine_new` resp.
@@ -647,7 +779,15 @@ Set, Range, Function`.
   rejected until the runtime implements them.
 - `Set` is unparameterized; `In`/`NotIn` → Bool with the same rules as
   §3.3. `range()` → Range, `list()` → List, `dict()` → Dict, `sum()` → Int
-  for Range, otherwise Any, `enumerate`/`zip`/`map`/`filter` → List.
+  for Range, otherwise Any, `enumerate`/`zip`/`map`/`filter` → List,
+  `format()` → Str, `isinstance()` → Bool, `repr()` → Str,
+  `hash()` → Int,
+  `max`/`min`/`round` → Any. Bitwise `&`/`|`/`^`/`<<`/`>>` on
+  `Int`/`Bool` operands → Int; other operand combinations stay `Any` and
+  raise `TypeError` at runtime.
+  `Is`/`IsNot` → Bool for every operand pair and does not narrow either
+  operand (`x is None` leaves `x` dynamic). `IfExp` joins the branch types;
+  incompatible branches become `Any`.
 - Comprehensions: ListComp → List, SetComp → Set, DictComp → Dict,
   GeneratorExp → List (eager). Targets bind synthetic locals.
 - Name/Lambda → Function; indirect call: callee Function/Any, result Any;
@@ -655,9 +795,10 @@ Set, Range, Function`.
   existing locals; `capture_count` is derived from the first use in the
   nested body.
 - Modules/imports: native module attributes/calls are typed via
-  `pyx_ir::stdlib`; user module imports bind exported
-  function signatures. Imports are globally visible but must be at
-  module level.
+  `pyx_ir::stdlib`; user module imports bind exported function signatures.
+  Module-level imports are globally visible. A name bound by a nested import
+  is visible too, but has the dynamic `DeferredImport` type: using it raises
+  at runtime instead of failing the type check.
 - Classes: `class` binds a dynamic class value (no static
   instance type); method calls via instances are checked dynamically,
   calls with `Any` fall back to runtime checks.
@@ -842,12 +983,16 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **1064 tests** (289 frontend, 23 codegen, 4 IR, 371
-  runtime unit, 173 runtime integration, 204 CLI/E2E). E2E coverage
+- As of 2026-10-25: **1329 tests** (395 frontend, 47 codegen, 16 IR, 479
+  runtime unit, 179 runtime integration, 213 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
   socket echo, pathlib, build cache, `pyx gc` and uv passthrough.
+- Generated stdlib import matrix (2026-10-25): **58/297 importable** (13
+  builtin/frozen, 41 pure, 4 extension; report in
+  [`COMPATIBILITY.md`](COMPATIBILITY.md)). `benchmarks/bench_all.py` does
+  **not** yet run under PyX; the first blocker is `rich/console.py`.
 - New unit tests cover the dict hash index, the GC statistics and
   fiber iteration; `examples/generators_async.py` runs under JIT and AOT.
 - E2E compares stdout/exit code of `pyx run` and the AOT binary; negative tests
@@ -856,10 +1001,13 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 
 **Limits (deliberate, documented):**
 
-- **Language:** no BigInt (i64), no decorators, pattern matching,
+- **Language:** no BigInt (i64), no general decorators (only
+  `property`/`classmethod`/`staticmethod` on methods and the ignored
+  `lru_cache`/`cache`/`wraps`/`abstractmethod`/`overload`/
+  `runtime_checkable`), pattern matching,
   metaclasses, descriptor/`__dunder__` protocols, `except*`,
-  implicit exception context, `bytearray`/`memoryview`; no slice assignment; no
-  class attributes/multiple inheritance; class namespace immutable.
+  implicit exception context, `bytearray`/`memoryview`; no
+  multiple inheritance, zero-argument `super()`; class namespace immutable.
 - **Closures:** by value at definition time; recursive nested
   functions and closures in lambdas are diagnostics. No cell/mutable
   capture.
@@ -876,11 +1024,13 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   fiber switch is register-only (two switches per yield, no syscalls); a
   100k generator sum reaches release AOT 6.8 ms / JIT 7.7 ms versus CPython
   10.2 ms (`strace -c`: 94 syscalls total).
-- **Modules:** native modules and sibling `.py` files; stdlib module values
-  work (with `getattr`), and simple module-level assignments are visible
-  inside functions. No user-module values, packages, dots/relative imports,
-  top-level side effects in imported modules, or general runtime module
-  objects/`sys.modules`.
+- **Modules:** native modules, sibling `.py` files and packages
+  (`__init__.py`, dotted names, submodules, relative imports,
+  site-packages). Imported module bodies run once as initializers. Stdlib
+  module values work (with `getattr`), and simple module-level assignments
+  are visible inside functions. No general runtime module
+  objects/`sys.modules`, namespace packages or frozen modules; user-module
+  values remain diagnostics.
 - **Stdlib:** curated subset (see §3.3); `re` uses the Rust
   `regex` syntax, `socket` only blocking TCP, `argparse` with a fixed help
   renderer (and no `SystemExit` for an explicit argv), `random` not

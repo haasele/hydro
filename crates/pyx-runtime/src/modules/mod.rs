@@ -21,18 +21,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pyx_ir::stdlib;
 use pyx_ir::{PYTHON_VERSION, PYTHON_VERSION_STRING};
 
+pub(crate) mod abc;
 pub(crate) mod argparse;
+pub(crate) mod ast;
 pub(crate) mod asyncio;
 pub(crate) mod base64;
 pub(crate) mod binascii;
 pub(crate) mod bisect;
 pub(crate) mod collections;
 pub(crate) mod colorsys;
+pub(crate) mod datetime;
+pub(crate) mod r#enum;
 pub(crate) mod errno;
 pub(crate) mod extension;
 pub(crate) mod fnmatch;
+pub(crate) mod fractions;
+pub(crate) mod future;
 pub(crate) mod getopt;
 pub(crate) mod heapq;
+pub(crate) mod importlib;
+pub(crate) mod itertools;
 pub(crate) mod keyword;
 pub(crate) mod mimetypes;
 pub(crate) mod quopri;
@@ -44,6 +52,8 @@ pub(crate) mod subprocess;
 pub(crate) mod tempfile;
 pub(crate) mod textwrap;
 pub(crate) mod timeit;
+pub(crate) mod types;
+pub(crate) mod typing;
 pub(crate) mod unittest;
 
 use crate::builtins;
@@ -276,6 +286,66 @@ pub(crate) fn module_call(
     call_native(&module, &function, argc, argv)
 }
 
+/// `pyx_module_call_kw`: `module.function(args..., name=value...)` for a spec
+/// that declares dynamic keywords (`functools.partial`).
+///
+/// `kw_argv` holds `2 * kwargc` tagged values in `[name, value, ...]` order.
+/// A spec without dynamic keywords rejects the call instead of dropping the
+/// names, mirroring the compile-time diagnostic for ordinary module functions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn module_call_kw(
+    module_ptr: *const u8,
+    module_len: usize,
+    function_ptr: *const u8,
+    function_len: usize,
+    argc: usize,
+    argv: *const i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> i64 {
+    if kwargc == 0 {
+        return module_call(
+            module_ptr,
+            module_len,
+            function_ptr,
+            function_len,
+            argc,
+            argv,
+        );
+    }
+    if let (Some(module), Some(function)) = (
+        name_str(module_ptr, module_len),
+        name_str(function_ptr, function_len),
+    ) {
+        return call_native_kw_at(
+            module_ptr as usize,
+            module_len,
+            module,
+            function_ptr as usize,
+            function_len,
+            function,
+            argc,
+            argv,
+            kwargc,
+            kw_argv,
+        );
+    }
+    let module = decode_name(module_ptr, module_len);
+    let function = decode_name(function_ptr, function_len);
+    call_native_kw_at(
+        module.as_ptr() as usize,
+        module.len(),
+        &module,
+        function.as_ptr() as usize,
+        function.len(),
+        &function,
+        argc,
+        argv,
+        kwargc,
+        kw_argv,
+    )
+}
+
 /// `pyx_module_get`: returns a constant value or a native function object.
 pub(crate) fn module_get(
     module_ptr: *const u8,
@@ -361,7 +431,9 @@ fn call_native_at(
         return missing_attribute(module, function);
     };
     if argc < spec.min_args || argc > spec.max_args {
-        let detail = if spec.min_args == spec.max_args {
+        let detail = if spec.max_args == usize::MAX {
+            format!("at least {} arguments", spec.min_args)
+        } else if spec.min_args == spec.max_args {
             format!("{} arguments", spec.max_args)
         } else {
             format!("{} to {} arguments", spec.min_args, spec.max_args)
@@ -389,11 +461,116 @@ fn call_native_at(
     dispatch(module_name, function_name, args)
 }
 
+/// Keyword variant of [`call_native_at`]: validates the spec's arity, decodes
+/// the keyword pairs, moves the fixed leading parameters supplied by name into
+/// their positional slots and hands the rest to the keyword-aware dispatcher.
+#[allow(clippy::too_many_arguments)]
+fn call_native_kw_at(
+    module_ptr: usize,
+    module_len: usize,
+    module: &str,
+    function_ptr: usize,
+    function_len: usize,
+    function: &str,
+    argc: usize,
+    argv: *const i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> i64 {
+    let Some((module_name, function_name, spec)) = native_spec(
+        module_ptr,
+        module_len,
+        module,
+        function_ptr,
+        function_len,
+        function,
+    ) else {
+        return missing_attribute(module, function);
+    };
+    if !spec.dynamic_keywords {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{module_name}.{function_name}() does not accept keyword arguments"),
+        );
+    }
+    if argc > MAX_ARGS || kwargc > MAX_ARGS / 2 {
+        return exc::raise_with_message(TYPE_ERROR, "argument count is out of range");
+    }
+    if (argc > 0 && argv.is_null()) || kw_argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "function call received arguments without an argument buffer",
+        );
+    }
+    // SAFETY: the length checks above keep both slices representable; the ABI
+    // requires the caller to pass readable buffers.
+    let mut args: Vec<i64> = if argc == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+    };
+    let words = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+    let mut keywords: Vec<(String, i64)> = Vec::with_capacity(kwargc);
+    for pair in words.chunks(2) {
+        let Some(name) = value::as_str(pair[0]) else {
+            return exc::raise_with_message(TYPE_ERROR, "keywords must be strings");
+        };
+        keywords.push((name.to_string(), pair[1]));
+    }
+    // A fixed leading parameter may be passed by name; it takes its positional
+    // slot so the dispatcher sees the usual layout.
+    for (index, param) in spec.params.iter().enumerate() {
+        if args.len() > index {
+            continue;
+        }
+        if let Some(position) = keywords
+            .iter()
+            .position(|(name, _)| name.as_str() == *param)
+        {
+            let (_, value) = keywords.remove(position);
+            args.push(value);
+        }
+    }
+    if args.len() < spec.min_args || args.len() > spec.max_args {
+        let detail = if spec.max_args == usize::MAX {
+            format!("at least {} arguments", spec.min_args)
+        } else if spec.min_args == spec.max_args {
+            format!("{} arguments", spec.max_args)
+        } else {
+            format!("{} to {} arguments", spec.min_args, spec.max_args)
+        };
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{module_name}.{function_name}() takes {detail} ({} given)",
+                args.len()
+            ),
+        );
+    }
+    dispatch_kw(module_name, function_name, &args, keywords)
+}
+
+/// Keyword-aware dispatch; only `functools.partial` binds names.
+fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    match module {
+        "functools" | "_functools" => functools_call_kw(function, args, keywords),
+        _ => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{module}.{function}() does not accept keyword arguments"),
+        ),
+    }
+}
+
 fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
     match module {
         "math" => math_call(function, args),
-        "functools" | "_functools" => reduce(args),
+        "functools" | "_functools" => functools_call(function, args),
         "operator" | "_operator" => operator_call(function, args),
+        "itertools" => itertools::call(function, args),
+        "ast" => ast::call(function, args),
+        "fractions" => fractions::call(function, args),
+        "importlib" => importlib::call(function, args),
+        "types" => types::call(function, args),
         "bisect" | "_bisect" => bisect::call(function, args),
         "heapq" | "_heapq" => heapq::call(function, args),
         "colorsys" => colorsys::call(function, args),
@@ -432,6 +609,10 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "shutil" => shutil::call(function, args),
         "textwrap" => textwrap::call(function, args),
         "timeit" => timeit::call(function, args),
+        "datetime" => datetime::call(function, args),
+        "typing" => typing::call(function, args),
+        "abc" => abc::call(function, args),
+        "enum" => r#enum::call(function, args),
         _ => missing_attribute(module, function),
     }
 }
@@ -442,6 +623,8 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
 
 fn constant_value(module: &str, name: &str) -> i64 {
     match (module, name) {
+        ("__future__", name) => future::constant(name),
+        ("types", name) => types::constant(name),
         ("math", "pi") => value::float_new(std::f64::consts::PI),
         ("math", "e") => value::float_new(std::f64::consts::E),
         ("math", "tau") => value::float_new(std::f64::consts::TAU),
@@ -476,6 +659,10 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `i64::MAX` does not fit into the 61-bit tagged integer; the
         // documented value is `2^60 - 1` (`value::MAX_INT`).
         ("sys", "maxsize") => encode_int(value::MAX_INT),
+        // Fresh native streams over fd 1/2 on every resolution. They hold no
+        // PyX children, so no rooting is required.
+        ("sys", "stdout") => value::std_stream_new(1),
+        ("sys", "stderr") => value::std_stream_new(2),
         ("os", "name") => {
             let name = if cfg!(windows) { "nt" } else { "posix" };
             value::str_from_bytes(name.as_bytes())
@@ -505,7 +692,15 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("keyword", "kwlist") => keyword::kwlist(),
         ("keyword", "softkwlist") => keyword::softkwlist(),
         ("stat" | "_stat", name) => stat::constant(name),
+        ("re", name) => re::constant(name),
         ("mimetypes", name) => mimetypes::constant(name),
+        ("datetime", name) => datetime::constant(name),
+        ("typing", name) => typing::constant(name),
+        ("abc", name) => abc::constant(name),
+        ("enum", name) => r#enum::constant(name),
+        // The `@dataclass` decorator is expanded by the frontend; the runtime
+        // value only has to exist for the import.
+        ("dataclasses", "dataclass") => NONE,
         _ => missing_attribute(module, name),
     }
 }
@@ -717,6 +912,31 @@ fn random_uniform(rng: &value::RandomState, args: &[i64]) -> i64 {
     value::float_new(low + (high - low) * rng.next_f64())
 }
 
+fn random_getrandbits(rng: &value::RandomState, arg: i64) -> i64 {
+    let bits = match random_int_arg(arg) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    if bits < 0 {
+        return exc::raise_with_message(VALUE_ERROR, "number of bits must be non-negative");
+    }
+    if bits == 0 {
+        return encode_int(0);
+    }
+    // PyX integers are 61-bit tagged immediates (`value::MAX_INT` is 2^60-1),
+    // so a wider request cannot be represented. Documented limitation:
+    // `getrandbits(k)` with `k > 60` raises OverflowError instead of returning
+    // a big integer.
+    if bits > 60 {
+        return exc::raise_with_message(
+            OVERFLOW_ERROR,
+            "getrandbits() result does not fit in a PyX int",
+        );
+    }
+    let draw = rng.next_u64() >> (64 - bits as u32);
+    encode_int(draw as i64)
+}
+
 /// Shared implementation of the module-level functions and `Random` methods.
 /// `seed` without an argument and `seed(None)` reseed from entropy.
 fn random_operation(rng: &value::RandomState, function: &str, args: &[i64]) -> i64 {
@@ -738,6 +958,7 @@ fn random_operation(rng: &value::RandomState, function: &str, args: &[i64]) -> i
         "choice" => random_choice(rng, args[0]),
         "uniform" => random_uniform(rng, args),
         "shuffle" => random_shuffle(rng, args[0]),
+        "getrandbits" => random_getrandbits(rng, args[0]),
         _ => missing_attribute("random", function),
     }
 }
@@ -788,6 +1009,7 @@ pub(crate) fn random_method(obj: i64, method: &str, args: &[i64]) -> i64 {
         "choice" => (1, 1),
         "uniform" => (2, 2),
         "shuffle" => (1, 1),
+        "getrandbits" => (1, 1),
         _ => {
             return exc::raise_with_message(
                 ATTRIBUTE_ERROR,
@@ -915,6 +1137,7 @@ fn platform_call(function: &str) -> i64 {
         )),
         "python_version" => value::str_from_bytes(PYTHON_VERSION_STRING.as_bytes()),
         "python_implementation" => value::str_from_bytes(b"PyX"),
+        "processor" => value::str_from_bytes(platform_machine().as_bytes()),
         _ => missing_attribute("platform", function),
     }
 }
@@ -1138,8 +1361,36 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
             Ok(x) => float_to_int(function, x),
             Err(err) => err,
         },
+        // `gcd(*integers)`: CPython accepts any number of integers and
+        // returns 0 for none. Floats are rejected even when integral.
+        "gcd" => {
+            let mut result: u64 = 0;
+            for arg in args {
+                let Some(n) = value::as_integer(*arg) else {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!(
+                            "'{}' object cannot be interpreted as an integer",
+                            value::type_name(*arg)
+                        ),
+                    );
+                };
+                result = gcd_u64(result, n.unsigned_abs());
+            }
+            ops::int_result(result as i64)
+        }
         _ => missing_attribute("math", function),
     }
+}
+
+/// Euclid's algorithm over magnitudes.
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
 }
 
 /// Converts an integral float to a tagged int, matching CPython's
@@ -1165,6 +1416,40 @@ fn float_to_int(function: &str, x: f64) -> i64 {
 // -------------------------------------------------------------------------
 // functools
 // -------------------------------------------------------------------------
+
+/// Dispatches a native `functools` function.
+///
+/// `lru_cache` and `wraps` are accepted as decorator factories: they return an
+/// identity callable, so applying the result to the decorated function leaves
+/// it unchanged. Caching and metadata copying are not implemented; the
+/// decorator syntax is handled by the frontend and the runtime values stay
+/// inert, which is enough for rich's module import and ordinary calls.
+///
+/// `partial(f, *args, **kwargs)` stores the keyword values by name; applying
+/// them happens when the partial is called (see
+/// `value::partial_new_with_keywords`).
+fn functools_call(function: &str, args: &[i64]) -> i64 {
+    match function {
+        "reduce" => reduce(args),
+        // `@cache` is an identity decorator: the function itself is returned.
+        "cache" => args[0],
+        "lru_cache" => value::identity_function_new("lru_cache.<locals>.decorator"),
+        "wraps" => value::identity_function_new("wraps.<locals>.decorator"),
+        "partial" => value::partial_new(args[0], args[1..].to_vec()),
+        _ => missing_attribute("functools", function),
+    }
+}
+
+/// Keyword-aware `functools` dispatch: only `partial` forwards names.
+fn functools_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    match function {
+        "partial" => value::partial_new_with_keywords(args[0], args[1..].to_vec(), keywords),
+        _ => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("functools.{function}() does not accept keyword arguments"),
+        ),
+    }
+}
 
 /// `functools.reduce(function, iterable[, initial])`.
 fn reduce(args: &[i64]) -> i64 {
@@ -1219,6 +1504,26 @@ fn reduce(args: &[i64]) -> i64 {
 // -------------------------------------------------------------------------
 
 fn operator_call(function: &str, args: &[i64]) -> i64 {
+    match function {
+        "attrgetter" => {
+            let mut names = Vec::with_capacity(args.len());
+            for &arg in args {
+                let Some(name) = value::as_str(arg) else {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!(
+                            "attribute name must be a string, not {}",
+                            value::type_name(arg)
+                        ),
+                    );
+                };
+                names.push(name.to_string());
+            }
+            return value::attribute_getter_new(names);
+        }
+        "itemgetter" => return value::item_getter_new(args.to_vec()),
+        _ => {}
+    }
     let binary = match function {
         "add" => Some(ops::OP_ADD),
         "sub" => Some(ops::OP_SUB),
@@ -1405,12 +1710,21 @@ fn spawn_arity_error(function: i64, argc: usize) -> Option<String> {
     match &func.body {
         value::FunctionBody::Wrapper { .. } => (func.arity != argc)
             .then(|| format!("function takes {} arguments ({argc} given)", func.arity)),
+        // Getter and identity callables also have an exact arity; a partial
+        // validates the combined argument list when it calls its target.
+        value::FunctionBody::AttributeGetter { .. }
+        | value::FunctionBody::ItemGetter { .. }
+        | value::FunctionBody::Identity => (func.arity != argc)
+            .then(|| format!("function takes {} arguments ({argc} given)", func.arity)),
+        value::FunctionBody::Partial { .. } => None,
         value::FunctionBody::Native { module, name } => {
             stdlib::function(module, name).and_then(|spec| {
                 if argc >= spec.min_args && argc <= spec.max_args {
                     return None;
                 }
-                let detail = if spec.min_args == spec.max_args {
+                let detail = if spec.max_args == usize::MAX {
+                    format!("at least {}", spec.min_args)
+                } else if spec.min_args == spec.max_args {
                     format!("{} arguments", spec.max_args)
                 } else {
                     format!("{} to {} arguments", spec.min_args, spec.max_args)
@@ -1875,12 +2189,104 @@ fn json_parse_error(message: &str) -> i64 {
 
 fn json_call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "dumps" => json_dumps(args[0]),
+        "dumps" => json_dumps(args),
         "loads" => json_loads(args[0]),
-        "dump" => json_dump(args[0], args[1]),
+        "dump" => json_dump(args),
         "load" => json_load(args[0]),
         _ => missing_attribute("json", function),
     }
+}
+
+/// Upper bound for `indent`: a pathological level must not exhaust memory.
+const MAX_JSON_INDENT: usize = 256;
+
+/// Formatting options of `json.dumps`/`json.dump`.
+///
+/// The frontend reorders keyword arguments into positional slots and pads the
+/// omitted ones with `None`, so every option is `None`-able and trailing
+/// `None` values keep the CPython defaults.
+struct JsonOptions {
+    indent: Option<usize>,
+    ensure_ascii: bool,
+    sort_keys: bool,
+    item_separator: String,
+    key_separator: String,
+}
+
+impl JsonOptions {
+    fn defaults() -> JsonOptions {
+        JsonOptions {
+            indent: None,
+            ensure_ascii: true,
+            sort_keys: false,
+            item_separator: ", ".to_string(),
+            key_separator: ": ".to_string(),
+        }
+    }
+}
+
+fn json_option_type_error(function: &str, option: &str, expected: &str, received: i64) -> i64 {
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "{function}() argument '{option}' must be {expected}, not {}",
+            value::type_name(received)
+        ),
+    )
+}
+
+/// Decodes `indent`, `ensure_ascii`, `separators` and `sort_keys` starting at
+/// `offset` in `args`. Absent or `None` slots select the CPython defaults.
+fn json_options(args: &[i64], offset: usize, function: &str) -> Result<JsonOptions, i64> {
+    let mut options = JsonOptions::defaults();
+    if let Some(&indent) = args.get(offset) {
+        if indent != NONE {
+            let Some(level) = value::as_integer(indent) else {
+                return Err(json_option_type_error(
+                    function,
+                    "indent",
+                    "an integer or None",
+                    indent,
+                ));
+            };
+            options.indent = Some(usize::try_from(level).unwrap_or(0).min(MAX_JSON_INDENT));
+        }
+    }
+    if let Some(&ensure_ascii) = args.get(offset + 1) {
+        if ensure_ascii != NONE {
+            options.ensure_ascii = value::truthy(ensure_ascii);
+        }
+    }
+    if let Some(&separators) = args.get(offset + 2) {
+        if separators != NONE {
+            let Some(items) = value::as_tuple(separators).or_else(|| value::as_list(separators))
+            else {
+                return Err(json_option_type_error(
+                    function,
+                    "separators",
+                    "a tuple",
+                    separators,
+                ));
+            };
+            let (Some(item_separator), Some(key_separator)) = (
+                items.first().and_then(|item| value::as_str(*item)),
+                items.get(1).and_then(|item| value::as_str(*item)),
+            ) else {
+                return Err(exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{function}() argument 'separators' must be a tuple of two strings"),
+                ));
+            };
+            options.item_separator = item_separator.to_string();
+            options.key_separator = key_separator.to_string();
+        }
+    }
+    if let Some(&sort_keys) = args.get(offset + 3) {
+        if sort_keys != NONE {
+            options.sort_keys = value::truthy(sort_keys);
+        }
+    }
+    Ok(options)
 }
 
 /// Validates the `file` argument of `json.dump`/`json.load`.
@@ -1897,16 +2303,21 @@ fn json_file(file: i64, function: &str) -> Result<&'static value::FileState, i64
     }
 }
 
-/// `json.dump(obj, file)`: serialises like [`json_dumps`] and writes the
-/// result with a single `FileState::write` call.
-fn json_dump(v: i64, file: i64) -> i64 {
-    let state = match json_file(file, "dump") {
+/// `json.dump(obj, file, indent=None, ensure_ascii=True, separators=None,
+/// sort_keys=False)`: serialises like [`json_dumps`] and writes the result
+/// with a single `FileState::write` call.
+fn json_dump(args: &[i64]) -> i64 {
+    let state = match json_file(args[1], "dump") {
         Ok(state) => state,
+        Err(err) => return err,
+    };
+    let options = match json_options(args, 2, "dump") {
+        Ok(options) => options,
         Err(err) => return err,
     };
     let mut out = String::new();
     let mut stack: Vec<i64> = Vec::new();
-    if let Err(err) = dumps_value(v, 0, &mut stack, &mut out) {
+    if let Err(err) = dumps_value(args[0], 0, &mut stack, &mut out, &options) {
         return err;
     }
     match state.write(&out) {
@@ -1928,21 +2339,40 @@ fn json_load(file: i64) -> i64 {
     }
 }
 
-/// `json.dumps(value)`: CPython defaults (`", "`/`": "` separators, insertion
-/// order, `ensure_ascii=True`).
-fn json_dumps(v: i64) -> i64 {
+/// `json.dumps(obj, indent=None, ensure_ascii=True, separators=None,
+/// sort_keys=False)`: CPython defaults are `", "`/`": "` separators, insertion
+/// order and `ensure_ascii=True`.
+fn json_dumps(args: &[i64]) -> i64 {
+    let options = match json_options(args, 1, "dumps") {
+        Ok(options) => options,
+        Err(err) => return err,
+    };
     let mut out = String::new();
     let mut stack: Vec<i64> = Vec::new();
-    match dumps_value(v, 0, &mut stack, &mut out) {
+    match dumps_value(args[0], 0, &mut stack, &mut out, &options) {
         Ok(()) => value::str_alloc(out),
         Err(err) => err,
+    }
+}
+
+/// Appends `width * depth` spaces; `indent` is already clamped by
+/// [`json_options`], so the repeated push stays bounded.
+fn write_indent(out: &mut String, width: usize, depth: usize) {
+    for _ in 0..width.saturating_mul(depth) {
+        out.push(' ');
     }
 }
 
 /// Appends the JSON form of `v`. Only heap objects created through
 /// [`dumps_value`]'s errors can trigger a collection here, so the borrows into
 /// containers taken below are never read again after an allocation.
-fn dumps_value(v: i64, depth: usize, stack: &mut Vec<i64>, out: &mut String) -> Result<(), i64> {
+fn dumps_value(
+    v: i64,
+    depth: usize,
+    stack: &mut Vec<i64>,
+    out: &mut String,
+    options: &JsonOptions,
+) -> Result<(), i64> {
     if v == NONE {
         out.push_str("null");
         return Ok(());
@@ -1960,7 +2390,7 @@ fn dumps_value(v: i64, depth: usize, stack: &mut Vec<i64>, out: &mut String) -> 
         return Ok(());
     }
     if let Some(s) = value::as_str(v) {
-        write_json_string(s, out);
+        write_json_string(s, options.ensure_ascii, out);
         return Ok(());
     }
     if let Some(f) = value::as_float(v) {
@@ -1975,9 +2405,23 @@ fn dumps_value(v: i64, depth: usize, stack: &mut Vec<i64>, out: &mut String) -> 
         out.push('[');
         for (index, item) in items.iter().enumerate() {
             if index > 0 {
-                out.push_str(", ");
+                if options.indent.is_some() {
+                    out.push(',');
+                } else {
+                    out.push_str(&options.item_separator);
+                }
             }
-            dumps_value(*item, depth + 1, stack, out)?;
+            if let Some(level) = options.indent {
+                out.push('\n');
+                write_indent(out, level, depth + 1);
+            }
+            dumps_value(*item, depth + 1, stack, out, options)?;
+        }
+        if let Some(level) = options.indent {
+            if !items.is_empty() {
+                out.push('\n');
+                write_indent(out, level, depth);
+            }
         }
         out.push(']');
         stack.pop();
@@ -1987,15 +2431,39 @@ fn dumps_value(v: i64, depth: usize, stack: &mut Vec<i64>, out: &mut String) -> 
         if depth >= MAX_JSON_DEPTH || stack.contains(&v) {
             return Err(circular_error());
         }
+        // Render the keys once; `sort_keys` then only reorders this table.
+        // Rendering allocates Rust strings (never PyX objects), so the values
+        // stay reachable through the dict while the table is built.
+        let mut entries: Vec<(String, i64)> = Vec::with_capacity(pairs.len());
+        for (key, item) in pairs.iter() {
+            entries.push((json_key(*key, options.ensure_ascii)?, *item));
+        }
+        if options.sort_keys {
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+        }
         stack.push(v);
         out.push('{');
-        for (index, (key, item)) in pairs.iter().enumerate() {
+        for (index, (key, item)) in entries.iter().enumerate() {
             if index > 0 {
-                out.push_str(", ");
+                if options.indent.is_some() {
+                    out.push(',');
+                } else {
+                    out.push_str(&options.item_separator);
+                }
             }
-            out.push_str(&json_key(*key)?);
-            out.push_str(": ");
-            dumps_value(*item, depth + 1, stack, out)?;
+            if let Some(level) = options.indent {
+                out.push('\n');
+                write_indent(out, level, depth + 1);
+            }
+            out.push_str(key);
+            out.push_str(&options.key_separator);
+            dumps_value(*item, depth + 1, stack, out, options)?;
+        }
+        if let Some(level) = options.indent {
+            if !entries.is_empty() {
+                out.push('\n');
+                write_indent(out, level, depth);
+            }
         }
         out.push('}');
         stack.pop();
@@ -2006,10 +2474,10 @@ fn dumps_value(v: i64, depth: usize, stack: &mut Vec<i64>, out: &mut String) -> 
 
 /// Renders a dict key. Scalars are accepted and always emitted as a quoted
 /// JSON string; other types raise CPython's key `TypeError`.
-fn json_key(key: i64) -> Result<String, i64> {
+fn json_key(key: i64, ensure_ascii: bool) -> Result<String, i64> {
     if let Some(s) = value::as_str(key) {
         let mut out = String::new();
-        write_json_string(s, &mut out);
+        write_json_string(s, ensure_ascii, &mut out);
         return Ok(out);
     }
     let scalar = if key == NONE {
@@ -2057,10 +2525,11 @@ fn json_float(f: f64) -> String {
     value::format_float(f)
 }
 
-/// Appends `s` as a JSON string with `ensure_ascii=True`: ASCII control
-/// characters, `"` and `\\` use escapes, everything outside printable ASCII is
-/// written as `\uXXXX` (surrogate pairs above the BMP).
-fn write_json_string(s: &str, out: &mut String) {
+/// Appends `s` as a JSON string. With `ensure_ascii` everything outside
+/// printable ASCII is written as `\uXXXX` (surrogate pairs above the BMP);
+/// without it non-ASCII text stays raw while control characters keep their
+/// escapes.
+fn write_json_string(s: &str, ensure_ascii: bool, out: &mut String) {
     out.push('"');
     for ch in s.chars() {
         match ch {
@@ -2071,9 +2540,8 @@ fn write_json_string(s: &str, out: &mut String) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            ch if (ch as u32) < 0x20 || (ch as u32) >= 0x7f => {
-                write_unicode_escape(ch as u32, out);
-            }
+            ch if (ch as u32) < 0x20 => write_unicode_escape(ch as u32, out),
+            ch if ensure_ascii && (ch as u32) >= 0x7f => write_unicode_escape(ch as u32, out),
             ch => out.push(ch),
         }
     }
@@ -2723,8 +3191,106 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
             }
         }
         "access" => os_access(args),
+        "sysconf" => os_sysconf(args),
+        "getloadavg" => os_getloadavg(),
         _ => missing_attribute("os", function),
     }
+}
+
+/// Configuration names accepted by `os.sysconf`. `None` means the name is
+/// unknown to this runtime.
+#[cfg(target_os = "linux")]
+fn sysconf_number(name: &str) -> Option<i64> {
+    let number = match name {
+        "SC_PAGE_SIZE" | "SC_PAGESIZE" => libc::_SC_PAGESIZE,
+        "SC_PHYS_PAGES" => libc::_SC_PHYS_PAGES,
+        "SC_AVPHYS_PAGES" => libc::_SC_AVPHYS_PAGES,
+        "SC_NPROCESSORS_ONLN" => libc::_SC_NPROCESSORS_ONLN,
+        "SC_NPROCESSORS_CONF" => libc::_SC_NPROCESSORS_CONF,
+        "SC_CLK_TCK" => libc::_SC_CLK_TCK,
+        "SC_ARG_MAX" => libc::_SC_ARG_MAX,
+        "SC_OPEN_MAX" => libc::_SC_OPEN_MAX,
+        _ => return None,
+    };
+    Some(i64::from(number))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn sysconf_number(name: &str) -> Option<i64> {
+    match name {
+        "SC_PAGE_SIZE" | "SC_PAGESIZE" => Some(i64::from(libc::_SC_PAGESIZE)),
+        _ => None,
+    }
+}
+
+/// `os.sysconf(name)`: accepts an integer configuration number (like CPython)
+/// or one of the common `SC_*` names.
+#[cfg(unix)]
+fn os_sysconf(args: &[i64]) -> i64 {
+    let argument = args[0];
+    let number = match value::as_integer(argument) {
+        Some(number) => number,
+        None => match value::as_str(argument) {
+            Some(name) => match sysconf_number(name) {
+                Some(number) => number,
+                None => {
+                    return exc::raise_with_message(
+                        VALUE_ERROR,
+                        &format!("unrecognized configuration name: {name}"),
+                    )
+                }
+            },
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "integer argument expected, got {}",
+                        value::type_name(argument)
+                    ),
+                )
+            }
+        },
+    };
+    // SAFETY: `sysconf` only reads the configuration number; every value is
+    // valid input and an invalid one reports -1 with `errno`.
+    let result = unsafe { libc::sysconf(number as libc::c_int) };
+    if result < 0 {
+        return exc::raise_with_message(OS_ERROR, "invalid configuration name");
+    }
+    encode_int(result as i64)
+}
+
+#[cfg(not(unix))]
+fn os_sysconf(_args: &[i64]) -> i64 {
+    exc::raise_with_message(
+        RUNTIME_ERROR,
+        "os.sysconf is not supported on this platform",
+    )
+}
+
+/// `os.getloadavg()`: the three 1/5/15-minute load averages.
+#[cfg(unix)]
+fn os_getloadavg() -> i64 {
+    let mut averages = [0.0f64; 3];
+    // SAFETY: the pointer is valid for three `f64` values.
+    let count = unsafe { libc::getloadavg(averages.as_mut_ptr(), 3) };
+    if count < 0 {
+        return exc::raise_with_message(OS_ERROR, "getloadavg() failed");
+    }
+    let count = (count as usize).min(averages.len());
+    let values: Vec<i64> = averages[..count]
+        .iter()
+        .map(|average| value::float_new(*average))
+        .collect();
+    value::tuple_new(values)
+}
+
+#[cfg(not(unix))]
+fn os_getloadavg() -> i64 {
+    exc::raise_with_message(
+        RUNTIME_ERROR,
+        "os.getloadavg is not supported on this platform",
+    )
 }
 
 /// `os.access(path, mode)`: Linux permission bits, no exception on failure.
@@ -3153,6 +3719,32 @@ mod tests {
     }
 
     #[test]
+    fn math_gcd_accepts_variadic_integers() {
+        exc::init();
+        assert_eq!(as_int(call("math", "gcd", &[])), 0);
+        assert_eq!(as_int(call("math", "gcd", &[int(12)])), 12);
+        assert_eq!(as_int(call("math", "gcd", &[int(12), int(8)])), 4);
+        assert_eq!(as_int(call("math", "gcd", &[int(12), int(8), int(6)])), 2);
+        assert_eq!(as_int(call("math", "gcd", &[int(-12), int(8)])), 4);
+        assert_eq!(as_int(call("math", "gcd", &[TRUE, int(4)])), 1);
+        assert!(!exc::pending());
+
+        // A function value resolved from the module (`from math import gcd`)
+        // dispatches through the same implementation.
+        let gcd = get("math", "gcd");
+        assert_eq!(as_int(call_value(gcd, &[int(30), int(18)])), 6);
+        assert!(!exc::pending());
+
+        // Floats are rejected like CPython's integer-argument conversion.
+        assert_eq!(call("math", "gcd", &[value::float_new(1.5), int(2)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "'float' object cannot be interpreted as an integer"
+        );
+    }
+
+    #[test]
     fn native_call_cache_hits_for_alternating_names() {
         exc::init();
         let module = "math";
@@ -3425,6 +4017,70 @@ mod tests {
         assert_eq!(as_int(pyx_info[4]), 0);
         assert_eq!(as_int(get("sys", "maxsize")), value::MAX_INT);
         assert!(stdlib::function("sys", "exit").is_some());
+        for name in ["stdout", "stderr"] {
+            let stream = get("sys", name);
+            assert!(value::as_std_stream(stream).is_some(), "{name}");
+            assert_eq!(value::type_name(stream), "TextIOWrapper");
+        }
+    }
+
+    #[test]
+    fn sys_streams_write_flush_and_report_a_tty() {
+        exc::init();
+        let stdout = get("sys", "stdout");
+        let empty = string("");
+        let count = crate::methods::call(stdout, b"write".as_ptr(), 5, 1, [empty].as_ptr());
+        assert_eq!(as_int(count), 0);
+        assert_eq!(
+            crate::methods::call(stdout, b"flush".as_ptr(), 5, 0, std::ptr::null()),
+            NONE
+        );
+        let tty = crate::methods::call(stdout, b"isatty".as_ptr(), 6, 0, std::ptr::null());
+        assert!(tty == TRUE || tty == FALSE);
+        assert!(!exc::pending());
+
+        exc::init();
+        assert_eq!(
+            crate::methods::call(stdout, b"write".as_ptr(), 5, 1, [int(1)].as_ptr()),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "write() argument must be str, not int");
+
+        exc::init();
+        assert_eq!(
+            crate::methods::call(stdout, b"close".as_ptr(), 5, 0, std::ptr::null()),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+    }
+
+    #[test]
+    fn random_getrandbits_draws_the_requested_width() {
+        exc::init();
+        assert_eq!(as_int(call("random", "getrandbits", &[int(0)])), 0);
+        for _ in 0..16 {
+            let value = as_int(call("random", "getrandbits", &[int(24)]));
+            assert!((0..(1 << 24)).contains(&value), "24-bit draw out of range");
+        }
+        let wide = as_int(call("random", "getrandbits", &[int(60)]));
+        assert!((0..=value::MAX_INT).contains(&wide));
+
+        exc::init();
+        assert_eq!(call("random", "getrandbits", &[int(-1)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "number of bits must be non-negative");
+
+        exc::init();
+        assert_eq!(call("random", "getrandbits", &[int(61)]), NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::OVERFLOW_ERROR as i64);
+
+        // The same operation is a `Random` method.
+        exc::init();
+        let rng = call("random", "Random", &[int(5)]);
+        let drawn = crate::methods::call(rng, b"getrandbits".as_ptr(), 11, 1, [int(8)].as_ptr());
+        assert!(!exc::pending(), "unexpected exception");
+        assert!((0..256).contains(&as_int(drawn)));
     }
 
     #[test]
@@ -3988,5 +4644,329 @@ mod tests {
         assert_eq!(call("asyncio", "create_task", &[int(1)]), NONE);
         assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
         assert_eq!(message(), "module 'asyncio' has no attribute 'create_task'");
+    }
+
+    fn text(v: i64) -> String {
+        value::as_str(v).expect("string result").to_string()
+    }
+
+    #[test]
+    fn datetime_module_values() {
+        exc::init();
+        assert_eq!(as_int(get("datetime", "MINYEAR")), 1);
+        assert_eq!(as_int(get("datetime", "MAXYEAR")), 9_999);
+        let singleton = get("datetime", "datetime");
+        assert!(!exc::pending());
+        let rendered = call(
+            "datetime",
+            "_datetime_strftime",
+            &[singleton, string("%Y%m%d")],
+        );
+        let rendered = text(rendered);
+        assert_eq!(rendered.len(), 8);
+        assert!(rendered.bytes().all(|byte| byte.is_ascii_digit()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_sysconf_and_getloadavg() {
+        exc::init();
+        let page_size = as_int(call("os", "sysconf", &[string("SC_PAGE_SIZE")]));
+        assert!(page_size >= 4096, "page size {page_size}");
+        assert!(as_int(call("os", "sysconf", &[string("SC_PHYS_PAGES")])) > 0);
+        // Integer configuration names are accepted like CPython.
+        #[cfg(unix)]
+        assert_eq!(
+            page_size,
+            as_int(call("os", "sysconf", &[int(i64::from(libc::_SC_PAGESIZE))]))
+        );
+
+        let averages = call("os", "getloadavg", &[]);
+        assert!(!exc::pending());
+        let averages = value::as_tuple(averages).expect("tuple");
+        assert_eq!(averages.len(), 3);
+        for average in averages {
+            assert!(value::as_float(*average).is_some());
+        }
+
+        exc::init();
+        assert_eq!(call("os", "sysconf", &[string("SC_NOT_A_NAME")]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+
+        exc::init();
+        assert_eq!(call("os", "sysconf", &[value::float_new(1.0)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn json_keyword_options_shape_output() {
+        exc::init();
+        let object = value::dict_new(vec![(string("b"), int(1)), (string("a"), int(2))]);
+        assert_eq!(
+            text(call("json", "dumps", &[object, int(2)])),
+            "{\n  \"b\": 1,\n  \"a\": 2\n}"
+        );
+        // Trailing `None` keyword slots keep the defaults.
+        assert_eq!(
+            text(call("json", "dumps", &[object, NONE, NONE, NONE, TRUE])),
+            "{\"a\": 2, \"b\": 1}"
+        );
+        assert_eq!(
+            text(call("json", "dumps", &[string("ä"), NONE, FALSE])),
+            "\"ä\""
+        );
+        assert_eq!(text(call("json", "dumps", &[string("ä")])), "\"\\u00e4\"");
+        let separators = value::tuple_new(vec![string(","), string(":")]);
+        let list = value::list_new(vec![int(1), int(2)]);
+        assert_eq!(
+            text(call("json", "dumps", &[list, NONE, NONE, separators, NONE])),
+            "[1,2]"
+        );
+
+        exc::init();
+        assert_eq!(call("json", "dumps", &[object, string("two")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn json_dump_accepts_keyword_defaults() {
+        exc::init();
+        let path = std::env::temp_dir().join(format!("pyx-json-dump-{}.json", std::process::id()));
+        let file = std::fs::File::create(&path).expect("create temp file");
+        let writer = value::file_new_write(path.to_string_lossy().into_owned(), 'w', file, false);
+        let object = value::dict_new(vec![(string("a"), int(1))]);
+        let result = call("json", "dump", &[object, writer, int(2), NONE, NONE, TRUE]);
+        assert_eq!(result, NONE);
+        assert!(!exc::pending());
+        let written = std::fs::read_to_string(&path).expect("read temp file");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(written, "{\n  \"a\": 1\n}");
+    }
+
+    #[test]
+    fn typing_abc_and_enum_resolve_through_the_module_surface() {
+        exc::init();
+        assert_eq!(get("typing", "TYPE_CHECKING"), FALSE);
+        assert_eq!(get("typing", "Any"), NONE);
+        for name in ["Generic", "NamedTuple", "Protocol"] {
+            let class = value::as_class(get("typing", name)).expect("class value");
+            assert_eq!(class.name, name);
+        }
+
+        let payload = string("payload");
+        let any = get("typing", "Any");
+        assert_eq!(call("typing", "cast", &[any, payload]), payload);
+        assert_eq!(call("typing", "TypeVar", &[string("T")]), NONE);
+        assert_eq!(
+            value::as_dict(call("typing", "get_type_hints", &[]))
+                .expect("dict value")
+                .len(),
+            0
+        );
+        assert_eq!(call("typing", "runtime_checkable", &[payload]), payload);
+        assert_eq!(call("typing", "overload", &[payload]), payload);
+
+        assert_eq!(
+            value::as_class(get("abc", "ABC"))
+                .expect("class value")
+                .name,
+            "ABC"
+        );
+        assert_eq!(call("abc", "abstractmethod", &[payload]), payload);
+
+        for name in ["Enum", "IntEnum"] {
+            let class = value::as_class(get("enum", name)).expect("class value");
+            assert_eq!(class.name, name);
+        }
+        assert_eq!(call("enum", "auto", &[]), NONE);
+        assert!(!exc::pending());
+
+        // Arity still comes from the central spec.
+        assert_eq!(call("typing", "cast", &[NONE]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn future_and_types_are_reachable() {
+        exc::init();
+        for name in [
+            "annotations",
+            "generator_stop",
+            "division",
+            "absolute_import",
+            "print_function",
+            "unicode_literals",
+        ] {
+            assert_eq!(get("__future__", name), TRUE, "{name}");
+        }
+        assert_eq!(get("__future__", "barry_as_FLUFL"), FALSE);
+
+        let class = value::as_class(get("types", "TracebackType")).expect("class value");
+        assert_eq!(class.name, "TracebackType");
+
+        let mapping = value::dict_new(vec![(string("a"), int(1))]);
+        let namespace = call("types", "SimpleNamespace", &[mapping]);
+        assert_eq!(
+            value::as_namespace(namespace).map(|pairs| pairs.len()),
+            Some(1)
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn itertools_and_literal_eval_dispatch() {
+        exc::init();
+        let first = value::list_new(vec![int(1), int(2)]);
+        let second = value::list_new(vec![int(3)]);
+        let chained = call("itertools", "chain", &[first, second]);
+        assert_eq!(
+            value::as_list(chained)
+                .expect("list result")
+                .iter()
+                .map(|item| as_int(*item))
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            value::as_tuple(call("ast", "literal_eval", &[string("(1, 2)")]))
+                .map(|items| items.len()),
+            Some(2)
+        );
+        let literal = call("ast", "literal_eval", &[string("42")]);
+        assert_eq!(as_int(literal), 42);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn operator_getters_and_functools_helpers() {
+        exc::init();
+        let namespace = value::namespace_new(vec![("value".to_string(), int(4))]);
+        let getter = call("operator", "attrgetter", &[string("value")]);
+        assert_eq!(call_value(getter, &[namespace]), int(4));
+
+        let list = value::list_new(vec![int(5)]);
+        let item = call("operator", "itemgetter", &[int(0)]);
+        assert_eq!(call_value(item, &[list]), int(5));
+
+        let target = value::builtin_function_new(pyx_ir::Builtin::Str);
+        let partial = call("functools", "partial", &[target, int(9)]);
+        assert_eq!(value::as_str(call_value(partial, &[])), Some("9"));
+
+        // `cache` is the identity decorator.
+        let decorated = string("function");
+        assert_eq!(call("functools", "cache", &[decorated]), decorated);
+
+        // `lru_cache`/`wraps` return an identity decorator value.
+        let decorator = call("functools", "wraps", &[decorated]);
+        assert_eq!(call_value(decorator, &[decorated]), decorated);
+        let cached = call("functools", "lru_cache", &[int(16), FALSE]);
+        assert_eq!(call_value(cached, &[decorated]), decorated);
+        assert!(!exc::pending());
+    }
+
+    /// Stand-in for a generated wrapper taking two positional parameters.
+    extern "C" fn pair_probe(argv: *const i64) -> i64 {
+        // SAFETY: the runtime only enters a wrapper after checking its arity.
+        let (left, right) = unsafe { (*argv, *argv.add(1)) };
+        value::tuple_new(vec![left, right])
+    }
+
+    #[test]
+    fn functools_partial_accepts_keywords_through_the_kw_abi() {
+        exc::init();
+        let target = value::function_new(pair_probe as *const () as usize, 2, "pair".to_string());
+        value::function_set_params(target, vec!["left".to_string(), "right".to_string()]);
+        let name = string("right");
+        let bound = int(9);
+        let keywords = [name, bound];
+        let partial = module_call_kw(
+            b"functools".as_ptr(),
+            9,
+            b"partial".as_ptr(),
+            7,
+            1,
+            &target,
+            1,
+            keywords.as_ptr(),
+        );
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        let left = int(1);
+        let result = crate::builtins::call(partial, 1, &left);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(value::to_string(result), "(1, 9)");
+
+        // `func` may be passed by name: the keyword takes the positional slot,
+        // while `right` stays a forwarded keyword.
+        let func_name = string("func");
+        let right_name = string("right");
+        let bound = int(4);
+        let named = [func_name, target, right_name, bound];
+        let partial = module_call_kw(
+            b"functools".as_ptr(),
+            9,
+            b"partial".as_ptr(),
+            7,
+            0,
+            std::ptr::null(),
+            2,
+            named.as_ptr(),
+        );
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        let result = crate::builtins::call(partial, 1, &left);
+        assert_eq!(value::to_string(result), "(1, 4)");
+
+        // A spec without dynamic keywords rejects the call outright.
+        let value_name = string("x");
+        let rejected = [value_name, int(1)];
+        let result = module_call_kw(
+            b"math".as_ptr(),
+            4,
+            b"sqrt".as_ptr(),
+            4,
+            0,
+            std::ptr::null(),
+            1,
+            rejected.as_ptr(),
+        );
+        assert_eq!(result, NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "math.sqrt() does not accept keyword arguments"
+        );
+        exc::init();
+    }
+
+    #[test]
+    fn importlib_and_fractions_are_reachable() {
+        exc::init();
+        let table = call(
+            "importlib",
+            "import_module",
+            &[string("rich._unicode_data")],
+        );
+        assert!(value::as_namespace(table).is_some());
+        let math = call("importlib", "import_module", &[string("math")]);
+        assert_eq!(
+            value::as_module(math).map(|module| module.name()),
+            Some("math")
+        );
+        assert_eq!(
+            value::as_float(call("fractions", "Fraction", &[int(1), int(4)])),
+            Some(0.25)
+        );
+        assert!(!exc::pending());
     }
 }

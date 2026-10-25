@@ -24,7 +24,7 @@ defined subset (see [Language Scope](#language-and-stdlib-scope) and
 | Phase 6 — Diagnostics/Developer Experience | largely done; completions/manpage and ICE regression test open |
 
 Current state of work (Cargo version 0.1.0, no public release yet):
-**1064 tests** (unit, integration, E2E). Compatibility target: **CPython
+**1329 tests** (unit, integration, E2E). Compatibility target: **CPython
 3.14.9**; the official `Lib/test` baseline is 1/398 (`test_errno.py`), tracked in [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md). JIT (`pyx run`) and AOT
 (`pyx build`) share the same runtime and IR. Details:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
@@ -155,8 +155,11 @@ supported by `run`.
   locals at definition time. Recursive nested functions are
   a diagnostic.
 - **Classes:** `class Name(Base)` with a single base, methods, `__init__`,
-  `self` attributes (`pyx_getattr`/`pyx_setattr`) and inheritance/overrides.
-  No class attributes, decorators, metaclasses or multiple inheritance.
+  `self` attributes (`pyx_getattr`/`pyx_setattr`), inheritance/overrides,
+  class attributes (`x = value`), `@property`/`@classmethod`/
+  `@staticmethod` and ignored `lru_cache`/`cache`/`wraps`/`abstractmethod`/
+  `overload`/`runtime_checkable` decorators.
+  No general decorators, metaclasses or multiple inheritance.
 - Comprehensions: lists/sets/dicts and generator expressions (the latter
   **eagerly as a list**), multiple `for` clauses, `if` filters.
 
@@ -251,18 +254,20 @@ plus the benchmark-critical `subprocess`, `tempfile`, `shutil`, `textwrap`,
 Async generators and async comprehensions (`asyncio` only
 `run`/`sleep`/`gather`), decorators,
 pattern matching, metaclasses, descriptor/`__dunder__` protocols, multiple
-inheritance, `bytearray`/`memoryview`, BigInt, slice assignment,
+inheritance, `bytearray`/`memoryview`, BigInt,
 implicit exception context, `except*`; arbitrary
-C extensions or the C API/ABI, the complete CPython stdlib, packages/
-relative imports, imports inside functions as well as top-level code in
-imported modules. Precise GC roots and a dedicated size-class allocator
+C extensions or the C API/ABI and the complete CPython stdlib (58/297
+modules importable; see [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
+Precise GC roots and a dedicated size-class allocator
 are missing. Package management is only a uv passthrough (no
-interpreter injection/packaging).
+interpreter injection/packaging). Packages, dotted/relative imports and
+`site-packages` resolution work through the module loader; imports inside
+functions are deferred until the enclosing code runs.
 
 ## Architecture
 
 ```
-Source .py (+ sibling modules) → rustpython-parser → pyx-frontend
+Source .py (+ imported sibling modules, packages, site-packages) → rustpython-parser → pyx-frontend
                                                           ↓
                                           typed IR (pyx-ir)
                                                           ↓
@@ -289,7 +294,7 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests and Benchmarks
 
 - `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), build,
-  `cargo test --workspace` (1064 tests), E2E comparison JIT vs. AOT,
+  `cargo test --workspace` (1329 tests), E2E comparison JIT vs. AOT,
   negative tests (diagnostics/tracebacks) and GC stress tests.
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Ubuntu, stable
   Rust, fmt/clippy/test/verify, no secrets).

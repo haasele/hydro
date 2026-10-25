@@ -15,20 +15,22 @@
 //! exception *instance* only (PyX has no exception class objects) and supports
 //! just the single-argument form.
 
+use std::io::{IsTerminal, Write as _};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::builtins;
 use crate::container;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, INDEX_ERROR, KEY_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR,
-    VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, INDEX_ERROR, KEY_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR,
+    TYPE_ERROR, VALUE_ERROR,
 };
 use crate::modules;
 use crate::ops;
 use crate::pool;
 use crate::process;
 use crate::value::{self, NONE};
+use pyx_ir::MethodKind;
 
 /// Dispatches `obj.<name>(args...)`.
 pub(crate) fn call(
@@ -45,6 +47,11 @@ pub(crate) fn call(
     // generic copy below (one allocation instead of two).
     if value::as_instance(obj).is_some() {
         return instance_method(obj, &method, argc, argv);
+    }
+    // `Class.method(...)` resolves through the class namespace; the binding
+    // kind decides whether the class or no receiver is prepended.
+    if value::as_class(obj).is_some() {
+        return class_member_method(obj, &method, argc, argv);
     }
     let Some(args) = copy_args(argc, argv) else {
         return type_error(format!(
@@ -110,6 +117,9 @@ pub(crate) fn call(
     if value::as_file(obj).is_some() {
         return file_method(obj, &method, &args);
     }
+    if value::as_std_stream(obj).is_some() {
+        return std_stream_method(obj, &method, &args);
+    }
     if value::as_random(obj).is_some() {
         return modules::random_method(obj, &method, &args);
     }
@@ -140,6 +150,10 @@ pub(crate) fn call(
 /// up along the class and base chain. A missing name is an `AttributeError` on
 /// the instance. The function itself validates its arity (the bound `self`
 /// counts as the first parameter).
+///
+/// `@classmethod` binds the class instead of the instance and
+/// `@staticmethod` binds no receiver; a property getter is called with the
+/// instance and no extra arguments.
 fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && (argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>()) {
         return type_error(format!(
@@ -152,11 +166,59 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
     let Some(state) = value::as_instance(obj) else {
         return attribute_error(obj, method);
     };
-    let Some(function) = value::class_method(state.class, method) else {
+    let class = state.class;
+    let Some(entry) = value::class_lookup(class, method) else {
         return attribute_error(obj, method);
     };
+    let (kind, function) = match entry {
+        // A callable class attribute is called without a bound receiver.
+        value::ClassEntry::Attr(value) => return builtins::call(value, argc, argv),
+        value::ClassEntry::Method(kind, function) => (kind, function),
+    };
+    let receiver = match kind {
+        MethodKind::Normal | MethodKind::Property => Some(obj),
+        MethodKind::Classmethod => Some(class),
+        MethodKind::Staticmethod => None,
+    };
     let mut call_args = Vec::with_capacity(argc + 1);
-    call_args.push(obj);
+    call_args.extend(receiver);
+    if argc > 0 {
+        // SAFETY: the ABI contract requires `argv` to point at `argc` readable
+        // tagged values; the length checks above keep the slice in range.
+        let args = unsafe { std::slice::from_raw_parts(argv, argc) };
+        call_args.extend_from_slice(args);
+    }
+    builtins::call(function, call_args.len(), call_args.as_ptr())
+}
+
+/// Calls `Class.method(...)` and `Class.attr`-style methods on a class value.
+///
+/// Ordinary methods are unbound (the caller supplies `self`), classmethods
+/// bind the class and staticmethods bind nothing. Properties are data
+/// attributes of instances, not callables on the class, so they report an
+/// `AttributeError` here.
+fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
+    if argc > 0 && (argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>()) {
+        return type_error(format!(
+            "{}.{}() received {} argument(s) without an argument buffer",
+            value::type_name_of(class),
+            method,
+            argc
+        ));
+    }
+    let Some(entry) = value::class_lookup(class, method) else {
+        return attribute_error(class, method);
+    };
+    let (kind, function) = match entry {
+        value::ClassEntry::Attr(value) => return builtins::call(value, argc, argv),
+        value::ClassEntry::Method(MethodKind::Property, _) => {
+            return attribute_error(class, method)
+        }
+        value::ClassEntry::Method(kind, function) => (kind, function),
+    };
+    let receiver = (kind == MethodKind::Classmethod).then_some(class);
+    let mut call_args = Vec::with_capacity(argc + 1);
+    call_args.extend(receiver);
     if argc > 0 {
         // SAFETY: the ABI contract requires `argv` to point at `argc` readable
         // tagged values; the length checks above keep the slice in range.
@@ -177,10 +239,10 @@ fn native_instance_params(obj: i64, method: &str) -> Option<(&'static [&'static 
     let value::FunctionBody::Native { module, name } = &value::as_function(function)?.body else {
         return None;
     };
-    if *module != "timeit" {
-        return None;
+    if *module == "timeit" {
+        return crate::modules::timeit::method_keyword_params(name).map(|params| (params, 0));
     }
-    crate::modules::timeit::method_keyword_params(name).map(|params| (params, 0))
+    None
 }
 
 /// Keyword arguments decoded from the `[name, value, ...]` buffer passed by
@@ -321,6 +383,16 @@ pub(crate) fn call_kw(
         Ok(keywords) => keywords,
         Err(err) => return err,
     };
+    if value::as_list(obj).is_some() {
+        let (params, min_args): (&[&str], usize) = match method.as_str() {
+            "sort" => (&["key", "reverse"], 0),
+            _ => return keywords.reject("list", &method),
+        };
+        if let Err(err) = keywords.bind("list", &method, params, min_args, &mut args) {
+            return err;
+        }
+        return list_method(obj, &method, args.as_slice());
+    }
     if let Some(s) = value::as_str(obj) {
         return str_method_kw(obj, s.to_string(), &method, &mut args, &keywords);
     }
@@ -360,6 +432,7 @@ fn str_method_kw(
 ) -> i64 {
     let (params, min_args): (&[&str], usize) = match method {
         "split" => (&["sep", "maxsplit"], 0),
+        "splitlines" => (&["keepends"], 0),
         "replace" => (&["old", "new", "count"], 2),
         "startswith" => (&["prefix"], 1),
         "endswith" => (&["suffix"], 1),
@@ -390,14 +463,16 @@ fn path_method_kw(obj: i64, method: &str, args: &mut Vec<i64>, keywords: &Keywor
     path_method(obj, method, args.as_slice())
 }
 
-/// Dispatches `obj.<name>` for data attributes of native objects and class
-/// instances.
+/// Dispatches `obj.<name>` for data attributes of native objects, class
+/// instances and class objects.
 ///
-/// Only data attributes are exposed; method attributes stay callable through
-/// [`call`] and remain an `AttributeError` when read without a call. Class
-/// instances resolve their own attribute table (the class namespace holds
-/// methods only). Unknown names and receivers without attributes report a
-/// pending `AttributeError` and return `None`.
+/// Method attributes stay callable through [`call`] and remain an
+/// `AttributeError` when read without a call; a `@property` is a data
+/// attribute and calls its getter. Class instances resolve their own attribute
+/// table first, then `__class__`, properties and the frozen class attributes.
+/// Class objects expose their frozen attributes and `__name__`. Unknown names
+/// and receivers without attributes report a pending `AttributeError` and
+/// return `None`.
 pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
@@ -444,15 +519,57 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         }
         return attribute_error(obj, &attr);
     }
-    if value::as_instance(obj).is_some() {
-        // Data attributes only. Methods are called through `pyx_method`
-        // (bound `self`) and are not readable as values.
+    if let Some(state) = value::as_instance(obj) {
+        // `__class__` is a data descriptor on every Python object, so it wins
+        // over an instance attribute of the same name.
+        if attr == "__class__" {
+            return state.class;
+        }
+        // Data attributes come next (`__dict__` wins over the class namespace).
         if let Some(attribute) = value::instance_attr(obj, &attr) {
             return attribute;
+        }
+        // Methods are called through `pyx_method`; properties and class
+        // attributes are data attributes (the latter inherited as fallback).
+        match value::class_lookup(state.class, &attr) {
+            Some(value::ClassEntry::Attr(value)) => return value,
+            Some(value::ClassEntry::Method(MethodKind::Property, function)) => {
+                let args = [obj];
+                return builtins::call(function, 1, args.as_ptr());
+            }
+            Some(value::ClassEntry::Method(_, _)) | None => {}
+        }
+        return attribute_error(obj, &attr);
+    }
+    if let Some(class) = value::as_class(obj) {
+        // Every class object knows its Python-visible name; its attributes
+        // were frozen when the class statement ran.
+        if attr == "__name__" {
+            return value::str_alloc(class.name.clone());
+        }
+        if let Some(value::ClassEntry::Attr(value)) = value::class_lookup(obj, &attr) {
+            return value;
         }
         return attribute_error(obj, &attr);
     }
     attribute_error(obj, &attr)
+}
+
+/// `hasattr(obj, name)`: whether the attribute exists.
+///
+/// It runs the regular attribute lookup and swallows only `AttributeError`;
+/// any other failure (a property raising a different exception) propagates
+/// with its own tag. A non-string name is rejected by the builtin itself.
+pub(crate) fn hasattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
+    let _value = getattr(obj, name, name_len);
+    if !exc::pending() {
+        return value::TRUE;
+    }
+    if exc::pending_tag() == ATTRIBUTE_ERROR as i64 {
+        exc::clear();
+        return value::FALSE;
+    }
+    NONE
 }
 
 /// `obj.name = value` for class instances.
@@ -757,6 +874,85 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
                     out.push_str(&s);
                 }
                 out.push_str(part);
+            }
+            value::str_alloc(out)
+        }
+        "splitlines" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 1) {
+                return err;
+            }
+            let keepends = args
+                .first()
+                .filter(|arg| **arg != NONE)
+                .map(|arg| value::truthy(*arg))
+                .unwrap_or(false);
+            let mut out: Vec<i64> = Vec::new();
+            let mut start = 0usize;
+            let mut chars = s.char_indices().peekable();
+            while let Some((index, ch)) = chars.next() {
+                let mut width = ch.len_utf8();
+                let is_break = matches!(
+                    ch,
+                    '\n' | '\r'
+                        | '\x0b'
+                        | '\x0c'
+                        | '\x1c'
+                        | '\x1d'
+                        | '\x1e'
+                        | '\u{85}'
+                        | '\u{2028}'
+                        | '\u{2029}'
+                );
+                if ch == '\r' {
+                    if let Some(&(_, '\n')) = chars.peek() {
+                        chars.next();
+                        width += 1;
+                    }
+                }
+                if is_break {
+                    let end = if keepends { index + width } else { index };
+                    out.push(value::str_alloc(s[start..end].to_string()));
+                    start = index + width;
+                }
+            }
+            if start < s.len() {
+                out.push(value::str_alloc(s[start..].to_string()));
+            }
+            value::list_new(out)
+        }
+        "translate" => {
+            if let Some(err) = check_arity("str", method, args.len(), 1, 1) {
+                return err;
+            }
+            if args[0] == NONE {
+                return value::str_alloc(s);
+            }
+            let Some(table) = value::as_dict_data(args[0]) else {
+                return type_error(format!(
+                    "translate() argument must be a dict or None, not '{}'",
+                    value::type_name(args[0])
+                ));
+            };
+            let mut out = String::with_capacity(s.len());
+            for ch in s.chars() {
+                let Some(key) = value::encode_int(ch as i64) else {
+                    out.push(ch);
+                    continue;
+                };
+                if let Some(position) = table.find(key) {
+                    let replacement = table.entries()[position].1;
+                    if replacement != NONE {
+                        let Some(text) = value::as_str(replacement) else {
+                            return type_error(format!(
+                                "character mapping must return integer, None or str, not '{}'",
+                                value::type_name(replacement)
+                            ));
+                        };
+                        out.push_str(text);
+                    }
+                } else {
+                    out.push(ch);
+                }
             }
             value::str_alloc(out)
         }
@@ -1380,6 +1576,29 @@ fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
 
 fn list_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     match method {
+        "sort" => {
+            if let Some(err) = check_arity("list", method, args.len(), 0, 2) {
+                return err;
+            }
+            let key = args.first().copied().unwrap_or(NONE);
+            let reverse = args.get(1).copied().unwrap_or(value::FALSE);
+            let sorted = crate::builtins::sorted(3, [obj, key, reverse].as_ptr());
+            if exc::pending() {
+                return sorted;
+            }
+            let Some(source) = value::as_list(sorted).map(|items| items.to_vec()) else {
+                return type_error("sort() internal result is not a list".to_string());
+            };
+            let Some(mut items) = value::list_items_mut(obj) else {
+                return type_error("sort() receiver is not a list".to_string());
+            };
+            items.clear();
+            for item in source {
+                items.push(item);
+                crate::heap::write_barrier_edge(obj, item);
+            }
+            NONE
+        }
         "append" => {
             if let Some(err) = check_arity("list", method, args.len(), 1, 1) {
                 return err;
@@ -2327,6 +2546,83 @@ fn pool_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// Methods of the native `sys.stdout` / `sys.stderr` stream.
+///
+/// `write(text)` appends the string and flushes (so output interleaves with
+/// `print`), returning the number of characters; `flush()` flushes; `isatty()`
+/// reports whether the descriptor is a terminal. No other attribute exists:
+/// unlike `io.open` there is no read side and the stream is never closed.
+fn std_stream_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    let Some(stream) = value::as_std_stream(obj) else {
+        return attribute_error(obj, method);
+    };
+    match method {
+        "write" => {
+            if let Some(err) = check_arity(stream.name(), method, args.len(), 1, 1) {
+                return err;
+            }
+            let Some(text) = value::as_str(args[0]) else {
+                return type_error(format!(
+                    "write() argument must be str, not {}",
+                    value::type_name(args[0])
+                ));
+            };
+            match write_std_stream(stream.fd(), text) {
+                Ok(count) => ops::int_result(count as i64),
+                Err(error) => exc::raise_with_message(OS_ERROR, &format!("write: {error}")),
+            }
+        }
+        "flush" => {
+            if let Some(err) = check_arity(stream.name(), method, args.len(), 0, 0) {
+                return err;
+            }
+            match flush_std_stream(stream.fd()) {
+                Ok(()) => NONE,
+                Err(error) => exc::raise_with_message(OS_ERROR, &format!("flush: {error}")),
+            }
+        }
+        "isatty" => {
+            if let Some(err) = check_arity(stream.name(), method, args.len(), 0, 0) {
+                return err;
+            }
+            value::bool_value(std_stream_is_tty(stream.fd()))
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
+/// Writes `text` to fd 1/2 and flushes it; returns the character count.
+fn write_std_stream(fd: i32, text: &str) -> std::io::Result<usize> {
+    if fd == 2 {
+        let stderr = std::io::stderr();
+        let mut out = stderr.lock();
+        out.write_all(text.as_bytes())?;
+        out.flush()?;
+    } else {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        out.write_all(text.as_bytes())?;
+        out.flush()?;
+    }
+    Ok(text.chars().count())
+}
+
+fn flush_std_stream(fd: i32) -> std::io::Result<()> {
+    if fd == 2 {
+        std::io::stderr().flush()
+    } else {
+        std::io::stdout().flush()
+    }
+}
+
+fn std_stream_is_tty(fd: i32) -> bool {
+    if fd == 2 {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
+    }
+}
+
 fn file_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     let Some(file) = value::as_file(obj) else {
         return attribute_error(obj, method);
@@ -3084,9 +3380,10 @@ fn generator_method(obj: i64, method: &str, args: &[i64]) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::call;
+    use super::{call, getattr};
     use crate::container;
     use crate::value::{self, encode_int, FALSE, NONE, TRUE};
+    use pyx_ir::MethodKind;
 
     fn int(n: i64) -> i64 {
         encode_int(n).expect("representable")
@@ -3644,6 +3941,117 @@ mod tests {
         // NULL name pointer.
         crate::exc::clear();
         call(obj, std::ptr::null(), 3, 0, std::ptr::null());
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+    }
+
+    /// Test getter/caller: returns its first (and only) argument, which lets a
+    /// test observe exactly which receiver a method bound.
+    extern "C" fn first_argument(args: *const i64) -> i64 {
+        // SAFETY: wrappers created with arity 1 are called with one argument.
+        unsafe { *args }
+    }
+
+    fn method(name: &str, arity: usize, kind: MethodKind) -> (String, i64, MethodKind) {
+        (
+            name.to_string(),
+            value::function_new(
+                first_argument as *const () as usize,
+                arity,
+                name.to_string(),
+            ),
+            kind,
+        )
+    }
+
+    #[test]
+    fn class_methods_bind_their_receiver_by_kind() {
+        reset();
+        let class = value::class_new_full(
+            "C".to_string(),
+            NONE,
+            vec![
+                method("get", 1, MethodKind::Normal),
+                method("make", 1, MethodKind::Classmethod),
+                method("helper", 1, MethodKind::Staticmethod),
+            ],
+            vec![("limit".to_string(), int(5))],
+        );
+        let instance = value::instance_new(class);
+
+        // Calling through an instance binds `self`, the class or nothing.
+        assert_eq!(invoke(instance, "get", &[]), instance);
+        assert_eq!(invoke(instance, "make", &[]), class);
+        assert_eq!(invoke(instance, "helper", &[int(9)]), int(9));
+        assert!(!crate::exc::pending());
+
+        // Calling through the class leaves ordinary methods unbound, binds the
+        // class for classmethods and nothing for staticmethods.
+        assert_eq!(invoke(class, "make", &[]), class);
+        assert_eq!(invoke(class, "helper", &[int(3)]), int(3));
+        assert_eq!(invoke(class, "get", &[instance]), instance);
+        assert!(!crate::exc::pending());
+
+        crate::exc::clear();
+        invoke(instance, "missing", &[]);
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+    }
+
+    #[test]
+    fn properties_and_class_attributes_resolve_through_getattr() {
+        reset();
+        let class = value::class_new_full(
+            "C".to_string(),
+            NONE,
+            vec![method("value", 1, MethodKind::Property)],
+            vec![
+                ("limit".to_string(), int(5)),
+                ("__slots__".to_string(), list(&[])),
+            ],
+        );
+        let instance = value::instance_new(class);
+
+        // A property getter receives the instance.
+        assert_eq!(getattr(instance, b"value".as_ptr(), 5), instance);
+        // Class attributes are visible on instances as a fallback.
+        assert_eq!(getattr(instance, b"limit".as_ptr(), 5), int(5));
+        assert_eq!(getattr(instance, b"__class__".as_ptr(), 9), class);
+        assert_eq!(getattr(class, b"limit".as_ptr(), 5), int(5));
+        assert_eq!(text(getattr(class, b"__name__".as_ptr(), 8)), "C");
+        assert!(!crate::exc::pending());
+
+        // The class namespace is frozen.
+        crate::exc::clear();
+        super::setattr(class, b"limit".as_ptr(), 5, int(6));
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        crate::exc::clear();
+        assert_eq!(getattr(class, b"limit".as_ptr(), 5), int(5));
+    }
+
+    #[test]
+    fn std_stream_methods_write_flush_and_report_a_tty() {
+        reset();
+        let stdout = value::std_stream_new(1);
+        assert_eq!(invoke(stdout, "write", &[string("")]), int(0));
+        assert_eq!(invoke(stdout, "flush", &[]), NONE);
+        let tty = invoke(stdout, "isatty", &[]);
+        assert!(tty == TRUE || tty == FALSE);
+        assert!(!crate::exc::pending());
+
+        // The stderr stream shares the same method surface.
+        let stderr = value::std_stream_new(2);
+        assert_eq!(invoke(stderr, "write", &[string("")]), int(0));
+        assert_eq!(invoke(stderr, "flush", &[]), NONE);
+
+        // Non-string writes and closed-stream operations are rejected.
+        reset();
+        let stdout = value::std_stream_new(1);
+        assert_eq!(invoke(stdout, "write", &[int(1)]), NONE);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "write() argument must be str, not int");
+
+        reset();
+        let stdout = value::std_stream_new(1);
+        assert_eq!(invoke(stdout, "close", &[]), NONE);
         assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
     }
 }

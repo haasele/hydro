@@ -70,12 +70,32 @@ pub extern "C" fn pyx_tuple_new(argc: usize, argv: *const i64) -> i64 {
     container::tuple_new(argc, argv)
 }
 
-/// Validates `a, b, ... = value` for lists and tuples of exactly
-/// `expected` elements. Returns `None` on success; raises `ValueError`
+/// Validates `a, b, ... = value` for lists, tuples, strings and bytes of
+/// exactly `expected` elements. Returns `None` on success; raises `ValueError`
 /// (length mismatch) or `TypeError` (non-sequence) otherwise.
 #[no_mangle]
 pub extern "C" fn pyx_unpack(value: i64, expected: usize) -> i64 {
     container::unpack(value, expected)
+}
+
+/// Unpacking-assignment source check: validates any iterable against
+/// `expected` and returns the sequence to read elements from.
+///
+/// Lists, tuples, strings and bytes are returned unchanged; every other
+/// iterable (including an existing iterator or generator) is materialised into
+/// a fresh list. Errors match [`pyx_unpack`]: `ValueError` for a length
+/// mismatch, `TypeError` for a non-iterable, with `None` returned on error.
+#[no_mangle]
+pub extern "C" fn pyx_unpack_seq(value: i64, expected: usize) -> i64 {
+    container::unpack_seq(value, expected)
+}
+
+/// Starred unpacking assignment (`a, *rest, b = value`): `before` and `after`
+/// count the plain targets around the starred one. Returns a fresh list whose
+/// slot `before` is the middle list, or `None` with a pending exception.
+#[no_mangle]
+pub extern "C" fn pyx_unpack_star(value: i64, before: usize, after: usize) -> i64 {
+    container::unpack_star(value, before, after)
 }
 
 /// `dict` literal from parallel key/value buffers. Unhashable keys raise
@@ -109,6 +129,12 @@ pub extern "C" fn pyx_range_new(start: i64, stop: i64, step: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn pyx_list_from(iterable: i64) -> i64 {
     builtins::list_from(iterable)
+}
+
+/// `tuple(iterable)`.
+#[no_mangle]
+pub extern "C" fn pyx_tuple_from(iterable: i64) -> i64 {
+    builtins::tuple_from(iterable)
 }
 
 /// `dict(iterable)`.
@@ -173,15 +199,22 @@ fn required_name(ptr: *const c_uchar, len: usize) -> Option<String> {
     }
 }
 
-/// Creates a class object: `class Name(Base):` with already-lowered methods.
+/// Creates a class object: `class Name(Base):` with already-lowered methods
+/// and frozen class attributes.
 ///
-/// `names_ptr`/`funcs_ptr` point at `method_count` tagged values: method names
-/// (strings) and function values. `base` is `NONE` or a class object.
-/// Duplicate method names keep their first position and the last function,
-/// mirroring successive assignments in a class body. Malformed buffers, names
-/// and non-function methods raise `TypeError` and return `None`.
+/// `names_ptr`/`funcs_ptr`/`kinds_ptr` point at `method_count` entries: method
+/// names (tagged strings), function values and raw [`pyx_ir::MethodKind`] tags
+/// (`0` normal, `1` property, `2` classmethod, `3` staticmethod).
+/// `attr_names_ptr`/`attr_values_ptr` point at `attr_count` class attribute
+/// name/value pairs; names are tagged strings and values any tagged value.
+/// `base` is `NONE` or a class object.
+///
+/// Duplicate method or attribute names keep their first position and the last
+/// value, mirroring successive assignments in a class body. Malformed buffers,
+/// names, method kinds and non-function methods raise `TypeError` and return
+/// `None`.
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
 pub extern "C" fn pyx_class_new(
     name_ptr: *const c_uchar,
     name_len: usize,
@@ -189,6 +222,10 @@ pub extern "C" fn pyx_class_new(
     method_count: usize,
     names_ptr: *const i64,
     funcs_ptr: *const i64,
+    kinds_ptr: *const i64,
+    attr_count: usize,
+    attr_names_ptr: *const i64,
+    attr_values_ptr: *const i64,
 ) -> i64 {
     let Some(name) = required_name(name_ptr, name_len) else {
         return exc::raise_with_message(exc::TYPE_ERROR, "class name must be a non-empty string");
@@ -199,11 +236,13 @@ pub extern "C" fn pyx_class_new(
             "class base must be a class object or None",
         );
     }
-    let mut methods: Vec<(String, i64)> = Vec::new();
+    let mut methods: Vec<(String, i64, pyx_ir::MethodKind)> = Vec::new();
     if method_count > 0 {
         if names_ptr.is_null()
             || funcs_ptr.is_null()
-            || method_count > isize::MAX as usize / std::mem::size_of::<(String, i64)>()
+            || kinds_ptr.is_null()
+            || method_count
+                > isize::MAX as usize / std::mem::size_of::<(String, i64, pyx_ir::MethodKind)>()
         {
             return exc::raise_with_message(
                 exc::TYPE_ERROR,
@@ -213,12 +252,13 @@ pub extern "C" fn pyx_class_new(
             );
         }
         methods.reserve(method_count);
-        // SAFETY: the ABI contract requires both buffers to hold
-        // `method_count` readable tagged values; the length check above keeps
-        // the slices representable.
+        // SAFETY: the ABI contract requires all three buffers to hold
+        // `method_count` readable entries; the length check above keeps the
+        // slices representable.
         let names = unsafe { std::slice::from_raw_parts(names_ptr, method_count) };
         let funcs = unsafe { std::slice::from_raw_parts(funcs_ptr, method_count) };
-        for (name_value, function) in names.iter().zip(funcs) {
+        let kinds = unsafe { std::slice::from_raw_parts(kinds_ptr, method_count) };
+        for ((name_value, function), kind_tag) in names.iter().zip(funcs).zip(kinds) {
             let Some(method_name) = value::as_str(*name_value) else {
                 return exc::raise_with_message(
                     exc::TYPE_ERROR,
@@ -237,16 +277,79 @@ pub extern "C" fn pyx_class_new(
                     &format!("class method '{method_name}' is not a function"),
                 );
             }
+            let Some(kind) = pyx_ir::MethodKind::from_abi_tag(*kind_tag) else {
+                return exc::raise_with_message(
+                    exc::TYPE_ERROR,
+                    &format!("class method '{method_name}' has an unknown method kind"),
+                );
+            };
             let position = methods
                 .iter()
-                .position(|(existing, _)| existing.as_str() == method_name);
+                .position(|(existing, _, _)| existing.as_str() == method_name);
             match position {
-                Some(index) => methods[index].1 = *function,
-                None => methods.push((method_name.to_string(), *function)),
+                Some(index) => {
+                    methods[index].1 = *function;
+                    methods[index].2 = kind;
+                }
+                None => methods.push((method_name.to_string(), *function, kind)),
             }
         }
     }
-    value::class_new(name, base, methods)
+    let mut attrs: Vec<(String, i64)> = Vec::new();
+    if attr_count > 0 {
+        if attr_names_ptr.is_null()
+            || attr_values_ptr.is_null()
+            || attr_count > isize::MAX as usize / std::mem::size_of::<(String, i64)>()
+        {
+            return exc::raise_with_message(
+                exc::TYPE_ERROR,
+                &format!(
+                    "class definition received {attr_count} attribute(s) without an attribute buffer"
+                ),
+            );
+        }
+        attrs.reserve(attr_count);
+        // SAFETY: the ABI contract requires both buffers to hold `attr_count`
+        // readable tagged values; the length check above keeps the slices
+        // representable.
+        let attr_names = unsafe { std::slice::from_raw_parts(attr_names_ptr, attr_count) };
+        let attr_values = unsafe { std::slice::from_raw_parts(attr_values_ptr, attr_count) };
+        for (name_value, attr_value) in attr_names.iter().zip(attr_values) {
+            let Some(attr_name) = value::as_str(*name_value) else {
+                return exc::raise_with_message(
+                    exc::TYPE_ERROR,
+                    "class attribute name must be a string",
+                );
+            };
+            if attr_name.is_empty() {
+                return exc::raise_with_message(
+                    exc::TYPE_ERROR,
+                    "class attribute name must not be empty",
+                );
+            }
+            let position = attrs
+                .iter()
+                .position(|(existing, _)| existing.as_str() == attr_name);
+            match position {
+                Some(index) => attrs[index].1 = *attr_value,
+                None => attrs.push((attr_name.to_string(), *attr_value)),
+            }
+        }
+    }
+    value::class_new_full(name, base, methods, attrs)
+}
+
+/// Returns the built-in exception class object for `tag` as a first-class
+/// value (`x = ValueError`, `class E(Exception):`).
+///
+/// The class is an empty native class named after the tag (`Class.__name__`
+/// and `repr` report it), cached per thread so repeated expressions share one
+/// object. The cache is cleared by [`pyx_runtime_init`] (through `exc::init`)
+/// before the heap is freed, so a later run never observes a dangling class
+/// pointer. An unknown tag raises `RuntimeError` and returns `None`.
+#[no_mangle]
+pub extern "C" fn pyx_exception_class(tag: u32) -> i64 {
+    exc::exception_class(tag)
 }
 
 /// Creates a function value from the generated wrapper entry point.
@@ -299,6 +402,37 @@ pub extern "C" fn pyx_closure_new(
     };
     let name = function_name(name_ptr, name_len);
     value::closure_new_with_flags(wrapper as usize, arity, name, captures, flags)
+}
+
+/// Attaches the user-visible positional parameter names of a generated wrapper
+/// to its function value. `names` points at `2 * count` words in
+/// `[name_ptr, name_len, ...]` order, mirroring the keyword buffers of
+/// `pyx_method_kw`. Returns the function value; a malformed buffer is ignored
+/// (the names are only used to bind `functools.partial` keywords).
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn pyx_function_params(function: i64, count: usize, names: *const i64) -> i64 {
+    if count == 0 || names.is_null() || count > isize::MAX as usize / 16 {
+        return function;
+    }
+    // SAFETY: the caller passes `2 * count` readable words (codegen stack
+    // array); the length check above keeps the slice representable.
+    let words = unsafe { std::slice::from_raw_parts(names, count * 2) };
+    let params = words
+        .chunks(2)
+        .map(|pair| {
+            let ptr = pair[0] as usize as *const c_uchar;
+            let len = pair[1] as usize;
+            if ptr.is_null() || len == 0 || len > isize::MAX as usize {
+                return String::new();
+            }
+            // SAFETY: the caller passes a readable `name_ptr..name_ptr+len`
+            // range for every pair; the length check keeps it representable.
+            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).into_owned()
+        })
+        .collect();
+    value::function_set_params(function, params);
+    function
 }
 
 /// Copies `argc` tagged arguments for a new fiber. `NULL` with `argc > 0` and
@@ -398,6 +532,45 @@ pub extern "C" fn pyx_call(function: i64, argc: usize, argv: *const i64) -> i64 
     builtins::call(function, argc, argv)
 }
 
+/// `fn(args..., *star)`: indirect call with one starred positional operand.
+///
+/// `argc`/`argv` are the positional operands that preceded the star; `star`
+/// must be a list or tuple whose elements are appended to them. Any other
+/// value raises `TypeError`. Argument evaluation order is the caller's
+/// responsibility (callee, then `args`, then `star`).
+#[no_mangle]
+pub extern "C" fn pyx_call_star(function: i64, argc: usize, argv: *const i64, star: i64) -> i64 {
+    builtins::call_star(function, argc, argv, star)
+}
+
+/// `f(*args, **kwargs)` at a call site the frontend could not bind statically.
+///
+/// The generated code evaluates the callee and every operand (in source
+/// order) before calling this helper, so side effects still happen; the helper
+/// itself always raises `RuntimeError`. It returns `None` with a pending
+/// exception, which the codegen propagates like any other failing runtime
+/// call.
+#[no_mangle]
+pub extern "C" fn pyx_deferred_call(argc: usize, argv: *const i64) -> i64 {
+    // The evaluated operands are intentionally unused: their evaluation
+    // already happened, and the call cannot be represented by the static ABI.
+    let _ = (argc, argv);
+    exc::raise_with_message(
+        exc::RUNTIME_ERROR,
+        "dynamic call with starred or double-star arguments is not supported",
+    )
+}
+
+/// Arity failure raised by a generated wrapper when a dynamic signature
+/// receives more positional arguments than it can bind (no `*args` slot).
+#[no_mangle]
+pub extern "C" fn pyx_arity_error(expected: i64, actual: i64) -> i64 {
+    exc::raise_with_message(
+        exc::TYPE_ERROR,
+        &format!("function takes at most {expected} positional arguments ({actual} given)"),
+    )
+}
+
 /// `map(function, iterable)`: materialised list of results.
 #[no_mangle]
 pub extern "C" fn pyx_map(function: i64, iterable: i64) -> i64 {
@@ -429,6 +602,33 @@ pub extern "C" fn pyx_module_call(
     argv: *const i64,
 ) -> i64 {
     modules::module_call(module, module_len, function, function_len, argc, argv)
+}
+
+/// Keyword variant of [`pyx_module_call`]: `kw_argv` holds `2 * kwargc` tagged
+/// values in `[name, value, ...]` order. Only specs that declare dynamic
+/// keywords (`functools.partial`) accept them; every other spec raises
+/// `TypeError` instead of dropping the names.
+#[no_mangle]
+pub extern "C" fn pyx_module_call_kw(
+    module: *const c_uchar,
+    module_len: usize,
+    function: *const c_uchar,
+    function_len: usize,
+    argc: usize,
+    argv: *const i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> i64 {
+    modules::module_call_kw(
+        module,
+        module_len,
+        function,
+        function_len,
+        argc,
+        argv,
+        kwargc,
+        kw_argv,
+    )
 }
 
 /// `module.name`: a constant value or a native function object.
@@ -508,6 +708,30 @@ pub extern "C" fn pyx_module_value(name_ptr: *const c_uchar, name_len: usize) ->
     value::module_value(name)
 }
 
+/// Name bound by a function-local import that was not linked at compile time.
+///
+/// Python defers such an import until the enclosing function runs; PyX resolves
+/// imports while compiling, so evaluating the name would require a dynamic
+/// import. This always raises `RuntimeError` naming the module (and member) and
+/// returns `None` with a pending exception. An empty/missing member means the
+/// name is a module alias (`import x as y`).
+#[no_mangle]
+pub extern "C" fn pyx_deferred_import(
+    module_ptr: *const c_uchar,
+    module_len: usize,
+    member_ptr: *const c_uchar,
+    member_len: usize,
+) -> i64 {
+    let Some(module) = required_name(module_ptr, module_len) else {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "deferred import name must be a non-empty string",
+        );
+    };
+    let member = required_name(member_ptr, member_len);
+    builtins::deferred_import(&module, member.as_deref())
+}
+
 // ---------------------------------------------------------------------
 // CPython limited-API extensions (P4-04)
 // ---------------------------------------------------------------------
@@ -571,6 +795,14 @@ pub extern "C" fn pyx_dict_set(dict: i64, key: i64, value: i64) -> i64 {
     container::dict_set(dict, key, value)
 }
 
+/// `{**left, **right}`: a fresh dict with `left`'s entries followed by
+/// `right`'s. Duplicate keys keep their first position and take the right
+/// value. Non-dict operands raise `TypeError`; returns `None` then.
+#[no_mangle]
+pub extern "C" fn pyx_dict_merge(left: i64, right: i64) -> i64 {
+    builtins::dict_merge(left, right)
+}
+
 // ---------------------------------------------------------------------
 // Indexing and iteration
 // ---------------------------------------------------------------------
@@ -596,12 +828,28 @@ pub extern "C" fn pyx_slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
     container::slice(obj, start, stop, step)
 }
 
+/// `object[start:stop:step] = value` for lists. A tagged `None` in any bound
+/// position means the argument was omitted. The right-hand side may be any
+/// iterable; a step of 1 splices it in, an extended slice requires a matching
+/// length (`ValueError`). Strings, bytes and tuples are immutable (`TypeError`).
+/// Returns `None`; errors are reported through the pending exception.
+#[no_mangle]
+pub extern "C" fn pyx_slice_set(obj: i64, start: i64, stop: i64, step: i64, new_value: i64) -> i64 {
+    container::slice_set(obj, start, stop, step, new_value)
+}
+
 /// `obj.name` for a data attribute of a native value or class instance.
 /// Unknown receivers and names raise `AttributeError`; the runtime never
 /// aborts.
 #[no_mangle]
 pub extern "C" fn pyx_getattr(obj: i64, name: *const c_uchar, name_len: usize) -> i64 {
     methods::getattr(obj, name, name_len)
+}
+
+/// `hasattr(obj, name)`: a bool. Only `AttributeError` is swallowed.
+#[no_mangle]
+pub extern "C" fn pyx_hasattr(obj: i64, name: *const c_uchar, name_len: usize) -> i64 {
+    methods::hasattr(obj, name, name_len)
 }
 
 /// `obj.name = value` for class instances. Class namespaces are immutable;
@@ -646,6 +894,47 @@ pub extern "C" fn pyx_method_kw(
     kw_argv: *const i64,
 ) -> i64 {
     methods::call_kw(obj, name, name_len, argc, argv, kwargc, kw_argv)
+}
+
+/// Starred dynamic method call: `obj.<name>(*star, name=value...)`.
+///
+/// `star` must be a list or tuple; its elements become the positional
+/// arguments (in order) of the method, followed by the keyword pairs in
+/// `kw_argv` (`2 * kwargc` tagged values, `[name, value, ...]`). A non-list/
+/// tuple operand raises `TypeError` and returns `None`.
+#[no_mangle]
+pub extern "C" fn pyx_method_star(
+    obj: i64,
+    name: *const c_uchar,
+    name_len: usize,
+    star: i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> i64 {
+    let Some(items) = value::as_list(star)
+        .or_else(|| value::as_tuple(star))
+        .map(|items| items.to_vec())
+    else {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            &format!(
+                "starred method argument must be a list or tuple, not '{}'",
+                value::type_name(star)
+            ),
+        );
+    };
+    // The element copies stay reachable through `star`, which is a live
+    // argument for the whole call, so a collection during dispatch cannot
+    // lose them.
+    methods::call_kw(
+        obj,
+        name,
+        name_len,
+        items.len(),
+        items.as_ptr(),
+        kwargc,
+        kw_argv,
+    )
 }
 
 /// Creates an iterator over a list, string, dict, tuple or generator object.
@@ -715,9 +1004,38 @@ pub extern "C" fn pyx_len(v: i64) -> i64 {
     builtins::len(v)
 }
 
+/// `ord(character)`: the Unicode scalar value of a one-character string.
+/// Any other string length or a non-string argument raises `TypeError` and
+/// returns `None`.
+#[no_mangle]
+pub extern "C" fn pyx_ord(v: i64) -> i64 {
+    builtins::ord_value(v)
+}
+
+/// `chr(codepoint)`: the one-character string for an integer in
+/// `0..=0x10FFFF`. Surrogate code points raise `ValueError` (PyX strings are
+/// UTF-8), as does an out-of-range integer; a non-integer raises `TypeError`.
+#[no_mangle]
+pub extern "C" fn pyx_chr(v: i64) -> i64 {
+    builtins::chr_value(v)
+}
+
 #[no_mangle]
 pub extern "C" fn pyx_to_str(v: i64) -> i64 {
     builtins::to_str(v)
+}
+
+/// `repr(value)`: Python's representation string.
+#[no_mangle]
+pub extern "C" fn pyx_to_repr(v: i64) -> i64 {
+    builtins::to_repr(v)
+}
+
+/// `hash(v)`: dict-key hash mapped into a tagged integer; unhashable values
+/// raise `TypeError`.
+#[no_mangle]
+pub extern "C" fn pyx_hash(v: i64) -> i64 {
+    builtins::hash(v)
 }
 
 #[no_mangle]
@@ -733,6 +1051,13 @@ pub extern "C" fn pyx_to_float(v: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn pyx_abs(v: i64) -> i64 {
     builtins::abs(v)
+}
+
+/// `all(iterable)`: tagged `True` when every element is truthy, `False` for a
+/// falsy element. Non-iterables raise `TypeError` and return `None`.
+#[no_mangle]
+pub extern "C" fn pyx_all(iterable: i64) -> i64 {
+    builtins::all(iterable)
 }
 
 /// Copies the static format spec passed by generated code. A missing buffer
@@ -1074,8 +1399,121 @@ mod tests {
         assert_eq!(pyx_exc_pending(), 0);
     }
 
+    #[test]
+    fn unpack_seq_entry_point() {
+        pyx_runtime_init();
+
+        // Lists, tuples, strings and bytes are returned unchanged.
+        let list = make_list(&[1, 2, 3]);
+        assert_eq!(pyx_unpack_seq(list, 3), list);
+        assert_eq!(pyx_exc_pending(), 0);
+        let tuple = pyx_tuple_new(2, [pyx_int(4), pyx_int(5)].as_ptr());
+        assert_eq!(pyx_unpack_seq(tuple, 2), tuple);
+        let text = pyx_str_new("ab".as_ptr(), 2);
+        assert_eq!(pyx_unpack_seq(text, 2), text);
+        assert_eq!(pyx_exc_pending(), 0);
+
+        // An existing iterator is consumed into a fresh list.
+        let iter = pyx_iter_new(list);
+        let sequence = pyx_unpack_seq(iter, 3);
+        assert_eq!(pyx_exc_pending(), 0);
+        assert_eq!(list_ints(sequence), vec![1, 2, 3]);
+        assert_eq!(pyx_subscript(sequence, pyx_int(1)), pyx_int(2));
+
+        // Length mismatches use the unpacking ValueError wording.
+        let iter = pyx_iter_new(make_list(&[1, 2]));
+        assert_eq!(pyx_unpack_seq(iter, 3), pyx_none());
+        assert_eq!(pyx_exc_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "not enough values to unpack (expected 3, got 2)"
+        );
+        pyx_exc_clear();
+
+        let iter = pyx_iter_new(make_list(&[1, 2, 3]));
+        assert_eq!(pyx_unpack_seq(iter, 1), pyx_none());
+        assert_eq!(pyx_exc_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "too many values to unpack (expected 1)"
+        );
+        pyx_exc_clear();
+
+        // Non-iterables keep the unpack-specific TypeError.
+        assert_eq!(pyx_unpack_seq(pyx_int(1), 1), pyx_none());
+        assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "cannot unpack non-iterable int object"
+        );
+        pyx_exc_clear();
+    }
+
+    #[test]
+    fn unpack_star_entry_point() {
+        pyx_runtime_init();
+
+        // `a, *rest, b = [1, 2, 3, 4]`: slot 1 is the fresh middle list.
+        let list = make_list(&[1, 2, 3, 4]);
+        let sequence = pyx_unpack_star(list, 1, 1);
+        assert_eq!(pyx_exc_pending(), 0);
+        let items = value::as_list(sequence).expect("fresh list");
+        assert_eq!(items.len(), 3);
+        assert_eq!(value::as_integer(items[0]), Some(1));
+        assert_eq!(value::as_integer(items[2]), Some(4));
+        let middle = value::as_list(items[1]).expect("middle list");
+        assert_eq!(
+            middle
+                .iter()
+                .map(|item| value::as_integer(*item).expect("integer item"))
+                .collect::<Vec<i64>>(),
+            vec![2, 3]
+        );
+
+        // A tuple source is copied, and the source is not mutated.
+        let tuple = pyx_tuple_new(3, [pyx_int(1), pyx_int(2), pyx_int(3)].as_ptr());
+        let starred = pyx_unpack_star(tuple, 0, 0);
+        let items = value::as_list(starred).expect("fresh list");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            value::as_integer(value::as_list(items[0]).unwrap()[0]),
+            Some(1)
+        );
+        assert_eq!(pyx_len(tuple), pyx_int(3));
+
+        // Too few elements uses CPython's "at least" wording.
+        let short = make_list(&[1]);
+        assert_eq!(pyx_unpack_star(short, 1, 1), pyx_none());
+        assert_eq!(pyx_exc_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "not enough values to unpack (expected at least 2, got 1)"
+        );
+        pyx_exc_clear();
+
+        // Non-iterables keep the unpack-specific TypeError.
+        assert_eq!(pyx_unpack_star(pyx_int(1), 0, 0), pyx_none());
+        assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "cannot unpack non-iterable int object"
+        );
+        pyx_exc_clear();
+
+        // `tuple(iterable)` and `hasattr` entry points.
+        assert_eq!(
+            value::as_tuple(pyx_tuple_from(list)).map(|items| items.len()),
+            Some(4)
+        );
+        let math = pyx_module_value(b"math".as_ptr(), 4);
+        assert_eq!(pyx_hasattr(math, b"pi".as_ptr(), 2), pyx_true());
+        assert_eq!(pyx_hasattr(math, b"tau".as_ptr(), 3), pyx_true());
+        assert_eq!(pyx_hasattr(math, b"nope".as_ptr(), 4), pyx_false());
+        assert_eq!(pyx_exc_pending(), 0);
+    }
+
     fn make_list(items: &[i64]) -> i64 {
-        let tagged: Vec<i64> = items.iter().map(|n| pyx_int(*n)).collect();
+        let tagged: Vec<i64> = items.iter().map(|n| n << 3).collect();
         pyx_list_new(tagged.len(), tagged.as_ptr())
     }
 
@@ -1227,6 +1665,220 @@ mod tests {
     }
 
     #[test]
+    fn slice_assignment_entry_point() {
+        pyx_runtime_init();
+
+        let list = make_list(&[0, 1, 2, 3, 4]);
+        // Same-length middle replacement. The ABI returns `None`.
+        assert_eq!(
+            pyx_slice_set(list, pyx_int(1), pyx_int(3), pyx_none(), make_list(&[9, 8])),
+            pyx_none()
+        );
+        assert_eq!(list_ints(list), vec![0, 9, 8, 3, 4]);
+        // A longer right-hand side grows the list, a shorter one shrinks it.
+        pyx_slice_set(
+            list,
+            pyx_int(1),
+            pyx_int(2),
+            pyx_none(),
+            make_list(&[7, 6, 5]),
+        );
+        assert_eq!(list_ints(list), vec![0, 7, 6, 5, 8, 3, 4]);
+        pyx_slice_set(list, pyx_int(1), pyx_int(4), pyx_none(), make_list(&[]));
+        assert_eq!(list_ints(list), vec![0, 8, 3, 4]);
+
+        // Head, tail, empty (pure insertion) and full slices.
+        pyx_slice_set(list, pyx_int(0), pyx_int(1), pyx_none(), make_list(&[1, 2]));
+        assert_eq!(list_ints(list), vec![1, 2, 8, 3, 4]);
+        pyx_slice_set(list, pyx_int(3), pyx_none(), pyx_none(), make_list(&[9]));
+        assert_eq!(list_ints(list), vec![1, 2, 8, 9]);
+        pyx_slice_set(list, pyx_int(2), pyx_int(2), pyx_none(), make_list(&[4, 5]));
+        assert_eq!(list_ints(list), vec![1, 2, 4, 5, 8, 9]);
+        pyx_slice_set(list, pyx_none(), pyx_none(), pyx_none(), make_list(&[6]));
+        assert_eq!(list_ints(list), vec![6]);
+        // A start past the end appends, and a backwards range inserts at
+        // `start` (Python raises `stop` to `start` for a step of 1).
+        pyx_slice_set(
+            list,
+            pyx_int(10),
+            pyx_none(),
+            pyx_none(),
+            make_list(&[7, 8]),
+        );
+        assert_eq!(list_ints(list), vec![6, 7, 8]);
+        pyx_slice_set(list, pyx_int(3), pyx_int(1), pyx_none(), make_list(&[9]));
+        assert_eq!(list_ints(list), vec![6, 7, 8, 9]);
+        assert_eq!(pyx_exc_pending(), 0);
+
+        // Negative bounds follow slice.indices.
+        let negative = make_list(&[0, 1, 2, 3, 4]);
+        pyx_slice_set(
+            negative,
+            pyx_int(-2),
+            pyx_none(),
+            pyx_none(),
+            make_list(&[8, 9]),
+        );
+        assert_eq!(list_ints(negative), vec![0, 1, 2, 8, 9]);
+        pyx_slice_set(
+            negative,
+            pyx_int(-100),
+            pyx_int(2),
+            pyx_none(),
+            make_list(&[5]),
+        );
+        assert_eq!(list_ints(negative), vec![5, 2, 8, 9]);
+        assert_eq!(pyx_exc_pending(), 0);
+
+        // Extended slices assign position by position, in both directions.
+        let extended = make_list(&[0, 1, 2, 3, 4]);
+        pyx_slice_set(
+            extended,
+            pyx_none(),
+            pyx_none(),
+            pyx_int(2),
+            make_list(&[7, 8, 9]),
+        );
+        assert_eq!(list_ints(extended), vec![7, 1, 8, 3, 9]);
+        pyx_slice_set(
+            extended,
+            pyx_none(),
+            pyx_none(),
+            pyx_int(-1),
+            make_list(&[10, 11, 12, 13, 14]),
+        );
+        assert_eq!(list_ints(extended), vec![14, 13, 12, 11, 10]);
+        pyx_slice_set(
+            extended,
+            pyx_int(1),
+            pyx_int(4),
+            pyx_int(2),
+            make_list(&[0, 1]),
+        );
+        assert_eq!(list_ints(extended), vec![14, 0, 12, 1, 10]);
+        assert_eq!(pyx_exc_pending(), 0);
+
+        // Any iterable is materialised: a string contributes characters and
+        // an iterator is consumed.
+        let mixed = make_list(&[0, 1, 2, 3, 4]);
+        pyx_slice_set(
+            mixed,
+            pyx_int(1),
+            pyx_int(2),
+            pyx_none(),
+            pyx_str_new(b"ab".as_ptr(), 2),
+        );
+        assert_eq!(value::repr(mixed), "[0, 'a', 'b', 2, 3, 4]");
+        let iterator = pyx_iter_new(make_list(&[7, 8]));
+        pyx_slice_set(mixed, pyx_int(0), pyx_int(1), pyx_none(), iterator);
+        assert_eq!(value::repr(mixed), "[7, 8, 'a', 'b', 2, 3, 4]");
+        assert_eq!(pyx_exc_pending(), 0);
+
+        // A list assigned to one of its own slices is snapshotted first.
+        let source = make_list(&[1, 2, 3]);
+        pyx_slice_set(source, pyx_none(), pyx_none(), pyx_none(), source);
+        assert_eq!(list_ints(source), vec![1, 2, 3]);
+        pyx_slice_set(source, pyx_int(1), pyx_int(1), pyx_none(), source);
+        assert_eq!(list_ints(source), vec![1, 1, 2, 3, 2, 3]);
+        assert_eq!(pyx_exc_pending(), 0);
+    }
+
+    #[test]
+    fn slice_assignment_errors() {
+        pyx_runtime_init();
+        let list = make_list(&[0, 1, 2, 3]);
+
+        // An extended slice needs exactly as many values as positions, and a
+        // mismatch leaves the list unchanged.
+        assert_eq!(
+            pyx_slice_set(list, pyx_none(), pyx_none(), pyx_int(2), make_list(&[1])),
+            pyx_none()
+        );
+        assert_eq!(pyx_exc_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "attempt to assign sequence of size 1 to extended slice of size 2"
+        );
+        pyx_exc_clear();
+        assert_eq!(list_ints(list), vec![0, 1, 2, 3]);
+
+        // Bound errors match slicing.
+        pyx_slice_set(list, pyx_none(), pyx_none(), pyx_int(0), make_list(&[1]));
+        assert_eq!(pyx_exc_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "slice step cannot be zero"
+        );
+        pyx_exc_clear();
+        pyx_slice_set(
+            list,
+            pyx_float_new(1.0),
+            pyx_none(),
+            pyx_none(),
+            make_list(&[1]),
+        );
+        assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "slice indices must be integers or None or have an __index__ method"
+        );
+        pyx_exc_clear();
+
+        // Strings, bytes and tuples are immutable.
+        let empty_tuple = pyx_tuple_new(0, std::ptr::null());
+        for immutable in [
+            pyx_str_new(b"abc".as_ptr(), 3),
+            pyx_bytes_new(b"abc".as_ptr(), 3),
+            empty_tuple,
+        ] {
+            pyx_slice_set(
+                immutable,
+                pyx_none(),
+                pyx_none(),
+                pyx_none(),
+                make_list(&[1]),
+            );
+            assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
+            assert!(
+                value::to_string(pyx_exc_value())
+                    .ends_with("object does not support item assignment"),
+                "{}",
+                value::to_string(pyx_exc_value())
+            );
+            pyx_exc_clear();
+        }
+
+        // A dict slice assignment reports the unhashable slice key.
+        let dict = pyx_dict_new(0, std::ptr::null(), std::ptr::null());
+        pyx_slice_set(dict, pyx_none(), pyx_none(), pyx_none(), make_list(&[1]));
+        assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "unhashable type: 'slice'"
+        );
+        pyx_exc_clear();
+
+        // The right-hand side must be iterable; CPython uses the same wording
+        // for simple and extended slices.
+        pyx_slice_set(list, pyx_none(), pyx_none(), pyx_none(), pyx_int(5));
+        assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "must assign iterable to extended slice"
+        );
+        pyx_exc_clear();
+        pyx_slice_set(list, pyx_none(), pyx_none(), pyx_int(2), pyx_int(5));
+        assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pyx_exc_value()),
+            "must assign iterable to extended slice"
+        );
+        pyx_exc_clear();
+        assert_eq!(list_ints(list), vec![0, 1, 2, 3]);
+        assert_eq!(pyx_exc_pending(), 0);
+    }
+
+    #[test]
     fn gc_entry_points() {
         pyx_runtime_init();
         assert_eq!(pyx_gc_objects(), 0);
@@ -1366,6 +2018,68 @@ mod tests {
         assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
         pyx_exc_clear();
         assert_eq!(pyx_dict_from(pyx_int(1)), pyx_none());
+        assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
+        pyx_exc_clear();
+    }
+
+    #[test]
+    fn all_and_dict_merge_entry_points() {
+        pyx_runtime_init();
+        assert_eq!(pyx_all(make_list(&[1, 2])), pyx_true());
+        assert_eq!(pyx_all(make_list(&[1, 0])), pyx_false());
+        assert_eq!(pyx_all(make_list(&[])), pyx_true());
+        assert_eq!(pyx_exc_pending(), 0);
+
+        assert_eq!(pyx_all(pyx_int(1)), pyx_none());
+        assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
+        pyx_exc_clear();
+
+        let left_keys = [pyx_str_new(b"a".as_ptr(), 1)];
+        let left_values = [pyx_int(1)];
+        let left = pyx_dict_new(1, left_keys.as_ptr(), left_values.as_ptr());
+        let right_keys = [pyx_str_new(b"a".as_ptr(), 1), pyx_str_new(b"b".as_ptr(), 1)];
+        let right_values = [pyx_int(2), pyx_int(3)];
+        let right = pyx_dict_new(2, right_keys.as_ptr(), right_values.as_ptr());
+        let merged = pyx_dict_merge(left, right);
+        assert_eq!(value::to_string(merged), "{'a': 2, 'b': 3}");
+        assert_eq!(value::to_string(left), "{'a': 1}");
+        assert_eq!(pyx_exc_pending(), 0);
+
+        assert_eq!(pyx_dict_merge(pyx_int(1), right), pyx_none());
+        assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
+        pyx_exc_clear();
+    }
+
+    #[test]
+    fn starred_method_entry_point() {
+        pyx_runtime_init();
+        let receiver = value::str_from_bytes(b"a-a");
+        let args = [value::str_from_bytes(b"a"), value::str_from_bytes(b"b")];
+        let star = pyx_tuple_new(args.len(), args.as_ptr());
+        let replaced = pyx_method_star(receiver, b"replace".as_ptr(), 7, star, 0, std::ptr::null());
+        assert_eq!(value::to_string(replaced), "b-b");
+        assert_eq!(pyx_exc_pending(), 0);
+
+        // Keyword pairs are bound after the flattened positional arguments.
+        let star_args = [value::str_from_bytes(b"a"), value::str_from_bytes(b"b")];
+        let star = pyx_list_new(star_args.len(), star_args.as_ptr());
+        let keyword_name = value::str_from_bytes(b"count");
+        let kw = [keyword_name, pyx_int(1)];
+        let replaced = pyx_method_star(receiver, b"replace".as_ptr(), 7, star, 1, kw.as_ptr());
+        assert_eq!(value::to_string(replaced), "b-a");
+        assert_eq!(pyx_exc_pending(), 0);
+
+        assert_eq!(
+            pyx_method_star(
+                receiver,
+                b"replace".as_ptr(),
+                7,
+                pyx_int(1),
+                0,
+                std::ptr::null(),
+            ),
+            pyx_none()
+        );
         assert_eq!(pyx_exc_tag(), exc::TYPE_ERROR as i64);
         pyx_exc_clear();
     }

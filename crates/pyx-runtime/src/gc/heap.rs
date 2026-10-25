@@ -1816,8 +1816,11 @@ unsafe fn trace(addr: usize) {
             if state.base != crate::value::NONE {
                 mark_value(state.base);
             }
-            for &(_, function) in &state.methods {
+            for &(_, function, _) in &state.methods {
                 mark_value(function);
+            }
+            for &(_, value) in &state.attrs {
+                mark_value(value);
             }
             mark_black(addr);
         }
@@ -1881,15 +1884,38 @@ unsafe fn trace(addr: usize) {
                 ObjData::Fiber(fiber) => {
                     fiber.trace(mark_value);
                 }
-                // Wrapper functions own their captured values; native and
-                // builtin function bodies own no PyX values.
-                ObjData::Function(function) => {
-                    if let FunctionBody::Wrapper { captures, .. } = &function.body {
+                // Wrapper functions own their captured values; item getters
+                // own their keys and partials own the callable and bound
+                // arguments. Names of attribute getters are plain strings.
+                ObjData::Function(function) => match &function.body {
+                    FunctionBody::Wrapper { captures, .. } => {
                         for &capture in captures {
                             mark_value(capture);
                         }
                     }
-                }
+                    FunctionBody::ItemGetter { keys } => {
+                        for &key in keys {
+                            mark_value(key);
+                        }
+                    }
+                    FunctionBody::Partial {
+                        function: inner,
+                        args,
+                        keywords,
+                    } => {
+                        mark_value(*inner);
+                        for &arg in args {
+                            mark_value(arg);
+                        }
+                        for (_, value) in keywords {
+                            mark_value(*value);
+                        }
+                    }
+                    FunctionBody::AttributeGetter { .. }
+                    | FunctionBody::Identity
+                    | FunctionBody::Native { .. }
+                    | FunctionBody::Builtin(_) => {}
+                },
                 // The explicit cause (`raise X from Y`) is a GC edge; `from
                 // None` stores no cause.
                 ObjData::Exception(exception) => {
@@ -1916,7 +1942,8 @@ unsafe fn trace(addr: usize) {
                 | ObjData::CsvReader(_)
                 | ObjData::ExtFunction(_)
                 | ObjData::Capsule { .. }
-                | ObjData::Module(_) => {}
+                | ObjData::Module(_)
+                | ObjData::StdStream(_) => {}
                 // The mutable containers were handled above; they cannot
                 // appear here.
                 ObjData::List(_)

@@ -25,11 +25,19 @@ pub(crate) const OP_GT: u32 = 11;
 pub(crate) const OP_GE: u32 = 12;
 pub(crate) const OP_IN: u32 = 13;
 pub(crate) const OP_NOT_IN: u32 = 14;
+pub(crate) const OP_IS: u32 = 15;
+pub(crate) const OP_IS_NOT: u32 = 16;
+pub(crate) const OP_BIT_AND: u32 = 17;
+pub(crate) const OP_BIT_OR: u32 = 18;
+pub(crate) const OP_BIT_XOR: u32 = 19;
+pub(crate) const OP_SHL: u32 = 20;
+pub(crate) const OP_SHR: u32 = 21;
 
 // `pyx_unop` op codes.
 pub(crate) const OP_NEG: u32 = 0;
 pub(crate) const OP_POS: u32 = 1;
 pub(crate) const OP_NOT: u32 = 2;
+pub(crate) const OP_INVERT: u32 = 3;
 
 /// `2^63` as `f64`; used for exact int/float comparisons near the i64 bounds.
 const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
@@ -102,7 +110,87 @@ pub(crate) fn binop(op: u32, a: i64, b: i64) -> i64 {
         OP_EQ | OP_NE | OP_LT | OP_LE | OP_GT | OP_GE => compare(op, a, b),
         OP_IN => contains(a, b, false),
         OP_NOT_IN => contains(a, b, true),
+        // Identity compares the tagged representation: `None` and the
+        // booleans are singletons, small integers are unboxed immediates, and
+        // heap values compare by pointer.
+        OP_IS => value::bool_value(a == b),
+        OP_IS_NOT => value::bool_value(a != b),
+        OP_BIT_AND => bitwise(op, a, b),
+        OP_BIT_OR => bitwise(op, a, b),
+        OP_BIT_XOR => bitwise(op, a, b),
+        OP_SHL => shift(a, b, true),
+        OP_SHR => shift(a, b, false),
         _ => exc::raise_with_message(TYPE_ERROR, "unknown binary operator"),
+    }
+}
+
+/// `&`, `|`, `^` on integers and booleans.
+///
+/// Two booleans keep the boolean result type (Python's `bool` is an `int`
+/// subtype); every other integer combination yields an `int`. Floating-point,
+/// string and container operands raise `TypeError` like CPython.
+fn bitwise(op: u32, a: i64, b: i64) -> i64 {
+    let symbol = match op {
+        OP_BIT_AND => "&",
+        OP_BIT_OR => "|",
+        _ => "^",
+    };
+    let (Some(x), Some(y)) = (value::as_integer(a), value::as_integer(b)) else {
+        return arithmetic_type_error(symbol, a, b);
+    };
+    let result = match op {
+        OP_BIT_AND => x & y,
+        OP_BIT_OR => x | y,
+        _ => x ^ y,
+    };
+    // `True` and `False` are singleton immediates; two booleans produce a
+    // boolean, any mixed pair produces an int.
+    if matches!(a, value::TRUE | value::FALSE) && matches!(b, value::TRUE | value::FALSE) {
+        return value::bool_value(result != 0);
+    }
+    int_result(result)
+}
+
+/// `left << right` and `left >> right` on integers (and booleans).
+///
+/// A negative shift count raises `ValueError`. Left shifts that leave the
+/// runtime's tagged-integer range raise `OverflowError`; right shifts
+/// saturate like Python's arithmetic shift for arbitrarily large counts.
+fn shift(a: i64, b: i64, left: bool) -> i64 {
+    let symbol = if left { "<<" } else { ">>" };
+    let (Some(base), Some(count)) = (value::as_integer(a), value::as_integer(b)) else {
+        return arithmetic_type_error(symbol, a, b);
+    };
+    if count < 0 {
+        return exc::raise_with_message(exc::VALUE_ERROR, "negative shift count");
+    }
+    if left {
+        let shifted = if count >= 64 {
+            if base == 0 {
+                0
+            } else {
+                return overflow();
+            }
+        } else {
+            let amount = count as u32;
+            match base.checked_shl(amount) {
+                // The reverse shift catches bits shifted out of the i64.
+                Some(shifted) if (shifted >> amount) == base => shifted,
+                _ => return overflow(),
+            }
+        };
+        int_result(shifted)
+    } else {
+        let shifted = if count >= 64 {
+            if base < 0 {
+                -1
+            } else {
+                0
+            }
+        } else {
+            base >> count
+        };
+        int_result(shifted)
     }
 }
 
@@ -333,6 +421,13 @@ fn mul(a: i64, b: i64) -> i64 {
     if let (Some(n), Some(bytes)) = (value::as_integer(a), value::as_bytes(b)) {
         return repeat_bytes(bytes, n);
     }
+    // `list * int` / `int * list`.
+    if let (Some(items), Some(n)) = (value::as_list(a), value::as_integer(b)) {
+        return repeat_list(items, n);
+    }
+    if let (Some(n), Some(items)) = (value::as_integer(a), value::as_list(b)) {
+        return repeat_list(items, n);
+    }
     // `tuple * int` / `int * tuple`.
     if let (Some(items), Some(n)) = (value::as_tuple(a), value::as_integer(b)) {
         return repeat_tuple(items, n);
@@ -372,6 +467,23 @@ fn repeat_bytes(bytes: &[u8], n: i64) -> i64 {
                 out.extend_from_slice(bytes);
             }
             value::bytes_new(out)
+        }
+        _ => overflow(),
+    }
+}
+
+fn repeat_list(items: &[i64], n: i64) -> i64 {
+    if n <= 0 || items.is_empty() {
+        return value::list_new(Vec::new());
+    }
+    let count = n as usize;
+    match items.len().checked_mul(count) {
+        Some(total) if total <= isize::MAX as usize / std::mem::size_of::<i64>() => {
+            let mut out = Vec::with_capacity(total);
+            for _ in 0..count {
+                out.extend_from_slice(items);
+            }
+            value::list_new(out)
         }
         _ => overflow(),
     }
@@ -528,6 +640,16 @@ fn compare(op: u32, a: i64, b: i64) -> i64 {
         // Bytes compare lexicographically by unsigned byte value.
         return ordered_result(op, Some(x.cmp(y)));
     }
+    // Tuples and lists compare lexicographically, with recursive element
+    // ordering (Python's sequence comparison).
+    if matches!(op, OP_LT | OP_LE | OP_GT | OP_GE) {
+        if let (Some(x), Some(y)) = (value::as_tuple(a), value::as_tuple(b)) {
+            return ordered_result(op, sequence_order(x, y));
+        }
+        if let (Some(x), Some(y)) = (value::as_list(a), value::as_list(b)) {
+            return ordered_result(op, sequence_order(x, y));
+        }
+    }
     // Containers compare structurally (lists element-wise, dicts
     // order-insensitively); ordering is not defined for them in Phase 2.0.
     if matches!(op, OP_EQ | OP_NE) && (is_container(a) || is_container(b)) {
@@ -549,6 +671,27 @@ fn compare(op: u32, a: i64, b: i64) -> i64 {
             value::type_name(b)
         ),
     )
+}
+
+/// Lexicographic ordering of two Python sequences. Equality is recursive;
+/// incomparable element types propagate the normal TypeError.
+fn sequence_order(a: &[i64], b: &[i64]) -> Option<Ordering> {
+    let common = a.len().min(b.len());
+    for index in 0..common {
+        if container::equals(a[index], b[index]) {
+            continue;
+        }
+        let result = binop(OP_LT, a[index], b[index]);
+        if exc::pending() {
+            return None;
+        }
+        return if value::truthy(result) {
+            Some(Ordering::Less)
+        } else {
+            Some(Ordering::Greater)
+        };
+    }
+    Some(a.len().cmp(&b.len()))
 }
 
 fn is_container(v: i64) -> bool {
@@ -656,6 +799,12 @@ pub(crate) fn unop(op: u32, a: i64) -> i64 {
             unary_type_error("+", a)
         }
         OP_NOT => value::bool_value(!value::truthy(a)),
+        // `~x == -x - 1`; `as_integer` also accepts `bool`, matching Python.
+        // Tagged ints stay far inside `i64`, so the complement cannot overflow.
+        OP_INVERT => match value::as_integer(a) {
+            Some(n) => int_result(!n),
+            None => unary_type_error("~", a),
+        },
         _ => exc::raise_with_message(TYPE_ERROR, "unknown unary operator"),
     }
 }
@@ -817,6 +966,24 @@ mod tests {
     }
 
     #[test]
+    fn identity_compares_tagged_values() {
+        exc::init();
+        assert_eq!(binop(OP_IS, NONE, NONE), TRUE);
+        assert_eq!(binop(OP_IS, NONE, int(0)), FALSE);
+        assert_eq!(binop(OP_IS_NOT, NONE, int(0)), TRUE);
+        assert_eq!(binop(OP_IS, TRUE, TRUE), TRUE);
+        assert_eq!(binop(OP_IS, TRUE, FALSE), FALSE);
+        // Small integers are tagged immediates, so equal values are identical.
+        assert_eq!(binop(OP_IS, int(7), int(7)), TRUE);
+        // Heap values compare by pointer, not by content.
+        let a = string("abc");
+        let same = a;
+        assert_eq!(binop(OP_IS, a, same), TRUE);
+        assert_eq!(binop(OP_IS_NOT, a, string("abc")), TRUE);
+        assert!(!exc::pending());
+    }
+
+    #[test]
     fn nan_comparisons_are_false() {
         exc::init();
         let nan = value::float_new(f64::NAN);
@@ -861,13 +1028,9 @@ mod tests {
         assert_eq!(binop(OP_NE, d1, d2), FALSE);
         assert_eq!(binop(OP_EQ, d1, a), FALSE);
 
-        // Ordering containers raises TypeError.
-        binop(OP_LT, a, b);
-        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
-        assert_eq!(
-            pending_message(),
-            "'<' not supported between instances of 'list' and 'list'"
-        );
+        // Lists compare lexicographically.
+        assert_eq!(binop(OP_LT, a, b), TRUE);
+        assert_eq!(binop(OP_GT, a, b), FALSE);
     }
 
     #[test]
@@ -924,12 +1087,9 @@ mod tests {
             FALSE
         );
         assert!(!exc::pending());
-        binop(OP_LT, a, b);
-        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
-        assert_eq!(
-            pending_message(),
-            "'<' not supported between instances of 'tuple' and 'tuple'"
-        );
+        // Tuples compare lexicographically.
+        assert_eq!(binop(OP_LT, a, b), TRUE);
+        assert_eq!(binop(OP_GT, a, b), FALSE);
 
         // Bad operand combinations keep the standard TypeError.
         exc::init();
@@ -1101,5 +1261,96 @@ mod tests {
             pending_message(),
             "unsupported operand type(s) for +: 'set' and 'set'"
         );
+    }
+
+    #[test]
+    fn bitwise_integer_and_bool_semantics() {
+        exc::init();
+        assert_eq!(as_int(binop(OP_BIT_AND, int(6), int(3))), 2);
+        assert_eq!(as_int(binop(OP_BIT_OR, int(6), int(3))), 7);
+        assert_eq!(as_int(binop(OP_BIT_XOR, int(6), int(3))), 5);
+        assert_eq!(as_int(binop(OP_SHL, int(1), int(4))), 16);
+        assert_eq!(as_int(binop(OP_SHR, int(-8), int(1))), -4);
+        assert!(!exc::pending());
+
+        // Two booleans keep the boolean result; a mixed pair is an int.
+        assert_eq!(binop(OP_BIT_AND, TRUE, TRUE), TRUE);
+        assert_eq!(binop(OP_BIT_AND, TRUE, FALSE), FALSE);
+        assert_eq!(binop(OP_BIT_OR, FALSE, FALSE), FALSE);
+        assert_eq!(binop(OP_BIT_XOR, TRUE, TRUE), FALSE);
+        assert_eq!(binop(OP_BIT_OR, TRUE, int(2)), int(3));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn bitwise_rejects_non_integers() {
+        exc::init();
+        let text = value::str_from_bytes(b"x");
+        assert_eq!(binop(OP_BIT_AND, text, int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for &: 'str' and 'int'"
+        );
+
+        exc::init();
+        assert_eq!(binop(OP_BIT_OR, value::float_new(1.5), int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for |: 'float' and 'int'"
+        );
+
+        exc::init();
+        assert_eq!(binop(OP_SHL, int(1), text), NONE);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for <<: 'int' and 'str'"
+        );
+    }
+
+    #[test]
+    fn shift_counts_are_bounded() {
+        exc::init();
+        assert_eq!(binop(OP_SHL, int(1), int(-1)), NONE);
+        assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(pending_message(), "negative shift count");
+
+        exc::init();
+        assert_eq!(binop(OP_SHR, int(1), int(-1)), NONE);
+        assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
+        assert_eq!(pending_message(), "negative shift count");
+
+        exc::init();
+        assert_eq!(binop(OP_SHL, int(value::MAX_INT), int(1)), NONE);
+        assert_eq!(exc::pending_tag(), OVERFLOW_ERROR as i64);
+        assert_eq!(pending_message(), "integer overflow");
+
+        // Huge right shifts saturate like Python.
+        exc::init();
+        assert_eq!(as_int(binop(OP_SHR, int(-1), int(100))), -1);
+        assert_eq!(as_int(binop(OP_SHR, int(1), int(100))), 0);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn invert_is_defined_for_ints_and_bools() {
+        exc::init();
+        assert_eq!(as_int(unop(OP_INVERT, int(5))), -6);
+        assert_eq!(as_int(unop(OP_INVERT, int(0))), -1);
+        assert_eq!(as_int(unop(OP_INVERT, int(-6))), 5);
+        // `bool` is numerically an int.
+        assert_eq!(as_int(unop(OP_INVERT, TRUE)), -2);
+        assert_eq!(as_int(unop(OP_INVERT, FALSE)), -1);
+        assert!(!exc::pending());
+
+        exc::init();
+        assert_eq!(unop(OP_INVERT, value::float_new(1.5)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "bad operand type for unary ~: 'float'");
+
+        exc::init();
+        assert_eq!(unop(OP_INVERT, value::str_from_bytes(b"x")), NONE);
+        assert_eq!(pending_message(), "bad operand type for unary ~: 'str'");
     }
 }

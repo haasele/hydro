@@ -202,22 +202,24 @@ pub(crate) fn set_contains(items: &[i64], target: i64) -> bool {
     set_find(items, target).is_some()
 }
 
-/// `a, b, ... = value`: checks that `value` is a list or tuple with exactly
-/// `expected` elements. On success returns `None`; mismatches raise
-/// `ValueError` and non-sequences `TypeError`.
-pub(crate) fn unpack(value: i64, expected: usize) -> i64 {
-    let len = if let Some(items) = value::as_list(value) {
-        items.len()
+/// Length of a value that can be unpacked without consuming an iterator.
+///
+/// Strings count Unicode scalar values, matching `iter(str)` and `str` index
+/// access.
+fn sequence_len(value: i64) -> Option<usize> {
+    if let Some(items) = value::as_list(value) {
+        Some(items.len())
     } else if let Some(items) = value::as_tuple(value) {
-        items.len()
+        Some(items.len())
     } else if let Some(bytes) = value::as_bytes(value) {
-        bytes.len()
+        Some(bytes.len())
     } else {
-        return type_error(format!(
-            "cannot unpack non-iterable {} object",
-            value::type_name(value)
-        ));
-    };
+        value::as_str(value).map(|text| text.chars().count())
+    }
+}
+
+/// Raises the length-mismatch error for `expected` when `len` differs.
+fn check_unpack_len(len: usize, expected: usize) -> i64 {
     if len > expected {
         return exc::raise_with_message(
             VALUE_ERROR,
@@ -234,6 +236,161 @@ pub(crate) fn unpack(value: i64, expected: usize) -> i64 {
         );
     }
     NONE
+}
+
+/// `a, b, ... = value`: checks that `value` is a list, tuple, string or bytes
+/// with exactly `expected` elements. On success returns `None`; mismatches
+/// raise `ValueError` and non-sequences `TypeError`.
+pub(crate) fn unpack(value: i64, expected: usize) -> i64 {
+    let Some(len) = sequence_len(value) else {
+        return type_error(format!(
+            "cannot unpack non-iterable {} object",
+            value::type_name(value)
+        ));
+    };
+    check_unpack_len(len, expected)
+}
+
+/// Sequence-producing variant of [`unpack`] for unpacking assignments.
+///
+/// Lists, tuples, strings and bytes are returned unchanged after the length
+/// check. Every other iterable (including an existing iterator or generator)
+/// is consumed into a fresh list, which the caller keeps rooted while it reads
+/// the elements. Raises `ValueError` on a length mismatch and `TypeError` for
+/// non-iterables, returning `None` in both cases.
+pub(crate) fn unpack_seq(value: i64, expected: usize) -> i64 {
+    if let Some(len) = sequence_len(value) {
+        check_unpack_len(len, expected);
+        return if exc::pending() { NONE } else { value };
+    }
+
+    let iterator = crate::iter::iter_of(value);
+    if exc::pending() {
+        // `iter()` reports its generic not-iterable error; unpacking keeps its
+        // own wording.
+        exc::clear();
+        return type_error(format!(
+            "cannot unpack non-iterable {} object",
+            value::type_name(value)
+        ));
+    }
+    let result = value::list_new(Vec::new());
+    let mut count = 0usize;
+    loop {
+        let mut item = NONE;
+        let status = crate::iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        if count == expected {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("too many values to unpack (expected {})", expected),
+            );
+        }
+        if let Some(mut items) = value::list_items_mut(result) {
+            items.push(item);
+            crate::heap::write_barrier_edge(result, item);
+        }
+        count += 1;
+    }
+    if count < expected {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            &format!(
+                "not enough values to unpack (expected {}, got {})",
+                expected, count
+            ),
+        );
+    }
+    result
+}
+
+/// Starred unpacking-assignment source (`a, *rest, b = value`).
+///
+/// `before` targets bind elements from the front and `after` from the back; the
+/// starred target receives a fresh list of everything between them. Returns a
+/// fresh list with `before + 1 + after` elements whose slot `before` is that
+/// middle list, so codegen reads it exactly like the exact-length case.
+///
+/// Lists and tuples are read in place (the caller keeps the source rooted);
+/// every other iterable is consumed into a list first, including strings,
+/// bytes, ranges and generators. Fewer than `before + after` elements raises
+/// CPython's "not enough values" `ValueError`; a non-iterable raises the
+/// unpack-specific `TypeError`.
+pub(crate) fn unpack_star(value: i64, before: usize, after: usize) -> i64 {
+    let minimum = match before.checked_add(after) {
+        Some(minimum) => minimum,
+        None => {
+            return exc::raise_with_message(TYPE_ERROR, "unpacking has too many targets");
+        }
+    };
+    let items_list = if value::as_list(value).is_some() || value::as_tuple(value).is_some() {
+        value
+    } else {
+        let iterator = crate::iter::iter_of(value);
+        if exc::pending() {
+            // `iter()` reports its generic not-iterable error; unpacking keeps
+            // its own wording.
+            exc::clear();
+            return type_error(format!(
+                "cannot unpack non-iterable {} object",
+                value::type_name(value)
+            ));
+        }
+        let collected = value::list_new(Vec::new());
+        loop {
+            let mut item = NONE;
+            let status = crate::iter::iter_next(iterator, &mut item);
+            if exc::pending() {
+                return NONE;
+            }
+            if status == 0 {
+                break;
+            }
+            if let Some(mut items) = value::list_items_mut(collected) {
+                items.push(item);
+                crate::heap::write_barrier_edge(collected, item);
+            }
+        }
+        collected
+    };
+    let items: Vec<i64> = if let Some(items) = value::as_list(items_list) {
+        items.to_vec()
+    } else if let Some(items) = value::as_tuple(items_list) {
+        items.to_vec()
+    } else {
+        Vec::new()
+    };
+    if items.len() < minimum {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            &format!(
+                "not enough values to unpack (expected at least {}, got {})",
+                minimum,
+                items.len()
+            ),
+        );
+    }
+    let tail = items.len() - after;
+    // The result list is allocated first so it roots the values as they are
+    // appended; the middle list is then built from the still-rooted source.
+    let result = value::list_new(Vec::with_capacity(minimum + 1));
+    let middle = value::list_new(items[before..tail].to_vec());
+    let values = items[..before]
+        .iter()
+        .chain(std::iter::once(&middle))
+        .chain(items[tail..].iter());
+    for &item in values {
+        if let Some(mut items) = value::list_items_mut(result) {
+            items.push(item);
+            crate::heap::write_barrier_edge(result, item);
+        }
+    }
+    result
 }
 
 // -------------------------------------------------------------------------
@@ -820,6 +977,153 @@ pub(crate) fn slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
         "'{}' object is not subscriptable",
         value::type_name(obj)
     ))
+}
+
+/// `object[start:stop:step] = value` for lists.
+///
+/// `start`, `stop` and `step` are tagged values; [`NONE`] means the argument
+/// was omitted. Bounds follow Python's `slice.indices` exactly. A `step` of 1
+/// splices the materialised right-hand side into the list (any length); any
+/// other step replaces the visited positions and requires exactly as many
+/// values as there are positions, otherwise `ValueError`.
+///
+/// Strings, bytes and tuples are immutable (`TypeError`); a dict reports the
+/// unhashable `slice` key like a slice read. The right-hand side may be any
+/// iterable and is materialised before the target is changed, so
+/// `xs[:] = xs` works. Every inserted edge publishes a GC insertion barrier
+/// while the list is locked. Returns `None`; errors are reported through the
+/// pending exception.
+pub(crate) fn slice_set(obj: i64, start: i64, stop: i64, step: i64, new_value: i64) -> i64 {
+    if value::as_list(obj).is_none() {
+        if value::as_dict(obj).is_some() || value::as_defaultdict(obj).is_some() {
+            let _ = type_error(unhashable_message("slice"));
+        } else {
+            let _ = type_error(format!(
+                "'{}' object does not support item assignment",
+                value::type_name(obj)
+            ));
+        }
+        return NONE;
+    }
+    // CPython validates the slice arguments (integers or `None`, `step != 0`)
+    // before it materialises the right-hand side, but clamps the bounds only
+    // afterwards: the right-hand side may run user code that mutates the
+    // list. The index computations below therefore use the length observed
+    // after the materialisation.
+    if let Err(err) = validate_slice_args(start, stop, step) {
+        let _ = slice_error(err);
+        return NONE;
+    }
+    let Some(values) = slice_assignment_values(new_value) else {
+        return NONE;
+    };
+    let Some(len) = value::as_list(obj).map(|items| items.len()) else {
+        return NONE;
+    };
+    let Ok((start, stop, step)) = slice_indices(start, stop, step, len) else {
+        return NONE;
+    };
+
+    let Some(mut items) = value::list_items_mut(obj) else {
+        return NONE;
+    };
+    if step == 1 {
+        // Python raises `stop` to `start`, so a "backwards" range such as
+        // `xs[2:1] = [...]` inserts at index 2. Clamp again in case another
+        // thread changed the list between the length read and the lock.
+        let stop = stop.max(start);
+        let length = items.len();
+        let low = (start as usize).min(length);
+        let high = (stop as usize).min(length).max(low);
+        items.splice(low..high, values.iter().copied());
+        for &value in &values {
+            crate::heap::write_barrier_edge(obj, value);
+        }
+        return NONE;
+    }
+    let positions = slice_positions(start, stop, step);
+    if positions.len() != values.len() {
+        // Drop the graph lock before allocating the exception object.
+        drop(items);
+        let _ = exc::raise_with_message(
+            VALUE_ERROR,
+            &format!(
+                "attempt to assign sequence of size {} to extended slice of size {}",
+                values.len(),
+                positions.len()
+            ),
+        );
+        return NONE;
+    }
+    for (position, &value) in positions.into_iter().zip(values.iter()) {
+        // Defensive: another thread may have shrunk the list despite the
+        // documented user-lock requirement. Positions ascend (or descend)
+        // monotonically, so stopping at the first out-of-range one is safe.
+        if position >= items.len() {
+            break;
+        }
+        items[position] = value;
+        crate::heap::write_barrier_edge(obj, value);
+    }
+    NONE
+}
+
+/// Validates the raw slice arguments like CPython's `PySlice_Unpack`: every
+/// bound is an integer or `None`, and `step != 0`.
+fn validate_slice_args(start: i64, stop: i64, step: i64) -> Result<(), SliceError> {
+    let _ = slice_bound(start).map_err(|()| SliceError::Type)?;
+    let _ = slice_bound(stop).map_err(|()| SliceError::Type)?;
+    match slice_bound(step).map_err(|()| SliceError::Type)? {
+        None => Ok(()),
+        Some(0) => Err(SliceError::Step),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Materialises the right-hand side of a list slice assignment into a
+/// snapshot, so assigning a list to one of its own slices works. Lists and
+/// tuples are copied directly; every other iterable (strings, bytes, dicts,
+/// sets, ranges, iterators and generators) is consumed through the runtime
+/// iterator. A non-iterable raises CPython's `TypeError` ("must assign
+/// iterable to extended slice", also for a step of 1); `None` is returned with
+/// a pending exception in that case.
+fn slice_assignment_values(new_value: i64) -> Option<Vec<i64>> {
+    if let Some(items) = value::as_list(new_value) {
+        return Some(items.to_vec());
+    }
+    if let Some(items) = value::as_tuple(new_value) {
+        return Some(items.to_vec());
+    }
+    let iterator = crate::iter::iter_of(new_value);
+    if exc::pending() {
+        // `iter()` reports its generic not-iterable error; slice assignment
+        // keeps CPython's wording.
+        exc::clear();
+        let _ = type_error("must assign iterable to extended slice".to_string());
+        return None;
+    }
+    // The fresh list keeps every element reachable while the iterator runs
+    // user code (a generator may allocate or collect).
+    let collected = value::list_new(Vec::new());
+    loop {
+        let mut item = NONE;
+        let status = crate::iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return None;
+        }
+        if status == 0 {
+            break;
+        }
+        if let Some(mut items) = value::list_items_mut(collected) {
+            items.push(item);
+            crate::heap::write_barrier_edge(collected, item);
+        }
+    }
+    Some(
+        value::as_list(collected)
+            .map(|items| items.to_vec())
+            .unwrap_or_default(),
+    )
 }
 
 fn slice_error(err: SliceError) -> i64 {

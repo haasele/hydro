@@ -4,12 +4,58 @@ use crate::*;
 fn op_codes_are_stable() {
     assert_eq!(BinOp::Add.code(), 0);
     assert_eq!(BinOp::Ge.code(), 12);
+    assert_eq!(BinOp::In.code(), 13);
+    assert_eq!(BinOp::NotIn.code(), 14);
+    assert_eq!(BinOp::Is.code(), 15);
+    assert_eq!(BinOp::IsNot.code(), 16);
+    assert_eq!(BinOp::BitAnd.code(), 17);
+    assert_eq!(BinOp::BitOr.code(), 18);
+    assert_eq!(BinOp::BitXor.code(), 19);
+    assert_eq!(BinOp::Shl.code(), 20);
+    assert_eq!(BinOp::Shr.code(), 21);
     assert_eq!(UnOp::Not.code(), 2);
+    assert_eq!(UnOp::Invert.code(), 3);
+    assert_eq!(UnOp::Invert.symbol(), "~");
+    assert_eq!(Builtin::from_name("repr"), Some(Builtin::Repr));
+    assert_eq!(Builtin::Repr.name(), "repr");
+    assert_eq!(Builtin::from_name("hash"), Some(Builtin::Hash));
+    assert_eq!(Builtin::Hash.name(), "hash");
+    assert_eq!(Builtin::from_name("ord"), Some(Builtin::Ord));
+    assert_eq!(Builtin::Ord.name(), "ord");
+    assert_eq!(Builtin::from_name("chr"), Some(Builtin::Chr));
+    assert_eq!(Builtin::Chr.name(), "chr");
+    assert_eq!(Builtin::from_name("divmod"), Some(Builtin::Divmod));
+    assert_eq!(Builtin::Divmod.name(), "divmod");
+    assert_eq!(Builtin::from_name("callable"), Some(Builtin::Callable));
+    assert_eq!(Builtin::Callable.name(), "callable");
+    assert_eq!(Builtin::from_name("nope"), None);
     assert_eq!(ExcKind::ZeroDivisionError.tag(), 2);
     assert_eq!(ExcKind::from_name("ValueError"), Some(ExcKind::ValueError));
     assert_eq!(ExcKind::from_name("IndexError"), Some(ExcKind::IndexError));
     assert_eq!(ExcKind::StopIteration.tag(), 8);
     assert_eq!(ExcKind::AttributeError.tag(), 9);
+    assert_eq!(ExcKind::AssertionError.tag(), 14);
+    assert_eq!(ExcKind::GeneratorExit.tag(), 11);
+    assert_eq!(
+        ExcKind::from_class_name("AssertionError"),
+        Some(ExcKind::AssertionError)
+    );
+    assert_eq!(
+        ExcKind::from_class_name("GeneratorExit"),
+        Some(ExcKind::GeneratorExit)
+    );
+    assert_eq!(
+        ExcKind::from_class_name("ValueError"),
+        Some(ExcKind::ValueError)
+    );
+    // `raise`/`except` keep their historical name table.
+    assert_eq!(
+        ExcKind::from_name("AssertionError"),
+        Some(ExcKind::AssertionError)
+    );
+    assert_eq!(ExcKind::from_name("GeneratorExit"), None);
+    assert_eq!(ExcKind::AssertionError.name(), "AssertionError");
+    assert_eq!(ExcKind::GeneratorExit.name(), "GeneratorExit");
     assert_eq!(ExcKind::from_name("Nope"), None);
 }
 
@@ -17,10 +63,25 @@ fn op_codes_are_stable() {
 fn const_types() {
     assert_eq!(Const::Int(1).ty(), Type::Int);
     assert_eq!(Const::None.ty(), Type::None);
+    assert_eq!(Const::NotImplemented.ty(), Type::Any);
+    assert_eq!(UnOp::Invert.symbol(), "~");
     assert!(Type::Bool.is_numeric());
     assert!(!Type::Str.is_numeric());
     assert_eq!(Type::List.name(), "list");
     assert_eq!(Type::Dict.name(), "dict");
+}
+
+#[test]
+fn random_and_sys_specs_expose_the_style_surface() {
+    let getrandbits = stdlib::function("random", "getrandbits").expect("getrandbits");
+    assert_eq!(
+        (getrandbits.min_args, getrandbits.max_args, getrandbits.ret),
+        (1, 1, Type::Int)
+    );
+    for name in ["stdout", "stderr"] {
+        let stream = stdlib::constant("sys", name).expect("sys stream");
+        assert_eq!(stream.ty, Type::Any);
+    }
 }
 
 #[test]

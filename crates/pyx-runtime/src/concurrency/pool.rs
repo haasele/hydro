@@ -364,6 +364,16 @@ fn validate_callable(function: i64) -> Result<(), String> {
                     .to_string(),
             );
         }
+        // Getter, partial and identity callables have no stable code entry.
+        value::FunctionBody::AttributeGetter { .. }
+        | value::FunctionBody::ItemGetter { .. }
+        | value::FunctionBody::Partial { .. }
+        | value::FunctionBody::Identity => {
+            return Err(
+                "cannot run a derived callable in a Pool; use a named module-level function"
+                    .to_string(),
+            );
+        }
     }
     if func.name == "<lambda>" || func.name.is_empty() {
         return Err("cannot run a lambda in a Pool; use a named module-level function".to_string());

@@ -126,7 +126,23 @@ const SLICES_STDOUT: &str = "bcd\n\
      [0, 1, 2, 3, 4, 5]\n\
      [0, 1, 2, 3, 4, 5]\n\
      zero slice step cannot be zero\n\
-     él olléh\n";
+     él olléh\n\
+     [0, 9, 8, 3, 4, 5]\n\
+     [0, 7, 6, 5, 8, 3, 4, 5]\n\
+     [0, 8, 3, 4, 5]\n\
+     [4, 3, 4, 5]\n\
+     [4, 3, 4, 8, 9]\n\
+     [4, 3, 5, 4, 8, 9]\n\
+     [0, 3, 0, 4, 0, 9]\n\
+     [6, 5, 4, 3, 2, 1]\n\
+     [6, 5, 4, 3, 2, 1]\n\
+     [6, 'a', 'b', 4, 3, 2, 1]\n\
+     eval value\n\
+     eval start\n\
+     eval stop\n\
+     [0, 9, 2]\n\
+     extended attempt to assign sequence of size 1 to extended slice of size 4\n\
+     immutable 'str' object does not support item assignment\n";
 
 /// Stdout produced by `examples/fstrings.py`.
 const FSTRINGS_STDOUT: &str = "Hello, PyX!\n\
@@ -223,7 +239,23 @@ const BUILTINS_STDOUT: &str = "range(0, 5) 5 [0, 1, 2, 3, 4] 10\n\
      True False False\n\
      0 1\n\
      zero range() arg 3 must not be zero\n\
-     sum unsupported operand type(s) for +: 'int' and 'str'\n";
+     sum unsupported operand type(s) for +: 'int' and 'str'\n\
+     65 233 A é 😀\n\
+     z\n\
+     ord ord() expected a character, but string of length 2 found\n\
+     chr chr() arg not in range(0x110000)\n\
+     chr chr() arg cannot be a surrogate code point\n\
+     walrus 10\n\
+     10\n\
+     loop 1\n\
+     loop 2\n\
+     after 3\n\
+     [2, 4, 6]\n\
+     6\n\
+     True 1\n\
+     False 2\n\
+     True 4\n\
+     False 3\n";
 
 /// Stdout produced by `examples/comprehensions.py`.
 const COMPREHENSIONS_STDOUT: &str = "[0, 2, 4, 6, 8]\n\
@@ -503,18 +535,21 @@ fn check_dict_slice() {
 }
 
 #[test]
-fn check_slice_assign() {
+fn check_augmented_slice_assign() {
     let program = example("errors/slice_assign.py");
     let (code, stdout, stderr) = run(&["run", &program]);
 
-    assert_eq!(code, 1, "slice assignment must exit with status 1");
+    assert_eq!(
+        code, 1,
+        "augmented slice assignment must exit with status 1"
+    );
     assert!(
         stdout.is_empty(),
         "no code may run after a frontend diagnostic"
     );
     assert!(
-        stderr.contains("slice assignment"),
-        "missing slice assignment diagnostic, got:\n{stderr}"
+        stderr.contains("augmented slice assignment"),
+        "missing augmented slice assignment diagnostic, got:\n{stderr}"
     );
 }
 
@@ -917,19 +952,6 @@ fn run_tuples_gc() {
     assert_eq!(code, 0, "pyx run failed with GC threshold: {stderr}");
     assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
     assert_eq!(stdout, TUPLES_STDOUT);
-}
-
-#[test]
-fn check_tuple_unpack_nested() {
-    let program = example("errors/tuple_unpack_nested.py");
-    let (code, stdout, stderr) = run(&["check", &program]);
-
-    assert_eq!(code, 1, "nested tuple unpacking must exit with status 1");
-    assert!(stdout.is_empty(), "pyx check must not write to stdout");
-    assert!(
-        stderr.contains("nested unpacking"),
-        "missing nested unpacking diagnostic, got:\n{stderr}"
-    );
 }
 
 #[test]
@@ -1453,6 +1475,124 @@ fn run_augmented_subscript_assignment_gc() {
 }
 
 #[test]
+fn run_chained_assignment_gcd_divmod_callable_and_finditer() {
+    let dir = TestDir::new("chained-assign");
+    let program = dir.path().join("chained_assign.py");
+    std::fs::write(
+        &program,
+        concat!(
+            "def f():\n",
+            "    a = b = 1\n",
+            "    d = {}\n",
+            "    xs = [0]\n",
+            "    d['k'] = xs[0] = 7\n",
+            "    return a, b, d['k'], xs[0]\n",
+            "print(f())\n",
+            "from math import gcd\n",
+            "print(gcd(12, 8), gcd(12, 8, 6))\n",
+            "print(divmod(-7, 3))\n",
+            "print(callable(print), callable(1))\n",
+            "import re\n",
+            "for m in re.finditer('[0-9]+', 'a1b22'):\n",
+            "    print(m.group(), m.start(), m.end())\n",
+            "for m in re.finditer('A', 'aA', flags=re.IGNORECASE):\n",
+            "    print(m.group(), m.start())\n",
+        ),
+    )
+    .expect("failed to write temp program");
+    let program = program.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &program]);
+
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(
+        stdout,
+        "(1, 1, 7, 7)\n4 2\n(-3, 2)\nTrue False\n1 1 2\n22 3 5\na 0\nA 1\n"
+    );
+}
+
+#[test]
+fn run_assert_statements() {
+    let dir = TestDir::new("assert-statements");
+    let program = dir.path().join("asserts.py");
+    std::fs::write(
+        &program,
+        concat!(
+            "def check(n):\n",
+            "    assert n > 0, 'n must be positive'\n",
+            "    return n\n",
+            "print(check(2))\n",
+            "try:\n",
+            "    check(0)\n",
+            "except AssertionError as exc:\n",
+            "    print('assertion:', exc)\n",
+            // `AssertionError` is an `Exception`: the generic handler catches
+            // a bare failing assert too.
+            "try:\n",
+            "    assert 1 == 2\n",
+            "except Exception:\n",
+            "    print('exception caught')\n",
+            // The message expression only runs when the test fails.
+            "seen = []\n",
+            "def message():\n",
+            "    seen.append(1)\n",
+            "    return 'lazy'\n",
+            "assert True, message()\n",
+            "print('lazy evaluations:', len(seen))\n",
+            "try:\n",
+            "    assert False, message()\n",
+            "except AssertionError as exc:\n",
+            "    print('message:', exc)\n",
+            "print('lazy evaluations:', len(seen))\n",
+        ),
+    )
+    .expect("failed to write temp program");
+    let program = program.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &program]);
+
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(
+        stdout,
+        "2\n\
+         assertion: n must be positive\n\
+         exception caught\n\
+         lazy evaluations: 0\n\
+         message: lazy\n\
+         lazy evaluations: 1\n"
+    );
+}
+
+#[test]
+fn run_re_flags_and_verbose_pattern() {
+    let dir = TestDir::new("re-flags");
+    let program = dir.path().join("re_flags.py");
+    std::fs::write(
+        &program,
+        concat!(
+            "import re\n",
+            "RE_COLOR = re.compile(\n",
+            "    r\"\"\"^\n",
+            "\\#([0-9a-f]{6})$|\n",
+            "color\\(([0-9]{1,3})\\)$|\n",
+            "rgb\\(([\\d\\s,]+)\\)$\n",
+            "\"\"\",\n",
+            "    re.VERBOSE,\n",
+            ")\n",
+            "m = RE_COLOR.search('rgb(1, 22, 200)')\n",
+            "print(m is not None, m.group(3))\n",
+            "print(RE_COLOR.search('nope') is None)\n",
+            "CASE = re.compile('abc', re.I)\n",
+            "print(CASE.search('xABCx') is not None)\n",
+        ),
+    )
+    .expect("failed to write temp program");
+    let program = program.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &program]);
+
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(stdout, "True 1, 22, 200\nTrue\nTrue\n");
+}
+
+#[test]
 fn run_functions() {
     let program = example("functions.py");
     let (code, stdout, stderr) = run(&["run", &program]);
@@ -1596,7 +1736,7 @@ fn check_import_unsupported() {
     assert_eq!(code, 1, "unsupported import must exit with status 1");
     assert!(stdout.is_empty(), "pyx check must not write to stdout");
     assert!(
-        stderr.contains("not supported"),
+        stderr.contains("not found") || stderr.contains("not supported"),
         "missing unsupported import diagnostic, got:\n{stderr}"
     );
 }
@@ -1615,16 +1755,13 @@ fn check_module_member_unknown() {
 }
 
 #[test]
-fn check_import_in_function() {
+fn check_import_in_function_is_deferred() {
+    // Nested imports are no longer rejected: native modules bind normally and
+    // user modules bind to a runtime error stub, so the program compiles.
     let program = example("errors/import_in_function.py");
-    let (code, stdout, stderr) = run(&["check", &program]);
+    let (code, _stdout, stderr) = run(&["check", &program]);
 
-    assert_eq!(code, 1, "function-local import must exit with status 1");
-    assert!(stdout.is_empty(), "pyx check must not write to stdout");
-    assert!(
-        stderr.contains("module level"),
-        "missing module-level import diagnostic, got:\n{stderr}"
-    );
+    assert_eq!(code, 0, "function-local import must check:\n{stderr}");
 }
 
 #[test]

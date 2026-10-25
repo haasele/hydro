@@ -29,3 +29,46 @@ try:
     print(sum(["a", "b"]))
 except TypeError as e:
     print("sum", e)
+
+print(ord("A"), ord("é"), chr(65), chr(233), chr(0x1F600))
+print(chr(ord("z")))
+
+try:
+    print(ord("ab"))
+except TypeError as e:
+    print("ord", e)
+
+try:
+    print(chr(-1))
+except ValueError as e:
+    print("chr", e)
+
+try:
+    print(chr(0xD800))
+except ValueError as e:
+    print("chr", e)
+
+if (n := 10) > 5:
+    print("walrus", n)
+print(n)
+
+i = 0
+while (i := i + 1) < 3:
+    print("loop", i)
+print("after", i)
+
+print([y := v * 2 for v in [1, 2, 3]])
+print(y)
+
+calls = [0]
+
+
+def probe(value):
+    calls[0] = calls[0] + 1
+    return value
+
+
+print(1 < probe(2) < 3, calls[0])
+print(3 < probe(2) < 5, calls[0])
+print(1 < probe(2) < probe(3) < 5, calls[0])
+print(0 <= i <= 1 < 2, i)

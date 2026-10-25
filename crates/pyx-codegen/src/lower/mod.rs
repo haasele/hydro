@@ -18,7 +18,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Linkage, Module};
 use pyx_ir::{
     BinOp, BoolOp, Builtin, Callee, CompClause, CompTarget, Const, ExcKind, Expr, ExprKind,
-    Function, FunctionId, Handler, LocalId, LocalInfo, Param, Program, Stmt, StmtKind, Type,
+    Function, FunctionId, Handler, LocalId, LocalInfo, Param, ParamKind, Program, Stmt, StmtKind,
+    Type, UnpackTarget,
 };
 
 use crate::CodegenError;
@@ -27,6 +28,9 @@ use crate::CodegenError;
 const NONE_TAG: i64 = 1;
 const FALSE_TAG: i64 = 9;
 const TRUE_TAG: i64 = 17;
+/// Reserved special immediate for `NotImplemented` (special payload 3); see
+/// `pyx_runtime::value::NOT_IMPLEMENTED`.
+const NOT_IMPLEMENTED_TAG: i64 = 25;
 
 /// Tagged-immediate integers are `payload << 3`; the payload is recovered with
 /// an arithmetic shift right.
@@ -105,10 +109,15 @@ struct Runtime {
     print: FuncId,
     len: FuncId,
     to_str: FuncId,
+    to_repr: FuncId,
+    hash: FuncId,
     format: FuncId,
     to_int: FuncId,
     to_float: FuncId,
     abs: FuncId,
+    all: FuncId,
+    ord: FuncId,
+    chr: FuncId,
     list_new: FuncId,
     list_append: FuncId,
     tuple_new: FuncId,
@@ -117,9 +126,11 @@ struct Runtime {
     set_from: FuncId,
     range_new: FuncId,
     list_from: FuncId,
+    tuple_from: FuncId,
     dict_from: FuncId,
     function_new: FuncId,
     closure_new: FuncId,
+    function_params: FuncId,
     coroutine_new: FuncId,
     generator_new: FuncId,
     await_value: FuncId,
@@ -127,29 +138,41 @@ struct Runtime {
     yield_from: FuncId,
     builtin_function: FuncId,
     call: FuncId,
+    call_star: FuncId,
+    deferred_call: FuncId,
+    arity_error: FuncId,
     map: FuncId,
     filter: FuncId,
     sum: FuncId,
     enumerate: FuncId,
     zip: FuncId,
-    unpack: FuncId,
+    unpack_seq: FuncId,
+    unpack_star: FuncId,
     dict_new: FuncId,
     dict_set: FuncId,
+    dict_merge: FuncId,
     subscript: FuncId,
     subscript_set: FuncId,
     slice: FuncId,
+    slice_set: FuncId,
     module_call: FuncId,
+    module_call_kw: FuncId,
     module_get: FuncId,
     module_value: FuncId,
+    deferred_import: FuncId,
     global_get: FuncId,
     global_set: FuncId,
     extension_call: FuncId,
     extension_get: FuncId,
     getattr: FuncId,
+    hasattr: FuncId,
     setattr: FuncId,
     class_new: FuncId,
+    /// Hidden ABI: the cached native class object of a built-in exception.
+    exception_class: FuncId,
     method: FuncId,
     method_kw: FuncId,
+    method_star: FuncId,
     iter_new: FuncId,
     iter_next: FuncId,
     iter_of: FuncId,
@@ -192,6 +215,8 @@ impl Runtime {
             print: declare_runtime(module, "pyx_print", &[i64t, ptr], Some(i64t))?,
             len: declare_runtime(module, "pyx_len", &[i64t], Some(i64t))?,
             to_str: declare_runtime(module, "pyx_to_str", &[i64t], Some(i64t))?,
+            to_repr: declare_runtime(module, "pyx_to_repr", &[i64t], Some(i64t))?,
+            hash: declare_runtime(module, "pyx_hash", &[i64t], Some(i64t))?,
             // One f-string field: value, static spec (ptr+len) and a `uint8_t`
             // conversion flag passed in a 32-bit register (C ABI).
             format: declare_runtime(
@@ -203,6 +228,9 @@ impl Runtime {
             to_int: declare_runtime(module, "pyx_to_int", &[i64t], Some(i64t))?,
             to_float: declare_runtime(module, "pyx_to_float", &[i64t], Some(i64t))?,
             abs: declare_runtime(module, "pyx_abs", &[i64t], Some(i64t))?,
+            all: declare_runtime(module, "pyx_all", &[i64t], Some(i64t))?,
+            ord: declare_runtime(module, "pyx_ord", &[i64t], Some(i64t))?,
+            chr: declare_runtime(module, "pyx_chr", &[i64t], Some(i64t))?,
             // `argc`/lengths are `usize`/`uint64_t` in the ABI: pointer-width.
             list_new: declare_runtime(module, "pyx_list_new", &[ptr, ptr], Some(i64t))?,
             list_append: declare_runtime(module, "pyx_list_append", &[i64t, i64t], Some(i64t))?,
@@ -213,6 +241,7 @@ impl Runtime {
             set_from: declare_runtime(module, "pyx_set_from", &[i64t], Some(i64t))?,
             range_new: declare_runtime(module, "pyx_range_new", &[i64t, i64t, i64t], Some(i64t))?,
             list_from: declare_runtime(module, "pyx_list_from", &[i64t], Some(i64t))?,
+            tuple_from: declare_runtime(module, "pyx_tuple_from", &[i64t], Some(i64t))?,
             dict_from: declare_runtime(module, "pyx_dict_from", &[i64t], Some(i64t))?,
             // `wrapper` is an `i64` function pointer in the ABI; `arity` and
             // `name_len` are `uint64_t`/`size_t`: pointer-width. `flags` is a
@@ -230,6 +259,15 @@ impl Runtime {
                 module,
                 "pyx_closure_new",
                 &[i64t, ptr, ptr, ptr, ptr, ptr, i32t],
+                Some(i64t),
+            )?,
+            // `function`, the parameter count and a pointer to `2 * count`
+            // words (name pointer, name length) of user-visible parameter
+            // names. Returns the function value unchanged.
+            function_params: declare_runtime(
+                module,
+                "pyx_function_params",
+                &[i64t, ptr, ptr],
                 Some(i64t),
             )?,
             // `entry` is the `__pyx_wrap_N` trampoline address passed as an
@@ -262,16 +300,36 @@ impl Runtime {
                 Some(i64t),
             )?,
             call: declare_runtime(module, "pyx_call", &[i64t, ptr, ptr], Some(i64t))?,
+            // Generic starred call: `fn(args, *star)`. `argc`/`argv` are the
+            // leading positional operands; `star` is the tagged list/tuple to
+            // flatten after them.
+            call_star: declare_runtime(
+                module,
+                "pyx_call_star",
+                &[i64t, ptr, ptr, i64t],
+                Some(i64t),
+            )?,
+            // `argc` is `size_t`/pointer-width; the helper only raises.
+            deferred_call: declare_runtime(module, "pyx_deferred_call", &[ptr, ptr], Some(i64t))?,
+            // `(expected, actual)` as `i64`; the wrapper passes its bound
+            // positional maximum and the supplied count.
+            arity_error: declare_runtime(module, "pyx_arity_error", &[i64t, i64t], Some(i64t))?,
             map: declare_runtime(module, "pyx_map", &[i64t, i64t], Some(i64t))?,
             filter: declare_runtime(module, "pyx_filter", &[i64t, i64t], Some(i64t))?,
             sum: declare_runtime(module, "pyx_sum", &[i64t, i64t], Some(i64t))?,
             enumerate: declare_runtime(module, "pyx_enumerate", &[i64t, i64t], Some(i64t))?,
             // `argc` is `uint64_t` in the ABI: pointer-width.
             zip: declare_runtime(module, "pyx_zip", &[ptr, ptr], Some(i64t))?,
-            // `expected` is a `size_t` in the ABI: pointer-width.
-            unpack: declare_runtime(module, "pyx_unpack", &[i64t, ptr], Some(i64t))?,
+            // `expected` is a `size_t` in the ABI: pointer-width. Returns the
+            // sequence being unpacked (the input itself for strings, bytes,
+            // lists and tuples; a fresh list for other iterables).
+            unpack_seq: declare_runtime(module, "pyx_unpack_seq", &[i64t, ptr], Some(i64t))?,
+            // `value`, the number of targets before and after the starred one.
+            // Returns a fresh list whose starred slot holds the middle list.
+            unpack_star: declare_runtime(module, "pyx_unpack_star", &[i64t, ptr, ptr], Some(i64t))?,
             dict_new: declare_runtime(module, "pyx_dict_new", &[ptr, ptr, ptr], Some(i64t))?,
             dict_set: declare_runtime(module, "pyx_dict_set", &[i64t, i64t, i64t], Some(i64t))?,
+            dict_merge: declare_runtime(module, "pyx_dict_merge", &[i64t, i64t], Some(i64t))?,
             subscript: declare_runtime(module, "pyx_subscript", &[i64t, i64t], Some(i64t))?,
             subscript_set: declare_runtime(
                 module,
@@ -280,12 +338,29 @@ impl Runtime {
                 Some(i64t),
             )?,
             slice: declare_runtime(module, "pyx_slice", &[i64t, i64t, i64t, i64t], Some(i64t))?,
+            // `target[start:stop:step] = value`; bounds and value are tagged
+            // values, omitted bounds are `None`. Returns the runtime `None`;
+            // errors are reported through the pending exception.
+            slice_set: declare_runtime(
+                module,
+                "pyx_slice_set",
+                &[i64t, i64t, i64t, i64t, i64t],
+                Some(i64t),
+            )?,
             // `module_len`, `function_len` and `argc` are `size_t`/`uint64_t`
             // in the ABI: pointer-width.
             module_call: declare_runtime(
                 module,
                 "pyx_module_call",
                 &[ptr, ptr, ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
+            // Same prefix as `pyx_module_call`, plus `kwargc` and `kw_argv`
+            // (`2 * kwargc` tagged values: name, value, ...).
+            module_call_kw: declare_runtime(
+                module,
+                "pyx_module_call_kw",
+                &[ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr],
                 Some(i64t),
             )?,
             // `module_len`/`name_len` are `size_t` in the ABI: pointer-width.
@@ -297,6 +372,14 @@ impl Runtime {
             )?,
             // `name_len` is a `size_t` in the ABI: pointer-width.
             module_value: declare_runtime(module, "pyx_module_value", &[ptr, ptr], Some(i64t))?,
+            // Module name and optional member, each a pointer/length pair. The
+            // helper always raises, so it never binds a real value.
+            deferred_import: declare_runtime(
+                module,
+                "pyx_deferred_import",
+                &[ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
             // Module name plus global name, each a pointer/length pair.
             global_get: declare_runtime(
                 module,
@@ -329,17 +412,23 @@ impl Runtime {
             )?,
             // `name_len` is a `size_t` in the ABI: pointer-width.
             getattr: declare_runtime(module, "pyx_getattr", &[i64t, ptr, ptr], Some(i64t))?,
+            hasattr: declare_runtime(module, "pyx_hasattr", &[i64t, ptr, ptr], Some(i64t))?,
             // `name_len` is a `size_t` in the ABI: pointer-width.
             setattr: declare_runtime(module, "pyx_setattr", &[i64t, ptr, ptr, i64t], Some(i64t))?,
-            // `name_len` and `method_count` are `size_t`/`usize` in the ABI:
-            // pointer-width. `names_ptr` holds tagged `str` values (method
-            // names) and `funcs_ptr` the matching function values.
+            // `name_len`, `method_count` and `attr_count` are `usize` in the
+            // ABI: pointer-width. `names_ptr`/`funcs_ptr`/`kinds_ptr` hold the
+            // method names, function values and raw binding-kind tags;
+            // `attr_names_ptr`/`attr_values_ptr` hold class attribute
+            // name/value pairs.
             class_new: declare_runtime(
                 module,
                 "pyx_class_new",
-                &[ptr, ptr, i64t, ptr, ptr, ptr],
+                &[ptr, ptr, i64t, ptr, ptr, ptr, ptr, ptr, ptr, ptr],
                 Some(i64t),
             )?,
+            // `tag` is a `uint32_t`; the runtime returns the cached native
+            // class object for that built-in exception.
+            exception_class: declare_runtime(module, "pyx_exception_class", &[i32t], Some(i64t))?,
             // `name_len`/`argc` are `size_t`/`uint64_t` in the ABI: pointer-width.
             method: declare_runtime(
                 module,
@@ -353,6 +442,14 @@ impl Runtime {
                 module,
                 "pyx_method_kw",
                 &[i64t, ptr, ptr, ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
+            // `name_len` and `kwargc` are pointer-width; `star` is the tagged
+            // operand to flatten, `kw_argv` holds `[name, value]` pairs.
+            method_star: declare_runtime(
+                module,
+                "pyx_method_star",
+                &[i64t, ptr, ptr, i64t, ptr, ptr],
                 Some(i64t),
             )?,
             iter_new: declare_runtime(module, "pyx_iter_new", &[i64t], Some(i64t))?,
@@ -476,7 +573,8 @@ pub(crate) fn lower_program<M: Module>(
         define_wrapper(
             module,
             index as FunctionId,
-            function.params.len(),
+            function,
+            &runtime,
             *symbols.get(&(index as FunctionId)).ok_or_else(|| {
                 CodegenError::new(format!("internal error: function {index} was not declared"))
             })?,
@@ -533,11 +631,16 @@ fn lower_function<M: Module>(
 ///
 /// `pyx_call` invokes function values with a uniform array of tagged values;
 /// the wrapper loads the arguments from `argv` and forwards them to the
-/// concrete `__pyx_fn_N` symbol.
+/// concrete `__pyx_fn_N` symbol. Functions with a dynamic signature (`*args`,
+/// `**kwargs` or keyword-only parameters) receive their total argument count
+/// as a tagged value at `argv[0]`; the wrapper then binds literal defaults,
+/// packs the remaining positional arguments into the `*args` list and creates
+/// the `**kwargs` dict before the call.
 fn define_wrapper<M: Module>(
     module: &mut M,
     index: FunctionId,
-    arity: usize,
+    function: &Function,
+    runtime: &Runtime,
     target: FuncId,
     wrapper: FuncId,
 ) -> Result<(), CodegenError> {
@@ -557,20 +660,26 @@ fn define_wrapper<M: Module>(
                 "internal error: wrapper {index} has no argv parameter"
             ))
         })?;
-        let mut args = Vec::with_capacity(arity);
-        for position in 0..arity {
-            let offset = position
-                .checked_mul(8)
-                .and_then(|offset| i32::try_from(offset).ok())
-                .ok_or_else(|| {
-                    CodegenError::new(format!(
-                        "internal error: wrapper {index} argument offset out of range"
-                    ))
-                })?;
-            let value = builder
-                .ins()
-                .load(types::I64, MemFlags::new(), argv, offset);
-            args.push(value);
+        let mut args = Vec::with_capacity(function.params.len());
+        if function.has_dynamic_signature() {
+            bind_dynamic_arguments(
+                module,
+                &mut builder,
+                ptr_ty,
+                function,
+                runtime,
+                index,
+                argv,
+                &mut args,
+            )?;
+        } else {
+            for position in 0..function.params.len() {
+                let offset = wrapper_arg_offset(index, position)?;
+                let value = builder
+                    .ins()
+                    .load(types::I64, MemFlags::new(), argv, offset);
+                args.push(value);
+            }
         }
 
         let reference = declare_ref(module, &mut builder, target);
@@ -589,6 +698,183 @@ fn define_wrapper<M: Module>(
     module
         .define_function(wrapper, &mut ctx)
         .map_err(|e| module_error(&format!("cannot define wrapper {index}"), e))
+}
+
+/// Byte offset of argument slot `position` in a wrapper's `argv` buffer.
+fn wrapper_arg_offset(index: FunctionId, position: usize) -> Result<i32, CodegenError> {
+    position
+        .checked_mul(8)
+        .and_then(|offset| i32::try_from(offset).ok())
+        .ok_or_else(|| {
+            CodegenError::new(format!(
+                "internal error: wrapper {index} argument offset out of range"
+            ))
+        })
+}
+
+/// Reinterpret an `i64` as a pointer-width integer (the ABI uses `usize` for
+/// lengths).
+fn as_pointer_width(builder: &mut FunctionBuilder, ptr_ty: ir::Type, value: Value) -> Value {
+    if ptr_ty == types::I64 {
+        value
+    } else {
+        builder.ins().ireduce(ptr_ty, value)
+    }
+}
+
+/// Materialise an IR [`Const`] in a wrapper body.
+fn wrapper_const<M: Module>(
+    module: &mut M,
+    builder: &mut FunctionBuilder,
+    ptr_ty: ir::Type,
+    runtime: &Runtime,
+    value: &Const,
+) -> Result<Value, CodegenError> {
+    Ok(match value {
+        Const::Int(value) => builder.ins().iconst(types::I64, value.wrapping_shl(3)),
+        Const::Bool(true) => builder.ins().iconst(types::I64, TRUE_TAG),
+        Const::Bool(false) => builder.ins().iconst(types::I64, FALSE_TAG),
+        Const::None => builder.ins().iconst(types::I64, NONE_TAG),
+        Const::NotImplemented => builder.ins().iconst(types::I64, NOT_IMPLEMENTED_TAG),
+        Const::Float(value) => {
+            let float = builder.ins().f64const(*value);
+            call_val_extern(module, builder, runtime.float_new, &[float])
+        }
+        Const::Str(text) => {
+            let (slot, len) = make_bytes_slot(builder, text.as_bytes())?;
+            let ptr = builder.ins().stack_addr(ptr_ty, slot, 0);
+            let len_value = builder.ins().iconst(types::I64, len as i64);
+            let len = as_pointer_width(builder, ptr_ty, len_value);
+            call_val_extern(module, builder, runtime.str_new, &[ptr, len])
+        }
+        Const::Bytes(bytes) => {
+            let (slot, len) = make_bytes_slot(builder, bytes)?;
+            let ptr = builder.ins().stack_addr(ptr_ty, slot, 0);
+            let len_value = builder.ins().iconst(types::I64, len as i64);
+            let len = as_pointer_width(builder, ptr_ty, len_value);
+            call_val_extern(module, builder, runtime.bytes_new, &[ptr, len])
+        }
+    })
+}
+
+/// Bind the arguments of a dynamic signature in a generated wrapper.
+///
+/// The buffer layout is `[tagged total count, captures..., user arguments...]`.
+/// The wrapper fills the concrete function's parameter slots in order:
+/// captures, positional parameters (literal defaults replace missing values),
+/// the `*args` list, keyword-only parameters (their defaults) and the
+/// `**kwargs` dict.
+#[allow(clippy::too_many_arguments)]
+fn bind_dynamic_arguments<M: Module>(
+    module: &mut M,
+    builder: &mut FunctionBuilder,
+    ptr_ty: ir::Type,
+    function: &Function,
+    runtime: &Runtime,
+    index: FunctionId,
+    argv: Value,
+    args: &mut Vec<Value>,
+) -> Result<(), CodegenError> {
+    let total = builder.ins().load(types::I64, MemFlags::new(), argv, 0);
+    let total = builder.ins().sshr_imm(total, INT_TAG_SHIFT);
+    let capture_count = function.capture_count;
+    let user_count = builder.ins().iadd_imm(total, -(capture_count as i64));
+    let positional_end = function.positional_end();
+    let fixed = positional_end.saturating_sub(capture_count);
+
+    // Without a `*args` slot, extra positional arguments cannot be bound.
+    // The runtime checked the minimum arity before entering the wrapper, so
+    // only the maximum is validated here.
+    if function.vararg().is_none() {
+        let raise_block = builder.create_block();
+        let continue_block = builder.create_block();
+        let too_many = builder
+            .ins()
+            .icmp_imm(IntCC::SignedGreaterThan, user_count, fixed as i64);
+        builder
+            .ins()
+            .brif(too_many, raise_block, &[], continue_block, &[]);
+        builder.switch_to_block(raise_block);
+        let expected = builder.ins().iconst(types::I64, fixed as i64);
+        let result = call_val_extern(
+            module,
+            builder,
+            runtime.arity_error,
+            &[expected, user_count],
+        );
+        builder.ins().return_(&[result]);
+        builder.switch_to_block(continue_block);
+    }
+
+    for position in 0..capture_count {
+        let offset = wrapper_arg_offset(index, position + 1)?;
+        args.push(
+            builder
+                .ins()
+                .load(types::I64, MemFlags::new(), argv, offset),
+        );
+    }
+
+    for position in 0..fixed {
+        let offset = wrapper_arg_offset(index, position + 1 + capture_count)?;
+        let loaded = builder
+            .ins()
+            .load(types::I64, MemFlags::new(), argv, offset);
+        let value = match &function.params[capture_count + position].default {
+            Some(default) => {
+                let fallback = wrapper_const(module, builder, ptr_ty, runtime, default)?;
+                let present =
+                    builder
+                        .ins()
+                        .icmp_imm(IntCC::SignedGreaterThan, user_count, position as i64);
+                builder.ins().select(present, loaded, fallback)
+            }
+            None => loaded,
+        };
+        args.push(value);
+    }
+
+    if function.vararg().is_some() {
+        let extra = builder.ins().iadd_imm(user_count, -(fixed as i64));
+        let count = if fixed == 0 {
+            user_count
+        } else {
+            let has_extra =
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedGreaterThan, user_count, fixed as i64 - 1);
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.ins().select(has_extra, extra, zero)
+        };
+        let count = as_pointer_width(builder, ptr_ty, count);
+        let first_extra = wrapper_arg_offset(index, 1 + capture_count + fixed)?;
+        let extras = builder.ins().iadd_imm(argv, i64::from(first_extra));
+        let list = call_val_extern(module, builder, runtime.list_new, &[count, extras]);
+        args.push(list);
+    }
+
+    for param in function.kwonly_params() {
+        let value = match &param.default {
+            Some(default) => wrapper_const(module, builder, ptr_ty, runtime, default)?,
+            None => builder.ins().iconst(types::I64, NONE_TAG),
+        };
+        args.push(value);
+    }
+
+    if function.kwarg().is_some() {
+        let null = builder.ins().iconst(ptr_ty, 0);
+        let dict = call_val_extern(module, builder, runtime.dict_new, &[null, null, null]);
+        args.push(dict);
+    }
+
+    if args.len() != function.params.len() {
+        return Err(CodegenError::new(format!(
+            "internal error: wrapper {index} bound {} of {} parameters",
+            args.len(),
+            function.params.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Loop targets for `break`/`continue`.
@@ -790,7 +1076,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// generator object are created from this flag word by the function
     /// wrappers.
     fn function_flags(&mut self, function: &Function) -> Value {
-        let flags = u32::from(function.is_async) | (u32::from(function.is_generator) << 1);
+        let flags = u32::from(function.is_async)
+            | (u32::from(function.is_generator) << 1)
+            | (u32::from(function.has_dynamic_signature()) << 2);
         self.builder.ins().iconst(types::I32, i64::from(flags))
     }
 
@@ -1360,6 +1648,26 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let _ = self.call_rt(id, &[object, index, value])?;
                 self.emit_exc_check()?;
             }
+            StmtKind::SetSlice {
+                target,
+                start,
+                stop,
+                step,
+                value,
+            } => {
+                // Python evaluates the right-hand side first, then the target
+                // expression, then the bounds in source order. Omitted bounds
+                // arrive as `Const::None`, which lowers to the runtime `None`
+                // sentinel.
+                let value = self.lower_expr(value)?;
+                let object = self.lower_expr(target)?;
+                let start = self.lower_expr(start)?;
+                let stop = self.lower_expr(stop)?;
+                let step = self.lower_expr(step)?;
+                let id = self.runtime.slice_set;
+                let _ = self.call_rt(id, &[object, start, stop, step, value])?;
+                self.emit_exc_check()?;
+            }
             StmtKind::Closure {
                 target,
                 function,
@@ -1382,16 +1690,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         func.capture_count
                     )));
                 }
-                let user_arity = func
-                    .params
-                    .len()
-                    .checked_sub(func.capture_count)
-                    .ok_or_else(|| {
-                        CodegenError::new(format!(
-                            "internal error: function '{}' has more captures than parameters",
-                            func.name
-                        ))
-                    })?;
+                let user_arity = func.call_arity();
                 let name = func.name.clone();
                 let wrapper = *self.wrappers.get(function).ok_or_else(|| {
                     CodegenError::new(format!(
@@ -1437,6 +1736,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     ],
                 )?;
                 self.emit_exc_check()?;
+                let closure = self.attach_function_params(closure, func)?;
                 let var = self.local_var(*target)?;
                 self.builder.def_var(var, closure);
             }
@@ -1445,9 +1745,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 name,
                 base,
                 methods,
+                attributes,
             } => {
-                // Python evaluates the base expression first, then creates the
-                // method functions while executing the class body.
+                // Python evaluates the base expression first, then executes the
+                // class body (creating methods and evaluating attributes).
                 let base = match base {
                     Some(base) => self.lower_expr(base)?,
                     None => self.none(),
@@ -1459,6 +1760,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
 
                 let names_slot = self.stack_array_slot(methods.len(), "class method names")?;
                 let funcs_slot = self.stack_array_slot(methods.len(), "class method functions")?;
+                let kinds_slot = self.stack_array_slot(methods.len(), "class method kinds")?;
                 for (index, method) in methods.iter().enumerate() {
                     let (name_slot, name_len) =
                         make_bytes_slot(&mut self.builder, method.name.as_bytes())?;
@@ -1475,6 +1777,36 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     self.builder
                         .ins()
                         .stack_store(function, funcs_slot, (index * 8) as i32);
+
+                    let kind = self
+                        .builder
+                        .ins()
+                        .iconst(self.ptr_ty, method.kind.abi_tag());
+                    self.builder
+                        .ins()
+                        .stack_store(kind, kinds_slot, (index * 8) as i32);
+                }
+
+                let attr_names_slot =
+                    self.stack_array_slot(attributes.len(), "class attribute names")?;
+                let attr_values_slot =
+                    self.stack_array_slot(attributes.len(), "class attribute values")?;
+                for (index, attribute) in attributes.iter().enumerate() {
+                    let (name_slot, name_len) =
+                        make_bytes_slot(&mut self.builder, attribute.name.as_bytes())?;
+                    let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+                    let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
+                    let id = self.runtime.str_new;
+                    let attr_name = self.call_rt(id, &[name_ptr, name_len])?;
+                    self.emit_exc_check()?;
+                    self.builder
+                        .ins()
+                        .stack_store(attr_name, attr_names_slot, (index * 8) as i32);
+
+                    let value = self.lower_expr(&attribute.value)?;
+                    self.builder
+                        .ins()
+                        .stack_store(value, attr_values_slot, (index * 8) as i32);
                 }
 
                 let (class_slot, class_len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
@@ -1483,11 +1815,35 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let count = self.builder.ins().iconst(self.ptr_ty, methods.len() as i64);
                 let names_ptr = self.builder.ins().stack_addr(self.ptr_ty, names_slot, 0);
                 let funcs_ptr = self.builder.ins().stack_addr(self.ptr_ty, funcs_slot, 0);
+                let kinds_ptr = self.builder.ins().stack_addr(self.ptr_ty, kinds_slot, 0);
+                let attr_count = self
+                    .builder
+                    .ins()
+                    .iconst(self.ptr_ty, attributes.len() as i64);
+                let attr_names_ptr = self
+                    .builder
+                    .ins()
+                    .stack_addr(self.ptr_ty, attr_names_slot, 0);
+                let attr_values_ptr =
+                    self.builder
+                        .ins()
+                        .stack_addr(self.ptr_ty, attr_values_slot, 0);
                 let base = self.builder.use_var(base_holder);
                 let id = self.runtime.class_new;
                 let class = self.call_rt(
                     id,
-                    &[class_ptr, class_len, base, count, names_ptr, funcs_ptr],
+                    &[
+                        class_ptr,
+                        class_len,
+                        base,
+                        count,
+                        names_ptr,
+                        funcs_ptr,
+                        kinds_ptr,
+                        attr_count,
+                        attr_names_ptr,
+                        attr_values_ptr,
+                    ],
                 )?;
                 self.emit_exc_check()?;
                 let var = self.local_var(*target)?;
@@ -1518,24 +1874,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_exc_check()?;
             }
             StmtKind::Unpack { targets, value } => {
-                // Evaluate the right-hand side once and park it in a variable
-                // so that it stays available while the targets are read out.
-                let items = self.lower_expr(value)?;
-                let holder = self.temp_var();
-                self.builder.def_var(holder, items);
-                let expected = self.builder.ins().iconst(self.ptr_ty, targets.len() as i64);
-                let id = self.runtime.unpack;
-                let _ = self.call_rt(id, &[items, expected])?;
-                self.emit_exc_check()?;
-                for (index, target) in targets.iter().enumerate() {
-                    let items = self.builder.use_var(holder);
-                    let index = self.tagged_int((index as i64).wrapping_shl(3));
-                    let id = self.runtime.subscript;
-                    let item = self.call_rt(id, &[items, index])?;
-                    self.emit_exc_check()?;
-                    let var = self.local_var(*target)?;
-                    self.builder.def_var(var, item);
-                }
+                let value = self.lower_expr(value)?;
+                self.bind_unpack(targets.as_slice(), value)?;
             }
             StmtKind::Return(value) => {
                 let value = match value {
@@ -1566,6 +1906,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             }
             StmtKind::Raise { exc, msg, cause } => {
                 self.lower_raise(*exc, msg.as_ref(), cause.as_ref())?;
+            }
+            StmtKind::Assert { test, msg } => {
+                let condition = self.lower_expr(test)?;
+                let passed = self.truthy_cond(condition)?;
+                let failure = self.builder.create_block();
+                let after = self.builder.create_block();
+                self.builder.ins().brif(passed, after, &[], failure, &[]);
+                self.switch_to(failure);
+                // The message is evaluated only on failure and becomes the
+                // `AssertionError` message (`assert x` has none).
+                self.lower_raise(Some(ExcKind::AssertionError), msg.as_ref(), None)?;
+                self.switch_to(after);
             }
             StmtKind::Try {
                 body,
@@ -1937,21 +2289,114 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.builder.def_var(var, value);
             }
             CompTarget::Unpack(targets) => {
-                // Keep the sequence in a temporary root while its elements are
-                // read out one by one.
-                let holder = self.temp_var();
-                self.builder.def_var(holder, value);
+                self.bind_unpack(targets.as_slice(), value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialise and validate `value` against `targets`, then bind the
+    /// extracted elements left to right.
+    ///
+    /// The source is evaluated by the caller (before this runs) and parked in
+    /// a variable so it stays a GC root while `pyx_unpack_seq` may allocate.
+    /// For lists, tuples, strings and bytes the runtime returns the source
+    /// itself; other iterables (including existing iterators and generators)
+    /// become a fresh list, which the holder roots for the element reads.
+    fn bind_unpack(
+        &mut self,
+        targets: &'a [UnpackTarget],
+        value: Value,
+    ) -> Result<(), CodegenError> {
+        let holder = self.temp_var();
+        self.builder.def_var(holder, value);
+        // One `*target` collects the elements no plain target consumed; the
+        // runtime returns a fresh list whose starred slot is that middle list,
+        // so the element reads stay identical to the exact-length case.
+        let sequence = match targets
+            .iter()
+            .position(|target| matches!(target, UnpackTarget::Star(_)))
+        {
+            Some(star) => {
+                let before = self.builder.ins().iconst(self.ptr_ty, star as i64);
+                let after = self
+                    .builder
+                    .ins()
+                    .iconst(self.ptr_ty, (targets.len() - star - 1) as i64);
+                self.call_rt(self.runtime.unpack_star, &[value, before, after])?
+            }
+            None => {
                 let expected = self.builder.ins().iconst(self.ptr_ty, targets.len() as i64);
-                let _ = self.call_rt(self.runtime.unpack, &[value, expected])?;
+                self.call_rt(self.runtime.unpack_seq, &[value, expected])?
+            }
+        };
+        self.emit_exc_check()?;
+        self.builder.def_var(holder, sequence);
+        for (index, target) in targets.iter().enumerate() {
+            let sequence = self.builder.use_var(holder);
+            let index = self.tagged_int((index as i64).wrapping_shl(3));
+            let item = self.call_rt(self.runtime.subscript, &[sequence, index])?;
+            self.emit_exc_check()?;
+            self.bind_unpack_target(target, item)?;
+        }
+        Ok(())
+    }
+
+    /// Bind one already-extracted element to a target. Nested targets recurse;
+    /// attribute and subscript receivers are evaluated here, after the source
+    /// and after every earlier target, matching Python's store order.
+    fn bind_unpack_target(
+        &mut self,
+        target: &'a UnpackTarget,
+        value: Value,
+    ) -> Result<(), CodegenError> {
+        match target {
+            UnpackTarget::Name(id) => {
+                let var = self.local_var(*id)?;
+                self.builder.def_var(var, value);
+            }
+            UnpackTarget::Attr { object, name } => {
+                // Park the element while the receiver expression runs: the
+                // calls it may make can trigger a collection or raise.
+                let value_holder = self.temp_var();
+                self.builder.def_var(value_holder, value);
+                let object = self.lower_expr(object)?;
+                let object_holder = self.temp_var();
+                self.builder.def_var(object_holder, object);
+
+                let (name_slot, name_len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
+                let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+                let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
+                let object = self.builder.use_var(object_holder);
+                let value = self.builder.use_var(value_holder);
+                let _ = self.call_rt(self.runtime.setattr, &[object, name_ptr, name_len, value])?;
                 self.emit_exc_check()?;
-                for (index, id) in targets.iter().enumerate() {
-                    let items = self.builder.use_var(holder);
-                    let index = self.tagged_int((index as i64).wrapping_shl(3));
-                    let item = self.call_rt(self.runtime.subscript, &[items, index])?;
-                    self.emit_exc_check()?;
-                    let var = self.local_var(*id)?;
-                    self.builder.def_var(var, item);
-                }
+            }
+            UnpackTarget::Subscript { object, index } => {
+                // Python evaluates the receiver, then the index, both after the
+                // element was extracted.
+                let value_holder = self.temp_var();
+                self.builder.def_var(value_holder, value);
+                let object = self.lower_expr(object)?;
+                let object_holder = self.temp_var();
+                self.builder.def_var(object_holder, object);
+                let index = self.lower_expr(index)?;
+                let index_holder = self.temp_var();
+                self.builder.def_var(index_holder, index);
+
+                let object = self.builder.use_var(object_holder);
+                let index = self.builder.use_var(index_holder);
+                let value = self.builder.use_var(value_holder);
+                let _ = self.call_rt(self.runtime.subscript_set, &[object, index, value])?;
+                self.emit_exc_check()?;
+            }
+            UnpackTarget::Nested(targets) => {
+                self.bind_unpack(targets.as_slice(), value)?;
+            }
+            // The element is the fresh middle list; bind it like any other
+            // value (the frontend only allows a name, attribute or subscript).
+            UnpackTarget::Star(target) => {
+                self.bind_unpack_target(target, value)?;
             }
         }
         Ok(())
@@ -2096,9 +2541,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         let matches = match kind {
                             // `Exception` matches every concrete kind except
                             // `KeyboardInterrupt`/`GeneratorExit`, and
-                            // `BaseException` matches everything. The runtime
-                            // owns that hierarchy so codegen only asks it.
-                            ExcKind::Exception | ExcKind::BaseException => {
+                            // `BaseException` matches everything. `OSError`
+                            // and its `FileNotFoundError` subclass match each
+                            // other. The runtime owns that hierarchy so
+                            // codegen only asks it.
+                            ExcKind::Exception
+                            | ExcKind::BaseException
+                            | ExcKind::OSError
+                            | ExcKind::FileNotFoundError => {
                                 let tag = self.builder.ins().iconst(types::I32, kind.tag() as i64);
                                 let id = self.runtime.exc_matches;
                                 let caught = self.call_rt(id, &[tag])?;
@@ -2324,6 +2774,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let var = self.local_var(*id)?;
                 Ok(self.builder.use_var(var))
             }
+            ExprKind::NamedExpr { target, value } => {
+                // The value is evaluated first, then stored in the local; the
+                // local is a GC root via `declare_var`, so the value stays
+                // reachable while it is also the expression result.
+                let var = self.local_var(*target)?;
+                let value = self.lower_expr(value)?;
+                self.builder.def_var(var, value);
+                Ok(value)
+            }
             ExprKind::Bin { op, lhs, rhs } => {
                 // Both operands are evaluated left to right before the
                 // operation itself, as in Python.
@@ -2356,6 +2815,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 Ok(result)
             }
             ExprKind::BoolOp { op, lhs, rhs } => self.lower_boolop(*op, lhs, rhs),
+            ExprKind::IfExp { test, then, orelse } => self.lower_ifexp(test, then, orelse),
             ExprKind::List(items) => {
                 let id = self.runtime.list_new;
                 self.lower_items_literal(items, "list literal", id)
@@ -2444,8 +2904,12 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 module,
                 function,
                 args,
-            } => self.lower_module_call(module, function, args),
+                keywords,
+            } => self.lower_module_call(module, function, args, keywords),
             ExprKind::ModuleRef { module } => self.lower_module_ref(module),
+            ExprKind::DeferredImport { module, member } => {
+                self.lower_deferred_import(module, member.as_deref())
+            }
             ExprKind::GlobalGet { module, name } => self.lower_global_get(module, name),
             ExprKind::ModuleAttr { module, name } => self.lower_module_attr(module, name),
             ExprKind::ExtensionAttr { path, member } => self.lower_extension_attr(path, member),
@@ -2454,12 +2918,25 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 object,
                 method,
                 args,
+                star,
                 keywords,
-            } => self.lower_method_call(object, method, args, keywords),
+            } => self.lower_method_call(object, method, args, star.as_deref(), keywords),
             ExprKind::FunctionRef(id) => self.lower_function_ref(*id),
             ExprKind::BuiltinRef(builtin) => self.lower_builtin_ref(*builtin),
-            ExprKind::IndirectCall { callee, args } => self.lower_indirect_call(callee, args),
+            ExprKind::ExceptionClass(kind) => {
+                let tag = self.builder.ins().iconst(types::I32, kind.tag() as i64);
+                let id = self.runtime.exception_class;
+                let class = self.call_rt(id, &[tag])?;
+                self.emit_exc_check()?;
+                Ok(class)
+            }
+            ExprKind::IndirectCall { callee, args, star } => {
+                self.lower_indirect_call(callee, args, star.as_deref())
+            }
             ExprKind::Call { callee, args } => self.lower_call(callee, args),
+            ExprKind::DeferredCall { callee, args } => {
+                self.lower_deferred_call(callee.as_deref(), args)
+            }
             ExprKind::Await { value } => {
                 let value = self.lower_expr(value)?;
                 let id = self.runtime.await_value;
@@ -2668,24 +3145,80 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             })
     }
 
-    /// Lower `object.method(args..., name=value...)` to a dynamic method call.
+    /// Lower `then if test else orelse`.
     ///
-    /// Python evaluates the receiver, then the positional arguments, then the
-    /// keyword values, each left to right. The receiver and each already
-    /// evaluated argument are stored into stack slots immediately so that a
-    /// collection triggered by a later allocation can still observe them.
-    /// Calls without keywords keep using `pyx_method`; calls with keywords use
-    /// `pyx_method_kw` with `[name, value]` pairs.
+    /// Only the selected branch is evaluated: the test drives a `brif` into
+    /// two blocks whose values meet in a single result block parameter, the
+    /// same shape as [`Self::lower_boolop`].
+    fn lower_ifexp(
+        &mut self,
+        test: &'a Expr,
+        then: &'a Expr,
+        orelse: &'a Expr,
+    ) -> Result<Value, CodegenError> {
+        let condition = self.lower_expr(test)?;
+        let condition = self.truthy_cond(condition)?;
+        let then_block = self.builder.create_block();
+        let else_block = self.builder.create_block();
+        let after = self.builder.create_block();
+        self.builder.append_block_param(after, types::I64);
+        self.builder
+            .ins()
+            .brif(condition, then_block, &[], else_block, &[]);
+
+        self.switch_to(then_block);
+        let then_value = self.lower_expr(then)?;
+        let then_arg = [ir::BlockArg::from(then_value)];
+        self.builder.ins().jump(after, &then_arg);
+        self.terminated = true;
+
+        self.switch_to(else_block);
+        let else_value = self.lower_expr(orelse)?;
+        let else_arg = [ir::BlockArg::from(else_value)];
+        self.builder.ins().jump(after, &else_arg);
+        self.terminated = true;
+
+        self.switch_to(after);
+        self.builder
+            .block_params(after)
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                CodegenError::new("internal error: conditional expression result has no parameter")
+            })
+    }
+
+    /// Lower `object.method(args..., name=value...)` or
+    /// `object.method(*star, name=value...)` to a dynamic method call.
+    ///
+    /// Python evaluates the receiver, then the positional arguments (or the
+    /// starred operand), then the keyword values, each left to right. The
+    /// receiver and each already evaluated argument are stored into stack
+    /// slots immediately so that a collection triggered by a later allocation
+    /// can still observe them. Calls without keywords keep using `pyx_method`;
+    /// calls with keywords use `pyx_method_kw`; a starred operand uses
+    /// `pyx_method_star`, which flattens it into positional arguments.
     fn lower_method_call(
         &mut self,
         object: &'a Expr,
         method: &str,
         args: &'a [Expr],
+        star: Option<&'a Expr>,
         keywords: &'a [(String, Expr)],
     ) -> Result<Value, CodegenError> {
+        if star.is_some() && !args.is_empty() {
+            return Err(CodegenError::new(
+                "method call cannot mix positional and starred arguments",
+            ));
+        }
         let receiver_slot = self.stack_array_slot(1, "method receiver")?;
         let receiver = self.lower_expr(object)?;
         self.builder.ins().stack_store(receiver, receiver_slot, 0);
+        let star_slot = if star.is_some() {
+            Some(self.stack_array_slot(1, "method starred argument")?)
+        } else {
+            None
+        };
 
         let argv_slot = self.stack_array_slot(args.len(), "method arguments")?;
         for (index, arg) in args.iter().enumerate() {
@@ -2694,6 +3227,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 .ins()
                 .stack_store(value, argv_slot, (index * 8) as i32);
         }
+        // The starred operand is evaluated after the receiver and before the
+        // keywords, matching its position in the call. It is parked in a
+        // stack slot like the receiver so that a collection triggered by a
+        // keyword value can still observe it.
+        let star = match (star, star_slot) {
+            (Some(star), Some(slot)) => {
+                let value = self.lower_expr(star)?;
+                self.builder.ins().stack_store(value, slot, 0);
+                Some(value)
+            }
+            _ => None,
+        };
 
         let receiver = self.builder.ins().stack_load(types::I64, receiver_slot, 0);
         // Empty names still get a valid, non-null pointer to a one-byte slot.
@@ -2704,7 +3249,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         // `argc == 0` still passes a valid pointer (the slot has one element).
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
 
-        if keywords.is_empty() {
+        if star.is_none() && keywords.is_empty() {
             let id = self.runtime.method;
             let result = self.call_rt(id, &[receiver, name, name_len, argc, argv])?;
             self.emit_exc_check()?;
@@ -2732,23 +3277,40 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             .ins()
             .iconst(self.ptr_ty, keywords.len() as i64);
         let kw_argv = self.builder.ins().stack_addr(self.ptr_ty, kw_slot, 0);
+        if star.is_some() {
+            let Some(star_slot) = star_slot else {
+                return Err(CodegenError::new(
+                    "internal error: starred method call without a stack slot",
+                ));
+            };
+            let star = self.builder.ins().stack_load(types::I64, star_slot, 0);
+            let id = self.runtime.method_star;
+            let result = self.call_rt(id, &[receiver, name, name_len, star, kwargc, kw_argv])?;
+            self.emit_exc_check()?;
+            return Ok(result);
+        }
         let id = self.runtime.method_kw;
         let result = self.call_rt(id, &[receiver, name, name_len, argc, argv, kwargc, kw_argv])?;
         self.emit_exc_check()?;
         Ok(result)
     }
 
-    /// Lower `module.function(args...)` to `pyx_module_call`.
+    /// Lower `module.function(args...)` to `pyx_module_call`, or to
+    /// `pyx_module_call_kw` when the spec keeps keyword names
+    /// (`functools.partial`'s `**kwargs`).
     ///
     /// Python evaluates the arguments left to right before the call; each
     /// value is stored into an 8-byte-aligned stack array immediately so that
     /// a collection triggered by a later allocation cannot observe a stale
     /// value. Module and function names are materialized in byte slots.
+    /// Keyword names are constant strings in the IR and become string values,
+    /// so the runtime consumes one uniform `[name, value, ...]` buffer.
     fn lower_module_call(
         &mut self,
         module: &str,
         function: &str,
         args: &'a [Expr],
+        keywords: &'a [(String, Expr)],
     ) -> Result<Value, CodegenError> {
         let argv_slot = self.stack_array_slot(args.len(), "module call arguments")?;
         for (index, arg) in args.iter().enumerate() {
@@ -2756,6 +3318,23 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             self.builder
                 .ins()
                 .stack_store(value, argv_slot, (index * 8) as i32);
+        }
+        let kw_slot = self.stack_array_slot(
+            keywords
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| CodegenError::new("module call: too many keyword arguments"))?,
+            "module call keyword arguments",
+        )?;
+        for (index, (name, value)) in keywords.iter().enumerate() {
+            let name = self.str_const(name)?;
+            self.builder
+                .ins()
+                .stack_store(name, kw_slot, (index * 16) as i32);
+            let value = self.lower_expr(value)?;
+            self.builder
+                .ins()
+                .stack_store(value, kw_slot, (index * 16 + 8) as i32);
         }
 
         // Empty names still get a valid, non-null pointer to a one-byte slot.
@@ -2769,7 +3348,28 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
         // `argc == 0` still passes a valid pointer (the slot has one element).
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
-        let id = self.runtime.module_call;
+        if keywords.is_empty() {
+            let id = self.runtime.module_call;
+            let result = self.call_rt(
+                id,
+                &[
+                    module_ptr,
+                    module_len,
+                    function_ptr,
+                    function_len,
+                    argc,
+                    argv,
+                ],
+            )?;
+            self.emit_exc_check()?;
+            return Ok(result);
+        }
+        let kwargc = self
+            .builder
+            .ins()
+            .iconst(self.ptr_ty, keywords.len() as i64);
+        let kw_argv = self.builder.ins().stack_addr(self.ptr_ty, kw_slot, 0);
+        let id = self.runtime.module_call_kw;
         let result = self.call_rt(
             id,
             &[
@@ -2779,6 +3379,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 function_len,
                 argc,
                 argv,
+                kwargc,
+                kw_argv,
             ],
         )?;
         self.emit_exc_check()?;
@@ -2797,6 +3399,27 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
         let id = self.runtime.module_value;
         let result = self.call_rt(id, &[name_ptr, name_len])?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
+    /// Lower a name bound by a nested import to `pyx_deferred_import`.
+    ///
+    /// The helper never returns normally: it raises `RuntimeError` naming the
+    /// module and member, so no dynamic import takes place. The exception
+    /// check makes the generated code branch to the unit's handler like any
+    /// other failing runtime call.
+    fn lower_deferred_import(
+        &mut self,
+        module: &str,
+        member: Option<&str>,
+    ) -> Result<Value, CodegenError> {
+        let (module_ptr, module_len) = self.module_name_args(module)?;
+        // An empty member means the binding is a module alias; the ABI treats
+        // a zero length as "no member".
+        let (member_ptr, member_len) = self.module_name_args(member.unwrap_or(""))?;
+        let id = self.runtime.deferred_import;
+        let result = self.call_rt(id, &[module_ptr, module_len, member_ptr, member_len])?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -2942,14 +3565,17 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// function with `pyx_builtin_function` and calls it through `pyx_call`,
     /// exactly like `g = getattr; g(obj, name)`.
     fn lower_getattr_builtin(&mut self, args: &'a [Expr]) -> Result<Value, CodegenError> {
-        let [object, name] = args else {
+        if args.len() != 2 && args.len() != 3 {
             return Err(CodegenError::new(format!(
-                "builtin getattr expects 2 arguments, got {}",
+                "builtin getattr expects 2 or 3 arguments, got {}",
                 args.len()
             )));
-        };
-        if let ExprKind::Const(Const::Str(name)) = &name.kind {
-            return self.lower_getattr(object, name);
+        }
+        if args.len() == 2 {
+            let [object, name] = args else { unreachable!() };
+            if let ExprKind::Const(Const::Str(name)) = &name.kind {
+                return self.lower_getattr(object, name);
+            }
         }
 
         // Park the callee and both arguments in stack slots as soon as they
@@ -2963,20 +3589,50 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.emit_exc_check()?;
         self.builder.ins().stack_store(function, callee_slot, 0);
 
-        let argv_slot = self.stack_array_slot(2, "getattr arguments")?;
-        let object = self.lower_expr(object)?;
-        self.builder.ins().stack_store(object, argv_slot, 0);
-        let name_value = self.lower_expr(name)?;
-        self.builder.ins().stack_store(name_value, argv_slot, 8);
-        // Reload after both argument expressions: the slot is the GC-safe
+        let argv_slot = self.stack_array_slot(args.len(), "getattr arguments")?;
+        for (index, argument) in args.iter().enumerate() {
+            let value = self.lower_expr(argument)?;
+            self.builder
+                .ins()
+                .stack_store(value, argv_slot, (index * 8) as i32);
+        }
+        // Reload after all argument expressions: the slot is the GC-safe
         // owner of the callee while they may allocate.
         let callee = self.builder.ins().stack_load(types::I64, callee_slot, 0);
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
-        let argc = self.builder.ins().iconst(self.ptr_ty, 2);
+        let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
         let id = self.runtime.call;
         let result = self.call_rt(id, &[callee, argc, argv])?;
         self.emit_exc_check()?;
         Ok(result)
+    }
+
+    /// Lower `hasattr(object, name)`.
+    ///
+    /// A constant name uses the `pyx_hasattr(object, bytes, len)` entry point,
+    /// like `getattr`; a dynamic name (including a non-string, which the
+    /// runtime rejects with `TypeError`) goes through the builtin function
+    /// value so the attribute name stays a plain tagged string.
+    fn lower_hasattr_builtin(&mut self, args: &'a [Expr]) -> Result<Value, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::new(format!(
+                "builtin hasattr expects 2 arguments, got {}",
+                args.len()
+            )));
+        }
+        let [object, name] = args else { unreachable!() };
+        let object = self.lower_expr(object)?;
+        if let ExprKind::Const(Const::Str(name)) = &name.kind {
+            let (name_slot, name_len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
+            let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+            let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
+            let id = self.runtime.hasattr;
+            let result = self.call_rt(id, &[object, name_ptr, name_len])?;
+            self.emit_exc_check()?;
+            return Ok(result);
+        }
+        let name = self.lower_expr(name)?;
+        self.lower_builtin_values(Builtin::Hasattr, &[object, name])
     }
 
     /// Lower a list/tuple/set literal: the elements are evaluated left-to-right
@@ -3030,6 +3686,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             Const::Bool(true) => Ok(self.tagged_int(TRUE_TAG)),
             Const::Bool(false) => Ok(self.tagged_int(FALSE_TAG)),
             Const::None => Ok(self.none()),
+            Const::NotImplemented => Ok(self.tagged_int(NOT_IMPLEMENTED_TAG)),
             Const::Float(value) => {
                 let float = self.builder.ins().f64const(*value);
                 let id = self.runtime.float_new;
@@ -3065,7 +3722,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let arity = self
             .builder
             .ins()
-            .iconst(self.ptr_ty, function.params.len() as i64);
+            .iconst(self.ptr_ty, function.call_arity() as i64);
         let (name_slot, name_len) = make_bytes_slot(&mut self.builder, function.name.as_bytes())?;
         let name = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
         let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
@@ -3073,7 +3730,57 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let id = self.runtime.function_new;
         let result = self.call_rt(id, &[wrapper_address, arity, name, name_len, flags])?;
         self.emit_exc_check()?;
+        let result = self.attach_function_params(result, function)?;
         Ok(result)
+    }
+
+    /// Attach the user-visible positional parameter names of a generated
+    /// wrapper to its function value through `pyx_function_params`.
+    ///
+    /// The runtime needs them to bind `functools.partial` keyword arguments by
+    /// name. Captured values, `*args`, keyword-only parameters and `**kwargs`
+    /// have no positional slot and are therefore not listed; a dynamic
+    /// signature is skipped entirely because its calls take the count-prefixed
+    /// buffer the runtime cannot bind by name.
+    fn attach_function_params(
+        &mut self,
+        value: Value,
+        function: &Function,
+    ) -> Result<Value, CodegenError> {
+        if function.has_dynamic_signature() {
+            return Ok(value);
+        }
+        let names: Vec<&str> = function.params[function.capture_count..]
+            .iter()
+            .filter(|param| param.kind == ParamKind::Positional)
+            .map(|param| param.name.as_str())
+            .collect();
+        if names.is_empty() {
+            return Ok(value);
+        }
+        let slots = names
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| CodegenError::new("function: too many parameters"))?;
+        let names_slot = self.stack_array_slot(slots, "function parameter names")?;
+        for (index, name) in names.iter().enumerate() {
+            let (name_slot, name_len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
+            // Both words are `i64`: the ABI buffer layout is fixed-width even
+            // on a 32-bit target.
+            let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+            let name_ptr = self.pointer_to_i64(name_ptr);
+            self.builder
+                .ins()
+                .stack_store(name_ptr, names_slot, (index * 16) as i32);
+            let name_len = self.builder.ins().iconst(types::I64, name_len as i64);
+            self.builder
+                .ins()
+                .stack_store(name_len, names_slot, (index * 16 + 8) as i32);
+        }
+        let count = self.builder.ins().iconst(self.ptr_ty, names.len() as i64);
+        let names_ptr = self.builder.ins().stack_addr(self.ptr_ty, names_slot, 0);
+        let id = self.runtime.function_params;
+        self.call_rt(id, &[value, count, names_ptr])
     }
 
     /// Lower a reference to a builtin function to a first-class function
@@ -3088,16 +3795,20 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(result)
     }
 
-    /// Lower a call through a function value via `pyx_call(fn, argc, argv)`.
+    /// Lower a call through a function value via `pyx_call(fn, argc, argv)`,
+    /// or `pyx_call_star(fn, argc, argv, star)` when the call has a starred
+    /// operand.
     ///
     /// Python evaluates the callee first, then the arguments left to right.
     /// Both the callee and every already-evaluated argument are parked in
     /// stack slots immediately so that later evaluation cannot invalidate
-    /// them.
+    /// them. The starred operand is evaluated last; the runtime flattens it
+    /// after the leading positional operands.
     fn lower_indirect_call(
         &mut self,
         callee: &'a Expr,
         args: &'a [Expr],
+        star: Option<&'a Expr>,
     ) -> Result<Value, CodegenError> {
         let callee_slot = self.stack_array_slot(1, "call callee")?;
         let callee = self.lower_expr(callee)?;
@@ -3110,14 +3821,65 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 .ins()
                 .stack_store(value, argv_slot, (position * 8) as i32);
         }
+        let star_slot = match star {
+            Some(star) => {
+                let slot = self.stack_array_slot(1, "call starred argument")?;
+                let value = self.lower_expr(star)?;
+                self.builder.ins().stack_store(value, slot, 0);
+                Some(slot)
+            }
+            None => None,
+        };
 
         let callee = self.builder.ins().stack_load(types::I64, callee_slot, 0);
         let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
         // `argc == 0` still passes a valid pointer: the slot holds one
         // element, which is 8-byte aligned.
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        if let Some(star_slot) = star_slot {
+            let star = self.builder.ins().stack_load(types::I64, star_slot, 0);
+            let id = self.runtime.call_star;
+            let result = self.call_rt(id, &[callee, argc, argv, star])?;
+            self.emit_exc_check()?;
+            return Ok(result);
+        }
         let id = self.runtime.call;
         let result = self.call_rt(id, &[callee, argc, argv])?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
+    /// Lower a call the frontend could not bind statically.
+    ///
+    /// The callee and every operand are evaluated in source order into stack
+    /// slots (so side effects and evaluation order match Python), then
+    /// `pyx_deferred_call` raises `RuntimeError`.
+    fn lower_deferred_call(
+        &mut self,
+        callee: Option<&'a Expr>,
+        args: &'a [Expr],
+    ) -> Result<Value, CodegenError> {
+        let count = args.len() + usize::from(callee.is_some());
+        let argv_slot = self.stack_array_slot(count, "deferred call arguments")?;
+        let mut position = 0usize;
+        if let Some(callee) = callee {
+            let value = self.lower_expr(callee)?;
+            self.builder
+                .ins()
+                .stack_store(value, argv_slot, (position * 8) as i32);
+            position += 1;
+        }
+        for arg in args {
+            let value = self.lower_expr(arg)?;
+            self.builder
+                .ins()
+                .stack_store(value, argv_slot, (position * 8) as i32);
+            position += 1;
+        }
+        let argc = self.builder.ins().iconst(self.ptr_ty, count as i64);
+        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        let id = self.runtime.deferred_call;
+        let result = self.call_rt(id, &[argc, argv])?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -3136,9 +3898,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             Callee::Function(id) => self.lower_direct_call(*id, args),
             // F-string fields carry their static spec and conversion flag as
             // trailing constant arguments; they become a direct runtime call
-            // instead of a first-class builtin invocation.
-            Callee::Builtin(Builtin::Format) => self.lower_format_call(args),
+            // instead of a first-class builtin invocation. A source-level
+            // `format(value, spec)` has no such constants and takes the
+            // ordinary builtin path.
+            Callee::Builtin(Builtin::Format) if is_format_field(args) => {
+                self.lower_format_call(args)
+            }
             Callee::Builtin(Builtin::Getattr) => self.lower_getattr_builtin(args),
+            Callee::Builtin(Builtin::Hasattr) => self.lower_hasattr_builtin(args),
             Callee::Builtin(builtin) => {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
@@ -3187,6 +3954,16 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let is_async = function.is_async;
 
         if deferred {
+            if function.has_dynamic_signature() {
+                // The runtime creates the fiber from the caller's positional
+                // arguments; the frontend therefore emits an indirect call for
+                // a dynamic coroutine/generator signature instead of binding
+                // the argument slots here.
+                return Err(CodegenError::new(format!(
+                    "internal error: dynamic generator/coroutine '{}' must be called through a function value",
+                    function.name
+                )));
+            }
             // Each argument is stored as soon as it is evaluated so that an
             // allocation in a later argument cannot observe a stale value.
             let argv_slot = self.stack_array_slot(args.len(), "call arguments")?;
@@ -3271,11 +4048,163 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(result)
     }
 
+    /// Invoke a builtin with an already-evaluated argument list.
+    ///
+    /// Builtins without a dedicated runtime entry point are called through
+    /// their first-class function value: `pyx_builtin_function` materialises
+    /// it and `pyx_call` dispatches to the runtime builtin table.
+    fn lower_builtin_values(
+        &mut self,
+        builtin: Builtin,
+        values: &[Value],
+    ) -> Result<Value, CodegenError> {
+        let slot = self.stack_array_slot(values.len(), builtin.name())?;
+        for (index, value) in values.iter().enumerate() {
+            self.builder
+                .ins()
+                .stack_store(*value, slot, (index * 8) as i32);
+        }
+        self.call_builtin_value(builtin, values.len(), slot)
+    }
+
+    /// Materialise the builtin function value and call it with `argc`
+    /// arguments parked in `argv`.
+    fn call_builtin_value(
+        &mut self,
+        builtin: Builtin,
+        argc: usize,
+        argv: StackSlot,
+    ) -> Result<Value, CodegenError> {
+        let function = self.lower_builtin_ref(builtin)?;
+        let argc = self.builder.ins().iconst(self.ptr_ty, argc as i64);
+        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv, 0);
+        let id = self.runtime.call;
+        let result = self.call_rt(id, &[function, argc, argv])?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
     fn lower_builtin(&mut self, builtin: Builtin, values: &[Value]) -> Result<Value, CodegenError> {
         match builtin {
-            Builtin::Format => Err(CodegenError::new(
-                "internal error: f-string format field reached first-class builtin lowering",
-            )),
+            Builtin::Bool
+            | Builtin::Type
+            | Builtin::Reversed
+            | Builtin::Divmod
+            | Builtin::Callable
+            | Builtin::Import => self.lower_builtin_values(builtin, values),
+            Builtin::Max | Builtin::Min => {
+                // The frontend always appends the key slot as the final
+                // argument (`None` without `key=`, the callable otherwise) and
+                // the runtime treats it as such.
+                if values.len() < 2 {
+                    let name = builtin.name();
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin {name} expects the candidates and the trailing key slot, got {actual} argument(s)"
+                    )));
+                }
+                self.lower_builtin_values(builtin, values)
+            }
+            Builtin::Sorted => {
+                // Direct lowering always supplies `(iterable, key, reverse)`;
+                // first-class calls pass one to three arguments. The generic
+                // builtin value call keeps the ABI unchanged.
+                if values.is_empty() || values.len() > 3 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin sorted expects 1 to 3 arguments, got {actual}"
+                    )));
+                }
+                self.lower_builtin_values(builtin, values)
+            }
+            Builtin::All => {
+                if values.len() != 1 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin all expects exactly 1 argument, got {actual}"
+                    )));
+                }
+                let id = self.runtime.all;
+                let result = self.call_rt(id, values)?;
+                self.emit_exc_check()?;
+                Ok(result)
+            }
+            Builtin::Ord | Builtin::Chr => {
+                if values.len() != 1 {
+                    let name = builtin.name();
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin {name} expects exactly 1 argument, got {actual}"
+                    )));
+                }
+                let id = match builtin {
+                    Builtin::Ord => self.runtime.ord,
+                    Builtin::Chr => self.runtime.chr,
+                    _ => {
+                        let name = builtin.name();
+                        return Err(CodegenError::new(format!(
+                            "internal error: {name} reached scalar builtin lowering"
+                        )));
+                    }
+                };
+                let result = self.call_rt(id, &values[..1])?;
+                self.emit_exc_check()?;
+                Ok(result)
+            }
+            Builtin::DictMerge => {
+                if values.len() != 2 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "internal dict merge expects exactly 2 arguments, got {actual}"
+                    )));
+                }
+                let id = self.runtime.dict_merge;
+                let result = self.call_rt(id, values)?;
+                self.emit_exc_check()?;
+                Ok(result)
+            }
+            Builtin::Round => {
+                if values.is_empty() || values.len() > 2 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin round expects 1 or 2 arguments, got {actual}"
+                    )));
+                }
+                self.lower_builtin_values(builtin, values)
+            }
+            Builtin::Format => {
+                // Three arguments are the internal f-string shape and are
+                // handled by `lower_format_call` before they reach this point;
+                // source-level `format(value, spec)` takes exactly two.
+                if values.len() != 2 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin format expects 2 arguments, got {actual}"
+                    )));
+                }
+                self.lower_builtin_values(builtin, values)
+            }
+            Builtin::Hash => {
+                if values.len() != 1 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin hash expects exactly 1 argument, got {actual}"
+                    )));
+                }
+                let id = self.runtime.hash;
+                let result = self.call_rt(id, &values[..1])?;
+                self.emit_exc_check()?;
+                Ok(result)
+            }
+            Builtin::Isinstance => {
+                if values.len() != 2 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin isinstance expects 2 arguments, got {actual}"
+                    )));
+                }
+                self.lower_builtin_values(builtin, values)
+            }
             Builtin::Print => {
                 let bytes = values
                     .len()
@@ -3380,6 +4309,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             Builtin::Getattr => Err(CodegenError::new(
                 "internal error: getattr reached first-class builtin lowering",
             )),
+            Builtin::Hasattr => {
+                if values.len() != 2 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin hasattr expects 2 arguments, got {actual}"
+                    )));
+                }
+                self.lower_builtin_values(builtin, values)
+            }
             Builtin::Range => {
                 // Tagged integer 1 (`n << 3`), the default step.
                 let one = self.tagged_int(1 << 3);
@@ -3418,6 +4356,27 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 }
                 actual => Err(CodegenError::new(format!(
                     "builtin list expects at most 1 argument, got {actual}"
+                ))),
+            },
+            Builtin::Tuple => match values.len() {
+                0 => {
+                    // `tuple()` — a valid dummy pointer is required by the ABI.
+                    let slot = self.stack_array_slot(0, "tuple()")?;
+                    let dummy = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+                    let argc = self.builder.ins().iconst(self.ptr_ty, 0);
+                    let id = self.runtime.tuple_new;
+                    let result = self.call_rt(id, &[argc, dummy])?;
+                    self.emit_exc_check()?;
+                    Ok(result)
+                }
+                1 => {
+                    let id = self.runtime.tuple_from;
+                    let result = self.call_rt(id, &values[..1])?;
+                    self.emit_exc_check()?;
+                    Ok(result)
+                }
+                actual => Err(CodegenError::new(format!(
+                    "builtin tuple expects at most 1 argument, got {actual}"
                 ))),
             },
             Builtin::Dict => match values.len() {
@@ -3495,7 +4454,12 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_exc_check()?;
                 Ok(result)
             }
-            Builtin::Len | Builtin::Str | Builtin::Int | Builtin::Float | Builtin::Abs => {
+            Builtin::Len
+            | Builtin::Str
+            | Builtin::Repr
+            | Builtin::Int
+            | Builtin::Float
+            | Builtin::Abs => {
                 if values.len() != 1 {
                     let name = builtin.name();
                     let actual = values.len();
@@ -3506,6 +4470,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let id = match builtin {
                     Builtin::Len => self.runtime.len,
                     Builtin::Str => self.runtime.to_str,
+                    Builtin::Repr => self.runtime.to_repr,
                     Builtin::Int => self.runtime.to_int,
                     Builtin::Float => self.runtime.to_float,
                     Builtin::Abs => self.runtime.abs,
@@ -3522,6 +4487,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             }
         }
     }
+}
+
+/// True when `Builtin::Format` arguments have the internal f-string shape.
+///
+/// An f-string field always passes three arguments `(value, spec,
+/// conversion)`; source-level `format(value, spec)` passes two and is lowered
+/// through the ordinary builtin path.
+fn is_format_field(args: &[Expr]) -> bool {
+    args.len() == 3
 }
 
 /// Materialize `bytes` in a stack slot and return the slot plus its length.
@@ -3643,6 +4617,16 @@ fn build_pyx_main<M: Module>(
         builder.ins().return_(&[child]);
 
         builder.switch_to_block(body_block);
+        // Imported module bodies run once, in dependency order, before the
+        // entry module. A spawned child skipped this block entirely, so it
+        // never re-runs them.
+        for &initializer in &program.initializers {
+            let symbol = *symbols.get(&initializer).ok_or_else(|| {
+                CodegenError::new(format!("module initializer {initializer} was not declared"))
+            })?;
+            let reference = declare_ref(module, &mut builder, symbol);
+            builder.ins().call(reference, &[]);
+        }
         let module_main = program.main;
         let body = *symbols.get(&module_main).ok_or_else(|| {
             CodegenError::new(format!(
@@ -3710,7 +4694,7 @@ fn build_c_main<M: Module>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyx_ir::{ClassMethod, LocalInfo, Param, StmtKind, Type};
+    use pyx_ir::{ClassMethod, LocalInfo, MethodKind, Param, StmtKind, Type};
 
     /// A module body with one `bytes`-typed local `x` assigned `value`.
     fn program_assigning(value: Expr) -> Program {
@@ -3730,6 +4714,7 @@ mod tests {
                 is_generator: false,
             }],
             main: 0,
+            initializers: Vec::new(),
         }
     }
 
@@ -3742,6 +4727,29 @@ mod tests {
         ));
         let object = crate::compile_object(&program).expect("bytes literal must lower");
         assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn divmod_and_callable_builtins_lower_through_the_value_path() {
+        let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let cases = [
+            (Builtin::Divmod, vec![int(7), int(3)], Type::Tuple),
+            (Builtin::Callable, vec![int(1)], Type::Bool),
+        ];
+        for (builtin, args, ret) in cases {
+            let mut program = program_assigning(Expr::new(
+                ExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    args,
+                },
+                ret,
+                1,
+            ));
+            program.functions[0].locals[0].ty = ret;
+            let object = crate::compile_object(&program)
+                .unwrap_or_else(|_| panic!("{}() must lower", builtin.name()));
+            assert!(!object.is_empty());
+        }
     }
 
     #[test]
@@ -3853,6 +4861,7 @@ mod tests {
                 object: Box::new(text("a-a")),
                 method: "replace".to_string(),
                 args: vec![text("a"), text("b")],
+                star: None,
                 keywords: vec![("count".to_string(), count)],
             },
             Type::Str,
@@ -3871,6 +4880,7 @@ mod tests {
                 object: Box::new(text("ab")),
                 method: "upper".to_string(),
                 args: Vec::new(),
+                star: None,
                 keywords: Vec::new(),
             },
             Type::Str,
@@ -3881,6 +4891,102 @@ mod tests {
     }
 
     #[test]
+    fn starred_method_call_lowers_to_pyx_method_star() {
+        let text =
+            |value: &str| Expr::new(ExprKind::Const(Const::Str(value.to_string())), Type::Str, 1);
+        let local = || Expr::new(ExprKind::Local(0), Type::Any, 1);
+        let program = program_assigning(Expr::new(
+            ExprKind::MethodCall {
+                object: Box::new(local()),
+                method: "add_row".to_string(),
+                args: Vec::new(),
+                star: Some(Box::new(Expr::new(
+                    ExprKind::List(vec![text("a"), text("b")]),
+                    Type::List,
+                    1,
+                ))),
+                keywords: vec![("style".to_string(), text("bold"))],
+            },
+            Type::Any,
+            1,
+        ));
+        let object = crate::compile_object(&program).expect("starred method call must lower");
+        assert!(runtime_call_sites(&object, "pyx_method_star") > 0);
+    }
+
+    #[test]
+    fn starred_indirect_call_lowers_to_pyx_call_star() {
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let program = program_assigning(Expr::new(
+            ExprKind::IndirectCall {
+                callee: Box::new(Expr::new(
+                    ExprKind::BuiltinRef(Builtin::Abs),
+                    Type::Function,
+                    1,
+                )),
+                args: vec![int(1)],
+                star: Some(Box::new(Expr::new(
+                    ExprKind::List(vec![int(2), int(3)]),
+                    Type::List,
+                    1,
+                ))),
+            },
+            Type::Any,
+            1,
+        ));
+        let object = crate::compile_object(&program).expect("starred call must lower");
+        assert!(runtime_call_sites(&object, "pyx_call_star") > 0);
+    }
+
+    #[test]
+    fn repr_lowers_to_pyx_to_repr() {
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let program = program_assigning(Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::Repr),
+                args: vec![int(7)],
+            },
+            Type::Str,
+            1,
+        ));
+        let object = crate::compile_object(&program).expect("repr must lower");
+        assert!(runtime_call_sites(&object, "pyx_to_repr") > 0);
+    }
+
+    #[test]
+    fn dict_merge_and_all_lower_to_the_runtime() {
+        let text =
+            |value: &str| Expr::new(ExprKind::Const(Const::Str(value.to_string())), Type::Str, 1);
+        let key = || Expr::new(ExprKind::Const(Const::Str("k".to_string())), Type::Str, 1);
+        let empty = || Expr::new(ExprKind::Dict(Vec::new()), Type::Dict, 1);
+        let merge = Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::DictMerge),
+                args: vec![
+                    Expr::new(ExprKind::Dict(vec![(key(), text("v"))]), Type::Dict, 1),
+                    empty(),
+                ],
+            },
+            Type::Dict,
+            1,
+        );
+        let object =
+            crate::compile_object(&program_assigning(merge)).expect("dict merge must lower");
+        assert!(runtime_call_sites(&object, "pyx_dict_merge") > 0);
+
+        let every = Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::All),
+                args: vec![Expr::new(ExprKind::List(vec![text("x")]), Type::List, 1)],
+            },
+            Type::Bool,
+            1,
+        );
+        let object = crate::compile_object(&program_assigning(every)).expect("all() must lower");
+        assert!(runtime_call_sites(&object, "pyx_all") > 0);
+    }
+
+    #[test]
     fn class_definition_and_setattr_emit_an_object_file() {
         let method = Function {
             name: "C.get".to_string(),
@@ -3888,6 +4994,8 @@ mod tests {
                 local: 0,
                 name: "self".to_string(),
                 ty: Type::Any,
+                default: None,
+                kind: ParamKind::Positional,
             }],
             capture_count: 0,
             ret_ty: Type::Any,
@@ -3926,7 +5034,9 @@ mod tests {
                         methods: vec![ClassMethod {
                             name: "get".to_string(),
                             function: 1,
+                            kind: MethodKind::Normal,
                         }],
+                        attributes: Vec::new(),
                     },
                     1,
                 ),
@@ -3937,6 +5047,7 @@ mod tests {
                             ExprKind::IndirectCall {
                                 callee: Box::new(Expr::new(ExprKind::Local(0), Type::Any, 2)),
                                 args: Vec::new(),
+                                star: None,
                             },
                             Type::Any,
                             2,
@@ -3960,10 +5071,74 @@ mod tests {
             source_name: "test.py".to_string(),
             functions: vec![module_body, method],
             main: 0,
+            initializers: Vec::new(),
         };
         let object = crate::compile_object(&program)
             .expect("class definition and attribute store must lower");
         assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn exception_class_base_lowers_through_the_cached_class_abi() {
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![
+                LocalInfo {
+                    name: "E".to_string(),
+                    ty: Type::Any,
+                },
+                LocalInfo {
+                    name: "e".to_string(),
+                    ty: Type::Any,
+                },
+            ],
+            body: vec![
+                Stmt::new(
+                    StmtKind::ClassDef {
+                        target: 0,
+                        name: "E".to_string(),
+                        base: Some(Expr::new(
+                            ExprKind::ExceptionClass(ExcKind::Exception),
+                            Type::Any,
+                            1,
+                        )),
+                        methods: Vec::new(),
+                        attributes: Vec::new(),
+                    },
+                    1,
+                ),
+                Stmt::new(
+                    StmtKind::Assign {
+                        target: 1,
+                        value: Expr::new(
+                            ExprKind::IndirectCall {
+                                callee: Box::new(Expr::new(ExprKind::Local(0), Type::Any, 2)),
+                                args: Vec::new(),
+                                star: None,
+                            },
+                            Type::Any,
+                            2,
+                        ),
+                    },
+                    2,
+                ),
+            ],
+            is_async: false,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program)
+            .expect("a built-in exception base must lower as a class value");
+        assert!(runtime_call_sites(&object, "pyx_exception_class") > 0);
+        assert!(runtime_call_sites(&object, "pyx_class_new") > 0);
     }
 
     #[test]
@@ -3986,11 +5161,15 @@ mod tests {
                     local: 0,
                     name: "x".to_string(),
                     ty: Type::Any,
+                    default: None,
+                    kind: ParamKind::Positional,
                 },
                 Param {
                     local: 1,
                     name: "y".to_string(),
                     ty: Type::Any,
+                    default: None,
+                    kind: ParamKind::Positional,
                 },
             ],
             capture_count: 1,
@@ -4045,6 +5224,7 @@ mod tests {
                         ExprKind::IndirectCall {
                             callee: Box::new(Expr::new(ExprKind::Local(1), Type::Any, 3)),
                             args: vec![Expr::new(ExprKind::Const(Const::Int(3)), Type::Int, 3)],
+                            star: None,
                         },
                         Type::Any,
                         3,
@@ -4059,6 +5239,7 @@ mod tests {
             source_name: "test.py".to_string(),
             functions: vec![module_body, inner],
             main: 0,
+            initializers: Vec::new(),
         };
         let object = crate::compile_object(&program).expect("closure definition must lower");
         assert!(!object.is_empty());
@@ -4100,6 +5281,8 @@ mod tests {
                 local: 0,
                 name: "n".to_string(),
                 ty: Type::Int,
+                default: None,
+                kind: ParamKind::Positional,
             }],
             capture_count: 0,
             ret_ty: Type::Any,
@@ -4118,6 +5301,7 @@ mod tests {
             source_name: "test.py".to_string(),
             functions: vec![module_body, coroutine],
             main: 0,
+            initializers: Vec::new(),
         };
         let object =
             crate::compile_object(&program).expect("direct call to an async function must lower");
@@ -4198,6 +5382,8 @@ mod tests {
                 local: 0,
                 name: "c".to_string(),
                 ty: Type::Any,
+                default: None,
+                kind: ParamKind::Positional,
             }],
             capture_count: 0,
             ret_ty: Type::Any,
@@ -4222,6 +5408,7 @@ mod tests {
             source_name: "test.py".to_string(),
             functions: vec![module_body, async_body, generator],
             main: 0,
+            initializers: Vec::new(),
         };
         let object = crate::compile_object(&program).expect("await/yield must lower");
         assert!(!object.is_empty());
@@ -4242,7 +5429,192 @@ mod tests {
                 is_generator: false,
             }],
             main: 0,
+            initializers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn dynamic_function_signatures_emit_wrapper_binding() {
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![
+                LocalInfo {
+                    name: "f".to_string(),
+                    ty: Type::Function,
+                },
+                LocalInfo {
+                    name: "x".to_string(),
+                    ty: Type::Any,
+                },
+            ],
+            body: vec![
+                Stmt::new(
+                    StmtKind::Assign {
+                        target: 0,
+                        value: Expr::new(ExprKind::FunctionRef(1), Type::Function, 1),
+                    },
+                    1,
+                ),
+                Stmt::new(
+                    StmtKind::Assign {
+                        target: 1,
+                        value: Expr::new(
+                            ExprKind::IndirectCall {
+                                callee: Box::new(Expr::new(ExprKind::Local(0), Type::Function, 1)),
+                                args: vec![int(1), int(2)],
+                                star: None,
+                            },
+                            Type::Any,
+                            1,
+                        ),
+                    },
+                    1,
+                ),
+            ],
+            is_async: false,
+            is_generator: false,
+        };
+        let varargs = Function {
+            name: "f".to_string(),
+            params: vec![Param {
+                local: 0,
+                name: "args".to_string(),
+                ty: Type::List,
+                default: None,
+                kind: ParamKind::VarArg,
+            }],
+            capture_count: 0,
+            ret_ty: Type::List,
+            locals: vec![LocalInfo {
+                name: "args".to_string(),
+                ty: Type::List,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Return(Some(Expr::new(ExprKind::Local(0), Type::List, 1))),
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, varargs],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program).expect("dynamic signature must lower");
+        assert!(!object.is_empty());
+        assert!(program.functions[1].has_dynamic_signature());
+        assert_eq!(program.functions[1].call_arity(), 0);
+    }
+
+    #[test]
+    fn dynamic_wrapper_materializes_literal_defaults() {
+        // `def f(a=1.5, *, key="k")`: the wrapper binds both defaults when the
+        // function value is called without arguments.
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![LocalInfo {
+                name: "f".to_string(),
+                ty: Type::Function,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Assign {
+                    target: 0,
+                    value: Expr::new(ExprKind::FunctionRef(1), Type::Function, 1),
+                },
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let defaults = Function {
+            name: "f".to_string(),
+            params: vec![
+                Param {
+                    local: 0,
+                    name: "a".to_string(),
+                    ty: Type::Any,
+                    default: Some(Const::Float(1.5)),
+                    kind: ParamKind::Positional,
+                },
+                Param {
+                    local: 1,
+                    name: "key".to_string(),
+                    ty: Type::Any,
+                    default: Some(Const::Str("k".to_string())),
+                    kind: ParamKind::KwOnly,
+                },
+            ],
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![
+                LocalInfo {
+                    name: "a".to_string(),
+                    ty: Type::Any,
+                },
+                LocalInfo {
+                    name: "key".to_string(),
+                    ty: Type::Any,
+                },
+            ],
+            body: vec![Stmt::new(StmtKind::Return(None), 1)],
+            is_async: false,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, defaults],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object =
+            crate::compile_object(&program).expect("literal defaults must lower in the wrapper");
+        assert!(!object.is_empty());
+        assert_eq!(program.functions[1].call_arity(), 0);
+    }
+
+    #[test]
+    fn deferred_calls_lower_to_the_runtime_helper() {
+        let body = vec![Stmt::new(
+            StmtKind::Expr(Expr::new(
+                ExprKind::DeferredCall {
+                    callee: None,
+                    args: vec![Expr::new(ExprKind::Const(Const::Int(1)), Type::Int, 1)],
+                },
+                Type::Any,
+                1,
+            )),
+            1,
+        )];
+        let program = program_with_body(body);
+        let object = crate::compile_object(&program).expect("deferred calls must lower");
+        assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn deferred_call_without_operands_lowers() {
+        let body = vec![Stmt::new(
+            StmtKind::Expr(Expr::new(
+                ExprKind::DeferredCall {
+                    callee: None,
+                    args: Vec::new(),
+                },
+                Type::Any,
+                1,
+            )),
+            1,
+        )];
+        let program = program_with_body(body);
+        let object = crate::compile_object(&program).expect("deferred calls must lower");
+        assert!(!object.is_empty());
     }
 
     #[test]
@@ -4320,6 +5692,7 @@ mod tests {
                 is_generator: false,
             }],
             main: 0,
+            initializers: Vec::new(),
         };
         let object = crate::compile_object(&program).expect("Any operand must lower");
         assert!(!object.is_empty());
@@ -4415,6 +5788,7 @@ mod tests {
                 is_generator: false,
             }],
             main: 0,
+            initializers: Vec::new(),
         };
         let object =
             crate::compile_object(&program).expect("int aug-assign and range loop must lower");
@@ -4514,6 +5888,7 @@ mod tests {
                 is_generator: false,
             }],
             main: 0,
+            initializers: Vec::new(),
         };
         let object = crate::compile_object(&program)
             .expect("extension call and attribute must lower to object code");
@@ -4641,6 +6016,7 @@ mod tests {
                 is_generator: false,
             }],
             main: 0,
+            initializers: Vec::new(),
         };
         let object = crate::compile_object(&program)
             .expect("module-global access must lower to object code");
@@ -4684,6 +6060,7 @@ mod tests {
                 is_generator: false,
             }],
             main: 0,
+            initializers: Vec::new(),
         };
 
         let int_object =
@@ -4769,6 +6146,7 @@ mod tests {
                 is_generator: false,
             }],
             main: 0,
+            initializers: Vec::new(),
         };
         let object = crate::compile_object(&program)
             .expect("exception hierarchy handlers and chaining must lower");
@@ -4776,6 +6154,528 @@ mod tests {
             assert!(
                 runtime_call_sites(&object, symbol) > 0,
                 "the generated code must reference {symbol}"
+            );
+        }
+    }
+
+    #[test]
+    fn assert_lowers_to_a_conditional_assertion_error_raise() {
+        let text =
+            |value: &str| Expr::new(ExprKind::Const(Const::Str(value.to_string())), Type::Str, 1);
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: Vec::new(),
+                body: vec![
+                    // `assert False, "boom"`: the message belongs to the
+                    // failure branch only.
+                    Stmt::new(
+                        StmtKind::Assert {
+                            test: Expr::new(ExprKind::Const(Const::Bool(false)), Type::Bool, 1),
+                            msg: Some(text("boom")),
+                        },
+                        1,
+                    ),
+                    // `assert True`: a message-less assert still lowers.
+                    Stmt::new(
+                        StmtKind::Assert {
+                            test: Expr::new(ExprKind::Const(Const::Bool(true)), Type::Bool, 2),
+                            msg: None,
+                        },
+                        2,
+                    ),
+                ],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program).expect("assert statements must lower");
+        assert!(
+            runtime_call_sites(&object, "pyx_raise") > 0,
+            "assert must raise through the runtime"
+        );
+        assert!(
+            runtime_call_sites(&object, "pyx_truthy") > 0,
+            "assert must test the condition dynamically"
+        );
+        assert!(
+            runtime_call_sites(&object, "pyx_str_new") > 0,
+            "the message must be materialised"
+        );
+    }
+
+    #[test]
+    fn conditional_expression_with_identity_test_lowers_to_an_object_file() {
+        let none = || Expr::new(ExprKind::Const(Const::None), Type::None, 1);
+        let test = Expr::new(
+            ExprKind::Bin {
+                op: BinOp::Is,
+                lhs: Box::new(Expr::new(ExprKind::Local(0), Type::Any, 1)),
+                rhs: Box::new(none()),
+            },
+            Type::Bool,
+            1,
+        );
+        let value = Expr::new(
+            ExprKind::IfExp {
+                test: Box::new(test),
+                then: Box::new(Expr::new(ExprKind::Const(Const::Int(7)), Type::Int, 1)),
+                orelse: Box::new(none()),
+            },
+            Type::Any,
+            1,
+        );
+        let object = crate::compile_object(&program_assigning(value))
+            .expect("ternary and identity must lower");
+        assert!(!object.is_empty());
+        assert!(
+            runtime_call_sites(&object, "pyx_binop") > 0,
+            "identity must go through the runtime operator"
+        );
+    }
+
+    #[test]
+    fn direct_new_builtin_calls_lower_to_an_object_file() {
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let text =
+            |value: &str| Expr::new(ExprKind::Const(Const::Str(value.to_string())), Type::Str, 1);
+        let int_type = || Expr::new(ExprKind::BuiltinRef(Builtin::Int), Type::Function, 1);
+        let none = || Expr::new(ExprKind::Const(Const::None), Type::None, 1);
+        let cases: Vec<(Builtin, Vec<Expr>)> = vec![
+            // The frontend appends the trailing key slot.
+            (Builtin::Max, vec![int(1), none()]),
+            (Builtin::Min, vec![int(1), none()]),
+            // The frontend appends the key and reverse slots.
+            (Builtin::Sorted, vec![int(1), none(), none()]),
+            (Builtin::All, vec![int(1)]),
+            (Builtin::Round, vec![int(1)]),
+            (Builtin::Format, vec![int(1), text("d")]),
+            (Builtin::Isinstance, vec![int(1), int_type()]),
+        ];
+        for (builtin, args) in cases {
+            let program = program_assigning(Expr::new(
+                ExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    args,
+                },
+                Type::Any,
+                1,
+            ));
+            let object = crate::compile_object(&program)
+                .unwrap_or_else(|error| panic!("{builtin:?} must lower: {error}"));
+            assert!(!object.is_empty(), "{builtin:?}");
+        }
+    }
+
+    #[test]
+    fn dataclass_style_init_lowers_to_an_object_file() {
+        // `class Bench:` with a synthesized `__init__(self, key)`.
+        let self_local = || Expr::new(ExprKind::Local(0), Type::Any, 1);
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![
+                Function {
+                    name: "<module>".to_string(),
+                    params: Vec::new(),
+                    capture_count: 0,
+                    ret_ty: Type::None,
+                    locals: vec![LocalInfo {
+                        name: "Bench".to_string(),
+                        ty: Type::Any,
+                    }],
+                    body: vec![Stmt::new(
+                        StmtKind::ClassDef {
+                            target: 0,
+                            name: "Bench".to_string(),
+                            base: None,
+                            methods: vec![ClassMethod {
+                                name: "__init__".to_string(),
+                                function: 1,
+                                kind: MethodKind::Normal,
+                            }],
+                            attributes: Vec::new(),
+                        },
+                        1,
+                    )],
+                    is_async: false,
+                    is_generator: false,
+                },
+                Function {
+                    name: "Bench.__init__".to_string(),
+                    params: vec![
+                        Param {
+                            local: 0,
+                            name: "self".to_string(),
+                            ty: Type::Any,
+                            default: None,
+                            kind: ParamKind::Positional,
+                        },
+                        Param {
+                            local: 1,
+                            name: "key".to_string(),
+                            ty: Type::Str,
+                            default: None,
+                            kind: ParamKind::Positional,
+                        },
+                    ],
+                    capture_count: 0,
+                    ret_ty: Type::None,
+                    locals: vec![
+                        LocalInfo {
+                            name: "self".to_string(),
+                            ty: Type::Any,
+                        },
+                        LocalInfo {
+                            name: "key".to_string(),
+                            ty: Type::Str,
+                        },
+                    ],
+                    body: vec![
+                        Stmt::new(
+                            StmtKind::SetAttr {
+                                object: self_local(),
+                                name: "key".to_string(),
+                                value: Expr::new(ExprKind::Local(1), Type::Str, 1),
+                            },
+                            1,
+                        ),
+                        Stmt::new(StmtKind::Return(None), 1),
+                    ],
+                    is_async: false,
+                    is_generator: false,
+                },
+            ],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program).expect("dataclass __init__ must lower");
+        assert!(!object.is_empty());
+        assert!(
+            runtime_call_sites(&object, "pyx_setattr") > 0,
+            "the synthesized __init__ must store its fields"
+        );
+    }
+
+    #[test]
+    fn nested_and_attribute_unpack_targets_lower() {
+        fn local(id: u32) -> Expr {
+            Expr::new(ExprKind::Local(id), Type::Any, 1)
+        }
+        let names = ["obj", "items", "a", "b", "t"];
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: names
+                    .iter()
+                    .map(|name| LocalInfo {
+                        name: (*name).to_string(),
+                        ty: Type::Any,
+                    })
+                    .collect(),
+                body: vec![Stmt::new(
+                    StmtKind::Unpack {
+                        targets: vec![
+                            UnpackTarget::Attr {
+                                object: local(0),
+                                name: "x".to_string(),
+                            },
+                            UnpackTarget::Subscript {
+                                object: local(1),
+                                index: Expr::new(ExprKind::Const(Const::Int(0)), Type::Int, 1),
+                            },
+                            UnpackTarget::Nested(vec![
+                                UnpackTarget::Name(2),
+                                UnpackTarget::Name(3),
+                            ]),
+                        ],
+                        value: local(4),
+                    },
+                    1,
+                )],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object =
+            crate::compile_object(&program).expect("unpack targets must lower to object code");
+        assert!(!object.is_empty());
+        assert!(runtime_call_sites(&object, "pyx_unpack_seq") > 0);
+        assert!(runtime_call_sites(&object, "pyx_setattr") > 0);
+        assert!(runtime_call_sites(&object, "pyx_subscript_set") > 0);
+    }
+
+    #[test]
+    fn slice_assignment_lowers_to_the_slice_set_runtime_helper() {
+        let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let none = || Expr::new(ExprKind::Const(Const::None), Type::None, 1);
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![LocalInfo {
+                    name: "xs".to_string(),
+                    ty: Type::List,
+                }],
+                body: vec![Stmt::new(
+                    StmtKind::SetSlice {
+                        target: Expr::new(ExprKind::Local(0), Type::List, 1),
+                        start: int(1),
+                        stop: none(),
+                        step: none(),
+                        value: Expr::new(ExprKind::List(vec![int(9)]), Type::List, 1),
+                    },
+                    1,
+                )],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object =
+            crate::compile_object(&program).expect("slice assignment must lower to object code");
+        assert!(!object.is_empty());
+        assert!(
+            runtime_call_sites(&object, "pyx_slice_set") > 0,
+            "slice assignment must call pyx_slice_set"
+        );
+        assert!(
+            runtime_call_sites(&object, "pyx_list_new") > 0,
+            "the right-hand side list must be materialised"
+        );
+    }
+
+    #[test]
+    fn starred_unpack_lowers_to_the_star_runtime_helper() {
+        let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![
+                    LocalInfo {
+                        name: "key".to_string(),
+                        ty: Type::Any,
+                    },
+                    LocalInfo {
+                        name: "value".to_string(),
+                        ty: Type::Any,
+                    },
+                    LocalInfo {
+                        name: "default".to_string(),
+                        ty: Type::Any,
+                    },
+                ],
+                body: vec![Stmt::new(
+                    StmtKind::Unpack {
+                        targets: vec![
+                            UnpackTarget::Name(0),
+                            UnpackTarget::Name(1),
+                            UnpackTarget::Star(Box::new(UnpackTarget::Name(2))),
+                        ],
+                        value: Expr::new(
+                            ExprKind::List(vec![int(1), int(2), int(3)]),
+                            Type::List,
+                            1,
+                        ),
+                    },
+                    1,
+                )],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object =
+            crate::compile_object(&program).expect("starred unpack must lower to object code");
+        assert!(runtime_call_sites(&object, "pyx_unpack_star") > 0);
+    }
+
+    #[test]
+    fn tuple_and_hasattr_builtins_lower_to_their_runtime_helpers() {
+        let text =
+            |value: &str| Expr::new(ExprKind::Const(Const::Str(value.to_string())), Type::Str, 1);
+        let tuple = Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::Tuple),
+                args: vec![text("ab")],
+            },
+            Type::Tuple,
+            1,
+        );
+        let hasattr = Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::Hasattr),
+                args: vec![tuple, text("count")],
+            },
+            Type::Bool,
+            1,
+        );
+        let object =
+            crate::compile_object(&program_assigning(hasattr)).expect("hasattr must lower");
+        assert!(runtime_call_sites(&object, "pyx_tuple_from") > 0);
+        assert!(runtime_call_sites(&object, "pyx_hasattr") > 0);
+    }
+
+    #[test]
+    fn keyword_module_calls_lower_to_the_kw_module_abi() {
+        let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let call = Expr::new(
+            ExprKind::ModuleCall {
+                module: "functools".to_string(),
+                function: "partial".to_string(),
+                args: vec![Expr::new(ExprKind::Local(0), Type::Any, 1)],
+                keywords: vec![("angular".to_string(), int(1))],
+            },
+            Type::Any,
+            1,
+        );
+        let object =
+            crate::compile_object(&program_assigning(call)).expect("keyword module call lowers");
+        assert!(runtime_call_sites(&object, "pyx_module_call_kw") > 0);
+    }
+
+    #[test]
+    fn function_values_carry_their_parameter_names() {
+        let parameter = |local: LocalId, name: &str| Param {
+            local,
+            name: name.to_string(),
+            ty: Type::Any,
+            default: None,
+            kind: ParamKind::Positional,
+        };
+        let target = Function {
+            name: "pair".to_string(),
+            params: vec![parameter(0, "left"), parameter(1, "right")],
+            capture_count: 0,
+            ret_ty: Type::Any,
+            locals: vec![
+                LocalInfo {
+                    name: "left".to_string(),
+                    ty: Type::Any,
+                },
+                LocalInfo {
+                    name: "right".to_string(),
+                    ty: Type::Any,
+                },
+            ],
+            body: vec![Stmt::new(
+                StmtKind::Return(Some(Expr::new(ExprKind::Local(0), Type::Any, 1))),
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![LocalInfo {
+                name: "f".to_string(),
+                ty: Type::Function,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Assign {
+                    target: 0,
+                    value: Expr::new(ExprKind::FunctionRef(1), Type::Function, 1),
+                },
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, target],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program).expect("function reference must lower");
+        assert!(runtime_call_sites(&object, "pyx_function_params") > 0);
+    }
+
+    #[test]
+    fn not_implemented_constant_lowers_to_the_reserved_tag() {
+        let program = program_assigning(Expr::new(
+            ExprKind::Const(Const::NotImplemented),
+            Type::Any,
+            1,
+        ));
+        let object = crate::compile_object(&program).expect("NotImplemented must lower");
+        assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn invert_lowers_to_pyx_unop() {
+        let operand = || Expr::new(ExprKind::Const(Const::Int(5)), Type::Int, 1);
+        let program = program_assigning(Expr::new(
+            ExprKind::Un {
+                op: pyx_ir::UnOp::Invert,
+                operand: Box::new(operand()),
+            },
+            Type::Int,
+            1,
+        ));
+        let object = crate::compile_object(&program).expect("invert must lower");
+        assert!(runtime_call_sites(&object, "pyx_unop") > 0);
+    }
+
+    #[test]
+    fn hash_builtin_lowers_to_pyx_hash() {
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let program = program_assigning(Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::Hash),
+                args: vec![int(7)],
+            },
+            Type::Int,
+            1,
+        ));
+        let object = crate::compile_object(&program).expect("hash must lower");
+        assert!(runtime_call_sites(&object, "pyx_hash") > 0);
+    }
+
+    #[test]
+    fn ord_and_chr_builtins_lower_to_their_abi_entries() {
+        let string =
+            |value: &str| Expr::new(ExprKind::Const(Const::Str(value.to_string())), Type::Str, 1);
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        for (builtin, arg, symbol) in [
+            (Builtin::Ord, string("A"), "pyx_ord"),
+            (Builtin::Chr, int(65), "pyx_chr"),
+        ] {
+            let program = program_assigning(Expr::new(
+                ExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    args: vec![arg],
+                },
+                Type::Any,
+                1,
+            ));
+            let object = crate::compile_object(&program).expect("builtin must lower");
+            assert!(
+                runtime_call_sites(&object, symbol) > 0,
+                "{symbol} was not called"
             );
         }
     }

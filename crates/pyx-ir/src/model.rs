@@ -83,6 +83,10 @@ pub enum Const {
     Str(String),
     Bytes(Vec<u8>),
     None,
+    /// Python's `NotImplemented` singleton. Codegen materialises the runtime's
+    /// reserved `NotImplemented` immediate; PyX has no `NotImplementedType`,
+    /// so its static type is [`Type::Any`].
+    NotImplemented,
 }
 
 impl Const {
@@ -94,6 +98,7 @@ impl Const {
             Const::Str(_) => Type::Str,
             Const::Bytes(_) => Type::Bytes,
             Const::None => Type::None,
+            Const::NotImplemented => Type::Any,
         }
     }
 }
@@ -118,6 +123,20 @@ pub enum BinOp {
     In,
     /// `left not in right`
     NotIn,
+    /// `left is right`
+    Is,
+    /// `left is not right`
+    IsNot,
+    /// `left & right`
+    BitAnd,
+    /// `left | right`
+    BitOr,
+    /// `left ^ right`
+    BitXor,
+    /// `left << right`
+    Shl,
+    /// `left >> right`
+    Shr,
 }
 
 impl BinOp {
@@ -139,6 +158,13 @@ impl BinOp {
             BinOp::Ge => 12,
             BinOp::In => 13,
             BinOp::NotIn => 14,
+            BinOp::Is => 15,
+            BinOp::IsNot => 16,
+            BinOp::BitAnd => 17,
+            BinOp::BitOr => 18,
+            BinOp::BitXor => 19,
+            BinOp::Shl => 20,
+            BinOp::Shr => 21,
         }
     }
 
@@ -159,6 +185,13 @@ impl BinOp {
             BinOp::Ge => ">=",
             BinOp::In => "in",
             BinOp::NotIn => "not in",
+            BinOp::Is => "is",
+            BinOp::IsNot => "is not",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
         }
     }
 
@@ -171,6 +204,8 @@ impl BinOp {
                 | BinOp::Le
                 | BinOp::Gt
                 | BinOp::Ge
+                | BinOp::Is
+                | BinOp::IsNot
                 | BinOp::In
                 | BinOp::NotIn
         )
@@ -183,6 +218,9 @@ pub enum UnOp {
     Neg,
     Pos,
     Not,
+    /// `~value`: bitwise inversion of an `int` (including `bool`, like
+    /// Python); any other operand raises `TypeError` at runtime.
+    Invert,
 }
 
 impl UnOp {
@@ -191,6 +229,7 @@ impl UnOp {
             UnOp::Neg => 0,
             UnOp::Pos => 1,
             UnOp::Not => 2,
+            UnOp::Invert => 3,
         }
     }
 
@@ -199,6 +238,7 @@ impl UnOp {
             UnOp::Neg => "-",
             UnOp::Pos => "+",
             UnOp::Not => "not",
+            UnOp::Invert => "~",
         }
     }
 }
@@ -217,15 +257,32 @@ pub enum Builtin {
     Print,
     Len,
     Str,
+    /// `repr(value)`: Python's representation string.
+    Repr,
+    /// `hash(value)`: a deterministic integer hash. Equal values hash equally
+    /// and unhashable values (`list`, `dict`, `set`, iterator, or a tuple
+    /// containing one) raise `TypeError`. The value is implementation-defined
+    /// and not reproducible against CPython.
+    Hash,
     Int,
     Float,
     Abs,
+    /// `bool(x)`.
+    Bool,
+    /// `type(x)`.
+    Type,
+    /// `reversed(iterable)`.
+    Reversed,
+    /// `__import__(name, ...)`: dynamic imports are not supported at runtime.
+    Import,
     /// `set()` / `set(iterable)`.
     Set,
     /// `range(...)` as a first-class value.
     Range,
     /// `list()` / `list(iterable)`.
     List,
+    /// `tuple()` / `tuple(iterable)`: an immutable sequence.
+    Tuple,
     /// `dict()` / `dict(iterable)`.
     Dict,
     /// `sum(iterable[, start])`.
@@ -252,11 +309,48 @@ pub enum Builtin {
     /// `getattr(object, name)`: the attribute value, raising `AttributeError`
     /// when it is missing.
     Getattr,
-    /// Internal: one f-string interpolation field lowered to
-    /// `pyx_format_value`. Arguments are the value, a constant format spec
-    /// string and a constant conversion flag (`0` none, `1` `!s`, `2` `!r`,
-    /// `3` `!a`). Not reachable from source code.
+    /// `hasattr(object, name)`: whether the attribute exists. Only an
+    /// `AttributeError` is swallowed; any other failure propagates.
+    Hasattr,
+    /// `max(*args)`: the largest candidate, or the largest element of a
+    /// single iterable.
+    Max,
+    /// `min(*args)`: the counterpart of [`Builtin::Max`].
+    Min,
+    /// `sorted(iterable, key=None, reverse=False)`: a new list with the
+    /// elements in ascending order (stable). Direct lowering always appends
+    /// the `key` and `reverse` slots.
+    Sorted,
+    /// `round(value[, ndigits])`.
+    Round,
+    /// `format(value, spec)`: Python's built-in formatting. F-string
+    /// interpolation fields reuse this builtin with two extra constant
+    /// arguments (the spec and conversion flag); the argument list
+    /// distinguishes the two shapes.
     Format,
+    /// `isinstance(object, type)`.
+    Isinstance,
+    /// `all(iterable)`: `True` when every element is truthy.
+    All,
+    /// `ord(character)`: the Unicode scalar value of a one-character `str`.
+    /// Any other string length or a non-`str` argument raises `TypeError`.
+    Ord,
+    /// `chr(codepoint)`: the one-character `str` for an integer in
+    /// `0..=0x10FFFF`. Surrogate code points are rejected because PyX strings
+    /// are UTF-8; a non-integer raises `TypeError` and an out-of-range or
+    /// surrogate code point raises `ValueError`.
+    Chr,
+    /// `divmod(a, b)`: the pair `(a // b, a % b)` as a 2-tuple, with Python's
+    /// floor-division semantics for ints and floats. A zero divisor raises
+    /// `ZeroDivisionError`; non-numeric operands raise `TypeError`.
+    Divmod,
+    /// `callable(object)`: `True` for functions, builtins, native module
+    /// functions, classes and extension functions.
+    Callable,
+    /// Internal: merge two dicts into a fresh dict (left to right, last value
+    /// wins, insertion order preserved). Produced by dict literals that
+    /// contain `**unpacking`; not reachable from source code.
+    DictMerge,
 }
 
 impl Builtin {
@@ -265,12 +359,19 @@ impl Builtin {
             Builtin::Print => "print",
             Builtin::Len => "len",
             Builtin::Str => "str",
+            Builtin::Repr => "repr",
+            Builtin::Hash => "hash",
             Builtin::Int => "int",
             Builtin::Float => "float",
             Builtin::Abs => "abs",
+            Builtin::Bool => "bool",
+            Builtin::Type => "type",
+            Builtin::Reversed => "reversed",
+            Builtin::Import => "__import__",
             Builtin::Set => "set",
             Builtin::Range => "range",
             Builtin::List => "list",
+            Builtin::Tuple => "tuple",
             Builtin::Dict => "dict",
             Builtin::Sum => "sum",
             Builtin::Enumerate => "enumerate",
@@ -282,23 +383,41 @@ impl Builtin {
             Builtin::Next => "next",
             Builtin::Frozenset => "frozenset",
             Builtin::Getattr => "getattr",
+            Builtin::Hasattr => "hasattr",
+            Builtin::Max => "max",
+            Builtin::Min => "min",
+            Builtin::Sorted => "sorted",
+            Builtin::Round => "round",
             Builtin::Format => "format",
+            Builtin::Isinstance => "isinstance",
+            Builtin::All => "all",
+            Builtin::Ord => "ord",
+            Builtin::Chr => "chr",
+            Builtin::Divmod => "divmod",
+            Builtin::Callable => "callable",
+            Builtin::DictMerge => "dict merge",
         }
     }
 
-    /// Resolves a builtin name visible to source code. `format` is an
-    /// internal f-string helper and is deliberately not resolvable.
+    /// Resolves a builtin name visible to source code.
     pub fn from_name(name: &str) -> Option<Builtin> {
         Some(match name {
             "print" => Builtin::Print,
             "len" => Builtin::Len,
             "str" => Builtin::Str,
+            "repr" => Builtin::Repr,
+            "hash" => Builtin::Hash,
             "int" => Builtin::Int,
             "float" => Builtin::Float,
             "abs" => Builtin::Abs,
+            "bool" => Builtin::Bool,
+            "type" => Builtin::Type,
+            "reversed" => Builtin::Reversed,
+            "__import__" => Builtin::Import,
             "set" => Builtin::Set,
             "range" => Builtin::Range,
             "list" => Builtin::List,
+            "tuple" => Builtin::Tuple,
             "dict" => Builtin::Dict,
             "sum" => Builtin::Sum,
             "enumerate" => Builtin::Enumerate,
@@ -310,6 +429,18 @@ impl Builtin {
             "next" => Builtin::Next,
             "frozenset" => Builtin::Frozenset,
             "getattr" => Builtin::Getattr,
+            "hasattr" => Builtin::Hasattr,
+            "max" => Builtin::Max,
+            "min" => Builtin::Min,
+            "sorted" => Builtin::Sorted,
+            "round" => Builtin::Round,
+            "format" => Builtin::Format,
+            "isinstance" => Builtin::Isinstance,
+            "all" => Builtin::All,
+            "ord" => Builtin::Ord,
+            "chr" => Builtin::Chr,
+            "divmod" => Builtin::Divmod,
+            "callable" => Builtin::Callable,
             _ => return None,
         })
     }
@@ -329,6 +460,15 @@ pub enum ExcKind {
     StopIteration,
     AttributeError,
     OSError,
+    /// `FileNotFoundError`: a subclass of `OSError` (a handler for either
+    /// kind matches both at runtime).
+    FileNotFoundError,
+    /// `AssertionError`: raised by `assert` statements and unittest
+    /// assertions.
+    AssertionError,
+    /// `GeneratorExit`: injected by `generator.close()`; it is also exposed
+    /// as a first-class class value.
+    GeneratorExit,
     /// Base class matching every exception except `KeyboardInterrupt` and
     /// `GeneratorExit` (Python's `Exception`).
     Exception,
@@ -351,8 +491,13 @@ impl ExcKind {
             ExcKind::StopIteration => 8,
             ExcKind::AttributeError => 9,
             ExcKind::OSError => 10,
+            // `GeneratorExit`, injected by `generator.close()`.
+            ExcKind::GeneratorExit => 11,
             ExcKind::Exception => 12,
             ExcKind::BaseException => 13,
+            // `AssertionError`, raised by `assert` statements.
+            ExcKind::AssertionError => 14,
+            ExcKind::FileNotFoundError => 15,
         }
     }
 
@@ -369,6 +514,9 @@ impl ExcKind {
             ExcKind::StopIteration => "StopIteration",
             ExcKind::AttributeError => "AttributeError",
             ExcKind::OSError => "OSError",
+            ExcKind::FileNotFoundError => "FileNotFoundError",
+            ExcKind::AssertionError => "AssertionError",
+            ExcKind::GeneratorExit => "GeneratorExit",
             ExcKind::Exception => "Exception",
             ExcKind::BaseException => "BaseException",
         }
@@ -388,10 +536,26 @@ impl ExcKind {
             "StopIteration" => ExcKind::StopIteration,
             "AttributeError" => ExcKind::AttributeError,
             "OSError" => ExcKind::OSError,
+            "FileNotFoundError" => ExcKind::FileNotFoundError,
+            "AssertionError" => ExcKind::AssertionError,
             "Exception" => ExcKind::Exception,
             "BaseException" => ExcKind::BaseException,
             "IOError" => ExcKind::OSError,
             _ => return None,
+        })
+    }
+
+    /// Resolves an unqualified built-in exception name used as a *value* in an
+    /// expression (`x = ValueError`, `class E(Exception):`).
+    ///
+    /// Unlike [`ExcKind::from_name`], which drives `raise`/`except` and stays
+    /// unchanged, this also exposes the hierarchy tags reachable only through
+    /// the runtime (`AssertionError` and `GeneratorExit`).
+    pub fn from_class_name(name: &str) -> Option<ExcKind> {
+        Some(match name {
+            "AssertionError" => ExcKind::AssertionError,
+            "GeneratorExit" => ExcKind::GeneratorExit,
+            other => return ExcKind::from_name(other),
         })
     }
 }

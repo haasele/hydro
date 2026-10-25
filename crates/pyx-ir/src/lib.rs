@@ -5,8 +5,10 @@
 //! inference; it only lowers this tree to machine code.
 //!
 //! Invariants:
-//! - `functions[0]` is the module body, named `<module>`, with no parameters
-//!   and return type [`Type::None`]. [`Program::main`] points at it.
+//! - [`Program::main`] points at the entry module body: a function named
+//!   `<module>` with no parameters and return type [`Type::None`]. Single-
+//!   source programs always have it at index `0`; multi-module programs emit
+//!   imported module bodies first and list them in [`Program::initializers`].
 //! - Every [`LocalId`] indexes the enclosing function's `locals` vector.
 //!   Parameters are locals too and appear first in `locals`.
 //! - Each [`FunctionId`] indexes `Program::functions`.
@@ -26,8 +28,8 @@ mod tests;
 
 pub use crate::compat::{PYTHON_ABI_TAG, PYTHON_VERSION, PYTHON_VERSION_STRING};
 pub use crate::ir::{
-    ClassMethod, CompClause, CompTarget, Expr, ExprKind, Function, Handler, LocalInfo, Param,
-    Program, Stmt, StmtKind,
+    ClassAttr, ClassMethod, CompClause, CompTarget, Expr, ExprKind, Function, Handler, LocalInfo,
+    MethodKind, Param, ParamKind, Program, Stmt, StmtKind, UnpackTarget,
 };
 pub use crate::model::{
     BinOp, BoolOp, Builtin, Callee, Const, ExcKind, FunctionId, LocalId, Type, UnOp,

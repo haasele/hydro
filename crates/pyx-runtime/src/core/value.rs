@@ -19,11 +19,14 @@
 //! same list/dict requires a user lock. The registry and collector access is
 //! mutex-protected (see [`crate::heap`]).
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use pyx_ir::MethodKind;
 
 use crate::container::DictData;
 use crate::exc::ExcData;
@@ -38,6 +41,11 @@ pub(crate) const TAG_HEAP: i64 = 0b010;
 pub(crate) const NONE: i64 = 1;
 pub(crate) const FALSE: i64 = 9;
 pub(crate) const TRUE: i64 = 17;
+/// Python's `NotImplemented` singleton (reserved special payload 3). Codegen
+/// materialises it for the `NotImplemented` constant; it is deliberately not a
+/// distinct type (`type_name` reports `NotImplementedType`) and the equality
+/// protocol does not treat it specially.
+pub(crate) const NOT_IMPLEMENTED: i64 = 25;
 
 /// Heap object kinds.
 pub(crate) const KIND_STR: u32 = 0;
@@ -96,8 +104,9 @@ pub(crate) const KIND_MATCH: u32 = 27;
 /// Blocking TCP `socket` object. Holds native state only, no PyX values; the
 /// descriptor is closed when the object is dropped.
 pub(crate) const KIND_SOCKET: u32 = 28;
-/// Class object created by `pyx_class_new`. Traces its base class and every
-/// method value. The class namespace is immutable after creation.
+/// Class object created by `pyx_class_new`. Traces its base class, every
+/// method value and every frozen class attribute. The class namespace is
+/// immutable after creation.
 pub(crate) const KIND_CLASS: u32 = 29;
 /// Instance of a class. Traces its class and every instance attribute.
 pub(crate) const KIND_INSTANCE: u32 = 30;
@@ -115,11 +124,20 @@ pub(crate) const KIND_CAPSULE: u32 = 33;
 /// Module value materialised by `pyx_module_value`; stores only its name and
 /// has no PyX children.
 pub(crate) const KIND_MODULE: u32 = 34;
+/// Native text stream over a process file descriptor (`sys.stdout`,
+/// `sys.stderr`). Holds only the descriptor number, so it has no PyX children.
+pub(crate) const KIND_STD_STREAM: u32 = 35;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
 pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
 /// Function flag: contains `yield`, a call produces a generator.
 pub(crate) const FUNCTION_FLAG_GENERATOR: u32 = 2;
+/// Function flag: the wrapper has a dynamic signature (`*args`, `**kwargs` or
+/// keyword-only parameters). Its argument buffer starts with the tagged total
+/// count, followed by the captured values and the caller's positional
+/// arguments; the wrapper binds defaults, the `*args` list and the `**kwargs`
+/// dict before calling the concrete function.
+pub(crate) const FUNCTION_FLAG_VARARGS: u32 = 4;
 
 /// Largest integer representable in a tagged immediate (`2^60 - 1`).
 pub(crate) const MAX_INT: i64 = i64::MAX >> 3;
@@ -164,22 +182,53 @@ pub(crate) enum FunctionBody {
     },
     /// A Python builtin referenced as a value (`f = int`).
     Builtin(pyx_ir::Builtin),
+    /// `operator.attrgetter`: reads one attribute per stored name and returns
+    /// the value, or a tuple when several names were given. Names are plain
+    /// Rust strings, so the body owns no PyX values.
+    AttributeGetter { names: Vec<String> },
+    /// `operator.itemgetter`: subscripts its argument with every stored key and
+    /// returns the value, or a tuple when several keys were given. The keys
+    /// are PyX values and are traced as GC edges.
+    ItemGetter { keys: Vec<i64> },
+    /// `functools.partial`: calls `function` with `args` prepended to the
+    /// arguments of each call and binds `keywords` by parameter name. The
+    /// values of `args` and `keywords` are traced as GC edges.
+    Partial {
+        function: i64,
+        args: Vec<i64>,
+        keywords: Vec<(String, i64)>,
+    },
+    /// Identity callable used by `functools.cache`/`wraps` and by the
+    /// decorator values returned from `lru_cache`/`wraps`: returns its single
+    /// argument. Holds no PyX values.
+    Identity,
 }
 
 /// A function value. For [`FunctionBody::Wrapper`] values `arity` is the exact
 /// number of user-visible positional parameters (captured values are not
-/// counted); native functions validate their arguments against the central
+/// counted), or the minimum count when the wrapper has
+/// [`FUNCTION_FLAG_VARARGS`] (the wrapper binds defaults, `*args` and
+/// `**kwargs`). Native functions validate their arguments against the central
 /// spec (`min_args..=max_args`) and store the upper bound here. Builtin values
-/// store `usize::MAX` because they validate their own arity. `name` is the
-/// Python-visible name (`<lambda>` for anonymous functions). Wrapper function
-/// objects own their captured PyX values; other function bodies own none.
+/// store `usize::MAX` because they validate their own arity. Getters and
+/// identity callables take exactly one argument; a partial stores the caller's
+/// remaining count when its target is a generated wrapper. `name` is the
+/// Python-visible name (`<lambda>` for anonymous functions). Wrapper functions
+/// own their captured values, item getters own their keys and partials own the
+/// target callable plus the bound arguments; the collector traces those edges
+/// (see `gc::heap`).
 pub(crate) struct FunctionObj {
     pub(crate) body: FunctionBody,
     pub(crate) arity: usize,
     pub(crate) name: String,
-    /// [`FUNCTION_FLAG_ASYNC`] / [`FUNCTION_FLAG_GENERATOR`] bits for a
-    /// generated wrapper. Native and builtin bodies keep `0`.
+    /// [`FUNCTION_FLAG_ASYNC`] / [`FUNCTION_FLAG_GENERATOR`] /
+    /// [`FUNCTION_FLAG_VARARGS`] bits for a generated wrapper. Native and
+    /// builtin bodies keep `0`.
     pub(crate) flags: u32,
+    /// User-visible positional parameter names of a generated wrapper.
+    /// `functools.partial` uses them to bind keyword arguments by name; derived
+    /// callables (native functions, getters, partials) have none.
+    pub(crate) params: Vec<String>,
 }
 
 /// Ownership state of a runtime lock, guarded by one mutex.
@@ -1383,23 +1432,32 @@ impl Attributes {
 }
 
 /// State of a class object: its Python-visible name, its base class (or
-/// `NONE`) and the methods collected from `class Name(Base):`.
+/// `NONE`), the methods collected from `class Name(Base):` and the class
+/// attributes frozen when the class statement ran.
 ///
-/// A method is an ordinary function value. The namespace is immutable after
-/// construction, so lookups need no lock and the collector can read it
-/// directly.
+/// A method is an ordinary function value plus its binding kind. The namespace
+/// is immutable after construction, so lookups need no lock and the collector
+/// can read it directly.
 pub(crate) struct ClassState {
     pub(crate) name: String,
     pub(crate) base: i64,
-    pub(crate) methods: Vec<(String, i64)>,
+    pub(crate) methods: Vec<(String, i64, MethodKind)>,
+    pub(crate) attrs: Vec<(String, i64)>,
 }
 
 impl ClassState {
-    fn method(&self, name: &str) -> Option<i64> {
+    fn method(&self, name: &str) -> Option<(MethodKind, i64)> {
         self.methods
             .iter()
+            .find(|(existing, _, _)| existing.as_str() == name)
+            .map(|(_, function, kind)| (*kind, *function))
+    }
+
+    fn attr(&self, name: &str) -> Option<i64> {
+        self.attrs
+            .iter()
             .find(|(existing, _)| existing.as_str() == name)
-            .map(|(_, function)| *function)
+            .map(|(_, value)| *value)
     }
 }
 
@@ -1428,6 +1486,31 @@ impl ModuleState {
     /// The module's import name, e.g. `"errno"`.
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+}
+
+/// Native text stream behind `sys.stdout` / `sys.stderr`.
+///
+/// The stream stores only its file descriptor (1 or 2); writing goes through
+/// `std::io`, one unbuffered-and-flushed call per `write`. It holds no PyX
+/// values, so the collector never traces children.
+pub(crate) struct StdStreamState {
+    fd: i32,
+}
+
+impl StdStreamState {
+    /// The descriptor (`1` stdout, `2` stderr).
+    pub(crate) fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    /// Python-visible name used in error messages.
+    pub(crate) fn name(&self) -> &'static str {
+        if self.fd == 2 {
+            "stderr"
+        } else {
+            "stdout"
+        }
     }
 }
 
@@ -1524,6 +1607,8 @@ pub(crate) enum ObjData {
     },
     /// Module value (`<module 'name'>`); holds no PyX values.
     Module(ModuleState),
+    /// Native text stream over fd 1/2; holds no PyX values.
+    StdStream(StdStreamState),
 }
 
 // -------------------------------------------------------------------------
@@ -1876,6 +1961,32 @@ pub(crate) fn as_module(v: i64) -> Option<&'static ModuleState> {
     }
 }
 
+/// Borrows the state of a native standard stream (`sys.stdout`/`sys.stderr`).
+pub(crate) fn as_std_stream(v: i64) -> Option<&'static StdStreamState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked above; the object is rooted/immutable for the
+    // duration of this call (the collector only frees unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_STD_STREAM {
+        return None;
+    }
+    match &obj.data {
+        ObjData::StdStream(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Allocates a fresh `sys.stdout`/`sys.stderr` stream over `fd`.
+///
+/// A fresh object per resolution keeps the value GC-safe without a rooted
+/// singleton; identity (`sys.stdout is sys.stdout`) is therefore not stable,
+/// which no supported program observes.
+pub(crate) fn std_stream_new(fd: i32) -> i64 {
+    alloc(KIND_STD_STREAM, ObjData::StdStream(StdStreamState { fd }))
+}
+
 /// Borrows the state of a class instance.
 pub(crate) fn as_instance(v: i64) -> Option<&'static InstanceState> {
     if !is_heap(v) {
@@ -1904,16 +2015,34 @@ pub(crate) fn instance_class_name(v: i64) -> Option<&'static str> {
     class_display_name(state.class)
 }
 
-/// Looks up `name` on `class` and its bases, returning the method value.
+/// One entry of a class namespace, as resolved through the base chain.
+///
+/// A class body cannot define the same name twice (the frontend diagnoses
+/// it), but a subclass attribute may shadow a base-class method, so attribute
+/// and method lookups share one namespace walk.
+pub(crate) enum ClassEntry {
+    /// Frozen class attribute value.
+    Attr(i64),
+    /// Method with its binding kind.
+    Method(MethodKind, i64),
+}
+
+/// Looks up `name` on `class` and its bases.
 ///
 /// The class namespace is immutable after construction, so bases form a finite
 /// chain; the iteration cap is defensive against a malformed heap object.
-pub(crate) fn class_method(class: i64, name: &str) -> Option<i64> {
+pub(crate) fn class_lookup(class: i64, name: &str) -> Option<ClassEntry> {
     let mut current = class;
     for _ in 0..1024 {
         let state = as_class(current)?;
-        if let Some(function) = state.method(name) {
-            return Some(function);
+        // Attributes and methods live in separate vectors for tracing, but
+        // they model one class dictionary; attributes are checked first
+        // because duplicate names are rejected when the class is created.
+        if let Some(value) = state.attr(name) {
+            return Some(ClassEntry::Attr(value));
+        }
+        if let Some((kind, function)) = state.method(name) {
+            return Some(ClassEntry::Method(kind, function));
         }
         if state.base == NONE {
             return None;
@@ -1921,6 +2050,21 @@ pub(crate) fn class_method(class: i64, name: &str) -> Option<i64> {
         current = state.base;
     }
     None
+}
+
+/// Looks up `name` on `class` and its bases, returning its binding kind and
+/// method value. Attributes of the same name are ignored.
+pub(crate) fn class_member(class: i64, name: &str) -> Option<(MethodKind, i64)> {
+    match class_lookup(class, name)? {
+        ClassEntry::Method(kind, function) => Some((kind, function)),
+        ClassEntry::Attr(_) => None,
+    }
+}
+
+/// Looks up `name` on `class` and its bases, returning the method value
+/// regardless of its binding kind.
+pub(crate) fn class_method(class: i64, name: &str) -> Option<i64> {
+    class_member(class, name).map(|(_, function)| function)
 }
 
 /// Reads an instance data attribute. Method attributes are resolved by
@@ -2557,12 +2701,28 @@ pub(crate) fn namespace_new(pairs: Vec<(String, i64)>) -> i64 {
 /// are function values in declaration order (duplicates already collapsed by
 /// the ABI entry point).
 pub(crate) fn class_new(name: String, base: i64, methods: Vec<(String, i64)>) -> i64 {
+    let methods = methods
+        .into_iter()
+        .map(|(name, function)| (name, function, MethodKind::Normal))
+        .collect();
+    class_new_full(name, base, methods, Vec::new())
+}
+
+/// Allocates a class object with method binding kinds and frozen class
+/// attributes. See [`class_new`].
+pub(crate) fn class_new_full(
+    name: String,
+    base: i64,
+    methods: Vec<(String, i64, MethodKind)>,
+    attrs: Vec<(String, i64)>,
+) -> i64 {
     let class = alloc(
         KIND_CLASS,
         ObjData::Class(ClassState {
             name,
             base,
             methods,
+            attrs,
         }),
     );
     // A subclass of the native unittest `TestCase` joins the test registry so
@@ -2596,10 +2756,10 @@ pub(crate) fn defaultdict_new(factory: i64, pairs: Vec<(i64, i64)>) -> i64 {
     )
 }
 
-pub(crate) fn pattern_new(source: String) -> i64 {
+pub(crate) fn pattern_new(source: String, flags: i64) -> i64 {
     alloc(
         KIND_PATTERN,
-        ObjData::Pattern(crate::modules::re::PatternState { source }),
+        ObjData::Pattern(crate::modules::re::PatternState { source, flags }),
     )
 }
 
@@ -2709,6 +2869,7 @@ pub(crate) fn function_new_with_flags(
             arity,
             name,
             flags,
+            params: Vec::new(),
         }),
     )
 }
@@ -2731,6 +2892,7 @@ pub(crate) fn closure_new_with_flags(
             arity,
             name,
             flags,
+            params: Vec::new(),
         }),
     )
 }
@@ -2746,6 +2908,7 @@ pub(crate) fn native_function_new(module: &'static str, name: &'static str, arit
             arity,
             name: name.to_string(),
             flags: 0,
+            params: Vec::new(),
         }),
     )
 }
@@ -2760,6 +2923,134 @@ pub(crate) fn builtin_function_new(builtin: pyx_ir::Builtin) -> i64 {
             arity: usize::MAX,
             name: builtin.name().to_string(),
             flags: 0,
+            params: Vec::new(),
+        }),
+    )
+}
+
+/// Allocates an `operator.attrgetter` key function. `arity` is `1`: the
+/// getter takes the object it reads from.
+pub(crate) fn attribute_getter_new(names: Vec<String>) -> i64 {
+    alloc(
+        KIND_FUNCTION,
+        ObjData::Function(FunctionObj {
+            body: FunctionBody::AttributeGetter { names },
+            arity: 1,
+            name: "attrgetter".to_string(),
+            flags: 0,
+            params: Vec::new(),
+        }),
+    )
+}
+
+/// Allocates an `operator.itemgetter` key function. Keys are moved into the
+/// body, which traces them as GC edges.
+pub(crate) fn item_getter_new(keys: Vec<i64>) -> i64 {
+    alloc(
+        KIND_FUNCTION,
+        ObjData::Function(FunctionObj {
+            body: FunctionBody::ItemGetter { keys },
+            arity: 1,
+            name: "itemgetter".to_string(),
+            flags: 0,
+            params: Vec::new(),
+        }),
+    )
+}
+
+/// Allocates a `functools.partial` value binding `args` as leading positional
+/// arguments of `function`.
+pub(crate) fn partial_new(function: i64, args: Vec<i64>) -> i64 {
+    partial_new_with_keywords(function, args, Vec::new())
+}
+
+/// Allocates a `functools.partial` value binding `args` as leading positional
+/// arguments and `keywords` by parameter name.
+///
+/// The keywords are applied when the partial is called: the target's parameter
+/// names (attached by codegen) place each value in its slot, and every named
+/// value is either consumed or reported with a `TypeError`. Nothing is
+/// silently dropped.
+///
+/// `arity` mirrors the remaining parameter count of a generated wrapper so the
+/// error paths that inspect it (`Thread`, `Process`, `Pool` targets) stay
+/// meaningful; other callables validate their own arity and store
+/// `usize::MAX`.
+pub(crate) fn partial_new_with_keywords(
+    function: i64,
+    args: Vec<i64>,
+    keywords: Vec<(String, i64)>,
+) -> i64 {
+    let bound = args.len().saturating_add(keywords.len());
+    let remaining = match as_function(function) {
+        Some(func) => match &func.body {
+            FunctionBody::Native { .. } | FunctionBody::Builtin(_) => usize::MAX,
+            // Generated wrappers count user-visible parameters; the derived
+            // callables here take exactly one argument.
+            FunctionBody::Wrapper { .. }
+            | FunctionBody::Partial { .. }
+            | FunctionBody::Identity
+            | FunctionBody::AttributeGetter { .. }
+            | FunctionBody::ItemGetter { .. } => func.arity.saturating_sub(bound),
+        },
+        None => usize::MAX,
+    };
+    alloc(
+        KIND_FUNCTION,
+        ObjData::Function(FunctionObj {
+            body: FunctionBody::Partial {
+                function,
+                args,
+                keywords,
+            },
+            arity: remaining,
+            name: "partial".to_string(),
+            flags: 0,
+            params: Vec::new(),
+        }),
+    )
+}
+
+/// Attaches the user-visible positional parameter names to a function value.
+///
+/// Codegen calls this right after creating a generated wrapper. Values that
+/// are not function objects are ignored, matching the ABI's tolerance for
+/// best-effort metadata.
+pub(crate) fn function_set_params(function: i64, params: Vec<String>) {
+    if !is_heap(function) || (function & !TAG_MASK) == 0 {
+        return;
+    }
+    // SAFETY: heap tag checked above; the function value is live for the
+    // duration of the call and the parameter names own no PyX values.
+    let obj = unsafe { &mut *((function & !TAG_MASK) as *mut PyxObj) };
+    if obj.kind != KIND_FUNCTION {
+        return;
+    }
+    if let ObjData::Function(func) = &mut obj.data {
+        func.params = params;
+    }
+}
+
+/// The user-visible positional parameter names of a function value, or an
+/// empty slice for callables without them.
+pub(crate) fn function_params(function: i64) -> &'static [String] {
+    match as_function(function) {
+        Some(func) => &func.params,
+        None => &[],
+    }
+}
+
+/// Allocates the identity callable returned by `functools.lru_cache` and
+/// `functools.wraps` (the decorator) and used by `functools.cache`.
+pub(crate) fn identity_function_new(name: &str) -> i64 {
+    alloc(
+        KIND_FUNCTION,
+        ObjData::Function(FunctionObj {
+            body: FunctionBody::Identity,
+            arity: 1,
+            name: name.to_string(),
+            flags: 0,
+            params: Vec::new(),
         }),
     )
 }
@@ -2982,6 +3273,7 @@ pub(crate) fn type_name(v: i64) -> &'static str {
         return match v >> 3 {
             0 => "NoneType",
             1 | 2 => "bool",
+            3 => "NotImplementedType",
             _ => "object",
         };
     }
@@ -3023,6 +3315,7 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             Some(ObjData::ExtFunction(_)) => "builtin_function_or_method",
             Some(ObjData::Capsule { .. }) => "PyCapsule",
             Some(ObjData::Module(_)) => "module",
+            Some(ObjData::StdStream(_)) => "TextIOWrapper",
             Some(ObjData::Fiber(state)) => match state.kind {
                 crate::fiber::FiberKind::Generator => "generator",
                 crate::fiber::FiberKind::Coroutine => "coroutine",
@@ -3031,6 +3324,38 @@ pub(crate) fn type_name(v: i64) -> &'static str {
         };
     }
     "object"
+}
+
+thread_local! {
+    /// Cached native classes returned by `type()` for primitive values. The
+    /// classes are heap objects and are registered as GC roots; the cache is
+    /// cleared by the runtime reset before the heap is freed.
+    static TYPE_CLASS_CACHE: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
+}
+
+pub(crate) fn clear_type_class_cache() {
+    TYPE_CLASS_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+/// `type(value)`: the class object for instances, otherwise a cached native
+/// class named after the value's runtime type. `type` itself maps to a cached
+/// class object named `type`.
+pub(crate) fn type_class(v: i64) -> i64 {
+    if let Some(instance) = as_instance(v) {
+        return instance.class;
+    }
+    let name = if as_class(v).is_some() {
+        "type".to_string()
+    } else {
+        type_name_of(v)
+    };
+    if let Some(class) = TYPE_CLASS_CACHE.with(|cache| cache.borrow().get(&name).copied()) {
+        return class;
+    }
+    let class = class_new(name.clone(), NONE, Vec::new());
+    crate::heap::add_thread_root(class);
+    TYPE_CLASS_CACHE.with(|cache| cache.borrow_mut().insert(name, class));
+    class
 }
 
 /// Python-style type name that resolves class objects and instances to their
@@ -3051,7 +3376,9 @@ pub(crate) fn truthy(v: i64) -> bool {
         return (v >> 3) != 0;
     }
     if is_special(v) {
-        return matches!(v >> 3, 2);
+        // `True` and Python's `NotImplemented` singleton are truthy; `None`
+        // and `False` are falsy.
+        return v == TRUE || v == NOT_IMPLEMENTED;
     }
     if is_heap(v) {
         // SAFETY: heap tag checked above; the object is rooted for the duration of
@@ -3099,6 +3426,8 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjData::ExtFunction(_)) => true,
             // Capsules and module values are always truthy, like CPython.
             Some(ObjData::Capsule { .. }) | Some(ObjData::Module(_)) => true,
+            // A standard stream is always truthy.
+            Some(ObjData::StdStream(_)) => true,
             None => true,
         };
     }
@@ -3141,6 +3470,7 @@ pub(crate) fn to_string(v: i64) -> String {
             0 => "None".to_string(),
             1 => "False".to_string(),
             2 => "True".to_string(),
+            3 => "NotImplemented".to_string(),
             // Malformed special payload: fall back to a stable rendering.
             _ => "None".to_string(),
         };
@@ -3232,6 +3562,7 @@ pub(crate) fn to_string(v: i64) -> String {
                     None => "<capsule object NULL>".to_string(),
                 },
                 ObjData::Module(state) => format!("<module '{}'>", state.name),
+                ObjData::StdStream(stream) => format!("<pyx.{}>", stream.name()),
             };
         }
     }

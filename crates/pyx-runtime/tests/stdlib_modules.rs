@@ -10,7 +10,9 @@ const RUNTIME_ERROR: i64 = 3;
 const KEY_ERROR: i64 = 7;
 
 fn int(n: i64) -> i64 {
-    pyx_int(n)
+    // The ABI takes tagged immediates; `pyx_int` treats multiples of 8 as
+    // already tagged, so encode explicitly.
+    n << 3
 }
 
 fn text(value: &str) -> i64 {
@@ -59,6 +61,10 @@ fn method_kw(obj: i64, name: &str, args: &[i64], kwargs: &[(&str, i64)]) -> i64 
 
 fn getattr(obj: i64, name: &str) -> i64 {
     pyx_getattr(obj, name.as_ptr(), name.len())
+}
+
+fn module_get(module: &str, name: &str) -> i64 {
+    pyx_module_get(module.as_ptr(), module.len(), name.as_ptr(), name.len())
 }
 
 fn assert_no_error() {
@@ -291,6 +297,45 @@ fn regex_search_findall_and_sub() {
 }
 
 #[test]
+fn regex_finditer_returns_match_objects_with_spans() {
+    pyx_runtime_init();
+    let matches = module("re", "finditer", &[text("[0-9]+"), text("a1b22")]);
+    assert_no_error();
+    assert_int(pyx_len(matches), 2);
+
+    let first = pyx_subscript(matches, int(0));
+    assert_str(method(first, "group", &[]), "1");
+    assert_int(method(first, "start", &[]), 1);
+    assert_int(method(first, "end", &[]), 2);
+
+    let second = pyx_subscript(matches, int(1));
+    assert_str(method(second, "group", &[]), "22");
+    assert_int(method(second, "start", &[]), 3);
+    assert_int(method(second, "end", &[]), 5);
+
+    // A compiled pattern keeps its flags for `finditer` too.
+    let pattern = module("re", "compile", &[text("[a-z]+"), int(2)]);
+    assert_no_error();
+    let words = method(pattern, "finditer", &[text("One TWO")]);
+    assert_no_error();
+    assert_int(pyx_len(words), 2);
+    assert_str(method(pyx_subscript(words, int(0)), "group", &[]), "One");
+
+    // Module-level `finditer` accepts the positional `flags` argument.
+    let ignored = module(
+        "re",
+        "finditer",
+        &[text("A"), text("aA"), int(2 /* IGNORECASE */)],
+    );
+    assert_no_error();
+    assert_int(pyx_len(ignored), 2);
+
+    // Non-string input follows the other module functions.
+    module("re", "finditer", &[text("a"), int(1)]);
+    expect_error(TYPE_ERROR);
+}
+
+#[test]
 fn regex_match_fullmatch_and_split() {
     pyx_runtime_init();
     let matched = module("re", "match", &[text("a+"), text("aaab")]);
@@ -340,5 +385,91 @@ fn regex_errors_are_python_exceptions() {
     module("re", "search", &[text("("), text("text")]);
     expect_error(VALUE_ERROR);
     module("re", "search", &[text("a"), int(1)]);
+    expect_error(TYPE_ERROR);
+}
+
+#[test]
+fn regex_flag_constants_have_cpython_values() {
+    pyx_runtime_init();
+    assert_eq!(module_get("re", "NOFLAG"), int(0));
+    assert_eq!(module_get("re", "TEMPLATE"), int(1));
+    assert_eq!(module_get("re", "T"), int(1));
+    assert_eq!(module_get("re", "IGNORECASE"), int(2));
+    assert_eq!(module_get("re", "I"), int(2));
+    assert_eq!(module_get("re", "LOCALE"), int(4));
+    assert_eq!(module_get("re", "MULTILINE"), int(8));
+    assert_eq!(module_get("re", "M"), int(8));
+    assert_eq!(module_get("re", "DOTALL"), int(16));
+    assert_eq!(module_get("re", "S"), int(16));
+    assert_eq!(module_get("re", "UNICODE"), int(32));
+    assert_eq!(module_get("re", "VERBOSE"), int(64));
+    assert_eq!(module_get("re", "X"), int(64));
+    assert_eq!(module_get("re", "DEBUG"), int(128));
+    assert_eq!(module_get("re", "ASCII"), int(256));
+    assert_eq!(module_get("re", "A"), int(256));
+    assert_no_error();
+}
+
+#[test]
+fn regex_compile_verbose_ignores_whitespace_and_comments() {
+    pyx_runtime_init();
+    // The `rich.color` colour pattern: it is only readable because
+    // `re.VERBOSE` drops the newlines, and `\#` still matches a literal `#`.
+    let source = "^
+\\#([0-9a-f]{6})$|
+color\\(([0-9]{1,3})\\)$|
+rgb\\(([\\d\\s,]+)\\)$
+";
+    let pattern = module(
+        "re",
+        "compile",
+        &[text(source), module_get("re", "VERBOSE")],
+    );
+    assert_no_error();
+    assert_int(getattr(pattern, "flags"), 64);
+
+    let hex = method(pattern, "search", &[text("#a1b2c3")]);
+    assert_str(method(hex, "group", &[int(1)]), "a1b2c3");
+
+    let indexed = method(pattern, "search", &[text("color(42)")]);
+    assert_str(method(indexed, "group", &[int(2)]), "42");
+
+    let rgb = method(pattern, "search", &[text("rgb(1, 22, 200)")]);
+    assert_str(method(rgb, "group", &[int(3)]), "1, 22, 200");
+
+    // Without the flag the newlines are literal, so nothing matches.
+    let plain = module("re", "compile", &[text(source)]);
+    assert_none(method(plain, "search", &[text("#a1b2c3")]));
+}
+
+#[test]
+fn regex_compile_honours_case_multiline_and_dotall_flags() {
+    pyx_runtime_init();
+
+    let insensitive = module(
+        "re",
+        "compile",
+        &[text("abc"), module_get("re", "IGNORECASE")],
+    );
+    assert_true(pyx_bool(method(insensitive, "search", &[text("xABCx")])));
+    let sensitive = module("re", "compile", &[text("abc")]);
+    assert_none(method(sensitive, "search", &[text("xABCx")]));
+
+    let multiline = module(
+        "re",
+        "compile",
+        &[text("^b"), module_get("re", "MULTILINE")],
+    );
+    assert_true(pyx_bool(method(multiline, "search", &[text("a\nb")])));
+    let anchored = module("re", "compile", &[text("^b")]);
+    assert_none(method(anchored, "search", &[text("a\nb")]));
+
+    let dotall = module("re", "compile", &[text("a.b"), module_get("re", "DOTALL")]);
+    assert_true(pyx_bool(method(dotall, "search", &[text("a\nb")])));
+    let line_local = module("re", "compile", &[text("a.b")]);
+    assert_none(method(line_local, "search", &[text("a\nb")]));
+
+    // `re.compile` flags must be integers.
+    module("re", "compile", &[text("a"), text("x")]);
     expect_error(TYPE_ERROR);
 }

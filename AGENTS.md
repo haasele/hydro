@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules + lazy generators/coroutines/event loop (no GIL)** | 1064 tests, JIT+AOT |
+| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1329 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -46,19 +46,45 @@ Still open are async generators/comprehensions, variable payload size classes as
 well as precise GC stack maps (P2-05/06/07), packaging/cross-platform/fuzzing
 and the C-API implementation itself. Details: `docs/TODO.md`.
 
+**Standard-library / ecosystem checkpoint (2026-10-25):**
+
+- **Package loader:** `check_file` resolves packages (`__init__.py`), dotted
+  names, submodules and relative imports. Search order: sibling files, the
+  package-chain root, `PYX_SITE_PACKAGES`, the `VIRTUAL_ENV`/
+  `CONDA_PREFIX` site-packages trees, then `PYTHONPATH`. Every unit loads
+  once per canonical path; imported module bodies run once as initializers.
+  Nested imports are recorded and stay unloaded until the enclosing code
+  runs.
+- **`rich` progress:** the native `rich` implementation was removed. The
+  official pure-Python `rich` distribution is resolved through the loader,
+  but `rich/console.py` (and likely further modules) still lack runtime
+  features, so no working `rich` path exists under PyX yet.
+- **Import matrix:** **58/297 modules importable** (13 builtin/frozen,
+  41 pure, 4 extension; 230 `PYX0002`, 9 modules where CPython 3.14.9
+  itself fails). Report: `docs/COMPATIBILITY.md`, JSON
+  `benchmarks/compat/latest.json`.
+- **`benchmarks/bench_all.py` under PyX: not yet green.** The first concrete
+  blocker is `rich/console.py`: `dataclasses.field`, `os.PathLike`, ellipsis,
+  `del`, `get_ipython`, `sys.stdin`/`__stdin__`/`__stdout__`/`__stderr__`,
+  `os.get_terminal_size`/`open`/`dup2`, `SystemExit`, `input()` and
+  `threading.local`. Further `rich` modules will likely add more.
+  `bench_all.py --only pyx` still completes under CPython.
+
 **Verification (as of 2026-10-25):**
 
-- `cargo test --workspace`: **1064 tests** — 289 frontend, 23 codegen, 4 IR,
-  371 runtime unit, 204 CLI/E2E (135 E2E incl. the abi3 extension fixture,
-  22 fibers, 6 closures, 5 user modules, completions, extension
-  path/dotted/multi-phase, 8 exception tests, 2 unittest-runner tests,
-  2 stdlib-batch-a, 2 stdlib-batch-b and 3 stdlib-bench-batch tests),
-  173 further runtime integration tests
-  (allocator, bytes, GC/concurrent GC, IO, CSV, stdlib modules, classes,
-  closures, socket, pathlib, pool, threads). New suites cover generator
-  send/throw/close + yield expressions, C-API containers, extension
-  value/loader conversion, extension import lowering and the JIT+AOT abi3
-  fixture (`crates/pyx-cli/tests/extensions.rs`).
+- `cargo test --workspace`: **1329 tests** — 395 frontend, 47 codegen, 16 IR,
+  479 runtime unit, 213 CLI/E2E (136 E2E incl. the abi3 extension fixture,
+  24 fibers, 6 closures, 10 user modules, 10 exception tests, 8
+  completions, extension path/dotted/multi-phase, 2 unittest-runner tests,
+  2 stdlib-batch-a, 2 stdlib-batch-b, 3 stdlib-bench-batch tests and 5 CLI
+  argument-parser unit tests), 179 further runtime integration tests
+  (allocator, bytes, GC/concurrent GC/STW GC, IO, CSV, stdlib modules,
+  stdlib utils, classes, closures, socket, pathlib, pool, threads, attrs,
+  format). New suites cover generator send/throw/close + yield expressions,
+  C-API containers, extension value/loader conversion, extension import
+  lowering, list slice assignment, starred unpacking/calls, deferred
+  imports, exception classes as values, the package/site-packages loader and
+  the shared `rich` surface.
 - `scripts/verify.sh`: fmt, clippy (`-D warnings`), build, tests, E2E for JIT
   and AOT (incl. classes/closures/generators_async/formatting/socket_echo/
   stdlib_modules/pathlib), negative tests, GC threshold/stress — ALL GREEN.
@@ -82,9 +108,12 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   `next`/`send` echo, `close` running `finally`, `throw(caught_exception)`
   re-raised inside the generator, StopIteration after completion.
 - **Stdlib compatibility baseline:** `python3 scripts/stdlib_compat.py`
-  (CPython 3.14.9, PyX 0.1.0): **47/297 modules importable** (11 builtin/frozen,
-  32 pure, 4 extension; 8 unknown names fail under CPython too). Batches A,
-  the native core of B and the benchmark-critical batch are implemented. Report:
+  (CPython 3.14.9, PyX 0.1.0): **58/297 modules importable** (13 builtin/frozen,
+  41 pure, 4 extension; 9 modules fail under CPython too). Batches A,
+  the native core of B, the benchmark-critical batch and the new native
+  `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
+  `__future__` modules are importable and API-tested; `dataclasses` and
+  `datetime` are importable through native module specs. Report:
   `docs/COMPATIBILITY.md`, JSON `benchmarks/compat/latest.json`.
 - **Official CPython suite baseline:** `python3 scripts/cpython_compat.py`
   (398 `Lib/test` modules, pinned 3.14.9 oracle): **1 passing**
@@ -536,7 +565,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 1064 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 1329 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -740,7 +769,7 @@ parallel benchmarks and race/stress tests.
   JIT 7.7 ms, AOT 6.8 ms; `strace -c` counts 94 syscalls total (previously
   200,097, two `rt_sigprocmask` per yield). Remaining weak spots: string
   concatenation (O(n²)) and float boxing — open performance work.
-- **Verified:** 1064 tests, `cargo fmt`, `cargo clippy --workspace -- -D warnings
+- **Verified:** 1329 tests, `cargo fmt`, `cargo clippy --workspace -- -D warnings
   --all-targets -- -D warnings` and `cargo test --workspace` green;
   micro baseline renewed (while_sum AOT 1.7 ms vs. CPython 23.5 ms).
 
@@ -748,7 +777,7 @@ parallel benchmarks and race/stress tests.
 conservative collector (stack scan, STW root rescan; white partition briefly
 under heap lock, freeing concurrent); no precise roots/stack maps and
 no size-class allocator (P2-05/06/07 open); exception hierarchy/
-chaining/`except*` missing; no slice assignment; `dict` views are materialized
+chaining/`except*` missing; `dict` views are materialized
 as lists; set order is deterministic (Python guarantees
 none); `and`/`or` return operands, types there may be `Any`. Dicts use
 a hash index (O(1) on average, Python equality, numeric key equivalence).
@@ -800,9 +829,12 @@ Windows/cross-compilation missing.
    module dispatch and generator resume are no longer bottlenecks.
 3. P2-05/P2-06/P2-07: size-class allocator, precise shadow-stack roots/
    stack maps, finer safepoint polling (P2-08 metrics are available).
-4. P7 standard library: Batch A and the Batch B native codec/text core are
-   importable/API-tested; next are P7-01 package/import execution, P7-03
-   builtin shims and the remaining Batch B modules, then the
+4. P7 standard library: Batch A, the Batch B native codec/text core, the
+   benchmark-critical batch, the package/site-packages loader and the new
+   native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
+   `importlib`/`__future__` modules are importable/API-tested. Next are
+   P7-03 builtin shims, the remaining Batch B/C/E/F modules and the
+   `rich/console.py` blockers for `bench_all.py` under PyX, then the
    dependency-ordered batches in `docs/TODO.md`. P4: extend the working abi3
    slice (capsules, buffer, container constructors, wheels/venv discovery),
    then the full CPython 3.14 ABI/NumPy/pydantic-core (P4-04c/d),
@@ -820,7 +852,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (1064)
+cargo test                             # unit/integration tests (1329)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1193,3 +1225,32 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   32 pure, 4 extension); 250 modules remain. `bench_all.py --only pyx`
   completes. **1064 tests**, clippy `-D warnings` and `scripts/verify.sh`
   green.
+
+- 2026-10-25 (continuation 49): list slice assignment.
+  `xs[a:b:c] = value` lowers to `StmtKind::SetSlice` (omitted bounds are
+  `Const::None`) and the new `pyx_slice_set` ABI; codegen keeps Python's
+  evaluation order (right-hand side, then target, then bounds). The runtime
+  implements `slice.indices` bounds, step-1 splice with any iterable,
+  extended-slice positional replacement (`ValueError` on length mismatch),
+  an iterable right-hand side materialised before mutation, immutable
+  target `TypeError`s, the dict `unhashable type: 'slice'` error and GC
+  insertion barriers. Augmented slice assignment stays a clear frontend
+  diagnostic. `examples/slices.py` (+ expected output and the E2E/AOT/GC
+  runs) covers head/middle/tail/empty/full slices, negative bounds, extended
+  steps, errors and evaluation order.
+
+- 2026-10-25 (continuation 50): package/site-packages loader and `rich`
+  progress. `check_file` now resolves packages (`__init__.py`), dotted names,
+  submodules and relative imports, searching sibling files, the package-chain
+  root, `PYX_SITE_PACKAGES`, the `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages
+  trees and `PYTHONPATH`; imported module bodies run once as initializers and
+  nested imports stay deferred. The native `rich` implementation is removed
+  and the official pure-Python `rich` package resolves through the loader.
+  Stdlib imports **58/297** (13 builtin/frozen, 41 pure, 4 extension; 9
+  modules where CPython itself fails); **239 remain**. `bench_all.py` under
+  PyX is **not yet green**: the first blocker is `rich/console.py`
+  (`dataclasses.field`, `os.PathLike`, ellipsis, `del`, `get_ipython`,
+  `sys.stdin`/`__stdin__`/`__stdout__`/`__stderr__`, `os.get_terminal_size`/
+  `open`/`dup2`, `SystemExit`, `input()`, `threading.local`), with further
+  `rich` modules likely to add more. **1329 tests**, clippy `-D warnings` and
+  `scripts/verify.sh` green.

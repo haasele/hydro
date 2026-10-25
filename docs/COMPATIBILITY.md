@@ -36,17 +36,17 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
-| builtin/frozen | 52 | 11 | 41 |
-| pure | 174 | 32 | 142 |
+| builtin/frozen | 52 | 13 | 39 |
+| pure | 174 | 41 | 133 |
 | extension | 63 | 4 | 59 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 47 | 250 |
+| **Total** | 297 | 58 | 239 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:PYX0002 | 241 |
+| compile_error:PYX0002 | 230 |
 | cpython_failed | 9 |
 
 ## Modules by layer
@@ -55,317 +55,317 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 
 | Module | CPython | PyX | Status | Error |
 | --- | --- | --- | --- | --- |
-| `_abc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_abc' not found: not supported unless a sibling _abc.py exists |
-| `_ast` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_ast' not found: not supported unless a sibling _ast.py exists |
-| `_codecs` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs' not found: not supported unless a sibling _codecs.py exi… |
-| `_collections` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_collections' not found: not supported unless a sibling _collecti… |
-| `_collections_abc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_collections_abc' not found: not supported unless a sibling _coll… |
-| `_contextvars` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_contextvars' not found: not supported unless a sibling _contextv… |
-| `_datetime` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_datetime' not found: not supported unless a sibling _datetime.py… |
-| `_frozen_importlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_frozen_importlib' not found: not supported unless a sibling _fro… |
-| `_frozen_importlib_external` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_frozen_importlib_external' not found: not supported unless a sib… |
+| `_abc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_abc' not found: not supported on the import search path |
+| `_ast` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_ast' not found: not supported on the import search path |
+| `_codecs` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs' not found: not supported on the import search path |
+| `_collections` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_collections' not found: not supported on the import search path |
+| `_collections_abc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_collections_abc' not found: not supported on the import search p… |
+| `_contextvars` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_contextvars' not found: not supported on the import search path |
+| `_datetime` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_datetime' not found: not supported on the import search path |
+| `_frozen_importlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_frozen_importlib' not found: not supported on the import search… |
+| `_frozen_importlib_external` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_frozen_importlib_external' not found: not supported on the impor… |
 | `_functools` | ok | ok | ok | - |
-| `_imp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_imp' not found: not supported unless a sibling _imp.py exists |
+| `_imp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_imp' not found: not supported on the import search path |
 | `_io` | ok | ok | ok | - |
-| `_locale` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_locale' not found: not supported unless a sibling _locale.py exi… |
-| `_opcode` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_opcode' not found: not supported unless a sibling _opcode.py exi… |
+| `_locale` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_locale' not found: not supported on the import search path |
+| `_opcode` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_opcode' not found: not supported on the import search path |
 | `_operator` | ok | ok | ok | - |
-| `_signal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_signal' not found: not supported unless a sibling _signal.py exi… |
-| `_sitebuiltins` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sitebuiltins' not found: not supported unless a sibling _sitebui… |
-| `_sre` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sre' not found: not supported unless a sibling _sre.py exists |
+| `_signal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_signal' not found: not supported on the import search path |
+| `_sitebuiltins` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sitebuiltins' not found: not supported on the import search path |
+| `_sre` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sre' not found: not supported on the import search path |
 | `_stat` | ok | ok | ok | - |
-| `_string` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_string' not found: not supported unless a sibling _string.py exi… |
-| `_suggestions` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_suggestions' not found: not supported unless a sibling _suggesti… |
-| `_symtable` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_symtable' not found: not supported unless a sibling _symtable.py… |
-| `_sysconfig` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sysconfig' not found: not supported unless a sibling _sysconfig.… |
+| `_string` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_string' not found: not supported on the import search path |
+| `_suggestions` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_suggestions' not found: not supported on the import search path |
+| `_symtable` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_symtable' not found: not supported on the import search path |
+| `_sysconfig` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sysconfig' not found: not supported on the import search path |
 | `_thread` | ok | ok | ok | - |
-| `_tokenize` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_tokenize' not found: not supported unless a sibling _tokenize.py… |
-| `_tracemalloc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_tracemalloc' not found: not supported unless a sibling _tracemal… |
-| `_types` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_types' not found: not supported unless a sibling _types.py exists |
-| `_typing` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_typing' not found: not supported unless a sibling _typing.py exi… |
-| `_warnings` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_warnings' not found: not supported unless a sibling _warnings.py… |
-| `_weakref` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_weakref' not found: not supported unless a sibling _weakref.py e… |
-| `abc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'abc' not found: not supported unless a sibling abc.py exists |
-| `atexit` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'atexit' not found: not supported unless a sibling atexit.py exists |
-| `builtins` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'builtins' not found: not supported unless a sibling builtins.py e… |
-| `codecs` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists |
+| `_tokenize` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_tokenize' not found: not supported on the import search path |
+| `_tracemalloc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_tracemalloc' not found: not supported on the import search path |
+| `_types` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_types' not found: not supported on the import search path |
+| `_typing` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_typing' not found: not supported on the import search path |
+| `_warnings` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_warnings' not found: not supported on the import search path |
+| `_weakref` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_weakref' not found: not supported on the import search path |
+| `abc` | ok | ok | ok | - |
+| `atexit` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'atexit' not found: not supported on the import search path |
+| `builtins` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'builtins' not found: not supported on the import search path |
+| `codecs` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'codecs' not found: not supported on the import search path |
 | `errno` | ok | ok | ok | - |
-| `faulthandler` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'faulthandler' not found: not supported unless a sibling faulthand… |
-| `gc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'gc' not found: not supported unless a sibling gc.py exists |
-| `genericpath` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'genericpath' not found: not supported unless a sibling genericpat… |
+| `faulthandler` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'faulthandler' not found: not supported on the import search path |
+| `gc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'gc' not found: not supported on the import search path |
+| `genericpath` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'genericpath' not found: not supported on the import search path |
 | `io` | ok | ok | ok | - |
-| `itertools` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'itertools' not found: not supported unless a sibling itertools.py… |
-| `marshal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'marshal' not found: not supported unless a sibling marshal.py exi… |
-| `ntpath` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ntpath' not found: not supported unless a sibling ntpath.py exists |
+| `itertools` | ok | ok | ok | - |
+| `marshal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'marshal' not found: not supported on the import search path |
+| `ntpath` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ntpath' not found: not supported on the import search path |
 | `os` | ok | ok | ok | - |
-| `posix` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'posix' not found: not supported unless a sibling posix.py exists |
-| `posixpath` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'posixpath' not found: not supported unless a sibling posixpath.py… |
-| `pwd` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pwd' not found: not supported unless a sibling pwd.py exists |
-| `runpy` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'runpy' not found: not supported unless a sibling runpy.py exists |
-| `site` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'site' not found: not supported unless a sibling site.py exists |
+| `posix` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'posix' not found: not supported on the import search path |
+| `posixpath` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'posixpath' not found: not supported on the import search path |
+| `pwd` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pwd' not found: not supported on the import search path |
+| `runpy` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'runpy' not found: not supported on the import search path |
+| `site` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'site' not found: not supported on the import search path |
 | `stat` | ok | ok | ok | - |
 | `sys` | ok | ok | ok | - |
 | `time` | ok | ok | ok | - |
-| `zipimport` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zipimport' not found: not supported unless a sibling zipimport.py… |
+| `zipimport` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zipimport' not found: not supported on the import search path |
 
 ### pure (174)
 
 | Module | CPython | PyX | Status | Error |
 | --- | --- | --- | --- | --- |
-| `__future__` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '__future__' not found: not supported unless a sibling __future__.… |
-| `_aix_support` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_aix_support' not found: not supported unless a sibling _aix_supp… |
-| `_android_support` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_android_support' not found: not supported unless a sibling _andr… |
-| `_apple_support` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_apple_support' not found: not supported unless a sibling _apple_… |
-| `_ast_unparse` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_ast_unparse' not found: not supported unless a sibling _ast_unpa… |
-| `_colorize` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_colorize' not found: not supported unless a sibling _colorize.py… |
-| `_compat_pickle` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_compat_pickle' not found: not supported unless a sibling _compat… |
-| `_ios_support` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_ios_support' not found: not supported unless a sibling _ios_supp… |
-| `_markupbase` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_markupbase' not found: not supported unless a sibling _markupbas… |
-| `_opcode_metadata` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_opcode_metadata' not found: not supported unless a sibling _opco… |
-| `_osx_support` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_osx_support' not found: not supported unless a sibling _osx_supp… |
-| `_py_abc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_py_abc' not found: not supported unless a sibling _py_abc.py exi… |
-| `_py_warnings` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_py_warnings' not found: not supported unless a sibling _py_warni… |
-| `_pydatetime` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pydatetime' not found: not supported unless a sibling _pydatetim… |
-| `_pydecimal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pydecimal' not found: not supported unless a sibling _pydecimal.… |
-| `_pyio` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pyio' not found: not supported unless a sibling _pyio.py exists |
-| `_pylong` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pylong' not found: not supported unless a sibling _pylong.py exi… |
-| `_pyrepl` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pyrepl' not found: not supported unless a sibling _pyrepl.py exi… |
-| `_strptime` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_strptime' not found: not supported unless a sibling _strptime.py… |
-| `_threading_local` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_threading_local' not found: not supported unless a sibling _thre… |
-| `_weakrefset` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_weakrefset' not found: not supported unless a sibling _weakrefse… |
-| `annotationlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'annotationlib' not found: not supported unless a sibling annotati… |
-| `antigravity` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'antigravity' not found: not supported unless a sibling antigravit… |
+| `__future__` | ok | ok | ok | - |
+| `_aix_support` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_aix_support' not found: not supported on the import search path |
+| `_android_support` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_android_support' not found: not supported on the import search p… |
+| `_apple_support` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_apple_support' not found: not supported on the import search path |
+| `_ast_unparse` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_ast_unparse' not found: not supported on the import search path |
+| `_colorize` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_colorize' not found: not supported on the import search path |
+| `_compat_pickle` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_compat_pickle' not found: not supported on the import search path |
+| `_ios_support` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_ios_support' not found: not supported on the import search path |
+| `_markupbase` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_markupbase' not found: not supported on the import search path |
+| `_opcode_metadata` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_opcode_metadata' not found: not supported on the import search p… |
+| `_osx_support` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_osx_support' not found: not supported on the import search path |
+| `_py_abc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_py_abc' not found: not supported on the import search path |
+| `_py_warnings` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_py_warnings' not found: not supported on the import search path |
+| `_pydatetime` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pydatetime' not found: not supported on the import search path |
+| `_pydecimal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pydecimal' not found: not supported on the import search path |
+| `_pyio` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pyio' not found: not supported on the import search path |
+| `_pylong` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pylong' not found: not supported on the import search path |
+| `_pyrepl` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pyrepl' not found: not supported on the import search path |
+| `_strptime` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_strptime' not found: not supported on the import search path |
+| `_threading_local` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_threading_local' not found: not supported on the import search p… |
+| `_weakrefset` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_weakrefset' not found: not supported on the import search path |
+| `annotationlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'annotationlib' not found: not supported on the import search path |
+| `antigravity` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'antigravity' not found: not supported on the import search path |
 | `argparse` | ok | ok | ok | - |
-| `ast` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ast' not found: not supported unless a sibling ast.py exists |
+| `ast` | ok | ok | ok | - |
 | `asyncio` | ok | ok | ok | - |
 | `base64` | ok | ok | ok | - |
-| `bdb` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'bdb' not found: not supported unless a sibling bdb.py exists |
+| `bdb` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'bdb' not found: not supported on the import search path |
 | `bisect` | ok | ok | ok | - |
-| `bz2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'bz2' not found: not supported unless a sibling bz2.py exists |
-| `cProfile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'cProfile' not found: not supported unless a sibling cProfile.py e… |
-| `calendar` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'calendar' not found: not supported unless a sibling calendar.py e… |
-| `cmd` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'cmd' not found: not supported unless a sibling cmd.py exists |
-| `code` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'code' not found: not supported unless a sibling code.py exists |
-| `codeop` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'codeop' not found: not supported unless a sibling codeop.py exists |
+| `bz2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'bz2' not found: not supported on the import search path |
+| `cProfile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'cProfile' not found: not supported on the import search path |
+| `calendar` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'calendar' not found: not supported on the import search path |
+| `cmd` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'cmd' not found: not supported on the import search path |
+| `code` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'code' not found: not supported on the import search path |
+| `codeop` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'codeop' not found: not supported on the import search path |
 | `collections` | ok | ok | ok | - |
 | `colorsys` | ok | ok | ok | - |
-| `compileall` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'compileall' not found: not supported unless a sibling compileall.… |
-| `compression` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'compression' not found: not supported unless a sibling compressio… |
-| `concurrent` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'concurrent' not found: not supported unless a sibling concurrent.… |
-| `configparser` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'configparser' not found: not supported unless a sibling configpar… |
-| `contextlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.… |
-| `contextvars` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'contextvars' not found: not supported unless a sibling contextvar… |
-| `copy` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `copyreg` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'copyreg' not found: not supported unless a sibling copyreg.py exi… |
+| `compileall` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'compileall' not found: not supported on the import search path |
+| `compression` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'compression' not found: not supported on the import search path |
+| `concurrent` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'concurrent' not found: not supported on the import search path |
+| `configparser` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'configparser' not found: not supported on the import search path |
+| `contextlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'contextlib' not found: not supported on the import search path |
+| `contextvars` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'contextvars' not found: not supported on the import search path |
+| `copy` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'copy' not found: not supported on the import search path |
+| `copyreg` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'copyreg' not found: not supported on the import search path |
 | `csv` | ok | ok | ok | - |
-| `ctypes` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ctypes' not found: not supported unless a sibling ctypes.py exists |
-| `curses` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'curses' not found: not supported unless a sibling curses.py exists |
-| `dataclasses` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'dataclasses' not found: not supported unless a sibling dataclasse… |
-| `datetime` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'datetime' not found: not supported unless a sibling datetime.py e… |
-| `dbm` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'dbm' not found: not supported unless a sibling dbm.py exists |
-| `decimal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'decimal' not found: not supported unless a sibling decimal.py exi… |
-| `difflib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'difflib' not found: not supported unless a sibling difflib.py exi… |
-| `dis` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'dis' not found: not supported unless a sibling dis.py exists |
-| `doctest` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exi… |
-| `email` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'email' not found: not supported unless a sibling email.py exists |
-| `encodings` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'encodings' not found: not supported unless a sibling encodings.py… |
-| `ensurepip` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ensurepip' not found: not supported unless a sibling ensurepip.py… |
-| `enum` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'enum' not found: not supported unless a sibling enum.py exists |
-| `filecmp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'filecmp' not found: not supported unless a sibling filecmp.py exi… |
-| `fileinput` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'fileinput' not found: not supported unless a sibling fileinput.py… |
+| `ctypes` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ctypes' not found: not supported on the import search path |
+| `curses` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'curses' not found: not supported on the import search path |
+| `dataclasses` | ok | ok | ok | - |
+| `datetime` | ok | ok | ok | - |
+| `dbm` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'dbm' not found: not supported on the import search path |
+| `decimal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'decimal' not found: not supported on the import search path |
+| `difflib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'difflib' not found: not supported on the import search path |
+| `dis` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'dis' not found: not supported on the import search path |
+| `doctest` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'doctest' not found: not supported on the import search path |
+| `email` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'email' not found: not supported on the import search path |
+| `encodings` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'encodings' not found: not supported on the import search path |
+| `ensurepip` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ensurepip' not found: not supported on the import search path |
+| `enum` | ok | ok | ok | - |
+| `filecmp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'filecmp' not found: not supported on the import search path |
+| `fileinput` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'fileinput' not found: not supported on the import search path |
 | `fnmatch` | ok | ok | ok | - |
-| `fractions` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'fractions' not found: not supported unless a sibling fractions.py… |
-| `ftplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ftplib' not found: not supported unless a sibling ftplib.py exists |
+| `fractions` | ok | ok | ok | - |
+| `ftplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ftplib' not found: not supported on the import search path |
 | `functools` | ok | ok | ok | - |
 | `getopt` | ok | ok | ok | - |
-| `getpass` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'getpass' not found: not supported unless a sibling getpass.py exi… |
-| `gettext` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'gettext' not found: not supported unless a sibling gettext.py exi… |
-| `glob` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'glob' not found: not supported unless a sibling glob.py exists |
-| `graphlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'graphlib' not found: not supported unless a sibling graphlib.py e… |
-| `gzip` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'gzip' not found: not supported unless a sibling gzip.py exists |
-| `hashlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'hashlib' not found: not supported unless a sibling hashlib.py exi… |
+| `getpass` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'getpass' not found: not supported on the import search path |
+| `gettext` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'gettext' not found: not supported on the import search path |
+| `glob` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'glob' not found: not supported on the import search path |
+| `graphlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'graphlib' not found: not supported on the import search path |
+| `gzip` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'gzip' not found: not supported on the import search path |
+| `hashlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'hashlib' not found: not supported on the import search path |
 | `heapq` | ok | ok | ok | - |
-| `hmac` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'hmac' not found: not supported unless a sibling hmac.py exists |
-| `html` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'html' not found: not supported unless a sibling html.py exists |
-| `http` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'http' not found: not supported unless a sibling http.py exists |
-| `idlelib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'idlelib' not found: not supported unless a sibling idlelib.py exi… |
-| `imaplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'imaplib' not found: not supported unless a sibling imaplib.py exi… |
-| `importlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'importlib' not found: not supported unless a sibling importlib.py… |
-| `inspect` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'inspect' not found: not supported unless a sibling inspect.py exi… |
-| `ipaddress` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ipaddress' not found: not supported unless a sibling ipaddress.py… |
+| `hmac` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'hmac' not found: not supported on the import search path |
+| `html` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'html' not found: not supported on the import search path |
+| `http` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'http' not found: not supported on the import search path |
+| `idlelib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'idlelib' not found: not supported on the import search path |
+| `imaplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'imaplib' not found: not supported on the import search path |
+| `importlib` | ok | ok | ok | - |
+| `inspect` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'inspect' not found: not supported on the import search path |
+| `ipaddress` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ipaddress' not found: not supported on the import search path |
 | `json` | ok | ok | ok | - |
 | `keyword` | ok | ok | ok | - |
-| `linecache` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'linecache' not found: not supported unless a sibling linecache.py… |
-| `locale` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'locale' not found: not supported unless a sibling locale.py exists |
-| `logging` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'logging' not found: not supported unless a sibling logging.py exi… |
-| `lzma` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'lzma' not found: not supported unless a sibling lzma.py exists |
-| `mailbox` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'mailbox' not found: not supported unless a sibling mailbox.py exi… |
+| `linecache` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'linecache' not found: not supported on the import search path |
+| `locale` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'locale' not found: not supported on the import search path |
+| `logging` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'logging' not found: not supported on the import search path |
+| `lzma` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'lzma' not found: not supported on the import search path |
+| `mailbox` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'mailbox' not found: not supported on the import search path |
 | `mimetypes` | ok | ok | ok | - |
-| `modulefinder` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'modulefinder' not found: not supported unless a sibling modulefin… |
+| `modulefinder` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'modulefinder' not found: not supported on the import search path |
 | `multiprocessing` | ok | ok | ok | - |
-| `netrc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'netrc' not found: not supported unless a sibling netrc.py exists |
-| `nturl2path` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'nturl2path' not found: not supported unless a sibling nturl2path.… |
-| `numbers` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'numbers' not found: not supported unless a sibling numbers.py exi… |
-| `opcode` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'opcode' not found: not supported unless a sibling opcode.py exists |
+| `netrc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'netrc' not found: not supported on the import search path |
+| `nturl2path` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'nturl2path' not found: not supported on the import search path |
+| `numbers` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'numbers' not found: not supported on the import search path |
+| `opcode` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'opcode' not found: not supported on the import search path |
 | `operator` | ok | ok | ok | - |
-| `optparse` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'optparse' not found: not supported unless a sibling optparse.py e… |
+| `optparse` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'optparse' not found: not supported on the import search path |
 | `pathlib` | ok | ok | ok | - |
-| `pdb` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pdb' not found: not supported unless a sibling pdb.py exists |
+| `pdb` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pdb' not found: not supported on the import search path |
 | `pickle` | ok | ok | ok | - |
-| `pickletools` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pickletools' not found: not supported unless a sibling pickletool… |
-| `pkgutil` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pkgutil' not found: not supported unless a sibling pkgutil.py exi… |
+| `pickletools` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pickletools' not found: not supported on the import search path |
+| `pkgutil` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pkgutil' not found: not supported on the import search path |
 | `platform` | ok | ok | ok | - |
-| `plistlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'plistlib' not found: not supported unless a sibling plistlib.py e… |
-| `poplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'poplib' not found: not supported unless a sibling poplib.py exists |
-| `pprint` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pprint' not found: not supported unless a sibling pprint.py exists |
-| `profile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'profile' not found: not supported unless a sibling profile.py exi… |
-| `pstats` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pstats' not found: not supported unless a sibling pstats.py exists |
-| `pty` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pty' not found: not supported unless a sibling pty.py exists |
-| `py_compile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'py_compile' not found: not supported unless a sibling py_compile.… |
-| `pyclbr` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pyclbr' not found: not supported unless a sibling pyclbr.py exists |
-| `pydoc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pydoc' not found: not supported unless a sibling pydoc.py exists |
-| `pydoc_data` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pydoc_data' not found: not supported unless a sibling pydoc_data.… |
+| `plistlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'plistlib' not found: not supported on the import search path |
+| `poplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'poplib' not found: not supported on the import search path |
+| `pprint` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pprint' not found: not supported on the import search path |
+| `profile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'profile' not found: not supported on the import search path |
+| `pstats` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pstats' not found: not supported on the import search path |
+| `pty` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pty' not found: not supported on the import search path |
+| `py_compile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'py_compile' not found: not supported on the import search path |
+| `pyclbr` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pyclbr' not found: not supported on the import search path |
+| `pydoc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pydoc' not found: not supported on the import search path |
+| `pydoc_data` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pydoc_data' not found: not supported on the import search path |
 | `queue` | ok | ok | ok | - |
 | `quopri` | ok | ok | ok | - |
 | `random` | ok | ok | ok | - |
 | `re` | ok | ok | ok | - |
-| `reprlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'reprlib' not found: not supported unless a sibling reprlib.py exi… |
-| `rlcompleter` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'rlcompleter' not found: not supported unless a sibling rlcomplete… |
-| `sched` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sched' not found: not supported unless a sibling sched.py exists |
-| `secrets` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'secrets' not found: not supported unless a sibling secrets.py exi… |
-| `selectors` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'selectors' not found: not supported unless a sibling selectors.py… |
-| `shelve` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'shelve' not found: not supported unless a sibling shelve.py exists |
-| `shlex` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'shlex' not found: not supported unless a sibling shlex.py exists |
+| `reprlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'reprlib' not found: not supported on the import search path |
+| `rlcompleter` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'rlcompleter' not found: not supported on the import search path |
+| `sched` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sched' not found: not supported on the import search path |
+| `secrets` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'secrets' not found: not supported on the import search path |
+| `selectors` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'selectors' not found: not supported on the import search path |
+| `shelve` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'shelve' not found: not supported on the import search path |
+| `shlex` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'shlex' not found: not supported on the import search path |
 | `shutil` | ok | ok | ok | - |
-| `signal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'signal' not found: not supported unless a sibling signal.py exists |
-| `smtplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'smtplib' not found: not supported unless a sibling smtplib.py exi… |
+| `signal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'signal' not found: not supported on the import search path |
+| `smtplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'smtplib' not found: not supported on the import search path |
 | `socket` | ok | ok | ok | - |
-| `socketserver` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'socketserver' not found: not supported unless a sibling socketser… |
-| `sqlite3` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sqlite3' not found: not supported unless a sibling sqlite3.py exi… |
-| `sre_compile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sre_compile' not found: not supported unless a sibling sre_compil… |
-| `sre_constants` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sre_constants' not found: not supported unless a sibling sre_cons… |
-| `sre_parse` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sre_parse' not found: not supported unless a sibling sre_parse.py… |
-| `ssl` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ssl' not found: not supported unless a sibling ssl.py exists |
+| `socketserver` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'socketserver' not found: not supported on the import search path |
+| `sqlite3` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sqlite3' not found: not supported on the import search path |
+| `sre_compile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sre_compile' not found: not supported on the import search path |
+| `sre_constants` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sre_constants' not found: not supported on the import search path |
+| `sre_parse` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sre_parse' not found: not supported on the import search path |
+| `ssl` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ssl' not found: not supported on the import search path |
 | `statistics` | ok | ok | ok | - |
-| `string` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'string' not found: not supported unless a sibling string.py exists |
-| `stringprep` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'stringprep' not found: not supported unless a sibling stringprep.… |
-| `struct` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'struct' not found: not supported unless a sibling struct.py exists |
+| `string` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'string' not found: not supported on the import search path |
+| `stringprep` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'stringprep' not found: not supported on the import search path |
+| `struct` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'struct' not found: not supported on the import search path |
 | `subprocess` | ok | ok | ok | - |
-| `symtable` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'symtable' not found: not supported unless a sibling symtable.py e… |
-| `sysconfig` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sysconfig' not found: not supported unless a sibling sysconfig.py… |
-| `tabnanny` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tabnanny' not found: not supported unless a sibling tabnanny.py e… |
-| `tarfile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tarfile' not found: not supported unless a sibling tarfile.py exi… |
+| `symtable` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'symtable' not found: not supported on the import search path |
+| `sysconfig` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sysconfig' not found: not supported on the import search path |
+| `tabnanny` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tabnanny' not found: not supported on the import search path |
+| `tarfile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tarfile' not found: not supported on the import search path |
 | `tempfile` | ok | ok | ok | - |
 | `textwrap` | ok | ok | ok | - |
-| `this` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'this' not found: not supported unless a sibling this.py exists |
+| `this` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'this' not found: not supported on the import search path |
 | `threading` | ok | ok | ok | - |
 | `timeit` | ok | ok | ok | - |
-| `tkinter` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tkinter' not found: not supported unless a sibling tkinter.py exi… |
-| `token` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'token' not found: not supported unless a sibling token.py exists |
-| `tokenize` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tokenize' not found: not supported unless a sibling tokenize.py e… |
-| `tomllib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tomllib' not found: not supported unless a sibling tomllib.py exi… |
-| `trace` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'trace' not found: not supported unless a sibling trace.py exists |
-| `traceback` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'traceback' not found: not supported unless a sibling traceback.py… |
-| `tracemalloc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tracemalloc' not found: not supported unless a sibling tracemallo… |
-| `tty` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tty' not found: not supported unless a sibling tty.py exists |
-| `turtle` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'turtle' not found: not supported unless a sibling turtle.py exists |
-| `turtledemo` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'turtledemo' not found: not supported unless a sibling turtledemo.… |
-| `types` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'types' not found: not supported unless a sibling types.py exists |
-| `typing` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'typing' not found: not supported unless a sibling typing.py exists |
+| `tkinter` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tkinter' not found: not supported on the import search path |
+| `token` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'token' not found: not supported on the import search path |
+| `tokenize` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tokenize' not found: not supported on the import search path |
+| `tomllib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tomllib' not found: not supported on the import search path |
+| `trace` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'trace' not found: not supported on the import search path |
+| `traceback` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'traceback' not found: not supported on the import search path |
+| `tracemalloc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tracemalloc' not found: not supported on the import search path |
+| `tty` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tty' not found: not supported on the import search path |
+| `turtle` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'turtle' not found: not supported on the import search path |
+| `turtledemo` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'turtledemo' not found: not supported on the import search path |
+| `types` | ok | ok | ok | - |
+| `typing` | ok | ok | ok | - |
 | `unittest` | ok | ok | ok | - |
-| `urllib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'urllib' not found: not supported unless a sibling urllib.py exists |
-| `uuid` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'uuid' not found: not supported unless a sibling uuid.py exists |
-| `venv` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'venv' not found: not supported unless a sibling venv.py exists |
-| `warnings` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'warnings' not found: not supported unless a sibling warnings.py e… |
-| `wave` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'wave' not found: not supported unless a sibling wave.py exists |
-| `weakref` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'weakref' not found: not supported unless a sibling weakref.py exi… |
-| `webbrowser` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'webbrowser' not found: not supported unless a sibling webbrowser.… |
-| `wsgiref` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'wsgiref' not found: not supported unless a sibling wsgiref.py exi… |
-| `xml` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'xml' not found: not supported unless a sibling xml.py exists |
-| `xmlrpc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'xmlrpc' not found: not supported unless a sibling xmlrpc.py exists |
-| `zipapp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zipapp' not found: not supported unless a sibling zipapp.py exists |
-| `zipfile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zipfile' not found: not supported unless a sibling zipfile.py exi… |
-| `zoneinfo` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zoneinfo' not found: not supported unless a sibling zoneinfo.py e… |
+| `urllib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'urllib' not found: not supported on the import search path |
+| `uuid` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'uuid' not found: not supported on the import search path |
+| `venv` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'venv' not found: not supported on the import search path |
+| `warnings` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'warnings' not found: not supported on the import search path |
+| `wave` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'wave' not found: not supported on the import search path |
+| `weakref` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'weakref' not found: not supported on the import search path |
+| `webbrowser` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'webbrowser' not found: not supported on the import search path |
+| `wsgiref` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'wsgiref' not found: not supported on the import search path |
+| `xml` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'xml' not found: not supported on the import search path |
+| `xmlrpc` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'xmlrpc' not found: not supported on the import search path |
+| `zipapp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zipapp' not found: not supported on the import search path |
+| `zipfile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zipfile' not found: not supported on the import search path |
+| `zoneinfo` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zoneinfo' not found: not supported on the import search path |
 
 ### extension (63)
 
 | Module | CPython | PyX | Status | Error |
 | --- | --- | --- | --- | --- |
-| `_asyncio` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_asyncio' not found: not supported unless a sibling _asyncio.py e… |
+| `_asyncio` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_asyncio' not found: not supported on the import search path |
 | `_bisect` | ok | ok | ok | - |
-| `_blake2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_blake2' not found: not supported unless a sibling _blake2.py exi… |
-| `_bz2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_bz2' not found: not supported unless a sibling _bz2.py exists |
-| `_codecs_cn` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_cn' not found: not supported unless a sibling _codecs_cn.… |
-| `_codecs_hk` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_hk' not found: not supported unless a sibling _codecs_hk.… |
-| `_codecs_iso2022` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_iso2022' not found: not supported unless a sibling _codec… |
-| `_codecs_jp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_jp' not found: not supported unless a sibling _codecs_jp.… |
-| `_codecs_kr` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_kr' not found: not supported unless a sibling _codecs_kr.… |
-| `_codecs_tw` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_tw' not found: not supported unless a sibling _codecs_tw.… |
-| `_csv` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_csv' not found: not supported unless a sibling _csv.py exists |
-| `_ctypes` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_ctypes' not found: not supported unless a sibling _ctypes.py exi… |
-| `_curses` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_curses' not found: not supported unless a sibling _curses.py exi… |
-| `_curses_panel` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_curses_panel' not found: not supported unless a sibling _curses_… |
-| `_dbm` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_dbm' not found: not supported unless a sibling _dbm.py exists |
-| `_decimal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_decimal' not found: not supported unless a sibling _decimal.py e… |
-| `_elementtree` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_elementtree' not found: not supported unless a sibling _elementt… |
-| `_gdbm` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_gdbm' not found: not supported unless a sibling _gdbm.py exists |
-| `_hashlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_hashlib' not found: not supported unless a sibling _hashlib.py e… |
+| `_blake2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_blake2' not found: not supported on the import search path |
+| `_bz2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_bz2' not found: not supported on the import search path |
+| `_codecs_cn` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_cn' not found: not supported on the import search path |
+| `_codecs_hk` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_hk' not found: not supported on the import search path |
+| `_codecs_iso2022` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_iso2022' not found: not supported on the import search pa… |
+| `_codecs_jp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_jp' not found: not supported on the import search path |
+| `_codecs_kr` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_kr' not found: not supported on the import search path |
+| `_codecs_tw` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_codecs_tw' not found: not supported on the import search path |
+| `_csv` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_csv' not found: not supported on the import search path |
+| `_ctypes` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_ctypes' not found: not supported on the import search path |
+| `_curses` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_curses' not found: not supported on the import search path |
+| `_curses_panel` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_curses_panel' not found: not supported on the import search path |
+| `_dbm` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_dbm' not found: not supported on the import search path |
+| `_decimal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_decimal' not found: not supported on the import search path |
+| `_elementtree` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_elementtree' not found: not supported on the import search path |
+| `_gdbm` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_gdbm' not found: not supported on the import search path |
+| `_hashlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_hashlib' not found: not supported on the import search path |
 | `_heapq` | ok | ok | ok | - |
-| `_hmac` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_hmac' not found: not supported unless a sibling _hmac.py exists |
-| `_interpchannels` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_interpchannels' not found: not supported unless a sibling _inter… |
-| `_interpqueues` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_interpqueues' not found: not supported unless a sibling _interpq… |
-| `_interpreters` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_interpreters' not found: not supported unless a sibling _interpr… |
-| `_json` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_json' not found: not supported unless a sibling _json.py exists |
-| `_lsprof` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_lsprof' not found: not supported unless a sibling _lsprof.py exi… |
-| `_lzma` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_lzma' not found: not supported unless a sibling _lzma.py exists |
-| `_md5` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_md5' not found: not supported unless a sibling _md5.py exists |
-| `_multibytecodec` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_multibytecodec' not found: not supported unless a sibling _multi… |
-| `_multiprocessing` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_multiprocessing' not found: not supported unless a sibling _mult… |
-| `_pickle` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pickle' not found: not supported unless a sibling _pickle.py exi… |
-| `_posixshmem` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_posixshmem' not found: not supported unless a sibling _posixshme… |
-| `_posixsubprocess` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_posixsubprocess' not found: not supported unless a sibling _posi… |
-| `_queue` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_queue' not found: not supported unless a sibling _queue.py exists |
-| `_random` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_random' not found: not supported unless a sibling _random.py exi… |
-| `_remote_debugging` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_remote_debugging' not found: not supported unless a sibling _rem… |
-| `_sha1` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sha1' not found: not supported unless a sibling _sha1.py exists |
-| `_sha2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sha2' not found: not supported unless a sibling _sha2.py exists |
-| `_sha3` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sha3' not found: not supported unless a sibling _sha3.py exists |
-| `_socket` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_socket' not found: not supported unless a sibling _socket.py exi… |
-| `_sqlite3` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sqlite3' not found: not supported unless a sibling _sqlite3.py e… |
-| `_ssl` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_ssl' not found: not supported unless a sibling _ssl.py exists |
-| `_statistics` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_statistics' not found: not supported unless a sibling _statistic… |
-| `_struct` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_struct' not found: not supported unless a sibling _struct.py exi… |
-| `_tkinter` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_tkinter' not found: not supported unless a sibling _tkinter.py e… |
-| `_uuid` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_uuid' not found: not supported unless a sibling _uuid.py exists |
-| `_zoneinfo` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_zoneinfo' not found: not supported unless a sibling _zoneinfo.py… |
-| `_zstd` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_zstd' not found: not supported unless a sibling _zstd.py exists |
-| `array` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'array' not found: not supported unless a sibling array.py exists |
+| `_hmac` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_hmac' not found: not supported on the import search path |
+| `_interpchannels` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_interpchannels' not found: not supported on the import search pa… |
+| `_interpqueues` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_interpqueues' not found: not supported on the import search path |
+| `_interpreters` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_interpreters' not found: not supported on the import search path |
+| `_json` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_json' not found: not supported on the import search path |
+| `_lsprof` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_lsprof' not found: not supported on the import search path |
+| `_lzma` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_lzma' not found: not supported on the import search path |
+| `_md5` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_md5' not found: not supported on the import search path |
+| `_multibytecodec` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_multibytecodec' not found: not supported on the import search pa… |
+| `_multiprocessing` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_multiprocessing' not found: not supported on the import search p… |
+| `_pickle` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_pickle' not found: not supported on the import search path |
+| `_posixshmem` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_posixshmem' not found: not supported on the import search path |
+| `_posixsubprocess` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_posixsubprocess' not found: not supported on the import search p… |
+| `_queue` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_queue' not found: not supported on the import search path |
+| `_random` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_random' not found: not supported on the import search path |
+| `_remote_debugging` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_remote_debugging' not found: not supported on the import search… |
+| `_sha1` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sha1' not found: not supported on the import search path |
+| `_sha2` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sha2' not found: not supported on the import search path |
+| `_sha3` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sha3' not found: not supported on the import search path |
+| `_socket` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_socket' not found: not supported on the import search path |
+| `_sqlite3` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_sqlite3' not found: not supported on the import search path |
+| `_ssl` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_ssl' not found: not supported on the import search path |
+| `_statistics` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_statistics' not found: not supported on the import search path |
+| `_struct` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_struct' not found: not supported on the import search path |
+| `_tkinter` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_tkinter' not found: not supported on the import search path |
+| `_uuid` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_uuid' not found: not supported on the import search path |
+| `_zoneinfo` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_zoneinfo' not found: not supported on the import search path |
+| `_zstd` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module '_zstd' not found: not supported on the import search path |
+| `array` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'array' not found: not supported on the import search path |
 | `binascii` | ok | ok | ok | - |
-| `cmath` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'cmath' not found: not supported unless a sibling cmath.py exists |
-| `fcntl` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'fcntl' not found: not supported unless a sibling fcntl.py exists |
-| `grp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'grp' not found: not supported unless a sibling grp.py exists |
+| `cmath` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'cmath' not found: not supported on the import search path |
+| `fcntl` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'fcntl' not found: not supported on the import search path |
+| `grp` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'grp' not found: not supported on the import search path |
 | `math` | ok | ok | ok | - |
-| `mmap` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'mmap' not found: not supported unless a sibling mmap.py exists |
-| `pyexpat` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pyexpat' not found: not supported unless a sibling pyexpat.py exi… |
-| `readline` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'readline' not found: not supported unless a sibling readline.py e… |
-| `resource` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'resource' not found: not supported unless a sibling resource.py e… |
-| `select` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'select' not found: not supported unless a sibling select.py exists |
-| `syslog` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'syslog' not found: not supported unless a sibling syslog.py exists |
-| `termios` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'termios' not found: not supported unless a sibling termios.py exi… |
-| `unicodedata` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'unicodedata' not found: not supported unless a sibling unicodedat… |
-| `zlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zlib' not found: not supported unless a sibling zlib.py exists |
+| `mmap` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'mmap' not found: not supported on the import search path |
+| `pyexpat` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pyexpat' not found: not supported on the import search path |
+| `readline` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'readline' not found: not supported on the import search path |
+| `resource` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'resource' not found: not supported on the import search path |
+| `select` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'select' not found: not supported on the import search path |
+| `syslog` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'syslog' not found: not supported on the import search path |
+| `termios` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'termios' not found: not supported on the import search path |
+| `unicodedata` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'unicodedata' not found: not supported on the import search path |
+| `zlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'zlib' not found: not supported on the import search path |
 
 ### unknown (8)
 
 | Module | CPython | PyX | Status | Error |
 | --- | --- | --- | --- | --- |
-| `_overlapped` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_overlapped' not found: not supported unless a sibling _overlappe… |
-| `_scproxy` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_scproxy' not found: not supported unless a sibling _scproxy.py e… |
-| `_winapi` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_winapi' not found: not supported unless a sibling _winapi.py exi… |
-| `_wmi` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_wmi' not found: not supported unless a sibling _wmi.py exists |
-| `msvcrt` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module 'msvcrt' not found: not supported unless a sibling msvcrt.py exists |
-| `nt` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module 'nt' not found: not supported unless a sibling nt.py exists |
-| `winreg` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module 'winreg' not found: not supported unless a sibling winreg.py exists |
-| `winsound` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module 'winsound' not found: not supported unless a sibling winsound.py e… |
+| `_overlapped` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_overlapped' not found: not supported on the import search path |
+| `_scproxy` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_scproxy' not found: not supported on the import search path |
+| `_winapi` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_winapi' not found: not supported on the import search path |
+| `_wmi` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module '_wmi' not found: not supported on the import search path |
+| `msvcrt` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module 'msvcrt' not found: not supported on the import search path |
+| `nt` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module 'nt' not found: not supported on the import search path |
+| `winreg` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module 'winreg' not found: not supported on the import search path |
+| `winsound` | exit 1 | exit 1 | cpython_failed | error[PYX0002]: module 'winsound' not found: not supported on the import search path |
 
 <!-- END GENERATED TABLE -->
