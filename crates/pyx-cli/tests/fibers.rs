@@ -819,3 +819,252 @@ print(sum(v for v in range(4)))
     assert_eq!(code, 0, "AOT binary failed: {stderr}");
     assert_eq!(stdout, "10\n[30]\n2\n6\n");
 }
+
+// -------------------------------------------------------------------------
+// Async generators, tasks and TaskGroup
+// -------------------------------------------------------------------------
+
+#[test]
+fn builtin_exception_classes_construct_and_type_identity() {
+    let source = "\
+error = ValueError('made')
+print(type(error) is ValueError)
+print(type(OSError('x')).__name__)
+print(str(error))
+
+try:
+    raise ValueError('caught')
+except ValueError:
+    print('caught ValueError')
+
+async def athrown():
+    try:
+        yield 1
+    except ValueError:
+        yield 99
+
+import asyncio
+
+async def main():
+    gen = athrown()
+    print(await gen.__anext__())
+    print(await gen.athrow(ValueError('thrown')))
+
+asyncio.run(main())
+";
+    let (code, stdout, stderr) = run_source("exc_identity", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "True\nOSError\nmade\ncaught ValueError\n1\n99\n");
+}
+
+#[test]
+fn async_generator_protocol_methods_work() {
+    let source = "\
+import asyncio
+
+async def sent():
+    received = yield 1
+    yield received
+
+async def closed():
+    try:
+        yield 1
+    finally:
+        print('closed')
+
+async def handled():
+    try:
+        yield 1
+    except ValueError:
+        yield 99
+
+async def main():
+    g = sent()
+    print(await g.__anext__())
+    print(await g.asend(5))
+    try:
+        await g.__anext__()
+    except StopAsyncIteration:
+        print('done')
+
+    c = closed()
+    await c.__anext__()
+    await c.aclose()
+
+    h = handled()
+    await h.__anext__()
+    print(await h.athrow(ValueError('x')))
+
+asyncio.run(main())
+";
+    let (code, stdout, stderr) = run_source("async_protocol", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "1\n5\ndone\nclosed\n99\n");
+}
+
+#[test]
+fn task_group_overlaps_tasks_in_creation_order() {
+    let source = "\
+import asyncio
+from asyncio import TaskGroup
+
+seen = []
+
+async def work(label, delay):
+    seen.append(label)
+    await asyncio.sleep(delay)
+    seen.append(label + '2')
+    return label
+
+async def main():
+    async with TaskGroup() as tg:
+        tg.create_task(work('a', 0))
+        tg.create_task(work('b', 0))
+    return seen
+
+print(asyncio.run(main()))
+";
+    let (code, stdout, stderr) = run_source("task_group_overlap", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "['a', 'b', 'a2', 'b2']\n");
+}
+
+#[test]
+fn task_group_cancels_siblings_and_propagates_the_error() {
+    let source = "\
+import asyncio
+
+seen = []
+
+async def slow():
+    try:
+        await asyncio.sleep(5)
+    finally:
+        seen.append('cancelled')
+
+async def boom():
+    raise ValueError('boom')
+
+async def main():
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(slow())
+            tg.create_task(boom())
+    except ValueError:
+        return 'caught'
+    return 'missed'
+
+print(asyncio.run(main()))
+print(seen)
+";
+    let (code, stdout, stderr) = run_source("task_group_error", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "caught\n['cancelled']\n");
+}
+
+#[test]
+fn task_cancel_and_current_task_are_available() {
+    let source = "\
+import asyncio
+
+async def child():
+    return 1
+
+async def main():
+    task = asyncio.create_task(child())
+    task.cancel()
+    print(task.cancelled())
+    print(asyncio.current_task() is not None)
+    return 0
+
+print(asyncio.run(main()))
+";
+    let (code, stdout, stderr) = run_source("task_cancel", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "True\nTrue\n0\n");
+}
+
+#[test]
+fn reentrant_run_reports_a_runtime_error() {
+    let source = "\
+import asyncio
+
+async def inner():
+    return 1
+
+async def main():
+    return asyncio.run(inner())
+
+asyncio.run(main())
+";
+    let (code, _, stderr) = run_source("reentrant_run", source);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("cannot be called from a running event loop"),
+        "missing reentrant-run diagnostic, got:\n{stderr}"
+    );
+}
+
+fn example_file(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples")
+        .join(name)
+}
+
+fn run_example(name: &str) -> (i32, String, String) {
+    let path = example_file(name);
+    let output = run(&["run", path.to_str().expect("UTF-8 example path")]);
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn expected_example(name: &str) -> String {
+    std::fs::read_to_string(example_file(&format!("expected/{name}")))
+        .expect("expected output file")
+}
+
+#[test]
+fn async_examples_match_cpython_expected_output() {
+    for name in ["generators_async.txt", "async_generators.txt"] {
+        let source = name.replace(".txt", ".py");
+        let (code, stdout, stderr) = run_example(&source);
+        assert_eq!(code, 0, "{source} stderr:\n{stderr}");
+        assert_eq!(stdout, expected_example(name), "{source} output");
+    }
+}
+
+#[test]
+fn async_examples_run_under_aot() {
+    if !runtime_lib_present() {
+        eprintln!("skipping async_examples_run_under_aot: libpyx_runtime.a not found");
+        return;
+    }
+    for name in ["generators_async.txt", "async_generators.txt"] {
+        let source = name.replace(".txt", ".py");
+        let program = example_file(&source);
+        let binary = std::env::temp_dir().join(format!(
+            "pyx-async-aot-{}-{}",
+            std::process::id(),
+            source.replace('.', "_")
+        ));
+        let program_arg = program.to_string_lossy().into_owned();
+        let binary_arg = binary.to_string_lossy().into_owned();
+        let (code, stdout, stderr) = output_parts(run(&["build", &program_arg, "-o", &binary_arg]));
+        assert_eq!(
+            code, 0,
+            "pyx build {source} failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let (code, stdout, stderr) = run_executable(&binary);
+        let _ = std::fs::remove_file(&binary);
+        assert_eq!(code, 0, "{source} AOT failed: {stderr}");
+        assert_eq!(stdout, expected_example(name), "{source} AOT output");
+    }
+}

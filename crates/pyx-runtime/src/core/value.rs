@@ -17,10 +17,12 @@
 //! visible to every thread; there is no GIL, so concurrent mutation of the
 //! same list/dict requires a user lock.
 
+use std::alloc::Layout;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -158,22 +160,29 @@ pub(crate) const MAX_INT: i64 = i64::MAX >> 3;
 /// Smallest integer representable in a tagged immediate (`-2^60`).
 pub(crate) const MIN_INT: i64 = i64::MIN >> 3;
 
-/// Heap object header plus payload.
+/// Fixed-size heap object header.
 ///
-/// `#[repr(C)]` guarantees `kind` sits at offset 0 and that the alignment of
-/// the payload (8, because of `String`/`f64`) makes every allocation
-/// 8-byte aligned, which keeps the low tag bits free.
+/// The collector tracks only this header: `kind` selects the payload type,
+/// `marked` is the collector colour and `class` is the payload allocator's
+/// size class (`0` means a large system allocation, `1..=N` index
+/// [`crate::heap`]'s size-class table). The payload itself lives in a
+/// separate block owned by the same pool and is reached through
+/// [`PyxObj::data_ref`] / [`PyxObj::data_mut`], which dispatch on `kind`.
+///
+/// `#[repr(C)]` keeps `kind` at offset 0; the header is exactly 16 bytes and
+/// the header slabs are 16-byte aligned, so tagged heap pointers are always
+/// 8-byte aligned and the low three tag bits stay free. Payload alignment is
+/// at least 8 and satisfies `align_of::<T>()` for the concrete payload type.
 #[repr(C)]
 pub(crate) struct PyxObj {
     pub(crate) kind: u32,
     /// Collector colour, owned by [`crate::heap`]: `WHITE` (0, not yet
     /// reached), `GREY` (1, queued for tracing) or `BLACK` (2, traced).
-    ///
-    /// The field is one byte wide, so `kind` stays at offset 0 and the
-    /// 8-byte alignment of `data` (forced by `String`/`f64`) keeps every
-    /// allocation 8-byte aligned, which keeps the low tag bits free.
     pub(crate) marked: AtomicU8,
-    pub(crate) data: ObjData,
+    /// Payload size class selected at allocation (`0` = large fallback).
+    pub(crate) class: u8,
+    /// Payload block; the concrete type is determined by `kind`.
+    pub(crate) data: *mut u8,
 }
 
 /// Mutable state of a runtime iterator. `target` is the tagged iterable and
@@ -219,6 +228,11 @@ pub(crate) enum FunctionBody {
     /// decorator values returned from `lru_cache`/`wraps`: returns its single
     /// argument. Holds no PyX values.
     Identity,
+    /// Interpreter-owned function body. `token` identifies the IR function in
+    /// the interpreter's program registry and `captures` are the closure
+    /// values (traced as GC edges). The runtime calls back into the
+    /// interpreter through the dispatcher installed by `pyx-interp`.
+    Host { token: u64, captures: Vec<i64> },
 }
 
 /// A function value. For [`FunctionBody::Wrapper`] values `arity` is the exact
@@ -905,6 +919,19 @@ impl ProcessState {
     }
 }
 
+impl Drop for ProcessState {
+    /// Reaps a started process that became unreachable before `join`.
+    ///
+    /// Without this hook an unjoined `Process` leaves the child running (or as
+    /// a zombie) for the lifetime of the parent. The cleanup is best effort and
+    /// bounded, keeps `joined`/`exitcode` semantics, never waits for a child
+    /// that was already reaped, and never parks for the collector: payload
+    /// drops run inside the sweep, where parking is forbidden.
+    fn drop(&mut self) {
+        crate::process::reap_orphan_process(self);
+    }
+}
+
 /// Partially received bytes of a `multiprocessing.Queue` frame.
 pub(crate) struct MpReadState {
     /// Bytes received but not yet consumed as a complete frame.
@@ -923,6 +950,9 @@ pub(crate) struct MpQueueState {
     pub(crate) maxsize: usize,
     pub(crate) read: Mutex<MpReadState>,
     pub(crate) write: Mutex<()>,
+    /// Set once [`Drop`] released the descriptors, so the endpoints are closed
+    /// exactly once even if a teardown path runs twice.
+    closed: AtomicBool,
 }
 
 impl MpQueueState {
@@ -933,6 +963,36 @@ impl MpQueueState {
             maxsize,
             read: Mutex::new(MpReadState { buffer: Vec::new() }),
             write: Mutex::new(()),
+            closed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Drop for MpQueueState {
+    /// Releases both queue endpoints when the last reference dies.
+    ///
+    /// A queue that is only reachable from Rust-side vectors (a pool that
+    /// became unreachable) would otherwise leak its descriptors, keeping the
+    /// socket pairs open for the rest of the process. Each descriptor is
+    /// closed at most once per state; a descriptor number that is already
+    /// closed (a decoded pickle wrapping released endpoints, or an inherited
+    /// copy after `fork`) only yields `EBADF`, which is deliberately ignored.
+    /// Closing the parent's copy never affects a forked child: the child owns
+    /// an independent file-descriptor table.
+    fn drop(&mut self) {
+        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        // `read_fd == write_fd` cannot happen for a socketpair, but a state
+        // that wrapped a single descriptor still closes it only once.
+        if self.read_fd >= 0 {
+            // SAFETY: the descriptor belongs to this queue state and this is
+            // its single close.
+            unsafe { libc::close(self.read_fd) };
+        }
+        if self.write_fd >= 0 && self.write_fd != self.read_fd {
+            // SAFETY: as above.
+            unsafe { libc::close(self.write_fd) };
         }
     }
 }
@@ -967,6 +1027,35 @@ impl PoolState {
     /// Number of workers (always the length of both queue vectors).
     pub(crate) fn size(&self) -> usize {
         self.task_queues.len()
+    }
+}
+
+impl Drop for PoolState {
+    /// Terminates and reaps every worker of a pool that became unreachable
+    /// without `close`/`join`/`terminate`.
+    ///
+    /// `joined` is claimed first, so a pool that was already torn down (or a
+    /// re-entrant path) never signals or waits twice. The pid vector is taken
+    /// through `get_mut` (no lock is acquired), so no graph, heap, queue or
+    /// pid lock is held across a signal or a wait. The signal/reap loop is the
+    /// same bounded best-effort cleanup used by [`ProcessState`]; a worker that
+    /// is not a child of this process (a forked child's inherited copy) is
+    /// skipped.
+    fn drop(&mut self) {
+        if self.joined.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.joined
+            .store(true, std::sync::atomic::Ordering::Release);
+        let pids = match self.pids.get_mut() {
+            Ok(pids) => std::mem::take(pids),
+            Err(poisoned) => std::mem::take(poisoned.into_inner()),
+        };
+        for pid in pids {
+            crate::process::reap_orphan_child(i64::from(pid));
+        }
     }
 }
 
@@ -1594,7 +1683,14 @@ pub(crate) enum StrBuilderState {
     Materialized(i64),
 }
 
+/// Constructor descriptor for a heap payload.
+///
+/// The runtime passes one of these to [`crate::heap::allocate`], which writes
+/// only the variant's inner value into a separately allocated, size-classed
+/// payload block. The enum itself is never stored on the heap; readers use
+/// [`ObjDataRef`] and writers [`ObjDataMut`].
 #[repr(C)]
+#[allow(clippy::large_enum_variant)] // Construction descriptor only; the stored payload is split by size class.
 pub(crate) enum ObjData {
     Str(String),
     Float(f64),
@@ -1687,6 +1783,452 @@ pub(crate) enum ObjData {
     Cell(i64),
 }
 
+/// Payload of a `range` object ([`KIND_RANGE`]).
+///
+/// The constructor descriptor keeps the fields inline ([`ObjData::Range`]);
+/// this is the concrete type written into the sized payload block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RangeData {
+    pub(crate) start: i64,
+    pub(crate) stop: i64,
+    pub(crate) step: i64,
+}
+
+/// Payload of a capsule object ([`KIND_CAPSULE`]).
+pub(crate) struct CapsuleData {
+    pub(crate) ptr: usize,
+    pub(crate) name: Option<String>,
+}
+
+/// Borrowed payload of a heap object, selected by [`PyxObj::kind`].
+///
+/// The variant shapes mirror [`ObjData`] so payload readers can pattern-match
+/// with the same arm names they used when the payload was stored inline. The
+/// references are valid for the lifetime of the borrow of the header; the
+/// collector never frees a reachable object.
+#[allow(clippy::borrowed_box)] // View mirrors the concrete boxed payload allocated by kind.
+pub(crate) enum ObjDataRef<'a> {
+    Str(&'a String),
+    Float(f64),
+    Exception(&'a ExcData),
+    StrBuilder(&'a StrBuilderState),
+    List(&'a Vec<i64>),
+    Dict(&'a DictData),
+    Iter(&'a Box<IterState>),
+    Tuple(&'a Vec<i64>),
+    Set(&'a Vec<i64>),
+    Range {
+        start: i64,
+        stop: i64,
+        step: i64,
+    },
+    Function(&'a FunctionObj),
+    Lock(&'a LockState),
+    Thread(&'a ThreadState),
+    Event(&'a EventState),
+    Queue(&'a QueueState),
+    Process(&'a ProcessState),
+    MpQueue(&'a MpQueueState),
+    Pool(&'a PoolState),
+    File(&'a FileState),
+    CsvReader(&'a CsvReaderState),
+    CsvWriter(&'a CsvWriterState),
+    Bytes(&'a Vec<u8>),
+    Random(&'a RandomState),
+    Path(&'a PathState),
+    ArgParser(&'a crate::modules::argparse::ArgParserState),
+    Namespace(&'a NamespaceState),
+    DefaultDict(&'a crate::modules::collections::DefaultDictState),
+    Pattern(&'a crate::modules::re::PatternState),
+    Match(&'a crate::modules::re::MatchState),
+    Socket(&'a crate::modules::socket::SocketState),
+    Class(&'a ClassState),
+    Instance(&'a InstanceState),
+    Fiber(&'a Box<crate::fiber::FiberState>),
+    ExtFunction(&'a ExtFunctionState),
+    Capsule {
+        ptr: usize,
+        name: Option<&'a String>,
+    },
+    Module(&'a ModuleState),
+    StdStream(&'a StdStreamState),
+    BigInt(&'a BigInt),
+    Cell(i64),
+}
+
+/// Exclusive payload view of a heap object, selected by [`PyxObj::kind`].
+///
+/// Every variant is an exclusive reference to the concrete payload type, so a
+/// mutation site cannot accidentally write a differently sized value.
+#[allow(dead_code)] // Complete typed view; most variants are used by mutation sites.
+pub(crate) enum ObjDataMut<'a> {
+    Str(&'a mut String),
+    Float(&'a mut f64),
+    Exception(&'a mut ExcData),
+    StrBuilder(&'a mut StrBuilderState),
+    List(&'a mut Vec<i64>),
+    Dict(&'a mut DictData),
+    Iter(&'a mut Box<IterState>),
+    Tuple(&'a mut Vec<i64>),
+    Set(&'a mut Vec<i64>),
+    Range(&'a mut RangeData),
+    Function(&'a mut FunctionObj),
+    Lock(&'a mut LockState),
+    Thread(&'a mut ThreadState),
+    Event(&'a mut EventState),
+    Queue(&'a mut QueueState),
+    Process(&'a mut ProcessState),
+    MpQueue(&'a mut MpQueueState),
+    Pool(&'a mut PoolState),
+    File(&'a mut FileState),
+    CsvReader(&'a mut CsvReaderState),
+    CsvWriter(&'a mut CsvWriterState),
+    Bytes(&'a mut Vec<u8>),
+    Random(&'a mut RandomState),
+    Path(&'a mut PathState),
+    ArgParser(&'a mut crate::modules::argparse::ArgParserState),
+    Namespace(&'a mut NamespaceState),
+    DefaultDict(&'a mut crate::modules::collections::DefaultDictState),
+    Pattern(&'a mut crate::modules::re::PatternState),
+    Match(&'a mut crate::modules::re::MatchState),
+    Socket(&'a mut crate::modules::socket::SocketState),
+    Class(&'a mut ClassState),
+    Instance(&'a mut InstanceState),
+    Fiber(&'a mut Box<crate::fiber::FiberState>),
+    ExtFunction(&'a mut ExtFunctionState),
+    Capsule(&'a mut CapsuleData),
+    Module(&'a mut ModuleState),
+    StdStream(&'a mut StdStreamState),
+    BigInt(&'a mut BigInt),
+    Cell(&'a mut i64),
+}
+
+impl PyxObj {
+    /// Borrows the payload as its concrete type.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an unknown `kind`; every value produced by the runtime
+    /// allocator has a kind covered by the payload table.
+    pub(crate) fn data_ref(&self) -> ObjDataRef<'_> {
+        debug_assert!(!self.data.is_null(), "heap object without a payload");
+        // SAFETY: the allocator writes exactly the payload type selected by
+        // `kind` into `data`; the borrow is tied to the header, which the
+        // collector keeps alive while the object is reachable.
+        unsafe {
+            let payload = self.data;
+            match self.kind {
+                KIND_STR => ObjDataRef::Str(&*(payload as *const String)),
+                KIND_FLOAT => ObjDataRef::Float(*(payload as *const f64)),
+                KIND_EXCEPTION => ObjDataRef::Exception(&*(payload as *const ExcData)),
+                KIND_STR_BUILDER => ObjDataRef::StrBuilder(&*(payload as *const StrBuilderState)),
+                KIND_LIST => ObjDataRef::List(&*(payload as *const Vec<i64>)),
+                KIND_DICT => ObjDataRef::Dict(&*(payload as *const DictData)),
+                KIND_ITER => ObjDataRef::Iter(&*(payload as *const Box<IterState>)),
+                KIND_TUPLE => ObjDataRef::Tuple(&*(payload as *const Vec<i64>)),
+                KIND_SET => ObjDataRef::Set(&*(payload as *const Vec<i64>)),
+                KIND_RANGE => {
+                    let range = &*(payload as *const RangeData);
+                    ObjDataRef::Range {
+                        start: range.start,
+                        stop: range.stop,
+                        step: range.step,
+                    }
+                }
+                KIND_FUNCTION => ObjDataRef::Function(&*(payload as *const FunctionObj)),
+                KIND_LOCK => ObjDataRef::Lock(&*(payload as *const LockState)),
+                KIND_THREAD => ObjDataRef::Thread(&*(payload as *const ThreadState)),
+                KIND_EVENT => ObjDataRef::Event(&*(payload as *const EventState)),
+                KIND_QUEUE => ObjDataRef::Queue(&*(payload as *const QueueState)),
+                KIND_PROCESS => ObjDataRef::Process(&*(payload as *const ProcessState)),
+                KIND_MPQUEUE => ObjDataRef::MpQueue(&*(payload as *const MpQueueState)),
+                KIND_POOL => ObjDataRef::Pool(&*(payload as *const PoolState)),
+                KIND_FILE => ObjDataRef::File(&*(payload as *const FileState)),
+                KIND_CSVREADER => ObjDataRef::CsvReader(&*(payload as *const CsvReaderState)),
+                KIND_CSVWRITER => ObjDataRef::CsvWriter(&*(payload as *const CsvWriterState)),
+                KIND_BYTES => ObjDataRef::Bytes(&*(payload as *const Vec<u8>)),
+                KIND_RANDOM => ObjDataRef::Random(&*(payload as *const RandomState)),
+                KIND_PATH => ObjDataRef::Path(&*(payload as *const PathState)),
+                KIND_ARG_PARSER => ObjDataRef::ArgParser(
+                    &*(payload as *const crate::modules::argparse::ArgParserState),
+                ),
+                KIND_NAMESPACE => ObjDataRef::Namespace(&*(payload as *const NamespaceState)),
+                KIND_DEFAULTDICT => ObjDataRef::DefaultDict(
+                    &*(payload as *const crate::modules::collections::DefaultDictState),
+                ),
+                KIND_PATTERN => {
+                    ObjDataRef::Pattern(&*(payload as *const crate::modules::re::PatternState))
+                }
+                KIND_MATCH => {
+                    ObjDataRef::Match(&*(payload as *const crate::modules::re::MatchState))
+                }
+                KIND_SOCKET => {
+                    ObjDataRef::Socket(&*(payload as *const crate::modules::socket::SocketState))
+                }
+                KIND_CLASS => ObjDataRef::Class(&*(payload as *const ClassState)),
+                KIND_INSTANCE => ObjDataRef::Instance(&*(payload as *const InstanceState)),
+                KIND_FIBER => {
+                    ObjDataRef::Fiber(&*(payload as *const Box<crate::fiber::FiberState>))
+                }
+                KIND_EXT_FUNCTION => {
+                    ObjDataRef::ExtFunction(&*(payload as *const ExtFunctionState))
+                }
+                KIND_CAPSULE => {
+                    let capsule = &*(payload as *const CapsuleData);
+                    ObjDataRef::Capsule {
+                        ptr: capsule.ptr,
+                        name: capsule.name.as_ref(),
+                    }
+                }
+                KIND_MODULE => ObjDataRef::Module(&*(payload as *const ModuleState)),
+                KIND_STD_STREAM => ObjDataRef::StdStream(&*(payload as *const StdStreamState)),
+                KIND_BIGINT => ObjDataRef::BigInt(&*(payload as *const BigInt)),
+                KIND_CELL => ObjDataRef::Cell(*(payload as *const i64)),
+                other => panic!("unknown object kind {other}"),
+            }
+        }
+    }
+
+    /// Exclusively borrows the payload as its concrete type.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an unknown `kind`, like [`PyxObj::data_ref`].
+    pub(crate) fn data_mut(&mut self) -> ObjDataMut<'_> {
+        debug_assert!(!self.data.is_null(), "heap object without a payload");
+        // SAFETY: as `data_ref`; callers only mutate reachable objects from
+        // the runtime thread (containers enter through a graph lock).
+        unsafe {
+            let payload = self.data;
+            match self.kind {
+                KIND_STR => ObjDataMut::Str(&mut *(payload as *mut String)),
+                KIND_FLOAT => ObjDataMut::Float(&mut *(payload as *mut f64)),
+                KIND_EXCEPTION => ObjDataMut::Exception(&mut *(payload as *mut ExcData)),
+                KIND_STR_BUILDER => ObjDataMut::StrBuilder(&mut *(payload as *mut StrBuilderState)),
+                KIND_LIST => ObjDataMut::List(&mut *(payload as *mut Vec<i64>)),
+                KIND_DICT => ObjDataMut::Dict(&mut *(payload as *mut DictData)),
+                KIND_ITER => ObjDataMut::Iter(&mut *(payload as *mut Box<IterState>)),
+                KIND_TUPLE => ObjDataMut::Tuple(&mut *(payload as *mut Vec<i64>)),
+                KIND_SET => ObjDataMut::Set(&mut *(payload as *mut Vec<i64>)),
+                KIND_RANGE => ObjDataMut::Range(&mut *(payload as *mut RangeData)),
+                KIND_FUNCTION => ObjDataMut::Function(&mut *(payload as *mut FunctionObj)),
+                KIND_LOCK => ObjDataMut::Lock(&mut *(payload as *mut LockState)),
+                KIND_THREAD => ObjDataMut::Thread(&mut *(payload as *mut ThreadState)),
+                KIND_EVENT => ObjDataMut::Event(&mut *(payload as *mut EventState)),
+                KIND_QUEUE => ObjDataMut::Queue(&mut *(payload as *mut QueueState)),
+                KIND_PROCESS => ObjDataMut::Process(&mut *(payload as *mut ProcessState)),
+                KIND_MPQUEUE => ObjDataMut::MpQueue(&mut *(payload as *mut MpQueueState)),
+                KIND_POOL => ObjDataMut::Pool(&mut *(payload as *mut PoolState)),
+                KIND_FILE => ObjDataMut::File(&mut *(payload as *mut FileState)),
+                KIND_CSVREADER => ObjDataMut::CsvReader(&mut *(payload as *mut CsvReaderState)),
+                KIND_CSVWRITER => ObjDataMut::CsvWriter(&mut *(payload as *mut CsvWriterState)),
+                KIND_BYTES => ObjDataMut::Bytes(&mut *(payload as *mut Vec<u8>)),
+                KIND_RANDOM => ObjDataMut::Random(&mut *(payload as *mut RandomState)),
+                KIND_PATH => ObjDataMut::Path(&mut *(payload as *mut PathState)),
+                KIND_ARG_PARSER => ObjDataMut::ArgParser(
+                    &mut *(payload as *mut crate::modules::argparse::ArgParserState),
+                ),
+                KIND_NAMESPACE => ObjDataMut::Namespace(&mut *(payload as *mut NamespaceState)),
+                KIND_DEFAULTDICT => ObjDataMut::DefaultDict(
+                    &mut *(payload as *mut crate::modules::collections::DefaultDictState),
+                ),
+                KIND_PATTERN => {
+                    ObjDataMut::Pattern(&mut *(payload as *mut crate::modules::re::PatternState))
+                }
+                KIND_MATCH => {
+                    ObjDataMut::Match(&mut *(payload as *mut crate::modules::re::MatchState))
+                }
+                KIND_SOCKET => {
+                    ObjDataMut::Socket(&mut *(payload as *mut crate::modules::socket::SocketState))
+                }
+                KIND_CLASS => ObjDataMut::Class(&mut *(payload as *mut ClassState)),
+                KIND_INSTANCE => ObjDataMut::Instance(&mut *(payload as *mut InstanceState)),
+                KIND_FIBER => {
+                    ObjDataMut::Fiber(&mut *(payload as *mut Box<crate::fiber::FiberState>))
+                }
+                KIND_EXT_FUNCTION => {
+                    ObjDataMut::ExtFunction(&mut *(payload as *mut ExtFunctionState))
+                }
+                KIND_CAPSULE => ObjDataMut::Capsule(&mut *(payload as *mut CapsuleData)),
+                KIND_MODULE => ObjDataMut::Module(&mut *(payload as *mut ModuleState)),
+                KIND_STD_STREAM => ObjDataMut::StdStream(&mut *(payload as *mut StdStreamState)),
+                KIND_BIGINT => ObjDataMut::BigInt(&mut *(payload as *mut BigInt)),
+                KIND_CELL => ObjDataMut::Cell(&mut *(payload as *mut i64)),
+                other => panic!("unknown object kind {other}"),
+            }
+        }
+    }
+}
+
+/// Expands `$m!(KIND_*, VariantName, PayloadType)` for every object kind.
+///
+/// The table is the single source of truth shared by the payload layout, the
+/// dropper and the allocator: every [`ObjData`] variant maps to exactly one
+/// payload type and exactly one kind.
+macro_rules! for_each_payload_type {
+    ($m:ident) => {
+        $m!(KIND_STR, Str, String);
+        $m!(KIND_FLOAT, Float, f64);
+        $m!(KIND_EXCEPTION, Exception, ExcData);
+        $m!(KIND_STR_BUILDER, StrBuilder, StrBuilderState);
+        $m!(KIND_LIST, List, Vec<i64>);
+        $m!(KIND_DICT, Dict, DictData);
+        $m!(KIND_ITER, Iter, Box<IterState>);
+        $m!(KIND_TUPLE, Tuple, Vec<i64>);
+        $m!(KIND_SET, Set, Vec<i64>);
+        $m!(KIND_RANGE, Range, RangeData);
+        $m!(KIND_FUNCTION, Function, FunctionObj);
+        $m!(KIND_LOCK, Lock, LockState);
+        $m!(KIND_THREAD, Thread, ThreadState);
+        $m!(KIND_EVENT, Event, EventState);
+        $m!(KIND_QUEUE, Queue, QueueState);
+        $m!(KIND_PROCESS, Process, ProcessState);
+        $m!(KIND_MPQUEUE, MpQueue, MpQueueState);
+        $m!(KIND_POOL, Pool, PoolState);
+        $m!(KIND_FILE, File, FileState);
+        $m!(KIND_CSVREADER, CsvReader, CsvReaderState);
+        $m!(KIND_CSVWRITER, CsvWriter, CsvWriterState);
+        $m!(KIND_BYTES, Bytes, Vec<u8>);
+        $m!(KIND_RANDOM, Random, RandomState);
+        $m!(KIND_PATH, Path, PathState);
+        $m!(
+            KIND_ARG_PARSER,
+            ArgParser,
+            crate::modules::argparse::ArgParserState
+        );
+        $m!(KIND_NAMESPACE, Namespace, NamespaceState);
+        $m!(
+            KIND_DEFAULTDICT,
+            DefaultDict,
+            crate::modules::collections::DefaultDictState
+        );
+        $m!(KIND_PATTERN, Pattern, crate::modules::re::PatternState);
+        $m!(KIND_MATCH, Match, crate::modules::re::MatchState);
+        $m!(KIND_SOCKET, Socket, crate::modules::socket::SocketState);
+        $m!(KIND_CLASS, Class, ClassState);
+        $m!(KIND_INSTANCE, Instance, InstanceState);
+        $m!(KIND_FIBER, Fiber, Box<crate::fiber::FiberState>);
+        $m!(KIND_EXT_FUNCTION, ExtFunction, ExtFunctionState);
+        $m!(KIND_CAPSULE, Capsule, CapsuleData);
+        $m!(KIND_MODULE, Module, ModuleState);
+        $m!(KIND_STD_STREAM, StdStream, StdStreamState);
+        $m!(KIND_BIGINT, BigInt, BigInt);
+        $m!(KIND_CELL, Cell, i64);
+    };
+}
+
+/// Layout required by the payload type of `kind`.
+///
+/// The allocator rounds this up to a size class; the alignment is always at
+/// least 8.
+pub(crate) fn payload_layout(kind: u32) -> Layout {
+    macro_rules! arm {
+        ($kind:expr, $variant:ident, $ty:ty) => {
+            if kind == $kind {
+                return Layout::new::<$ty>();
+            }
+        };
+    }
+    for_each_payload_type!(arm);
+    panic!("unknown object kind {kind}")
+}
+
+/// Writes `data` into the payload block `dst`.
+///
+/// # Safety
+///
+/// `dst` must point to at least [`payload_layout`] of the type selected by
+/// `kind`, and uninitialised storage for that type.
+pub(crate) unsafe fn write_payload(kind: u32, data: ObjData, dst: *mut u8) {
+    // The macro must expand to the whole `match`: a macro invoked in match-arm
+    // position may only expand to a pattern, never to `pattern => body`.
+    macro_rules! payload_match {
+        ($data:expr, $dst:expr; $( $kind_const:expr, $variant:ident, $ty:ty ),* $(,)?) => {
+            match $data {
+                $(
+                    ObjData::$variant(value) => {
+                        assert_eq!(
+                            kind, $kind_const,
+                            "object kind {kind} does not match its payload variant"
+                        );
+                        unsafe { ptr::write($dst as *mut $ty, value) };
+                    }
+                )*
+                ObjData::Range { start, stop, step } => {
+                    assert_eq!(kind, KIND_RANGE, "object kind {kind} is not a range");
+                    unsafe { ptr::write($dst as *mut RangeData, RangeData { start, stop, step }) };
+                }
+                ObjData::Capsule { ptr: capsule_ptr, name } => {
+                    assert_eq!(kind, KIND_CAPSULE, "object kind {kind} is not a capsule");
+                    unsafe {
+                        ptr::write($dst as *mut CapsuleData, CapsuleData { ptr: capsule_ptr, name })
+                    };
+                }
+            }
+        };
+    }
+
+    payload_match! { data, dst;
+        KIND_STR, Str, String,
+        KIND_FLOAT, Float, f64,
+        KIND_EXCEPTION, Exception, ExcData,
+        KIND_STR_BUILDER, StrBuilder, StrBuilderState,
+        KIND_LIST, List, Vec<i64>,
+        KIND_DICT, Dict, DictData,
+        KIND_ITER, Iter, Box<IterState>,
+        KIND_TUPLE, Tuple, Vec<i64>,
+        KIND_SET, Set, Vec<i64>,
+        KIND_FUNCTION, Function, FunctionObj,
+        KIND_LOCK, Lock, LockState,
+        KIND_THREAD, Thread, ThreadState,
+        KIND_EVENT, Event, EventState,
+        KIND_QUEUE, Queue, QueueState,
+        KIND_PROCESS, Process, ProcessState,
+        KIND_MPQUEUE, MpQueue, MpQueueState,
+        KIND_POOL, Pool, PoolState,
+        KIND_FILE, File, FileState,
+        KIND_CSVREADER, CsvReader, CsvReaderState,
+        KIND_CSVWRITER, CsvWriter, CsvWriterState,
+        KIND_BYTES, Bytes, Vec<u8>,
+        KIND_RANDOM, Random, RandomState,
+        KIND_PATH, Path, PathState,
+        KIND_ARG_PARSER, ArgParser, crate::modules::argparse::ArgParserState,
+        KIND_NAMESPACE, Namespace, NamespaceState,
+        KIND_DEFAULTDICT, DefaultDict, crate::modules::collections::DefaultDictState,
+        KIND_PATTERN, Pattern, crate::modules::re::PatternState,
+        KIND_MATCH, Match, crate::modules::re::MatchState,
+        KIND_SOCKET, Socket, crate::modules::socket::SocketState,
+        KIND_CLASS, Class, ClassState,
+        KIND_INSTANCE, Instance, InstanceState,
+        KIND_FIBER, Fiber, Box<crate::fiber::FiberState>,
+        KIND_EXT_FUNCTION, ExtFunction, ExtFunctionState,
+        KIND_MODULE, Module, ModuleState,
+        KIND_STD_STREAM, StdStream, StdStreamState,
+        KIND_BIGINT, BigInt, BigInt,
+        KIND_CELL, Cell, i64,
+    }
+}
+
+/// Drops the payload selected by `kind` in place.
+///
+/// # Safety
+///
+/// `dst` must point to an initialised payload of the type selected by `kind`;
+/// the storage is logically uninitialised afterwards.
+pub(crate) unsafe fn drop_payload(kind: u32, dst: *mut u8) {
+    macro_rules! arm {
+        ($kind:expr, $variant:ident, $ty:ty) => {
+            if kind == $kind {
+                unsafe { ptr::drop_in_place(dst as *mut $ty) };
+                return;
+            }
+        };
+    }
+    for_each_payload_type!(arm);
+    panic!("unknown object kind {kind}")
+}
+
 // Tag helpers
 
 #[inline]
@@ -1743,8 +2285,8 @@ pub(crate) fn as_bigint(v: i64) -> Option<&'static BigInt> {
     if obj.kind != KIND_BIGINT {
         return None;
     }
-    match &obj.data {
-        ObjData::BigInt(n) => Some(n),
+    match obj.data_ref() {
+        ObjDataRef::BigInt(n) => Some(n),
         _ => None,
     }
 }
@@ -1890,8 +2432,8 @@ pub(crate) fn as_float(v: i64) -> Option<f64> {
     if obj.kind != KIND_FLOAT {
         return None;
     }
-    match &obj.data {
-        ObjData::Float(f) => Some(*f),
+    match obj.data_ref() {
+        ObjDataRef::Float(f) => Some(f),
         _ => None,
     }
 }
@@ -1905,8 +2447,8 @@ pub(crate) fn as_str(v: i64) -> Option<&'static str> {
     if obj.kind != KIND_STR {
         return None;
     }
-    match &obj.data {
-        ObjData::Str(s) => Some(s.as_str()),
+    match obj.data_ref() {
+        ObjDataRef::Str(s) => Some(s.as_str()),
         _ => None,
     }
 }
@@ -1921,8 +2463,8 @@ pub(crate) fn as_bytes(v: i64) -> Option<&'static [u8]> {
     if obj.kind != KIND_BYTES {
         return None;
     }
-    match &obj.data {
-        ObjData::Bytes(bytes) => Some(bytes.as_slice()),
+    match obj.data_ref() {
+        ObjDataRef::Bytes(bytes) => Some(bytes.as_slice()),
         _ => None,
     }
 }
@@ -1937,8 +2479,8 @@ pub(crate) fn as_random(v: i64) -> Option<&'static RandomState> {
     if obj.kind != KIND_RANDOM {
         return None;
     }
-    match &obj.data {
-        ObjData::Random(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::Random(state) => Some(state),
         _ => None,
     }
 }
@@ -1953,8 +2495,8 @@ pub(crate) fn as_path(v: i64) -> Option<&'static PathState> {
     if obj.kind != KIND_PATH {
         return None;
     }
-    match &obj.data {
-        ObjData::Path(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::Path(state) => Some(state),
         _ => None,
     }
 }
@@ -1977,8 +2519,8 @@ pub(crate) fn as_arg_parser(v: i64) -> Option<&'static crate::modules::argparse:
     if obj.kind != KIND_ARG_PARSER {
         return None;
     }
-    match &obj.data {
-        ObjData::ArgParser(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::ArgParser(state) => Some(state),
         _ => None,
     }
 }
@@ -1993,8 +2535,8 @@ pub(crate) fn as_namespace(v: i64) -> Option<&'static [(String, i64)]> {
     if obj.kind != KIND_NAMESPACE {
         return None;
     }
-    match &obj.data {
-        ObjData::Namespace(state) => Some(state.pairs.as_slice()),
+    match obj.data_ref() {
+        ObjDataRef::Namespace(state) => Some(state.pairs.as_slice()),
         _ => None,
     }
 }
@@ -2009,8 +2551,8 @@ pub(crate) fn as_defaultdict(v: i64) -> Option<(&'static [(i64, i64)], i64)> {
     if obj.kind != KIND_DEFAULTDICT {
         return None;
     }
-    match &obj.data {
-        ObjData::DefaultDict(state) => Some((state.pairs.as_slice(), state.factory)),
+    match obj.data_ref() {
+        ObjDataRef::DefaultDict(state) => Some((state.pairs.as_slice(), state.factory)),
         _ => None,
     }
 }
@@ -2025,8 +2567,8 @@ pub(crate) fn as_pattern(v: i64) -> Option<&'static crate::modules::re::PatternS
     if obj.kind != KIND_PATTERN {
         return None;
     }
-    match &obj.data {
-        ObjData::Pattern(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::Pattern(state) => Some(state),
         _ => None,
     }
 }
@@ -2041,8 +2583,8 @@ pub(crate) fn as_match(v: i64) -> Option<&'static crate::modules::re::MatchState
     if obj.kind != KIND_MATCH {
         return None;
     }
-    match &obj.data {
-        ObjData::Match(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::Match(state) => Some(state),
         _ => None,
     }
 }
@@ -2057,8 +2599,8 @@ pub(crate) fn as_socket(v: i64) -> Option<&'static crate::modules::socket::Socke
     if obj.kind != KIND_SOCKET {
         return None;
     }
-    match &obj.data {
-        ObjData::Socket(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::Socket(state) => Some(state),
         _ => None,
     }
 }
@@ -2072,8 +2614,8 @@ pub(crate) fn exception_data(v: i64) -> Option<&'static ExcData> {
     if obj.kind != KIND_EXCEPTION {
         return None;
     }
-    match &obj.data {
-        ObjData::Exception(e) => Some(e),
+    match obj.data_ref() {
+        ObjDataRef::Exception(e) => Some(e),
         _ => None,
     }
 }
@@ -2088,8 +2630,8 @@ pub(crate) fn as_class(v: i64) -> Option<&'static ClassState> {
     if obj.kind != KIND_CLASS {
         return None;
     }
-    match &obj.data {
-        ObjData::Class(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::Class(state) => Some(state),
         _ => None,
     }
 }
@@ -2104,8 +2646,8 @@ pub(crate) fn as_module(v: i64) -> Option<&'static ModuleState> {
     if obj.kind != KIND_MODULE {
         return None;
     }
-    match &obj.data {
-        ObjData::Module(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::Module(state) => Some(state),
         _ => None,
     }
 }
@@ -2121,8 +2663,8 @@ pub(crate) fn as_std_stream(v: i64) -> Option<&'static StdStreamState> {
     if obj.kind != KIND_STD_STREAM {
         return None;
     }
-    match &obj.data {
-        ObjData::StdStream(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::StdStream(state) => Some(state),
         _ => None,
     }
 }
@@ -2165,8 +2707,8 @@ pub(crate) fn as_instance(v: i64) -> Option<&'static InstanceState> {
     if obj.kind != KIND_INSTANCE {
         return None;
     }
-    match &obj.data {
-        ObjData::Instance(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::Instance(state) => Some(state),
         _ => None,
     }
 }
@@ -2236,16 +2778,17 @@ pub(crate) fn class_method(class: i64, name: &str) -> Option<i64> {
 
 /// Snapshot of `instance.__dict__` in insertion order. Method attributes are
 /// resolved by [`crate::methods::call`] instead.
-pub(crate) fn instance_dict(instance: i64) -> Option<Vec<(i64, i64)>> {
+pub(crate) fn instance_dict(instance: i64) -> Option<i64> {
     let state = as_instance(instance)?;
-    Some(
-        state
-            .attrs
-            .snapshot()
-            .into_iter()
-            .map(|(name, value)| (str_alloc(name), value))
-            .collect(),
-    )
+    let snapshot = state.attrs.snapshot();
+    let result = dict_new(Vec::new());
+    let root = crate::heap::root_values(&[result]);
+    for (name, value) in snapshot {
+        let key = str_alloc(name);
+        crate::container::dict_set(result, key, value);
+    }
+    crate::heap::release_roots(root);
+    Some(result)
 }
 
 /// Replaces `instance.__dict__` from a mapping of string keys.
@@ -2323,8 +2866,8 @@ pub(crate) fn as_list(v: i64) -> Option<&'static [i64]> {
     if obj.kind != KIND_LIST {
         return None;
     }
-    match &obj.data {
-        ObjData::List(items) => Some(items.as_slice()),
+    match obj.data_ref() {
+        ObjDataRef::List(items) => Some(items.as_slice()),
         _ => None,
     }
 }
@@ -2339,8 +2882,8 @@ pub(crate) fn as_dict_data(v: i64) -> Option<&'static DictData> {
     if obj.kind != KIND_DICT {
         return None;
     }
-    match &obj.data {
-        ObjData::Dict(dict) => Some(dict),
+    match obj.data_ref() {
+        ObjDataRef::Dict(dict) => Some(dict),
         _ => None,
     }
 }
@@ -2358,8 +2901,8 @@ pub(crate) fn as_tuple(v: i64) -> Option<&'static [i64]> {
     if obj.kind != KIND_TUPLE {
         return None;
     }
-    match &obj.data {
-        ObjData::Tuple(items) => Some(items.as_slice()),
+    match obj.data_ref() {
+        ObjDataRef::Tuple(items) => Some(items.as_slice()),
         _ => None,
     }
 }
@@ -2373,8 +2916,8 @@ pub(crate) fn as_set(v: i64) -> Option<&'static [i64]> {
     if obj.kind != KIND_SET {
         return None;
     }
-    match &obj.data {
-        ObjData::Set(items) => Some(items.as_slice()),
+    match obj.data_ref() {
+        ObjDataRef::Set(items) => Some(items.as_slice()),
         _ => None,
     }
 }
@@ -2389,8 +2932,8 @@ pub(crate) fn as_range(v: i64) -> Option<(i64, i64, i64)> {
     if obj.kind != KIND_RANGE {
         return None;
     }
-    match &obj.data {
-        ObjData::Range { start, stop, step } => Some((*start, *stop, *step)),
+    match obj.data_ref() {
+        ObjDataRef::Range { start, stop, step } => Some((start, stop, step)),
         _ => None,
     }
 }
@@ -2404,8 +2947,8 @@ pub(crate) fn as_function(v: i64) -> Option<&'static FunctionObj> {
     if obj.kind != KIND_FUNCTION {
         return None;
     }
-    match &obj.data {
-        ObjData::Function(function) => Some(function),
+    match obj.data_ref() {
+        ObjDataRef::Function(function) => Some(function),
         _ => None,
     }
 }
@@ -2420,8 +2963,8 @@ pub(crate) fn as_ext_function(v: i64) -> Option<&'static ExtFunctionState> {
     if obj.kind != KIND_EXT_FUNCTION {
         return None;
     }
-    match &obj.data {
-        ObjData::ExtFunction(state) => Some(state),
+    match obj.data_ref() {
+        ObjDataRef::ExtFunction(state) => Some(state),
         _ => None,
     }
 }
@@ -2444,8 +2987,8 @@ pub(crate) fn as_capsule(v: i64) -> Option<(usize, Option<&'static str>)> {
     if obj.kind != KIND_CAPSULE {
         return None;
     }
-    match &obj.data {
-        ObjData::Capsule { ptr, name } => Some((*ptr, name.as_deref())),
+    match obj.data_ref() {
+        ObjDataRef::Capsule { ptr, name } => Some((ptr, name.map(String::as_str))),
         _ => None,
     }
 }
@@ -2462,8 +3005,8 @@ pub(crate) fn as_lock(v: i64) -> Option<&'static LockState> {
     if obj.kind != KIND_LOCK {
         return None;
     }
-    match &obj.data {
-        ObjData::Lock(lock) => Some(lock),
+    match obj.data_ref() {
+        ObjDataRef::Lock(lock) => Some(lock),
         _ => None,
     }
 }
@@ -2478,8 +3021,8 @@ pub(crate) fn as_thread(v: i64) -> Option<&'static ThreadState> {
     if obj.kind != KIND_THREAD {
         return None;
     }
-    match &obj.data {
-        ObjData::Thread(thread) => Some(thread),
+    match obj.data_ref() {
+        ObjDataRef::Thread(thread) => Some(thread),
         _ => None,
     }
 }
@@ -2494,8 +3037,8 @@ pub(crate) fn as_event(v: i64) -> Option<&'static EventState> {
     if obj.kind != KIND_EVENT {
         return None;
     }
-    match &obj.data {
-        ObjData::Event(event) => Some(event),
+    match obj.data_ref() {
+        ObjDataRef::Event(event) => Some(event),
         _ => None,
     }
 }
@@ -2510,8 +3053,8 @@ pub(crate) fn as_queue(v: i64) -> Option<&'static QueueState> {
     if obj.kind != KIND_QUEUE {
         return None;
     }
-    match &obj.data {
-        ObjData::Queue(queue) => Some(queue),
+    match obj.data_ref() {
+        ObjDataRef::Queue(queue) => Some(queue),
         _ => None,
     }
 }
@@ -2526,8 +3069,8 @@ pub(crate) fn as_process(v: i64) -> Option<&'static ProcessState> {
     if obj.kind != KIND_PROCESS {
         return None;
     }
-    match &obj.data {
-        ObjData::Process(process) => Some(process),
+    match obj.data_ref() {
+        ObjDataRef::Process(process) => Some(process),
         _ => None,
     }
 }
@@ -2542,8 +3085,8 @@ pub(crate) fn as_mp_queue(v: i64) -> Option<&'static MpQueueState> {
     if obj.kind != KIND_MPQUEUE {
         return None;
     }
-    match &obj.data {
-        ObjData::MpQueue(queue) => Some(queue),
+    match obj.data_ref() {
+        ObjDataRef::MpQueue(queue) => Some(queue),
         _ => None,
     }
 }
@@ -2558,8 +3101,8 @@ pub(crate) fn as_pool(v: i64) -> Option<&'static PoolState> {
     if obj.kind != KIND_POOL {
         return None;
     }
-    match &obj.data {
-        ObjData::Pool(pool) => Some(pool),
+    match obj.data_ref() {
+        ObjDataRef::Pool(pool) => Some(pool),
         _ => None,
     }
 }
@@ -2574,8 +3117,8 @@ pub(crate) fn as_file(v: i64) -> Option<&'static FileState> {
     if obj.kind != KIND_FILE {
         return None;
     }
-    match &obj.data {
-        ObjData::File(file) => Some(file),
+    match obj.data_ref() {
+        ObjDataRef::File(file) => Some(file),
         _ => None,
     }
 }
@@ -2590,8 +3133,8 @@ pub(crate) fn as_csv_reader(v: i64) -> Option<&'static CsvReaderState> {
     if obj.kind != KIND_CSVREADER {
         return None;
     }
-    match &obj.data {
-        ObjData::CsvReader(reader) => Some(reader),
+    match obj.data_ref() {
+        ObjDataRef::CsvReader(reader) => Some(reader),
         _ => None,
     }
 }
@@ -2606,8 +3149,8 @@ pub(crate) fn as_csv_writer(v: i64) -> Option<&'static CsvWriterState> {
     if obj.kind != KIND_CSVWRITER {
         return None;
     }
-    match &obj.data {
-        ObjData::CsvWriter(writer) => Some(writer),
+    match obj.data_ref() {
+        ObjDataRef::CsvWriter(writer) => Some(writer),
         _ => None,
     }
 }
@@ -2621,8 +3164,8 @@ pub(crate) fn as_iter(v: i64) -> Option<&'static IterState> {
     if obj.kind != KIND_ITER {
         return None;
     }
-    match &obj.data {
-        ObjData::Iter(state) => Some(state.as_ref()),
+    match obj.data_ref() {
+        ObjDataRef::Iter(state) => Some(state.as_ref()),
         _ => None,
     }
 }
@@ -2637,8 +3180,8 @@ pub(crate) fn as_fiber(v: i64) -> Option<&'static crate::fiber::FiberState> {
     if obj.kind != KIND_FIBER {
         return None;
     }
-    match &obj.data {
-        ObjData::Fiber(state) => Some(state.as_ref()),
+    match obj.data_ref() {
+        ObjDataRef::Fiber(state) => Some(state.as_ref()),
         _ => None,
     }
 }
@@ -2654,8 +3197,8 @@ pub(crate) fn fiber_state_mut(v: i64) -> Option<&'static mut crate::fiber::Fiber
     if obj.kind != KIND_FIBER {
         return None;
     }
-    match &mut obj.data {
-        ObjData::Fiber(state) => Some(state.as_mut()),
+    match obj.data_mut() {
+        ObjDataMut::Fiber(state) => Some(state.as_mut()),
         _ => None,
     }
 }
@@ -2755,8 +3298,8 @@ pub(crate) fn list_items_mut(v: i64) -> Option<ContainerGuard<Vec<i64>>> {
     let graph = lock_container(v, KIND_LIST)?;
     // SAFETY: heap tag/kind checked; value owned by the executing program (see contract).
     let obj: &'static mut PyxObj = unsafe { &mut *((v & !TAG_MASK) as *mut PyxObj) };
-    match &mut obj.data {
-        ObjData::List(items) => Some(ContainerGuard::new(items, graph)),
+    match obj.data_mut() {
+        ObjDataMut::List(items) => Some(ContainerGuard::new(items, graph)),
         _ => None,
     }
 }
@@ -2766,8 +3309,8 @@ pub(crate) fn dict_pairs_mut(v: i64) -> Option<ContainerGuard<DictData>> {
     let graph = lock_container(v, KIND_DICT)?;
     // SAFETY: see `list_items_mut`.
     let obj: &'static mut PyxObj = unsafe { &mut *((v & !TAG_MASK) as *mut PyxObj) };
-    match &mut obj.data {
-        ObjData::Dict(dict) => Some(ContainerGuard::new(dict, graph)),
+    match obj.data_mut() {
+        ObjDataMut::Dict(dict) => Some(ContainerGuard::new(dict, graph)),
         _ => None,
     }
 }
@@ -2777,8 +3320,8 @@ pub(crate) fn set_items_mut(v: i64) -> Option<ContainerGuard<Vec<i64>>> {
     let graph = lock_container(v, KIND_SET)?;
     // SAFETY: see `list_items_mut`.
     let obj: &'static mut PyxObj = unsafe { &mut *((v & !TAG_MASK) as *mut PyxObj) };
-    match &mut obj.data {
-        ObjData::Set(items) => Some(ContainerGuard::new(items, graph)),
+    match obj.data_mut() {
+        ObjDataMut::Set(items) => Some(ContainerGuard::new(items, graph)),
         _ => None,
     }
 }
@@ -2790,8 +3333,19 @@ pub(crate) fn arg_parser_mut(
     let graph = lock_container(v, KIND_ARG_PARSER)?;
     // SAFETY: see `list_items_mut`.
     let obj: &'static mut PyxObj = unsafe { &mut *((v & !TAG_MASK) as *mut PyxObj) };
-    match &mut obj.data {
-        ObjData::ArgParser(state) => Some(ContainerGuard::new(state, graph)),
+    match obj.data_mut() {
+        ObjDataMut::ArgParser(state) => Some(ContainerGuard::new(state, graph)),
+        _ => None,
+    }
+}
+
+/// Returns exclusive access to an `argparse.Namespace`'s attribute pairs.
+pub(crate) fn namespace_pairs_mut(v: i64) -> Option<ContainerGuard<NamespaceState>> {
+    let graph = lock_container(v, KIND_NAMESPACE)?;
+    // SAFETY: see `list_items_mut`.
+    let obj: &'static mut PyxObj = unsafe { &mut *((v & !TAG_MASK) as *mut PyxObj) };
+    match obj.data_mut() {
+        ObjDataMut::Namespace(state) => Some(ContainerGuard::new(state, graph)),
         _ => None,
     }
 }
@@ -2803,8 +3357,8 @@ pub(crate) fn defaultdict_state_mut(
     let graph = lock_container(v, KIND_DEFAULTDICT)?;
     // SAFETY: see `list_items_mut`.
     let obj: &'static mut PyxObj = unsafe { &mut *((v & !TAG_MASK) as *mut PyxObj) };
-    match &mut obj.data {
-        ObjData::DefaultDict(state) => Some(ContainerGuard::new(state, graph)),
+    match obj.data_mut() {
+        ObjDataMut::DefaultDict(state) => Some(ContainerGuard::new(state, graph)),
         _ => None,
     }
 }
@@ -2819,8 +3373,8 @@ pub(crate) fn iter_state_mut(v: i64) -> Option<&'static mut IterState> {
     if obj.kind != KIND_ITER {
         return None;
     }
-    match &mut obj.data {
-        ObjData::Iter(state) => Some(state.as_mut()),
+    match obj.data_mut() {
+        ObjDataMut::Iter(state) => Some(state.as_mut()),
         _ => None,
     }
 }
@@ -2839,7 +3393,7 @@ pub(crate) fn exception_clone(v: i64) -> Option<ExcData> {
 /// [`crate::heap::allocate`] (under the global-heap lock once `_thread` has
 /// switched to the shared heap).
 ///
-/// Audit note: an `&str`/`&ObjData`/`&mut` reference into *another* heap
+/// Audit note: an `&str`/payload borrow/`&mut` reference into *another* heap
 /// object is a plain pointer, not a tagged root, so it must not be read
 /// after an allocation that may collect. All current call sites finish
 /// reading their inputs before calling an allocator and only retain owned
@@ -2936,15 +3490,9 @@ pub(crate) fn path_new(path: String) -> i64 {
     alloc(KIND_PATH, ObjData::Path(PathState { path }))
 }
 
-pub(crate) fn arg_parser_new(prog: Option<String>, description: Option<String>) -> i64 {
-    alloc(
-        KIND_ARG_PARSER,
-        ObjData::ArgParser(crate::modules::argparse::ArgParserState {
-            prog,
-            description,
-            options: Vec::new(),
-        }),
-    )
+/// Allocates an `argparse.ArgumentParser` with a fully built state.
+pub(crate) fn arg_parser_new(state: crate::modules::argparse::ArgParserState) -> i64 {
+    alloc(KIND_ARG_PARSER, ObjData::ArgParser(state))
 }
 
 pub(crate) fn namespace_new(pairs: Vec<(String, i64)>) -> i64 {
@@ -2983,6 +3531,11 @@ pub(crate) fn class_new_full(
     // `unittest.main()` can discover and run it.
     if base != NONE && class_method(base, "__unittest_case__").is_some() {
         crate::modules::unittest::register(class);
+    }
+    // `Test*` classes with `test*` methods join the pytest registry; the
+    // pytest runner instantiates them and calls each method.
+    if as_class(class).is_some() {
+        crate::modules::pytest::register_class(class);
     }
     class
 }
@@ -3143,8 +3696,8 @@ pub(crate) fn cell_get(cell: i64) -> i64 {
     };
     // SAFETY: heap tag/kind checked under the graph lock.
     let obj = unsafe { &*((cell & !TAG_MASK) as *const PyxObj) };
-    match &obj.data {
-        ObjData::Cell(value) => *value,
+    match obj.data_ref() {
+        ObjDataRef::Cell(value) => value,
         _ => NONE,
     }
 }
@@ -3158,7 +3711,7 @@ pub(crate) fn cell_set(cell: i64, value: i64) {
         // SAFETY: heap tag/kind checked under the graph lock; the collector
         // only frees unreachable objects.
         let obj = unsafe { &mut *((cell & !TAG_MASK) as *mut PyxObj) };
-        let ObjData::Cell(slot) = &mut obj.data else {
+        let ObjDataMut::Cell(slot) = obj.data_mut() else {
             return;
         };
         *slot = value;
@@ -3190,8 +3743,8 @@ fn with_str_builder<R>(builder: i64, f: impl FnOnce(&mut StrBuilderState) -> R) 
     // SAFETY: heap tag and kind checked under the graph lock; the calling
     // ABI entry keeps the value rooted for the borrow.
     let obj = unsafe { &mut *((builder & !TAG_MASK) as *mut PyxObj) };
-    match &mut obj.data {
-        ObjData::StrBuilder(state) => Some(f(state)),
+    match obj.data_mut() {
+        ObjDataMut::StrBuilder(state) => Some(f(state)),
         _ => None,
     }
 }
@@ -3231,7 +3784,7 @@ fn store_builder_value(builder: i64, value: i64) {
     {
         // SAFETY: heap tag/kind checked under the graph lock.
         let obj = unsafe { &mut *((builder & !TAG_MASK) as *mut PyxObj) };
-        let ObjData::StrBuilder(slot) = &mut obj.data else {
+        let ObjDataMut::StrBuilder(slot) = obj.data_mut() else {
             return;
         };
         *slot = state;
@@ -3386,6 +3939,50 @@ pub(crate) fn builtin_function_new(builtin: pyx_ir::Builtin) -> i64 {
     )
 }
 
+/// Allocates an interpreter-backed function value.
+///
+/// `token` identifies the IR function inside the interpreter's program
+/// registry; `captures` are stored as traced GC edges. The parameter metadata
+/// drives the runtime keyword binder and the generic call path; `full_entry`
+/// carries the non-zero sentinel that enables keyword binding for host
+/// functions even though no machine-code trampoline exists.
+pub(crate) fn host_function_new(
+    token: u64,
+    captures: Vec<i64>,
+    arity: usize,
+    name: String,
+    flags: u32,
+    params: Vec<(String, ParamKind, Option<i64>)>,
+) -> i64 {
+    let signature: Vec<ParamMeta> = params
+        .iter()
+        .map(|(name, kind, default)| ParamMeta {
+            name: name.clone(),
+            kind: *kind,
+            default: *default,
+        })
+        .collect();
+    let positional = signature
+        .iter()
+        .filter(|param| param.kind == ParamKind::Positional)
+        .map(|param| param.name.clone())
+        .collect();
+    alloc(
+        KIND_FUNCTION,
+        ObjData::Function(FunctionObj {
+            body: FunctionBody::Host { token, captures },
+            arity,
+            name,
+            flags,
+            // Non-zero sentinel: keyword/omitted-default binding must route
+            // through the runtime binder for interpreter functions too.
+            full_entry: 1,
+            signature,
+            params: positional,
+        }),
+    )
+}
+
 /// Allocates an `operator.attrgetter` key function. `arity` is `1`: the
 /// getter takes the object it reads from.
 pub(crate) fn attribute_getter_new(names: Vec<String>) -> i64 {
@@ -3452,6 +4049,7 @@ pub(crate) fn partial_new_with_keywords(
             // Generated wrappers count user-visible parameters; the derived
             // callables here take exactly one argument.
             FunctionBody::Wrapper { .. }
+            | FunctionBody::Host { .. }
             | FunctionBody::Partial { .. }
             | FunctionBody::Identity
             | FunctionBody::AttributeGetter { .. }
@@ -3491,7 +4089,7 @@ pub(crate) fn function_set_params(function: i64, params: Vec<String>) {
     if obj.kind != KIND_FUNCTION {
         return;
     }
-    if let ObjData::Function(func) = &mut obj.data {
+    if let ObjDataMut::Function(func) = obj.data_mut() {
         func.params = params;
     }
 }
@@ -3503,7 +4101,7 @@ pub(crate) fn function_set_full_entry(function: i64, entry: usize) {
     }
     let obj = unsafe { &mut *((function & !TAG_MASK) as *mut PyxObj) };
     if obj.kind == KIND_FUNCTION {
-        if let ObjData::Function(func) = &mut obj.data {
+        if let ObjDataMut::Function(func) = obj.data_mut() {
             func.full_entry = entry;
         }
     }
@@ -3516,7 +4114,7 @@ pub(crate) fn function_set_signature(function: i64, signature: Vec<ParamMeta>) {
     }
     let obj = unsafe { &mut *((function & !TAG_MASK) as *mut PyxObj) };
     if obj.kind == KIND_FUNCTION {
-        if let ObjData::Function(func) = &mut obj.data {
+        if let ObjDataMut::Function(func) = obj.data_mut() {
             func.params = signature
                 .iter()
                 .filter(|param| param.kind == ParamKind::Positional)
@@ -3609,6 +4207,12 @@ pub(crate) fn fiber_generator_new(entry: usize, name: String, args: Vec<i64>) ->
 /// Creates a coroutine object. No body code runs until the first `await`.
 pub(crate) fn fiber_coroutine_new(entry: usize, name: String, args: Vec<i64>) -> Option<i64> {
     fiber_alloc(crate::fiber::FiberKind::Coroutine, entry, name, args)
+}
+
+/// Creates a lazy async generator object. No body code runs until the first
+/// `__anext__`/`asend`.
+pub(crate) fn fiber_async_generator_new(entry: usize, name: String, args: Vec<i64>) -> Option<i64> {
+    fiber_alloc(crate::fiber::FiberKind::AsyncGenerator, entry, name, args)
 }
 
 fn fiber_alloc(
@@ -3810,50 +4414,51 @@ pub(crate) fn type_name(v: i64) -> &'static str {
     }
     if is_heap(v) {
         // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
-        return match unsafe { as_obj(v) }.map(|o| &o.data) {
-            Some(ObjData::Str(_)) => "str",
-            Some(ObjData::Float(_)) => "float",
-            Some(ObjData::BigInt(_)) => "int",
-            Some(ObjData::Exception(e)) => e.name,
-            Some(ObjData::List(_)) => "list",
-            Some(ObjData::Dict(_)) => "dict",
-            Some(ObjData::Iter(_)) => "iterator",
+        return match unsafe { as_obj(v) }.map(|o| o.data_ref()) {
+            Some(ObjDataRef::Str(_)) => "str",
+            Some(ObjDataRef::Float(_)) => "float",
+            Some(ObjDataRef::BigInt(_)) => "int",
+            Some(ObjDataRef::Exception(e)) => e.name,
+            Some(ObjDataRef::List(_)) => "list",
+            Some(ObjDataRef::Dict(_)) => "dict",
+            Some(ObjDataRef::Iter(_)) => "iterator",
             // Internal accumulator: unreachable from user code, but reported
             // as the value it will finish as.
-            Some(ObjData::StrBuilder(_)) => "str",
-            Some(ObjData::Tuple(_)) => "tuple",
-            Some(ObjData::Set(_)) => "set",
-            Some(ObjData::Range { .. }) => "range",
-            Some(ObjData::Function(_)) => "function",
-            Some(ObjData::Lock(_)) => "lock",
-            Some(ObjData::Thread(_)) => "Thread",
-            Some(ObjData::Event(_)) => "Event",
-            Some(ObjData::Queue(_)) => "Queue",
-            Some(ObjData::Process(_)) => "Process",
-            Some(ObjData::MpQueue(_)) => "Queue",
-            Some(ObjData::Pool(_)) => "Pool",
-            Some(ObjData::File(_)) => "file",
-            Some(ObjData::CsvReader(_)) => "csv.reader",
-            Some(ObjData::CsvWriter(_)) => "csv.writer",
-            Some(ObjData::Bytes(_)) => "bytes",
-            Some(ObjData::Random(_)) => "Random",
-            Some(ObjData::Path(_)) => "Path",
-            Some(ObjData::ArgParser(_)) => "ArgumentParser",
-            Some(ObjData::Namespace(_)) => "Namespace",
-            Some(ObjData::DefaultDict(_)) => "defaultdict",
-            Some(ObjData::Pattern(_)) => "Pattern",
-            Some(ObjData::Match(_)) => "Match",
-            Some(ObjData::Socket(_)) => "socket",
-            Some(ObjData::Class(_)) => "type",
-            Some(ObjData::Instance(_)) => "instance",
-            Some(ObjData::ExtFunction(_)) => "builtin_function_or_method",
-            Some(ObjData::Capsule { .. }) => "PyCapsule",
-            Some(ObjData::Module(_)) => "module",
-            Some(ObjData::StdStream(_)) => "TextIOWrapper",
-            Some(ObjData::Cell(_)) => "cell",
-            Some(ObjData::Fiber(state)) => match state.kind {
+            Some(ObjDataRef::StrBuilder(_)) => "str",
+            Some(ObjDataRef::Tuple(_)) => "tuple",
+            Some(ObjDataRef::Set(_)) => "set",
+            Some(ObjDataRef::Range { .. }) => "range",
+            Some(ObjDataRef::Function(_)) => "function",
+            Some(ObjDataRef::Lock(_)) => "lock",
+            Some(ObjDataRef::Thread(_)) => "Thread",
+            Some(ObjDataRef::Event(_)) => "Event",
+            Some(ObjDataRef::Queue(_)) => "Queue",
+            Some(ObjDataRef::Process(_)) => "Process",
+            Some(ObjDataRef::MpQueue(_)) => "Queue",
+            Some(ObjDataRef::Pool(_)) => "Pool",
+            Some(ObjDataRef::File(_)) => "file",
+            Some(ObjDataRef::CsvReader(_)) => "csv.reader",
+            Some(ObjDataRef::CsvWriter(_)) => "csv.writer",
+            Some(ObjDataRef::Bytes(_)) => "bytes",
+            Some(ObjDataRef::Random(_)) => "Random",
+            Some(ObjDataRef::Path(_)) => "Path",
+            Some(ObjDataRef::ArgParser(_)) => "ArgumentParser",
+            Some(ObjDataRef::Namespace(_)) => "Namespace",
+            Some(ObjDataRef::DefaultDict(_)) => "defaultdict",
+            Some(ObjDataRef::Pattern(_)) => "Pattern",
+            Some(ObjDataRef::Match(_)) => "Match",
+            Some(ObjDataRef::Socket(_)) => "socket",
+            Some(ObjDataRef::Class(_)) => "type",
+            Some(ObjDataRef::Instance(_)) => "instance",
+            Some(ObjDataRef::ExtFunction(_)) => "builtin_function_or_method",
+            Some(ObjDataRef::Capsule { .. }) => "PyCapsule",
+            Some(ObjDataRef::Module(_)) => "module",
+            Some(ObjDataRef::StdStream(_)) => "TextIOWrapper",
+            Some(ObjDataRef::Cell(_)) => "cell",
+            Some(ObjDataRef::Fiber(state)) => match state.kind {
                 crate::fiber::FiberKind::Generator => "generator",
                 crate::fiber::FiberKind::Coroutine => "coroutine",
+                crate::fiber::FiberKind::AsyncGenerator => "async_generator",
             },
             None => "object",
         };
@@ -3878,6 +4483,11 @@ pub(crate) fn clear_type_class_cache() {
 pub(crate) fn type_class(v: i64) -> i64 {
     if let Some(instance) = as_instance(v) {
         return instance.class;
+    }
+    // A built-in exception's type is the same cached class object the name
+    // `ValueError` resolves to, so `type(e) is ValueError` holds.
+    if let Some(tag) = exception_data(v).map(|data| data.tag) {
+        return crate::exc::exception_class(tag);
     }
     let name = if as_class(v).is_some() {
         "type".to_string()
@@ -3917,59 +4527,59 @@ pub(crate) fn truthy(v: i64) -> bool {
     }
     if is_heap(v) {
         // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
-        return match unsafe { as_obj(v) }.map(|o| &o.data) {
-            Some(ObjData::Str(s)) => !s.is_empty(),
+        return match unsafe { as_obj(v) }.map(|o| o.data_ref()) {
+            Some(ObjDataRef::Str(s)) => !s.is_empty(),
             // Internal accumulator: truthy exactly when its text is.
-            Some(ObjData::StrBuilder(state)) => match state {
+            Some(ObjDataRef::StrBuilder(state)) => match state {
                 StrBuilderState::Building(text) => !text.is_empty(),
                 StrBuilderState::Materialized(value) => truthy(*value),
             },
-            Some(ObjData::Float(f)) => *f != 0.0,
-            Some(ObjData::BigInt(n)) => n.sign() != Sign::NoSign,
-            Some(ObjData::Exception(_)) => true,
-            Some(ObjData::List(items)) => !items.is_empty(),
-            Some(ObjData::Dict(pairs)) => !pairs.is_empty(),
-            Some(ObjData::Iter(_)) => true,
-            Some(ObjData::Tuple(items)) => !items.is_empty(),
-            Some(ObjData::Set(items)) => !items.is_empty(),
-            Some(ObjData::Bytes(bytes)) => !bytes.is_empty(),
-            Some(ObjData::Range { start, stop, step }) => range_len(*start, *stop, *step) > 0,
-            Some(ObjData::Function(_)) => true,
+            Some(ObjDataRef::Float(f)) => f != 0.0,
+            Some(ObjDataRef::BigInt(n)) => n.sign() != Sign::NoSign,
+            Some(ObjDataRef::Exception(_)) => true,
+            Some(ObjDataRef::List(items)) => !items.is_empty(),
+            Some(ObjDataRef::Dict(pairs)) => !pairs.is_empty(),
+            Some(ObjDataRef::Iter(_)) => true,
+            Some(ObjDataRef::Tuple(items)) => !items.is_empty(),
+            Some(ObjDataRef::Set(items)) => !items.is_empty(),
+            Some(ObjDataRef::Bytes(bytes)) => !bytes.is_empty(),
+            Some(ObjDataRef::Range { start, stop, step }) => range_len(start, stop, step) > 0,
+            Some(ObjDataRef::Function(_)) => true,
             // Like CPython, a lock object is always truthy.
-            Some(ObjData::Lock(_)) => true,
+            Some(ObjDataRef::Lock(_)) => true,
             // Synchronisation objects are always truthy.
-            Some(ObjData::Thread(_))
-            | Some(ObjData::Event(_))
-            | Some(ObjData::Queue(_))
-            | Some(ObjData::Process(_))
-            | Some(ObjData::MpQueue(_))
-            | Some(ObjData::Pool(_))
-            | Some(ObjData::File(_))
-            | Some(ObjData::CsvReader(_))
-            | Some(ObjData::CsvWriter(_)) => true,
+            Some(ObjDataRef::Thread(_))
+            | Some(ObjDataRef::Event(_))
+            | Some(ObjDataRef::Queue(_))
+            | Some(ObjDataRef::Process(_))
+            | Some(ObjDataRef::MpQueue(_))
+            | Some(ObjDataRef::Pool(_))
+            | Some(ObjDataRef::File(_))
+            | Some(ObjDataRef::CsvReader(_))
+            | Some(ObjDataRef::CsvWriter(_)) => true,
             // A generator object is always truthy.
-            Some(ObjData::Random(_)) => true,
+            Some(ObjDataRef::Random(_)) => true,
             // Like CPython, a path is always truthy.
-            Some(ObjData::Path(_)) => true,
+            Some(ObjDataRef::Path(_)) => true,
             // Parser objects and namespaces are always truthy.
-            Some(ObjData::ArgParser(_)) | Some(ObjData::Namespace(_)) => true,
+            Some(ObjDataRef::ArgParser(_)) | Some(ObjDataRef::Namespace(_)) => true,
             // A defaultdict is truthy exactly when it has entries, like dict.
-            Some(ObjData::DefaultDict(state)) => !state.pairs.is_empty(),
-            Some(ObjData::Pattern(_)) | Some(ObjData::Match(_)) => true,
+            Some(ObjDataRef::DefaultDict(state)) => !state.pairs.is_empty(),
+            Some(ObjDataRef::Pattern(_)) | Some(ObjDataRef::Match(_)) => true,
             // A socket object is always truthy.
-            Some(ObjData::Socket(_)) => true,
+            Some(ObjDataRef::Socket(_)) => true,
             // Classes and instances are always truthy (there is no `__bool__`).
-            Some(ObjData::Class(_)) | Some(ObjData::Instance(_)) => true,
+            Some(ObjDataRef::Class(_)) | Some(ObjDataRef::Instance(_)) => true,
             // Generator and coroutine objects are always truthy.
-            Some(ObjData::Fiber(_)) => true,
+            Some(ObjDataRef::Fiber(_)) => true,
             // Function objects are always truthy.
-            Some(ObjData::ExtFunction(_)) => true,
+            Some(ObjDataRef::ExtFunction(_)) => true,
             // Capsules and module values are always truthy, like CPython.
-            Some(ObjData::Capsule { .. }) | Some(ObjData::Module(_)) => true,
+            Some(ObjDataRef::Capsule { .. }) | Some(ObjDataRef::Module(_)) => true,
             // A standard stream is always truthy.
-            Some(ObjData::StdStream(_)) => true,
+            Some(ObjDataRef::StdStream(_)) => true,
             // Cells are internal; they are always truthy.
-            Some(ObjData::Cell(_)) => true,
+            Some(ObjDataRef::Cell(_)) => true,
             None => true,
         };
     }
@@ -3991,6 +4601,7 @@ fn fiber_repr(state: &crate::fiber::FiberState) -> String {
     let (kind, fallback) = match state.kind {
         crate::fiber::FiberKind::Generator => ("generator", "<generator object>"),
         crate::fiber::FiberKind::Coroutine => ("coroutine", "<coroutine object>"),
+        crate::fiber::FiberKind::AsyncGenerator => ("async_generator", "<async_generator object>"),
     };
     if state.name.is_empty() {
         fallback.to_string()
@@ -4020,25 +4631,26 @@ pub(crate) fn to_string(v: i64) -> String {
     if is_heap(v) {
         // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
         if let Some(obj) = unsafe { as_obj(v) } {
-            return match &obj.data {
-                ObjData::Str(s) => s.clone(),
+            return match obj.data_ref() {
+                ObjDataRef::Str(s) => s.clone(),
                 // Internal accumulator: renders the text it will finish as.
-                ObjData::StrBuilder(state) => match state {
+                ObjDataRef::StrBuilder(state) => match state {
                     StrBuilderState::Building(text) => text.clone(),
                     StrBuilderState::Materialized(value) => to_string(*value),
                 },
-                ObjData::Float(f) => format_float(*f),
-                ObjData::BigInt(n) => n.to_string(),
+                ObjDataRef::Float(f) => format_float(f),
+                ObjDataRef::BigInt(n) => n.to_string(),
                 // `str(exception)` is its message (Python behaviour).
-                ObjData::Exception(e) => e.msg.clone(),
-                ObjData::List(_) | ObjData::Dict(_) | ObjData::Tuple(_) | ObjData::Set(_) => {
-                    repr_depth(v, 0)
-                }
-                ObjData::Range { .. } => repr_depth(v, 0),
-                ObjData::Function(function) => format!("<function {}>", function.name),
-                ObjData::Lock(_) => "<lock object>".to_string(),
-                ObjData::Iter(_) => "<iterator>".to_string(),
-                ObjData::Thread(thread) => {
+                ObjDataRef::Exception(e) => e.msg.clone(),
+                ObjDataRef::List(_)
+                | ObjDataRef::Dict(_)
+                | ObjDataRef::Tuple(_)
+                | ObjDataRef::Set(_) => repr_depth(v, 0),
+                ObjDataRef::Range { .. } => repr_depth(v, 0),
+                ObjDataRef::Function(function) => format!("<function {}>", function.name),
+                ObjDataRef::Lock(_) => "<lock object>".to_string(),
+                ObjDataRef::Iter(_) => "<iterator>".to_string(),
+                ObjDataRef::Thread(thread) => {
                     let state = if thread.started.load(std::sync::atomic::Ordering::Acquire) {
                         "started"
                     } else {
@@ -4046,22 +4658,22 @@ pub(crate) fn to_string(v: i64) -> String {
                     };
                     format!("<Thread({}, {state})>", thread.name)
                 }
-                ObjData::Event(event) => {
+                ObjDataRef::Event(event) => {
                     if event.is_set() {
                         "<Event set>".to_string()
                     } else {
                         "<Event unset>".to_string()
                     }
                 }
-                ObjData::Queue(queue) => format!("<Queue size={}>", queue.qsize()),
+                ObjDataRef::Queue(queue) => format!("<Queue size={}>", queue.qsize()),
                 // Listing the peer's items would require reading the socket;
                 // render the metadata only. `maxsize` is informational for a
                 // cross-process queue (see `process`).
-                ObjData::MpQueue(queue) => format!("<Queue maxsize={}>", queue.maxsize),
-                ObjData::Pool(pool) => {
+                ObjDataRef::MpQueue(queue) => format!("<Queue maxsize={}>", queue.maxsize),
+                ObjDataRef::Pool(pool) => {
                     format!("<Pool({} processes)>", pool.size())
                 }
-                ObjData::Process(process) => {
+                ObjDataRef::Process(process) => {
                     let state = if process.started.load(std::sync::atomic::Ordering::Acquire) {
                         "started"
                     } else {
@@ -4069,7 +4681,7 @@ pub(crate) fn to_string(v: i64) -> String {
                     };
                     format!("<Process({}, {state})>", process.name)
                 }
-                ObjData::File(file) => {
+                ObjDataRef::File(file) => {
                     if file.binary() {
                         format!("<file name='{}' mode='{}b'>", file.path(), file.mode())
                     } else {
@@ -4080,26 +4692,26 @@ pub(crate) fn to_string(v: i64) -> String {
                         )
                     }
                 }
-                ObjData::CsvReader(_) => "<csv.reader>".to_string(),
-                ObjData::CsvWriter(_) => "<csv.writer>".to_string(),
+                ObjDataRef::CsvReader(_) => "<csv.reader>".to_string(),
+                ObjDataRef::CsvWriter(_) => "<csv.writer>".to_string(),
                 // `str(bytes)` is its `repr`, like CPython.
-                ObjData::Bytes(bytes) => quote_bytes(bytes),
-                ObjData::Random(_) => "<random.Random>".to_string(),
+                ObjDataRef::Bytes(bytes) => quote_bytes(bytes),
+                ObjDataRef::Random(_) => "<random.Random>".to_string(),
                 // `str(Path)` is the path itself.
-                ObjData::Path(state) => state.path.clone(),
-                ObjData::ArgParser(state) => match &state.prog {
+                ObjDataRef::Path(state) => state.path.clone(),
+                ObjDataRef::ArgParser(state) => match &state.prog {
                     Some(prog) => format!("ArgumentParser(prog='{prog}')"),
                     None => "ArgumentParser(prog='program')".to_string(),
                 },
-                ObjData::Namespace(_) => repr_depth(v, 0),
-                ObjData::DefaultDict(_) => repr_depth(v, 0),
-                ObjData::Pattern(state) => format!("re.compile({})", quote_str(&state.source)),
-                ObjData::Match(state) => {
+                ObjDataRef::Namespace(_) => repr_depth(v, 0),
+                ObjDataRef::DefaultDict(_) => repr_depth(v, 0),
+                ObjDataRef::Pattern(state) => format!("re.compile({})", quote_str(&state.source)),
+                ObjDataRef::Match(state) => {
                     format!("<re.Match object; pattern={}>", quote_str(&state.pattern))
                 }
-                ObjData::Socket(state) => state.render(),
-                ObjData::Class(state) => format!("<class '{}'>", state.name),
-                ObjData::Instance(state) => {
+                ObjDataRef::Socket(state) => state.render(),
+                ObjDataRef::Class(state) => format!("<class '{}'>", state.name),
+                ObjDataRef::Instance(state) => {
                     let class = state.class;
                     if let Some(ClassEntry::Method(pyx_ir::MethodKind::Normal, function)) =
                         class_lookup(class, "__str__")
@@ -4113,17 +4725,17 @@ pub(crate) fn to_string(v: i64) -> String {
                     }
                     instance_default_repr(state)
                 }
-                ObjData::Fiber(state) => fiber_repr(state),
-                ObjData::ExtFunction(state) => {
+                ObjDataRef::Fiber(state) => fiber_repr(state),
+                ObjDataRef::ExtFunction(state) => {
                     format!("<built-in function {}>", state.name)
                 }
-                ObjData::Capsule { name, .. } => match name {
+                ObjDataRef::Capsule { name, .. } => match name {
                     Some(name) => format!("<capsule object \"{name}\">"),
                     None => "<capsule object NULL>".to_string(),
                 },
-                ObjData::Module(state) => format!("<module '{}'>", state.name),
-                ObjData::StdStream(stream) => format!("<pyx.{}>", stream.name()),
-                ObjData::Cell(value) => to_string(*value),
+                ObjDataRef::Module(state) => format!("<module '{}'>", state.name),
+                ObjDataRef::StdStream(stream) => format!("<pyx.{}>", stream.name()),
+                ObjDataRef::Cell(value) => to_string(value),
             };
         }
     }
@@ -4140,6 +4752,71 @@ pub(crate) fn repr(v: i64) -> String {
 /// against self-referential lists/dicts (possible via item assignment)
 /// overflowing the stack.
 const MAX_REPR_DEPTH: usize = 64;
+
+// Heap objects currently being rendered by `repr_depth` on this thread.
+//
+// A depth limit alone is insufficient for the cyclic graphs Python permits
+// through item assignment: a 24-node graph rendered to depth 64 can expand
+// exponentially. The active set turns a back-edge into the conventional
+// `...` marker immediately.
+thread_local! {
+    static REPR_ACTIVE: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Marks a heap object active for the duration of its repr. Returns `false`
+/// when the object is already active (a cycle).
+struct ReprGuard {
+    address: usize,
+    entered: bool,
+}
+
+impl ReprGuard {
+    fn enter(value: i64) -> (ReprGuard, bool) {
+        let address = if is_heap(value) {
+            (value & !TAG_MASK) as usize
+        } else {
+            0
+        };
+        if address == 0 {
+            return (
+                ReprGuard {
+                    address: 0,
+                    entered: false,
+                },
+                true,
+            );
+        }
+        let fresh = REPR_ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            if active.contains(&address) {
+                false
+            } else {
+                active.push(address);
+                true
+            }
+        });
+        (
+            ReprGuard {
+                address,
+                entered: fresh,
+            },
+            fresh,
+        )
+    }
+}
+
+impl Drop for ReprGuard {
+    fn drop(&mut self) {
+        if self.entered {
+            REPR_ACTIVE.with(|active| {
+                let mut active = active.borrow_mut();
+                if let Some(index) = active.iter().rposition(|&value| value == self.address) {
+                    active.remove(index);
+                }
+            });
+        }
+    }
+}
 
 /// Python-style rendering of a `defaultdict` factory.
 fn factory_repr(factory: i64) -> String {
@@ -4201,6 +4878,11 @@ fn repr_depth(v: i64, depth: usize) -> String {
     if depth >= MAX_REPR_DEPTH {
         return "...".to_string();
     }
+    let (repr_guard, fresh) = ReprGuard::enter(v);
+    if !fresh {
+        return "...".to_string();
+    }
+    let _repr_guard = repr_guard;
     if let Some(items) = as_list(v) {
         let mut out = String::from("[");
         for (index, item) in items.iter().enumerate() {

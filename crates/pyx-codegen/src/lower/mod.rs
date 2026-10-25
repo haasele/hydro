@@ -169,6 +169,7 @@ struct Runtime {
     function_meta: FuncId,
     coroutine_new: FuncId,
     generator_new: FuncId,
+    async_generator_new: FuncId,
     await_value: FuncId,
     yield_value: FuncId,
     yield_from: FuncId,
@@ -230,6 +231,13 @@ struct Runtime {
     frame_enter: FuncId,
     safepoint: FuncId,
     frame_leave: FuncId,
+    /// Precise shadow frame for locals/return/temporaries.
+    gc_frame_push: FuncId,
+    gc_frame_pop: FuncId,
+    gc_frame_used: FuncId,
+    /// Registered ranges over argument/literal stack arrays.
+    gc_scope_push: FuncId,
+    gc_scope_pop: FuncId,
     exc_pending: FuncId,
     exc_tag: FuncId,
     exc_value: FuncId,
@@ -368,6 +376,12 @@ impl Runtime {
             generator_new: declare_runtime(
                 module,
                 "pyx_generator_new",
+                &[i64t, ptr, ptr],
+                Some(i64t),
+            )?,
+            async_generator_new: declare_runtime(
+                module,
+                "pyx_async_generator_new",
                 &[i64t, ptr, ptr],
                 Some(i64t),
             )?,
@@ -600,6 +614,15 @@ impl Runtime {
             // it by name; the JIT binds it in `backend::jit::register_runtime_symbols`.
             safepoint: declare_runtime(module, "pyx_safepoint", &[], None)?,
             frame_leave: declare_runtime(module, "pyx_frame_leave", &[], None)?,
+            // Precise roots: `frame_push(base, capacity)` zero-fills the
+            // shadow frame, `frame_pop(token)` unregisters it, and
+            // `frame_used(token, used)` sets the scanned prefix. Stack arrays
+            // are registered with `scope_push(base, count)`/`scope_pop(token)`.
+            gc_frame_push: declare_runtime(module, "pyx_gc_frame_push", &[ptr, ptr], Some(ptr))?,
+            gc_frame_pop: declare_runtime(module, "pyx_gc_frame_pop", &[ptr], None)?,
+            gc_frame_used: declare_runtime(module, "pyx_gc_frame_used", &[ptr, ptr], None)?,
+            gc_scope_push: declare_runtime(module, "pyx_gc_scope_push", &[ptr, ptr], Some(ptr))?,
+            gc_scope_pop: declare_runtime(module, "pyx_gc_scope_pop", &[ptr], None)?,
             exc_pending: declare_runtime(module, "pyx_exc_pending", &[], Some(i64t))?,
             exc_tag: declare_runtime(module, "pyx_exc_tag", &[], Some(i64t))?,
             exc_value: declare_runtime(module, "pyx_exc_value", &[], Some(i64t))?,
@@ -737,6 +760,7 @@ pub(crate) fn lower_program<M: Module>(
             index as FunctionId,
             &symbols,
             &full_wrappers,
+            &runtime,
         )?;
     }
 
@@ -796,7 +820,7 @@ fn lower_function<M: Module>(
             runtime,
             builder,
             ptr_ty,
-        );
+        )?;
         lower.run()?;
         lower.finish();
     }
@@ -804,6 +828,80 @@ fn lower_function<M: Module>(
     module
         .define_function(func_id, &mut ctx)
         .map_err(|e| module_error(&format!("cannot define function {index}"), e))
+}
+
+/// Shadow frame used by the generated call wrappers.
+///
+/// Wrappers run before the lowered body's frame exists, so they need their own
+/// precise frame for the tagged values they materialise (defaults, `*args`
+/// lists, `**kwargs` dicts) while a later runtime helper may allocate.
+struct WrapperRoots {
+    slot: StackSlot,
+    token: Value,
+    capacity: usize,
+}
+
+fn wrapper_frame<M: Module>(
+    module: &mut M,
+    builder: &mut FunctionBuilder,
+    runtime: &Runtime,
+    ptr_ty: ir::Type,
+    capacity: usize,
+) -> Result<WrapperRoots, CodegenError> {
+    let capacity = capacity.max(1);
+    let bytes = capacity
+        .checked_mul(8)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| CodegenError::new("wrapper GC root frame is too large"))?;
+    let slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, bytes, 3));
+    let base = builder.ins().stack_addr(ptr_ty, slot, 0);
+    let cap = builder.ins().iconst(ptr_ty, capacity as i64);
+    let token = call_val_extern(module, builder, runtime.gc_frame_push, &[base, cap]);
+    call_void_extern(module, builder, runtime.gc_frame_used, &[token, cap]);
+    Ok(WrapperRoots {
+        slot,
+        token,
+        capacity,
+    })
+}
+
+fn wrapper_root(
+    builder: &mut FunctionBuilder,
+    roots: &WrapperRoots,
+    index: usize,
+    value: Value,
+) -> Result<(), CodegenError> {
+    if index >= roots.capacity {
+        return Err(CodegenError::new(
+            "internal error: wrapper GC root index out of range",
+        ));
+    }
+    builder
+        .ins()
+        .stack_store(value, roots.slot, (index * 8) as i32);
+    Ok(())
+}
+
+fn wrapper_frame_pop<M: Module>(
+    module: &mut M,
+    builder: &mut FunctionBuilder,
+    runtime: &Runtime,
+    roots: &WrapperRoots,
+) {
+    call_void_extern(module, builder, runtime.gc_frame_pop, &[roots.token]);
+}
+
+fn push_wrapper_arg(
+    builder: &mut FunctionBuilder,
+    roots: &WrapperRoots,
+    args: &mut Vec<Value>,
+    value: Value,
+) -> Result<(), CodegenError> {
+    let index = args.len();
+    wrapper_root(builder, roots, index, value)?;
+    args.push(value);
+    Ok(())
 }
 
 /// Define the `(argv: ptr) -> i64` trampoline for program function `index`.
@@ -839,6 +937,17 @@ fn define_wrapper<M: Module>(
                 "internal error: wrapper {index} has no argv parameter"
             ))
         })?;
+        let epilogue = builder.create_block();
+        let ret_var = Variable::from_u32(function.params.len() as u32);
+        builder.declare_var(ret_var, types::I64);
+        let roots = wrapper_frame(
+            module,
+            &mut builder,
+            runtime,
+            ptr_ty,
+            function.params.len() + 1,
+        )?;
+
         let mut args = Vec::with_capacity(function.params.len());
         if function.has_dynamic_signature() {
             bind_dynamic_arguments(
@@ -849,6 +958,9 @@ fn define_wrapper<M: Module>(
                 runtime,
                 index,
                 argv,
+                &roots,
+                epilogue,
+                ret_var,
                 &mut args,
             )?;
         } else {
@@ -857,6 +969,7 @@ fn define_wrapper<M: Module>(
                 let value = builder
                     .ins()
                     .load(types::I64, MemFlags::new(), argv, offset);
+                wrapper_root(&mut builder, &roots, position, value)?;
                 args.push(value);
             }
         }
@@ -868,6 +981,12 @@ fn define_wrapper<M: Module>(
                 "internal error: wrapper {index} target returned no value"
             ))
         })?;
+        builder.def_var(ret_var, result);
+        wrapper_root(&mut builder, &roots, function.params.len(), result)?;
+        builder.ins().jump(epilogue, &[]);
+        builder.switch_to_block(epilogue);
+        wrapper_frame_pop(module, &mut builder, runtime, &roots);
+        let result = builder.use_var(ret_var);
         builder.ins().return_(&[result]);
 
         builder.seal_all_blocks();
@@ -887,6 +1006,7 @@ fn define_full_wrapper<M: Module>(
     index: FunctionId,
     symbols: &HashMap<FunctionId, FuncId>,
     full_wrappers: &HashMap<FunctionId, FuncId>,
+    runtime: &Runtime,
 ) -> Result<(), CodegenError> {
     let ptr_ty = module.target_config().pointer_type();
     let wrapper = *full_wrappers.get(&index).ok_or_else(|| {
@@ -912,13 +1032,20 @@ fn define_full_wrapper<M: Module>(
             ))
         })?;
         let mut values = Vec::with_capacity(function.params.len());
+        let roots = wrapper_frame(
+            module,
+            &mut builder,
+            runtime,
+            ptr_ty,
+            function.params.len() + 1,
+        )?;
         for position in 0..function.params.len() {
             let offset = wrapper_arg_offset(index, position)?;
-            values.push(
-                builder
-                    .ins()
-                    .load(types::I64, MemFlags::new(), argv, offset),
-            );
+            let value = builder
+                .ins()
+                .load(types::I64, MemFlags::new(), argv, offset);
+            wrapper_root(&mut builder, &roots, position, value)?;
+            values.push(value);
         }
         let reference = declare_ref(module, &mut builder, target);
         let call = builder.ins().call(reference, &values);
@@ -927,6 +1054,8 @@ fn define_full_wrapper<M: Module>(
                 "internal error: full wrapper {index} target returned no value"
             ))
         })?;
+        wrapper_root(&mut builder, &roots, function.params.len(), result)?;
+        wrapper_frame_pop(module, &mut builder, runtime, &roots);
         builder.ins().return_(&[result]);
         builder.seal_all_blocks();
         builder.finalize();
@@ -1022,17 +1151,26 @@ fn wrapper_const<M: Module>(
         Const::Tuple(items) => {
             let slot = builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
-                (items.len() * 8) as u32,
+                ((items.len().max(1)) * 8) as u32,
                 3,
             ));
+            // Zero-fill with tagged `None` before publishing the buffer: the
+            // scope is live while the elements are materialised.
+            let none = builder.ins().iconst(types::I64, NONE_TAG);
+            for index in 0..items.len().max(1) {
+                builder.ins().stack_store(none, slot, (index * 8) as i32);
+            }
+            let ptr = builder.ins().stack_addr(ptr_ty, slot, 0);
+            let len = builder.ins().iconst(types::I64, items.len() as i64);
+            let len_ptr = as_pointer_width(builder, ptr_ty, len);
+            let scope = call_val_extern(module, builder, runtime.gc_scope_push, &[ptr, len_ptr]);
             for (index, item) in items.iter().enumerate() {
                 let value = wrapper_const(module, builder, ptr_ty, runtime, item)?;
                 builder.ins().stack_store(value, slot, (index * 8) as i32);
             }
-            let ptr = builder.ins().stack_addr(ptr_ty, slot, 0);
-            let len = builder.ins().iconst(types::I64, items.len() as i64);
-            let len = as_pointer_width(builder, ptr_ty, len);
-            call_val_extern(module, builder, runtime.tuple_new, &[len, ptr])
+            let value = call_val_extern(module, builder, runtime.tuple_new, &[len_ptr, ptr]);
+            call_void_extern(module, builder, runtime.gc_scope_pop, &[scope]);
+            value
         }
     })
 }
@@ -1053,6 +1191,9 @@ fn bind_dynamic_arguments<M: Module>(
     runtime: &Runtime,
     index: FunctionId,
     argv: Value,
+    roots: &WrapperRoots,
+    epilogue: Block,
+    ret_var: Variable,
     args: &mut Vec<Value>,
 ) -> Result<(), CodegenError> {
     let total = builder.ins().load(types::I64, MemFlags::new(), argv, 0);
@@ -1082,17 +1223,18 @@ fn bind_dynamic_arguments<M: Module>(
             runtime.arity_error,
             &[expected, user_count],
         );
-        builder.ins().return_(&[result]);
+        builder.def_var(ret_var, result);
+        wrapper_root(builder, roots, function.params.len(), result)?;
+        builder.ins().jump(epilogue, &[]);
         builder.switch_to_block(continue_block);
     }
 
     for position in 0..capture_count {
         let offset = wrapper_arg_offset(index, position + 1)?;
-        args.push(
-            builder
-                .ins()
-                .load(types::I64, MemFlags::new(), argv, offset),
-        );
+        let value = builder
+            .ins()
+            .load(types::I64, MemFlags::new(), argv, offset);
+        push_wrapper_arg(builder, roots, args, value)?;
     }
 
     for position in 0..fixed {
@@ -1111,7 +1253,7 @@ fn bind_dynamic_arguments<M: Module>(
             }
             None => loaded,
         };
-        args.push(value);
+        push_wrapper_arg(builder, roots, args, value)?;
     }
 
     if function.vararg().is_some() {
@@ -1130,7 +1272,7 @@ fn bind_dynamic_arguments<M: Module>(
         let first_extra = wrapper_arg_offset(index, 1 + capture_count + fixed)?;
         let extras = builder.ins().iadd_imm(argv, i64::from(first_extra));
         let list = call_val_extern(module, builder, runtime.list_new, &[count, extras]);
-        args.push(list);
+        push_wrapper_arg(builder, roots, args, list)?;
     }
 
     for param in function.kwonly_params() {
@@ -1138,13 +1280,13 @@ fn bind_dynamic_arguments<M: Module>(
             Some(default) => wrapper_const(module, builder, ptr_ty, runtime, default)?,
             None => builder.ins().iconst(types::I64, NONE_TAG),
         };
-        args.push(value);
+        push_wrapper_arg(builder, roots, args, value)?;
     }
 
     if function.kwarg().is_some() {
         let null = builder.ins().iconst(ptr_ty, 0);
         let dict = call_val_extern(module, builder, runtime.dict_new, &[null, null, null]);
-        args.push(dict);
+        push_wrapper_arg(builder, roots, args, dict)?;
     }
 
     if args.len() != function.params.len() {
@@ -1202,11 +1344,302 @@ struct CleanupInfo {
     break_loop: Option<usize>,
     /// Where exceptions raised by the `finally` body itself propagate.
     outer_exc: ExcTarget,
-    /// Slot holding the exception object in flight when the cleanup is
-    /// entered with action `4`.
-    pending_slot: StackSlot,
+    /// Shadow-frame root holding the exception object in flight when the
+    /// cleanup is entered with action `4`.
+    pending_root: Variable,
     /// Runtime handler depth outside the `try`.
     handler_depth: Variable,
+}
+
+/// Count one expression node and its descendants.
+///
+/// The count is used only to size the precise shadow frame conservatively; it
+/// does not have to match lowering one-to-one, only to grow with the program.
+fn count_expr(expr: &Expr) -> usize {
+    1 + match &expr.kind {
+        ExprKind::Const(_)
+        | ExprKind::Local(_)
+        | ExprKind::CellGet(_)
+        | ExprKind::FunctionRef(_)
+        | ExprKind::BuiltinRef(_)
+        | ExprKind::ExceptionClass(_)
+        | ExprKind::ModuleRef { .. }
+        | ExprKind::DeferredImport { .. }
+        | ExprKind::ModuleAttr { .. }
+        | ExprKind::GlobalGet { .. }
+        | ExprKind::ExtensionAttr { .. } => 0,
+        ExprKind::CellSet { value, .. } | ExprKind::NamedExpr { value, .. } => count_expr(value),
+        ExprKind::StrBuilderNew { init } => count_expr(init),
+        ExprKind::StrBuilderAppend { builder, value } => count_expr(builder) + count_expr(value),
+        ExprKind::StrBuilderFinish { builder } => count_expr(builder),
+        ExprKind::Bin { lhs, rhs, .. }
+        | ExprKind::BoolOp { lhs, rhs, .. }
+        | ExprKind::Subscript {
+            object: lhs,
+            index: rhs,
+        } => count_expr(lhs) + count_expr(rhs),
+        ExprKind::Un { operand, .. } => count_expr(operand),
+        ExprKind::IfExp { test, then, orelse } => {
+            count_expr(test) + count_expr(then) + count_expr(orelse)
+        }
+        ExprKind::List(items) | ExprKind::Tuple(items) | ExprKind::Set(items) => {
+            items.iter().map(count_expr).sum()
+        }
+        ExprKind::Dict(pairs) => pairs
+            .iter()
+            .map(|(key, value)| count_expr(key) + count_expr(value))
+            .sum(),
+        ExprKind::Slice {
+            object,
+            start,
+            stop,
+            step,
+        } => {
+            count_expr(object)
+                + start.as_deref().map_or(0, count_expr)
+                + stop.as_deref().map_or(0, count_expr)
+                + step.as_deref().map_or(0, count_expr)
+        }
+        ExprKind::ModuleCall { args, keywords, .. } => {
+            args.iter().map(count_expr).sum::<usize>()
+                + keywords
+                    .iter()
+                    .map(|(_, value)| count_expr(value))
+                    .sum::<usize>()
+        }
+        ExprKind::GetAttr { object, .. } => count_expr(object),
+        ExprKind::IndirectCall { callee, args, star } => {
+            count_expr(callee)
+                + args.iter().map(count_expr).sum::<usize>()
+                + star.as_deref().map_or(0, count_expr)
+        }
+        ExprKind::ListComp { element, clauses } | ExprKind::SetComp { element, clauses } => {
+            count_expr(element) + count_comp_clauses(clauses)
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            clauses,
+        } => count_expr(key) + count_expr(value) + count_comp_clauses(clauses),
+        ExprKind::MethodCall {
+            object,
+            args,
+            star,
+            keywords,
+            ..
+        } => {
+            count_expr(object)
+                + args.iter().map(count_expr).sum::<usize>()
+                + star.as_deref().map_or(0, count_expr)
+                + keywords
+                    .iter()
+                    .map(|(_, value)| count_expr(value))
+                    .sum::<usize>()
+        }
+        ExprKind::Call { args, .. } => args.iter().map(count_expr).sum(),
+        ExprKind::CallKw {
+            callee,
+            args,
+            keywords,
+        } => {
+            count_expr(callee)
+                + args.iter().map(count_expr).sum::<usize>()
+                + keywords
+                    .iter()
+                    .map(|(_, value)| count_expr(value))
+                    .sum::<usize>()
+        }
+        ExprKind::ClassCall {
+            class,
+            args,
+            dynamic_kwargs,
+            ..
+        } => {
+            count_expr(class)
+                + args.iter().map(count_expr).sum::<usize>()
+                + dynamic_kwargs.as_deref().map_or(0, count_expr)
+        }
+        ExprKind::DeferredCall { callee, args } => {
+            callee.as_deref().map_or(0, count_expr) + args.iter().map(count_expr).sum::<usize>()
+        }
+        ExprKind::Await { value } | ExprKind::YieldFrom { value } => count_expr(value),
+        ExprKind::Yield { value } => value.as_deref().map_or(0, count_expr),
+    }
+}
+
+fn count_comp_clauses(clauses: &[CompClause]) -> usize {
+    clauses
+        .iter()
+        .map(|clause| {
+            1 + count_expr(&clause.iterable)
+                + clause.conditions.iter().map(count_expr).sum::<usize>()
+                + count_comp_target(&clause.target)
+        })
+        .sum()
+}
+
+fn count_comp_target(target: &CompTarget) -> usize {
+    match target {
+        CompTarget::Name(_) => 0,
+        CompTarget::Unpack(targets) => count_unpack_targets(targets),
+    }
+}
+
+fn count_unpack_targets(targets: &[UnpackTarget]) -> usize {
+    targets.iter().map(count_unpack_target).sum()
+}
+
+fn count_unpack_target(target: &UnpackTarget) -> usize {
+    1 + match target {
+        UnpackTarget::Name(_) | UnpackTarget::Cell(_) => 0,
+        UnpackTarget::Star(inner) => count_unpack_target(inner),
+        UnpackTarget::Attr { object, .. } => count_expr(object),
+        UnpackTarget::Subscript { object, index } => count_expr(object) + count_expr(index),
+        UnpackTarget::Nested(targets) => count_unpack_targets(targets),
+    }
+}
+
+fn count_stmt(stmt: &Stmt) -> usize {
+    1 + match &stmt.kind {
+        StmtKind::Expr(expr) => count_expr(expr),
+        StmtKind::Assign { value, .. }
+        | StmtKind::CellAssign { value, .. }
+        | StmtKind::GlobalSet { value, .. } => count_expr(value),
+        StmtKind::CellInit { value, .. } => value.as_ref().map_or(0, count_expr),
+        StmtKind::AugAssign { value, .. } => count_expr(value),
+        StmtKind::If {
+            cond,
+            then_body,
+            else_body,
+        } => count_expr(cond) + count_body(then_body) + count_body(else_body),
+        StmtKind::While {
+            cond,
+            body,
+            else_body,
+        } => count_expr(cond) + count_body(body) + count_body(else_body),
+        StmtKind::ForRange {
+            start,
+            stop,
+            step,
+            body,
+            else_body,
+            ..
+        } => {
+            count_expr(start)
+                + count_expr(stop)
+                + step.as_ref().map_or(0, count_expr)
+                + count_body(body)
+                + count_body(else_body)
+        }
+        StmtKind::ForEach {
+            iterable,
+            body,
+            else_body,
+            ..
+        } => count_expr(iterable) + count_body(body) + count_body(else_body),
+        StmtKind::Unpack { targets, value } => count_unpack_targets(targets) + count_expr(value),
+        StmtKind::SetSubscript {
+            object,
+            index,
+            value,
+        } => count_expr(object) + count_expr(index) + count_expr(value),
+        StmtKind::SetSlice {
+            target,
+            start,
+            stop,
+            step,
+            value,
+        } => {
+            count_expr(target)
+                + count_expr(start)
+                + count_expr(stop)
+                + count_expr(step)
+                + count_expr(value)
+        }
+        StmtKind::Closure { captures, .. } => captures.len(),
+        StmtKind::ClassDef {
+            base,
+            methods,
+            attributes,
+            ..
+        } => {
+            base.as_ref().map_or(0, count_expr)
+                + methods.len()
+                + attributes
+                    .iter()
+                    .map(|attribute| count_expr(&attribute.value))
+                    .sum::<usize>()
+        }
+        StmtKind::SetAttr { object, value, .. } => count_expr(object) + count_expr(value),
+        StmtKind::Return(value) => value.as_ref().map_or(0, count_expr),
+        StmtKind::Break | StmtKind::Continue | StmtKind::Pass => 0,
+        StmtKind::Yield { value } => value.as_ref().map_or(0, count_expr),
+        StmtKind::Raise { msg, cause, .. } => {
+            msg.as_ref().map_or(0, count_expr) + cause.as_ref().map_or(0, count_expr)
+        }
+        StmtKind::Assert { test, msg } => count_expr(test) + msg.as_ref().map_or(0, count_expr),
+        StmtKind::Delete { targets } => targets
+            .iter()
+            .map(|target| match target {
+                DeleteTarget::Name(_) | DeleteTarget::Cell(_) | DeleteTarget::Global { .. } => 0,
+                DeleteTarget::Attr { object, .. } => count_expr(object),
+                DeleteTarget::Subscript { object, index } => count_expr(object) + count_expr(index),
+                DeleteTarget::Slice {
+                    object,
+                    start,
+                    stop,
+                    step,
+                } => count_expr(object) + count_expr(start) + count_expr(stop) + count_expr(step),
+            })
+            .sum(),
+        StmtKind::Try {
+            body,
+            handlers,
+            else_body,
+            finally_body,
+        } => {
+            count_body(body)
+                + handlers
+                    .iter()
+                    .map(|handler| 1 + count_body(&handler.body))
+                    .sum::<usize>()
+                + count_body(else_body)
+                + count_body(finally_body)
+        }
+    }
+}
+
+fn count_body(body: &[Stmt]) -> usize {
+    body.iter().map(count_stmt).sum()
+}
+
+/// Number of shadow-frame slots reserved for one function.
+///
+/// Every local and the return slot always own a slot. Temporary roots grow
+/// with the HIR size: a lowering step allocates at most four temporaries per
+/// node or per unpack target (which is a local), and operand scratch is bounded
+/// by two slots per node on the deepest evaluated path (an operand plus a
+/// tagged keyword name can both be pending). The fixed margin keeps small
+/// functions and nested literals safe. `temp_var` and `scratch_reserve` raise a
+/// lowering error instead of writing past the frame.
+fn root_layout(function: &Function) -> (usize, usize, usize) {
+    let nodes = count_body(&function.body)
+        + function
+            .params
+            .iter()
+            .map(|param| param.default_expr.as_deref().map_or(0, count_expr))
+            .sum::<usize>();
+    let locals = function.locals.len();
+    let temp_roots = nodes
+        .saturating_mul(4)
+        .saturating_add(locals.saturating_mul(4))
+        .saturating_add(16);
+    let scratch_roots = nodes.saturating_mul(2).saturating_add(64);
+    let capacity = locals
+        .saturating_add(1)
+        .saturating_add(temp_roots)
+        .saturating_add(scratch_roots);
+    (capacity, temp_roots, scratch_roots)
 }
 
 struct Lower<'a, 'b, M: Module> {
@@ -1233,15 +1666,29 @@ struct Lower<'a, 'b, M: Module> {
     /// Runtime handler depth at function entry; leaving the function unwinds
     /// to it so caller contexts stay intact.
     handler_base: Variable,
+    /// Explicit, 8-byte-aligned stack slot backing the precise shadow frame.
+    root_slot: StackSlot,
+    /// Token returned by `pyx_gc_frame_push`; valid until the epilogue.
+    root_token: Variable,
+    /// Number of tagged shadow slots (`root_slot` size / 8).
+    root_capacity: usize,
+    /// First shadow index reserved for `temp_var` roots.
+    temp_root_base: usize,
+    /// First Cranelift variable id handed out by `temp_var`.
+    temp_var_base: u32,
+    /// Shadow index range reserved for operands live across nested lowering.
+    scratch_base: usize,
+    scratch_budget: usize,
+    scratch_next: usize,
     loops: Vec<LoopTargets>,
     /// Active `finally` blocks, innermost last.
     cleanups: Vec<CleanupId>,
     /// Append-only table of cleanup metadata (ids stay stable).
     cleanup_infos: Vec<CleanupInfo>,
-    /// Pending-exception slots of the `finally` bodies currently being
+    /// Pending-exception roots of the `finally` bodies currently being
     /// lowered, innermost last. A bare `raise` inside a `finally` re-raises
     /// the exception parked here (CPython semantics).
-    finally_slots: Vec<StackSlot>,
+    finally_slots: Vec<Variable>,
     /// Number of enclosing `finally` bodies currently being lowered; pending
     /// exceptions must be cleared before transferring control out of them.
     suppress_pending: usize,
@@ -1260,13 +1707,34 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         wrappers: &'a HashMap<FunctionId, FuncId>,
         full_wrappers: &'a HashMap<FunctionId, FuncId>,
         runtime: &'a Runtime,
-        builder: FunctionBuilder<'b>,
+        mut builder: FunctionBuilder<'b>,
         ptr_ty: ir::Type,
-    ) -> Lower<'a, 'b, M> {
-        let ret_var = Variable::from_u32(function.locals.len() as u32);
-        let safepoint_counter = Variable::from_u32(function.locals.len() as u32 + 1);
-        let handler_base = Variable::from_u32(function.locals.len() as u32 + 2);
-        Lower {
+    ) -> Result<Lower<'a, 'b, M>, CodegenError> {
+        let locals = function.locals.len();
+        let ret_var = Variable::from_u32(locals as u32);
+        let safepoint_counter = Variable::from_u32(locals as u32 + 1);
+        let handler_base = Variable::from_u32(locals as u32 + 2);
+        let root_token = Variable::from_u32(locals as u32 + 3);
+        let temp_var_base = locals as u32 + 4;
+
+        let (capacity, temp_roots, scratch_roots) = root_layout(function);
+        let capacity = capacity.max(1);
+        let bytes = capacity
+            .checked_mul(8)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| {
+                CodegenError::new(format!(
+                    "function {} needs more GC root slots than a stack frame can hold",
+                    function.name
+                ))
+            })?;
+        let root_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            bytes,
+            3,
+        ));
+
+        Ok(Lower {
             module,
             program,
             locals: &function.locals,
@@ -1285,15 +1753,23 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             exc_target: ExcTarget::Function,
             current_exc: None,
             handler_base,
+            root_slot,
+            root_token,
+            root_capacity: capacity,
+            temp_root_base: locals + 1,
+            temp_var_base,
+            scratch_base: locals + 1 + temp_roots,
+            scratch_budget: scratch_roots,
+            scratch_next: 0,
             loops: Vec::new(),
             cleanups: Vec::new(),
             cleanup_infos: Vec::new(),
             finally_slots: Vec::new(),
             suppress_pending: 0,
-            next_temp: function.locals.len() as u32 + 3,
+            next_temp: temp_var_base,
             terminated: false,
             func_refs: HashMap::new(),
-        }
+        })
     }
 
     fn run(&mut self) -> Result<(), CodegenError> {
@@ -1304,6 +1780,25 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let epilogue = self.builder.create_block();
         self.epilogue = Some(epilogue);
 
+        // Register the precise shadow frame before any runtime call. The
+        // runtime zero-fills every slot with `None`, so the uninitialised
+        // stack memory is safe to scan from this point onwards. Parameter
+        // slots are then published through `define_var`.
+        let capacity = self
+            .builder
+            .ins()
+            .iconst(self.ptr_ty, self.root_capacity as i64);
+        let base = self
+            .builder
+            .ins()
+            .stack_addr(self.ptr_ty, self.root_slot, 0);
+        let token = self.call_rt(self.runtime.gc_frame_push, &[base, capacity])?;
+        self.builder.declare_var(self.root_token, self.ptr_ty);
+        self.builder.def_var(self.root_token, token);
+        // All capacity slots were just initialised with `None`; make them
+        // visible to the collector even though not every slot is written yet.
+        self.call_void(self.runtime.gc_frame_used, &[token, capacity]);
+
         // All locals start out as None; parameters overwrite their slots.
         self.builder.declare_var(self.ret_var, types::I64);
         self.builder.declare_var(self.safepoint_counter, types::I64);
@@ -1313,9 +1808,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         }
         let none = self.none();
         for index in 0..self.locals.len() {
-            self.builder.def_var(Variable::from_u32(index as u32), none);
+            self.define_var(Variable::from_u32(index as u32), none)?;
         }
-        self.builder.def_var(self.ret_var, none);
+        self.define_var(self.ret_var, none)?;
         let zero = self.builder.ins().iconst(types::I64, 0);
         self.builder.def_var(self.safepoint_counter, zero);
         // Handler contexts of enclosing callers stay on the runtime stack;
@@ -1333,7 +1828,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     "parameter {position} of function {function_name} has no Cranelift parameter"
                 ))
             })?;
-            self.builder.def_var(var, value);
+            self.define_var(var, value)?;
         }
 
         self.emit_frame_enter()?;
@@ -1348,6 +1843,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         }
         self.builder.switch_to_block(epilogue);
         self.terminated = false;
+        // Unregister the precise frame before leaving the activation.
+        let token = self.builder.use_var(self.root_token);
+        self.call_void(self.runtime.gc_frame_pop, &[token]);
         let id = self.runtime.frame_leave;
         self.call_void(id, &[]);
         let result = self.builder.use_var(self.ret_var);
@@ -1391,11 +1889,141 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(Variable::from_u32(id))
     }
 
-    fn temp_var(&mut self) -> Variable {
+    /// Allocate a temporary Cranelift variable and its dedicated shadow-frame
+    /// root. The root index is permanent for the function, so a value parked
+    /// in the variable stays reachable across any runtime call, including loop
+    /// backedges. Exceeding the precomputed capacity is a codegen error, never
+    /// an out-of-bounds write.
+    fn temp_var(&mut self) -> Result<Variable, CodegenError> {
         let var = Variable::from_u32(self.next_temp);
         self.next_temp += 1;
+        let ordinal = (var.as_u32() - self.temp_var_base) as usize;
+        let index = self.temp_root_base + ordinal;
+        if index >= self.scratch_base {
+            let function_name = self.name;
+            return Err(CodegenError::new(format!(
+                "function {function_name} exceeds its GC root capacity (temporary {ordinal})"
+            )));
+        }
         self.builder.declare_var(var, types::I64);
-        var
+        Ok(var)
+    }
+
+    /// Map a Cranelift variable to its shadow-frame slot, if it carries a
+    /// tagged value. Control variables (`safepoint_counter`, `handler_base`,
+    /// the frame token and cleanup actions) have no root slot.
+    fn root_index(&self, var: Variable) -> Option<usize> {
+        let index = var.as_u32() as usize;
+        if index <= self.locals.len() {
+            // Locals occupy `0..len`; the return value uses `locals.len()`.
+            return Some(index);
+        }
+        if (self.temp_var_base..self.next_temp).contains(&var.as_u32()) {
+            return Some(self.temp_root_base + (var.as_u32() - self.temp_var_base) as usize);
+        }
+        None
+    }
+
+    /// Define a tagged variable and mirror the value into its shadow slot.
+    fn define_var(&mut self, var: Variable, value: Value) -> Result<(), CodegenError> {
+        self.builder.def_var(var, value);
+        if let Some(index) = self.root_index(var) {
+            self.write_root(index, value)?;
+        }
+        Ok(())
+    }
+
+    /// Store one tagged value into a shadow-frame slot.
+    fn write_root(&mut self, index: usize, value: Value) -> Result<(), CodegenError> {
+        if index >= self.root_capacity {
+            let function_name = self.name;
+            return Err(CodegenError::new(format!(
+                "function {function_name} writes GC root slot {index} beyond capacity {}",
+                self.root_capacity
+            )));
+        }
+        let offset = i32::try_from(index * 8).map_err(|_| {
+            CodegenError::new(format!(
+                "function {}: GC root slot {index} offset out of range",
+                self.name
+            ))
+        })?;
+        self.builder
+            .ins()
+            .stack_store(value, self.root_slot, offset);
+        Ok(())
+    }
+
+    /// Current top of the scratch-root stack (an absolute shadow index).
+    fn scratch_mark(&self) -> usize {
+        self.scratch_base + self.scratch_next
+    }
+
+    /// Reserve `count` contiguous scratch roots and return the first absolute
+    /// shadow index. Returns an error when the statically reserved capacity is
+    /// exhausted instead of writing past the frame.
+    fn scratch_reserve(&mut self, count: usize) -> Result<usize, CodegenError> {
+        let end = self.scratch_next.checked_add(count).ok_or_else(|| {
+            CodegenError::new(format!("function {}: GC root scratch overflow", self.name))
+        })?;
+        if end > self.scratch_budget {
+            let function_name = self.name;
+            return Err(CodegenError::new(format!(
+                "function {function_name} exceeds its GC root scratch capacity \
+                 ({} slots needed, {} reserved)",
+                end, self.scratch_budget
+            )));
+        }
+        let base = self.scratch_base + self.scratch_next;
+        self.scratch_next = end;
+        Ok(base)
+    }
+
+    /// Root one value on the scratch stack and return its absolute slot.
+    fn scratch_push(&mut self, value: Value) -> Result<usize, CodegenError> {
+        let index = self.scratch_reserve(1)?;
+        self.write_root(index, value)?;
+        Ok(index)
+    }
+
+    /// Release scratch roots reserved at `mark`, clearing them to `None` so a
+    /// dead operand cannot retain a heap object.
+    fn scratch_release(&mut self, mark: usize) -> Result<(), CodegenError> {
+        if mark < self.scratch_base || mark > self.scratch_base + self.scratch_next {
+            return Err(CodegenError::new(format!(
+                "internal error: unbalanced GC scratch release in function {}",
+                self.name
+            )));
+        }
+        if !self.terminated {
+            let none = self.none();
+            for index in mark..self.scratch_base + self.scratch_next {
+                self.write_root(index, none)?;
+            }
+        }
+        self.scratch_next = mark - self.scratch_base;
+        Ok(())
+    }
+
+    /// Register an already-initialised tagged stack array as a GC scope for
+    /// exactly one runtime call. The returned token must be passed to
+    /// [`Self::close_scope`] immediately after the call and before
+    /// `emit_exc_check`, so the scope cannot leak on the exceptional path.
+    ///
+    /// Arrays whose elements are still being evaluated are rooted through the
+    /// scratch region instead: that region is a permanent part of the frame
+    /// and needs no dynamic unwinding.
+    fn open_scope(&mut self, base: Value, count: usize) -> Result<Value, CodegenError> {
+        let count_value = self.builder.ins().iconst(self.ptr_ty, count as i64);
+        self.call_rt(self.runtime.gc_scope_push, &[base, count_value])
+    }
+
+    /// Unregister a scope created by [`Self::open_scope`].
+    fn close_scope(&mut self, token: Value) {
+        if self.terminated {
+            return;
+        }
+        self.call_void(self.runtime.gc_scope_pop, &[token]);
     }
 
     #[allow(clippy::explicit_auto_deref, clippy::needless_borrow)]
@@ -1485,9 +2113,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
 
     /// Capture the current runtime handler depth in a fresh variable.
     fn capture_handler_depth(&mut self) -> Result<Variable, CodegenError> {
-        let var = self.temp_var();
+        let var = self.temp_var()?;
         let depth = self.call_rt(self.runtime.exc_handler_depth, &[])?;
-        self.builder.def_var(var, depth);
+        self.define_var(var, depth)?;
         Ok(var)
     }
 
@@ -1540,7 +2168,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_handler_unwind(info.handler_depth)?;
                 let value_id = self.runtime.exc_value;
                 let value = self.call_rt(value_id, &[])?;
-                self.builder.ins().stack_store(value, info.pending_slot, 0);
+                self.define_var(info.pending_root, value)?;
                 let clear_id = self.runtime.exc_clear;
                 self.call_rt(clear_id, &[])?;
                 let action = self.tagged_int(4);
@@ -1589,9 +2217,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// `pyx_exc_value`. Bare `raise` inside the `finally` body therefore
     /// re-raises exactly the in-flight exception, and raises `RuntimeError`
     /// when there is none (matching CPython).
-    fn reset_finally_slot(&mut self, slot: StackSlot) {
+    fn reset_finally_slot(&mut self, slot: Variable) -> Result<(), CodegenError> {
         let none = self.none();
-        self.builder.ins().stack_store(none, slot, 0);
+        self.define_var(slot, none)
     }
 
     /// Transfer control out of the current function, running every active
@@ -1604,7 +2232,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         if let Some(id) = self.cleanups.last().copied() {
             let info = self.cleanup_info(id)?;
             // Entering for `return` without an in-flight exception.
-            self.reset_finally_slot(info.pending_slot);
+            self.reset_finally_slot(info.pending_root)?;
             let action = self.tagged_int(1);
             self.builder.def_var(info.action_var, action);
             self.enter_finally(info.finally_entry, None)?;
@@ -1633,7 +2261,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         if let Some(id) = self.cleanups.last().copied() {
             let info = self.cleanup_info(id)?;
             if info.break_loop == Some(index) {
-                self.reset_finally_slot(info.pending_slot);
+                self.reset_finally_slot(info.pending_root)?;
                 let action = self.tagged_int(2);
                 self.builder.def_var(info.action_var, action);
                 self.enter_finally(info.finally_entry, None)?;
@@ -1660,7 +2288,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         if let Some(id) = self.cleanups.last().copied() {
             let info = self.cleanup_info(id)?;
             if info.break_loop == Some(index) {
-                self.reset_finally_slot(info.pending_slot);
+                self.reset_finally_slot(info.pending_root)?;
                 let action = self.tagged_int(3);
                 self.builder.def_var(info.action_var, action);
                 self.enter_finally(info.finally_entry, None)?;
@@ -1683,7 +2311,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let info = self.cleanup_info(id)?;
                 // Normal completion enters the `finally` without an
                 // exception in flight.
-                self.reset_finally_slot(info.pending_slot);
+                self.reset_finally_slot(info.pending_root)?;
                 let action = self.tagged_int(0);
                 self.builder.def_var(info.action_var, action);
                 self.enter_finally(info.finally_entry, None)?;
@@ -1744,7 +2372,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             let outer = self.cleanup_info(outer_id)?;
             // An outer cleanup entered for `return` has no exception in
             // flight.
-            self.reset_finally_slot(outer.pending_slot);
+            self.reset_finally_slot(outer.pending_root)?;
             let action = self.tagged_int(1);
             self.builder.def_var(outer.action_var, action);
             self.enter_finally(outer.finally_entry, None)?;
@@ -1766,10 +2394,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         // An exception (or an unknown action) re-propagates to the enclosing
         // exception target, re-raising the parked exception object first.
         self.switch_to(exceptional);
-        let value = self
-            .builder
-            .ins()
-            .stack_load(types::I64, info.pending_slot, 0);
+        let value = self.builder.use_var(info.pending_root);
         let raise_id = self.runtime.raise_value;
         self.call_rt(raise_id, &[value])?;
         let target = info.outer_exc;
@@ -1800,7 +2425,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             if outer.break_loop == Some(loop_index) {
                 // An outer cleanup entered for `break`/`continue` has no
                 // exception in flight.
-                self.reset_finally_slot(outer.pending_slot);
+                self.reset_finally_slot(outer.pending_root)?;
                 let action = self.tagged_int(code);
                 self.builder.def_var(outer.action_var, action);
                 self.enter_finally(outer.finally_entry, None)?;
@@ -1888,16 +2513,16 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             StmtKind::Assign { target, value } => {
                 let var = self.local_var(*target)?;
                 let value = self.lower_expr(value)?;
-                self.builder.def_var(var, value);
+                self.define_var(var, value)?;
             }
             StmtKind::CellInit { target, value } => {
                 let value = match value {
                     Some(expr) => {
                         // Park the initial value in a stack slot so a
                         // collection during `cell_new` still sees it.
-                        let holder = self.temp_var();
+                        let holder = self.temp_var()?;
                         let value = self.lower_expr(expr)?;
-                        self.builder.def_var(holder, value);
+                        self.define_var(holder, value)?;
                         self.builder.use_var(holder)
                     }
                     None => self.none(),
@@ -1906,7 +2531,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let id = self.runtime.cell_new;
                 let cell = self.call_rt(id, &[value])?;
                 self.emit_exc_check()?;
-                self.builder.def_var(var, cell);
+                self.define_var(var, cell)?;
             }
             StmtKind::CellAssign { target, value } => {
                 let value = self.lower_expr(value)?;
@@ -1945,7 +2570,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 } else {
                     self.lower_binop(*op, lhs, rhs)?
                 };
-                self.builder.def_var(var, result);
+                self.define_var(var, result)?;
             }
             StmtKind::If {
                 cond,
@@ -2053,12 +2678,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 value,
             } => {
                 // Python evaluates the right-hand side first, then the object,
-                // then the index.
+                // then the index. Each value stays in the scratch region until
+                // the store call returns.
+                let mark = self.scratch_mark();
                 let value = self.lower_expr(value)?;
+                self.scratch_push(value)?;
                 let object = self.lower_expr(object)?;
+                self.scratch_push(object)?;
                 let index = self.lower_expr(index)?;
+                self.scratch_push(index)?;
                 let id = self.runtime.subscript_set;
                 let _ = self.call_rt(id, &[object, index, value])?;
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
             }
             StmtKind::SetSlice {
@@ -2072,13 +2703,20 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 // expression, then the bounds in source order. Omitted bounds
                 // arrive as `Const::None`, which lowers to the runtime `None`
                 // sentinel.
+                let mark = self.scratch_mark();
                 let value = self.lower_expr(value)?;
+                self.scratch_push(value)?;
                 let object = self.lower_expr(target)?;
+                self.scratch_push(object)?;
                 let start = self.lower_expr(start)?;
+                self.scratch_push(start)?;
                 let stop = self.lower_expr(stop)?;
+                self.scratch_push(stop)?;
                 let step = self.lower_expr(step)?;
+                self.scratch_push(step)?;
                 let id = self.runtime.slice_set;
                 let _ = self.call_rt(id, &[object, start, stop, step, value])?;
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
             }
             StmtKind::Closure {
@@ -2136,6 +2774,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let captures_ptr = self.builder.ins().stack_addr(self.ptr_ty, captures_slot, 0);
                 let flags = self.function_flags(func);
                 let id = self.runtime.closure_new;
+                let captures_scope = self.open_scope(captures_ptr, captures.len())?;
                 let closure = self.call_rt(
                     id,
                     &[
@@ -2148,10 +2787,16 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         flags,
                     ],
                 )?;
+                self.close_scope(captures_scope);
                 self.emit_exc_check()?;
+                // `attach_function_params` allocates; keep the new closure in
+                // a permanent root slot across it.
+                let closure_holder = self.temp_var()?;
+                self.define_var(closure_holder, closure)?;
+                let closure = self.builder.use_var(closure_holder);
                 let closure = self.attach_function_params(closure, func)?;
                 let var = self.local_var(*target)?;
-                self.builder.def_var(var, closure);
+                self.define_var(var, closure)?;
             }
             StmtKind::ClassDef {
                 target,
@@ -2168,9 +2813,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 };
                 // Kept in a variable: function creation may branch into a new
                 // block on a pending exception.
-                let base_holder = self.temp_var();
-                self.builder.def_var(base_holder, base);
+                let base_holder = self.temp_var()?;
+                self.define_var(base_holder, base)?;
 
+                let mark = self.scratch_mark();
                 let names_slot = self.stack_array_slot(methods.len(), "class method names")?;
                 let funcs_slot = self.stack_array_slot(methods.len(), "class method functions")?;
                 let kinds_slot = self.stack_array_slot(methods.len(), "class method kinds")?;
@@ -2182,11 +2828,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     let id = self.runtime.str_new;
                     let method_name = self.call_rt(id, &[name_ptr, name_len])?;
                     self.emit_exc_check()?;
+                    self.scratch_push(method_name)?;
                     self.builder
                         .ins()
                         .stack_store(method_name, names_slot, (index * 8) as i32);
 
                     let function = self.lower_function_ref(method.function)?;
+                    self.scratch_push(function)?;
                     self.builder
                         .ins()
                         .stack_store(function, funcs_slot, (index * 8) as i32);
@@ -2212,11 +2860,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     let id = self.runtime.str_new;
                     let attr_name = self.call_rt(id, &[name_ptr, name_len])?;
                     self.emit_exc_check()?;
+                    self.scratch_push(attr_name)?;
                     self.builder
                         .ins()
                         .stack_store(attr_name, attr_names_slot, (index * 8) as i32);
 
                     let value = self.lower_expr(&attribute.value)?;
+                    self.scratch_push(value)?;
                     self.builder
                         .ins()
                         .stack_store(value, attr_values_slot, (index * 8) as i32);
@@ -2242,6 +2892,12 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         .ins()
                         .stack_addr(self.ptr_ty, attr_values_slot, 0);
                 let base = self.builder.use_var(base_holder);
+                // Only the arrays that hold tagged values are registered as
+                // scopes; `kinds` stores raw integer tags.
+                let names_scope = self.open_scope(names_ptr, methods.len())?;
+                let funcs_scope = self.open_scope(funcs_ptr, methods.len())?;
+                let attr_names_scope = self.open_scope(attr_names_ptr, attributes.len())?;
+                let attr_values_scope = self.open_scope(attr_values_ptr, attributes.len())?;
                 let id = self.runtime.class_new;
                 let class = self.call_rt(
                     id,
@@ -2258,9 +2914,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         attr_values_ptr,
                     ],
                 )?;
+                self.close_scope(attr_values_scope);
+                self.close_scope(attr_names_scope);
+                self.close_scope(funcs_scope);
+                self.close_scope(names_scope);
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
                 let var = self.local_var(*target)?;
-                self.builder.def_var(var, class);
+                self.define_var(var, class)?;
             }
             StmtKind::SetAttr {
                 object,
@@ -2271,11 +2932,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 // object. Both intermediate values must survive the calls that
                 // may raise, so they are parked in variables.
                 let value = self.lower_expr(value)?;
-                let value_holder = self.temp_var();
-                self.builder.def_var(value_holder, value);
+                let value_holder = self.temp_var()?;
+                self.define_var(value_holder, value)?;
                 let object = self.lower_expr(object)?;
-                let object_holder = self.temp_var();
-                self.builder.def_var(object_holder, object);
+                let object_holder = self.temp_var()?;
+                self.define_var(object_holder, object)?;
 
                 let (name_slot, name_len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
                 let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
@@ -2295,7 +2956,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     Some(expr) => self.lower_expr(expr)?,
                     None => self.none(),
                 };
-                self.builder.def_var(self.ret_var, value);
+                self.define_var(self.ret_var, value)?;
                 self.emit_return()?;
             }
             StmtKind::Break => {
@@ -2313,8 +2974,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 // Statement form: the value sent on resume is discarded.
                 // `yield` in an expression position uses `ExprKind::Yield`
                 // instead, which keeps the sent value.
+                let mark = self.scratch_mark();
+                self.scratch_push(value)?;
                 let id = self.runtime.yield_value;
                 self.call_rt(id, &[value])?;
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
             }
             StmtKind::Raise { exc, msg, cause } => {
@@ -2349,7 +3013,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                             // `NameError`.
                             let var = self.local_var(*local)?;
                             let none = self.none();
-                            self.builder.def_var(var, none);
+                            self.define_var(var, none)?;
                         }
                         DeleteTarget::Global { module, name } => {
                             let module_args = self.module_name_args(module)?;
@@ -2365,8 +3029,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                             // The receiver must survive the name allocation,
                             // which may collect and raise.
                             let object = self.lower_expr(object)?;
-                            let object_holder = self.temp_var();
-                            self.builder.def_var(object_holder, object);
+                            let object_holder = self.temp_var()?;
+                            self.define_var(object_holder, object)?;
                             let (name_slot, name_len) =
                                 make_bytes_slot(&mut self.builder, name.as_bytes())?;
                             let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
@@ -2380,8 +3044,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                             // Python evaluates the receiver before the index;
                             // the receiver stays parked while the index runs.
                             let object = self.lower_expr(object)?;
-                            let object_holder = self.temp_var();
-                            self.builder.def_var(object_holder, object);
+                            let object_holder = self.temp_var()?;
+                            self.define_var(object_holder, object)?;
                             let index = self.lower_expr(index)?;
                             let object = self.builder.use_var(object_holder);
                             let id = self.runtime.delete_subscript;
@@ -2394,15 +3058,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                             stop,
                             step,
                         } => {
+                            let mark = self.scratch_mark();
                             let object = self.lower_expr(object)?;
-                            let object_holder = self.temp_var();
-                            self.builder.def_var(object_holder, object);
+                            self.scratch_push(object)?;
                             let start = self.lower_expr(start)?;
+                            self.scratch_push(start)?;
                             let stop = self.lower_expr(stop)?;
+                            self.scratch_push(stop)?;
                             let step = self.lower_expr(step)?;
-                            let object = self.builder.use_var(object_holder);
+                            self.scratch_push(step)?;
                             let id = self.runtime.delete_slice;
                             let _ = self.call_rt(id, &[object, start, stop, step])?;
+                            self.scratch_release(mark)?;
                             self.emit_exc_check()?;
                         }
                     }
@@ -2451,10 +3118,17 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             && stop.ty == Type::Int
             && step.is_none_or(|expr| expr.ty == Type::Int);
 
+        let mark = self.scratch_mark();
         let start_value = self.lower_expr(start)?;
+        self.scratch_push(start_value)?;
         let stop_value = self.lower_expr(stop)?;
+        self.scratch_push(stop_value)?;
         let step_value = match step {
-            Some(expr) => self.lower_expr(expr)?,
+            Some(expr) => {
+                let value = self.lower_expr(expr)?;
+                self.scratch_push(value)?;
+                value
+            }
             None => self.tagged_int(8),
         };
 
@@ -2468,6 +3142,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             self.call_rt(id, &[tag, message])?;
             let target = self.exc_target;
             self.emit_jump_exc_target(target)?;
+            self.scratch_release(mark)?;
             return Ok(());
         }
 
@@ -2490,13 +3165,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.emit_jump_exc_target(target)?;
         self.switch_to(ready_block);
 
-        let start_var = self.temp_var();
-        let stop_var = self.temp_var();
-        let step_var = self.temp_var();
-        self.builder.def_var(start_var, start_value);
-        self.builder.def_var(stop_var, stop_value);
-        self.builder.def_var(step_var, step_value);
-        self.builder.def_var(local, start_value);
+        let start_var = self.temp_var()?;
+        let stop_var = self.temp_var()?;
+        let step_var = self.temp_var()?;
+        self.define_var(start_var, start_value)?;
+        self.define_var(stop_var, stop_value)?;
+        self.define_var(step_var, step_value)?;
+        self.define_var(local, start_value)?;
+        // The bounds now live in permanent root slots.
+        self.scratch_release(mark)?;
 
         let condition = self.builder.create_block();
         let positive = self.builder.create_block();
@@ -2592,7 +3269,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         } else {
             self.lower_binop(BinOp::Add, current, step_current)?
         };
-        self.builder.def_var(local, next);
+        self.define_var(local, next)?;
         self.jump(condition);
         self.loops.pop();
 
@@ -2624,11 +3301,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     ) -> Result<(), CodegenError> {
         let local = self.local_var(var)?;
 
+        let mark = self.scratch_mark();
         let iterable = self.lower_expr(iterable)?;
+        self.scratch_push(iterable)?;
         let iterator = self.call_rt(self.runtime.iter_new, &[iterable])?;
+        let iter_var = self.temp_var()?;
+        self.define_var(iter_var, iterator)?;
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
-        let iter_var = self.temp_var();
-        self.builder.def_var(iter_var, iterator);
 
         // Slot for the yielded value, created once before the loop starts.
         let out_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -2675,7 +3355,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             .builder
             .ins()
             .load(types::I64, MemFlags::new(), out_addr, 0);
-        self.builder.def_var(local, value);
+        self.define_var(local, value)?;
         self.lower_stmts(body)?;
         if !self.terminated {
             self.jump(next_block);
@@ -2725,9 +3405,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.call_rt(self.runtime.dict_new, &[zero, empty_ptr, empty_ptr])?
             }
         };
+        let result_var = self.temp_var()?;
+        self.define_var(result_var, result)?;
         self.emit_exc_check()?;
-        let result_var = self.temp_var();
-        self.builder.def_var(result_var, result);
 
         self.lower_comp_level(clauses, 0, result_var, emit)?;
         Ok(self.builder.use_var(result_var))
@@ -2749,11 +3429,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
 
         // The iterable is evaluated once per execution of this level, in the
         // block inherited from the enclosing clause.
+        let mark = self.scratch_mark();
         let iterable = self.lower_expr(&clause.iterable)?;
+        self.scratch_push(iterable)?;
         let iterator = self.call_rt(self.runtime.iter_new, &[iterable])?;
+        let iter_var = self.temp_var()?;
+        self.define_var(iter_var, iterator)?;
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
-        let iter_var = self.temp_var();
-        self.builder.def_var(iter_var, iterator);
 
         // Slot for the element yielded by `pyx_iter_next`, created once.
         let out_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -2821,7 +3504,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         match target {
             CompTarget::Name(id) => {
                 let var = self.local_var(*id)?;
-                self.builder.def_var(var, value);
+                self.define_var(var, value)?;
             }
             CompTarget::Unpack(targets) => {
                 self.bind_unpack(targets.as_slice(), value)?;
@@ -2843,8 +3526,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         targets: &'a [UnpackTarget],
         value: Value,
     ) -> Result<(), CodegenError> {
-        let holder = self.temp_var();
-        self.builder.def_var(holder, value);
+        let holder = self.temp_var()?;
+        self.define_var(holder, value)?;
         // One `*target` collects the elements no plain target consumed; the
         // runtime returns a fresh list whose starred slot is that middle list,
         // so the element reads stay identical to the exact-length case.
@@ -2866,7 +3549,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             }
         };
         self.emit_exc_check()?;
-        self.builder.def_var(holder, sequence);
+        self.define_var(holder, sequence)?;
         for (index, target) in targets.iter().enumerate() {
             let sequence = self.builder.use_var(holder);
             let index = self.tagged_int((index as i64).wrapping_shl(3));
@@ -2893,17 +3576,17 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     let id = self.runtime.cell_set;
                     self.call_void(id, &[cell, value]);
                 } else {
-                    self.builder.def_var(var, value);
+                    self.define_var(var, value)?;
                 }
             }
             UnpackTarget::Attr { object, name } => {
                 // Park the element while the receiver expression runs: the
                 // calls it may make can trigger a collection or raise.
-                let value_holder = self.temp_var();
-                self.builder.def_var(value_holder, value);
+                let value_holder = self.temp_var()?;
+                self.define_var(value_holder, value)?;
                 let object = self.lower_expr(object)?;
-                let object_holder = self.temp_var();
-                self.builder.def_var(object_holder, object);
+                let object_holder = self.temp_var()?;
+                self.define_var(object_holder, object)?;
 
                 let (name_slot, name_len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
                 let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
@@ -2916,14 +3599,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             UnpackTarget::Subscript { object, index } => {
                 // Python evaluates the receiver, then the index, both after the
                 // element was extracted.
-                let value_holder = self.temp_var();
-                self.builder.def_var(value_holder, value);
+                let value_holder = self.temp_var()?;
+                self.define_var(value_holder, value)?;
                 let object = self.lower_expr(object)?;
-                let object_holder = self.temp_var();
-                self.builder.def_var(object_holder, object);
+                let object_holder = self.temp_var()?;
+                self.define_var(object_holder, object)?;
                 let index = self.lower_expr(index)?;
-                let index_holder = self.temp_var();
-                self.builder.def_var(index_holder, index);
+                let index_holder = self.temp_var()?;
+                self.define_var(index_holder, index)?;
 
                 let object = self.builder.use_var(object_holder);
                 let index = self.builder.use_var(index_holder);
@@ -2991,17 +3674,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         // return/break/continue/exception inside the region finds it.
         let cleanup = if has_finally {
             let finally_entry = self.builder.create_block();
-            let action_var = self.temp_var();
+            let action_var = self.temp_var()?;
             let zero = self.tagged_int(0);
             self.builder.def_var(action_var, zero);
-            let pending_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                3,
-            ));
-            // Tagged `None`: only an exception entry parks a real value.
+            let pending_root = self.temp_var()?;
             let none = self.none();
-            self.builder.ins().stack_store(none, pending_slot, 0);
+            // Tagged `None`: only an exception entry parks a real value.
+            self.define_var(pending_root, none)?;
             let id = self.cleanup_infos.len();
             let break_loop = self.loops.len().checked_sub(1);
             self.cleanup_infos.push(CleanupInfo {
@@ -3009,7 +3688,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 action_var,
                 break_loop,
                 outer_exc,
-                pending_slot,
+                pending_root,
                 handler_depth: outer_handler_depth,
             });
             self.cleanups.push(id);
@@ -3114,10 +3793,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.switch_to(handler_block);
                 // Always capture the exception object before clearing the
                 // pending flag: bare `raise` must re-raise this object.
-                let exc_var = self.temp_var();
+                let exc_var = self.temp_var()?;
                 let value_id = self.runtime.exc_value;
                 let value = self.call_rt(value_id, &[])?;
-                self.builder.def_var(exc_var, value);
+                self.define_var(exc_var, value)?;
                 if let Some(binding) = handler.binding {
                     let binding_var = self.local_var(binding)?;
                     if handler.binding_cell {
@@ -3125,7 +3804,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         let id = self.runtime.cell_set;
                         self.call_void(id, &[cell, value]);
                     } else {
-                        self.builder.def_var(binding_var, value);
+                        self.define_var(binding_var, value)?;
                     }
                 }
                 let clear_id = self.runtime.exc_clear;
@@ -3170,12 +3849,12 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             // A bare `raise` in this body re-raises the exception parked in
             // this cleanup's slot (or falls back to RuntimeError when the
             // body was entered normally and the slot is `None`).
-            self.finally_slots.push(info.pending_slot);
+            self.finally_slots.push(info.pending_root);
             // Every entry into the body pushed a handler context (the
             // in-flight exception or a `None` marker); the body-completion
             // pop below balances it.
             self.lower_stmts(finally_body)?;
-            if self.finally_slots.pop() != Some(info.pending_slot) {
+            if self.finally_slots.pop() != Some(info.pending_root) {
                 return Err(CodegenError::new(
                     "internal error: finally slot stack is unbalanced",
                 ));
@@ -3213,14 +3892,20 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 // Python evaluates the exception expression before the
                 // `from` cause; an exception raised while evaluating either
                 // one propagates through the normal exception path.
+                let mark = self.scratch_mark();
                 let message = match msg {
-                    Some(expr) => self.lower_expr(expr)?,
+                    Some(expr) => {
+                        let value = self.lower_expr(expr)?;
+                        self.scratch_push(value)?;
+                        value
+                    }
                     None => self.none(),
                 };
                 let tag = self.builder.ins().iconst(types::I32, kind.tag() as i64);
                 match cause {
                     Some(expr) => {
                         let cause = self.lower_expr(expr)?;
+                        self.scratch_push(cause)?;
                         let id = self.runtime.raise_from;
                         self.call_rt(id, &[tag, message, cause])?;
                     }
@@ -3229,6 +3914,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         self.call_rt(id, &[tag, message])?;
                     }
                 }
+                self.scratch_release(mark)?;
                 let target = self.exc_target;
                 self.emit_jump_exc_target(target)?;
             }
@@ -3237,10 +3923,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     // `raise <value>`: the expression evaluates to an
                     // exception object. As with a kind/message raise, the
                     // explicit cause is evaluated after the exception value.
+                    let mark = self.scratch_mark();
                     let value = self.lower_expr(expr)?;
+                    self.scratch_push(value)?;
                     match cause {
                         Some(expr) => {
                             let cause = self.lower_expr(expr)?;
+                            self.scratch_push(cause)?;
                             let id = self.runtime.raise_value_from;
                             self.call_rt(id, &[value, cause])?;
                         }
@@ -3249,6 +3938,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                             self.call_rt(id, &[value])?;
                         }
                     }
+                    self.scratch_release(mark)?;
                     let target = self.exc_target;
                     self.emit_jump_exc_target(target)?;
                     return Ok(());
@@ -3268,12 +3958,12 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     self.emit_jump_exc_target(target)?;
                 } else if let Some(slot) = self.finally_slots.last().copied() {
                     // A bare `raise` in a `finally` body re-raises the
-                    // exception that forced the `finally` to run. The slot
+                    // exception that forced the `finally` to run. The root
                     // holds it only for an exception entry; every other entry
                     // (normal completion, return, break, continue) reset it
                     // to tagged `None`, in which case CPython reports that no
                     // exception is active.
-                    let value = self.builder.ins().stack_load(types::I64, slot, 0);
+                    let value = self.builder.use_var(slot);
                     let none = self.none();
                     let has_value = self.builder.ins().icmp(IntCC::NotEqual, value, none);
                     let parked = self.builder.create_block();
@@ -3341,11 +4031,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.call_rt(id, &[cell])
             }
             ExprKind::CellSet { target, value } => {
+                let mark = self.scratch_mark();
                 let value = self.lower_expr(value)?;
+                self.scratch_push(value)?;
                 let var = self.local_var(*target)?;
                 let cell = self.builder.use_var(var);
                 let id = self.runtime.cell_set;
                 self.call_void(id, &[cell, value]);
+                self.scratch_release(mark)?;
                 Ok(value)
             }
             ExprKind::NamedExpr { target, value } => {
@@ -3354,63 +4047,87 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 // reachable while it is also the expression result.
                 let var = self.local_var(*target)?;
                 let value = self.lower_expr(value)?;
-                self.builder.def_var(var, value);
+                self.define_var(var, value)?;
                 Ok(value)
             }
             // Internal string accumulator; the frontend only emits these for
             // a local it proved to be a pure `s += ...` accumulator.
             ExprKind::StrBuilderNew { init } => {
+                let mark = self.scratch_mark();
                 let init = self.lower_expr(init)?;
+                self.scratch_push(init)?;
                 let id = self.runtime.str_builder_new;
-                self.call_rt(id, &[init])
+                let result = self.call_rt(id, &[init])?;
+                self.scratch_release(mark)?;
+                Ok(result)
             }
             ExprKind::StrBuilderAppend { builder, value } => {
                 // `s += rhs` evaluates the right-hand side before reading the
                 // target. Appending may raise (`TypeError`, `__radd__`), so
-                // the result is exception-checked.
+                // the result is exception-checked. Both operands stay rooted
+                // while the other one is evaluated and during the call.
+                let mark = self.scratch_mark();
                 let value = self.lower_expr(value)?;
+                self.scratch_push(value)?;
                 let builder = self.lower_expr(builder)?;
+                self.scratch_push(builder)?;
                 let id = self.runtime.str_builder_append;
                 let result = self.call_rt(id, &[builder, value])?;
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
                 Ok(result)
             }
             ExprKind::StrBuilderFinish { builder } => {
+                let mark = self.scratch_mark();
                 let builder = self.lower_expr(builder)?;
+                self.scratch_push(builder)?;
                 let id = self.runtime.str_builder_finish;
-                self.call_rt(id, &[builder])
+                let result = self.call_rt(id, &[builder])?;
+                self.scratch_release(mark)?;
+                Ok(result)
             }
             ExprKind::Bin { op, lhs, rhs } => {
                 // Both operands are evaluated left to right before the
-                // operation itself, as in Python.
+                // operation itself, as in Python. The left operand is a root
+                // while the right one runs, and both stay in the frame while
+                // the runtime operator may allocate.
                 let lhs_ty = lhs.ty;
                 let rhs_ty = rhs.ty;
+                let mark = self.scratch_mark();
                 let lhs = self.lower_expr(lhs)?;
+                self.scratch_push(lhs)?;
                 let rhs = self.lower_expr(rhs)?;
+                self.scratch_push(rhs)?;
                 // Only statically tagged operands use the specialised paths;
                 // `Type::BigInt` values are heap objects and always go through
                 // the dynamic operator.
-                if lhs_ty == Type::Int && rhs_ty == Type::Int {
+                let result = if lhs_ty == Type::Int && rhs_ty == Type::Int {
                     match op {
                         // The tagged-int fast path is only exact when the
                         // result stays an `int`; other results (e.g. `/`)
                         // go through the runtime operator.
                         BinOp::Add | BinOp::Sub | BinOp::Mul if expr.ty == Type::Int => {
-                            return self.lower_int_arith(*op, lhs, rhs);
+                            self.lower_int_arith(*op, lhs, rhs)
                         }
                         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                            return self.lower_int_comparison(*op, lhs, rhs)
+                            self.lower_int_comparison(*op, lhs, rhs)
                         }
-                        _ => {}
+                        _ => self.lower_binop(*op, lhs, rhs),
                     }
-                }
-                self.lower_binop(*op, lhs, rhs)
+                } else {
+                    self.lower_binop(*op, lhs, rhs)
+                }?;
+                self.scratch_release(mark)?;
+                Ok(result)
             }
             ExprKind::Un { op, operand } => {
+                let mark = self.scratch_mark();
                 let operand = self.lower_expr(operand)?;
+                self.scratch_push(operand)?;
                 let code = self.builder.ins().iconst(types::I32, op.code() as i64);
                 let id = self.runtime.unop;
                 let result = self.call_rt(id, &[code, operand])?;
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
                 Ok(result)
             }
@@ -3429,25 +4146,41 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.lower_items_literal(items, "set literal", id)
             }
             ExprKind::Dict(pairs) => {
+                let mark = self.scratch_mark();
+                let mut keys = Vec::with_capacity(pairs.len());
+                let mut values = Vec::with_capacity(pairs.len());
+                // Python evaluates each key before its value, pairs in source
+                // order; duplicate keys are resolved by the runtime. Earlier
+                // elements stay rooted in the scratch region while later ones
+                // may allocate.
+                for (key, value) in pairs {
+                    let key = self.lower_expr(key)?;
+                    self.scratch_push(key)?;
+                    let value = self.lower_expr(value)?;
+                    self.scratch_push(value)?;
+                    keys.push(key);
+                    values.push(value);
+                }
                 let key_slot = self.stack_array_slot(pairs.len(), "dict literal keys")?;
                 let value_slot = self.stack_array_slot(pairs.len(), "dict literal values")?;
-                // Python evaluates each key before its value, pairs in source
-                // order; duplicate keys are resolved by the runtime.
-                for (index, (key, value)) in pairs.iter().enumerate() {
-                    let key = self.lower_expr(key)?;
+                for (index, (key, value)) in keys.iter().zip(&values).enumerate() {
                     self.builder
                         .ins()
-                        .stack_store(key, key_slot, (index * 8) as i32);
-                    let value = self.lower_expr(value)?;
+                        .stack_store(*key, key_slot, (index * 8) as i32);
                     self.builder
                         .ins()
-                        .stack_store(value, value_slot, (index * 8) as i32);
+                        .stack_store(*value, value_slot, (index * 8) as i32);
                 }
                 let keys_ptr = self.builder.ins().stack_addr(self.ptr_ty, key_slot, 0);
                 let values_ptr = self.builder.ins().stack_addr(self.ptr_ty, value_slot, 0);
                 let argc = self.builder.ins().iconst(self.ptr_ty, pairs.len() as i64);
+                let keys_scope = self.open_scope(keys_ptr, pairs.len())?;
+                let values_scope = self.open_scope(values_ptr, pairs.len())?;
                 let id = self.runtime.dict_new;
                 let result = self.call_rt(id, &[argc, keys_ptr, values_ptr])?;
+                self.close_scope(values_scope);
+                self.close_scope(keys_scope);
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
                 Ok(result)
             }
@@ -3463,10 +4196,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 clauses,
             } => self.lower_comprehension(clauses.as_slice(), CompEmit::Dict(key, value)),
             ExprKind::Subscript { object, index } => {
+                let mark = self.scratch_mark();
                 let object = self.lower_expr(object)?;
+                self.scratch_push(object)?;
                 let index = self.lower_expr(index)?;
+                self.scratch_push(index)?;
                 let id = self.runtime.subscript;
                 let result = self.call_rt(id, &[object, index])?;
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
                 Ok(result)
             }
@@ -3477,22 +4214,38 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 step,
             } => {
                 // Python evaluates the sliced object before the bounds, then
-                // the bounds in source order (start, stop, step).
+                // the bounds in source order (start, stop, step). Every
+                // evaluated operand stays rooted until the call returns.
+                let mark = self.scratch_mark();
                 let object = self.lower_expr(object)?;
+                self.scratch_push(object)?;
                 let start = match start {
-                    Some(start) => self.lower_expr(start)?,
+                    Some(start) => {
+                        let value = self.lower_expr(start)?;
+                        self.scratch_push(value)?;
+                        value
+                    }
                     None => self.none(),
                 };
                 let stop = match stop {
-                    Some(stop) => self.lower_expr(stop)?,
+                    Some(stop) => {
+                        let value = self.lower_expr(stop)?;
+                        self.scratch_push(value)?;
+                        value
+                    }
                     None => self.none(),
                 };
                 let step = match step {
-                    Some(step) => self.lower_expr(step)?,
+                    Some(step) => {
+                        let value = self.lower_expr(step)?;
+                        self.scratch_push(value)?;
+                        value
+                    }
                     None => self.none(),
                 };
                 let id = self.runtime.slice;
                 let result = self.call_rt(id, &[object, start, stop, step])?;
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
                 Ok(result)
             }
@@ -3556,30 +4309,42 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.lower_deferred_call(callee.as_deref(), args)
             }
             ExprKind::Await { value } => {
+                let mark = self.scratch_mark();
                 let value = self.lower_expr(value)?;
+                self.scratch_push(value)?;
                 let id = self.runtime.await_value;
                 let result = self.call_rt(id, &[value])?;
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
                 Ok(result)
             }
             ExprKind::Yield { value } => {
+                let mark = self.scratch_mark();
                 let value = match value {
-                    Some(expr) => self.lower_expr(expr)?,
+                    Some(expr) => {
+                        let value = self.lower_expr(expr)?;
+                        self.scratch_push(value)?;
+                        value
+                    }
                     None => self.none(),
                 };
                 // Returns the value passed to the resume that continues the
                 // generator (`send(value)`, or `None` for `next`).
                 let id = self.runtime.yield_value;
                 let sent = self.call_rt(id, &[value])?;
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
                 Ok(sent)
             }
             ExprKind::YieldFrom { value } => {
+                let mark = self.scratch_mark();
                 let value = self.lower_expr(value)?;
+                self.scratch_push(value)?;
                 // Delegates iteration; the result is the delegate's return
                 // value (or `None` for a plain iterator).
                 let id = self.runtime.yield_from;
                 let result = self.call_rt(id, &[value])?;
+                self.scratch_release(mark)?;
                 self.emit_exc_check()?;
                 Ok(result)
             }
@@ -3887,12 +4652,12 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// `object.method(*star, name=value...)` to a dynamic method call.
     ///
     /// Python evaluates the receiver, then the positional arguments (or the
-    /// starred operand), then the keyword values, each left to right. The
-    /// receiver and each already evaluated argument are stored into stack
-    /// slots immediately so that a collection triggered by a later allocation
-    /// can still observe them. Calls without keywords keep using `pyx_method`;
-    /// calls with keywords use `pyx_method_kw`; a starred operand uses
-    /// `pyx_method_star`, which flattens it into positional arguments.
+    /// starred operand), then the keyword values, each left to right. Every
+    /// evaluated operand is parked in the precise root frame while later
+    /// operands run; the argument buffers are registered as GC scopes for the
+    /// runtime call. Calls without keywords keep using `pyx_method`; calls with
+    /// keywords use `pyx_method_kw`; a starred operand uses `pyx_method_star`,
+    /// which flattens it into positional arguments.
     fn lower_method_call(
         &mut self,
         object: &'a Expr,
@@ -3906,86 +4671,120 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 "method call cannot mix positional and starred arguments",
             ));
         }
-        let receiver_slot = self.stack_array_slot(1, "method receiver")?;
+        // Evaluate every operand left to right, rooting each one in the
+        // scratch region so a later argument's allocation cannot collect an
+        // earlier one. The arrays are only populated afterwards; they are
+        // registered as scopes for the single runtime call.
+        let mark = self.scratch_mark();
         let receiver = self.lower_expr(object)?;
-        self.builder.ins().stack_store(receiver, receiver_slot, 0);
-        let star_slot = if star.is_some() {
-            Some(self.stack_array_slot(1, "method starred argument")?)
-        } else {
-            None
-        };
-
-        let argv_slot = self.stack_array_slot(args.len(), "method arguments")?;
-        for (index, arg) in args.iter().enumerate() {
+        self.scratch_push(receiver)?;
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
             let value = self.lower_expr(arg)?;
-            self.builder
-                .ins()
-                .stack_store(value, argv_slot, (index * 8) as i32);
+            self.scratch_push(value)?;
+            arg_values.push(value);
         }
         // The starred operand is evaluated after the receiver and before the
-        // keywords, matching its position in the call. It is parked in a
-        // stack slot like the receiver so that a collection triggered by a
-        // keyword value can still observe it.
-        let star = match (star, star_slot) {
-            (Some(star), Some(slot)) => {
+        // keywords, matching its position in the call.
+        let star_value = match star {
+            Some(star) => {
                 let value = self.lower_expr(star)?;
-                self.builder.ins().stack_store(value, slot, 0);
+                self.scratch_push(value)?;
                 Some(value)
             }
-            _ => None,
+            None => None,
         };
-
-        let receiver = self.builder.ins().stack_load(types::I64, receiver_slot, 0);
-        // Empty names still get a valid, non-null pointer to a one-byte slot.
-        let (name_slot, name_len) = make_bytes_slot(&mut self.builder, method.as_bytes())?;
-        let name = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
-        let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
-        let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
-        // `argc == 0` still passes a valid pointer (the slot has one element).
-        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
-
-        if star.is_none() && keywords.is_empty() {
-            let id = self.runtime.method;
-            let result = self.call_rt(id, &[receiver, name, name_len, argc, argv])?;
-            self.emit_exc_check()?;
-            return Ok(result);
+        let mut kw_values = Vec::with_capacity(keywords.len());
+        for (keyword, value) in keywords {
+            // Names are tagged strings, like every other ABI value, and are
+            // materialised before the value to preserve left-to-right order.
+            let keyword = self.str_const(keyword)?;
+            self.scratch_push(keyword)?;
+            let value = self.lower_expr(value)?;
+            self.scratch_push(value)?;
+            kw_values.push((keyword, value));
         }
 
+        let receiver_slot = self.stack_array_slot(1, "method receiver")?;
+        self.builder.ins().stack_store(receiver, receiver_slot, 0);
+        let argv_slot = self.stack_array_slot(args.len(), "method arguments")?;
+        for (index, value) in arg_values.iter().enumerate() {
+            self.builder
+                .ins()
+                .stack_store(*value, argv_slot, (index * 8) as i32);
+        }
+        let star_slot = match star_value {
+            Some(value) => {
+                let slot = self.stack_array_slot(1, "method starred argument")?;
+                self.builder.ins().stack_store(value, slot, 0);
+                Some(slot)
+            }
+            None => None,
+        };
         let pairs = keywords
             .len()
             .checked_mul(2)
             .ok_or_else(|| CodegenError::new("method call: too many keyword arguments"))?;
         let kw_slot = self.stack_array_slot(pairs, "method keyword arguments")?;
-        for (index, (keyword, value)) in keywords.iter().enumerate() {
-            // Names are tagged strings, like every other ABI value.
-            let keyword = self.str_const(keyword)?;
+        for (index, (keyword, value)) in kw_values.iter().enumerate() {
             self.builder
                 .ins()
-                .stack_store(keyword, kw_slot, (index * 16) as i32);
-            let value = self.lower_expr(value)?;
+                .stack_store(*keyword, kw_slot, (index * 16) as i32);
             self.builder
                 .ins()
-                .stack_store(value, kw_slot, (index * 16 + 8) as i32);
+                .stack_store(*value, kw_slot, (index * 16 + 8) as i32);
         }
+
+        // Empty names still get a valid, non-null pointer to a one-byte slot.
+        let (name_slot, name_len) = make_bytes_slot(&mut self.builder, method.as_bytes())?;
+        let name = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+        let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
+        let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
+        let receiver_ptr = self.builder.ins().stack_addr(self.ptr_ty, receiver_slot, 0);
+        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
         let kwargc = self
             .builder
             .ins()
             .iconst(self.ptr_ty, keywords.len() as i64);
         let kw_argv = self.builder.ins().stack_addr(self.ptr_ty, kw_slot, 0);
-        if star.is_some() {
+
+        let receiver_scope = self.open_scope(receiver_ptr, 1)?;
+        let result = if star_value.is_some() {
             let Some(star_slot) = star_slot else {
                 return Err(CodegenError::new(
                     "internal error: starred method call without a stack slot",
                 ));
             };
+            let star_ptr = self.builder.ins().stack_addr(self.ptr_ty, star_slot, 0);
+            let star_scope = self.open_scope(star_ptr, 1)?;
+            let kw_scope = self.open_scope(kw_argv, pairs)?;
             let star = self.builder.ins().stack_load(types::I64, star_slot, 0);
             let id = self.runtime.method_star;
-            let result = self.call_rt(id, &[receiver, name, name_len, star, kwargc, kw_argv])?;
-            self.emit_exc_check()?;
-            return Ok(result);
-        }
-        let id = self.runtime.method_kw;
-        let result = self.call_rt(id, &[receiver, name, name_len, argc, argv, kwargc, kw_argv])?;
+            let result: Result<Value, CodegenError> =
+                self.call_rt(id, &[receiver, name, name_len, star, kwargc, kw_argv]);
+            self.close_scope(kw_scope);
+            self.close_scope(star_scope);
+            result
+        } else if keywords.is_empty() {
+            let argv_scope = self.open_scope(argv, args.len())?;
+            let id = self.runtime.method;
+            let result: Result<Value, CodegenError> =
+                self.call_rt(id, &[receiver, name, name_len, argc, argv]);
+            self.close_scope(argv_scope);
+            result
+        } else {
+            let argv_scope = self.open_scope(argv, args.len())?;
+            let kw_scope = self.open_scope(kw_argv, pairs)?;
+            let id = self.runtime.method_kw;
+            let result: Result<Value, CodegenError> =
+                self.call_rt(id, &[receiver, name, name_len, argc, argv, kwargc, kw_argv]);
+            self.close_scope(kw_scope);
+            self.close_scope(argv_scope);
+            result
+        };
+        self.close_scope(receiver_scope);
+        self.scratch_release(mark)?;
+        let result = result?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -3995,9 +4794,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// (`functools.partial`'s `**kwargs`).
     ///
     /// Python evaluates the arguments left to right before the call; each
-    /// value is stored into an 8-byte-aligned stack array immediately so that
-    /// a collection triggered by a later allocation cannot observe a stale
-    /// value. Module and function names are materialized in byte slots.
+    /// evaluated operand is parked in the precise root frame while later ones
+    /// run, and the compiled argument buffers are registered as scopes for the
+    /// call. Module and function names are materialized in byte slots.
     /// Keyword names are constant strings in the IR and become string values,
     /// so the runtime consumes one uniform `[name, value, ...]` buffer.
     fn lower_module_call(
@@ -4012,12 +4811,28 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 return Ok(value);
             }
         }
-        let argv_slot = self.stack_array_slot(args.len(), "module call arguments")?;
-        for (index, arg) in args.iter().enumerate() {
+        // Evaluate all operands up front, rooting each in the scratch region;
+        // the argument buffers are registered as scopes only for the call.
+        let mark = self.scratch_mark();
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
             let value = self.lower_expr(arg)?;
+            self.scratch_push(value)?;
+            arg_values.push(value);
+        }
+        let mut kw_values = Vec::with_capacity(keywords.len());
+        for (name, value) in keywords {
+            let name = self.str_const(name)?;
+            self.scratch_push(name)?;
+            let value = self.lower_expr(value)?;
+            self.scratch_push(value)?;
+            kw_values.push((name, value));
+        }
+        let argv_slot = self.stack_array_slot(args.len(), "module call arguments")?;
+        for (index, value) in arg_values.iter().enumerate() {
             self.builder
                 .ins()
-                .stack_store(value, argv_slot, (index * 8) as i32);
+                .stack_store(*value, argv_slot, (index * 8) as i32);
         }
         let kw_slot = self.stack_array_slot(
             keywords
@@ -4026,15 +4841,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 .ok_or_else(|| CodegenError::new("module call: too many keyword arguments"))?,
             "module call keyword arguments",
         )?;
-        for (index, (name, value)) in keywords.iter().enumerate() {
-            let name = self.str_const(name)?;
+        for (index, (name, value)) in kw_values.iter().enumerate() {
             self.builder
                 .ins()
-                .stack_store(name, kw_slot, (index * 16) as i32);
-            let value = self.lower_expr(value)?;
+                .stack_store(*name, kw_slot, (index * 16) as i32);
             self.builder
                 .ins()
-                .stack_store(value, kw_slot, (index * 16 + 8) as i32);
+                .stack_store(*value, kw_slot, (index * 16 + 8) as i32);
         }
 
         // Empty names still get a valid, non-null pointer to a one-byte slot.
@@ -4046,9 +4859,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let function_ptr = self.builder.ins().stack_addr(self.ptr_ty, function_slot, 0);
         let function_len = self.builder.ins().iconst(self.ptr_ty, function_len as i64);
         let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
-        // `argc == 0` still passes a valid pointer (the slot has one element).
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
-        if keywords.is_empty() {
+        let pairs = keywords.len() * 2;
+        let kw_argv = self.builder.ins().stack_addr(self.ptr_ty, kw_slot, 0);
+        let argv_scope = self.open_scope(argv, args.len())?;
+        let result = if keywords.is_empty() {
             let id = self.runtime.module_call;
             let result = self.call_rt(
                 id,
@@ -4060,29 +4875,35 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     argc,
                     argv,
                 ],
-            )?;
-            self.emit_exc_check()?;
-            return Ok(result);
-        }
-        let kwargc = self
-            .builder
-            .ins()
-            .iconst(self.ptr_ty, keywords.len() as i64);
-        let kw_argv = self.builder.ins().stack_addr(self.ptr_ty, kw_slot, 0);
-        let id = self.runtime.module_call_kw;
-        let result = self.call_rt(
-            id,
-            &[
-                module_ptr,
-                module_len,
-                function_ptr,
-                function_len,
-                argc,
-                argv,
-                kwargc,
-                kw_argv,
-            ],
-        )?;
+            );
+            self.close_scope(argv_scope);
+            result
+        } else {
+            let kwargc = self
+                .builder
+                .ins()
+                .iconst(self.ptr_ty, keywords.len() as i64);
+            let kw_scope = self.open_scope(kw_argv, pairs)?;
+            let id = self.runtime.module_call_kw;
+            let result = self.call_rt(
+                id,
+                &[
+                    module_ptr,
+                    module_len,
+                    function_ptr,
+                    function_len,
+                    argc,
+                    argv,
+                    kwargc,
+                    kw_argv,
+                ],
+            );
+            self.close_scope(kw_scope);
+            self.close_scope(argv_scope);
+            result
+        };
+        self.scratch_release(mark)?;
+        let result = result?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -4131,7 +4952,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// and promoted `BigInt`s fall back to `pyx_math_floor_sqrt_int`, which
     /// reproduces the generic path (including the domain `ValueError`).
     fn lower_int_floor_sqrt(&mut self, arg: &'a Expr) -> Result<Value, CodegenError> {
+        let mark = self.scratch_mark();
         let value = self.lower_expr(arg)?;
+        self.scratch_push(value)?;
         let fast_cond = self.tagged_non_negative_int(value);
 
         let fast = self.builder.create_block();
@@ -4155,6 +4978,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.switch_to(slow);
         let id = self.runtime.math_floor_sqrt_int;
         let fallback = self.call_rt(id, &[value])?;
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         self.builder
             .ins()
@@ -4178,7 +5002,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// keeps the generic `pyx_module_call` path, which boxes the float and
     /// raises the same errors.
     fn lower_int_sqrt(&mut self, arg: &'a Expr) -> Result<Value, CodegenError> {
+        let mark = self.scratch_mark();
         let value = self.lower_expr(arg)?;
+        self.scratch_push(value)?;
         // The fallback passes the value through the ordinary argv pointer.
         let argv_slot = self.stack_array_slot(1, "math.sqrt argument")?;
         self.builder.ins().stack_store(value, argv_slot, 0);
@@ -4208,6 +5034,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let function_len = self.builder.ins().iconst(self.ptr_ty, function_len as i64);
         let argc = self.builder.ins().iconst(self.ptr_ty, 1);
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        let scope = self.open_scope(argv, 1)?;
         let id = self.runtime.module_call;
         let result = self.call_rt(
             id,
@@ -4220,6 +5047,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 argv,
             ],
         )?;
+        self.close_scope(scope);
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         self.builder.ins().jump(join, &[ir::BlockArg::from(result)]);
         self.terminated = true;
@@ -4290,7 +5119,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     ) -> Result<Value, CodegenError> {
         let module_args = self.module_name_args(module)?;
         let name_args = self.module_name_args(name)?;
+        let mark = self.scratch_mark();
         let value = self.lower_expr(value)?;
+        self.scratch_push(value)?;
         let id = self.runtime.global_set;
         let result = self.call_rt(
             id,
@@ -4302,6 +5133,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 value,
             ],
         )?;
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -4347,12 +5179,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         member: &str,
         args: &'a [Expr],
     ) -> Result<Value, CodegenError> {
-        let argv_slot = self.stack_array_slot(args.len(), "extension call arguments")?;
-        for (index, arg) in args.iter().enumerate() {
+        let mark = self.scratch_mark();
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
             let value = self.lower_expr(arg)?;
+            self.scratch_push(value)?;
+            arg_values.push(value);
+        }
+        let argv_slot = self.stack_array_slot(args.len(), "extension call arguments")?;
+        for (index, value) in arg_values.iter().enumerate() {
             self.builder
                 .ins()
-                .stack_store(value, argv_slot, (index * 8) as i32);
+                .stack_store(*value, argv_slot, (index * 8) as i32);
         }
 
         // Empty names still get a valid, non-null pointer to a one-byte slot.
@@ -4363,13 +5201,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let member_ptr = self.builder.ins().stack_addr(self.ptr_ty, member_slot, 0);
         let member_len = self.builder.ins().iconst(self.ptr_ty, member_len as i64);
         let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
-        // `argc == 0` still passes a valid pointer (the slot has one element).
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        let scope = self.open_scope(argv, args.len())?;
         let id = self.runtime.extension_call;
         let result = self.call_rt(
             id,
             &[path_ptr, path_len, member_ptr, member_len, argc, argv],
         )?;
+        self.close_scope(scope);
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -4393,13 +5233,16 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// Lower `object.name` to `pyx_getattr`: the receiver is evaluated first,
     /// then the runtime resolves the data attribute by receiver kind.
     fn lower_getattr(&mut self, object: &'a Expr, name: &str) -> Result<Value, CodegenError> {
+        let mark = self.scratch_mark();
         let object = self.lower_expr(object)?;
+        self.scratch_push(object)?;
         // Empty names still get a valid, non-null pointer to a one-byte slot.
         let (name_slot, name_len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
         let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
         let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
         let id = self.runtime.getattr;
         let result = self.call_rt(id, &[object, name_ptr, name_len])?;
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -4425,31 +5268,36 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             }
         }
 
-        // Park the callee and both arguments in stack slots as soon as they
-        // are evaluated, so a later allocation cannot invalidate them.
-        let callee_slot = self.stack_array_slot(1, "getattr callee")?;
+        // Materialise the callee, then evaluate both arguments into rooted
+        // scratch slots; the argv buffer is scoped for the call only.
+        let mark = self.scratch_mark();
         let (name_slot, name_len) = make_bytes_slot(&mut self.builder, b"getattr")?;
         let builtin_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
         let builtin_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
         let id = self.runtime.builtin_function;
         let function = self.call_rt(id, &[builtin_ptr, builtin_len])?;
         self.emit_exc_check()?;
-        self.builder.ins().stack_store(function, callee_slot, 0);
+        self.scratch_push(function)?;
 
-        let argv_slot = self.stack_array_slot(args.len(), "getattr arguments")?;
-        for (index, argument) in args.iter().enumerate() {
+        let mut values = Vec::with_capacity(args.len());
+        for argument in args {
             let value = self.lower_expr(argument)?;
+            self.scratch_push(value)?;
+            values.push(value);
+        }
+        let argv_slot = self.stack_array_slot(args.len(), "getattr arguments")?;
+        for (index, value) in values.iter().enumerate() {
             self.builder
                 .ins()
-                .stack_store(value, argv_slot, (index * 8) as i32);
+                .stack_store(*value, argv_slot, (index * 8) as i32);
         }
-        // Reload after all argument expressions: the slot is the GC-safe
-        // owner of the callee while they may allocate.
-        let callee = self.builder.ins().stack_load(types::I64, callee_slot, 0);
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
         let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
+        let scope = self.open_scope(argv, args.len())?;
         let id = self.runtime.call;
-        let result = self.call_rt(id, &[callee, argc, argv])?;
+        let result = self.call_rt(id, &[function, argc, argv])?;
+        self.close_scope(scope);
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -4468,18 +5316,24 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             )));
         }
         let [object, name] = args else { unreachable!() };
+        let mark = self.scratch_mark();
         let object = self.lower_expr(object)?;
+        self.scratch_push(object)?;
         if let ExprKind::Const(Const::Str(name)) = &name.kind {
             let (name_slot, name_len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
             let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
             let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
             let id = self.runtime.hasattr;
             let result = self.call_rt(id, &[object, name_ptr, name_len])?;
+            self.scratch_release(mark)?;
             self.emit_exc_check()?;
             return Ok(result);
         }
         let name = self.lower_expr(name)?;
-        self.lower_builtin_values(Builtin::Hasattr, &[object, name])
+        self.scratch_push(name)?;
+        let result = self.lower_builtin_values(Builtin::Hasattr, &[object, name]);
+        self.scratch_release(mark)?;
+        result
     }
 
     /// Lower a list/tuple/set literal: the elements are evaluated left-to-right
@@ -4491,9 +5345,12 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         what: &str,
         id: FuncId,
     ) -> Result<Value, CodegenError> {
+        let mark = self.scratch_mark();
         let mut values = Vec::with_capacity(items.len());
         for item in items {
-            values.push(self.lower_expr(item)?);
+            let value = self.lower_expr(item)?;
+            self.scratch_push(value)?;
+            values.push(value);
         }
         let slot = self.stack_array_slot(values.len(), what)?;
         for (index, value) in values.iter().enumerate() {
@@ -4503,7 +5360,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         }
         let items_ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
         let argc = self.builder.ins().iconst(self.ptr_ty, values.len() as i64);
+        let scope = self.open_scope(items_ptr, values.len())?;
         let result = self.call_rt(id, &[argc, items_ptr])?;
+        self.close_scope(scope);
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -4546,17 +5406,27 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             Const::Bytes(bytes) => self.bytes_const(bytes),
             Const::Global { module, name } => self.lower_global_get(module, name),
             Const::Tuple(items) => {
-                let slot = self.stack_array_slot(items.len(), "literal tuple default")?;
-                for (index, item) in items.iter().enumerate() {
+                let mark = self.scratch_mark();
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
                     let value = self.lower_const(item)?;
+                    self.scratch_push(value)?;
+                    values.push(value);
+                }
+                let slot = self.stack_array_slot(items.len(), "literal tuple default")?;
+                for (index, value) in values.iter().enumerate() {
                     self.builder
                         .ins()
-                        .stack_store(value, slot, (index * 8) as i32);
+                        .stack_store(*value, slot, (index * 8) as i32);
                 }
                 let ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
                 let len = self.builder.ins().iconst(self.ptr_ty, items.len() as i64);
                 let id = self.runtime.tuple_new;
-                self.call_rt(id, &[len, ptr])
+                let scope = self.open_scope(ptr, items.len())?;
+                let result = self.call_rt(id, &[len, ptr])?;
+                self.close_scope(scope);
+                self.scratch_release(mark)?;
+                Ok(result)
             }
         }
     }
@@ -4593,7 +5463,12 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let flags = self.function_flags(function);
         let call_id = self.runtime.function_new;
         let result = self.call_rt(call_id, &[wrapper_address, arity, name, name_len, flags])?;
+        // Metadata attachment allocates (defaults, trampoline registration);
+        // keep the new function object rooted across it.
+        let holder = self.temp_var()?;
+        self.define_var(holder, result)?;
         self.emit_exc_check()?;
+        let result = self.builder.use_var(holder);
         let result = self.attach_function_signature(result, function, id)?;
         Ok(result)
     }
@@ -4609,6 +5484,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let full_wrapper = *self.full_wrappers.get(&id).ok_or_else(|| {
             CodegenError::new(format!("full wrapper for function {id} was not declared"))
         })?;
+        // The function object is an operand of `function_meta`; root it while
+        // the parameter defaults are evaluated.
+        let mark = self.scratch_mark();
+        self.scratch_push(value)?;
         let reference = self.func_ref(full_wrapper);
         let address = self.builder.ins().func_addr(self.ptr_ty, reference);
         let address = self.pointer_to_i64(address);
@@ -4647,6 +5526,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             };
             match default {
                 Some(value) => {
+                    self.scratch_push(value)?;
                     self.builder
                         .ins()
                         .stack_store(value, defaults, (index * 8) as i32);
@@ -4672,6 +5552,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let defaults_ptr = self.builder.ins().stack_addr(self.ptr_ty, defaults, 0);
         let flags_ptr = self.builder.ins().stack_addr(self.ptr_ty, flags, 0);
         let id = self.runtime.function_meta;
+        // `defaults` is the only buffer with tagged entries; `names`, `kinds`
+        // and `flags` hold raw metadata words.
+        let defaults_scope = self.open_scope(defaults_ptr, count)?;
         let _ = self.call_rt(
             id,
             &[
@@ -4684,6 +5567,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 flags_ptr,
             ],
         )?;
+        self.close_scope(defaults_scope);
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(value)
     }
@@ -4756,41 +5641,58 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         args: &'a [Expr],
         star: Option<&'a Expr>,
     ) -> Result<Value, CodegenError> {
-        let callee_slot = self.stack_array_slot(1, "call callee")?;
+        let mark = self.scratch_mark();
         let callee = self.lower_expr(callee)?;
-        self.builder.ins().stack_store(callee, callee_slot, 0);
+        self.scratch_push(callee)?;
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = self.lower_expr(arg)?;
+            self.scratch_push(value)?;
+            arg_values.push(value);
+        }
+        // The starred operand is evaluated after the positional arguments.
+        let star_value = match star {
+            Some(star) => {
+                let value = self.lower_expr(star)?;
+                self.scratch_push(value)?;
+                Some(value)
+            }
+            None => None,
+        };
 
         let argv_slot = self.stack_array_slot(args.len(), "call arguments")?;
-        for (position, arg) in args.iter().enumerate() {
-            let value = self.lower_expr(arg)?;
+        for (position, value) in arg_values.iter().enumerate() {
             self.builder
                 .ins()
-                .stack_store(value, argv_slot, (position * 8) as i32);
+                .stack_store(*value, argv_slot, (position * 8) as i32);
         }
-        let star_slot = match star {
-            Some(star) => {
+        let star_slot = match star_value {
+            Some(value) => {
                 let slot = self.stack_array_slot(1, "call starred argument")?;
-                let value = self.lower_expr(star)?;
                 self.builder.ins().stack_store(value, slot, 0);
                 Some(slot)
             }
             None => None,
         };
 
-        let callee = self.builder.ins().stack_load(types::I64, callee_slot, 0);
         let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
-        // `argc == 0` still passes a valid pointer: the slot holds one
-        // element, which is 8-byte aligned.
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
-        if let Some(star_slot) = star_slot {
+        let argv_scope = self.open_scope(argv, args.len())?;
+        let result = if let Some(star_slot) = star_slot {
+            let star_ptr = self.builder.ins().stack_addr(self.ptr_ty, star_slot, 0);
+            let star_scope = self.open_scope(star_ptr, 1)?;
             let star = self.builder.ins().stack_load(types::I64, star_slot, 0);
             let id = self.runtime.call_star;
-            let result = self.call_rt(id, &[callee, argc, argv, star])?;
-            self.emit_exc_check()?;
-            return Ok(result);
-        }
-        let id = self.runtime.call;
-        let result = self.call_rt(id, &[callee, argc, argv])?;
+            let result: Result<Value, CodegenError> = self.call_rt(id, &[callee, argc, argv, star]);
+            self.close_scope(star_scope);
+            result
+        } else {
+            let id = self.runtime.call;
+            self.call_rt(id, &[callee, argc, argv])
+        };
+        self.close_scope(argv_scope);
+        self.scratch_release(mark)?;
+        let result = result?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -4806,26 +5708,31 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         args: &'a [Expr],
     ) -> Result<Value, CodegenError> {
         let count = args.len() + usize::from(callee.is_some());
-        let argv_slot = self.stack_array_slot(count, "deferred call arguments")?;
-        let mut position = 0usize;
+        let mark = self.scratch_mark();
+        let mut values = Vec::with_capacity(count);
         if let Some(callee) = callee {
             let value = self.lower_expr(callee)?;
-            self.builder
-                .ins()
-                .stack_store(value, argv_slot, (position * 8) as i32);
-            position += 1;
+            self.scratch_push(value)?;
+            values.push(value);
         }
         for arg in args {
             let value = self.lower_expr(arg)?;
+            self.scratch_push(value)?;
+            values.push(value);
+        }
+        let argv_slot = self.stack_array_slot(count, "deferred call arguments")?;
+        for (position, value) in values.iter().enumerate() {
             self.builder
                 .ins()
-                .stack_store(value, argv_slot, (position * 8) as i32);
-            position += 1;
+                .stack_store(*value, argv_slot, (position * 8) as i32);
         }
         let argc = self.builder.ins().iconst(self.ptr_ty, count as i64);
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        let scope = self.open_scope(argv, count)?;
         let id = self.runtime.deferred_call;
         let result = self.call_rt(id, &[argc, argv])?;
+        self.close_scope(scope);
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -4853,11 +5760,16 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             Callee::Builtin(Builtin::Getattr) => self.lower_getattr_builtin(args),
             Callee::Builtin(Builtin::Hasattr) => self.lower_hasattr_builtin(args),
             Callee::Builtin(builtin) => {
+                let mark = self.scratch_mark();
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
-                    values.push(self.lower_expr(arg)?);
+                    let value = self.lower_expr(arg)?;
+                    self.scratch_push(value)?;
+                    values.push(value);
                 }
-                self.lower_builtin(*builtin, &values)
+                let result = self.lower_builtin(*builtin, &values);
+                self.scratch_release(mark)?;
+                result
             }
             // Keyword arguments are impossible here: the frontend rejects
             // them for extension members.
@@ -4903,28 +5815,35 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             ));
         }
         let class_value = self.lower_expr(class)?;
-        let class_holder = self.temp_var();
-        self.builder.def_var(class_holder, class_value);
+        let class_holder = self.temp_var()?;
+        self.define_var(class_holder, class_value)?;
         let class_value = self.builder.use_var(class_holder);
         let instance = self.call_rt(self.runtime.instance_new, &[class_value])?;
         self.emit_exc_check()?;
-        let instance_holder = self.temp_var();
-        self.builder.def_var(instance_holder, instance);
+        let instance_holder = self.temp_var()?;
+        self.define_var(instance_holder, instance)?;
 
         if let Some(mapping) = dynamic_kwargs {
-            // Evaluate the arguments into a stack array first: the runtime
-            // router overwrites named slots in place and may allocate while
-            // merging the `**kwargs` dict.
-            let slot = self.stack_array_slot(args.len(), "class constructor arguments")?;
-            for (index, arg) in args.iter().enumerate() {
+            // Evaluate the arguments into rooted scratch slots first: the
+            // runtime router overwrites named slots in place and may allocate
+            // while merging the `**kwargs` dict.
+            let mark = self.scratch_mark();
+            let mut arg_values = Vec::with_capacity(args.len());
+            for arg in args {
                 let value = self.lower_expr(arg)?;
+                self.scratch_push(value)?;
+                arg_values.push(value);
+            }
+            let slot = self.stack_array_slot(args.len(), "class constructor arguments")?;
+            for (index, value) in arg_values.iter().enumerate() {
                 self.builder
                     .ins()
-                    .stack_store(value, slot, (index * 8) as i32);
+                    .stack_store(*value, slot, (index * 8) as i32);
             }
             let mapping = self.lower_expr(mapping)?;
-            let mapping_holder = self.temp_var();
-            self.builder.def_var(mapping_holder, mapping);
+            self.scratch_push(mapping)?;
+            let mapping_holder = self.temp_var()?;
+            self.define_var(mapping_holder, mapping)?;
             let names = self.stack_array_slot(param_names.len() * 2, "class parameter names")?;
             for (index, name) in param_names.iter().enumerate() {
                 let (name_slot, name_len) = make_bytes_slot(&mut self.builder, name.as_bytes())?;
@@ -4954,6 +5873,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 .iconst(types::I64, kwarg_index.map_or(-1, |index| index as i64));
             let mapping = self.builder.use_var(mapping_holder);
             let id = self.runtime.bind_class_kwargs;
+            let slots_scope = self.open_scope(slots_ptr, args.len())?;
             let _ = self.call_rt(
                 id,
                 &[
@@ -4966,6 +5886,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     class_len,
                 ],
             )?;
+            self.close_scope(slots_scope);
+            self.scratch_release(mark)?;
             self.emit_exc_check()?;
 
             let mut values = Vec::with_capacity(args.len() + 1);
@@ -4997,10 +5919,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             return Ok(self.builder.use_var(instance_holder));
         }
 
+        let mark = self.scratch_mark();
         let mut values = Vec::with_capacity(args.len() + 1);
         values.push(self.builder.use_var(instance_holder));
         for arg in args {
-            values.push(self.lower_expr(arg)?);
+            let value = self.lower_expr(arg)?;
+            self.scratch_push(value)?;
+            values.push(value);
         }
         let target = *self.symbols.get(&init).ok_or_else(|| {
             CodegenError::new(format!("class initializer {init} was not declared"))
@@ -5015,6 +5940,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             .ok_or_else(|| {
                 CodegenError::new("internal error: class initializer returned no value")
             })?;
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(self.builder.use_var(instance_holder))
     }
@@ -5051,6 +5977,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             )));
         }
         let deferred = function.is_async || function.is_generator;
+        let is_async_generator = function.is_async && function.is_generator;
         let is_async = function.is_async;
 
         if deferred {
@@ -5064,14 +5991,20 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     function.name
                 )));
             }
-            // Each argument is stored as soon as it is evaluated so that an
-            // allocation in a later argument cannot observe a stale value.
-            let argv_slot = self.stack_array_slot(args.len(), "call arguments")?;
-            for (index, arg) in args.iter().enumerate() {
+            // Each argument is evaluated into the scratch region while later
+            // arguments run; the argv buffer is scoped for the runtime call.
+            let mark = self.scratch_mark();
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
                 let value = self.lower_expr(arg)?;
+                self.scratch_push(value)?;
+                values.push(value);
+            }
+            let argv_slot = self.stack_array_slot(args.len(), "call arguments")?;
+            for (index, value) in values.iter().enumerate() {
                 self.builder
                     .ins()
-                    .stack_store(value, argv_slot, (index * 8) as i32);
+                    .stack_store(*value, argv_slot, (index * 8) as i32);
             }
             let wrapper = *self.wrappers.get(&id).ok_or_else(|| {
                 CodegenError::new(format!("call to undeclared wrapper for function id {id}"))
@@ -5080,22 +6013,28 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             let entry = self.builder.ins().func_addr(self.ptr_ty, reference);
             let entry = self.pointer_to_i64(entry);
             let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
-            // `argc == 0` still passes a valid pointer (the slot has one
-            // element).
             let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
-            let runtime_id = if is_async {
+            let scope = self.open_scope(argv, args.len())?;
+            let runtime_id = if is_async_generator {
+                self.runtime.async_generator_new
+            } else if is_async {
                 self.runtime.coroutine_new
             } else {
                 self.runtime.generator_new
             };
             let result = self.call_rt(runtime_id, &[entry, argc, argv])?;
+            self.close_scope(scope);
+            self.scratch_release(mark)?;
             self.emit_exc_check()?;
             return Ok(result);
         }
 
+        let mark = self.scratch_mark();
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
-            values.push(self.lower_expr(arg)?);
+            let value = self.lower_expr(arg)?;
+            self.scratch_push(value)?;
+            values.push(value);
         }
         let target = *self
             .symbols
@@ -5109,6 +6048,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             .first()
             .copied()
             .ok_or_else(|| CodegenError::new("internal error: user call returned no value"))?;
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -5120,32 +6060,42 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         args: &'a [Expr],
         keywords: &'a [(String, Expr)],
     ) -> Result<Value, CodegenError> {
-        let function_slot = self.stack_array_slot(1, "call kw callee")?;
+        let mark = self.scratch_mark();
         let function = self.lower_expr(callee)?;
-        self.builder.ins().stack_store(function, function_slot, 0);
-        let argv_slot = self.stack_array_slot(args.len(), "call kw arguments")?;
-        for (index, arg) in args.iter().enumerate() {
+        self.scratch_push(function)?;
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
             let value = self.lower_expr(arg)?;
-            self.builder
-                .ins()
-                .stack_store(value, argv_slot, (index * 8) as i32);
+            self.scratch_push(value)?;
+            arg_values.push(value);
         }
         let pairs = keywords
             .len()
             .checked_mul(2)
             .ok_or_else(|| CodegenError::new("call: too many keyword arguments"))?;
-        let kw_slot = self.stack_array_slot(pairs, "call keyword arguments")?;
-        for (index, (keyword, value)) in keywords.iter().enumerate() {
+        let mut kw_values = Vec::with_capacity(keywords.len());
+        for (keyword, value) in keywords {
             let keyword = self.str_const(keyword)?;
-            self.builder
-                .ins()
-                .stack_store(keyword, kw_slot, (index * 16) as i32);
+            self.scratch_push(keyword)?;
             let value = self.lower_expr(value)?;
+            self.scratch_push(value)?;
+            kw_values.push((keyword, value));
+        }
+        let argv_slot = self.stack_array_slot(args.len(), "call kw arguments")?;
+        for (index, value) in arg_values.iter().enumerate() {
             self.builder
                 .ins()
-                .stack_store(value, kw_slot, (index * 16 + 8) as i32);
+                .stack_store(*value, argv_slot, (index * 8) as i32);
         }
-        let function = self.builder.ins().stack_load(types::I64, function_slot, 0);
+        let kw_slot = self.stack_array_slot(pairs, "call keyword arguments")?;
+        for (index, (keyword, value)) in kw_values.iter().enumerate() {
+            self.builder
+                .ins()
+                .stack_store(*keyword, kw_slot, (index * 16) as i32);
+            self.builder
+                .ins()
+                .stack_store(*value, kw_slot, (index * 16 + 8) as i32);
+        }
         let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
         let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
         let kwargc = self
@@ -5153,8 +6103,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             .ins()
             .iconst(self.ptr_ty, keywords.len() as i64);
         let kw_argv = self.builder.ins().stack_addr(self.ptr_ty, kw_slot, 0);
+        let argv_scope = self.open_scope(argv, args.len())?;
+        let kw_scope = self.open_scope(kw_argv, pairs)?;
         let id = self.runtime.call_kw;
         let result = self.call_rt(id, &[function, argc, argv, kwargc, kw_argv])?;
+        self.close_scope(kw_scope);
+        self.close_scope(argv_scope);
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -5183,13 +6138,16 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 ));
             }
         };
+        let mark = self.scratch_mark();
         let value = self.lower_expr(&args[0])?;
+        self.scratch_push(value)?;
         let (spec_slot, spec_len) = make_bytes_slot(&mut self.builder, spec.as_bytes())?;
         let spec_ptr = self.builder.ins().stack_addr(self.ptr_ty, spec_slot, 0);
         let spec_len = self.builder.ins().iconst(self.ptr_ty, spec_len as i64);
         let conversion = self.builder.ins().iconst(types::I32, conversion);
         let id = self.runtime.format;
         let result = self.call_rt(id, &[value, spec_ptr, spec_len, conversion])?;
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -5221,11 +6179,26 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         argc: usize,
         argv: StackSlot,
     ) -> Result<Value, CodegenError> {
+        // The values in `argv` may come from SSA operands that are not owned by
+        // a variable, so publish them in the scratch region before
+        // `lower_builtin_ref` may allocate. The scope only spans the call.
+        let mark = self.scratch_mark();
+        for index in 0..argc {
+            let value = self
+                .builder
+                .ins()
+                .stack_load(types::I64, argv, (index * 8) as i32);
+            self.scratch_push(value)?;
+        }
         let function = self.lower_builtin_ref(builtin)?;
-        let argc = self.builder.ins().iconst(self.ptr_ty, argc as i64);
-        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv, 0);
+        self.scratch_push(function)?;
+        let argc_value = self.builder.ins().iconst(self.ptr_ty, argc as i64);
+        let argv_ptr = self.builder.ins().stack_addr(self.ptr_ty, argv, 0);
+        let scope = self.open_scope(argv_ptr, argc)?;
         let id = self.runtime.call;
-        let result = self.call_rt(id, &[function, argc, argv])?;
+        let result = self.call_rt(id, &[function, argc_value, argv_ptr])?;
+        self.close_scope(scope);
+        self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -5881,6 +6854,27 @@ mod tests {
             main: 0,
             initializers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn generated_functions_register_precise_roots() {
+        let argument = Expr::new(ExprKind::Const(Const::Int(100)), Type::Int, 1);
+        let program = program_assigning(Expr::new(
+            ExprKind::ModuleCall {
+                module: "math".to_string(),
+                function: "sqrt".to_string(),
+                args: vec![argument],
+                keywords: Vec::new(),
+            },
+            Type::Float,
+            1,
+        ));
+        let object = crate::compile_object(&program).expect("module call must lower");
+        assert!(runtime_call_sites(&object, "pyx_gc_frame_push") > 0);
+        assert!(runtime_call_sites(&object, "pyx_gc_frame_pop") > 0);
+        // The module-call argument buffer must be a registered GC scope.
+        assert!(runtime_call_sites(&object, "pyx_gc_scope_push") > 0);
+        assert!(runtime_call_sites(&object, "pyx_gc_scope_pop") > 0);
     }
 
     #[test]

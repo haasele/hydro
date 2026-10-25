@@ -66,3 +66,39 @@ jobs:
 
       - name: Full gate (E2E, AOT, GC)
         run: ./scripts/verify.sh
+
+  # Bounded fuzz smoke (P2-20f): every target runs for a small fixed budget and
+  # a crash fails the job. The 24 h campaign is a manual/local run; see the
+  # header of scripts/fuzz-smoke.sh and fuzz/Cargo.toml.
+  fuzz-smoke:
+    name: bounded fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and fuzz target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            fuzz/stable/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-
+            ${{ runner.os }}-cargo-
+
+      # No cargo-fuzz/nightly on the runner: the script falls back to the
+      # stable harness in fuzz/stable (same harness code, deterministic
+      # bounded inputs).
+      - name: Bounded fuzz smoke
+        timeout-minutes: 15
+        env:
+          FUZZ_ITERATIONS: 200
+        run: ./scripts/fuzz-smoke.sh

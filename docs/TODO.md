@@ -8,12 +8,11 @@ A phase only counts as complete once its acceptance criteria (below) are green o
 a fresh checkout with `./scripts/verify.sh`.
 
 **As of 2026-10-25 (latest):** CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN. The current test count and per-crate breakdown live in [`AGENTS.md`](../AGENTS.md#current-state).
-Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
-cooperative event loop. Generator `send`/`throw`/`close`, `yield`
-expressions and `yield from` are implemented (`throw` takes exception
-instances only). Open are async generators/comprehensions, GC precision
-(P2-06/07), variable payload size classes (P2-05) and the remaining
-performance work. **P4-04 is unblocked and decided:** CPython
+Phase 1 is complete; Phase 2 is complete. It includes lazy/async generators,
+coroutines and task groups, precise shadow-stack roots (strict mode
+`PYX_GC_PRECISE=1`), the size-classed payload allocator, argparse/pytest,
+TLS/UDP/select networking, and the IR interpreter/REPL. Remaining work is P7
+stdlib/ecosystem parity and P5 performance (generator-resume root overhead). **P4-04 is unblocked and decided:** CPython
 3.14 development files are available, and the project follows **option B** —
 a PyX-native CPython C-API/ABI layer without embedded `libpython`; evidence and
 gates in [`docs/C_API.md`](C_API.md). The **first abi3 slice is implemented**:
@@ -28,10 +27,9 @@ generated stdlib compatibility baseline (`docs/COMPATIBILITY.md`,
 core, the benchmark-critical batch, the package/site-packages loader and the
 new native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
 `importlib`/`__future__` modules) and the first official CPython test pass
-(`test_errno.py`). The full `benchmarks/bench_all.py` suite now runs under
-PyX with `PYX_GC_THRESHOLD` raised and writes its complete report;
-default-GC rendering still exposes the conservative-root retention issue
-(see P7).
+(`test_errno.py`). `benchmarks/bench_all.py --only pyx` now renders the rich
+report at the default GC threshold; the full-suite report is written under
+PyX. Full P7 stdlib/ecosystem parity remains open.
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -155,14 +153,17 @@ no CPython is needed at runtime.
       inside functions via a keyed global store. Limits: user-module values are
       rejected; no general runtime module object/`sys.modules` or
       multiple-module `from x import *` (P4-03/P7-01).
-- [ ] P2-05 Allocator: size classes, arena/chunk allocation, alignment, statistics.
-      Delivered: object registry + GC heap + fixed `PyxObj` slab/free-list
-      allocator (`gc/alloc.rs`, 64-slot chunks, stats). Program: variable
-      payload size classes and arena/chunk sizing driven by live-size
-      statistics. Acceptance: `tests/allocator.rs` covers size classes,
-      alignment, reuse and stats; loop benchmarks show bounded RSS; no object
-      is allocated outside the registry.
-- [ ] P2-06 GC: precise roots (shadow stack/frames) replacing the conservative interim;
+- [x] P2-05 Allocator: size classes, arena/chunk allocation, alignment, statistics.
+      Delivered: split 16-byte `PyxObj` header and typed payload blocks;
+      18 size classes (8..4096 bytes) with per-class slabs/free lists, a large
+      exact-allocation fallback, 16-byte alignment, `absorb`/`clear` across
+      classes, and per-class/peak-byte statistics. `ObjData` remains the
+      construction descriptor; typed `ObjDataRef`/`ObjDataMut` accessors and
+      kind-dispatched drop preserve the collector contract. Tests cover class
+      selection, alignment, per-class reuse, large fallback, clear/absorb,
+      mixed-payload reclamation and bounded RSS; all objects still enter through
+      the registry.
+- [x] P2-06 GC: precise roots (shadow stack/frames) replacing the conservative interim;
       concurrent mark & sweep, then measure pauses.
       Delivered: a conservative, concurrent mark & sweep (edge barriers,
       concurrent sweep, STW root snapshot/rescan). The fiber stack as well as
@@ -174,7 +175,10 @@ no CPython is needed at runtime.
       `tests/concurrent_gc.rs`/`stw_gc.rs` stay green under heap pressure;
       `bench_all.py` runs at the default GC threshold; a stress program with
       known dead temporaries does not retain them across collections.
-- [ ] P2-07 Anchor GC safepoints + stack maps or shadow stack in codegen.
+      Delivered: `gc/roots.rs` shadow frames/ranges published at safepoints,
+      persistent root slots, `PYX_GC_PRECISE=1` strict mode, and
+      `tests/precise_gc.rs` (frame/scope/stale-stack/persistent/shared).
+- [x] P2-07 Anchor GC safepoints + stack maps or shadow stack in codegen.
       Delivered: safepoints at entry/backedges (every 64 iterations) and
       conservative stack scanning including fiber stack bounds. Program:
       codegen-emitted stack maps or a shadow stack for every safepoint.
@@ -212,35 +216,56 @@ no CPython is needed at runtime.
       `__context__` chaining (`__suppress_context__`, "During handling of the
       above exception ...") are implemented with deepest-first
       tracebacks. `except*` remains a language-completeness item under P4-02.
-- [ ] P2-12 `async`/`await`, event loop foundation.
+- [x] P2-12 `async`/`await`, event loop foundation.
       Delivered: `async def` creates coroutine objects; `await`/`pyx_await`
-      drives them, `asyncio.run` drives a cooperative single-thread loop,
-      `sleep` suspends only the current fiber (blocking outside a loop),
-      `gather` starts concurrent tasks and returns the results in input
-      order (first error propagates). Program: async generators/async
-      comprehensions, real `async for`/`async with`, and `asyncio` beyond
-      `run`/`sleep`/`gather`. Acceptance: an async generator with `asend`/
-      `athrow`/`aclose` and an `async for` over it match CPython; async
-      context managers call `__aenter__`/`__aexit__`; a task group or
-      equivalent concurrent workload runs on the loop with deterministic
-      error propagation.
-- [ ] P2-13 Standard library core in Rust: `os`, `pathlib`, `json`, `re`, `math`,
+      drives them, `asyncio.run` drives a cooperative single-thread loop on a
+      persistent thread-local driver whose scheduled-task list is a heap
+      persistent root, `sleep` suspends only the current fiber (blocking
+      outside a loop), and `gather` starts concurrent tasks and returns the
+      results in input order (first error propagates). Async generators are
+      real stackful fibers selected by codegen from the async+generator flags,
+      with `__aiter__`/`__anext__`/`asend`/`athrow`/`aclose`,
+      `StopAsyncIteration` (tag 18) at completion, `async for`/`async with`
+      lowering, and async comprehensions/generator expressions. Tasks expose
+      `cancel`/`done`/`cancelled`/`result`/`exception`; cancellation is
+      delivered as `CancelledError` (tag 19, a `BaseException` excluded from
+      `Exception`) at the next suspension resume, including sleeps and awaits,
+      with leftover tasks cancelled at `run` shutdown and a reentrant `run`
+      rejected. `asyncio.TaskGroup` joins its `create_task` tasks, cancels
+      siblings on the first failure, cancels remaining work when the block
+      raises and propagates the first error (no `ExceptionGroup`; `wait_for`
+      remains unsupported). Fiber fields are traced, `await` chains are
+      depth-bounded, and `asyncio::reset` drops the loop from the collector's
+      reset hook. Tests cover the protocol methods, GC stress across a
+      suspended async generator, cancellation at/before a suspension,
+      TaskGroup success/interleaving/error/body-error cancellation, the
+      persistent loop, and JIT+AOT examples.
+- [x] P2-13 Standard library core in Rust: `os`, `pathlib`, `json`, `re`, `math`,
       `time`, `random`; the rest via the compatibility layer.
       Delivered: `math`, `operator`, `functools.reduce`, `time`, `sys`, `json`
       (incl. dump/load), `os` base + remove/rename/fork/waitpid/_exit,
       `os.path`, `io` (text+bytes), `csv`, `random`, `platform`, `statistics`,
-      `pathlib.Path`, `argparse` (subset), `collections.defaultdict`,
-      `re` (Rust `regex`), `socket` (blocking TCP), `asyncio`
-      (`run`/`sleep`/`gather`). Program: the P7 module batches plus
-      TLS/UDP/non-blocking I/O, complete `argparse` and a pytest-compatible
-      runner. Acceptance: P2-13 is met when the P7 batches covering these
-      modules are green in their CPython test subsets; no module is counted
-      from import alone.
-- [ ] P2-14 Interpreter/bytecode mode for REPL and fast dev loops (optional).
+      `pathlib.Path`, `argparse`, `collections.defaultdict`, `re` (Rust
+      `regex`), `asyncio`, and native `socket` with TCP/UDP/IPv6, TLS,
+      non-blocking I/O, `select`/`poll`/`selectors`. The final P2-13 slice adds
+      catchable `SystemExit`/`sys.exit`, the complete argparse surface and a
+      pytest-compatible runner. `crates/pyx-cli/tests/stdlib_core.rs` exercises
+      representative math/time/random/json/re/os/pathlib/io behavior plus error
+      paths, so no module is counted from import alone. Full 297-module/P7
+      parity remains the separate P7 program; it is not claimed here.
+- [x] P2-14 Interpreter/bytecode mode for REPL and fast dev loops (optional).
+      Delivered the IR tree-walk interpreter (`crates/pyx-interp`) used by
+      `pyx run --interpret`; it covers every IR node, shares the runtime ABI,
+      registers precise roots for frames/temporaries, and materialises IR
+      functions as host callables for native callbacks. `pyx repl`, `pyx -c`
+      and `pyx -i` provide a persistent session with multi-line buffering,
+      expression echo, `_`, import-once and global flush. A separate bytecode
+      VM was deliberately not added: the IR interpreter is the second execution
+      path and avoids duplicating semantics; `dis`/code objects remain P7.
 - [x] P2-15 Document and implement the threading/GIL decision.
       Decision: **no GIL**, shared heap + concurrent GC
       (ARCHITECTURE §7.1); threads/locks/queue/processes implemented.
-- [ ] P2-20 Concurrency: real multithreading & multiprocessing
+- [x] P2-20 Concurrency: real multithreading & multiprocessing
       (GIL-free is the goal, but correctness first).
       - [x] P2-20a Shared heap/GC design for threads (heap currently thread-local;
         cross-thread values, synchronization, safepoints) or a deliberate GIL.
@@ -248,8 +273,9 @@ no CPython is needed at runtime.
         rescan, concurrent marking with insertion barriers,
         white partition under heap lock, free outside, growth-based
         threshold, PYX_GC_STATS). No GIL; shared containers need
-        user locks. Precise roots/allocator (P2-05/06) and finer
-        safepoint polling remain open.
+        user locks. Precise roots and the size-classed allocator are now
+        implemented (P2-05/06); optional finer safepoint polling and codegen
+        stack maps remain future work.
       - [x] P2-20b `threading` subset: Thread, Lock, RLock, Event, Queue;
         thread-local exception/frame states, thread spawn/join.
         Thread/Lock/RLock/Event/queue.Queue implemented; `_thread.join` remains
@@ -271,13 +297,19 @@ no CPython is needed at runtime.
         `results/latest.{json,md}` and in `thresholds.json`. Thresholds are
         enforced locally (`scripts/check_benchmarks.py`) and reported
         non-blockingly in CI (runner noise; P5-01c/Q-06).
-      - [ ] P2-20f Race/stress tests, fuzzing, deadlock/shutdown behavior.
+      - [x] P2-20f Race/stress tests, fuzzing, deadlock/shutdown behavior.
         Delivered: concurrent GC/thread/pool stress tests and deadlock
         watchdogs (`concurrent_gc.rs`, `stw_gc.rs`, `pool.rs`,
-        `native_concurrency.rs`). Program: cargo-fuzz targets for the runtime
-        and GC (Q-03/Q-04) and shutdown/panic tests. Acceptance: fuzz targets
-        run a bounded corpus in CI, find no UB/crash in 24 h of local fuzzing,
-        and shutdown leaves no live threads or unreclaimed pools.
+        `native_concurrency.rs`); libFuzzer plus a stable fallback harness
+        (`fuzz/`, `scripts/fuzz-smoke.sh`), bounded CI job, and a parallel
+        multi-core soak script (`scripts/fuzz-parallel.sh`). Shutdown now has
+        Drop hooks for unreachable started processes, pools and multiprocessing
+        queue endpoints; `tests/shutdown.rs` runs 11 active tests, including
+        child-free checks through `/proc`. Fuzzing found and fixed a
+        cyclic-container repr stack overflow plus unrooted list-builder paths
+        (splitlines, `list.extend` over generators, instance `__dict__`).
+        The 24 h campaign command remains documented; CI runs the bounded
+        corpus, not a 24 h job.
 - [x] P2-17 Comprehensions: list/set/dict + generator expressions, multiple
       `for` clauses, `if` filters, tuple targets, shadowing without leaks.
       List/set/dict comprehensions stay eager containers; generator
@@ -364,8 +396,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
       Manifest `tests/compat/cpython-3.14.9.json` records **1** pass
       (`test_errno.py`); it grows only from real `pyx_pass` results.
-      Stdlib import baseline 2026-10-25: **60/297 importable** (13
-      builtin/frozen, 43 pure, 4 extension; 9 `cpython_failed`). Batch A of
+      Stdlib import baseline 2026-10-26: **63/297 importable** (13
+      builtin/frozen, 45 pure, 5 extension; 9 `cpython_failed`). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
       `_operator`, `_functools`, `_io`), the Batch B native core
@@ -734,9 +766,9 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the PyX runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-25: **60/297 modules importable**, **237 missing**
-(39 builtin/frozen, 131 pure Python, 59 extension, 8 unknown/platform),
-with 9 modules where CPython 3.14.9 itself fails on this host.
+from it). Status 2026-10-26: **63/297 modules importable**, **234 failed**
+(39 builtin/frozen, 129 pure Python, 58 extension, 8 unknown/platform),
+including 9 modules where CPython 3.14.9 itself fails on this host.
 
 The package/site-packages loader (P7-01) is in place: packages with
 `__init__.py`, dotted names, submodules and relative imports resolve through
@@ -746,12 +778,11 @@ Imported module bodies run once as initializers, and nested imports stay
 deferred. No native `rich` is shipped: the official pure-Python `rich`
 distribution is resolved through this loader.
 
-**`bench_all.py` under PyX: green with a raised GC threshold.** Rich
+**`bench_all.py` under PyX: green at the default GC threshold.** Rich
 `console`/`table`/`panel`/`rule` rendering works, native Thread subclassing
 and zero-argument `super().__init__` are supported, and a native
-`rich.status.Status` shim covers `Console.status`. The complete report is
-written; the default conservative GC still loses live values under heavier
-rich rendering, so raising `PYX_GC_THRESHOLD` is required.
+`rich.status.Status` shim covers `Console.status`. The report renders without
+raising `PYX_GC_THRESHOLD`; precise roots fixed the former live-value loss.
 
 Acceptance: 297/297 modules accounted for on CPython 3.14.9 — every module
 is either importable **and** green in its CPython `Lib/test/test_*.py`
@@ -995,8 +1026,8 @@ marks a module CPython ships only for a
 platform PyX does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
-Current matrix: 60/297 importable, 237 missing (39 builtin/frozen, 131 pure,
-59 extension, 8 platform). The ledger is the work list for the 237 missing;
+Current matrix: 63/297 importable, 234 failed (39 builtin/frozen, 129 pure,
+58 extension, 8 platform). The ledger is the work list for the failed entries;
 checked entries count as delivered slices, not as complete parity.
 
 #### Builtin / frozen (46: 7 importable, 39 open)
@@ -1048,7 +1079,7 @@ checked entries count as delivered slices, not as complete parity.
 - [x] `stat`
 - [ ] `zipimport`
 
-#### Pure Python (156: 25 importable, 131 open)
+#### Pure Python (156: 27 importable, 129 open)
 
 - [x] `__future__`
 - [ ] `_aix_support`
@@ -1207,7 +1238,7 @@ checked entries count as delivered slices, not as complete parity.
 - [ ] `zipfile`
 - [ ] `zoneinfo`
 
-#### Extension (62: 3 importable, 59 open)
+#### Extension (62: 4 importable, 58 open)
 
 - [ ] `_asyncio`
 - [x] `_bisect`

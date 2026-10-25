@@ -58,6 +58,41 @@ Diagnostic options must therefore precede the source file, and
 .B \-\-
 ends option parsing.
 .TP
+.B repl \fR[\fB\-\-no\-echo\fR] [\fB\-\-no\-banner\fR] [\fB\-\-quiet\fR]
+Run a persistent interpreter session reading standard input until EOF.
+Every input is compiled and executed in the same session namespace, so
+bindings, functions and classes from earlier inputs stay usable, and a
+module imported by one input is initialized only once.
+The value of a trailing top\-level expression statement is printed on
+stdout and stored in
+.BR _ ;
+assignments and compound statements (
+.BR if ,
+.BR for ,
+.BR def ,
+.BR class ,
+...) print nothing.
+An indented block is buffered until a blank line; a genuine syntax error
+is reported immediately and the session continues.
+Prompts and the banner are written to stderr and appear only when standard
+input is a terminal.
+.TP
+.B pyx \-c \fIcode\fR [\fIprogram arguments\fR]
+Run
+.I code
+with the persistent interpreter and exit.
+.B sys.argv[0]
+is
+.BR \-c .
+An uncaught exception is printed and sets exit status 1.
+.TP
+.B pyx \-i \fR[\fIfile.py\fR | \fB\-c\fR \fIcode\fR] [\fIprogram arguments\fR]
+Run the script or
+.B \-c
+code, then enter the same session's REPL without resetting it.
+A compile error in the prelude exits with status 1; a runtime exception is
+reported and the REPL still starts.
+.TP
 .B gc \fR[\fB\-\-json\fR] \fIfile.py\fR [\fIdiagnostic options\fR]
 Compile and run exactly like
 .BR run ,
@@ -80,6 +115,51 @@ file found under
 .IR paths .
 A test passes when its program exits with status 0; there are no
 pytest\-style assertions.
+.TP
+.B pytest \fR[\fIpaths\fR...] [\fB\-q\fR] [\fB\-x\fR] [\fB\-\-maxfail=\fIN\fR] [\fB\-k\fR \fIEXPR\fR] [\fB\-\-json\fR]
+Run pytest\-style tests.
+Every
+.B test_*.py
+and
+.B *_test.py
+file runs in its own child process, so a crash or leaked global state cannot
+abort the run.
+Ancestor
+.B conftest.py
+files contribute fixtures and are initialized once per child.
+The test module may use
+.BR pytest.fixture ,
+.BR pytest.mark.parametrize ,
+.BR pytest.mark.skip ,
+.BR pytest.mark.skipif ,
+.BR pytest.mark.xfail ,
+.BR pytest.raises ,
+.B pytest.approx
+and
+.BR pytest.skip / pytest.fail / pytest.xfail .
+.TP
+.B \-q, \-\-quiet
+Print one status character per test instead of the per\-file report.
+.TP
+.B \-x, \-\-exitfirst
+Stop after the first failure.
+.TP
+.BI \-\-maxfail= N
+Stop after
+.I N
+failures.
+.TP
+.BI \-k " EXPR"
+Only run tests whose names match
+.IR EXPR ,
+a substring expression supporting
+.BR not ,
+.B and
+and
+.BR or .
+.TP
+.B \-\-json
+Print one JSON object with the aggregated results on stdout.
 .TP
 .B fmt \fR[\fIpaths\fR...] [\fB\-\-check\fR] [\fIdiagnostic options\fR]
 Strip trailing whitespace and terminate each file with exactly one newline.
@@ -183,6 +263,28 @@ Errors and diagnostics are always printed.
 and
 .B \-\-quiet
 cannot be combined; doing so is a usage error with exit status 2.
+.SS Interpreter options
+Accepted by
+.B repl
+and, where meaningful, by
+.BR \-i .
+Diagnostic options are also accepted and apply to fragments that fail to
+compile.
+.TP
+.B \-\-no\-echo
+Do not print the value of a trailing top\-level expression (it is still
+stored in
+.BR _ ).
+.TP
+.B \-\-no\-banner
+Do not print the version banner of an interactive session.
+.TP
+.B \-\-quiet
+Suppress the banner and the
+.B >>>
+and
+.B ...
+prompts.
 .SS Diagnostic options
 Accepted by
 .BR check ,
@@ -191,8 +293,11 @@ Accepted by
 .BR build ,
 .BR test ,
 .BR lint
+.BR fmt ,
+.BR repl ,
+.B \-c
 and
-.BR fmt .
+.BR \-i .
 .TP
 .B \-\-json
 Render diagnostics as a JSON array on stderr.
@@ -260,6 +365,11 @@ are skipped; explicit file arguments are always used as given.
 .TP
 .B 0
 Success.
+A
+.B repl
+session exits with status 0 at EOF even when individual inputs raised;
+.B \-c
+returns 1 for an uncaught exception.
 .TP
 .B 1
 User or program error: a diagnostic, a failed program, or an I/O failure.
@@ -274,6 +384,10 @@ the exit status is the one returned by
 .TP
 .B 2
 Usage, setup or internal error, including a compiler panic (ICE).
+.TP
+.B 5
+.B pytest
+collected no tests.
 .SH ENVIRONMENT
 .TP
 .B CC

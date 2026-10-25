@@ -160,14 +160,29 @@ pub(crate) fn parse_single_source(
 /// Diagnostic flags are only recognized before the source file; the first
 /// positional argument selects the file and every later token, including `--`,
 /// is forwarded to the program verbatim. `run -- file.py a` works as well.
+#[allow(dead_code)] // Exercised by the argument-parser unit tests; run uses parse_run_args.
 pub(crate) fn parse_source_and_args(
     args: &[OsString],
     command: &str,
     verbosity: Verbosity,
 ) -> Result<(PathBuf, diag::Options, Vec<String>), CliError> {
+    let (file, options, program_args, _) = parse_run_args(args, command, verbosity)?;
+    Ok((file, options, program_args))
+}
+
+/// Like [`parse_source_and_args`], but also reports `--interpret`.
+///
+/// `--interpret` selects the IR tree-walk interpreter instead of the JIT; it
+/// is only recognized before the source file, like the diagnostic flags.
+pub(crate) fn parse_run_args(
+    args: &[OsString],
+    command: &str,
+    verbosity: Verbosity,
+) -> Result<(PathBuf, diag::Options, Vec<String>, bool), CliError> {
     let mut file: Option<PathBuf> = None;
     let mut program_args = Vec::new();
     let mut positional_only = false;
+    let mut interpret = false;
     let mut options = diag::Options {
         verbosity,
         ..diag::Options::default()
@@ -180,6 +195,10 @@ pub(crate) fn parse_source_and_args(
         let text = arg.to_string_lossy();
         if !positional_only && text == "--" {
             positional_only = true;
+            continue;
+        }
+        if !positional_only && text == "--interpret" {
+            interpret = true;
             continue;
         }
         if !positional_only && text.starts_with('-') && text != "-" {
@@ -195,7 +214,7 @@ pub(crate) fn parse_source_and_args(
     }
     let file =
         file.ok_or_else(|| CliError::usage(format!("pyx: {command}: missing source file")))?;
-    Ok((file, options, program_args))
+    Ok((file, options, program_args, interpret))
 }
 
 /// Options of `new`/`init`: one destination and the overwrite switch.
@@ -436,6 +455,195 @@ pub(crate) fn parse_build(
     })
 }
 
+/// Presentation and diagnostic options of the persistent interpreter
+/// (`pyx repl`, `pyx -i`).
+pub(crate) struct ReplOptions {
+    /// Echo the value of a trailing top-level expression (`--no-echo`
+    /// disables it).
+    pub(crate) echo: bool,
+    /// Print the version banner when the session is interactive
+    /// (`--no-banner` disables it).
+    pub(crate) banner: bool,
+    /// Suppress the banner and prompts (`--quiet`, also a global flag).
+    pub(crate) quiet: bool,
+    pub(crate) diag: diag::Options,
+}
+
+impl ReplOptions {
+    fn new(verbosity: Verbosity) -> ReplOptions {
+        ReplOptions {
+            echo: true,
+            banner: true,
+            quiet: verbosity.is_quiet(),
+            diag: diag::Options {
+                verbosity,
+                ..diag::Options::default()
+            },
+        }
+    }
+}
+
+/// Applies a REPL flag, including the diagnostic flags every command shares.
+fn apply_repl_flag(
+    text: &str,
+    options: &mut ReplOptions,
+    command: &str,
+) -> Option<Result<(), CliError>> {
+    match text {
+        "--no-echo" => {
+            options.echo = false;
+            return Some(Ok(()));
+        }
+        "--no-banner" => {
+            options.banner = false;
+            return Some(Ok(()));
+        }
+        _ => {}
+    }
+    apply_diag_flag(text, &mut options.diag, command)
+}
+
+/// Parse `pyx repl [--no-echo] [--no-banner] [--quiet] [diagnostic options]`.
+pub(crate) fn parse_repl_args(
+    args: &[OsString],
+    command: &str,
+    verbosity: Verbosity,
+) -> Result<ReplOptions, CliError> {
+    let mut options = ReplOptions::new(verbosity);
+    for arg in args {
+        let text = arg.to_string_lossy();
+        match apply_repl_flag(text.as_ref(), &mut options, command) {
+            Some(result) => result?,
+            None => {
+                return Err(CliError::usage(format!(
+                    "pyx: {command}: unexpected argument '{text}'"
+                )))
+            }
+        }
+    }
+    options.quiet = options.diag.verbosity.is_quiet();
+    Ok(options)
+}
+
+/// Source executed before an interactive session starts (`pyx -i ...`).
+pub(crate) enum Prelude {
+    /// `-c <code>`: compile and run `code` from `<pyx -c>`.
+    Command(String),
+    /// A script file, compiled and run before the REPL reads standard input.
+    File(PathBuf),
+}
+
+/// A top-level `-c`/`-i` invocation, recognized before subcommand dispatch.
+pub(crate) enum InterpreterRequest {
+    /// `pyx -c <code> [args...]`: run `code` and exit. `sys.argv[0]` is
+    /// `-c`.
+    Command {
+        code: String,
+        program_args: Vec<String>,
+        /// Diagnostics and echo/banner settings; echo is off for `-c`.
+        options: ReplOptions,
+    },
+    /// `pyx -i [<file> | -c <code>] [args...]`: run the optional prelude and
+    /// then enter the REPL with the same session.
+    Interactive {
+        prelude: Option<Prelude>,
+        program_args: Vec<String>,
+        options: ReplOptions,
+    },
+}
+
+/// Recognizes `-c` and `-i` as the first argument after the global flags.
+///
+/// Returns `Ok(None)` for every other first argument so [`super::dispatch`]
+/// can continue with the regular subcommands.
+pub(crate) fn parse_interpreter_entry(
+    args: &[OsString],
+    verbosity: Verbosity,
+) -> Result<Option<InterpreterRequest>, CliError> {
+    let Some(first) = args.first() else {
+        return Ok(None);
+    };
+    let first = first.to_string_lossy();
+    match first.as_ref() {
+        "-c" => {
+            let code = args
+                .get(1)
+                .ok_or_else(|| CliError::usage("pyx: -c: missing code"))?;
+            let mut options = ReplOptions::new(verbosity);
+            // `-c` is not interactive: expression values are not echoed.
+            options.echo = false;
+            Ok(Some(InterpreterRequest::Command {
+                code: code.to_string_lossy().into_owned(),
+                program_args: program_args(&args[2..]),
+                options,
+            }))
+        }
+        "-i" => Ok(Some(parse_interactive(&args[1..], verbosity)?)),
+        _ => Ok(None),
+    }
+}
+
+fn program_args(args: &[OsString]) -> Vec<String> {
+    args.iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Parses the arguments after `pyx -i`.
+///
+/// Flags come first, then either `-c <code>` or a script path; everything
+/// after the code/script is a program argument. Without either, the session
+/// starts empty.
+fn parse_interactive(
+    args: &[OsString],
+    verbosity: Verbosity,
+) -> Result<InterpreterRequest, CliError> {
+    let mut options = ReplOptions::new(verbosity);
+    let mut prelude = None;
+    let mut program = Vec::new();
+    let mut positional_only = false;
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_string_lossy();
+        if !positional_only && text == "--" {
+            positional_only = true;
+            index += 1;
+            continue;
+        }
+        if !positional_only && text == "-c" {
+            let code = args
+                .get(index + 1)
+                .ok_or_else(|| CliError::usage("pyx: -i: option '-c' requires code"))?;
+            prelude = Some(Prelude::Command(code.to_string_lossy().into_owned()));
+            program = program_args(&args[index + 2..]);
+            break;
+        }
+        if !positional_only && text.starts_with('-') && text != "-" {
+            match apply_repl_flag(text.as_ref(), &mut options, "-i") {
+                Some(result) => {
+                    result?;
+                    index += 1;
+                    continue;
+                }
+                None => {
+                    return Err(CliError::usage(format!(
+                        "pyx: -i: unsupported option '{text}'"
+                    )))
+                }
+            }
+        }
+        prelude = Some(Prelude::File(PathBuf::from(args[index].as_os_str())));
+        program = program_args(&args[index + 1..]);
+        break;
+    }
+    options.quiet = options.diag.verbosity.is_quiet();
+    Ok(InterpreterRequest::Interactive {
+        prelude,
+        program_args: program,
+        options,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_source_and_args, Verbosity};
@@ -443,6 +651,16 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<std::ffi::OsString> {
         values.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn run_accepts_interpret_before_source() {
+        let input = args(&["--interpret", "--color=never", "a.py", "--interpret"]);
+        let (file, _options, program_args, interpret) =
+            super::parse_run_args(&input, "run", Verbosity::Normal).unwrap();
+        assert_eq!(file, PathBuf::from("a.py"));
+        assert_eq!(program_args, ["--interpret"]);
+        assert!(interpret);
     }
 
     #[test]

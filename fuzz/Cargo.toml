@@ -1,0 +1,59 @@
+# libFuzzer targets (P2-20f).
+#
+# These are built by `cargo fuzz` on nightly with sanitizer/coverage flags; a
+# plain stable `cargo build` of this manifest is not expected to work (that is
+# what `fuzz/stable/` is for -- same harness code, no libfuzzer-sys).
+#
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run frontend_pipeline -- -runs=2000 -max_total_time=15 -timeout=10
+#   cargo +nightly fuzz run runtime_gc        -- -runs=2000 -max_total_time=15 -timeout=10
+#
+# Bounded smoke (both backends): ./scripts/fuzz-smoke.sh
+# 24 h campaign (resumable through fuzz/corpus/<target>):
+#   cargo +nightly fuzz run frontend_pipeline -- -max_total_time=86400 -timeout=10
+#   cargo +nightly fuzz run runtime_gc        -- -max_total_time=86400 -timeout=10
+# Without nightly, soak the stable harness instead:
+#   cargo build --release --manifest-path fuzz/stable/Cargo.toml
+#   fuzz/stable/target/release/pyx-fuzz-stable runtime_gc --iterations 500000
+[package]
+name = "pyx-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pyx-frontend = { path = "../crates/pyx-frontend" }
+pyx-codegen = { path = "../crates/pyx-codegen" }
+pyx-runtime = { path = "../crates/pyx-runtime" }
+
+# `cargo-fuzz` targets. Bounded local smoke run: `scripts/fuzz-smoke.sh`.
+# Long campaign (24 h per target, resumable through the corpus directory):
+#   cargo +nightly fuzz run frontend_pipeline -- -max_total_time=86400 -timeout=10
+#   cargo +nightly fuzz run runtime_gc        -- -max_total_time=86400 -timeout=10
+[[bin]]
+name = "frontend_pipeline"
+path = "fuzz_targets/frontend_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "runtime_gc"
+path = "fuzz_targets/runtime_gc.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+# Standalone workspace: `cargo fuzz` builds this manifest with nightly and
+# sanitizer flags, which must not leak into the normal workspace build.
+[workspace]

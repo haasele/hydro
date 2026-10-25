@@ -529,6 +529,9 @@ pub enum ExcKind {
     /// Root exception class matching every exception (Python's
     /// `BaseException`).
     BaseException,
+    /// `StopAsyncIteration`: the normal end of an asynchronous iterator,
+    /// caught by `async for` lowering.
+    StopAsyncIteration,
 }
 
 impl ExcKind {
@@ -554,6 +557,9 @@ impl ExcKind {
             ExcKind::FileNotFoundError => 15,
             ExcKind::NameError => 16,
             ExcKind::SystemExit => 17,
+            // `StopAsyncIteration`, raised when an asynchronous iterator is
+            // exhausted.
+            ExcKind::StopAsyncIteration => 18,
         }
     }
 
@@ -574,6 +580,7 @@ impl ExcKind {
             ExcKind::AssertionError => "AssertionError",
             ExcKind::NameError => "NameError",
             ExcKind::SystemExit => "SystemExit",
+            ExcKind::StopAsyncIteration => "StopAsyncIteration",
             ExcKind::GeneratorExit => "GeneratorExit",
             ExcKind::Exception => "Exception",
             ExcKind::BaseException => "BaseException",
@@ -598,6 +605,7 @@ impl ExcKind {
             "AssertionError" => ExcKind::AssertionError,
             "NameError" => ExcKind::NameError,
             "SystemExit" => ExcKind::SystemExit,
+            "StopAsyncIteration" => ExcKind::StopAsyncIteration,
             "Exception" => ExcKind::Exception,
             "BaseException" => ExcKind::BaseException,
             "IOError" => ExcKind::OSError,

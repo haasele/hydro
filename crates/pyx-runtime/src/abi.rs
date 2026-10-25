@@ -1,5 +1,6 @@
 use std::os::raw::c_uchar;
 
+use crate::gc::roots;
 use crate::{builtins, container, exc, fiber, format, heap, iter, methods, modules, ops, value};
 
 // Constants (tagged representation, see ARCHITECTURE §3.1)
@@ -693,6 +694,17 @@ pub extern "C" fn pyx_coroutine_new(entry: *const c_uchar, argc: usize, argv: *c
     fiber_new(entry, argc, argv, fiber::FiberKind::Coroutine)
 }
 
+/// Creates a lazy async generator object from a generated wrapper entry point.
+/// The body does not run until the first `__anext__`/`asend`.
+#[no_mangle]
+pub extern "C" fn pyx_async_generator_new(
+    entry: *const c_uchar,
+    argc: usize,
+    argv: *const i64,
+) -> i64 {
+    fiber_new(entry, argc, argv, fiber::FiberKind::AsyncGenerator)
+}
+
 fn fiber_new(entry: *const c_uchar, argc: usize, argv: *const i64, kind: fiber::FiberKind) -> i64 {
     if entry.is_null() {
         return exc::raise_with_message(exc::RUNTIME_ERROR, "fiber entry point is NULL");
@@ -706,6 +718,9 @@ fn fiber_new(entry: *const c_uchar, argc: usize, argv: *const i64, kind: fiber::
         }
         fiber::FiberKind::Coroutine => {
             value::fiber_coroutine_new(entry as usize, String::new(), args)
+        }
+        fiber::FiberKind::AsyncGenerator => {
+            value::fiber_async_generator_new(entry as usize, String::new(), args)
         }
     };
     match created {
@@ -1520,6 +1535,53 @@ pub extern "C" fn pyx_safepoint() {
 #[no_mangle]
 pub extern "C" fn pyx_gc_objects() -> i64 {
     heap::objects() as i64
+}
+
+// Precise shadow-stack roots (P2-06/P2-07)
+
+/// Registers a precise shadow frame and returns its token (never `0`).
+///
+/// `base` points at `capacity` writable `i64` slots owned by the generated
+/// frame; all of them are initialised to tagged `None` before the frame
+/// becomes visible to the collector, so the capacity must cover every local,
+/// temporary and return-value slot that can hold a tagged value. The frame
+/// is popped with the returned token. The call allocates no PyX objects and
+/// takes no heap lock.
+#[no_mangle]
+pub extern "C" fn pyx_gc_frame_push(base: *mut i64, capacity: usize) -> usize {
+    roots::frame_push(base, capacity)
+}
+
+/// Unregisters the innermost shadow frame pushed by
+/// [`pyx_gc_frame_push`]. Tokens must be popped in LIFO order.
+#[no_mangle]
+pub extern "C" fn pyx_gc_frame_pop(token: usize) {
+    roots::frame_pop(token);
+}
+
+/// Narrows the scanned prefix of the frame identified by `token`.
+///
+/// The frame must still be the innermost one and `used` is clamped to its
+/// capacity.
+#[no_mangle]
+pub extern "C" fn pyx_gc_frame_used(token: usize, used: usize) {
+    roots::frame_used(token, used);
+}
+
+/// Registers a precise root range covering `count` tagged values owned by
+/// the caller (`argv`, a packed argument buffer, a stack array) and returns
+/// its token (never `0`). The values are already initialised; the range is
+/// popped with [`pyx_gc_scope_pop`].
+#[no_mangle]
+pub extern "C" fn pyx_gc_scope_push(base: *const i64, count: usize) -> usize {
+    roots::scope_push(base, count)
+}
+
+/// Unregisters the innermost root range pushed by [`pyx_gc_scope_push`].
+/// Tokens must be popped in LIFO order.
+#[no_mangle]
+pub extern "C" fn pyx_gc_scope_pop(token: usize) {
+    roots::scope_pop(token);
 }
 
 #[no_mangle]

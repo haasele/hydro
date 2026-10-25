@@ -6,19 +6,26 @@
 //! of [`Diagnostic`]s. [`check_file`] additionally resolves imports of user
 //! modules and packages (siblings, site-packages and `PYTHONPATH`) and links
 //! them into one program. Both must never panic on user input.
+//!
+//! [`session::SessionCompiler`] builds incremental REPL/interpreter fragments
+//! on top of the same parser, lowerer and type checker, preserving modules,
+//! import bindings and session globals between fragments.
 
 pub mod diag;
 mod lower;
 mod sema;
+pub mod session;
 
+pub use diag::Diagnostic;
+pub use session::{
+    is_incomplete, SessionCompiler, SessionEntry, SessionFragment, SessionImport, SessionOptions,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use pyx_ir::{FunctionId, Program};
 use rustpython_parser::{ast, Mode};
-
-pub use diag::Diagnostic;
 
 use diag::codes;
 use lower::{HFunction, HParam, LHir, Lowerer, UserModule};
@@ -132,6 +139,86 @@ pub fn check_file(path: &Path) -> Result<Program, Vec<Diagnostic>> {
     lower_modules(&loader.units)
 }
 
+/// Parse, lower and type-check a pytest test file together with every
+/// ancestor `conftest.py`.
+///
+/// `conftest.py` units are loaded before the test file and linked as its
+/// dependencies (root-most first, so the nearest conftest wins fixture
+/// lookups). Their module bodies run once per child, before the test body, and
+/// their fixtures are visible to the generated test wrappers by name. Returns
+/// the same typed [`Program`] as [`check_file`].
+pub fn check_pytest_file(path: &Path) -> Result<Program, Vec<Diagnostic>> {
+    let mut loader = ModuleLoader::default();
+    let display = path.to_path_buf();
+    let key = fs::canonicalize(path).unwrap_or_else(|_| display.clone());
+    let root = display
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+
+    // Root-most conftest first. A deeper conftest depends on its parent so the
+    // lowerer can reference parent fixtures while generating wrappers.
+    let mut directories: Vec<PathBuf> = display
+        .parent()
+        .map(Path::ancestors)
+        .into_iter()
+        .flatten()
+        .map(Path::to_path_buf)
+        .collect();
+    directories.reverse();
+    directories.dedup();
+
+    let mut conftests: Vec<usize> = Vec::new();
+    for (index, directory) in directories.iter().enumerate() {
+        let candidate = directory.join("conftest.py");
+        if !candidate.is_file() {
+            continue;
+        }
+        let conftest_key = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        let name = format!("conftest{index}");
+        if let Some(unit) =
+            loader.load_file(conftest_key, candidate, name, String::new(), root.clone())
+        {
+            if let Some(parent) = conftests.last().copied() {
+                loader.units[unit].deps.push(parent);
+            }
+            conftests.push(unit);
+        }
+    }
+
+    let entry = loader.load_file(
+        key,
+        display,
+        "__main__".to_string(),
+        String::new(),
+        root.clone(),
+    );
+    if let Some(entry) = entry {
+        for conftest in &conftests {
+            if !loader.units[entry].deps.contains(conftest) {
+                loader.units[entry].deps.push(*conftest);
+            }
+        }
+        if loader.diags.is_empty() {
+            loader.preload_deferred_site_modules(entry, &root);
+        }
+    }
+
+    if !loader.diags.is_empty() {
+        return Err(loader.diags);
+    }
+    if loader.units.is_empty() {
+        return Err(vec![Diagnostic::new(
+            &path.to_string_lossy(),
+            1,
+            1,
+            "cannot read module",
+        )]);
+    }
+    lower_modules(&loader.units)
+}
+
 /// A parsed module in dependency order (dependencies before importers).
 struct LoadedModule {
     /// Full dotted module name; `__main__` for the entry file.
@@ -240,6 +327,83 @@ struct ModuleLoader {
 }
 
 impl ModuleLoader {
+    /// Loads one source unit that has no file on disk (a REPL fragment,
+    /// `<stdin>` or `<pyx -c>`) and resolves its module-level imports.
+    ///
+    /// `virtual_key` is the loader identity of this unit: callers compiling
+    /// several fragments must pass a fresh key per fragment so the units stay
+    /// distinct. `filename` is the display name used for diagnostics and for
+    /// resolving imports: a real path anchors the search at its directory,
+    /// while `<stdin>` searches the current directory.
+    ///
+    /// Diagnostics produced while scanning imports are returned instead of
+    /// being left in the loader, so a failed fragment can be rolled back by
+    /// the caller.
+    #[allow(dead_code)] // Public-to-the-crate session helper; `load_source_at` is used directly.
+    pub(crate) fn load_source(
+        &mut self,
+        virtual_key: PathBuf,
+        source: String,
+        filename: String,
+    ) -> Result<usize, Vec<Diagnostic>> {
+        let importer_dir = Path::new(&filename)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        self.load_source_at(virtual_key, source, filename, importer_dir)
+    }
+
+    /// [`Self::load_source`] with an explicit import search root.
+    pub(crate) fn load_source_at(
+        &mut self,
+        virtual_key: PathBuf,
+        source: String,
+        filename: String,
+        importer_dir: PathBuf,
+    ) -> Result<usize, Vec<Diagnostic>> {
+        let diags_before = self.diags.len();
+        let file = filename.clone();
+        let module = parse_module(&source, &file)?;
+
+        let display = PathBuf::from(&filename);
+        self.stack
+            .push((virtual_key.clone(), "__main__".to_string()));
+        let mut scan = ImportScan::default();
+        self.scan_imports(
+            &module,
+            &source,
+            &display,
+            &importer_dir,
+            &importer_dir,
+            "__main__",
+            "",
+            &mut scan,
+        );
+        self.stack.pop();
+
+        if scan.failed {
+            return Err(self.diags.split_off(diags_before));
+        }
+
+        let index = self.units.len();
+        self.units.push(LoadedModule {
+            name: "__main__".to_string(),
+            package: String::new(),
+            display: file,
+            source,
+            module,
+            deps: scan.deps,
+            late: scan.late,
+            deferred: scan.deferred,
+        });
+        // The key is not registered in `loaded`: a session deliberately
+        // compiles every fragment as a new unit, even when it reuses a
+        // virtual filename such as `<stdin>`.
+        debug_assert_eq!(self.units.len() - 1, index);
+        Ok(index)
+    }
+
     /// Loads `display` (keyed by the canonical `key`) and its module-level
     /// user imports. Nested imports are recorded but never loaded: they only
     /// run when their enclosing code executes.

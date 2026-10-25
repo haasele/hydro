@@ -5,13 +5,18 @@ use std::ffi::OsString;
 use super::args;
 use super::commands::{
     cmd_add, cmd_build, cmd_check, cmd_clean, cmd_completions, cmd_doctor, cmd_fmt, cmd_gc,
-    cmd_help, cmd_init, cmd_lint, cmd_lock, cmd_new, cmd_remove, cmd_run, cmd_spawn, cmd_sync,
-    cmd_test, cmd_version,
+    cmd_help, cmd_init, cmd_interpreter, cmd_lint, cmd_lock, cmd_new, cmd_pytest, cmd_pytest_child,
+    cmd_remove, cmd_repl, cmd_run, cmd_spawn, cmd_sync, cmd_test, cmd_version,
 };
 use super::{CliError, CliResult};
 
 pub(crate) fn dispatch(args: &[OsString]) -> CliResult {
     let (verbosity, args) = args::parse_global(args)?;
+    // `pyx -c <code>` and `pyx -i [...]` are interpreter entry points, not
+    // subcommands: they are recognized before the command name is looked up.
+    if let Some(request) = args::parse_interpreter_entry(&args, verbosity)? {
+        return cmd_interpreter(request);
+    }
     let Some(command) = args.first() else {
         return Err(CliError::usage("pyx: missing command"));
     };
@@ -21,9 +26,13 @@ pub(crate) fn dispatch(args: &[OsString]) -> CliResult {
         "init" => cmd_init(&args[1..], verbosity),
         "check" => cmd_check(&args[1..], verbosity),
         "run" => cmd_run(&args[1..], verbosity),
+        "repl" => cmd_repl(&args[1..], verbosity),
         "gc" => cmd_gc(&args[1..], verbosity),
         "build" => cmd_build(&args[1..], verbosity),
         "test" => cmd_test(&args[1..], verbosity),
+        "pytest" => cmd_pytest(&args[1..], verbosity),
+        // Internal entry point used by `pyx pytest` for one isolated file.
+        "__pytest" => cmd_pytest_child(&args[1..], verbosity),
         "fmt" => cmd_fmt(&args[1..], verbosity),
         "lint" => cmd_lint(&args[1..], verbosity),
         "clean" => cmd_clean(&args[1..], verbosity),

@@ -8,21 +8,93 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25 the full suite is green (`scripts/verify.sh` ALL GREEN; current
-test count and breakdown in [`AGENTS.md`](AGENTS.md#current-state)). The official
-CPython suite has its first real pass (`test_errno.py`), recorded in the
-manifest. The first abi3
-extension slice runs under JIT and AOT without `libpython`; the full C
-API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
-60/297 standard-library modules are importable (13 builtin/frozen, 43 pure,
-4 extension). The **full** `benchmarks/bench_all.py` suite (without
-`--only`) runs under PyX with `PYX_GC_THRESHOLD` raised: all five benchmark
-groups complete, the rich report renders, all AOT binaries build, and the
-default-GC path still exposes a conservative-root retention issue under
-heavier rich rendering. See the package-loader entry below.
+As of 2026-10-26 the full suite is green (`scripts/verify.sh` ALL GREEN;
+current test count and breakdown in [`AGENTS.md`](AGENTS.md#current-state)).
+P2 is complete: precise shadow-stack roots, the size-classed payload
+allocator, async generators/TaskGroup, the standard-library core plus
+TLS/UDP/non-blocking networking, argparse/pytest, the IR interpreter/REPL,
+and the fuzz/shutdown gate are in place. The official CPython suite still has
+one real pass (`test_errno.py`); the first abi3 extension slice runs under JIT
+and AOT without `libpython`. Full P7 stdlib parity, the C API/ABI and
+ecosystem work remain open. `benchmarks/bench_all.py --only pyx` now renders
+the rich report at the **default** GC threshold.
 
 ### Added
 
+- **Size-classed payload allocator (P2-05):** `PyxObj` is a 16-byte header with
+  a typed payload pointer; 18 payload size classes, per-class slabs/free lists,
+  exact large-object fallback, 16-byte alignment, cross-class absorb/clear and
+  per-class/peak-byte statistics. Typed `ObjDataRef`/`ObjDataMut` views and
+  kind-dispatched drop replace the single inline enum cell. Tests cover class
+  selection, alignment, reuse, large objects, mixed reclamation and bounded
+  RSS.
+- **Parallel fuzz and shutdown gate (P2-20f):** libFuzzer plus stable
+  fallback targets for frontend/codegen and runtime/GC, a bounded CI smoke
+  script, and `scripts/fuzz-parallel.sh` to soak every core with independent
+  seeds. Unreachable started processes, pools and multiprocessing queue
+  endpoints now clean themselves up through bounded Drop hooks;
+  `tests/shutdown.rs` verifies child-free shutdown through `/proc`. The fuzz
+  campaign found and fixed recursive cyclic-container repr, unrooted
+  `splitlines`/`list.extend(generator)` builders and instance `__dict__`
+  construction.
+- **Persistent REPL and `-c`/`-i` (P2-14):** `pyx repl` buffers incomplete
+  blocks to a blank line, echoes the trailing expression, stores `_`, keeps
+  imports initialized once, continues after exceptions, and flushes
+  source-bound module names into the session global table. `pyx -c` and
+  `pyx -i` share the same interpreter session without resetting the heap.
+- **pytest-compatible runner (P2-13):** `pyx pytest [paths...]` discovers
+  `test_*.py`/`*_test.py` files and runs each in an isolated child process,
+  aggregating results with exit codes 0 (pass), 1 (failure), 2
+  (collection/internal) and 5 (no tests). The native `pytest` module supplies
+  `raises` (real `with` suppression, `match=`, `.value`/`.type`), `approx`,
+  `fail`, `skip`, `xfail`, `fixture` and `mark.*` identities. Test modules use
+  `@pytest.fixture` (function and module scope, `yield` teardown), ancestor
+  `conftest.py` fixtures, compile-time `parametrize` expansion, skip/skipif/
+  xfail markers, and pytest assertion messages (the statement source text).
+  `Test*` classes with `test*` methods are collected through a runtime class
+  registry. `-q`, `-x`, `--maxfail`, `-k` and `--json` are supported;
+  `pyx test` keeps its existing exit-status contract.
+- **argparse and `SystemExit` (P2-13):** `sys.exit()` now raises a catchable
+  `SystemExit` instead of terminating the process; uncaught it prints no
+  traceback and uses the stored code (`None`/`0` → 0, integers masked to one
+  byte, strings → stderr plus 1). `argparse` gained the constructor
+  parameters, all standard actions, `nargs` (`None`/`?`/`*`/`+`/`N`),
+  argument and mutually exclusive groups, subparsers, `set_defaults`,
+  `parse_known_args`, the scanner (`--opt=value`, short clusters, `--`,
+  abbreviations, negative numbers), CPython-style help/usage rendering and
+  the `Namespace`/formatter/`SUPPRESS`/`FileType`/`Action` exports. Parse
+  errors raise `SystemExit(2)`; `-h`/`--version` raise `SystemExit(0)`.
+- **IR tree-walk interpreter (P2-14):** `pyx run --interpret <file.py>` runs
+  the typed IR without Cranelift through the new `pyx-interp` crate. It shares
+  the runtime value model and ABI operators, executes module initializers
+  once, covers every `ExprKind`/`StmtKind` (evaluation order, loops/`else`,
+  `try`/`except`/`else`/`finally` with bare and chained raise, classes,
+  closures/cells, comprehensions, unpacking, slices, generators and async via
+  runtime fibers), and registers precise GC roots for every frame and
+  temporary. IR functions materialise as runtime host function values, so
+  native callbacks (`sorted(key=...)`, `threading.Thread` targets,
+  `functools.partial`) and class/method dispatch re-enter the interpreter.
+- **Async generators, tasks and `TaskGroup` (P2-12):** `async def` with
+  `yield` creates a lazy async generator with the real
+  `__aiter__`/`__anext__`/`asend`/`athrow`/`aclose` protocol and
+  `StopAsyncIteration` completion; `async for`, `async with` and async
+  comprehensions use it. `asyncio` keeps a persistent thread-local loop whose
+  scheduled tasks are a heap persistent root, adds `create_task`/
+  `current_task` and task methods (`cancel`/`done`/`cancelled`/`result`/
+  `exception`), delivers `CancelledError` at suspension resume and cancels
+  leftover tasks at `run` shutdown. `asyncio.TaskGroup` joins its tasks,
+  cancels siblings on the first failure and on a raising body, and propagates
+  the first error (no `ExceptionGroup`). Built-in exception classes now
+  construct instances (`ValueError('x')`) and `type(e)` returns the same
+  cached class object that the exception name resolves to.
+- **Precise GC roots (P2-06/P2-07):** generated frames and caller-owned value
+  arrays are registered in a shadow-stack registry (`pyx_gc_frame_push`/
+  `pyx_gc_scope_push`), published at safepoint/blocking slow paths and marked
+  exactly by the collector; their byte extents are excluded from conservative
+  stack scans. `PYX_GC_PRECISE=1` selects strict mode, which disables
+  conservative stack/register scanning entirely. Persistent root slots cover
+  long-lived Rust-side owners (asyncio loop tasks), and `GcStats`/`pyx gc`
+  report the mode plus the precise frame count.
 - **Math intrinsic fast path:** `math.floor(math.sqrt(int))` lowers to an
   unboxed Cranelift f64 `sqrt`/floor with a runtime fallback for negatives and
   non-integers, removing one heap `float` per iteration and both native-module

@@ -13,7 +13,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -46,8 +45,10 @@ pub(crate) mod importlib;
 pub(crate) mod itertools;
 pub(crate) mod keyword;
 pub(crate) mod mimetypes;
+pub(crate) mod pytest;
 pub(crate) mod quopri;
 pub(crate) mod re;
+pub(crate) mod select;
 pub(crate) mod shutil;
 pub(crate) mod socket;
 pub(crate) mod stat;
@@ -380,6 +381,9 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if module == "unittest" && name == "TestCase" {
         return unittest::test_case();
     }
+    if module == "pytest" && name == "mark" {
+        return pytest::marks();
+    }
     if let Some(spec) = stdlib::function(module, name) {
         let module_name = stdlib::module(module).map(|m| m.name).unwrap_or("<module>");
         return value::native_function_new(module_name, spec.name, spec.max_args);
@@ -553,6 +557,11 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
     match module {
         "functools" | "_functools" => functools_call_kw(function, args, keywords),
         "dataclasses" => dataclasses_call_kw(function, args, keywords),
+        "argparse" => argparse::call_kw(function, args, &keywords),
+        "socket" => socket::call_kw(function, args, keywords),
+        "ssl" => socket::ssl_call_kw(function, args, keywords),
+        "select" => select::call_kw(function, args, keywords),
+        "pytest" => pytest::call_kw(function, args, keywords),
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("{module}.{function}() does not accept keyword arguments"),
@@ -597,8 +606,12 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "collections" => collections::call(function, args),
         "re" => re::call(function, args),
         "socket" => socket::call(function, args),
+        "select" => select::call(function, args),
+        "selectors" => select::selectors_call(function, args),
+        "ssl" => socket::ssl_call(function, args),
         "asyncio" => asyncio::call(function, args),
         "unittest" => unittest::call(function, args),
+        "pytest" => pytest::call(function, args),
         "binascii" => binascii::call(function, args),
         "base64" => base64::call(function, args),
         "quopri" => quopri::call(function, args),
@@ -706,16 +719,25 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // limitation is that concurrent instances share nothing, which is the
         // usual pattern for console/render state.
         ("threading", "local") => value::class_new("local".to_string(), NONE, Vec::new()),
-        // Accepted for `ArgumentParser(formatter_class=...)`; the help
-        // renderer is fixed, so the formatter is always the default.
-        ("argparse", "RawTextHelpFormatter") => NONE,
-        ("socket", "AF_INET") => encode_int(2),
-        ("socket", "SOCK_STREAM") => encode_int(1),
-        ("socket", "SOL_SOCKET") => encode_int(1),
-        ("socket", "SO_REUSEADDR") => encode_int(2),
-        ("socket", "SHUT_RD") => encode_int(0),
-        ("socket", "SHUT_WR") => encode_int(1),
-        ("socket", "SHUT_RDWR") => encode_int(2),
+        // Help formatters are marker classes; `ArgumentParser` reads the
+        // class name to select layout details. `SUPPRESS` is CPython's
+        // sentinel string.
+        (
+            "argparse",
+            name @ ("RawTextHelpFormatter"
+            | "RawDescriptionHelpFormatter"
+            | "ArgumentDefaultsHelpFormatter"
+            | "MetavarTypeHelpFormatter"
+            | "HelpFormatter"
+            | "Action"
+            | "BooleanOptionalAction"
+            | "SUPPRESS"),
+        ) => argparse::constant(name),
+        ("asyncio", "CancelledError") => exc::exception_class(exc::CANCELLED_ERROR),
+        ("socket", name) => socket::constant(name),
+        ("select", name) => select::constant(name),
+        ("selectors", name) => select::selectors_constant(name),
+        ("ssl", name) => socket::ssl_constant(name),
         ("subprocess", "PIPE") => encode_int(subprocess::PIPE),
         ("subprocess", "STDOUT") => encode_int(subprocess::STDOUT),
         ("subprocess", "DEVNULL") => encode_int(subprocess::DEVNULL),
@@ -1833,7 +1855,8 @@ fn spawn_arity_error(function: i64, argc: usize) -> Option<String> {
     // their upper bound there, so consult the central spec for the lower
     // bound as well.
     match &func.body {
-        value::FunctionBody::Wrapper { .. } => (func.arity != argc)
+        value::FunctionBody::Wrapper { .. } | value::FunctionBody::Host { .. } => (func.arity
+            != argc)
             .then(|| format!("function takes {} arguments ({argc} given)", func.arity)),
         // Getter and identity callables also have an exact arity; a partial
         // validates the combined argument list when it calls its target.
@@ -3763,23 +3786,12 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-/// `sys.exit(code=None)`: `None` and `0` exit successfully; an integer exits
-/// with that status; a string is reported on stderr with status 1.
+/// `sys.exit(code=None)`: raises `SystemExit`, which `try/except
+/// SystemExit` can catch. Uncaught, `None` exits 0, an integer exits with
+/// that status and a string is reported on stderr with status 1.
 fn sys_exit(args: &[i64]) -> i64 {
     let code = args.first().copied().unwrap_or(NONE);
-    if code == NONE {
-        process::exit_now(0);
-    }
-    if let Some(status) = value::as_integer(code) {
-        process::exit_now(i32::try_from(status).unwrap_or(1));
-    }
-    let mut stderr = std::io::stderr();
-    let message = value::as_str(code)
-        .map(str::to_string)
-        .unwrap_or_else(|| value::repr(code));
-    let _ = writeln!(stderr, "{message}");
-    let _ = stderr.flush();
-    process::exit_now(1)
+    exc::raise_exit(code)
 }
 
 // io
@@ -4900,18 +4912,12 @@ mod tests {
     #[test]
     fn argparse_explicit_argv_help_does_not_exit() {
         exc::init();
-        // `formatter_class` is accepted and ignored; the constant resolves to
-        // `None`.
-        let parser = call(
-            "argparse",
-            "ArgumentParser",
-            &[
-                string("prog"),
-                NONE,
-                get("argparse", "RawTextHelpFormatter"),
-            ],
-        );
+        // The internal test mode keeps the legacy non-exiting behaviour; the
+        // default path raises `SystemExit` (covered by the CLI tests).
+        let parser = call("argparse", "ArgumentParser", &[string("prog")]);
         assert!(!exc::pending());
+        assert!(value::as_class(get("argparse", "RawTextHelpFormatter")).is_some());
+        argparse::method(parser, "_pyx_test_mode", &[]);
         let argv = value::list_new(vec![string("--help")]);
         let parsed = argparse::method(parser, "parse_args", &[argv]);
         assert!(!exc::pending());
@@ -5466,12 +5472,16 @@ mod tests {
         assert_eq!(call("asyncio", "sleep", &[int(-1)]), NONE);
         assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
 
-        // Unsupported APIs raise AttributeError instead of pretending to be
-        // coroutines.
+        // Task APIs validate their argument and the running loop instead of
+        // pretending to be coroutines.
         exc::init();
         assert_eq!(call("asyncio", "create_task", &[int(1)]), NONE);
-        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
-        assert_eq!(message(), "module 'asyncio' has no attribute 'create_task'");
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "create_task() requires a coroutine");
+
+        exc::init();
+        assert_eq!(call("asyncio", "current_task", &[]), NONE);
+        assert!(!exc::pending());
     }
 
     fn text(v: i64) -> String {

@@ -14,6 +14,11 @@
 //! parked thread fails the test after a timeout instead of hanging the
 //! harness. `PYX_GC_THRESHOLD` is set per test (the collector re-reads the
 //! configuration on `pyx_runtime_init`).
+//!
+//! MIXED MODE ONLY: the worker closures keep their tagged values in plain
+//! Rust locals and the `argv` slice, which are not precise shadow frames.
+//! These tests must run with `PYX_GC_PRECISE` unset (the default); strict
+//! precise-root coverage lives in `tests/precise_gc.rs`.
 
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Mutex;

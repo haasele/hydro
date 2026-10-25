@@ -43,6 +43,13 @@ pub(crate) fn call(
     let Some(method) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    if let Some(module) = value::as_module(obj) {
+        let function = modules::module_get_by_name(module.name(), &method);
+        if exc::pending() {
+            return NONE;
+        }
+        return builtins::call(function, argc, argv);
+    }
     if method == "$super_init" {
         let args = if argc == 0 {
             Vec::new()
@@ -74,13 +81,19 @@ pub(crate) fn call(
             argc
         ));
     };
-    // Generators expose `send`, `throw` and `close`; coroutine fibers have no
-    // such methods.
-    if value::as_fiber(obj)
-        .map(|fiber| fiber.kind == crate::fiber::FiberKind::Generator)
-        .unwrap_or(false)
-    {
-        return generator_method(obj, &method, &args);
+    // argparse group/subparsers handles are namespaces with native methods.
+    if crate::modules::argparse::is_handle(obj) {
+        return crate::modules::argparse::handle_method(obj, &method, &args);
+    }
+    // Generators expose `send`, `throw` and `close`; async generators expose
+    // the `__aiter__`/`__anext__`/`asend`/`athrow`/`aclose` protocol; tasks
+    // (coroutine fibers) expose `cancel` and the result probes.
+    if let Some(kind) = value::as_fiber(obj).map(|fiber| fiber.kind) {
+        return match kind {
+            crate::fiber::FiberKind::Generator => generator_method(obj, &method, &args),
+            crate::fiber::FiberKind::AsyncGenerator => async_generator_method(obj, &method, &args),
+            crate::fiber::FiberKind::Coroutine => coroutine_method(obj, &method, &args),
+        };
     }
     if let Some(s) = value::as_str(obj) {
         // Copy the receiver before any allocation: a reference into a heap
@@ -186,6 +199,9 @@ fn super_init(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
 }
 
 fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
+    if crate::modules::asyncio::is_task_group(obj) {
+        return crate::modules::asyncio::task_group_method(obj, method, argc, argv);
+    }
     if argc > 0 && (argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>()) {
         return type_error(format!(
             "{}.{}() received {} argument(s) without an argument buffer",
@@ -298,9 +314,10 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
 
 /// Keyword parameter names for native class methods that bind keywords.
 ///
-/// Only the `timeit.Timer` methods declare names today; generated user methods
-/// have no parameter metadata, so every other instance method rejects
-/// keywords. `self` is implicit and excluded from the returned names.
+/// `timeit.Timer` methods, the `ssl.SSLContext` methods and the
+/// `select`/`selectors` objects declare names; generated user methods have no
+/// parameter metadata, so every other instance method rejects keywords.
+/// `self` is implicit and excluded from the returned names.
 fn native_instance_params(obj: i64, method: &str) -> Option<(&'static [&'static str], usize)> {
     let state = value::as_instance(obj)?;
     let function = value::class_method(state.class, method)?;
@@ -310,7 +327,21 @@ fn native_instance_params(obj: i64, method: &str) -> Option<(&'static [&'static 
     if *module == "timeit" {
         return crate::modules::timeit::method_keyword_params(name).map(|params| (params, 0));
     }
-    None
+    match (*module, *name) {
+        ("ssl", "_ssl_context_wrap_socket") => Some((&["sock", "server_hostname"], 1)),
+        ("ssl", "_ssl_context_load_verify_locations") => Some((&["cafile", "capath", "cadata"], 0)),
+        ("ssl", "_ssl_context_load_cert_chain") => Some((&["certfile", "keyfile", "password"], 1)),
+        ("selectors", "_selector_register") => Some((&["fileobj", "events", "data"], 2)),
+        ("selectors", "_selector_unregister") => Some((&["fileobj"], 1)),
+        ("selectors", "_selector_modify") => Some((&["fileobj", "events", "data"], 2)),
+        ("selectors", "_selector_select") => Some((&["timeout"], 0)),
+        ("selectors", "_selector_get_key") => Some((&["fileobj"], 1)),
+        ("select", "_poll_register") => Some((&["fd", "eventmask"], 1)),
+        ("select", "_poll_unregister") => Some((&["fd"], 1)),
+        ("select", "_poll_modify") => Some((&["fd", "eventmask"], 2)),
+        ("select", "_poll_poll") => Some((&["timeout"], 0)),
+        _ => None,
+    }
 }
 
 /// Runtime keyword binding for a generated user method, also used by class
@@ -452,6 +483,11 @@ fn call_user_method_kw(
     }
 
     let full: Vec<i64> = slots.into_iter().map(|slot| slot.unwrap_or(NONE)).collect();
+    if let Some(func) = value::as_function(function) {
+        if let value::FunctionBody::Host { token, captures } = &func.body {
+            return crate::host::call_slots(*token, captures, &full, func.flags, &func.name);
+        }
+    }
     if let Some(func) = value::as_function(function) {
         if func.flags & (value::FUNCTION_FLAG_GENERATOR | value::FUNCTION_FLAG_ASYNC) != 0 {
             if signature
@@ -604,8 +640,24 @@ pub(crate) fn call_kw(
         Ok(keywords) => keywords,
         Err(err) => return err,
     };
+    if let Some(module) = value::as_module(obj) {
+        let module_name = module.name();
+        return modules::module_call_kw(
+            module_name.as_ptr(),
+            module_name.len(),
+            method.as_ptr(),
+            method.len(),
+            argc,
+            argv,
+            kwargc,
+            kw_argv,
+        );
+    }
     if method == "$super_init" {
         return super_init(obj, &args, &keywords.items);
+    }
+    if crate::modules::argparse::is_handle(obj) {
+        return crate::modules::argparse::handle_method_kw(obj, &method, &mut args, &keywords);
     }
     if value::as_list(obj).is_some() {
         let (params, min_args): (&[&str], usize) = match method.as_str() {
@@ -850,7 +902,7 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     if let Some(state) = value::as_instance(obj) {
         if attr == "__dict__" {
             return match value::instance_dict(obj) {
-                Some(pairs) => value::dict_new(pairs),
+                Some(mapping) => mapping,
                 None => attribute_error(obj, &attr),
             };
         }
@@ -1336,7 +1388,8 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
                 .filter(|arg| **arg != NONE)
                 .map(|arg| value::truthy(*arg))
                 .unwrap_or(false);
-            let mut out: Vec<i64> = Vec::new();
+            let result = value::list_new(Vec::new());
+            let root = crate::heap::root_values(&[result]);
             let mut start = 0usize;
             let mut chars = s.char_indices().peekable();
             while let Some((index, ch)) = chars.next() {
@@ -1361,14 +1414,17 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
                 }
                 if is_break {
                     let end = if keepends { index + width } else { index };
-                    out.push(value::str_alloc(s[start..end].to_string()));
+                    let part = value::str_alloc(s[start..end].to_string());
+                    container::list_append(result, part);
                     start = index + width;
                 }
             }
             if start < s.len() {
-                out.push(value::str_alloc(s[start..].to_string()));
+                let part = value::str_alloc(s[start..].to_string());
+                container::list_append(result, part);
             }
-            value::list_new(out)
+            crate::heap::release_roots(root);
+            result
         }
         "translate" => {
             if let Some(err) = check_arity("str", method, args.len(), 1, 1) {
@@ -2061,16 +2117,61 @@ fn list_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_arity("list", method, args.len(), 1, 1) {
                 return err;
             }
-            // Any iterable is accepted; copy first because `xs.extend(xs)`
-            // must see the original items and the mutable borrow below must
-            // never alias the source.
-            let copied = match iterable_values(args[0]) {
-                Ok(values) => values,
-                Err(err) => return err,
-            };
-            if let Some(mut items) = value::list_items_mut(obj) {
-                for item in copied {
-                    items.push(item);
+            let source = args[0];
+            // `xs.extend(xs)` must append the original snapshot once, not
+            // iterate a list that is growing underneath the iterator.
+            if source == obj {
+                let snapshot = value::as_list(obj).unwrap_or(&[]).to_vec();
+                if let Some(mut items) = value::list_items_mut(obj) {
+                    for item in snapshot {
+                        items.push(item);
+                        crate::heap::write_barrier_edge(obj, item);
+                    }
+                }
+                return NONE;
+            }
+            // Lists/tuples/sets/dicts keep their elements reachable while we
+            // append; arbitrary iterables (generators in particular) may
+            // produce a value that exists only in the loop local, so append it
+            // immediately instead of collecting an unrooted Rust Vec.
+            if let Some(items) = value::as_list(source)
+                .or_else(|| value::as_tuple(source))
+                .or_else(|| value::as_set(source))
+            {
+                let copied = items.to_vec();
+                if let Some(mut target) = value::list_items_mut(obj) {
+                    for item in copied {
+                        target.push(item);
+                        crate::heap::write_barrier_edge(obj, item);
+                    }
+                }
+                return NONE;
+            }
+            if let Some(pairs) = value::as_dict(source) {
+                let keys: Vec<i64> = pairs.iter().map(|(key, _)| *key).collect();
+                if let Some(mut target) = value::list_items_mut(obj) {
+                    for item in keys {
+                        target.push(item);
+                        crate::heap::write_barrier_edge(obj, item);
+                    }
+                }
+                return NONE;
+            }
+            let iterator = crate::iter::iter_new(source);
+            if exc::pending() {
+                return NONE;
+            }
+            loop {
+                let mut item = NONE;
+                let produced = crate::iter::iter_next(iterator, &mut item);
+                if exc::pending() {
+                    return NONE;
+                }
+                if produced == 0 {
+                    break;
+                }
+                if let Some(mut target) = value::list_items_mut(obj) {
+                    target.push(item);
                     crate::heap::write_barrier_edge(obj, item);
                 }
             }
@@ -2317,34 +2418,6 @@ fn iterable_elements(value: i64) -> Result<Vec<i64>, i64> {
         "'{}' object is not iterable",
         value::type_name(value)
     )))
-}
-
-/// Materialises any iterable into a list of tagged values. Errors are returned
-/// as a pending-exception value from the iterator.
-fn iterable_values(value: i64) -> Result<Vec<i64>, i64> {
-    if let Some(items) = value::as_list(value)
-        .or_else(|| value::as_tuple(value))
-        .or_else(|| value::as_set(value))
-    {
-        return Ok(items.to_vec());
-    }
-    let iterator = crate::core::iter::iter_new(value);
-    if exc::pending() {
-        return Err(NONE);
-    }
-    let mut out = Vec::new();
-    loop {
-        let mut item = NONE;
-        let produced = crate::core::iter::iter_next(iterator, &mut item);
-        if produced == 0 {
-            if exc::pending() {
-                return Err(NONE);
-            }
-            break;
-        }
-        out.push(item);
-    }
-    Ok(out)
 }
 
 fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
@@ -4062,6 +4135,97 @@ fn generator_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 return err;
             }
             crate::fiber::close_value(obj)
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
+/// Methods of an async generator object.
+fn async_generator_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    match method {
+        "__aiter__" => {
+            if let Some(err) = check_arity("async_generator", method, args.len(), 0, 0) {
+                return err;
+            }
+            crate::fiber::async_generator_aiter(obj)
+        }
+        "__anext__" => {
+            if let Some(err) = check_arity("async_generator", method, args.len(), 0, 0) {
+                return err;
+            }
+            crate::fiber::async_generator_next(obj)
+        }
+        "asend" => {
+            if let Some(err) = check_arity("async_generator", method, args.len(), 1, 1) {
+                return err;
+            }
+            crate::fiber::asend_value(obj, args[0])
+        }
+        "athrow" => {
+            if let Some(err) = check_arity("async_generator", method, args.len(), 1, 1) {
+                return err;
+            }
+            crate::fiber::athrow_value(obj, args[0])
+        }
+        "aclose" => {
+            if let Some(err) = check_arity("async_generator", method, args.len(), 0, 0) {
+                return err;
+            }
+            crate::fiber::aclose_value(obj)
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
+/// Methods of a task (a coroutine fiber scheduled by asyncio).
+fn coroutine_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    match method {
+        "cancel" => {
+            if let Some(err) = check_arity("Task", method, args.len(), 0, 1) {
+                return err;
+            }
+            crate::fiber::cancel_value(obj)
+        }
+        "done" => {
+            if let Some(err) = check_arity("Task", method, args.len(), 0, 0) {
+                return err;
+            }
+            if crate::fiber::is_done(obj) {
+                value::TRUE
+            } else {
+                value::FALSE
+            }
+        }
+        "cancelled" => {
+            if let Some(err) = check_arity("Task", method, args.len(), 0, 0) {
+                return err;
+            }
+            if crate::fiber::is_cancelled(obj) {
+                value::TRUE
+            } else {
+                value::FALSE
+            }
+        }
+        "result" => {
+            if let Some(err) = check_arity("Task", method, args.len(), 0, 0) {
+                return err;
+            }
+            if !crate::fiber::is_done(obj) {
+                return exc::raise_with_message(RUNTIME_ERROR, "task is not done");
+            }
+            crate::fiber::finish_value(obj)
+        }
+        "exception" => {
+            if let Some(err) = check_arity("Task", method, args.len(), 0, 0) {
+                return err;
+            }
+            if !crate::fiber::is_done(obj) {
+                return exc::raise_with_message(RUNTIME_ERROR, "task is not done");
+            }
+            if crate::fiber::is_cancelled(obj) {
+                return crate::fiber::raise_error(obj);
+            }
+            crate::fiber::exception_value(obj)
         }
         _ => attribute_error(obj, method),
     }

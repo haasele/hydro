@@ -92,7 +92,7 @@ PYX_GC_THRESHOLD=1 "$PYX" run examples/threads_gc.py > "$tmp/threads_gc.out"
 diff -u examples/expected/threads_gc.txt "$tmp/threads_gc.out"
 echo "ok: threads_gc (STW)"
 
-for name in threading event_queue rlock pickle multiprocessing spawn pool pool_spawn files csv_json bytes binary_files stdlib_utils stdlib_modules socket_echo pathlib_example formatting classes generators_async closures bigint; do
+for name in threading event_queue rlock pickle multiprocessing spawn pool pool_spawn files csv_json bytes binary_files stdlib_utils stdlib_modules socket_echo pathlib_example formatting classes generators_async async_generators closures bigint; do
     "$PYX" run "examples/$name.py" > "$tmp/$name.out"
     diff -u "examples/expected/$name.txt" "$tmp/$name.out"
     echo "ok: $name"
@@ -397,7 +397,7 @@ PYX_GC_THRESHOLD=1 "$tmp/threads_gc" > "$tmp/threads_gc.aot.out"
 diff -u examples/expected/threads_gc.txt "$tmp/threads_gc.aot.out"
 echo "ok: aot threads_gc (STW)"
 
-for name in threading event_queue rlock pickle multiprocessing spawn pool pool_spawn files csv_json bytes binary_files stdlib_utils stdlib_modules socket_echo pathlib_example formatting classes generators_async closures bigint; do
+for name in threading event_queue rlock pickle multiprocessing spawn pool pool_spawn files csv_json bytes binary_files stdlib_utils stdlib_modules socket_echo pathlib_example formatting classes generators_async async_generators closures bigint; do
     "$PYX" build "examples/$name.py" -o "$tmp/$name"
     "$tmp/$name" > "$tmp/$name.aot.out"
     diff -u "examples/expected/$name.txt" "$tmp/$name.aot.out"

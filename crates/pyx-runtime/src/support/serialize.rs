@@ -239,6 +239,7 @@ fn encode_value(
             | FunctionBody::ItemGetter { .. }
             | FunctionBody::Partial { .. }
             | FunctionBody::BoundMethod { .. }
+            | FunctionBody::Host { .. }
             | FunctionBody::Identity => {
                 return Err(PickleError::Unsupported("function"));
             }
@@ -692,6 +693,7 @@ mod tests {
             | crate::value::FunctionBody::ItemGetter { .. }
             | crate::value::FunctionBody::Partial { .. }
             | crate::value::FunctionBody::BoundMethod { .. }
+            | crate::value::FunctionBody::Host { .. }
             | crate::value::FunctionBody::Identity => panic!("expected a wrapper"),
         }
         assert_eq!(decoded.arity, 2);

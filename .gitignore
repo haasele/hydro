@@ -1,6 +1,10 @@
 # Rust build output
 /target
 
+# Standalone fuzz workspaces (fuzz/Cargo.toml, fuzz/stable/Cargo.toml)
+/fuzz/target
+/fuzz/stable/target
+
 # PyX build cache / project state (also test-created caches under crates/)
 .pyx/
 

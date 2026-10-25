@@ -77,6 +77,19 @@ pub(crate) fn lookup(name: &str) -> Option<(usize, usize)> {
     functions().get(name).copied()
 }
 
+/// Every registered function as `(name, wrapper, arity)`, sorted by name.
+///
+/// The snapshot lets the test runner enumerate generated functions without
+/// holding the registry lock while user code runs.
+pub(crate) fn registered() -> Vec<(String, usize, usize)> {
+    let mut entries: Vec<(String, usize, usize)> = functions()
+        .iter()
+        .map(|(name, (wrapper, arity))| (name.clone(), *wrapper, *arity))
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
 /// Serializes unit tests that reset or consult the global registry.
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());

@@ -4,6 +4,7 @@ members = [
     "crates/pyx-ir",
     "crates/pyx-frontend",
     "crates/pyx-runtime",
+    "crates/pyx-interp",
     "crates/pyx-codegen",
     "crates/pyx-cli",
 ]
@@ -18,6 +19,7 @@ rust-version = "1.85"
 pyx-ir = { path = "crates/pyx-ir" }
 pyx-frontend = { path = "crates/pyx-frontend" }
 pyx-runtime = { path = "crates/pyx-runtime" }
+pyx-interp = { path = "crates/pyx-interp" }
 pyx-codegen = { path = "crates/pyx-codegen" }
 rustpython-parser = "0.4"
 cranelift-codegen = "0.120"

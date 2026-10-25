@@ -17,16 +17,16 @@ defined subset (see `docs/TODO.md`).
 
 **Supported:** tagged values, containers, functions/closures, classes
 (single base), comprehensions, f-strings/formatting, exceptions,
-file I/O, user modules and packages, native stdlib modules, lazy generators
-and coroutines
-with a cooperative event loop, threads/processes/pool, a conservative
-concurrent mark-&-sweep GC.
+file I/O, user modules and packages, native stdlib modules, lazy generators,
+async generators and coroutines
+with a cooperative event loop and task groups, threads/processes/pool, and a
+precise-shadow-frame concurrent mark-&-sweep GC with a size-classed payload
+allocator.
 
-**Deliberately not (as of now):** async generators/comprehensions, the
-complete CPython stdlib,
+**Deliberately not (as of now):** the complete CPython stdlib,
 C extensions/C API, decorators, pattern matching, metaclasses,
-`bytearray`/`memoryview`, precise GC roots and variable payload
-size classes. Details in §10 and `docs/TODO.md`.
+`bytearray`/`memoryview` and the complete CPython stdlib/ABI. Details in §10
+and `docs/TODO.md`.
 
 ## 2. Components & Data Flow
 
@@ -116,10 +116,10 @@ normal `str`, so it never reaches user code.
 Lists/dicts/sets are insertion-ordered (sets deterministically; Python
 guarantees no order). `Iter` holds target and index. `Class` carries name,
 optional base and an immutable method table; `Instance` carries the
-class and a mutable attribute table. `Fiber` is a generator
-or coroutine object (`kind`, own stack, architecture context, state,
-result/error; see §3.3). On x86_64 the context is a
-callee-saved register frame, otherwise a `ucontext_t`.
+class and a mutable attribute table. `Fiber` is a generator, coroutine or
+async generator object (`kind`, own stack, architecture context, state,
+result/error, cancellation and awaiting fields; see §3.3). On x86_64 the
+context is a callee-saved register frame, otherwise a `ucontext_t`.
 
 ### 3.2 Symbols
 
@@ -255,6 +255,8 @@ i64  pyx_iter(i64 obj);                             // iter(obj)
 i64  pyx_next(i64 obj, i64 default, i64 has_default); // next(obj[, default])
 i64  pyx_generator_new(const uint8_t* entry, uint64_t argc, const i64* argv);
 i64  pyx_coroutine_new(const uint8_t* entry, uint64_t argc, const i64* argv);
+i64  pyx_async_generator_new(const uint8_t* entry, uint64_t argc,
+                             const i64* argv);      // lazy async generator
 i64  pyx_yield(i64 value);                          // suspends the fiber
 i64  pyx_yield_from(i64 iterable);                  // delegates iteration
 i64  pyx_await(i64 value);                          // drives a coroutine
@@ -289,16 +291,19 @@ int32_t pyx_spawn_child(void);        // child mode after exec (-1 = normal)
 
 `flags` in `pyx_function_new`/`pyx_closure_new`: Bit 0 = `async`, Bit 1 =
 generator. If either of the bits is set, the generated wrapper calls
-`pyx_coroutine_new`/`pyx_generator_new`; `argv` contains the captures
-followed by the call arguments. The fiber starts only on the first
-`pyx_iter_next` (generator) or `pyx_await`/`asyncio.run` (coroutine).
+`pyx_async_generator_new` (both bits), `pyx_coroutine_new` (async only) or
+`pyx_generator_new` (generator only); `argv` contains the captures followed
+by the call arguments. The fiber starts only on the first `pyx_iter_next`
+(generator), `pyx_await`/`asyncio.run` (coroutine) or
+`__anext__`/`asend` (async generator).
 
 Exception tags: `0 ValueError, 1 TypeError, 2 ZeroDivisionError,
 3 RuntimeError, 4 OverflowError, 5 KeyboardInterrupt, 6 IndexError,
 7 KeyError, 8 StopIteration, 9 AttributeError, 10 OSError, 11 GeneratorExit,
-12 Exception, 13 BaseException, 14 AssertionError, 15 FileNotFoundError`.
+12 Exception, 13 BaseException, 14 AssertionError, 15 FileNotFoundError,
+16 NameError, 17 SystemExit, 18 StopAsyncIteration, 19 CancelledError`.
 Names are 1:1 as in Python; `IOError` is an alias for `OSError`.
-`except Exception` matches every tag except 5/11; `except BaseException`
+`except Exception` matches every tag except 5/11/19; `except BaseException`
 matches every tag. `raise`/`except` resolve tags from names directly, while
 an unqualified exception name used as a value lowers to
 `pyx_exception_class(tag)`, which returns one cached empty class object per
@@ -496,34 +501,91 @@ built-in kinds), so the fallback never matches a user handler.
   generator, and `close()` closes the delegate first so its `finally` blocks
   run. The expression evaluates to the delegate's return value (`None` for a
   plain iterator). Delegating to a running generator raises `RuntimeError`.
-  Not supported: async generators (`async def` + `yield` is a diagnostic) and
-  async comprehensions. Generator expressions are lazy (a synthetic generator
+  Not supported: none of the generator protocol is missing; PEP 479
+  (converting a body-raised `StopIteration` into `RuntimeError`) is not
+  implemented. Generator expressions are lazy (a synthetic generator
   function; the outermost iterable is evaluated at creation). Deviations: `send` into a plain-iterator
   delegate raises `AttributeError` naming the iterator as `'iterator'` (not
-  e.g. `'list_iterator'`), and PEP 479 (converting a body-raised
-  `StopIteration` into `RuntimeError`) is not implemented.
-- **async** (Phase 2.32): `async def` creates a coroutine object;
+  e.g. `'list_iterator'`).
+- **Async generators** (Phase 2.12): `async def` with `yield` compiles to a
+  `FiberKind::AsyncGenerator` (`pyx_async_generator_new`). `__aiter__`
+  returns the object, `__anext__` resumes it and returns the item directly
+  (or raises `StopAsyncIteration`, tag 18), and `asend`/`athrow`/`aclose`
+  mirror `send`/`throw`/`close` with async completion semantics. Awaits
+  inside the generator propagate their wait request through the enclosing
+  coroutine, so `asyncio.sleep` inside an async generator suspends only the
+  running task. `async for`/`async with` and asynchronous comprehensions are
+  real await loops (`__aiter__`/`__anext__`/`__aenter__`/`__aexit__`).
+- **async** (Phase 2.12): `async def` creates a coroutine object;
   `await`/`pyx_await` drives it to completion (non-fiber values are
-  returned unchanged). `asyncio.run(coro)` runs a cooperative
-  single-thread event loop: `asyncio.sleep(secs)` suspends only the current
-  fiber (blocking outside a loop), `asyncio.gather(*awaitables)` starts all
-  tasks concurrently, returns the results in input order and propagates the
-  first error. Tasks switch only at explicit suspension points; there is no
-  GIL. `async for`/`async with` still use the synchronous
-  lowering/protocol logic. Beyond that, `asyncio` offers only
-  `run`/`sleep`/`gather`; real `__aiter__`/`__anext__` protocols and
-  non-blocking I/O are missing.
+  returned unchanged) and rejects generators/async generators. Suspensions
+  carry runtime-internal wait requests (sleep/join) outwards; an awaiting
+  chain is bounded to 512 frames. A thread-local persistent loop
+  (`modules/asyncio.rs`) owns a `Driver` whose scheduled-task list is a
+  heap persistent root, so tasks stay reachable while queued in Rust
+  vectors. `asyncio.run(coro)` drives the root, services `sleep`, cancels
+  leftover tasks at shutdown and resets the queues; a reentrant `run` is a
+  `RuntimeError`. `create_task(coro)` schedules a task on the running loop
+  and returns it; tasks expose `cancel`/`done`/`cancelled`/`result`/
+  `exception`, and `current_task()` reports the running task.
+  Cancellation queues `CancelledError` (tag 19, a `BaseException` excluded
+  from `Exception`) in the fiber and delivers it at the next suspension
+  resume; `cancel` before the first step finishes the task without running
+  its body. `asyncio.gather(*awaitables)` joins concurrent tasks in input
+  order and propagates the first failure. `asyncio.TaskGroup` is a native
+  class whose `__aenter__`/`create_task`/`__aexit__` join the group,
+  cancel siblings on the first failure, cancel remaining tasks when the
+  block raises and propagate the first error. `TaskGroup` is exposed as a
+  zero-argument spec function (the frontend types module members as functions)
+  whose runtime arm returns a `TaskGroup` instance, so both
+  `asyncio.TaskGroup()` and `from asyncio import TaskGroup` construct usable
+  async context managers. Deviations: no
+  `ExceptionGroup` (the first error propagates directly), no `wait_for`,
+  and async generators are not automatically closed when their last
+  consumer is cancelled.
 
 #### `with` Protocol
 
-`with a as x, b as y:` becomes nested `try/finally` blocks. Every
-context expression is evaluated exactly once into a hidden `$withN` local,
-whose `__enter__()` is bound to the `as` target. The
-`finally` calls `__exit__(None, None, None)` on the same object, so that
-`return`, `break`, `continue` and exceptions leave every object in reverse
-order. The return value of `__exit__` is ignored:
-exceptions are **never** suppressed. Files, `Pool` and user classes
-implement the protocol; without `as`, `__enter__` still runs.
+`with a as x, b as y:` becomes nested `try` blocks, one per item, in the
+shape CPython uses:
+
+```text
+$with = <context expression>
+$wexc = None
+[x =] $with.__enter__()
+try:
+    <body>
+except BaseException as $wexc:
+    if not $with.__exit__(type($wexc), $wexc, None):
+        raise
+finally:
+    if $wexc is None:
+        $with.__exit__(None, None, None)
+```
+
+Every context expression is evaluated exactly once into a hidden `$withN`
+local, and its `__enter__()` result is bound to the `as` target (without
+`as`, `__enter__` still runs). The entry happens **before** the `try`, so a
+context expression or `__enter__()` that raises never calls that manager's
+own `__exit__` (an enclosing manager still gets its exit call, as in
+CPython).
+
+The return value of `__exit__` is honoured: a truthy value suppresses the
+exception raised by the body and execution continues after the `with`; a
+falsy value re-raises the original exception through a bare `raise`. A
+`None` return therefore propagates, so files, `Pool` and user classes that
+implement the protocol without returning anything keep their old behaviour.
+
+`__exit__` runs exactly once per manager on every path. On an exception the
+handler performs the single call, and if that call itself raises, its
+exception replaces the in-flight one — the `$wexc` guard then keeps the
+`finally` arm from calling it a second time. On normal completion the
+`finally` arm calls `__exit__(None, None, None)`; because it is a `finally`,
+`return`, `break` and `continue` leaving the body also run it. Managers are
+evaluated left to right and exited in reverse order, and a manager that
+suppresses the exception leaves the outer managers with no exception to see.
+PyX has no traceback objects, so `__exit__` always receives `None` as its
+third argument.
 
 #### Imports, User Modules, `__name__`
 
@@ -599,12 +661,21 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
 - `csv`: `reader`/`writer` and `DictReader`/`DictWriter` (fieldnames),
   RFC-4180-like quoting/embedded newlines, `writerow(s)`/`writeheader`.
   Readers materialize; no dialect/restkey, CSV is not streaming.
-- `argparse` (Phase 2.25): an `ArgumentParser` with positional arguments,
-  long/short options, `type`, `default`, `required`, `choices`, `help`,
-  `store_true`, `nargs="?"`; `parse_args` returns a `Namespace`. Errors
-  are `RuntimeError` (no `SystemExit`). With no explicit argv it reads
-  `sys.argv[1:]`, and `-h`/`--help` prints help and exits 0; an explicit
-  argv list keeps `_help=True` without exiting.
+- `argparse`: an `ArgumentParser` with the common constructor parameters
+  (`prog`, `usage`, `description`, `epilog`, `parents`, `formatter_class`,
+  `prefix_chars`, `fromfile_prefix_chars`, `argument_default`,
+  `conflict_handler`, `add_help`, `allow_abbrev`, `exit_on_error`), the
+  `store`/`store_true`/`store_false`/`store_const`/`append`/`append_const`/
+  `count`/`help`/`version`/`BooleanOptionalAction` actions, `nargs`
+  (`None`, `?`, `*`, `+`, `N`), `type`, `choices`, `default`, `required`,
+  `const`, `metavar` and `dest`; argument groups, mutually exclusive groups
+  and subparsers; `set_defaults`, `parse_known_args` and a `Namespace`
+  result. The token scanner handles `--opt=value`, short clusters, `--`,
+  unique long-option abbreviations and negative numbers. Parse errors print
+  the usage block to stderr and raise `SystemExit(2)`; `-h`/`--help` and
+  `--version` print to stdout and raise `SystemExit(0)`. `parse_args` reads
+  `sys.argv[1:]` by default. The legacy non-exiting explicit-argv behaviour
+  is confined to the internal `_pyx_test_mode` used by the runtime tests.
 - `collections.defaultdict`: insertion-ordered `(key, value)` pairs plus
   `default_factory`; a missing key calls the factory, inserts and returns;
   `None` factory → `KeyError`.
@@ -641,7 +712,9 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
   `**`), `joinpath`/`resolve`/`absolute`/`as_posix`, `/` join and
   data attributes `name`/`stem`/`suffix`/`parent`/`path`. `os.remove`/
   `rename` accept path objects.
-- `asyncio`: see §3.3 "Generators and async" (only `run`/`sleep`/`gather`).
+- `asyncio`: see §3.3 "Generators and async" (`run`/`sleep`/`gather`,
+  `create_task`/`current_task`, the `TaskGroup` class and the
+  `CancelledError` constant).
 
 #### Methods
 
@@ -704,7 +777,9 @@ Traceback (most recent call last):
 ZeroDivisionError: division by zero
 ```
 
-and returns exit code `1`.
+and returns exit code `1`. An uncaught `SystemExit` prints no traceback:
+an integer code becomes the process status (masked to one byte), a message
+is printed to stderr with status 1, and `SystemExit()` exits 0.
 
 ## 4. Backend Decision
 
@@ -824,14 +899,17 @@ it. The cache is not a shared artifact store.
   instead of silently passing `None`.
 - Functions carry `is_generator` and `is_async`; codegen derives the
   flags in `pyx_function_new`/`pyx_closure_new` from them (bit 0 async, bit 1
-  generator) and generates a wrapper that calls `pyx_coroutine_new` resp.
-  `pyx_generator_new`. `Yield` statements become `pyx_yield` (result
+  generator) and generates a wrapper that calls `pyx_async_generator_new`
+  when both are set, else `pyx_coroutine_new` resp. `pyx_generator_new`.
+  `Yield` statements become `pyx_yield` (result
   discarded); `Yield` expressions keep the returned sent value; `YieldFrom`
   becomes `pyx_yield_from`. `Await` becomes `pyx_await`.
 - **Lowering:** `with`/`async with` become nested `try/finally` with
-  `__enter__`/`__exit__`; augmented subscript assignment
+  `__enter__`/`__exit__`; async managers bind `__aenter__`/`__aexit__`
+  through awaited method calls. Augmented subscript assignment
   (`a[i] += x`) evaluates object and index exactly once into `$aug` locals.
-  `async for` uses the synchronous `for` lowering logic.
+  `async for` lowers to `__aiter__()` plus a `while` loop that awaits
+  `__anext__()` and catches `StopAsyncIteration`.
 - **User modules:** imports emit no IR statements; the loader replaces
   them with `FunctionRef`s to the exported functions of the target module.
   `__name__` is an optional module body local.
@@ -903,11 +981,40 @@ collector as an interim**:
   uses a deterministic non-cryptographic SplitMix64 hasher: its keys are
   runtime-owned aligned heap addresses, never adversarial bytes, so SipHash
   seeding is unnecessary while equality still compares the full address.
-- Roots: conservative scan of the native stack (bounds via
-  `pthread_getattr_np`), a register dump (x86_64/aarch64) and the
-  pending exception. Tagged heap values are accepted only if their
-  object address lies exactly in the registry; false hits can only cause
-  over-retention.
+- Roots: **precise shadow frames** plus a conservative fallback. Generated
+  code registers every frame with `pyx_gc_frame_push` (all slots `None`-filled,
+  scanned prefix narrowed with `pyx_gc_frame_used`) and every caller-owned
+  value array with `pyx_gc_scope_push`; the collector marks those slots
+  exactly. A mutator publishes its thread-local frame/range set at each
+  safepoint slow path and before `blocking_enter` parks, so a shared
+  collection snapshots every stopped thread's roots (`snapshot_all`); the
+  local collector reads them directly (`snapshot_current`). A frame is dropped
+  on thread exit and in a forked child (`clear_current`/`clear_thread`), so no
+  dangling slot is ever dereferenced. Tagged values are still validated
+  against the registry address index, so a stale slot (or a conservative false
+  hit) can only be ignored, never dereferenced.
+- **Root modes:** by default the collector is *mixed*: precise slots are
+  marked exactly and their byte extents are excluded from the conservative
+  native-stack/register scan (merged ranges are skipped), while unregistered
+  Rust frames and suspended fiber stacks are still scanned. `PYX_GC_PRECISE=1`
+  selects *strict* mode: every conservative stack and register scan is
+  disabled, so only precise frames/ranges, pending/handled/thread roots,
+  suspended fibers' `SavedRoots`, C-API shim roots and persistent roots keep
+  objects alive. Strict mode therefore requires native code to root its tagged
+  locals explicitly; the runtime's own shims, module globals and test suites
+  that hold raw Rust locals (`gc.rs`, `concurrent_gc.rs`, `stw_gc.rs`,
+  `gc_properties.rs`) are mixed-mode only, and `tests/precise_gc.rs` proves
+  strict mode end to end.
+- **Persistent roots:** `heap::add_persistent_root`/`set_persistent_root`/
+  `remove_persistent_root` maintain a per-thread slot vector in `ThreadGc`
+  that is marked by every collection. They are for long-lived Rust-side owners
+  (asyncio loop tasks) and are cleared on thread exit and by
+  `pyx_runtime_init` (which also resets the asyncio loop state before the heap
+  is freed). The hidden `pyx_runtime::precise_roots` module re-exports them for
+  the integration tests.
+- Conservative fallback (mixed mode): native stack scan (bounds via
+  `pthread_getattr_np`), a register dump (x86_64/aarch64) and the pending
+  exception.
 - **Fiber roots:** While a generator/coroutine fiber runs, the
   thread stack points to the fiber stack; `push_stack_bounds` overrides the
   stack bounds so that the scan sees the running fiber stack. The
@@ -956,20 +1063,28 @@ collector as an interim**:
   as well as frees per collection on stderr.
 - `pyx_runtime::gc_stats()` returns a `GcStats` snapshot
   (`collections`, `pause_total_us`, `pause_max_us`, `mark_total_us`,
-  `sweep_total_us`, `freed_total`, `live_objects`, `threshold`, `stress`);
-  `reset_gc_stats()` resets the counters. `pyx gc [--json] <file.py>`
+  `sweep_total_us`, `freed_total`, `live_objects`, `threshold`, `stress`,
+  `precise`, `precise_frames`); `precise` reports strict mode and
+  `precise_frames` the frames marked by the latest collection. The
+  `PYX_GC_STATS=1` line carries the same `precise=mixed|strict` and
+  `precise_frames=` fields. `reset_gc_stats()` resets the counters.
+  `pyx gc [--json] <file.py>`
   runs the program like `pyx run` and prints the statistics afterwards;
   with `--json` the last stdout line is an object with snake_case keys.
-- `gc/alloc.rs` manages fixed `PyxObj` cells in slabs (chunks of 64,
-  free list, alignment, reuse/stats); variable payload size classes are
-  a separate heap architecture phase.
+- `gc/alloc.rs` keeps a fixed 16-byte `PyxObj` header separate from a typed
+  payload block. Payloads use 18 size classes (8..4096 bytes) with per-class
+  slabs/free lists and an exact large-object fallback; the header has its own
+  slab class. Stats cover per-class slabs/live/reused/bytes, large blocks and
+  peak live bytes. `ObjData` remains the construction descriptor and
+  `ObjDataRef`/`ObjDataMut` provide typed access.
 - `pyx_gc_collect()` forces a collection; `pyx_gc_objects()` returns the
   live object count. `pyx_runtime_init()` resets heap and exception state.
 
-This is deliberately an **interim**: conservative scanning can preserve false
-positives; the final root rescan is STW, the white partition runs briefly
-under the heap lock. P2-05 (variable payload size classes), P2-06/P2-07
-(precise shadow-stack roots, finer safepoint polling) remain open. The
+This is deliberately an **interim**: in mixed mode conservative scanning can
+preserve false positives; the final root rescan is STW and the white partition
+runs briefly under the heap lock. Strict precise mode removes the conservative
+fallback entirely but requires every native stack to root its tagged locals.
+The
 `unsafe` policy: The GC scan/free paths are encapsulated in `pyx-runtime/src/gc/`
 and justify their invariants there.
 
@@ -1080,15 +1195,16 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
   socket echo, pathlib, build cache, `pyx gc` and uv passthrough.
-- Generated stdlib import matrix (2026-10-25): **60/297 importable** (13
-  builtin/frozen, 43 pure, 4 extension; report in
-  [`COMPATIBILITY.md`](COMPATIBILITY.md)). `benchmarks/bench_all.py` does
-  run under PyX with `PYX_GC_THRESHOLD` raised; rich
-  console/table/panel/rule rendering works and a native `rich.status.Status`
-  shim covers `Console.status`. The default conservative collector still
-  loses live values under heavier rich rendering.
-- New unit tests cover the dict hash index, the GC statistics and
-  fiber iteration; `examples/generators_async.py` runs under JIT and AOT.
+- Generated stdlib import matrix (2026-10-26): **63/297 importable** (13
+  builtin/frozen, 45 pure, 5 extension; report in
+  [`COMPATIBILITY.md`](COMPATIBILITY.md)). `benchmarks/bench_all.py --only pyx`
+  runs at the default GC threshold; rich console/table/panel/rule rendering
+  works and a native `rich.status.Status` shim covers `Console.status`.
+  Precise roots removed the former live-value loss.
+- New unit tests cover the dict hash index, the GC statistics, fiber
+  iteration, async generators, task cancellation and TaskGroup;
+  `examples/generators_async.py` and `examples/async_generators.py` run
+  under JIT and AOT.
 - E2E compares stdout/exit code of `pyx run` and the AOT binary; negative tests
   check diagnostics and tracebacks (stderr, exit code).
 - No silent miscompilation: unsupported syntax → diagnostic.
@@ -1110,23 +1226,19 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   mutates them (or a descendant declares `nonlocal`), in which case the
   binding lives in a traced heap cell shared with every closure; recursive
   nested functions and closures in lambdas are diagnostics.
-- **Generators/async:** real lazy generators (stackful fibers) and
-  coroutines with a cooperative event loop. Open: async generators, async
-  comprehensions and `asyncio` beyond `run`/`sleep`/`gather`; generator
-  expressions are lazy (synthetic generator function),
-  `async for`/`async with` use the
-  synchronous protocol. `throw` accepts exception instances only (no
-  exception class objects) and has no three-argument form.
-- **GC:** the conservative collector roots container builders and generated
-  call buffers, but heavy rich rendering still exposes live values lost
-  under allocation (`P2-06` precise roots remain the fix).
-- **Performance:** native module dispatch is fixed (thread-local spec cache;
-  math_loop at parity/faster, 50k micro harness AOT 6.2 ms vs. CPython
-  13.6 ms). Remaining open weak spots: string concatenation (O(n²)) and float
-  boxing; CPython-extension boundaries will add conversion cost. The x86_64
-  fiber switch is register-only (two switches per yield, no syscalls); a
-  100k generator sum reaches release AOT 6.8 ms / JIT 7.7 ms versus CPython
-  10.2 ms (`strace -c`: 94 syscalls total).
+- **Generators/async:** real lazy generators, async generators and coroutines
+  on stackful fibers; `async for`/`async with`, async comprehensions,
+  cancellation, task methods and `TaskGroup` are implemented. Open:
+  `ExceptionGroup`, `wait_for` and the wider `asyncio` API; `throw` accepts
+  exception instances only (no three-argument form).
+- **GC:** generated frames and call buffers are precise shadow-stack roots;
+  `PYX_GC_PRECISE=1` runs the collector without conservative scanning. The
+  default mixed mode keeps the conservative fallback for Rust-side frames.
+- **Performance:** native module dispatch is fixed (thread-local spec cache).
+  The precise root-frame bookkeeping currently makes generator resume the
+  weak spot; the default-GC benchmark records generator_sum at JIT 16.07 ms /
+  AOT 14.61 ms versus CPython 11.23 ms. String concatenation and float boxing
+  are otherwise improved. The x86_64 fiber switch remains register-only.
 - **Nested imports:** declaration-only site-packages modules referenced
   only from nested blocks are preloaded after the import graph is complete
   and inserted before their importer; modules with executable top-level
@@ -1140,13 +1252,15 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   preloaded for this path. No general runtime module objects/`sys.modules`,
   namespace packages or frozen modules; user-module
   values remain diagnostics.
-- **Stdlib:** curated subset (see §3.3); `re` uses the Rust
-  `regex` syntax, `socket` only blocking TCP, `argparse` with a fixed help
-  renderer (and no `SystemExit` for an explicit argv), `random` not
-  CPython-reproducible.
-- **GC:** conservative root scanning (no precise roots/stack maps); fixed
-  slab/free-list allocator with variable payload size classes still open;
-  STW root window. P2-05/06/07 open.
+- **Stdlib:** curated core (see §3.3); `re` uses Rust `regex` syntax,
+  `socket` supports TCP/UDP/IPv6, TLS (client), non-blocking I/O and
+  `select`/`poll`/`selectors`, argparse is CPython-compatible for the
+  documented surface, and `random` is SplitMix64 (not CPython-reproducible).
+  Full P7 module parity remains open.
+- **GC:** precise shadow frames for generated code plus a conservative
+  fallback in the default mixed mode (`PYX_GC_PRECISE=1` = strict, no
+  conservative scan); size-classed slab/free-list allocator; STW root
+  window.
 - **Concurrency:** no GIL; unprotected mutations of shared containers are
   data races. Function registry for spawn/Pool only by name/arity
   (duplicates/lambdas/native targets rejected); queue `maxsize` is lost in the

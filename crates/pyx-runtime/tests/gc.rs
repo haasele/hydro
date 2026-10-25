@@ -4,6 +4,10 @@
 //! the stack or in a register, so all assertions are tolerant: they check
 //! that garbage is reclaimed and reachable values survive, never exact
 //! counts. Tests run on their own threads, each with a thread-local heap.
+//!
+//! MIXED MODE ONLY: roots are plain Rust locals, not precise shadow frames,
+//! so the suite requires the conservative scan (`PYX_GC_PRECISE` unset).
+//! Strict-mode collector behaviour is covered by `tests/precise_gc.rs`.
 
 use pyx_runtime::abi::*;
 

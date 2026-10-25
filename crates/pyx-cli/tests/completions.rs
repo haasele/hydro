@@ -25,11 +25,13 @@ const COMMANDS: &[&str] = &[
     "run",
     "build",
     "test",
+    "pytest",
     "fmt",
     "lint",
     "clean",
     "doctor",
     "gc",
+    "repl",
     "add",
     "remove",
     "sync",
@@ -51,6 +53,8 @@ const OPTIONS: &[&str] = &[
     "--force",
     "--check",
     "--dry-run",
+    "--no-echo",
+    "--no-banner",
 ];
 
 fn assert_script_complete(shell: &str, script: &str) {

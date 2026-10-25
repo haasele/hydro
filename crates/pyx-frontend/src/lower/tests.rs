@@ -683,16 +683,31 @@ fn locals_assigned_in_all_try_parts_get_slots() {
 
 /// Name of the hidden local whose `__exit__(None, None, None)` runs in a
 /// desugared `with` `finally` block.
+///
+/// The block must be guarded by the `$wexc is None` sentinel, so an exception
+/// path never reaches the normal exit call.
 fn exit_local_name<'a>(locals: &'a [HLocal], finally_body: &[HStmt]) -> &'a str {
     assert_eq!(finally_body.len(), 1, "finally must only exit the item");
     let HStmtKind::If {
+        cond,
         then_body,
         else_body,
-        ..
     } = &finally_body[0].kind
     else {
         panic!("expected the guarded __exit__ block");
     };
+    let HExprKind::Bin { op, lhs, rhs } = &cond.kind else {
+        panic!("expected `$wexc is None`, got {:?}", cond.kind);
+    };
+    assert_eq!(*op, BinOp::Is);
+    let HExprKind::Local(guard) = &lhs.kind else {
+        panic!("expected the exception sentinel, got {:?}", lhs.kind);
+    };
+    assert!(
+        locals[*guard as usize].name.starts_with("$wexc"),
+        "the guard must read the exception sentinel, not the context object"
+    );
+    assert!(matches!(&rhs.kind, HExprKind::Const(Const::None)));
     assert!(else_body.is_empty());
     assert_eq!(then_body.len(), 1);
     let HStmtKind::Expr(exit) = &then_body[0].kind else {
@@ -725,30 +740,32 @@ fn exit_local_name<'a>(locals: &'a [HLocal], finally_body: &[HStmt]) -> &'a str 
 }
 
 #[test]
-fn with_open_lowers_to_try_finally_with_exit() {
+fn with_open_lowers_to_try_with_exit_guard() {
     let source = "with open('x') as f:\n    print(f.read())\n";
     let (hir, mut infer, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
     let locals = &hir.functions[0].locals;
     assert_eq!(hir.functions[0].body.len(), 1);
 
+    let (prelude, try_stmt) = with_parts(&hir.functions[0].body[0]);
     let HStmtKind::Try {
         body,
         handlers,
         else_body,
         finally_body,
-    } = &hir.functions[0].body[0].kind
+    } = &try_stmt.kind
     else {
-        panic!("expected a try/finally statement");
+        panic!("expected the __exit__ try");
     };
-    assert!(handlers.is_empty());
     assert!(else_body.is_empty());
     assert_eq!(exit_local_name(locals, finally_body), "$with0");
 
-    // Prelude: evaluate `open(...)` once into `$with0`, then bind `f` to the
-    // result of `$with0.__enter__()`.
-    assert_eq!(body.len(), 3);
-    let HStmtKind::Assign { target, value } = &body[0].kind else {
+    // Prelude: evaluate `open(...)` once into `$with0`, seed the exception
+    // slot with `None`, then bind `f` to the result of
+    // `$with0.__enter__()`. All of this runs before the `try`, so a failing
+    // `__enter__` never reaches `__exit__`.
+    assert_eq!(prelude.len(), 3);
+    let HStmtKind::Assign { target, value } = &prelude[0].kind else {
         panic!("expected the hidden local assignment");
     };
     assert_eq!(locals[*target as usize].name, "$with0");
@@ -766,7 +783,13 @@ fn with_open_lowers_to_try_finally_with_exit() {
     assert_eq!(args.len(), 1, "positional call keeps only the given args");
     assert!(matches!(&args[0].kind, HExprKind::Const(Const::Str(s)) if s == "x"));
 
-    let HStmtKind::Assign { target, value } = &body[1].kind else {
+    let HStmtKind::Assign { target, value } = &prelude[1].kind else {
+        panic!("expected the exception slot seed");
+    };
+    assert!(locals[*target as usize].name.starts_with("$wexc"));
+    assert!(matches!(value.kind, HExprKind::Const(Const::None)));
+
+    let HStmtKind::Assign { target, value } = &prelude[2].kind else {
         panic!("expected the `as f` assignment");
     };
     assert_eq!(locals[*target as usize].name, "f");
@@ -788,6 +811,10 @@ fn with_open_lowers_to_try_finally_with_exit() {
     };
     assert_eq!(locals[*source_local as usize].name, "$with0");
 
+    assert_eq!(handlers.len(), 1, "the body exception reaches __exit__");
+    assert_eq!(handlers[0].exc, Some(ExcKind::BaseException));
+    assert_eq!(body.len(), 1, "only the user body is guarded");
+
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 
@@ -797,11 +824,9 @@ fn with_without_target_still_calls_enter() {
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
     let locals = &hir.functions[0].locals;
-    let HStmtKind::Try { body, .. } = &hir.functions[0].body[0].kind else {
-        panic!("expected a try/finally statement");
-    };
-    assert_eq!(body.len(), 3);
-    let HStmtKind::Expr(enter) = &body[1].kind else {
+    let (prelude, _) = with_parts(&hir.functions[0].body[0]);
+    assert_eq!(prelude.len(), 3);
+    let HStmtKind::Expr(enter) = &prelude[2].kind else {
         panic!("expected an __enter__() expression statement");
     };
     let HExprKind::MethodCall {
@@ -829,18 +854,35 @@ fn multiple_with_items_exit_in_reverse_order() {
     let locals = &hir.functions[0].locals;
     assert_eq!(hir.functions[0].body.len(), 1);
 
+    let (outer_prelude, outer) = with_parts(&hir.functions[0].body[0]);
+    assert_eq!(outer_prelude.len(), 3);
+    // The first written manager is evaluated and entered first, so its try is
+    // the outer one and its exit runs last. Items are lowered last-to-first,
+    // so the outer manager owns the later `$withN` slots.
+    let outer_manager = assigned_local(locals, &outer_prelude[0]);
+    assert_eq!(open_argument(&outer_prelude[0]), "a");
     let HStmtKind::Try {
         body, finally_body, ..
-    } = &hir.functions[0].body[0].kind
+    } = &outer.kind
     else {
         panic!("expected the outer try");
     };
-    assert_eq!(exit_local_name(locals, finally_body), "$with1");
-    assert_eq!(body.len(), 3, "outer assignments plus the inner try");
-    let HStmtKind::Try { finally_body, .. } = &body[2].kind else {
+    assert_eq!(exit_local_name(locals, finally_body), outer_manager);
+
+    assert_eq!(body.len(), 4, "second prelude plus its try");
+    let inner_manager = assigned_local(locals, &body[0]);
+    assert_eq!(open_argument(&body[0]), "b");
+    assert_ne!(inner_manager, outer_manager);
+    let HStmtKind::Try {
+        body: inner_body,
+        finally_body,
+        ..
+    } = &body[3].kind
+    else {
         panic!("expected the inner try");
     };
-    assert_eq!(exit_local_name(locals, finally_body), "$with0");
+    assert_eq!(exit_local_name(locals, finally_body), inner_manager);
+    assert!(matches!(&inner_body[0].kind, HStmtKind::Pass));
 }
 
 #[test]
@@ -849,18 +891,40 @@ fn with_exit_runs_from_finally_after_a_raising_body() {
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
     let f = function(&hir, "f");
-    let HStmtKind::Try {
-        body, finally_body, ..
-    } = &f.body[0].kind
-    else {
-        panic!("expected a try/finally statement");
+    let (prelude, try_stmt) = with_parts(&f.body[0]);
+    // Without an `as` target the enter call still runs, as an expression
+    // statement; only the assignment to the target is missing.
+    assert_eq!(
+        prelude.len(),
+        3,
+        "context expression, exception seed, enter"
+    );
+    let HStmtKind::Expr(enter) = &prelude[2].kind else {
+        panic!(
+            "expected the __enter__() statement, got {:?}",
+            prelude[2].kind
+        );
     };
-    // The raising body stays inside the try, so the exit call still runs and
-    // the original exception propagates.
+    assert_eq!(method_name(enter), "__enter__");
+    let HStmtKind::Try {
+        body,
+        handlers,
+        finally_body,
+        ..
+    } = &try_stmt.kind
+    else {
+        panic!("expected the __exit__ try");
+    };
+    // The raising body stays inside the try, so the handler calls `__exit__`
+    // with the real exception and the `finally` guard stays closed.
     assert!(matches!(
         &body.last().expect("with body").kind,
-        HStmtKind::Raise { .. }
+        HStmtKind::Raise {
+            exc: Some(ExcKind::ValueError),
+            ..
+        }
     ));
+    assert_eq!(handlers[0].exc, Some(ExcKind::BaseException));
     assert_eq!(exit_local_name(&f.locals, finally_body), "$with0");
 }
 
@@ -869,10 +933,11 @@ fn with_open_for_loop_checks_cleanly() {
     let source = "with open('data.txt') as f:\n    for line in f:\n        print(line)\n";
     let (hir, mut infer, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
-    let HStmtKind::Try { body, .. } = &hir.functions[0].body[0].kind else {
-        panic!("expected a try/finally statement");
+    let (_, try_stmt) = with_parts(&hir.functions[0].body[0]);
+    let HStmtKind::Try { body, .. } = &try_stmt.kind else {
+        panic!("expected the __exit__ try");
     };
-    assert!(matches!(&body[2].kind, HStmtKind::ForEach { .. }));
+    assert!(matches!(&body[0].kind, HStmtKind::ForEach { .. }));
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 
@@ -888,10 +953,8 @@ fn with_tuple_as_target_is_diagnosed() {
     );
     // The body is still lowered and exited so later errors stay useful.
     assert_eq!(hir.functions[0].body.len(), 1);
-    assert!(matches!(
-        &hir.functions[0].body[0].kind,
-        HStmtKind::Try { .. }
-    ));
+    let (_, try_stmt) = with_parts(&hir.functions[0].body[0]);
+    assert!(matches!(&try_stmt.kind, HStmtKind::Try { .. }));
 }
 
 #[test]
@@ -906,7 +969,320 @@ fn with_target_gets_a_local_slot_inside_functions() {
         .expect("function g");
     let names: Vec<&str> = function.locals.iter().map(|l| l.name.as_str()).collect();
     assert!(names.contains(&"f"), "missing local f: {names:?}");
-    assert!(matches!(&function.body[0].kind, HStmtKind::Try { .. }));
+    assert!(matches!(&function.body[0].kind, HStmtKind::If { .. }));
+}
+
+/// Splits a lowered `with` block into its prelude statements and the guarded
+/// `try`.
+fn with_parts(stmt: &HStmt) -> (&[HStmt], &HStmt) {
+    let stmts = block_body(stmt);
+    let (try_stmt, prelude) = stmts.split_last().expect("a with block is never empty");
+    assert!(
+        matches!(&try_stmt.kind, HStmtKind::Try { .. }),
+        "expected the __exit__ try"
+    );
+    (prelude, try_stmt)
+}
+
+/// Name of the hidden local assigned by `stmt` (`$withN` or `$wexcN`).
+fn assigned_local<'a>(locals: &'a [HLocal], stmt: &HStmt) -> &'a str {
+    let HStmtKind::Assign { target, .. } = &stmt.kind else {
+        panic!("expected an assignment, got {:?}", stmt.kind);
+    };
+    &locals[*target as usize].name
+}
+
+/// String literal passed to the `open(...)` call assigned by `stmt`.
+fn open_argument(stmt: &HStmt) -> &str {
+    let HStmtKind::Assign { value, .. } = &stmt.kind else {
+        panic!("expected an assignment, got {:?}", stmt.kind);
+    };
+    let HExprKind::ModuleCall { args, .. } = &value.kind else {
+        panic!("expected a module call, got {:?}", value.kind);
+    };
+    match &args[0].kind {
+        HExprKind::Const(Const::Str(s)) => s.as_str(),
+        other => panic!("expected a string literal, got {other:?}"),
+    }
+}
+
+/// Method name of an `object.method(...)` expression.
+fn method_name(expr: &HExpr) -> &str {
+    match &expr.kind {
+        HExprKind::MethodCall { method, .. } => method,
+        other => panic!("expected a method call, got {other:?}"),
+    }
+}
+
+/// Counts `__exit__` calls in `stmts` and every statement nested inside them.
+///
+/// The lowering places them either as a statement (`__exit__(None, None,
+/// None)` in a guard) or inside an `if not __exit__(...)` condition, so those
+/// two shapes are what the walk looks for.
+fn count_exit_calls(stmts: &[HStmt]) -> usize {
+    let mut total = 0;
+    for stmt in stmts {
+        match &stmt.kind {
+            HStmtKind::Expr(expr) if method_name_opt(expr) == Some("__exit__") => {
+                total += 1;
+            }
+            HStmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                if let HExprKind::Un { operand, .. } = &cond.kind {
+                    if method_name_opt(operand) == Some("__exit__") {
+                        total += 1;
+                    }
+                }
+                total += count_exit_calls(then_body) + count_exit_calls(else_body);
+            }
+            HStmtKind::While {
+                body, else_body, ..
+            }
+            | HStmtKind::ForEach {
+                body, else_body, ..
+            }
+            | HStmtKind::ForRange {
+                body, else_body, ..
+            } => total += count_exit_calls(body) + count_exit_calls(else_body),
+            HStmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                total += count_exit_calls(body)
+                    + count_exit_calls(else_body)
+                    + count_exit_calls(finally_body);
+                for handler in handlers {
+                    total += count_exit_calls(&handler.body);
+                }
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// Method name when `expr` is an `object.method(...)` call.
+fn method_name_opt(expr: &HExpr) -> Option<&str> {
+    match &expr.kind {
+        HExprKind::MethodCall { method, .. } => Some(method.as_str()),
+        _ => None,
+    }
+}
+
+/// Checks the `except BaseException as $wexc: if not __exit__(...): raise`
+/// arm of a lowered `with` and returns the handler binding name together with
+/// the `__exit__` call.
+fn with_handler_check<'a>(locals: &'a [HLocal], try_stmt: &'a HStmt) -> (&'a str, &'a HExpr) {
+    let HStmtKind::Try {
+        handlers,
+        finally_body,
+        ..
+    } = &try_stmt.kind
+    else {
+        panic!("expected the __exit__ try");
+    };
+    assert_eq!(handlers.len(), 1, "one BaseException handler");
+    let handler = &handlers[0];
+    assert_eq!(handler.exc, Some(ExcKind::BaseException));
+    let exc = handler.binding.expect("the handler binds the exception");
+    assert!(!handler.binding_cell);
+
+    assert_eq!(finally_body.len(), 1);
+    let HStmtKind::If { cond, .. } = &finally_body[0].kind else {
+        panic!("expected the normal-exit guard");
+    };
+    let HExprKind::Bin { op, lhs, rhs } = &cond.kind else {
+        panic!("expected `$wexc is None`, got {:?}", cond.kind);
+    };
+    assert_eq!(*op, BinOp::Is);
+    assert!(matches!(&lhs.kind, HExprKind::Local(local) if *local == exc));
+    assert!(matches!(&rhs.kind, HExprKind::Const(Const::None)));
+
+    assert_eq!(handler.body.len(), 1, "only the suppression check");
+    let HStmtKind::If {
+        cond, then_body, ..
+    } = &handler.body[0].kind
+    else {
+        panic!("expected `if not __exit__(...): raise`");
+    };
+    let HExprKind::Un { op, operand } = &cond.kind else {
+        panic!("expected `not __exit__(...)`, got {:?}", cond.kind);
+    };
+    assert_eq!(*op, pyx_ir::UnOp::Not);
+    assert!(matches!(
+        &then_body[0].kind,
+        HStmtKind::Raise {
+            exc: None,
+            msg: None,
+            cause: None,
+        }
+    ));
+    (locals[exc as usize].name.as_str(), operand)
+}
+
+#[test]
+fn with_exit_truthy_suppresses_the_body_exception() {
+    let source = "def f(cm):\n    with cm:\n        raise ValueError('boom')\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let (_, try_stmt) = with_parts(&f.body[0]);
+    let (_, exit_call) = with_handler_check(&f.locals, try_stmt);
+    // The handler raises only when `__exit__` is falsy, so a truthy result
+    // falls through and the body exception is suppressed.
+    let HExprKind::MethodCall { method, args, .. } = &exit_call.kind else {
+        panic!("expected __exit__, got {:?}", exit_call.kind);
+    };
+    assert_eq!(method, "__exit__");
+    assert_eq!(args.len(), 3);
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn with_exit_falsy_reraises_with_a_bare_raise() {
+    let source = "def f(cm):\n    with cm:\n        raise ValueError('boom')\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let (_, try_stmt) = with_parts(&f.body[0]);
+    // `with_handler_check` already asserted the re-raise is bare: it carries
+    // no exception expression, so the runtime re-raises the original
+    // `ValueError` instead of wrapping it.
+    let (exc_local, _) = with_handler_check(&f.locals, try_stmt);
+    assert!(exc_local.starts_with("$wexc"));
+}
+
+#[test]
+fn with_enter_failure_does_not_call_exit() {
+    let source = "def f(cm):\n    with cm:\n        print('body')\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let (prelude, try_stmt) = with_parts(&f.body[0]);
+    // `$with = cm`, `$wexc = None`, `cm.__enter__()` all precede the try, so
+    // an exception from either the context expression or `__enter__` leaves
+    // this manager without an `__exit__` call.
+    assert_eq!(prelude.len(), 3);
+    assert_eq!(assigned_local(&f.locals, &prelude[0]), "$with0");
+    assert!(assigned_local(&f.locals, &prelude[1]).starts_with("$wexc"));
+    let HStmtKind::Expr(enter) = &prelude[2].kind else {
+        panic!("expected the __enter__() statement");
+    };
+    assert_eq!(method_name(enter), "__enter__");
+    let HStmtKind::Try { body, .. } = &try_stmt.kind else {
+        panic!("expected the __exit__ try");
+    };
+    assert_eq!(body.len(), 1, "only the user body is guarded");
+    assert!(
+        !nested_stmt_any(prelude, &|kind| matches!(kind, HStmtKind::Try { .. })),
+        "the prelude must not be wrapped in a try of its own"
+    );
+}
+
+#[test]
+fn with_normal_path_calls_exit_once_with_none() {
+    let source = "def f(cm):\n    with cm:\n        print('body')\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let (_, try_stmt) = with_parts(&f.body[0]);
+    let HStmtKind::Try {
+        handlers,
+        finally_body,
+        ..
+    } = &try_stmt.kind
+    else {
+        panic!("expected the __exit__ try");
+    };
+    // The handler only fires for an exception, so a normal exit is the
+    // `finally` call with `(None, None, None)`.
+    assert_eq!(exit_local_name(&f.locals, finally_body), "$with0");
+    assert_eq!(
+        count_exit_calls(std::slice::from_ref(try_stmt)),
+        2,
+        "one guarded normal exit plus the handler's exception exit"
+    );
+    assert_eq!(handlers.len(), 1);
+}
+
+#[test]
+fn with_exception_path_passes_type_and_instance() {
+    let source = "def f(cm):\n    with cm:\n        raise ValueError('boom')\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let (_, try_stmt) = with_parts(&f.body[0]);
+    let (exc_name, exit_call) = with_handler_check(&f.locals, try_stmt);
+    let HExprKind::MethodCall { args, .. } = &exit_call.kind else {
+        panic!("expected __exit__, got {:?}", exit_call.kind);
+    };
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::Type),
+        args: type_args,
+    } = &args[0].kind
+    else {
+        panic!("expected `type($wexc)`, got {:?}", args[0].kind);
+    };
+    assert_eq!(type_args.len(), 1);
+    let HExprKind::Local(exc) = &type_args[0].kind else {
+        panic!("expected the handler binding");
+    };
+    assert_eq!(f.locals[*exc as usize].name.as_str(), exc_name);
+    assert!(matches!(&args[1].kind, HExprKind::Local(local) if local == exc));
+    assert!(matches!(&args[2].kind, HExprKind::Const(Const::None)));
+}
+
+#[test]
+fn with_exit_is_called_once_per_manager_on_every_path() {
+    // `break`, `continue` and `return` leave the guarded try through its
+    // `finally`, which holds exactly one `__exit__` call; the handler's call
+    // is the only other one and fires solely for an exception.
+    for body in ["break", "continue", "return"] {
+        let source = format!("def f(cm):\n    while True:\n        with cm:\n            {body}\n");
+        let (hir, _, diags) = lower_source(&source, &parse(&source));
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = function(&hir, "f");
+        let HStmtKind::While {
+            body: loop_body, ..
+        } = &f.body[0].kind
+        else {
+            panic!("expected the loop");
+        };
+        let (_, try_stmt) = with_parts(&loop_body[0]);
+        assert_eq!(
+            count_exit_calls(std::slice::from_ref(try_stmt)),
+            2,
+            "`{body}` must not add or drop an __exit__ call"
+        );
+        let HStmtKind::Try { finally_body, .. } = &try_stmt.kind else {
+            panic!("expected the __exit__ try");
+        };
+        assert_eq!(exit_local_name(&f.locals, finally_body), "$with0");
+    }
+}
+
+#[test]
+fn with_exit_exception_replaces_the_body_exception() {
+    let source = "def f(cm):\n    with cm:\n        raise ValueError('boom')\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let (_, try_stmt) = with_parts(&f.body[0]);
+    // The handler's `__exit__` call is not itself guarded: an exception it
+    // raises leaves the handler and replaces the in-flight `ValueError`.
+    // The `finally` guard then sees `$wexc` bound and does not call it again.
+    let (_, exit_call) = with_handler_check(&f.locals, try_stmt);
+    assert_eq!(
+        count_exit_calls(std::slice::from_ref(try_stmt)),
+        2,
+        "the failing call is the only exception-path call"
+    );
+    assert_eq!(method_name(exit_call), "__exit__");
 }
 
 #[test]
@@ -2574,14 +2950,15 @@ fn nested_comprehensions_keep_both_scopes() {
 }
 
 #[test]
-fn async_comprehension_is_rejected() {
+fn async_comprehension_outside_an_async_function_is_rejected() {
     let source = "xs = [x async for x in range(3)]\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(
         diags[0].message,
-        "async comprehensions are not supported yet"
+        "asynchronous comprehension outside of an asynchronous function"
     );
+    assert_eq!(diags[0].code, codes::CONTROL);
 }
 
 #[test]
@@ -4075,25 +4452,528 @@ fn await_outside_an_async_function_is_rejected() {
 }
 
 #[test]
-fn async_generator_is_rejected() {
+fn async_generator_keeps_both_function_flags() {
     let source = "async def g():\n    yield 1\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].message, "async generators are not supported");
-    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert!(diags.is_empty(), "{diags:?}");
     let g = function(&hir, "g");
     assert!(g.is_async);
     assert!(g.is_generator);
+    assert!(matches!(
+        &g.body[0].kind,
+        HStmtKind::Yield { value: Some(_) }
+    ));
+}
+
+/// Unwraps the always-true `if` block that keeps a multi-statement lowering a
+/// single HIR statement.
+fn block_body(stmt: &HStmt) -> &[HStmt] {
+    let HStmtKind::If {
+        cond,
+        then_body,
+        else_body,
+    } = &stmt.kind
+    else {
+        panic!("expected an always-true block wrapper, got {:?}", stmt.kind);
+    };
+    assert!(matches!(cond.kind, HExprKind::Const(Const::Bool(true))));
+    assert!(else_body.is_empty());
+    then_body
+}
+
+/// Method name called by an `await obj.method(...)` expression.
+fn awaited_method(expr: &HExpr, expected: &str) {
+    let HExprKind::Await { value } = &expr.kind else {
+        panic!("expected await, got {:?}", expr.kind);
+    };
+    let HExprKind::MethodCall { method, .. } = &value.kind else {
+        panic!("expected a method call, got {:?}", value.kind);
+    };
+    assert_eq!(method, expected);
 }
 
 #[test]
-fn async_with_and_async_for_reuse_the_synchronous_lowering() {
-    let source = "async def f():\n    async with open('x.txt') as fh:\n        for line in fh:\n            print(line)\n    async for x in [1, 2]:\n        print(x)\n";
+fn async_for_awaits_anext_and_catches_stop_async_iteration() {
+    let source = "async def f(it):\n    async for x in it:\n        print(x)\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
     let f = function(&hir, "f");
-    assert!(matches!(&f.body[0].kind, HStmtKind::Try { .. }));
-    assert!(matches!(&f.body[1].kind, HStmtKind::ForEach { .. }));
+    let stmts = block_body(&f.body[0]);
+
+    // `$aiter = it.__aiter__()`
+    let HStmtKind::Assign { target, value } = &stmts[0].kind else {
+        panic!("expected the iterator binding, got {:?}", stmts[0].kind);
+    };
+    assert!(f.locals[*target as usize].name.starts_with("$aiter"));
+    let HExprKind::MethodCall { method, args, .. } = &value.kind else {
+        panic!("expected __aiter__(), got {:?}", value.kind);
+    };
+    assert_eq!(method, "__aiter__");
+    assert!(args.is_empty());
+
+    // `while True: try: x = await $aiter.__anext__() except ...: break`
+    let HStmtKind::While {
+        cond,
+        body,
+        else_body,
+    } = &stmts[1].kind
+    else {
+        panic!("expected the iteration loop, got {:?}", stmts[1].kind);
+    };
+    assert!(matches!(cond.kind, HExprKind::Const(Const::Bool(true))));
+    assert!(else_body.is_empty());
+    let HStmtKind::Try {
+        body: fetch,
+        handlers,
+        else_body: try_else,
+        finally_body,
+    } = &body[0].kind
+    else {
+        panic!("expected the __anext__ try, got {:?}", body[0].kind);
+    };
+    assert!(try_else.is_empty());
+    assert!(finally_body.is_empty());
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].exc, Some(ExcKind::StopAsyncIteration));
+    assert_eq!(
+        handlers[0].exc.map(ExcKind::tag),
+        Some(18),
+        "StopAsyncIteration keeps the stable tag"
+    );
+    assert!(matches!(
+        handlers[0].body.as_slice(),
+        [HStmt {
+            kind: HStmtKind::Break,
+            ..
+        }]
+    ));
+
+    let HStmtKind::Assign { target, value } = &fetch[0].kind else {
+        panic!("expected the __anext__ assignment, got {:?}", fetch[0].kind);
+    };
+    assert_eq!(f.locals[*target as usize].name, "x");
+    let HExprKind::Await { value } = &value.kind else {
+        panic!("expected the awaited __anext__(), got {:?}", value.kind);
+    };
+    let HExprKind::MethodCall { method, .. } = &value.kind else {
+        panic!("expected __anext__(), got {:?}", value.kind);
+    };
+    assert_eq!(method, "__anext__");
+
+    // The body runs after the fetch.
+    assert!(matches!(&body[1].kind, HStmtKind::Expr(_)));
+}
+
+#[test]
+fn async_for_else_runs_only_after_normal_exhaustion() {
+    let source =
+        "async def f(it):\n    async for x in it:\n        print(x)\n    else:\n        print(0)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let stmts = block_body(&f.body[0]);
+    assert_eq!(stmts.len(), 4, "{stmts:?}");
+
+    // `$aloop = False` runs once, before the iterator is created.
+    let HStmtKind::Assign { target, value } = &stmts[0].kind else {
+        panic!("expected the exhaustion flag, got {:?}", stmts[0].kind);
+    };
+    assert!(f.locals[*target as usize].name.starts_with("$aloop"));
+    assert!(matches!(value.kind, HExprKind::Const(Const::Bool(false))));
+
+    // Exhaustion sets the flag before leaving the loop.
+    let HStmtKind::While { body, .. } = &stmts[2].kind else {
+        panic!("expected the iteration loop, got {:?}", stmts[2].kind);
+    };
+    let HStmtKind::Try { handlers, .. } = &body[0].kind else {
+        panic!("expected the __anext__ try, got {:?}", body[0].kind);
+    };
+    assert_eq!(handlers[0].exc, Some(ExcKind::StopAsyncIteration));
+    let HStmtKind::Assign {
+        target: flag_target,
+        value: flag_value,
+    } = &handlers[0].body[0].kind
+    else {
+        panic!("expected the exhaustion flag assignment");
+    };
+    assert_eq!(flag_target, target);
+    assert!(matches!(
+        flag_value.kind,
+        HExprKind::Const(Const::Bool(true))
+    ));
+    assert!(matches!(handlers[0].body[1].kind, HStmtKind::Break));
+
+    // `if $aloop: <else body>` follows the loop, outside it.
+    let HStmtKind::If {
+        cond,
+        then_body,
+        else_body,
+    } = &stmts[3].kind
+    else {
+        panic!("expected the else guard, got {:?}", stmts[3].kind);
+    };
+    assert!(matches!(cond.kind, HExprKind::Local(local) if local == *target));
+    assert!(else_body.is_empty());
+    assert!(matches!(then_body[0].kind, HStmtKind::Expr(_)));
+}
+
+#[test]
+fn async_with_awaits_aenter_and_guards_aexit() {
+    let source = "async def f(cm):\n    async with cm as value:\n        print(value)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let stmts = block_body(&f.body[0]);
+    assert_eq!(stmts.len(), 4, "{stmts:?}");
+
+    // `$with = cm`, `$aexc = None`, `value = await $with.__aenter__()`.
+    let HStmtKind::Assign {
+        target: manager, ..
+    } = &stmts[0].kind
+    else {
+        panic!("expected the manager binding, got {:?}", stmts[0].kind);
+    };
+    assert!(f.locals[*manager as usize].name.starts_with("$with"));
+    let HStmtKind::Assign { target: exc, value } = &stmts[1].kind else {
+        panic!("expected the exception slot, got {:?}", stmts[1].kind);
+    };
+    assert!(f.locals[*exc as usize].name.starts_with("$aexc"));
+    assert!(matches!(value.kind, HExprKind::Const(Const::None)));
+    let HStmtKind::Assign {
+        target: bound,
+        value,
+    } = &stmts[2].kind
+    else {
+        panic!("expected the as binding, got {:?}", stmts[2].kind);
+    };
+    assert_eq!(f.locals[*bound as usize].name, "value");
+    awaited_method(value, "__aenter__");
+
+    let HStmtKind::Try {
+        body,
+        handlers,
+        else_body,
+        finally_body,
+    } = &stmts[3].kind
+    else {
+        panic!("expected the __aexit__ try, got {:?}", stmts[3].kind);
+    };
+    assert!(matches!(body[0].kind, HStmtKind::Expr(_)));
+    assert!(else_body.is_empty());
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].exc, Some(ExcKind::BaseException));
+    assert_eq!(handlers[0].binding, Some(*exc));
+
+    // `if not await __aexit__(type(exc), exc, None): raise`
+    let HStmtKind::If {
+        cond, then_body, ..
+    } = &handlers[0].body[0].kind
+    else {
+        panic!("expected the suppression check");
+    };
+    let HExprKind::Un { op, operand } = &cond.kind else {
+        panic!("expected `not __aexit__(...)`, got {:?}", cond.kind);
+    };
+    assert_eq!(*op, pyx_ir::UnOp::Not);
+    awaited_method(operand, "__aexit__");
+    let HExprKind::Await { value: exit } = &operand.kind else {
+        panic!("expected an await");
+    };
+    let HExprKind::MethodCall { args, .. } = &exit.kind else {
+        panic!("expected a method call");
+    };
+    assert_eq!(args.len(), 3);
+    assert!(matches!(
+        &args[0].kind,
+        HExprKind::Call {
+            callee: Callee::Builtin(Builtin::Type),
+            ..
+        }
+    ));
+    assert!(matches!(&args[1].kind, HExprKind::Local(local) if local == exc));
+    assert!(matches!(&args[2].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(
+        &then_body[0].kind,
+        HStmtKind::Raise { exc: None, .. }
+    ));
+
+    // `finally: if $aexc is None: await __aexit__(None, None, None)`
+    assert_eq!(finally_body.len(), 1);
+    let HStmtKind::If {
+        cond, then_body, ..
+    } = &finally_body[0].kind
+    else {
+        panic!("expected the normal-exit guard");
+    };
+    let HExprKind::Bin { op, lhs, rhs } = &cond.kind else {
+        panic!("expected `$aexc is None`, got {:?}", cond.kind);
+    };
+    assert_eq!(*op, BinOp::Is);
+    assert!(matches!(&lhs.kind, HExprKind::Local(local) if local == exc));
+    assert!(matches!(&rhs.kind, HExprKind::Const(Const::None)));
+    let HStmtKind::Expr(exit) = &then_body[0].kind else {
+        panic!("expected the normal exit call");
+    };
+    let HExprKind::Await { value } = &exit.kind else {
+        panic!("expected an await");
+    };
+    let HExprKind::MethodCall { method, args, .. } = &value.kind else {
+        panic!("expected a method call");
+    };
+    assert_eq!(method, "__aexit__");
+    assert_eq!(args.len(), 3);
+    assert!(args
+        .iter()
+        .all(|arg| matches!(arg.kind, HExprKind::Const(Const::None))));
+}
+
+#[test]
+fn async_with_stacks_managers_in_reverse_order() {
+    let source = "async def f(a, b):\n    async with a as x, b as y:\n        pass\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let stmts = block_body(&f.body[0]);
+
+    // The outer manager is `a` (first written, first entered).
+    let HStmtKind::Assign { value, .. } = &stmts[0].kind else {
+        panic!("expected the first manager binding");
+    };
+    let HExprKind::Local(first_manager) = &value.kind else {
+        panic!("expected `a`, got {:?}", value.kind);
+    };
+    let first_param = f
+        .locals
+        .iter()
+        .position(|local| local.name == "a")
+        .expect("parameter a");
+    assert_eq!(*first_manager as usize, first_param);
+
+    // The inner Try's body begins with the second manager's prelude.
+    let HStmtKind::Try { body, .. } = &stmts[stmts.len() - 1].kind else {
+        panic!("expected the outer try");
+    };
+    let HStmtKind::Assign { value, .. } = &body[0].kind else {
+        panic!("expected the second manager binding");
+    };
+    let HExprKind::Local(second_manager) = &value.kind else {
+        panic!("expected `b`, got {:?}", value.kind);
+    };
+    let second_param = f
+        .locals
+        .iter()
+        .position(|local| local.name == "b")
+        .expect("parameter b");
+    assert_eq!(*second_manager as usize, second_param);
+}
+
+/// True when `stmts` or any statement nested inside them matches `pred`.
+fn nested_stmt_any(stmts: &[HStmt], pred: &dyn Fn(&HStmtKind) -> bool) -> bool {
+    stmts.iter().any(|stmt| {
+        if pred(&stmt.kind) {
+            return true;
+        }
+        match &stmt.kind {
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => nested_stmt_any(then_body, pred) || nested_stmt_any(else_body, pred),
+            HStmtKind::While {
+                body, else_body, ..
+            }
+            | HStmtKind::ForEach {
+                body, else_body, ..
+            }
+            | HStmtKind::ForRange {
+                body, else_body, ..
+            } => nested_stmt_any(body, pred) || nested_stmt_any(else_body, pred),
+            HStmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                nested_stmt_any(body, pred)
+                    || handlers
+                        .iter()
+                        .any(|handler| nested_stmt_any(&handler.body, pred))
+                    || nested_stmt_any(else_body, pred)
+                    || nested_stmt_any(finally_body, pred)
+            }
+            _ => false,
+        }
+    })
+}
+
+fn catches_stop_async_iteration(kind: &HStmtKind) -> bool {
+    matches!(
+        kind,
+        HStmtKind::Try { handlers, .. }
+            if handlers
+                .iter()
+                .any(|handler| handler.exc == Some(ExcKind::StopAsyncIteration))
+    )
+}
+
+#[test]
+fn async_list_comprehension_lowers_to_an_awaited_coroutine() {
+    let source = "async def f(it):\n    return [x async for x in it]\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let HStmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!(
+            "expected the returned comprehension, got {:?}",
+            f.body[0].kind
+        );
+    };
+    assert_eq!(value.ty, Ty::Concrete(Type::List));
+    let HExprKind::Await { value: call } = &value.kind else {
+        panic!("expected an awaited helper, got {:?}", value.kind);
+    };
+    let HExprKind::Call {
+        callee: Callee::Function(id),
+        args,
+    } = &call.kind
+    else {
+        panic!("expected a helper call, got {:?}", call.kind);
+    };
+    assert_eq!(args.len(), 1, "the outermost iterable is passed eagerly");
+
+    let helper = &hir.functions[*id as usize];
+    assert_eq!(helper.name, "<asynccomp>");
+    assert!(helper.is_async);
+    assert!(!helper.is_generator);
+    assert!(matches!(
+        helper.body.first().map(|stmt| &stmt.kind),
+        Some(HStmtKind::Assign { .. })
+    ));
+    assert!(matches!(
+        helper.body.last().map(|stmt| &stmt.kind),
+        Some(HStmtKind::Return(Some(_)))
+    ));
+    assert!(
+        nested_stmt_any(&helper.body, &catches_stop_async_iteration),
+        "the helper handles the end of the async iterator"
+    );
+    assert!(nested_stmt_any(&helper.body, &|kind| matches!(
+        kind,
+        HStmtKind::Expr(HExpr {
+            kind: HExprKind::MethodCall { method, .. },
+            ..
+        }) if method == "append"
+    )));
+    assert_eq!(helper.ret_ty, Ty::Concrete(Type::Any));
+}
+
+#[test]
+fn async_generator_expression_is_an_async_generator() {
+    let source = "async def f(it):\n    return (x async for x in it)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let HStmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!("expected the returned generator expression");
+    };
+    let HExprKind::Call {
+        callee: Callee::Function(id),
+        ..
+    } = &value.kind
+    else {
+        panic!("expected the generator function call, got {:?}", value.kind);
+    };
+    let helper = &hir.functions[*id as usize];
+    assert_eq!(helper.name, "<genexpr>");
+    assert!(helper.is_async);
+    assert!(helper.is_generator, "async generator expressions stay lazy");
+    assert!(nested_stmt_any(&helper.body, &|kind| matches!(
+        kind,
+        HStmtKind::Yield { .. }
+    )));
+    assert!(nested_stmt_any(&helper.body, &catches_stop_async_iteration));
+}
+
+#[test]
+fn generator_expression_with_await_is_an_async_generator() {
+    let source =
+        "import asyncio\nasync def f(xs):\n    return (await asyncio.sleep(0) for x in xs)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let HStmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!("expected the returned generator expression");
+    };
+    let HExprKind::Call {
+        callee: Callee::Function(id),
+        ..
+    } = &value.kind
+    else {
+        panic!("expected the generator function call, got {:?}", value.kind);
+    };
+    let helper = &hir.functions[*id as usize];
+    assert_eq!(helper.name, "<genexpr>");
+    assert!(helper.is_async, "a frame that awaits is an async generator");
+    assert!(helper.is_generator);
+    assert!(nested_stmt_any(&helper.body, &|kind| matches!(
+        kind,
+        HStmtKind::Yield { value: Some(value) }
+            if matches!(value.kind, HExprKind::Await { .. })
+    )));
+}
+
+#[test]
+fn await_inside_a_list_comprehension_stays_in_the_enclosing_coroutine() {
+    let source =
+        "import asyncio\nasync def f(xs):\n    return [await asyncio.sleep(0) for x in xs]\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    // No synthetic coroutine: the comprehension is eager and its element
+    // awaits directly in `f`.
+    assert_eq!(hir.functions.len(), 2, "only the module body and f");
+    let f = function(&hir, "f");
+    let HStmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!("expected the returned list comprehension");
+    };
+    let HExprKind::ListComp { element, .. } = &value.kind else {
+        panic!("expected a list comprehension, got {:?}", value.kind);
+    };
+    assert!(matches!(element.kind, HExprKind::Await { .. }));
+    assert!(hir
+        .functions
+        .iter()
+        .all(|function| function.name != "<asynccomp>"));
+}
+
+#[test]
+fn async_comprehension_in_a_sync_function_is_rejected() {
+    let source = "def f(it):\n    return [x async for x in it]\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(
+        diags[0].message,
+        "asynchronous comprehension outside of an asynchronous function"
+    );
+    assert_eq!(diags[0].code, codes::CONTROL);
+}
+
+#[test]
+fn async_for_and_with_outside_async_functions_are_rejected() {
+    for (source, expected) in [
+        (
+            "async for x in y:\n    pass\n",
+            "'async for' is only allowed inside async functions",
+        ),
+        (
+            "async with y:\n    pass\n",
+            "'async with' is only allowed inside async functions",
+        ),
+    ] {
+        let (_, _, diags) = lower_source(source, &parse(source));
+        assert_eq!(diags.len(), 1, "{source}: {diags:?}");
+        assert_eq!(diags[0].message, expected, "{source}");
+        assert_eq!(diags[0].code, codes::CONTROL, "{source}");
+    }
 }
 
 #[test]

@@ -134,5 +134,27 @@ fn asyncio_module_spec_is_registered() {
         (gather.min_args, gather.max_args, gather.ret),
         (0, usize::MAX, Type::List)
     );
-    assert!(stdlib::module("asyncio").unwrap().constants.is_empty());
+    let create_task = stdlib::function("asyncio", "create_task").expect("create_task");
+    assert_eq!(
+        (create_task.min_args, create_task.max_args, create_task.ret),
+        (1, 1, Type::Any)
+    );
+    let current_task = stdlib::function("asyncio", "current_task").expect("current_task");
+    assert_eq!(
+        (
+            current_task.min_args,
+            current_task.max_args,
+            current_task.ret
+        ),
+        (0, 0, Type::Any)
+    );
+    let constants = stdlib::module("asyncio").unwrap().constants;
+    assert!(constants
+        .iter()
+        .any(|constant| constant.name == "CancelledError"));
+    let task_group = stdlib::function("asyncio", "TaskGroup").expect("TaskGroup");
+    assert_eq!(
+        (task_group.min_args, task_group.max_args, task_group.ret),
+        (0, 0, Type::Any)
+    );
 }

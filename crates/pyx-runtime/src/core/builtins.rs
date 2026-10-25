@@ -1027,7 +1027,11 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
                 let entry = *entry;
                 let roots = crate::heap::root_values(&args);
                 let created = if func.flags & value::FUNCTION_FLAG_ASYNC != 0 {
-                    value::fiber_coroutine_new(entry, name, args)
+                    if func.flags & value::FUNCTION_FLAG_GENERATOR != 0 {
+                        value::fiber_async_generator_new(entry, name, args)
+                    } else {
+                        value::fiber_coroutine_new(entry, name, args)
+                    }
                 } else {
                     value::fiber_generator_new(entry, name, args)
                 };
@@ -1073,6 +1077,31 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             let result = unsafe { entry(argv) };
             crate::heap::release_roots(roots);
             result
+        }
+        FunctionBody::Host { token, captures } => {
+            // Interpreter functions carry full parameter metadata. Positional
+            // calls with a complete, plain signature dispatch directly; any
+            // omitted default, keyword-only/vararg slot or dynamic signature
+            // goes through the shared runtime binder first.
+            let expected = func.signature.len();
+            let varargs = func.flags & value::FUNCTION_FLAG_VARARGS != 0;
+            if expected != 0 && (varargs || argc != expected) {
+                return call_kw(function, argc, argv, 0, std::ptr::null());
+            }
+            if expected == 0 && argc != 0 {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{}() takes no arguments ({argc} given)", func.name),
+                );
+            }
+            let args: &[i64] = if argc == 0 {
+                &[]
+            } else {
+                // SAFETY: NULL with argc > 0 was rejected above; the caller
+                // guarantees a readable buffer of `argc` tagged values.
+                unsafe { std::slice::from_raw_parts(argv, argc) }
+            };
+            crate::host::call_slots(*token, captures, args, func.flags, &func.name)
         }
         FunctionBody::Native { module, name } => modules::call_native(module, name, argc, argv),
         FunctionBody::BoundMethod { receiver, method } => {
@@ -1355,6 +1384,15 @@ pub(crate) fn call_kw(
             };
             keywords.push((keyword.to_string(), pair[1]));
         }
+        if let Some(tag) = exc::exception_tag_of_class(class) {
+            if !keywords.is_empty() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "exception class does not accept keyword arguments",
+                );
+            }
+            return instantiate_exception(tag, args.len(), args.as_ptr());
+        }
         let instance = value::instance_new(class);
         let Some((kind, init)) = value::class_member(class, "__init__") else {
             if !args.is_empty() || !keywords.is_empty() {
@@ -1581,6 +1619,11 @@ pub(crate) fn call_kw(
         }
     }
     let full: Vec<i64> = slots.into_iter().map(|slot| slot.unwrap_or(NONE)).collect();
+    if let FunctionBody::Host { token, captures } = &func.body {
+        // The shared binder produced one value per user-visible parameter;
+        // the interpreter copies captures and these slots into its frame.
+        return crate::host::call_slots(*token, captures, &full, func.flags, &name);
+    }
     if func.flags & (value::FUNCTION_FLAG_ASYNC | value::FUNCTION_FLAG_GENERATOR) != 0 {
         // Generator/coroutine calls must create a suspended fiber instead of
         // running the concrete entry. Plain positional signatures can go
@@ -1718,6 +1761,30 @@ fn push_item(list: i64, item: i64) {
 /// `__init__`'s return value is ignored (Python requires `None`). Without
 /// `__init__` any positional argument is a `TypeError`; otherwise a raised
 /// exception propagates and no instance is returned.
+/// Instantiates a built-in exception class: `ValueError('x')` creates a
+/// plain exception object with the tag's class name and message. Extra
+/// positional arguments are rejected (PyX stores one message, not an
+/// `args` tuple).
+fn instantiate_exception(tag: u32, argc: usize, argv: *const i64) -> i64 {
+    if argc > 1 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{}() takes at most 1 argument ({} given)",
+                exc::tag_name(tag),
+                argc
+            ),
+        );
+    }
+    let message = if argc == 1 && !argv.is_null() {
+        // SAFETY: ABI contract: `argv` points at one readable tagged value.
+        value::to_string(unsafe { *argv })
+    } else {
+        String::new()
+    };
+    exc::exception_value(tag, &message)
+}
+
 fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -1727,6 +1794,9 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     }
     if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return exc::raise_with_message(TYPE_ERROR, "class instantiation has too many arguments");
+    }
+    if let Some(tag) = exc::exception_tag_of_class(class) {
+        return instantiate_exception(tag, argc, argv);
     }
     // Copy the class name before allocating: a reference into a heap object
     // must not be read after an allocation that may collect.

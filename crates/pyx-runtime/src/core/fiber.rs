@@ -25,6 +25,13 @@
 //! The *native* caller frames of a resume (the only suspended side that is
 //! not on a fiber stack) are published through
 //! [`crate::heap::set_aux_stack`] while the fiber runs.
+//!
+//! Precise shadow-stack roots follow the switch: [`resume_raw`] detaches the
+//! resumer's root set into [`FiberState::caller_roots`] and installs the
+//! fiber's own set ([`FiberState::saved_roots`]); [`suspend_switch`] and
+//! [`finish_switch`] do the reverse. Both sets stay inside the fiber object,
+//! so the collector can still scan them (`FiberState::trace` marks them) while
+//! the other context runs.
 
 use std::alloc::{self, Layout};
 use std::cell::Cell;
@@ -32,6 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR};
+use crate::gc::roots::{self, SavedRoots};
 use crate::value::{self, NONE};
 
 // -------------------------------------------------------------------------
@@ -281,6 +289,8 @@ pub(crate) enum FiberKind {
     Generator,
     /// `async def`: driven by `pyx_await` or `asyncio.run`.
     Coroutine,
+    /// `async def` with `yield`: driven by `__anext__`/`asend`.
+    AsyncGenerator,
 }
 
 /// A suspension request that the driver has to service before the fiber can
@@ -366,6 +376,25 @@ pub(crate) struct FiberState {
     /// Exception injected by `throw()`/`close()` and raised at the suspended
     /// `yield` when the fiber is resumed.
     pub(crate) injected: Option<i64>,
+    /// Exception queued by task cancellation and raised when the fiber next
+    /// resumes from a suspension point.
+    pub(crate) pending_raise: Option<i64>,
+    /// Fiber this one is currently awaiting (`NONE` when none). Keeps the
+    /// awaited object reachable while the awning fiber is suspended.
+    pub(crate) awaiting: i64,
+    /// The task has been handed to the asyncio driver at least once.
+    pub(crate) scheduled: bool,
+    /// The fiber is a task owned by the asyncio loop (`create_task`), so
+    /// awaiting it must go through a join instead of resuming it here.
+    pub(crate) owned: bool,
+    /// `Task.cancel()` was requested; the CancelledError is delivered at the
+    /// next resume.
+    pub(crate) cancel_requested: bool,
+    /// The task finished by propagating `CancelledError`.
+    pub(crate) cancelled: bool,
+    /// Number of active `await` frames on this fiber's stack, saved across
+    /// context switches so nested awaits are bounded per chain.
+    pub(crate) await_depth: usize,
     /// `close()` is driving the fiber; a `yield` that resumes afterwards is
     /// an ignored `GeneratorExit`.
     pub(crate) closing: bool,
@@ -382,6 +411,20 @@ pub(crate) struct FiberState {
     /// Monotonic completion order, used to report the first failing gather
     /// task.
     pub(crate) finish_seq: u64,
+    /// Precise shadow-stack roots of this fiber while it is suspended.
+    ///
+    /// Filled by [`suspend_switch`] and installed by [`resume_raw`]; the
+    /// collector can scan them through [`SavedRoots::frames`]/
+    /// [`SavedRoots::ranges`] while another context runs, and
+    /// [`FiberState::trace`]
+    /// marks them for the conservative collector.
+    pub(crate) saved_roots: SavedRoots,
+    /// Precise roots of the resumer while this fiber runs.
+    ///
+    /// Captured by [`resume_raw`] before the switch and installed again by
+    /// [`suspend_switch`]/[`finish_switch`], so the caller's frames stay
+    /// scannable while its native stack is inactive.
+    pub(crate) caller_roots: SavedRoots,
 }
 
 impl FiberState {
@@ -412,6 +455,13 @@ impl FiberState {
             started: false,
             sent: NONE,
             injected: None,
+            pending_raise: None,
+            awaiting: NONE,
+            scheduled: false,
+            owned: false,
+            cancel_requested: false,
+            cancelled: false,
+            await_depth: 0,
             closing: false,
             request: None,
             stack_root_lo: stack_lo,
@@ -421,6 +471,8 @@ impl FiberState {
             caller_ctx_root_lo: 0,
             caller_ctx_root_hi: 0,
             finish_seq: 0,
+            saved_roots: SavedRoots::default(),
+            caller_roots: SavedRoots::default(),
         });
         // The three ranges stay valid until `Drop`; registering them once
         // keeps the per-resume path free of global-registry work.
@@ -437,6 +489,10 @@ impl FiberState {
 
     /// Marks the values owned by this object. The fiber stack and the two
     /// register contexts are scanned separately by the collector.
+    ///
+    /// The precise shadow roots are marked too: while a fiber is suspended
+    /// they are its only record of the values on its stack, and while it runs
+    /// `caller_roots` pins the resumer's frames.
     pub(crate) fn trace(&self, mark: fn(i64)) {
         for &arg in &self.args {
             mark(arg);
@@ -445,19 +501,30 @@ impl FiberState {
         mark(self.result);
         mark(self.error);
         mark(self.sent);
+        mark(self.awaiting);
         if let Some(injected) = self.injected {
             mark(injected);
+        }
+        if let Some(pending) = self.pending_raise {
+            mark(pending);
         }
         if let Some(WaitRequest::Join(tasks)) = &self.request {
             for &task in tasks {
                 mark(task);
             }
         }
+        roots::mark_precise(self.saved_roots.frames(), self.saved_roots.ranges(), mark);
+        roots::mark_precise(self.caller_roots.frames(), self.caller_roots.ranges(), mark);
     }
 }
 
 impl Drop for FiberState {
     fn drop(&mut self) {
+        // Drop the precise root descriptors before anything they point at is
+        // freed. `clear` only drops the vectors: it never dereferences a slot,
+        // so a stale frame on a dead fiber stack cannot be scanned here.
+        self.saved_roots.clear();
+        self.caller_roots.clear();
         // The lifetime root ranges must be gone before the stack and the
         // contexts are freed.
         crate::heap::unregister_suspended_stack(self.stack_root_lo, self.stack_root_hi);
@@ -481,6 +548,41 @@ struct CurrentFiber {
 
 thread_local! {
     static CURRENT: Cell<Option<CurrentFiber>> = const { Cell::new(None) };
+    /// Chain depth of active `await` frames on the running fiber. Saved into
+    /// [`FiberState::await_depth`] across a context switch, so unrelated
+    /// tasks never accumulate each other's depth.
+    static AWAIT_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Upper bound for nested `await` chains. Each level keeps a Rust frame plus
+/// the awaited fiber's trampoline alive; a chain this deep is already far
+/// beyond useful programs and a `RuntimeError` is better than a stack probe.
+const MAX_AWAIT_DEPTH: usize = 512;
+
+/// Decrements [`AWAIT_DEPTH`] when an `await` frame exits (including when
+/// the exception path unwinds through it).
+struct AwaitDepthGuard;
+
+impl AwaitDepthGuard {
+    fn enter() -> Option<AwaitDepthGuard> {
+        let depth = AWAIT_DEPTH.with(|cell| {
+            let depth = cell.get() + 1;
+            cell.set(depth);
+            depth
+        });
+        if depth > MAX_AWAIT_DEPTH {
+            AWAIT_DEPTH.with(|cell| cell.set(depth - 1));
+            None
+        } else {
+            Some(AwaitDepthGuard)
+        }
+    }
+}
+
+impl Drop for AwaitDepthGuard {
+    fn drop(&mut self) {
+        AWAIT_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+    }
 }
 
 /// Completion counter shared by every thread.
@@ -510,7 +612,11 @@ extern "C" fn fiber_trampoline() {
     unsafe {
         (*ptr).result = result;
         if exc::pending() {
-            (*ptr).error = exc::pending_value();
+            let error = exc::pending_value();
+            (*ptr).error = error;
+            if value::exception_data(error).map(|data| data.tag) == Some(exc::CANCELLED_ERROR) {
+                (*ptr).cancelled = true;
+            }
             let _ = exc::clear();
         }
         (*ptr).finish_seq = next_finish_seq();
@@ -531,6 +637,13 @@ unsafe fn finish_switch(ptr: *mut FiberState) {
     unsafe {
         (*ptr).running = false;
         crate::heap::pop_stack_bounds();
+        // The body returned: its precise roots die with this frame. Drop the
+        // active set (without scanning it) and make the resumer's roots
+        // current again before its native context becomes reachable.
+        (*ptr).await_depth = AWAIT_DEPTH.with(Cell::get);
+        let _ = roots::take_current();
+        let caller = std::mem::take(&mut (*ptr).caller_roots);
+        let _ = roots::install(caller);
         // The context must never be resumed once the body returned. Save the
         // fiber's (dead) continuation into its own slot and switch to the
         // resumer (`caller_ctx`).
@@ -554,6 +667,13 @@ unsafe fn suspend_switch(ptr: *mut FiberState) {
     unsafe {
         (*ptr).running = false;
         crate::heap::pop_stack_bounds();
+        // Park this fiber's precise roots in the fiber object, where the
+        // collector can still find them, and restore the resumer's set. Both
+        // operations only move vectors; no snapshot or lock is taken.
+        (*ptr).await_depth = AWAIT_DEPTH.with(Cell::get);
+        (*ptr).saved_roots = roots::take_current();
+        let caller = std::mem::take(&mut (*ptr).caller_roots);
+        let _ = roots::install(caller);
         // Save the fiber's continuation into `ctx` and switch back to the
         // resumer (`caller_ctx`).
         switch_from_fiber(ptr);
@@ -604,12 +724,25 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
         (*ptr).sent = value;
         (*ptr).running = true;
         crate::heap::push_stack_bounds((*ptr).stack.low(), (*ptr).stack.high());
+        // Save the resumer's await-chain depth and install the callee's. A
+        // fresh fiber starts at the resumer's depth (it is being awaited),
+        // while a scheduler-resumed task uses its own saved depth.
+        let resume_depth = AWAIT_DEPTH.with(Cell::get);
+        let callee_depth = (*ptr).await_depth.max(resume_depth);
+        AWAIT_DEPTH.with(|cell| cell.set(callee_depth));
+        // Save the resumer's precise roots in the fiber object and install
+        // this fiber's set (empty on the first resume, restored after a
+        // suspension). The resumer's roots stay scannable there while its
+        // native stack is inactive.
+        (*ptr).caller_roots = roots::take_current();
+        let _ = roots::install(std::mem::take(&mut (*ptr).saved_roots));
         let outer = CURRENT.with(|cell| cell.replace(Some(CurrentFiber { ptr, value })));
         // Resume: save the caller's continuation into `caller_ctx` and switch
         // to the fiber's `ctx` (the trampoline entry on first resume, the
         // suspension point afterwards).
         switch_to_fiber(ptr);
         CURRENT.with(|cell| cell.set(outer));
+        AWAIT_DEPTH.with(|cell| cell.set(resume_depth));
         (*ptr).running = false;
         // The suspension/finish path restored the caller's stack bounds
         // before switching back.
@@ -690,6 +823,28 @@ fn current_ptr() -> Option<*mut FiberState> {
     CURRENT.with(Cell::get).map(|current| current.ptr)
 }
 
+/// Re-raises a detached exception value. The value is rooted while the
+/// runtime clones it into the pending slot (the clone allocates).
+fn raise_detached(error: i64) -> i64 {
+    let token = crate::heap::root_values(&[error]);
+    exc::raise_value(error);
+    crate::heap::release_roots(token);
+    NONE
+}
+
+/// Takes the exception queued by `throw()`/`close()` or by cancellation.
+/// `injected` wins: an explicit `throw`/`close` is delivered before a
+/// cancellation request queued while the fiber was suspended.
+fn take_suspension_raise(ptr: *mut FiberState) -> Option<i64> {
+    // SAFETY: `ptr` is a live fiber.
+    unsafe {
+        if let Some(injected) = (*ptr).injected.take() {
+            return Some(injected);
+        }
+        (*ptr).pending_raise.take()
+    }
+}
+
 /// Suspends the running fiber with an optional wait request. Returns `None`
 /// once the fiber is resumed.
 pub(crate) fn suspend_current(request: Option<WaitRequest>) -> i64 {
@@ -703,6 +858,9 @@ pub(crate) fn suspend_current(request: Option<WaitRequest>) -> i64 {
     unsafe {
         (*ptr).request = request;
         suspend_switch(ptr);
+        if let Some(error) = take_suspension_raise(ptr) {
+            return raise_detached(error);
+        }
     }
     NONE
 }
@@ -714,18 +872,19 @@ pub(crate) fn yield_value(value: i64) -> i64 {
         return exc::raise_with_message(RUNTIME_ERROR, "'yield' outside of a generator");
     };
     // SAFETY: `ptr` is the running fiber installed by `resume_raw`.
-    if unsafe { (*ptr).kind } != FiberKind::Generator {
+    let kind = unsafe { (*ptr).kind };
+    if !matches!(kind, FiberKind::Generator | FiberKind::AsyncGenerator) {
         return exc::raise_with_message(RUNTIME_ERROR, "'yield' outside of a generator");
     }
     unsafe {
         (*ptr).yielded = value;
         (*ptr).request = None;
         suspend_switch(ptr);
-        // An exception thrown or injected by `close()` is raised at the
-        // suspension point, so codegen routes it through the generator's
-        // handlers and `finally` blocks.
-        if let Some(injected) = (*ptr).injected.take() {
-            return exc::raise_value(injected);
+        // An exception thrown, injected by `close()` or queued by task
+        // cancellation is raised at the suspension point, so codegen routes
+        // it through the generator's handlers and `finally` blocks.
+        if let Some(injected) = take_suspension_raise(ptr) {
+            return raise_detached(injected);
         }
         // `close()` resumed this generator after injecting `GeneratorExit`;
         // a further yield means the body ignored it.
@@ -861,6 +1020,277 @@ pub(crate) fn close_value(generator: i64) -> i64 {
         (*ptr).finish_seq = next_finish_seq();
         exc::raise_with_message(RUNTIME_ERROR, "generator ignored GeneratorExit")
     }
+}
+
+/// Builds a detached exception value and clears the pending slot.
+fn detached_exception(tag: u32, message: &str) -> i64 {
+    exc::raise_with_message(tag, message);
+    let value = exc::pending_value();
+    let _ = exc::clear();
+    value
+}
+
+/// `__aiter__` of an async generator: the object is its own iterator.
+pub(crate) fn async_generator_aiter(value: i64) -> i64 {
+    if value::as_fiber(value)
+        .map(|fiber| fiber.kind == FiberKind::AsyncGenerator)
+        .unwrap_or(false)
+    {
+        value
+    } else {
+        exc::raise_with_message(TYPE_ERROR, "object is not an async iterable")
+    }
+}
+
+/// Resumes an async generator and drives its wait requests, returning the
+/// yielded item. The caller has already validated `ptr` and the resume value.
+fn drive_async_generator(agen: i64, ptr: *mut FiberState, first_value: i64) -> i64 {
+    let Some(_depth) = AwaitDepthGuard::enter() else {
+        return exc::raise_with_message(RUNTIME_ERROR, "await chain is too deep");
+    };
+    let mut resume_value = first_value;
+    loop {
+        // SAFETY: `ptr` is a live fiber that is not running.
+        unsafe {
+            resume_raw(ptr, resume_value);
+        }
+        resume_value = NONE;
+        if unsafe { (*ptr).error != NONE } {
+            return raise_error(agen);
+        }
+        if unsafe { (*ptr).done } {
+            return exc::raise_with_message(exc::STOP_ASYNC_ITERATION, "");
+        }
+        let has_request = unsafe { (*ptr).request.is_some() };
+        if has_request {
+            if current_ptr().is_none() {
+                service_pending_request(ptr);
+                continue;
+            }
+            // Propagate the suspension outwards; the enclosing task's driver
+            // resumes us and this loop continues the async generator.
+            let request = unsafe { (*ptr).request.take() };
+            let _ = suspend_current(request);
+            if exc::pending() {
+                return NONE;
+            }
+            continue;
+        }
+        // No request: the body executed `yield`, so `yielded` holds the item.
+        return unsafe { (*ptr).yielded };
+    }
+}
+
+/// `async_generator.__anext__()`: returns the next item directly (await
+/// passes non-fibers through), or raises `StopAsyncIteration` at completion.
+pub(crate) fn async_generator_next(agen: i64) -> i64 {
+    let Some(ptr) = value::fiber_raw(agen) else {
+        return exc::raise_with_message(TYPE_ERROR, "__anext__() requires an async generator");
+    };
+    // SAFETY: `fiber_raw` returned a live fiber payload.
+    unsafe {
+        if (*ptr).kind != FiberKind::AsyncGenerator {
+            return exc::raise_with_message(TYPE_ERROR, "__anext__() requires an async generator");
+        }
+        if current_ptr() == Some(ptr) {
+            return exc::raise_with_message(RUNTIME_ERROR, "async generator already executing");
+        }
+        if (*ptr).done {
+            return exc::raise_with_message(exc::STOP_ASYNC_ITERATION, "");
+        }
+    }
+    drive_async_generator(agen, ptr, NONE)
+}
+
+/// `async_generator.asend(value)`: resumes the generator delivering `value`.
+pub(crate) fn asend_value(agen: i64, value: i64) -> i64 {
+    let Some(ptr) = value::fiber_raw(agen) else {
+        return exc::raise_with_message(TYPE_ERROR, "asend() requires an async generator");
+    };
+    // SAFETY: `fiber_raw` returned a live fiber payload.
+    unsafe {
+        if (*ptr).kind != FiberKind::AsyncGenerator {
+            return exc::raise_with_message(TYPE_ERROR, "asend() requires an async generator");
+        }
+        if current_ptr() == Some(ptr) {
+            return exc::raise_with_message(RUNTIME_ERROR, "async generator already executing");
+        }
+        if (*ptr).done {
+            return exc::raise_with_message(exc::STOP_ASYNC_ITERATION, "");
+        }
+        if !(*ptr).started && value != NONE {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "can't send non-None value to a just-started async generator",
+            );
+        }
+    }
+    drive_async_generator(agen, ptr, value)
+}
+
+/// `async_generator.athrow(exception)`: raises `exception` at the suspension
+/// point and returns the item the handler yields, or raises
+/// `StopAsyncIteration` when the body finishes.
+pub(crate) fn athrow_value(agen: i64, exception: i64) -> i64 {
+    let Some(ptr) = value::fiber_raw(agen) else {
+        return exc::raise_with_message(TYPE_ERROR, "athrow() requires an async generator");
+    };
+    if value::exception_data(exception).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "athrow() argument must be an exception instance",
+        );
+    }
+    // SAFETY: `fiber_raw` returned a live fiber payload.
+    unsafe {
+        if (*ptr).kind != FiberKind::AsyncGenerator {
+            return exc::raise_with_message(TYPE_ERROR, "athrow() requires an async generator");
+        }
+        if current_ptr() == Some(ptr) {
+            return exc::raise_with_message(RUNTIME_ERROR, "async generator already executing");
+        }
+        if (*ptr).done {
+            return exc::raise_with_message(exc::STOP_ASYNC_ITERATION, "");
+        }
+        if !(*ptr).started {
+            (*ptr).done = true;
+            (*ptr).finish_seq = next_finish_seq();
+            return exc::raise_value(exception);
+        }
+        (*ptr).injected = Some(exception);
+    }
+    drive_async_generator(agen, ptr, NONE)
+}
+
+/// `async_generator.aclose()`: runs the generator's `finally` blocks by
+/// raising `GeneratorExit` at its suspension point.
+pub(crate) fn aclose_value(agen: i64) -> i64 {
+    let Some(ptr) = value::fiber_raw(agen) else {
+        return exc::raise_with_message(TYPE_ERROR, "aclose() requires an async generator");
+    };
+    // SAFETY: `fiber_raw` returned a live fiber payload.
+    unsafe {
+        if (*ptr).kind != FiberKind::AsyncGenerator {
+            return exc::raise_with_message(TYPE_ERROR, "aclose() requires an async generator");
+        }
+        if current_ptr() == Some(ptr) {
+            return exc::raise_with_message(RUNTIME_ERROR, "async generator already executing");
+        }
+        if (*ptr).done {
+            return NONE;
+        }
+        if !(*ptr).started {
+            (*ptr).done = true;
+            (*ptr).finish_seq = next_finish_seq();
+            return NONE;
+        }
+        (*ptr).injected = Some(detached_exception(exc::GENERATOR_EXIT, ""));
+        (*ptr).closing = true;
+    }
+    loop {
+        // SAFETY: `ptr` is a live, suspended async generator.
+        unsafe { resume_raw(ptr, NONE) };
+        let error = unsafe { std::mem::replace(&mut (*ptr).error, NONE) };
+        if error != NONE {
+            let tag = value::exception_data(error).map(|data| data.tag);
+            if tag == Some(exc::GENERATOR_EXIT) {
+                unsafe { (*ptr).closing = false };
+                return NONE;
+            }
+            // `error` was detached from the fiber, so root it while
+            // `raise_value` allocates the pending copy.
+            let token = crate::heap::root_values(&[error]);
+            exc::raise_value(error);
+            crate::heap::release_roots(token);
+            return NONE;
+        }
+        if unsafe { (*ptr).done } {
+            unsafe { (*ptr).closing = false };
+            return NONE;
+        }
+        if unsafe { (*ptr).request.is_some() } {
+            let request = unsafe { (*ptr).request.take() };
+            let _ = suspend_current(request);
+            if exc::pending() {
+                return NONE;
+            }
+            continue;
+        }
+        // A yield while closing is an ignored GeneratorExit.
+        unsafe {
+            (*ptr).done = true;
+            (*ptr).closing = false;
+            (*ptr).finish_seq = next_finish_seq();
+        }
+        return exc::raise_with_message(RUNTIME_ERROR, "async generator ignored GeneratorExit");
+    }
+}
+
+/// Queues `CancelledError` for `task`. A task that has not started is
+/// finished immediately, mirroring CPython's "cancelled before first step".
+pub(crate) fn cancel_value(task: i64) -> i64 {
+    let Some(ptr) = value::fiber_raw(task) else {
+        return exc::raise_with_message(TYPE_ERROR, "cancel() requires a task");
+    };
+    // SAFETY: `fiber_raw` returned a live fiber payload.
+    unsafe {
+        if (*ptr).kind != FiberKind::Coroutine {
+            return exc::raise_with_message(TYPE_ERROR, "cancel() requires a task");
+        }
+        if (*ptr).done || (*ptr).cancel_requested {
+            return NONE;
+        }
+        (*ptr).cancel_requested = true;
+        if !(*ptr).started {
+            (*ptr).error = detached_exception(exc::CANCELLED_ERROR, "");
+            (*ptr).cancelled = true;
+            (*ptr).done = true;
+            (*ptr).finish_seq = next_finish_seq();
+            return NONE;
+        }
+        (*ptr).pending_raise = Some(detached_exception(exc::CANCELLED_ERROR, ""));
+    }
+    if current_ptr() != Some(ptr) {
+        crate::modules::asyncio::wake_task(task);
+    }
+    NONE
+}
+
+/// Whether a task finished by propagating `CancelledError`.
+pub(crate) fn is_cancelled(value: i64) -> bool {
+    value::as_fiber(value)
+        .map(|fiber| fiber.cancelled)
+        .unwrap_or(false)
+}
+
+/// Marks a task as queued on (or removed from) the scheduler.
+pub(crate) fn set_scheduled(value: i64, scheduled: bool) {
+    if let Some(ptr) = value::fiber_raw(value) {
+        // SAFETY: `fiber_raw` returned a live fiber payload.
+        unsafe { (*ptr).scheduled = scheduled };
+    }
+}
+
+/// Whether a task is currently queued on the scheduler's ready/timer lists.
+pub(crate) fn is_scheduled(value: i64) -> bool {
+    value::as_fiber(value)
+        .map(|fiber| fiber.scheduled)
+        .unwrap_or(false)
+}
+
+/// Marks a coroutine as a task owned by the asyncio loop.
+pub(crate) fn mark_owned(value: i64) {
+    if let Some(ptr) = value::fiber_raw(value) {
+        // SAFETY: `fiber_raw` returned a live fiber payload.
+        unsafe { (*ptr).owned = true };
+    }
+}
+
+/// The exception captured by a finished task (`NONE` when it returned).
+pub(crate) fn exception_value(value: i64) -> i64 {
+    value::as_fiber(value)
+        .map(|fiber| fiber.error)
+        .unwrap_or(NONE)
 }
 
 /// One advance of a `yield from` delegate.
@@ -1024,6 +1454,29 @@ pub(crate) fn take_request(value: i64) -> Option<WaitRequest> {
     unsafe { (*ptr).request.take() }
 }
 
+/// Waits for a task the scheduler owns without resuming it here.
+fn await_scheduled_task(value: i64, ptr: *mut FiberState) -> i64 {
+    if unsafe { (*ptr).done } {
+        return finish_value(value);
+    }
+    if current_ptr().is_none() {
+        crate::modules::asyncio::drive_join_tasks(&[value]);
+        let token = crate::heap::root_values(&[value]);
+        let result = finish_value(value);
+        crate::heap::release_roots(token);
+        return result;
+    }
+    loop {
+        if unsafe { (*ptr).done } {
+            return finish_value(value);
+        }
+        let _ = suspend_current(Some(WaitRequest::Join(vec![value])));
+        if exc::pending() {
+            return NONE;
+        }
+    }
+}
+
 /// `pyx_await`: drives an awaitable value.
 ///
 /// Non-fiber values are returned unchanged (PyX has no other awaitables). A
@@ -1037,22 +1490,55 @@ pub(crate) fn await_value(value: i64) -> i64 {
     if current_ptr() == Some(ptr) {
         return exc::raise_with_message(RUNTIME_ERROR, "cannot await the running coroutine");
     }
+    // Only coroutines are awaitable. Generators and async generators are
+    // driven by iteration (and their `__anext__` returns the item directly).
+    match unsafe { (*ptr).kind } {
+        FiberKind::Coroutine => {}
+        FiberKind::Generator => {
+            return exc::raise_with_message(TYPE_ERROR, "'generator' object is not awaitable")
+        }
+        FiberKind::AsyncGenerator => {
+            return exc::raise_with_message(TYPE_ERROR, "'async_generator' object is not awaitable")
+        }
+    }
+    // A task owned by the driver must not be resumed from the awaiting
+    // fiber's stack: the scheduler will run it. Wait through a join request
+    // instead, so `await task` observes the task's completion without
+    // executing it twice.
+    if unsafe { (*ptr).owned } {
+        return await_scheduled_task(value, ptr);
+    }
+    let Some(_depth) = AwaitDepthGuard::enter() else {
+        return exc::raise_with_message(RUNTIME_ERROR, "await chain is too deep");
+    };
+    // SAFETY: `fiber_raw` returned a live fiber payload. The awaited value
+    // stays reachable through the awaiting fiber's field while it runs.
+    let caller = current_ptr();
+    if let Some(caller) = caller {
+        unsafe { (*caller).awaiting = value };
+    }
+    let clear_awaiting = |ptr: *mut FiberState| {
+        // SAFETY: `ptr` is the live calling fiber installed by `resume_raw`.
+        unsafe { (*ptr).awaiting = NONE };
+    };
     loop {
         if unsafe { (*ptr).done } {
+            if let Some(caller) = caller {
+                clear_awaiting(caller);
+            }
             return finish_value(value);
         }
         // SAFETY: `ptr` is live and not done.
         unsafe { resume_raw(ptr, NONE) };
         if unsafe { (*ptr).done } {
+            if let Some(caller) = caller {
+                clear_awaiting(caller);
+            }
             return finish_value(value);
         }
         let has_request = unsafe { (*ptr).request.is_some() };
         if !has_request {
-            let generator = unsafe { (*ptr).kind } == FiberKind::Generator;
-            if generator {
-                return exc::raise_with_message(TYPE_ERROR, "'generator' object is not awaitable");
-            }
-            // A plain coroutine suspension: resume it again, delivering
+            // A bare coroutine suspension: resume it again, delivering
             // `None`, mirroring a bare `yield` inside a coroutine.
             continue;
         }
@@ -1060,10 +1546,15 @@ pub(crate) fn await_value(value: i64) -> i64 {
             service_pending_request(ptr);
         } else {
             // Propagate the request outwards: the caller's driver decides how
-            // to service it.
+            // to service it. `suspend_current` delivers a cancellation queued
+            // for this fiber.
             let request = unsafe { (*ptr).request.take() };
-            if let Some(request) = request {
-                suspend_current(Some(request));
+            let _ = suspend_current(request);
+            if exc::pending() {
+                if let Some(caller) = caller {
+                    clear_awaiting(caller);
+                }
+                return NONE;
             }
         }
     }

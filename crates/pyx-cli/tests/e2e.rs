@@ -3222,17 +3222,35 @@ fn user_dunders_and_defaults_are_dispatched() {
 }
 
 #[test]
-fn uncaught_system_exit_and_input_eof_fail_with_a_traceback() {
+fn uncaught_system_exit_and_input_eof_fail() {
     let dir = TestDir::new("console-errors");
     let system_exit = dir.path().join("system_exit.py");
     std::fs::write(&system_exit, "raise SystemExit\n").expect("failed to write temp program");
     let system_exit = system_exit.to_string_lossy().into_owned();
-    let (code, _, stderr) = run(&["run", &system_exit]);
-    assert_eq!(code, 1, "uncaught SystemExit must exit nonzero");
+    let (code, stdout, stderr) = run(&["run", &system_exit]);
+    assert_eq!(code, 0, "uncaught bare SystemExit exits 0");
+    assert!(stdout.is_empty(), "unexpected stdout:\n{stdout}");
     assert!(
-        stderr.contains("SystemExit"),
-        "missing SystemExit traceback:\n{stderr}"
+        stderr.is_empty(),
+        "SystemExit must not print a traceback:\n{stderr}"
     );
+
+    let system_exit_code = dir.path().join("system_exit_code.py");
+    std::fs::write(&system_exit_code, "raise SystemExit(3)\n")
+        .expect("failed to write temp program");
+    let system_exit_code = system_exit_code.to_string_lossy().into_owned();
+    let (code, _, stderr) = run(&["run", &system_exit_code]);
+    assert_eq!(code, 3, "SystemExit(3) must use the stored code:\n{stderr}");
+    assert!(stderr.is_empty(), "no traceback for SystemExit:\n{stderr}");
+
+    let system_exit_message = dir.path().join("system_exit_message.py");
+    std::fs::write(&system_exit_message, "import sys\nsys.exit('boom')\n")
+        .expect("failed to write temp program");
+    let system_exit_message = system_exit_message.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &system_exit_message]);
+    assert_eq!(code, 1, "sys.exit(str) must exit 1");
+    assert!(stdout.is_empty(), "unexpected stdout:\n{stdout}");
+    assert_eq!(stderr, "boom\n", "sys.exit(str) message goes to stderr");
 
     let eof = dir.path().join("input_eof.py");
     std::fs::write(&eof, "input('prompt: ')\n").expect("failed to write temp program");

@@ -37,10 +37,53 @@ mod support;
 pub(crate) use self::concurrency::{pool, process, spawn};
 pub(crate) use self::core::{builtins, container, exc, fiber, format, iter, methods, ops, value};
 pub(crate) use self::gc::heap;
+/// Precise shadow-stack root registry.
+///
+/// Hidden because it is an implementation boundary between generated code,
+/// the collector and `tests/precise_roots.rs`, not part of the frozen C ABI
+/// (the C entry points live in [`abi`]).
+#[doc(hidden)]
+pub mod precise_roots {
+    pub use crate::gc::roots::*;
+
+    // Persistent-root entry points. The collector API itself is crate
+    // private; these hidden forwarders let the integration tests exercise
+    // the exact slot semantics without widening the public surface.
+    /// Registers a persistent root and returns its slot index.
+    pub fn add_persistent_root(value: i64) -> usize {
+        crate::gc::heap::add_persistent_root(value)
+    }
+
+    /// Overwrites the persistent root in `slot`.
+    pub fn set_persistent_root(slot: usize, value: i64) {
+        crate::gc::heap::set_persistent_root(slot, value);
+    }
+
+    /// Removes the persistent root in `slot`.
+    pub fn remove_persistent_root(slot: usize) {
+        crate::gc::heap::remove_persistent_root(slot);
+    }
+}
 // Public collector statistics (used by `pyx gc`). The heap module itself
 // stays private; only the snapshot API is re-exported.
 pub use self::gc::heap::{gc_stats, reset_gc_stats, GcStats};
 pub(crate) use self::support::serialize;
+
+/// Runs the tests registered by a compiled PyX test module.
+///
+/// The generated module body has already executed; this discovers functions
+/// registered by codegen (`test_*` entry functions and `Test*.test_*` methods),
+/// runs them, prints a pytest-style report and returns the pytest exit code
+/// (0 pass, 1 failure, 5 no tests). `keyword` is the `-k` expression and
+/// `maxfail` stops the run after that many failures.
+pub fn run_pytest_with(keyword: Option<&str>, maxfail: Option<usize>) -> i32 {
+    modules::pytest::run(keyword, maxfail)
+}
+
+/// [`run_pytest_with`] without a keyword filter or failure limit.
+pub fn run_pytest() -> i32 {
+    run_pytest_with(None, None)
+}
 
 /// Records the canonical source path of the JIT-compiled program.
 ///
@@ -87,3 +130,10 @@ pub(crate) fn argv() -> Vec<String> {
 }
 
 pub mod abi;
+
+/// Interpreter bridge: function values backed by the tree-walk interpreter.
+///
+/// The runtime calls the dispatcher installed through
+/// [`host::set_dispatch`]; the interpreter registers its own program registry
+/// and creates [`host::function_new`] values for IR functions.
+pub mod host;

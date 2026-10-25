@@ -1,6 +1,6 @@
 # PyX — Source Layout
 
-As of 2026-10-25 (after the module restructuring). The crates remain the
+As of 2026-10-26 (after the P2 completion slice). The crates remain the
 only Frontend↔Codegen contract; inside the crates, the formerly flat
 `src/*.rs` files are split into topic folders. Paths are relative to the
 repository root.
@@ -19,6 +19,8 @@ repository root.
 │   ├── test_check_benchmarks.py  deterministic tests for the threshold gate
 │   ├── bench_hyperfine.sh     hyperfine adapter for benchmark harnesses
 │   ├── repro_check.sh         same-host AOT reproducibility check (docs/REPRODUCIBLE.md)
+│   ├── fuzz-smoke.sh          bounded libFuzzer/stable fuzz smoke
+│   ├── fuzz-parallel.sh       multi-core stable fuzz soak (independent seeds)
 │   ├── stdlib_compat.py       stdlib import matrix (pinned CPython 3.14.9)
 │   └── cpython_compat.py      official Lib/test differential gate
 ├── benchmarks/
@@ -28,6 +30,7 @@ repository root.
 │   ├── compare_engines.py     CPython/PyX/PyPy/Go loop + startup comparison
 │   └── pyx/                   micro-benchmarks, run_micro.py, results/, thresholds.json
 ├── spikes/p4_04/              embedded-CPython/abi3 probes + measurements
+├── fuzz/                      libFuzzer targets + stable fallback harness
 ├── tests/compat/              pinned CPython test manifests (3.14.9)
 ├── examples/                  JIT/AOT examples + expected/*.txt
 ├── docs/
@@ -74,7 +77,8 @@ repository root.
     │   │   ├── core/          value, ops, container, iter, builtins, methods,
     │   │   │                  exc, format, fiber (generators/coroutines;
     │   │   │                  x86_64 register switch, ucontext fallback)
-    │   │   ├── gc/            heap, color/barriers, safepoints, sweep
+    │   │   ├── gc/            heap, color/barriers, safepoints, sweep, roots
+│   │   │                  (precise shadow frames)
     │   │   ├── modules/       math/io/json/os/... + argparse, collections,
     │   │   │                  re, socket, asyncio, typing, abc, enum, types,
     │   │   │                  itertools, ast, fractions, importlib,
@@ -83,6 +87,8 @@ repository root.
     │   │   ├── support/       PYX1 serialization (pickle/spawn/mp.Queue)
     │   │   └── csv.rs         CSV reader/writer
     │   └── tests/             integration tests per feature (ABI level)
+    ├── pyx-interp/            IR tree-walk interpreter + REPL session
+    │   └── src/               frame roots, eval, stmt, host callbacks
     └── pyx-cli/               `pyx` binary
         ├── src/
         │   ├── main.rs        ICE catching, exit codes
@@ -91,15 +97,18 @@ repository root.
         │       ├── args.rs    shared option parser
         │       ├── diag.rs    snippet/JSON/color rendering
         │       ├── dispatch.rs subcommand table
-        │       └── commands/  new, init, check, run, build, test, fmt,
-        │                      lint, clean, doctor, help, uv (passthrough),
-        │                      spawn (internal), scan (file discovery),
-        │                      completions; `gc.rs` = `pyx gc`
+        │       └── commands/  new, init, check, run (JIT/--interpret),
+        │                      build, test, pytest, repl, fmt, lint, clean,
+        │                      doctor, help, uv (passthrough), spawn
+        │                      (internal), scan (file discovery), completions;
+        │                      `gc.rs` = `pyx gc`
         └── tests/             E2E, fibers, closures, user modules, extensions
                                (paths, dotted, multi-phase), completions,
                                exceptions, unittest_runner, stdlib_batch_a,
-                               stdlib_batch_b, stdlib_bench_batch
-                               (+ fixtures/abi3_probe.c, abi3_multiphase.c)
+                               stdlib_batch_b, stdlib_bench_batch, stdlib_core,
+                               interpret, repl, pytest_runner, argparse_complete,
+                               precise_gc (+ fixtures/abi3_probe.c,
+                               abi3_multiphase.c)
 ```
 
 ## Mapping rules

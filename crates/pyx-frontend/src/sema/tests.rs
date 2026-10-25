@@ -1536,6 +1536,351 @@ fn async_with_and_async_for_typecheck() {
     crate::check_source(source, "test.py").expect("valid async with/for");
 }
 
+/// True when `stmts` or any statement nested inside them matches `pred`.
+fn ir_stmt_any(stmts: &[pyx_ir::Stmt], pred: &dyn Fn(&pyx_ir::StmtKind) -> bool) -> bool {
+    stmts.iter().any(|stmt| {
+        if pred(&stmt.kind) {
+            return true;
+        }
+        match &stmt.kind {
+            pyx_ir::StmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => ir_stmt_any(then_body, pred) || ir_stmt_any(else_body, pred),
+            pyx_ir::StmtKind::While {
+                body, else_body, ..
+            }
+            | pyx_ir::StmtKind::ForRange {
+                body, else_body, ..
+            }
+            | pyx_ir::StmtKind::ForEach {
+                body, else_body, ..
+            } => ir_stmt_any(body, pred) || ir_stmt_any(else_body, pred),
+            pyx_ir::StmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                ir_stmt_any(body, pred)
+                    || handlers
+                        .iter()
+                        .any(|handler| ir_stmt_any(&handler.body, pred))
+                    || ir_stmt_any(else_body, pred)
+                    || ir_stmt_any(finally_body, pred)
+            }
+            _ => false,
+        }
+    })
+}
+
+fn ir_catches_stop_async_iteration(kind: &pyx_ir::StmtKind) -> bool {
+    matches!(
+        kind,
+        pyx_ir::StmtKind::Try { handlers, .. }
+            if handlers
+                .iter()
+                .any(|handler| handler.exc == Some(ExcKind::StopAsyncIteration))
+    )
+}
+
+#[test]
+fn async_generators_carry_both_flags() {
+    let source = "async def g():\n    yield 1\n";
+    let program = crate::check_source(source, "test.py").expect("valid async generator");
+    let g = program_function(&program, "g");
+    assert!(g.is_async, "an async generator is a coroutine function");
+    assert!(g.is_generator, "an async generator is a generator");
+    assert!(matches!(&g.body[0].kind, pyx_ir::StmtKind::Yield { .. }));
+}
+
+#[test]
+fn async_for_emits_await_anext_and_stop_async_iteration() {
+    let source = "async def f(it):\n    async for x in it:\n        print(x)\n";
+    let program = crate::check_source(source, "test.py").expect("valid async for");
+    let f = program_function(&program, "f");
+
+    // The desugaring is wrapped in an always-true block.
+    let pyx_ir::StmtKind::If { then_body, .. } = &f.body[0].kind else {
+        panic!("expected the async-for block, got {:?}", f.body[0].kind);
+    };
+    let pyx_ir::StmtKind::While {
+        body, else_body, ..
+    } = &then_body[1].kind
+    else {
+        panic!("expected the iteration loop, got {:?}", then_body[1].kind);
+    };
+    assert!(else_body.is_empty());
+
+    let pyx_ir::StmtKind::Try {
+        body: fetch,
+        handlers,
+        else_body,
+        finally_body,
+    } = &body[0].kind
+    else {
+        panic!("expected the __anext__ try, got {:?}", body[0].kind);
+    };
+    assert!(else_body.is_empty());
+    assert!(finally_body.is_empty());
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].exc, Some(ExcKind::StopAsyncIteration));
+    assert_eq!(
+        handlers[0].exc.map(ExcKind::tag),
+        Some(18),
+        "StopAsyncIteration keeps the stable tag"
+    );
+    assert!(matches!(&handlers[0].body[0].kind, pyx_ir::StmtKind::Break));
+
+    let pyx_ir::StmtKind::Assign { value, .. } = &fetch[0].kind else {
+        panic!("expected the awaited item, got {:?}", fetch[0].kind);
+    };
+    let pyx_ir::ExprKind::Await { value } = &value.kind else {
+        panic!("expected await, got {:?}", value.kind);
+    };
+    let pyx_ir::ExprKind::MethodCall { method, .. } = &value.kind else {
+        panic!("expected a method call, got {:?}", value.kind);
+    };
+    assert_eq!(method, "__anext__");
+    assert_eq!(value.ty, Type::Any);
+}
+
+#[test]
+fn async_for_else_sets_an_exhaustion_flag() {
+    let source =
+        "async def f(it):\n    async for x in it:\n        print(x)\n    else:\n        print(0)\n";
+    let program = crate::check_source(source, "test.py").expect("valid async for/else");
+    let f = program_function(&program, "f");
+    let pyx_ir::StmtKind::If { then_body, .. } = &f.body[0].kind else {
+        panic!("expected the async-for block");
+    };
+    // [$aloop = False, $aiter = ..., while, if $aloop: else]
+    assert_eq!(then_body.len(), 4);
+    let pyx_ir::StmtKind::If {
+        then_body: else_body,
+        ..
+    } = &then_body[3].kind
+    else {
+        panic!("expected the else guard");
+    };
+    assert_eq!(else_body.len(), 1, "the else body runs behind the guard");
+    let pyx_ir::StmtKind::While { body, .. } = &then_body[2].kind else {
+        panic!("expected the loop");
+    };
+    let pyx_ir::StmtKind::Try { handlers, .. } = &body[0].kind else {
+        panic!("expected the __anext__ try");
+    };
+    assert_eq!(handlers[0].exc, Some(ExcKind::StopAsyncIteration));
+    assert!(matches!(
+        &handlers[0].body[0].kind,
+        pyx_ir::StmtKind::Assign { .. }
+    ));
+    assert!(matches!(&handlers[0].body[1].kind, pyx_ir::StmtKind::Break));
+}
+
+#[test]
+fn async_with_awaits_aenter_and_aexit() {
+    let source = "async def f(cm):\n    async with cm as value:\n        print(value)\n";
+    let program = crate::check_source(source, "test.py").expect("valid async with");
+    let f = program_function(&program, "f");
+    let pyx_ir::StmtKind::If { then_body, .. } = &f.body[0].kind else {
+        panic!("expected the async-with block, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(then_body.len(), 4, "manager, exception slot, entry, try");
+
+    let pyx_ir::StmtKind::Assign { value, .. } = &then_body[2].kind else {
+        panic!("expected the entry binding, got {:?}", then_body[2].kind);
+    };
+    let pyx_ir::ExprKind::Await { value } = &value.kind else {
+        panic!("expected `await __aenter__()`");
+    };
+    let pyx_ir::ExprKind::MethodCall { method, .. } = &value.kind else {
+        panic!("expected a method call");
+    };
+    assert_eq!(method, "__aenter__");
+
+    let pyx_ir::StmtKind::Try {
+        handlers,
+        finally_body,
+        ..
+    } = &then_body[3].kind
+    else {
+        panic!("expected the __aexit__ try, got {:?}", then_body[3].kind);
+    };
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].exc, Some(ExcKind::BaseException));
+    assert!(handlers[0].binding.is_some());
+
+    // The handler awaits `__aexit__(type(exc), exc, None)`.
+    let pyx_ir::StmtKind::If {
+        cond, then_body, ..
+    } = &handlers[0].body[0].kind
+    else {
+        panic!("expected the suppression check");
+    };
+    let pyx_ir::ExprKind::Un { op, operand } = &cond.kind else {
+        panic!("expected `not await __aexit__(...)`, got {:?}", cond.kind);
+    };
+    assert_eq!(*op, pyx_ir::UnOp::Not);
+    let pyx_ir::ExprKind::Await { value } = &operand.kind else {
+        panic!("expected an await");
+    };
+    let pyx_ir::ExprKind::MethodCall { method, args, .. } = &value.kind else {
+        panic!("expected a method call");
+    };
+    assert_eq!(method, "__aexit__");
+    assert_eq!(args.len(), 3);
+    assert!(matches!(
+        &args[0].kind,
+        pyx_ir::ExprKind::Call {
+            callee: pyx_ir::Callee::Builtin(pyx_ir::Builtin::Type),
+            ..
+        }
+    ));
+    assert_eq!(args[2].ty, Type::Any, "PyX passes None as the traceback");
+    assert!(matches!(
+        &then_body[0].kind,
+        pyx_ir::StmtKind::Raise { exc: None, .. }
+    ));
+
+    // The finally arm calls `__aexit__(None, None, None)` on a normal exit.
+    assert_eq!(finally_body.len(), 1);
+    let pyx_ir::StmtKind::If { then_body, .. } = &finally_body[0].kind else {
+        panic!("expected the normal-exit guard");
+    };
+    let pyx_ir::StmtKind::Expr(exit) = &then_body[0].kind else {
+        panic!("expected the normal exit call");
+    };
+    let pyx_ir::ExprKind::Await { value } = &exit.kind else {
+        panic!("expected an await");
+    };
+    let pyx_ir::ExprKind::MethodCall { method, args, .. } = &value.kind else {
+        panic!("expected a method call");
+    };
+    assert_eq!(method, "__aexit__");
+    assert_eq!(args.len(), 3);
+    assert!(args.iter().all(|arg| arg.ty == Type::Any));
+}
+
+#[test]
+fn async_list_comprehension_emits_an_async_helper() {
+    let source = "async def f(it):\n    return [x async for x in it]\n";
+    let program = crate::check_source(source, "test.py").expect("valid async comprehension");
+    let f = program_function(&program, "f");
+    let pyx_ir::StmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!("expected the returned comprehension");
+    };
+    assert_eq!(value.ty, Type::List);
+    let pyx_ir::ExprKind::Await { value } = &value.kind else {
+        panic!("expected the awaited helper, got {:?}", value.kind);
+    };
+    let pyx_ir::ExprKind::Call {
+        callee: pyx_ir::Callee::Function(id),
+        ..
+    } = &value.kind
+    else {
+        panic!("expected a helper call, got {:?}", value.kind);
+    };
+    let helper = program.function(*id);
+    assert_eq!(helper.name, "<asynccomp>");
+    assert!(helper.is_async);
+    assert!(!helper.is_generator);
+    assert!(matches!(
+        helper.body.first().map(|stmt| &stmt.kind),
+        Some(pyx_ir::StmtKind::Assign { .. })
+    ));
+    assert!(matches!(
+        helper.body.last().map(|stmt| &stmt.kind),
+        Some(pyx_ir::StmtKind::Return(Some(_)))
+    ));
+    assert!(
+        ir_stmt_any(&helper.body, &ir_catches_stop_async_iteration),
+        "the helper handles the end of the async iterator"
+    );
+}
+
+#[test]
+fn async_generator_expression_emits_an_async_generator() {
+    let source = "async def f(it):\n    return (x async for x in it)\n";
+    let program = crate::check_source(source, "test.py").expect("valid async genexp");
+    let f = program_function(&program, "f");
+    let pyx_ir::StmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!("expected the returned generator expression");
+    };
+    let pyx_ir::ExprKind::Call {
+        callee: pyx_ir::Callee::Function(id),
+        ..
+    } = &value.kind
+    else {
+        panic!("expected the generator function call, got {:?}", value.kind);
+    };
+    let helper = program.function(*id);
+    assert_eq!(helper.name, "<genexpr>");
+    assert!(helper.is_async);
+    assert!(helper.is_generator);
+    assert!(ir_stmt_any(&helper.body, &|kind| matches!(
+        kind,
+        pyx_ir::StmtKind::Yield { .. }
+    )));
+    assert!(ir_stmt_any(&helper.body, &ir_catches_stop_async_iteration));
+}
+
+#[test]
+fn generator_expression_with_await_is_an_async_generator() {
+    let source =
+        "import asyncio\nasync def f(xs):\n    return (await asyncio.sleep(0) for x in xs)\n";
+    let program = crate::check_source(source, "test.py").expect("valid async genexp");
+    let f = program_function(&program, "f");
+    let pyx_ir::StmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!("expected the returned generator expression");
+    };
+    let pyx_ir::ExprKind::Call {
+        callee: pyx_ir::Callee::Function(id),
+        ..
+    } = &value.kind
+    else {
+        panic!("expected the generator function call, got {:?}", value.kind);
+    };
+    let helper = program.function(*id);
+    assert_eq!(helper.name, "<genexpr>");
+    assert!(helper.is_async, "a frame that awaits is an async generator");
+    assert!(helper.is_generator);
+    assert!(ir_stmt_any(&helper.body, &|kind| matches!(
+        kind,
+        pyx_ir::StmtKind::Yield { value: Some(value) }
+            if matches!(value.kind, pyx_ir::ExprKind::Await { .. })
+    )));
+}
+
+#[test]
+fn stop_async_iteration_is_a_catchable_exception() {
+    let source = "def f():\n    try:\n        pass\n    except StopAsyncIteration:\n        pass\n";
+    let program = crate::check_source(source, "test.py").expect("catchable StopAsyncIteration");
+    let f = program_function(&program, "f");
+    let pyx_ir::StmtKind::Try { handlers, .. } = &f.body[0].kind else {
+        panic!("expected a try statement");
+    };
+    assert_eq!(handlers[0].exc, Some(ExcKind::StopAsyncIteration));
+    assert_eq!(ExcKind::StopAsyncIteration.tag(), 18);
+    assert_eq!(ExcKind::StopAsyncIteration.name(), "StopAsyncIteration");
+    assert_eq!(
+        ExcKind::from_name("StopAsyncIteration"),
+        Some(ExcKind::StopAsyncIteration)
+    );
+}
+
+#[test]
+fn async_comprehension_outside_async_function_is_a_control_error() {
+    let diags = check_diags("def f():\n    return [x async for x in range(3)]\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::CONTROL);
+    assert_eq!(
+        diags[0].message,
+        "asynchronous comprehension outside of an asynchronous function"
+    );
+}
+
 #[test]
 fn asyncio_sleep_and_gather_typecheck() {
     let source = "import asyncio\nasync def f():\n    await asyncio.sleep(0.001)\n    values = asyncio.gather([1, 2])\n    return values\nf()\n";
@@ -1546,12 +1891,39 @@ fn asyncio_sleep_and_gather_typecheck() {
 
 #[test]
 fn asyncio_unsupported_members_are_rejected() {
-    let diags = check_diags("import asyncio\nasyncio.create_task(1)\n");
+    let diags = check_diags("import asyncio\nasyncio.wait_for(1, 2)\n");
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, codes::ATTRIBUTE);
     assert_eq!(
         diags[0].message,
-        "module 'asyncio' has no attribute 'create_task'"
+        "module 'asyncio' has no attribute 'wait_for'"
+    );
+}
+
+#[test]
+fn asyncio_task_api_is_supported() {
+    let source = "import asyncio\n\
+                  task = asyncio.create_task(None)\n\
+                  current = asyncio.current_task()\n\
+                  group = asyncio.TaskGroup()\n\
+                  factory = asyncio.TaskGroup\n\
+                  cancelled = asyncio.CancelledError\n";
+    assert!(
+        check_errors(source).is_empty(),
+        "{:?}",
+        check_errors(source)
+    );
+
+    let imported = r#"from asyncio import TaskGroup
+async def main():
+    async with TaskGroup() as group:
+        pass
+main()
+"#;
+    assert!(
+        check_errors(imported).is_empty(),
+        "{:?}",
+        check_errors(imported)
     );
 }
 

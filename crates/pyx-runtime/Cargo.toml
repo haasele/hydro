@@ -14,6 +14,11 @@ regex = "1"
 num-bigint.workspace = true
 num-traits.workspace = true
 pyx-ir.workspace = true
+# Pure-Rust TLS for the native `ssl` module. `ring` avoids a system OpenSSL
+# dependency; `webpki-roots` supplies the Mozilla trust store.
+rustls = { version = "=0.23.36", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "=1.13.1", features = ["std"] }
+webpki-roots = "=1.0.5"
 
 [build-dependencies]
 cc = "1"

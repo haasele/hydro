@@ -1323,24 +1323,41 @@ impl<'a> Checker<'a> {
     fn check_comp_clauses(&mut self, clauses: &[HCompClause], f: &HFunction) {
         for clause in clauses {
             self.check_expr(&clause.iterable, f);
-            match self.inf.resolve(clause.iterable.ty) {
-                Ty::Concrete(Type::List)
-                | Ty::Concrete(Type::Tuple)
-                | Ty::Concrete(Type::Set)
-                | Ty::Concrete(Type::Range)
-                | Ty::Concrete(Type::Str)
-                | Ty::Concrete(Type::Bytes)
-                | Ty::Concrete(Type::Dict)
-                | Ty::Concrete(Type::Any) => {}
-                Ty::Var(_) => {
-                    let _ = self.inf.unify(clause.iterable.ty, Ty::Concrete(Type::Any));
-                }
-                Ty::Concrete(got) => {
-                    self.error(
+            if clause.is_async {
+                // An asynchronous iterable only needs `__aiter__`; library and
+                // user objects are dynamically typed, so only a concrete
+                // builtin that has no such protocol is statically impossible.
+                match self.inf.resolve(clause.iterable.ty) {
+                    Ty::Var(_) => {
+                        let _ = self.inf.unify(clause.iterable.ty, Ty::Concrete(Type::Any));
+                    }
+                    Ty::Concrete(Type::Any) => {}
+                    Ty::Concrete(got) => self.error(
                         clause.iterable.line,
                         clause.iterable.col,
-                        format!("'{}' object is not iterable", got.name()),
-                    );
+                        format!("'{}' object is not async iterable", got.name()),
+                    ),
+                }
+            } else {
+                match self.inf.resolve(clause.iterable.ty) {
+                    Ty::Concrete(Type::List)
+                    | Ty::Concrete(Type::Tuple)
+                    | Ty::Concrete(Type::Set)
+                    | Ty::Concrete(Type::Range)
+                    | Ty::Concrete(Type::Str)
+                    | Ty::Concrete(Type::Bytes)
+                    | Ty::Concrete(Type::Dict)
+                    | Ty::Concrete(Type::Any) => {}
+                    Ty::Var(_) => {
+                        let _ = self.inf.unify(clause.iterable.ty, Ty::Concrete(Type::Any));
+                    }
+                    Ty::Concrete(got) => {
+                        self.error(
+                            clause.iterable.line,
+                            clause.iterable.col,
+                            format!("'{}' object is not iterable", got.name()),
+                        );
+                    }
                 }
             }
             match &clause.target {
@@ -3988,22 +4005,30 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
 fn emit_comp_clauses(clauses: &[HCompClause], inf: &mut Infer) -> Vec<CompClause> {
     clauses
         .iter()
-        .map(|clause| CompClause {
-            target: match &clause.target {
-                HCompTarget::Name(id) => CompTarget::Name(*id),
-                HCompTarget::Unpack(targets) => CompTarget::Unpack(
-                    targets
-                        .iter()
-                        .map(|target| emit_unpack_target(target, inf))
-                        .collect(),
-                ),
-            },
-            iterable: emit_expr(&clause.iterable, inf),
-            conditions: clause
-                .conditions
-                .iter()
-                .map(|condition| emit_expr(condition, inf))
-                .collect(),
+        .map(|clause| {
+            // Asynchronous clauses are desugared into `await __anext__()`
+            // loops that never reach the IR comprehension nodes.
+            debug_assert!(
+                !clause.is_async,
+                "async comprehension clause reached the IR"
+            );
+            CompClause {
+                target: match &clause.target {
+                    HCompTarget::Name(id) => CompTarget::Name(*id),
+                    HCompTarget::Unpack(targets) => CompTarget::Unpack(
+                        targets
+                            .iter()
+                            .map(|target| emit_unpack_target(target, inf))
+                            .collect(),
+                    ),
+                },
+                iterable: emit_expr(&clause.iterable, inf),
+                conditions: clause
+                    .conditions
+                    .iter()
+                    .map(|condition| emit_expr(condition, inf))
+                    .collect(),
+            }
         })
         .collect()
 }

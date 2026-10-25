@@ -7,10 +7,11 @@ defined subset (see [Language Scope](#language-and-stdlib-scope) and
 [`docs/TODO.md`](docs/TODO.md)).
 
 > **Status: early development (0.1.0).** Compiler/runtime, containers, classes,
-> closures, formatting, file I/O, user modules, the stdlib core, real lazy
-> generators and coroutines with an event loop as well as concurrency primitives
-> are working. A complete CPython stdlib and C extensions are still missing;
-> PyX is neither fully Python-compatible nor production-ready.
+> closures, formatting, file I/O, user modules, the stdlib core, lazy/async
+> generators, task groups, precise GC roots, threads/processes, TLS/UDP
+> networking, argparse/pytest, and an IR interpreter/REPL are working. A
+> complete CPython stdlib and C extensions are still missing; PyX is neither
+> fully Python-compatible nor production-ready.
 
 ## Status
 
@@ -34,28 +35,28 @@ covers unit, integration and E2E tests (current count and breakdown:
 
 ## Performance
 
-Medians over 5 runs, fresh process per run, AOT excluding build time. Measured on Linux x86_64 (Intel Core Ultra 7 255H, 16 cores, 24 GB); CPython 3.13.13 via `uv` is the benchmark reference, while CPython **3.14.9** is the compatibility oracle. Every benchmark subprocess is capped at 10 seconds.
+Medians over 5 runs, a fresh process per run, AOT excluding build time. Measured on Linux x86_64 (Intel Core Ultra 7 255H, 16 cores, 24 GB) with CPython **3.14.9** as the benchmark runner and compatibility oracle. Every subprocess is capped at 10 seconds.
 
 ```bash
-uv run benchmarks/bench_pyx.py --pyx ./target/release/pyx \
-  --n 200000 --repeat 5 --timeout 10
+PYX_SITE_PACKAGES=/usr/lib/python3.14/site-packages \
+  target/release/pyx run benchmarks/bench_all.py --only pyx
 ```
 
 | Workload | CPython | PyX JIT | PyX AOT | CPython/JIT | CPython/AOT |
 |---|---:|---:|---:|---:|---:|
-| hello | 7.50 ms | 2.12 ms | 1.18 ms | 3.54× | 6.33× |
-| while_sum | 19.67 ms | 2.59 ms | 2.26 ms | 7.59× | 8.69× |
-| for_range_sum | 14.53 ms | 2.80 ms | 1.35 ms | 5.19× | 10.74× |
-| list_append | 16.11 ms | 5.00 ms | 4.10 ms | 3.22× | 3.93× |
-| list_comp | 10.15 ms | 4.18 ms | 2.95 ms | 2.43× | 3.44× |
-| dict_insert | 7.83 ms | 2.30 ms | 1.60 ms | 3.40× | 4.89× |
-| string_concat | 8.59 ms | 2.55 ms | 1.25 ms | 3.37× | 6.86× |
-| json_roundtrip | 12.70 ms | 3.08 ms | 2.57 ms | 4.13× | 4.94× |
-| math_loop | 21.85 ms | 2.88 ms | 2.01 ms | 7.57× | 10.87× |
-| generator_sum | 9.73 ms | 6.92 ms | 6.46 ms | 1.40× | 1.51× |
-| async_gather | 62.78 ms | 22.83 ms | 21.51 ms | 2.75× | 2.92× |
+| hello | 8.40 ms | 1.88 ms | 1.19 ms | 4.48× | 7.04× |
+| while_sum | 24.79 ms | 3.94 ms | 2.96 ms | 6.30× | 8.37× |
+| for_range_sum | 15.48 ms | 2.84 ms | 1.98 ms | 5.45× | 7.83× |
+| list_append | 15.79 ms | 6.33 ms | 5.97 ms | 2.49× | 2.65× |
+| list_comp | 13.74 ms | 4.70 ms | 3.91 ms | 2.92× | 3.51× |
+| dict_insert | 10.08 ms | 3.29 ms | 1.82 ms | 3.06× | 5.54× |
+| string_concat | 9.64 ms | 3.21 ms | 1.95 ms | 3.00× | 4.93× |
+| json_roundtrip | 16.00 ms | 3.53 ms | 2.47 ms | 4.53× | 6.47× |
+| math_loop | 25.52 ms | 4.52 ms | 2.62 ms | 5.64× | 9.73× |
+| generator_sum | 11.23 ms | 16.07 ms | 14.61 ms | 0.70× | 0.77× |
+| async_gather | 71.94 ms | 24.04 ms | 22.11 ms | 2.99× | 3.25× |
 
-PyX is faster than CPython on all 11 workloads: JIT median **3.40×**, AOT median **4.94×**. Loop, container, JSON and math workloads show the widest margins; `generator_sum` is the narrowest because every yield resumes a fiber, and `async_gather` is bounded by the sleep duration.
+PyX is faster on 10 of 11 workloads (JIT median **3.06×**, AOT **5.54×**); the exception is generator resume, where per-frame precise-root bookkeeping is currently the dominant cost. Startup remains substantially lower (`pyx JIT hello` 1.88 ms, `pyx AOT hello` 1.19 ms, CPython 9.00 ms). Closing the generator gap is tracked under P5.
 
 ## Requirements
 
@@ -139,8 +140,9 @@ pyx --version | -V                 version
   and return its exit status (`PYX_UV` selects the executable).
 - Exit codes: `0` success, `1` user/program error, `2` internal/setup error.
 - Environment: `CC` (linker for AOT, default `cc`), `PYX_RUNTIME_LIB`, `PYX_UV`,
-  `NO_COLOR`; additionally at runtime `PYX_GC_THRESHOLD`, `PYX_GC_STRESS=1`
-  and `PYX_GC_STATS=1`.
+  `NO_COLOR`; additionally at runtime `PYX_GC_THRESHOLD`, `PYX_GC_STRESS=1`,
+  `PYX_GC_STATS=1` and `PYX_GC_PRECISE=1` (strict precise-root mode: no
+  conservative stack/register scanning).
 
 `--` ends option parsing. Everything after the source file is forwarded to the
 program as `sys.argv[1:]` (`sys.argv[0]` is the source path), so diagnostic
@@ -275,7 +277,7 @@ Async generators and async comprehensions (`asyncio` only
 `run`/`sleep`/`gather`), user decorators, pattern matching, metaclasses,
 multiple inheritance, the general descriptor protocol, `bytearray`/
 `memoryview`, `except*`; arbitrary C extensions or the C API/ABI and the
-complete CPython stdlib (60/297 modules importable; see
+complete CPython stdlib (63/297 modules importable; see
 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). Precise GC roots/stack maps
 and variable payload size classes are missing. A general `sys.path`/
 `sys.modules` model, namespace/zip/frozen imports and `from x import *` are

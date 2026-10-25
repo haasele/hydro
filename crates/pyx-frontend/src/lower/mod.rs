@@ -68,10 +68,12 @@ pub struct HFunction {
     pub locals: Vec<HLocal>,
     pub body: Vec<HStmt>,
     /// `async def`: calling the function creates a coroutine object instead
-    /// of running the body.
+    /// of running the body. Together with `is_generator` it marks an async
+    /// generator.
     pub is_async: bool,
     /// The body contains a `yield`: calling the function creates a generator
-    /// object instead of running the body.
+    /// object instead of running the body. An async generator sets both
+    /// flags.
     pub is_generator: bool,
     pub is_module: bool,
     pub line: u32,
@@ -326,11 +328,49 @@ pub enum HCompTarget {
 }
 
 /// One `for target in iterable if cond ...` clause of a comprehension.
+///
+/// `is_async` marks an `async for` clause: the iterable is an asynchronous
+/// iterable and each step goes through `await __anext__()`.
 #[derive(Clone, Debug)]
 pub struct HCompClause {
     pub target: HCompTarget,
     pub iterable: HExpr,
     pub conditions: Vec<HExpr>,
+    pub is_async: bool,
+}
+
+/// Resolved target of a `for`/`async for` statement.
+#[derive(Clone, Debug)]
+struct LoopTarget {
+    /// Plain-name target, already resolved to its local slot.
+    name: Option<LocalId>,
+    /// Sequence target, unpacked from the item the loop binds.
+    unpack: Option<Vec<HUnpackTarget>>,
+}
+
+/// Result collection of an asynchronous comprehension.
+enum AsyncCompKind<'a> {
+    List(&'a ast::Expr),
+    Set(&'a ast::Expr),
+    Dict(&'a ast::Expr, &'a ast::Expr),
+}
+
+impl<'a> AsyncCompKind<'a> {
+    /// Expressions evaluated in the innermost frame, in evaluation order.
+    fn elements(&self) -> Vec<&'a ast::Expr> {
+        match self {
+            AsyncCompKind::List(element) | AsyncCompKind::Set(element) => vec![*element],
+            AsyncCompKind::Dict(key, value) => vec![*key, *value],
+        }
+    }
+
+    fn result_ty(&self) -> Type {
+        match self {
+            AsyncCompKind::List(_) => Type::List,
+            AsyncCompKind::Set(_) => Type::Set,
+            AsyncCompKind::Dict(..) => Type::Dict,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -549,11 +589,6 @@ pub enum HExprKind {
     },
 }
 
-/// Signature-relevant fields shared by `def` and `async def`.
-///
-/// The only difference between the two forms is `is_async`: calling an async
-/// function creates a coroutine object, while `async with`/`async for` reuse
-/// the synchronous lowerings.
 /// Result of binding a dynamic-signature class constructor call.
 struct ClassCallBind {
     /// Values for every `__init__` parameter after `self`.
@@ -566,6 +601,10 @@ struct ClassCallBind {
     kwarg_index: Option<usize>,
 }
 
+/// Signature-relevant fields shared by `def` and `async def`.
+///
+/// `is_async` marks a coroutine function; a body that also contains `yield`
+/// makes it an async generator (`is_async && is_generator`).
 struct FnDecl<'a> {
     range: TextRange,
     name: &'a str,
@@ -1212,6 +1251,19 @@ pub struct Lowerer<'a> {
     /// importers, and mirroring every assignment would add a global store to
     /// each top-level loop iteration.
     mirror_all_globals: bool,
+    /// Compile a REPL/session fragment instead of a standalone module.
+    ///
+    /// Session fragments share one runtime global table: names bound by an
+    /// earlier fragment are visible here, module-level reads that no local
+    /// binding shadows resolve to a [`HExprKind::GlobalGet`] (including names
+    /// that would otherwise resolve to a builtin, function or exception), and
+    /// import bindings are mirrored into the table so they survive the
+    /// fragment.
+    session_mode: bool,
+    /// Names bound by earlier fragments of the same session. They are part of
+    /// [`Self::global_names`] but tracked separately so a session-global read
+    /// can be distinguished from a name this fragment binds itself.
+    session_globals: HashSet<String>,
     /// `from X import f [as g]` bindings: name -> (module, function spec).
     imported_functions: HashMap<String, (&'static ModuleSpec, &'static FunctionSpec)>,
     /// `from X import c [as d]` bindings: name -> (module, constant spec).
@@ -1233,6 +1285,13 @@ pub struct Lowerer<'a> {
     multi_counter: u32,
     /// Next synthetic `$forN` local receiving a loop target that is a cell.
     for_counter: u32,
+    /// Next synthetic local of an asynchronous lowering: `$aiterN`,
+    /// `$aitemN`, `$aexcN`, `$aloopN`.
+    async_counter: u32,
+    /// Function frames in which an `await` was lowered (source-level or
+    /// synthesized, e.g. by an asynchronous comprehension). A generator
+    /// expression whose frame awaits is an async generator.
+    await_frames: HashSet<FunctionId>,
     /// Per-function cell analysis: locals whose binding lives in a heap cell
     /// and capture parameters that alias an enclosing cell.
     cell_plans: HashMap<FunctionId, CellPlan>,
@@ -1312,6 +1371,8 @@ impl<'a> Lowerer<'a> {
             global_names: HashSet::new(),
             used_globals: HashSet::new(),
             mirror_all_globals: false,
+            session_mode: false,
+            session_globals: HashSet::new(),
             imported_functions: HashMap::new(),
             imported_constants: HashMap::new(),
             unpack_counter: 0,
@@ -1321,6 +1382,8 @@ impl<'a> Lowerer<'a> {
             cmp_counter: 0,
             multi_counter: 0,
             for_counter: 0,
+            async_counter: 0,
+            await_frames: HashSet::new(),
             cell_plans: HashMap::new(),
             class_defs: HashMap::new(),
             class_names: HashSet::new(),
@@ -1387,6 +1450,31 @@ impl<'a> Lowerer<'a> {
     /// `collect_function_read_globals`).
     pub fn set_mirror_all_globals(&mut self, enabled: bool) {
         self.mirror_all_globals = enabled;
+    }
+
+    /// Compiles this unit as a REPL/session fragment.
+    ///
+    /// Session fragments share a runtime global table: names bound by earlier
+    /// fragments are seeded with [`Self::set_session_globals`], unshadowed
+    /// module-level reads resolve to `GlobalGet` instead of being rejected,
+    /// session globals take precedence over builtins/functions/exceptions, and
+    /// import bindings are mirrored into the table. Session compilation still
+    /// expects [`Self::set_mirror_all_globals`] so every module-body binding
+    /// reaches the table.
+    pub fn set_session_mode(&mut self, enabled: bool) {
+        self.session_mode = enabled;
+    }
+
+    /// Seeds the names bound by earlier fragments of the same session.
+    ///
+    /// They join [`Self::global_names`], so functions of this fragment read
+    /// them from the runtime global table, and they shadow builtins, functions
+    /// and exception classes exactly like a module-level binding.
+    pub fn set_session_globals(&mut self, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            self.global_names.insert(name.clone());
+            self.session_globals.insert(name);
+        }
     }
 
     /// Makes resolved user modules (and their exported functions) visible.
@@ -1495,6 +1583,16 @@ impl<'a> Lowerer<'a> {
         //    lets us explain why a module-level name is not visible there.
         let mut module_names = Vec::new();
         collect_names(&module.body, &mut module_names, false);
+        // A session fragment that only augments a name bound by an earlier
+        // fragment must not allocate a fresh local for it: the read and the
+        // write both go through the runtime global table. Names the fragment
+        // binds some other way keep their local slot.
+        if self.session_mode {
+            let mut direct = HashSet::new();
+            collect_source_bound_names(&module.body, &mut direct, false);
+            module_names
+                .retain(|name| direct.contains(name) || !self.session_globals.contains(name));
+        }
         let mut module_locals: HashMap<String, LocalId> = HashMap::new();
         for name in module_names {
             if module_locals.contains_key(&name) {
@@ -1564,7 +1662,9 @@ impl<'a> Lowerer<'a> {
 
         // 6. Module body. Function definitions are declarations only (their
         //    values are mirrored for late importers, see
-        //    `mirror_module_function`); imports were resolved in step 1.
+        //    `mirror_module_function`); normal imports were resolved in step 1
+        //    and emit no statement. A session fragment mirrors its import
+        //    bindings, so its imports lower through `lower_stmt`.
         let mut fs = FuncState {
             fid: 0,
             is_module: true,
@@ -1586,7 +1686,7 @@ impl<'a> Lowerer<'a> {
                     self.mirror_module_function(idx, &def_ids, &mut body);
                     continue;
                 }
-                ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) => continue,
+                ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) if !self.session_mode => continue,
                 _ => {}
             }
             if let Some(s) = self.lower_stmt(stmt, &mut fs) {
@@ -1596,10 +1696,548 @@ impl<'a> Lowerer<'a> {
         body.splice(0..0, dunder_inits);
         self.functions[0].body = body;
 
+        self.synthesize_pytest(&module.body, &mut fs);
+
         LHir {
             source_name: self.filename.to_string(),
             functions: std::mem::take(&mut self.functions),
         }
+    }
+
+    /// Expands pytest fixtures and parametrization into zero-argument
+    /// wrappers.
+    ///
+    /// The runtime registry only knows function names and arities, so a test
+    /// that takes fixture parameters cannot be called directly. This pass
+    /// renames each such test to `<name>__pyx_impl` and appends a generated
+    /// wrapper that resolves the fixtures and calls the implementation.
+    /// Parametrized tests produce one wrapper per parameter set, named
+    /// `test_x[<id>]`, matching pytest's report names.
+    ///
+    /// Fixture wrappers are named `__pyx_fixture_<name>` and return the raw
+    /// fixture value. A `yield` fixture therefore returns its generator; the
+    /// runtime helper `pytest._fixture_resolve` advances it and schedules the
+    /// teardown. Module-scoped fixtures go through `pytest._fixture_module`,
+    /// which caches the resolved value for the child run.
+    fn synthesize_pytest(&mut self, body: &[ast::Stmt], fs: &mut FuncState) {
+        let mut fixtures: HashMap<String, (FunctionId, &'static str)> = HashMap::new();
+        for stmt in body {
+            let ast::Stmt::FunctionDef(function) = stmt else {
+                continue;
+            };
+            let Some(scope) = pytest_fixture_scope(&function.decorator_list) else {
+                continue;
+            };
+            let Some(&implementation) = self.fn_ids.get(function.name.as_str()) else {
+                continue;
+            };
+            let wrapper = self.build_pytest_fixture(function, implementation, &fixtures, fs);
+            fixtures.insert(function.name.to_string(), (wrapper, scope));
+        }
+
+        for stmt in body {
+            let ast::Stmt::FunctionDef(function) = stmt else {
+                continue;
+            };
+            self.build_pytest_tests(function, &fixtures, fs);
+        }
+    }
+
+    /// Reference to a fixture value for a generated wrapper.
+    fn pytest_fixture_reference(
+        &mut self,
+        name: &str,
+        fixtures: &HashMap<String, (FunctionId, &'static str)>,
+        line: u32,
+        col: u32,
+    ) -> Option<HExpr> {
+        if let Some((wrapper, scope)) = fixtures.get(name) {
+            let (wrapper, scope) = (*wrapper, *scope);
+            let raw = self.pytest_call(wrapper, Vec::new(), line, col);
+            return Some(if scope == "function" {
+                self.pytest_module_call("_fixture_resolve", vec![raw], line, col)
+            } else {
+                self.pytest_module_call(
+                    "_fixture_module",
+                    vec![
+                        HExpr {
+                            kind: HExprKind::Const(Const::Str(name.to_string())),
+                            ty: Ty::Concrete(Type::Str),
+                            line,
+                            col,
+                        },
+                        HExpr {
+                            kind: HExprKind::FunctionRef(wrapper),
+                            ty: Ty::Concrete(Type::Function),
+                            line,
+                            col,
+                        },
+                    ],
+                    line,
+                    col,
+                )
+            });
+        }
+        // Fixtures from imported units (conftest.py): the wrapper naming
+        // convention identifies them. Cross-unit scope metadata is not part
+        // of the export table, so they keep function scope (the common case).
+        let wrapper_name = format!("__pyx_fixture_{name}");
+        let mut modules: Vec<&UserModule> = self.user_modules.values().collect();
+        modules.sort_by(|left, right| left.name.cmp(&right.name));
+        let wrapper =
+            modules
+                .iter()
+                .rev()
+                .find_map(|module| match module.exports.get(&wrapper_name) {
+                    Some(UserExport::Function(wrapper)) => Some(*wrapper),
+                    _ => None,
+                });
+        let wrapper = wrapper?;
+        let raw = self.pytest_call(wrapper, Vec::new(), line, col);
+        Some(self.pytest_module_call("_fixture_resolve", vec![raw], line, col))
+    }
+
+    fn pytest_call(
+        &mut self,
+        function: FunctionId,
+        args: Vec<HExpr>,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Function(function),
+                args,
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
+    fn pytest_module_call(
+        &mut self,
+        function: &str,
+        args: Vec<HExpr>,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        HExpr {
+            kind: HExprKind::ModuleCall {
+                module: "pytest".to_string(),
+                function: function.to_string(),
+                args,
+                keywords: Vec::new(),
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
+    fn pytest_stmt(kind: HStmtKind, line: u32, col: u32) -> HStmt {
+        HStmt { kind, line, col }
+    }
+
+    /// Builds the raw zero-argument wrapper for one fixture.
+    fn build_pytest_fixture(
+        &mut self,
+        function: &ast::StmtFunctionDef,
+        implementation: FunctionId,
+        fixtures: &HashMap<String, (FunctionId, &'static str)>,
+        _fs: &mut FuncState,
+    ) -> FunctionId {
+        let (line, col) = self.span(function.range);
+        let mut locals: Vec<HLocal> = Vec::new();
+        let mut body = Vec::new();
+        let names = pytest_parameter_names(&function.args);
+        for name in &names {
+            let local = locals.len() as LocalId;
+            locals.push(HLocal {
+                name: name.clone(),
+                ty: self.infer.fresh(),
+            });
+            let value = match self.pytest_fixture_reference(name, fixtures, line, col) {
+                Some(value) => value,
+                None => {
+                    self.error_at(
+                        function.range,
+                        format!("pytest fixture '{name}' is not defined"),
+                    );
+                    HExpr {
+                        kind: HExprKind::Const(Const::None),
+                        ty: Ty::Concrete(Type::None),
+                        line,
+                        col,
+                    }
+                }
+            };
+            body.push(Self::pytest_stmt(
+                HStmtKind::Assign {
+                    target: local,
+                    value,
+                },
+                line,
+                col,
+            ));
+        }
+        let args = (0..names.len() as LocalId)
+            .map(|local| HExpr {
+                kind: HExprKind::Local(local),
+                ty: self.infer.fresh(),
+                line,
+                col,
+            })
+            .collect();
+        body.push(Self::pytest_stmt(
+            HStmtKind::Return(Some(self.pytest_call(implementation, args, line, col))),
+            line,
+            col,
+        ));
+
+        let id = self.functions.len() as FunctionId;
+        let wrapper_name = format!("__pyx_fixture_{}", function.name);
+        self.functions.push(HFunction {
+            name: wrapper_name.clone(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: self.infer.fresh(),
+            locals,
+            body,
+            is_async: false,
+            is_generator: false,
+            is_module: false,
+            line,
+            col,
+        });
+        // HIR function references carry absolute ids, like `create_function`
+        // records in `fn_ids`. Imported units export the wrapper by this name
+        // so a test file can reference a conftest fixture without importing it.
+        let absolute = self.fid_base + id;
+        self.fn_ids.insert(wrapper_name, absolute);
+        absolute
+    }
+
+    /// Generates the zero-argument wrappers for one test function.
+    fn build_pytest_tests(
+        &mut self,
+        function: &ast::StmtFunctionDef,
+        fixtures: &HashMap<String, (FunctionId, &'static str)>,
+        fs: &mut FuncState,
+    ) {
+        let name = function.name.to_string();
+        if !name.starts_with("test") {
+            return;
+        }
+        let skip = pytest_skip(&function.decorator_list);
+        let xfail = pytest_xfail(&function.decorator_list);
+        let skipif = pytest_skipif(&function.decorator_list);
+        let usefixtures = pytest_usefixtures(&function.decorator_list);
+        let (param_names, cases) = self.pytest_parametrize(&function.decorator_list, fs);
+        let parameters = pytest_parameter_names(&function.args);
+
+        let needs_wrapper = skip.is_some()
+            || xfail.is_some()
+            || skipif.is_some()
+            || !usefixtures.is_empty()
+            || !parameters.is_empty()
+            || !param_names.is_empty();
+        if !needs_wrapper {
+            return;
+        }
+        let Some(&implementation) = self.fn_ids.get(name.as_str()) else {
+            return;
+        };
+        let (line, col) = self.span(function.range);
+
+        let rows: Vec<Vec<(String, HExpr, String)>> = if param_names.is_empty() {
+            vec![Vec::new()]
+        } else {
+            cases
+        };
+        let local = implementation
+            .checked_sub(self.fid_base)
+            .unwrap_or(implementation) as usize;
+        self.functions[local].name = format!("{name}__pyx_impl");
+        if rows.is_empty() {
+            // An empty `parametrize` list collects no tests.
+            return;
+        }
+
+        let mut used_names: HashSet<String> = HashSet::new();
+        for row in rows {
+            let values: HashMap<&str, &HExpr> = row
+                .iter()
+                .map(|(name, value, _)| (name.as_str(), value))
+                .collect();
+            let mut locals: Vec<HLocal> = Vec::new();
+            let mut body: Vec<HStmt> = Vec::new();
+            body.extend(self.pytest_skip_statements(&skip, &skipif, line, col, fs));
+            let mut arguments: Vec<HExpr> = Vec::with_capacity(parameters.len());
+            for parameter in &parameters {
+                let local = locals.len() as LocalId;
+                locals.push(HLocal {
+                    name: parameter.clone(),
+                    ty: self.infer.fresh(),
+                });
+                let value = if let Some(value) = values.get(parameter.as_str()) {
+                    (*value).clone()
+                } else {
+                    match self.pytest_fixture_reference(parameter, fixtures, line, col) {
+                        Some(value) => value,
+                        None => {
+                            self.error_at(
+                                function.range,
+                                format!("pytest fixture '{parameter}' is not defined"),
+                            );
+                            HExpr {
+                                kind: HExprKind::Const(Const::None),
+                                ty: Ty::Concrete(Type::None),
+                                line,
+                                col,
+                            }
+                        }
+                    }
+                };
+                body.push(Self::pytest_stmt(
+                    HStmtKind::Assign {
+                        target: local,
+                        value,
+                    },
+                    line,
+                    col,
+                ));
+                arguments.push(HExpr {
+                    kind: HExprKind::Local(local),
+                    ty: self.infer.fresh(),
+                    line,
+                    col,
+                });
+            }
+            for fixture in &usefixtures {
+                if parameters.iter().any(|parameter| parameter == fixture) {
+                    continue;
+                }
+                if let Some(value) = self.pytest_fixture_reference(fixture, fixtures, line, col) {
+                    body.push(Self::pytest_stmt(HStmtKind::Expr(value), line, col));
+                } else {
+                    self.error_at(
+                        function.range,
+                        format!("pytest fixture '{fixture}' is not defined"),
+                    );
+                }
+            }
+            let call = self.pytest_call(implementation, arguments, line, col);
+            if let Some(reason) = &xfail {
+                body.push(Self::pytest_stmt(
+                    HStmtKind::Try {
+                        body: vec![Self::pytest_stmt(HStmtKind::Expr(call), line, col)],
+                        handlers: vec![HHandler {
+                            exc: None,
+                            binding: None,
+                            binding_cell: false,
+                            body: vec![Self::pytest_stmt(
+                                HStmtKind::Expr(self.pytest_module_call(
+                                    "_xfail",
+                                    vec![HExpr {
+                                        kind: HExprKind::Const(Const::Str(reason.clone())),
+                                        ty: Ty::Concrete(Type::Str),
+                                        line,
+                                        col,
+                                    }],
+                                    line,
+                                    col,
+                                )),
+                                line,
+                                col,
+                            )],
+                        }],
+                        else_body: Vec::new(),
+                        finally_body: Vec::new(),
+                    },
+                    line,
+                    col,
+                ));
+            } else {
+                body.push(Self::pytest_stmt(HStmtKind::Expr(call), line, col));
+            }
+
+            let suffix = {
+                let parts: Vec<String> = row
+                    .iter()
+                    .map(|(_, _, text)| sanitize_pytest_id(text))
+                    .collect();
+                let parts = if parts.is_empty() {
+                    vec!["0".to_string()]
+                } else {
+                    parts
+                };
+                let base = parts.join("-");
+                let mut candidate = base.clone();
+                let mut counter = 1;
+                while used_names.contains(&candidate) {
+                    candidate = format!("{base}-{counter}");
+                    counter += 1;
+                }
+                used_names.insert(candidate.clone());
+                candidate
+            };
+            let wrapper_name = if param_names.is_empty() {
+                name.clone()
+            } else {
+                format!("{name}[{suffix}]")
+            };
+            self.functions.push(HFunction {
+                name: wrapper_name,
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Ty::Concrete(Type::None),
+                locals,
+                body,
+                is_async: false,
+                is_generator: false,
+                is_module: false,
+                line,
+                col,
+            });
+        }
+    }
+
+    /// Builds the skip statements a test wrapper starts with.
+    fn pytest_skip_statements(
+        &mut self,
+        skip: &Option<String>,
+        skipif: &Option<ast::Expr>,
+        line: u32,
+        col: u32,
+        fs: &mut FuncState,
+    ) -> Vec<HStmt> {
+        let mut statements = Vec::new();
+        if let Some(reason) = skip {
+            statements.push(Self::pytest_stmt(
+                HStmtKind::Expr(self.pytest_skip_call(reason, line, col)),
+                line,
+                col,
+            ));
+            return statements;
+        }
+        if let Some(condition) = skipif {
+            let test = self.expr(condition, fs);
+            statements.push(Self::pytest_stmt(
+                HStmtKind::If {
+                    cond: test,
+                    then_body: vec![Self::pytest_stmt(
+                        HStmtKind::Expr(self.pytest_skip_call("conditionally skipped", line, col)),
+                        line,
+                        col,
+                    )],
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            ));
+        }
+        statements
+    }
+
+    fn pytest_skip_call(&mut self, reason: &str, line: u32, col: u32) -> HExpr {
+        self.pytest_module_call(
+            "skip",
+            vec![HExpr {
+                kind: HExprKind::Const(Const::Str(reason.to_string())),
+                ty: Ty::Concrete(Type::Str),
+                line,
+                col,
+            }],
+            line,
+            col,
+        )
+    }
+
+    /// Expands every `parametrize` decorator into concrete argument rows.
+    #[allow(clippy::type_complexity)]
+    fn pytest_parametrize(
+        &mut self,
+        decorators: &[ast::Expr],
+        fs: &mut FuncState,
+    ) -> (Vec<String>, Vec<Vec<(String, HExpr, String)>>) {
+        let mut names: Vec<String> = Vec::new();
+        let mut cases: Vec<Vec<(String, HExpr, String)>> = vec![Vec::new()];
+        for decorator in decorators {
+            if decorator_final_name(decorator).as_deref() != Some("parametrize") {
+                continue;
+            }
+            let ast::Expr::Call(call) = decorator else {
+                continue;
+            };
+            if call.args.len() < 2 {
+                self.error_at(decorator.range(), "parametrize requires names and values");
+                continue;
+            }
+            let Some(arguments) = pytest_string_list(&call.args[0]) else {
+                self.error_at(
+                    call.args[0].range(),
+                    "parametrize names must be a string literal",
+                );
+                continue;
+            };
+            let Some(values) = pytest_sequence(&call.args[1]) else {
+                self.error_at(
+                    call.args[1].range(),
+                    "parametrize values must be a literal list or tuple",
+                );
+                continue;
+            };
+            names.extend(arguments.iter().cloned());
+            let mut decorator_cases: Vec<Vec<(String, HExpr, String)>> = Vec::new();
+            for value in values {
+                let mut row = Vec::with_capacity(arguments.len());
+                if arguments.len() == 1 {
+                    row.push((
+                        arguments[0].clone(),
+                        self.expr(value, fs),
+                        self.source_text(value.range()),
+                    ));
+                } else {
+                    let Some(elements) = pytest_sequence(value) else {
+                        self.error_at(
+                            value.range(),
+                            "a parametrize row must be a tuple when several names are given",
+                        );
+                        continue;
+                    };
+                    if elements.len() != arguments.len() {
+                        self.error_at(
+                            value.range(),
+                            format!(
+                                "parametrize row has {} value(s) for {} name(s)",
+                                elements.len(),
+                                arguments.len()
+                            ),
+                        );
+                        continue;
+                    }
+                    for (name, element) in arguments.iter().zip(elements) {
+                        row.push((
+                            name.clone(),
+                            self.expr(element, fs),
+                            self.source_text(element.range()),
+                        ));
+                    }
+                }
+                decorator_cases.push(row);
+            }
+            let mut combined = Vec::with_capacity(cases.len() * decorator_cases.len());
+            for case in &cases {
+                for decorator_case in &decorator_cases {
+                    let mut merged = case.clone();
+                    merged.extend(decorator_case.iter().cloned());
+                    combined.push(merged);
+                }
+            }
+            cases = combined;
+        }
+        (names, cases)
     }
 
     /// Mirrors a module-level function into the runtime global table.
@@ -1728,6 +2366,13 @@ impl<'a> Lowerer<'a> {
 
     fn span(&self, range: TextRange) -> (u32, u32) {
         line_col(self.source, u32::from(range.start()) as usize)
+    }
+
+    /// Source text covered by `range`, used for pytest assertion messages.
+    fn source_text(&self, range: TextRange) -> String {
+        let start = (u32::from(range.start()) as usize).min(self.source.len());
+        let end = (u32::from(range.end()) as usize).min(self.source.len());
+        self.source.get(start..end).unwrap_or("").trim().to_string()
     }
 
     /// Start position plus the exclusive end column of `range`, clamped to the
@@ -2302,6 +2947,147 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Mirrors the bindings of a module-level `import` statement into the
+    /// session global table.
+    ///
+    /// A REPL fragment is compiled separately from the fragment that follows
+    /// it, so import names must live in the runtime table rather than only in
+    /// the binding tables of this compilation unit. Extension module aliases
+    /// have no first-class value in the IR and are therefore not mirrored;
+    /// their members (`from ext import name`) are.
+    fn lower_session_import(&mut self, s: &ast::StmtImport, line: u32, col: u32) -> Option<HStmt> {
+        let mut stores = Vec::new();
+        for alias in &s.names {
+            let binding = import_binding(alias);
+            let value = if let Some(module) = self.user_module_aliases.get(&binding).cloned() {
+                self.module_ref_expr(&module, line, col)
+            } else if let Some(module) = self.module_aliases.get(&binding).copied() {
+                self.module_ref_expr(module.name, line, col)
+            } else {
+                continue;
+            };
+            stores.push(self.session_global_store(&binding, value, line, col));
+        }
+        self.session_import_statement(stores, line, col)
+    }
+
+    /// Mirrors the bindings of a module-level `from ... import ...` statement
+    /// into the session global table.
+    fn lower_session_import_from(
+        &mut self,
+        s: &ast::StmtImportFrom,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let mut stores = Vec::new();
+        for alias in &s.names {
+            if alias.name.as_str() == "*" {
+                continue;
+            }
+            let binding = import_binding(alias);
+            let value = if let Some(&function) = self.imported_user_functions.get(&binding) {
+                HExpr {
+                    kind: HExprKind::FunctionRef(function),
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                }
+            } else if let Some((module, name)) = self.imported_user_globals.get(&binding).cloned() {
+                HExpr {
+                    kind: HExprKind::GlobalGet { module, name },
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                }
+            } else if let Some(module) = self.user_module_aliases.get(&binding).cloned() {
+                self.module_ref_expr(&module, line, col)
+            } else if let Some((module, function)) = self.imported_functions.get(&binding).copied()
+            {
+                self.module_attr_expr(module.name, function.name, line, col)
+            } else if let Some((module, constant)) = self.imported_constants.get(&binding).copied()
+            {
+                self.module_attr_expr(module.name, constant.name, line, col)
+            } else if let Some((path, member)) =
+                self.imported_extension_members.get(&binding).cloned()
+            {
+                HExpr {
+                    kind: HExprKind::ExtensionAttr { path, member },
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                }
+            } else {
+                continue;
+            };
+            stores.push(self.session_global_store(&binding, value, line, col));
+        }
+        self.session_import_statement(stores, line, col)
+    }
+
+    fn module_ref_expr(&self, module: &str, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::ModuleRef {
+                module: module.to_string(),
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        }
+    }
+
+    fn module_attr_expr(&self, module: &str, name: &str, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::ModuleAttr {
+                module: module.to_string(),
+                name: name.to_string(),
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        }
+    }
+
+    fn session_global_store(&self, name: &str, value: HExpr, line: u32, col: u32) -> HStmt {
+        HStmt {
+            kind: HStmtKind::GlobalSet {
+                module: self.dunder_name.clone(),
+                name: name.to_string(),
+                value,
+            },
+            line,
+            col,
+        }
+    }
+
+    /// Wraps several import bindings in one statement. Every binding must run
+    /// where its import statement runs, so an `if True:` block keeps them
+    /// together without introducing a new scope.
+    fn session_import_statement(
+        &mut self,
+        mut stores: Vec<HStmt>,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        match stores.len() {
+            0 => None,
+            1 => stores.pop(),
+            _ => Some(HStmt {
+                kind: HStmtKind::If {
+                    cond: HExpr {
+                        kind: HExprKind::Const(Const::Bool(true)),
+                        ty: Ty::Concrete(Type::Bool),
+                        line,
+                        col,
+                    },
+                    then_body: stores,
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            }),
+        }
+    }
+
     /// Resolves the base of an attribute chain to an imported extension.
     ///
     /// A local of the same name shadows the import, exactly like module
@@ -2587,7 +3373,7 @@ impl<'a> Lowerer<'a> {
         );
     }
 
-    fn module_attr_expr(
+    fn module_spec_attr_expr(
         &mut self,
         module: &'static ModuleSpec,
         member: &str,
@@ -2849,16 +3635,10 @@ impl<'a> Lowerer<'a> {
             );
         }
 
-        // A body containing `yield` makes the function a generator; `async def`
-        // plus `yield` would be an async generator, which is not implemented.
+        // A body containing `yield` makes the function a generator; combined
+        // with `async def` the function is an async generator and retains
+        // both flags.
         let is_generator = body_has_yield(decl.body);
-        if decl.is_async && is_generator {
-            self.error_at_code(
-                decl.range,
-                codes::UNSUPPORTED,
-                "async generators are not supported",
-            );
-        }
 
         let ret_ty = match decl.returns {
             Some(ann) => self.annotation_ty(ann),
@@ -4104,16 +4884,7 @@ impl<'a> Lowerer<'a> {
                         name: target.id.to_string(),
                         value,
                     }
-                } else {
-                    let Some(local) = fs.lookup(target.id.as_str()) else {
-                        self.error_name(
-                            target.range,
-                            target.id.as_str(),
-                            fs,
-                            format!("assignment to unknown name '{}'", target.id),
-                        );
-                        return None;
-                    };
+                } else if let Some(local) = fs.lookup(target.id.as_str()) {
                     let value = self.expr(&s.value, fs);
                     if fs.is_cell(local) {
                         // Read and write both go through the shared cell so a
@@ -4141,6 +4912,44 @@ impl<'a> Lowerer<'a> {
                             value,
                         }
                     }
+                } else if self.session_mode && self.global_names.contains(target.id.as_str()) {
+                    // A REPL fragment updating a name bound by an earlier
+                    // fragment has no local slot: read and write the session
+                    // global table.
+                    self.used_globals.insert(target.id.to_string());
+                    let lhs = HExpr {
+                        kind: HExprKind::GlobalGet {
+                            module: self.dunder_name.clone(),
+                            name: target.id.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    };
+                    let rhs = self.expr(&s.value, fs);
+                    let value = HExpr {
+                        kind: HExprKind::Bin {
+                            op,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
+                    HStmtKind::GlobalSet {
+                        module: self.dunder_name.clone(),
+                        name: target.id.to_string(),
+                        value,
+                    }
+                } else {
+                    self.error_name(
+                        target.range,
+                        target.id.as_str(),
+                        fs,
+                        format!("assignment to unknown name '{}'", target.id),
+                    );
+                    return None;
                 }
             }
             ast::Stmt::If(s) => {
@@ -4341,21 +5150,41 @@ impl<'a> Lowerer<'a> {
                     },
                 }
             }
-            // Imports were resolved into the binding tables in step 1; they
-            // emit no runtime statement wherever they appear.
-            ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) => return None,
+            // Imports were resolved into the binding tables in step 1. A
+            // session fragment also mirrors them into the runtime global
+            // table so a later fragment sees the same names.
+            ast::Stmt::Import(s) => {
+                if !self.session_mode || !fs.is_module {
+                    return None;
+                }
+                return self.lower_session_import(s, line, col);
+            }
+            ast::Stmt::ImportFrom(s) => {
+                if !self.session_mode || !fs.is_module {
+                    return None;
+                }
+                return self.lower_session_import_from(s, line, col);
+            }
             ast::Stmt::With(s) => return self.lower_with(s, fs, line, col),
-            ast::Stmt::AsyncWith(s) => {
-                return self.lower_with_items(&s.items, &s.body, s.range, fs)
-            }
-            ast::Stmt::AsyncFor(s) => {
-                return self.lower_for_parts(&s.target, &s.iter, &s.body, &s.orelse, fs, line, col)
-            }
+            ast::Stmt::AsyncWith(s) => return self.lower_async_with(s, fs, line, col),
+            ast::Stmt::AsyncFor(s) => return self.lower_async_for(s, fs, line, col),
             ast::Stmt::Assert(s) => {
                 let test = self.expr(&s.test, fs);
                 // Python evaluates the message only when the test fails;
                 // codegen keeps it inside the failure branch.
-                let msg = s.msg.as_deref().map(|msg| self.expr(msg, fs));
+                let msg = match s.msg.as_deref() {
+                    Some(msg) => Some(self.expr(msg, fs)),
+                    // pytest reports the assertion's source text for a bare
+                    // `assert`; PyX does not rewrite the expression, so the
+                    // statement text is the closest real message.
+                    None if pytest_mode() => Some(HExpr {
+                        kind: HExprKind::Const(Const::Str(self.source_text(s.range))),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    }),
+                    None => None,
+                };
                 HStmtKind::Assert { test, msg }
             }
             ast::Stmt::Delete(s) => return self.lower_delete(s, fs, line, col),
@@ -4877,11 +5706,44 @@ impl<'a> Lowerer<'a> {
             .collect()
     }
 
-    /// Create the hidden `$withN` local that holds a `with` context object so
-    /// its `__enter__()`/`__exit__()` are still reachable from the generated
-    /// prelude and `finally` block.
-    fn with_temp(&mut self, fs: &mut FuncState, range: TextRange) -> (LocalId, HExpr) {
-        let name = format!("$with{}", self.with_counter);
+    /// Create a hidden local of an asynchronous lowering (`$aiterN`,
+    /// `$aitemN`, `$aexcN`, `$aloopN`).
+    ///
+    /// The name contains `$`, so user code can never refer to the slot and it
+    /// is not registered in the scope's name table.
+    fn async_temp(
+        &mut self,
+        fs: &mut FuncState,
+        prefix: &str,
+        line: u32,
+        col: u32,
+    ) -> (LocalId, HExpr) {
+        let name = format!("{prefix}{}", self.async_counter);
+        self.async_counter += 1;
+        let var = self.functions[fs.fid as usize].locals.len() as LocalId;
+        self.functions[fs.fid as usize].locals.push(HLocal {
+            name,
+            ty: Ty::Concrete(Type::Any),
+        });
+        let value = HExpr {
+            kind: HExprKind::Local(var),
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        };
+        (var, value)
+    }
+
+    /// Create a hidden `with` local (`$withN` for the context object, `$wexcN`
+    /// for the exception it may suppress) so both stay reachable from the
+    /// generated prelude, handler and `finally` block.
+    fn with_temp(
+        &mut self,
+        fs: &mut FuncState,
+        prefix: &str,
+        range: TextRange,
+    ) -> (LocalId, HExpr) {
+        let name = format!("{prefix}{}", self.with_counter);
         self.with_counter += 1;
         let var = self.functions[fs.fid as usize].locals.len() as LocalId;
         self.functions[fs.fid as usize].locals.push(HLocal {
@@ -5302,10 +6164,14 @@ impl<'a> Lowerer<'a> {
         saved: &mut Vec<(String, Option<LocalId>)>,
         iterable: HExpr,
     ) -> HCompClause {
-        if generator.is_async {
-            self.error_at(
+        if generator.is_async && !fs.is_async {
+            // CPython rejects an asynchronous comprehension outside an
+            // asynchronous function; the enclosing frame would have no way to
+            // await the iterator.
+            self.error_at_code(
                 generator.target.range(),
-                "async comprehensions are not supported yet",
+                codes::CONTROL,
+                "asynchronous comprehension outside of an asynchronous function",
             );
         }
         let target = self.lower_comp_target(&generator.target, fs, saved);
@@ -5317,6 +6183,7 @@ impl<'a> Lowerer<'a> {
             target,
             iterable,
             conditions,
+            is_async: generator.is_async,
         }
     }
 
@@ -5326,7 +6193,9 @@ impl<'a> Lowerer<'a> {
     /// parameter receives the outermost iterable (Python evaluates it when the
     /// generator is created) and one parameter per captured enclosing value.
     /// Calling it creates a suspended fiber, so the clauses and the element run
-    /// only as items are requested and never build a result list.
+    /// only as items are requested and never build a result list. With an
+    /// `async for` clause the function is an async generator (`is_async` and
+    /// `is_generator`) instead of a plain generator.
     fn lower_generator_exp(
         &mut self,
         c: &ast::ExprGeneratorExp,
@@ -5337,56 +6206,26 @@ impl<'a> Lowerer<'a> {
         let Some(first) = c.generators.first() else {
             return self.error_expr(c.range);
         };
+        let async_for_clause = c.generators.iter().any(|generator| generator.is_async);
+        if async_for_clause && !fs.is_async {
+            self.error_at_code(
+                c.range,
+                codes::CONTROL,
+                "asynchronous comprehension outside of an asynchronous function",
+            );
+        }
+        // `await` inside the frame turns the generator expression into an
+        // async generator. The enclosing function must be async for that, so
+        // the frame only permits `await` when it is; whether it actually
+        // contains one is decided after lowering (`await_frames`).
+        let frame_is_async = async_for_clause || fs.is_async;
 
         // Free names read by the generator frame in first-use order. The
         // outermost iterable is evaluated in the enclosing frame, so names it
         // reads nowhere else are not captures. Everything the frame does read
         // from the enclosing scope becomes a parameter.
-        let mut free = Vec::new();
-        let mut seen = HashSet::new();
-        let mut bound = HashSet::new();
-        for (index, generator) in c.generators.iter().enumerate() {
-            if index > 0 {
-                walk_free_expr(&generator.iter, &bound, &mut free, &mut seen);
-            }
-            // Attribute/subscript receivers of a target are evaluated per item,
-            // inside the generator frame.
-            walk_free_target(&generator.target, &bound, &mut free, &mut seen);
-            collect_comp_target_names(&generator.target, &mut bound);
-            for condition in &generator.ifs {
-                walk_free_expr(condition, &bound, &mut free, &mut seen);
-            }
-        }
-        walk_free_expr(&c.elt, &bound, &mut free, &mut seen);
-        let mut capture_names = Vec::new();
-        let mut captures = Vec::new();
-        let mut capture_cells = Vec::new();
-        let mut globals = HashSet::new();
-        for name in free {
-            if fs.is_global(&name) {
-                globals.insert(name);
-            } else if let Some(local) = fs.lookup(&name) {
-                capture_names.push(name);
-                capture_cells.push(fs.is_cell(local));
-                captures.push(HExpr {
-                    kind: HExprKind::Local(local),
-                    ty: Ty::Concrete(Type::Any),
-                    line,
-                    col,
-                });
-            } else if let Some(value) = self
-                .class_attr_scopes
-                .last()
-                .and_then(|scope| scope.get(&name))
-                .cloned()
-            {
-                // A class body has no frame of its own: the attribute value is
-                // evaluated where the generator is created.
-                capture_names.push(name);
-                capture_cells.push(false);
-                captures.push(value);
-            }
-        }
+        let (capture_names, captures, capture_cells, globals) =
+            self.comp_captures(&c.generators, &[c.elt.as_ref()], fs, line, col);
 
         // The outermost iterable belongs to the enclosing frame.
         let outer_iterable = self.expr(&first.iter, fs);
@@ -5426,7 +6265,7 @@ impl<'a> Lowerer<'a> {
             ret_ty: Ty::Concrete(Type::Any),
             locals: locals.clone(),
             body: Vec::new(),
-            is_async: false,
+            is_async: async_for_clause,
             is_generator: true,
             is_module: false,
             line: fid_line,
@@ -5447,7 +6286,7 @@ impl<'a> Lowerer<'a> {
             globals,
             loop_depth: 0,
             in_lambda: fs.in_lambda,
-            is_async: false,
+            is_async: frame_is_async,
             is_generator: true,
             genexp_frame: true,
         };
@@ -5468,8 +6307,24 @@ impl<'a> Lowerer<'a> {
         let element = self.expr(&c.elt, &mut gfs);
         self.restore_comp_bindings(&mut gfs, saved);
 
-        let body = self.gen_body(clauses, element, &mut gfs);
+        let element_line = element.line;
+        let element_col = element.col;
+        let body = self.comp_body(
+            clauses,
+            vec![HStmt {
+                kind: HStmtKind::Yield {
+                    value: Some(element),
+                },
+                line: element_line,
+                col: element_col,
+            }],
+            &mut gfs,
+        );
         self.functions[fid as usize].body = body;
+        // A frame that awaits is an async generator even without an
+        // `async for` clause, e.g. `(await f(x) for x in xs)`.
+        self.functions[fid as usize].is_async =
+            async_for_clause || self.await_frames.contains(&fid);
 
         let mut args = Vec::with_capacity(captures.len() + 1);
         args.push(outer_iterable);
@@ -5485,23 +6340,253 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Build the synthetic generator body: one `for` per clause (outermost
-    /// first), its filters in source order, and the element as the `yield`
-    /// executed by the innermost level.
-    fn gen_body(
+    /// Lower a list/set/dict comprehension that contains at least one
+    /// `async for` clause.
+    ///
+    /// The comprehension becomes a synthetic async function (a coroutine, not
+    /// a generator) that builds the result and returns it; the expression is
+    /// the `await` of a call to it. The outermost iterable is evaluated in the
+    /// enclosing frame when the expression runs, exactly like a synchronous
+    /// comprehension, and the remaining clauses and the element run inside the
+    /// coroutine with the same target scoping.
+    fn lower_async_comprehension(
         &mut self,
-        clauses: Vec<HCompClause>,
-        element: HExpr,
+        generators: &[ast::Comprehension],
+        kind: AsyncCompKind<'_>,
+        range: TextRange,
         fs: &mut FuncState,
-    ) -> Vec<HStmt> {
-        let (line, col) = (element.line, element.col);
-        let mut body = vec![HStmt {
-            kind: HStmtKind::Yield {
-                value: Some(element),
+    ) -> HExpr {
+        let (line, col) = self.span(range);
+        let Some(first) = generators.first() else {
+            return self.error_expr(range);
+        };
+        // The result is the `await` of the helper, so the enclosing frame
+        // awaits as well; a generator expression containing this value is
+        // therefore an async generator.
+        self.await_frames.insert(fs.fid);
+        let result_ty = kind.result_ty();
+        let (capture_names, captures, capture_cells, globals) =
+            self.comp_captures(generators, &kind.elements(), fs, line, col);
+        let outer_iterable = self.expr(&first.iter, fs);
+
+        let fid = self.functions.len() as FunctionId;
+        let mut params = Vec::with_capacity(capture_names.len() + 1);
+        let mut locals = Vec::with_capacity(capture_names.len() + 2);
+        let push_param = |name: &str, params: &mut Vec<HParam>, locals: &mut Vec<HLocal>| {
+            let local = locals.len() as LocalId;
+            locals.push(HLocal {
+                name: name.to_string(),
+                ty: Ty::Concrete(Type::Any),
+            });
+            params.push(HParam {
+                local,
+                name: name.to_string(),
+                ty: Ty::Concrete(Type::Any),
+                default: None,
+                default_expr: None,
+                kind: ParamKind::Positional,
+            });
+            local
+        };
+        let iter_local = push_param("$geniter", &mut params, &mut locals);
+        let mut frame_cells = HashSet::new();
+        for (index, name) in capture_names.iter().enumerate() {
+            let local = push_param(name, &mut params, &mut locals);
+            if capture_cells.get(index).copied().unwrap_or(false) {
+                frame_cells.insert(local);
+            }
+        }
+        let accum = locals.len() as LocalId;
+        locals.push(HLocal {
+            name: "$accum".to_string(),
+            ty: Ty::Concrete(result_ty),
+        });
+
+        self.functions.push(HFunction {
+            name: "<asynccomp>".to_string(),
+            params,
+            capture_count: 0,
+            ret_ty: Ty::Concrete(Type::Any),
+            locals: locals.clone(),
+            body: Vec::new(),
+            is_async: true,
+            is_generator: false,
+            is_module: false,
+            line,
+            col,
+        });
+
+        let mut cfs = FuncState {
+            fid,
+            is_module: false,
+            locals: locals
+                .iter()
+                .enumerate()
+                .map(|(index, local)| (local.name.clone(), index as LocalId))
+                .collect(),
+            cells: frame_cells.clone(),
+            cell_aliases: frame_cells,
+            comp_shadowed: HashMap::new(),
+            globals,
+            loop_depth: 0,
+            in_lambda: fs.in_lambda,
+            is_async: true,
+            is_generator: false,
+            genexp_frame: true,
+        };
+        let accum_ref = HExpr {
+            kind: HExprKind::Local(accum),
+            ty: Ty::Concrete(result_ty),
+            line,
+            col,
+        };
+        let init = HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Builtin(match &kind {
+                    AsyncCompKind::List(_) => Builtin::List,
+                    AsyncCompKind::Set(_) => Builtin::Set,
+                    AsyncCompKind::Dict(..) => Builtin::Dict,
+                }),
+                args: Vec::new(),
+            },
+            ty: Ty::Concrete(result_ty),
+            line,
+            col,
+        };
+        let mut helper_body = vec![HStmt {
+            kind: HStmtKind::Assign {
+                target: accum,
+                value: init,
             },
             line,
             col,
         }];
+
+        let mut saved = Vec::new();
+        let mut clauses = Vec::with_capacity(generators.len());
+        let first_iterable = HExpr {
+            kind: HExprKind::Local(iter_local),
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        };
+        clauses.push(self.lower_comp_clause_from(first, &mut cfs, &mut saved, first_iterable));
+        for generator in &generators[1..] {
+            let clause = self.lower_comp_clause(generator, &mut cfs, &mut saved);
+            clauses.push(clause);
+        }
+        let innermost = match &kind {
+            AsyncCompKind::List(element) => {
+                let element = self.expr(element, &mut cfs);
+                vec![HStmt {
+                    kind: HStmtKind::Expr(self.method_call_expr(
+                        accum_ref.clone(),
+                        "append",
+                        vec![element],
+                        line,
+                        col,
+                    )),
+                    line,
+                    col,
+                }]
+            }
+            AsyncCompKind::Set(element) => {
+                let element = self.expr(element, &mut cfs);
+                vec![HStmt {
+                    kind: HStmtKind::Expr(self.method_call_expr(
+                        accum_ref.clone(),
+                        "add",
+                        vec![element],
+                        line,
+                        col,
+                    )),
+                    line,
+                    col,
+                }]
+            }
+            AsyncCompKind::Dict(key, value) => {
+                // `dict.__setitem__` evaluates the value first, so the key is
+                // staged in a hidden local to preserve Python's key-before-
+                // value evaluation order.
+                let key = self.expr(key, &mut cfs);
+                let key_local = self.comp_local(&mut cfs);
+                let stored_key = HExpr {
+                    kind: HExprKind::Local(key_local),
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                };
+                let value = self.expr(value, &mut cfs);
+                vec![
+                    HStmt {
+                        kind: HStmtKind::Assign {
+                            target: key_local,
+                            value: key,
+                        },
+                        line,
+                        col,
+                    },
+                    HStmt {
+                        kind: HStmtKind::SetSubscript {
+                            object: accum_ref.clone(),
+                            index: stored_key,
+                            value,
+                        },
+                        line,
+                        col,
+                    },
+                ]
+            }
+        };
+        self.restore_comp_bindings(&mut cfs, saved);
+
+        let loops = self.comp_body(clauses, innermost, &mut cfs);
+        helper_body.extend(loops);
+        helper_body.push(HStmt {
+            kind: HStmtKind::Return(Some(accum_ref)),
+            line,
+            col,
+        });
+        self.functions[fid as usize].body = helper_body;
+
+        let mut args = Vec::with_capacity(captures.len() + 1);
+        args.push(outer_iterable);
+        args.extend(captures);
+        let call = HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Function(self.fid_base + fid),
+                args,
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        };
+        HExpr {
+            kind: HExprKind::Await {
+                value: Box::new(call),
+            },
+            // The synthetic coroutine always returns this collection type;
+            // the normal `await` rule (dynamic result) does not apply.
+            ty: Ty::Concrete(result_ty),
+            line,
+            col,
+        }
+    }
+
+    /// Build the loop nest of a comprehension: one `for` per clause (outermost
+    /// first), its filters in source order, and `innermost` executed where all
+    /// clauses have bound.
+    ///
+    /// Asynchronous clauses become [`Lowerer::async_iteration`] loops, so this
+    /// builder drives generator expressions and the eager comprehensions
+    /// alike.
+    fn comp_body(
+        &mut self,
+        clauses: Vec<HCompClause>,
+        innermost: Vec<HStmt>,
+        fs: &mut FuncState,
+    ) -> Vec<HStmt> {
+        let mut body = innermost;
         for clause in clauses.into_iter().rev() {
             for condition in clause.conditions.into_iter().rev() {
                 let (line, col) = (condition.line, condition.col);
@@ -5515,13 +6600,41 @@ impl<'a> Lowerer<'a> {
                     col,
                 }];
             }
+            let (line, col) = (clause.iterable.line, clause.iterable.col);
+            if clause.is_async {
+                // The awaited item binds the clause target before the filters
+                // and the inner levels run.
+                let (item, item_ref) = self.async_temp(fs, "$aitem", line, col);
+                let mut bound = Vec::with_capacity(body.len() + 1);
+                match clause.target {
+                    HCompTarget::Name(local) => bound.push(HStmt {
+                        kind: HStmtKind::Assign {
+                            target: local,
+                            value: item_ref,
+                        },
+                        line,
+                        col,
+                    }),
+                    HCompTarget::Unpack(targets) => bound.push(HStmt {
+                        kind: HStmtKind::Unpack {
+                            targets,
+                            value: item_ref,
+                        },
+                        line,
+                        col,
+                    }),
+                }
+                bound.extend(body);
+                body =
+                    self.async_iteration(clause.iterable, item, Vec::new(), bound, line, col, fs);
+                continue;
+            }
             let (var, bound) = match clause.target {
                 HCompTarget::Name(local) => (local, body),
                 HCompTarget::Unpack(targets) => {
                     // The loop variable receives the whole item and the target
                     // unpacks it, as `for a, b in ...` does.
                     let temp = self.comp_local(fs);
-                    let (line, col) = (clause.iterable.line, clause.iterable.col);
                     let mut bound = Vec::with_capacity(body.len() + 1);
                     bound.push(HStmt {
                         kind: HStmtKind::Unpack {
@@ -5540,7 +6653,6 @@ impl<'a> Lowerer<'a> {
                     (temp, bound)
                 }
             };
-            let (line, col) = (clause.iterable.line, clause.iterable.col);
             body = vec![HStmt {
                 kind: HStmtKind::ForEach {
                     var,
@@ -5553,6 +6665,177 @@ impl<'a> Lowerer<'a> {
             }];
         }
         body
+    }
+
+    /// Build the statements of one asynchronous iteration over `iterable`:
+    ///
+    /// ```text
+    /// $aiter = <iterable>.__aiter__()
+    /// while True:
+    ///     try:
+    ///         <item> = await $aiter.__anext__()
+    ///     except StopAsyncIteration:
+    ///         <on_exhausted>
+    ///         break
+    ///     <body>
+    /// ```
+    ///
+    /// `__aiter__()` is evaluated exactly once and each step awaits
+    /// `__anext__()`, storing the value in `item` before `body` runs. The
+    /// `on_exhausted` statements run only on normal exhaustion, right before
+    /// the loop exits. The loop is a plain `while` over awaits, so `break`,
+    /// `continue` and exceptions in `body` behave exactly like a synchronous
+    /// `for` body.
+    #[allow(clippy::too_many_arguments)]
+    fn async_iteration(
+        &mut self,
+        iterable: HExpr,
+        item: LocalId,
+        on_exhausted: Vec<HStmt>,
+        body: Vec<HStmt>,
+        line: u32,
+        col: u32,
+        fs: &mut FuncState,
+    ) -> Vec<HStmt> {
+        let (aiter, aiter_ref) = self.async_temp(fs, "$aiter", line, col);
+        let iter_call = self.method_call_expr(iterable, "__aiter__", Vec::new(), line, col);
+        let bind_aiter = HStmt {
+            kind: HStmtKind::Assign {
+                target: aiter,
+                value: iter_call,
+            },
+            line,
+            col,
+        };
+        let next_call = self.method_call_expr(aiter_ref, "__anext__", Vec::new(), line, col);
+        let awaited = HExpr {
+            kind: HExprKind::Await {
+                value: Box::new(next_call),
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        };
+        let fetch = HStmt {
+            kind: HStmtKind::Assign {
+                target: item,
+                value: awaited,
+            },
+            line,
+            col,
+        };
+        let mut stop_body = on_exhausted;
+        stop_body.push(HStmt {
+            kind: HStmtKind::Break,
+            line,
+            col,
+        });
+        let try_stmt = HStmt {
+            kind: HStmtKind::Try {
+                body: vec![fetch],
+                handlers: vec![HHandler {
+                    exc: Some(ExcKind::StopAsyncIteration),
+                    binding: None,
+                    binding_cell: false,
+                    body: stop_body,
+                }],
+                else_body: Vec::new(),
+                finally_body: Vec::new(),
+            },
+            line,
+            col,
+        };
+        let mut loop_body = Vec::with_capacity(body.len() + 1);
+        loop_body.push(try_stmt);
+        loop_body.extend(body);
+        let cond = HExpr {
+            kind: HExprKind::Const(Const::Bool(true)),
+            ty: Ty::Concrete(Type::Bool),
+            line,
+            col,
+        };
+        vec![
+            bind_aiter,
+            HStmt {
+                kind: HStmtKind::While {
+                    cond,
+                    body: loop_body,
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            },
+        ]
+    }
+
+    /// Free names a comprehension frame reads from the enclosing scope, in
+    /// first-use order.
+    ///
+    /// Returns the capture names, the already-lowered value passed for each
+    /// one, whether that value is a closure cell, and the names the frame
+    /// reads directly from the module global table. The outermost iterable is
+    /// evaluated in the enclosing frame, so names it reads nowhere else are
+    /// not captures. `elements` are the expressions evaluated in the innermost
+    /// frame (`elt`, or `key`/`value`).
+    fn comp_captures(
+        &mut self,
+        generators: &[ast::Comprehension],
+        elements: &[&ast::Expr],
+        fs: &FuncState,
+        line: u32,
+        col: u32,
+    ) -> (Vec<String>, Vec<HExpr>, Vec<bool>, HashSet<String>) {
+        let mut free = Vec::new();
+        let mut seen = HashSet::new();
+        let mut bound = HashSet::new();
+        for (index, generator) in generators.iter().enumerate() {
+            if index > 0 {
+                walk_free_expr(&generator.iter, &bound, &mut free, &mut seen);
+            }
+            // Attribute/subscript receivers of a target are evaluated per item,
+            // inside the comprehension frame.
+            walk_free_target(&generator.target, &bound, &mut free, &mut seen);
+            collect_comp_target_names(&generator.target, &mut bound);
+            for condition in &generator.ifs {
+                walk_free_expr(condition, &bound, &mut free, &mut seen);
+            }
+        }
+        for element in elements {
+            walk_free_expr(element, &bound, &mut free, &mut seen);
+        }
+
+        let mut capture_names = Vec::new();
+        let mut captures = Vec::new();
+        let mut capture_cells = Vec::new();
+        let mut globals = HashSet::new();
+        for name in free {
+            if fs.is_global(&name) {
+                globals.insert(name);
+            } else if let Some(local) = fs.lookup(&name) {
+                capture_names.push(name);
+                capture_cells.push(fs.is_cell(local));
+                // A cell capture passes the cell itself, which the frame's
+                // parameter aliases; a plain capture passes the value.
+                captures.push(HExpr {
+                    kind: HExprKind::Local(local),
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                });
+            } else if let Some(value) = self
+                .class_attr_scopes
+                .last()
+                .and_then(|scope| scope.get(&name))
+                .cloned()
+            {
+                // A class body has no frame of its own: the attribute value is
+                // evaluated where the comprehension is created.
+                capture_names.push(name);
+                capture_cells.push(false);
+                captures.push(value);
+            }
+        }
+        (capture_names, captures, capture_cells, globals)
     }
 
     /// Restore the bindings shadowed by a comprehension. Reversed so that a
@@ -5627,8 +6910,47 @@ impl<'a> Lowerer<'a> {
         self.lower_for_parts(&s.target, &s.iter, &s.body, &s.orelse, fs, line, col)
     }
 
-    /// Shared `for`/`async for` lowering. `async for` is sequential: it uses
-    /// exactly the same synchronous iterator loop.
+    /// Resolve the target of a `for`/`async for` statement: a plain name
+    /// already bound in this scope, or a sequence of unpacking targets. Any
+    /// other target form is diagnosed here.
+    fn resolve_loop_target(
+        &mut self,
+        target: &ast::Expr,
+        fs: &mut FuncState,
+    ) -> Option<LoopTarget> {
+        let unpack = matches!(target, ast::Expr::Tuple(_) | ast::Expr::List(_));
+        let name = match target {
+            ast::Expr::Name(n) => match fs.lookup(n.id.as_str()) {
+                Some(var) => Some(var),
+                None => {
+                    self.error_name(
+                        n.range,
+                        n.id.as_str(),
+                        fs,
+                        format!("for loop variable '{}' is not defined", n.id),
+                    );
+                    return None;
+                }
+            },
+            _ => None,
+        };
+        if !unpack && name.is_none() {
+            self.error_at(
+                target.range(),
+                "for loop target must be a single name in Phase 2.0",
+            );
+            return None;
+        }
+        let unpack = if unpack {
+            Some(self.unpack_targets(target, fs)?)
+        } else {
+            None
+        };
+        Some(LoopTarget { name, unpack })
+    }
+
+    /// Lower `for target in iterable:` (and its optional `else:`) to
+    /// [`HStmtKind::ForRange`] or [`HStmtKind::ForEach`].
     #[allow(clippy::too_many_arguments)]
     fn lower_for_parts(
         &mut self,
@@ -5641,39 +6963,10 @@ impl<'a> Lowerer<'a> {
         col: u32,
     ) -> Option<HStmt> {
         let target_expr = target;
-        let unpack_target = matches!(target_expr, ast::Expr::Tuple(_) | ast::Expr::List(_));
-        let name_target = match target_expr {
-            ast::Expr::Name(n) => Some(n),
-            _ => None,
-        };
-        if !unpack_target && name_target.is_none() {
-            self.error_at(
-                target_expr.range(),
-                "for loop target must be a single name in Phase 2.0",
-            );
-            return None;
-        }
-        let var = match name_target {
-            Some(target) => match fs.lookup(target.id.as_str()) {
-                Some(var) => Some(var),
-                None => {
-                    self.error_name(
-                        target.range,
-                        target.id.as_str(),
-                        fs,
-                        format!("for loop variable '{}' is not defined", target.id),
-                    );
-                    return None;
-                }
-            },
-            None => None,
-        };
-        let unpack_targets = if unpack_target {
-            let targets = self.unpack_targets(target_expr, fs)?;
-            Some(targets)
-        } else {
-            None
-        };
+        let LoopTarget {
+            name: var,
+            unpack: unpack_targets,
+        } = self.resolve_loop_target(target, fs)?;
 
         // `range(...)` keeps its dedicated `ForRange` form; every other
         // iterable is lowered to the runtime iterator form.
@@ -6195,11 +7488,7 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Lowers `with a as x, b as y:` into nested `try/finally` blocks: each
-    /// context expression is evaluated once into a hidden `$withN` local, its
-    /// `__enter__()` is bound to the `as` target, and the innermost `finally`
-    /// calls `__exit__(None, None, None)`. `__exit__` results are ignored:
-    /// exceptions are never suppressed.
+    /// Lower `with a as x, b as y:` into nested `try` blocks.
     fn lower_with(
         &mut self,
         s: &ast::StmtWith,
@@ -6210,9 +7499,33 @@ impl<'a> Lowerer<'a> {
         self.lower_with_items(&s.items, &s.body, s.range, fs)
     }
 
-    /// Shared `with`/`async with` lowering. `async with` is sequential: the
-    /// synchronous `try/finally` + `__enter__`/`__exit__` protocol is used
-    /// unchanged.
+    /// Lower `with a as x, b as y:`.
+    ///
+    /// Every item expands to
+    ///
+    /// ```text
+    /// $with = <context expression>
+    /// $wexc = None
+    /// [x =] $with.__enter__()
+    /// try:
+    ///     <body>
+    /// except BaseException as $wexc:
+    ///     if not $with.__exit__(type($wexc), $wexc, None):
+    ///         raise
+    /// finally:
+    ///     if $wexc is None:
+    ///         $with.__exit__(None, None, None)
+    /// ```
+    ///
+    /// The entry runs before the `try`, so a failing `__enter__` never calls
+    /// `__exit__`. The `finally` arm covers normal completion, `break`,
+    /// `continue` and `return`, so exactly one `__exit__` call happens on
+    /// every path. A truthy result suppresses the body exception; a falsy
+    /// result re-raises the original exception through a bare `raise`. An
+    /// exception raised by `__exit__` itself replaces the in-flight one, and
+    /// the `$wexc` guard then keeps the `finally` arm from calling it twice.
+    /// PyX has no traceback objects, so the third argument is `None`.
+    /// Managers stack inside out.
     fn lower_with_items(
         &mut self,
         items: &[ast::WithItem],
@@ -6229,138 +7542,522 @@ impl<'a> Lowerer<'a> {
             return None;
         }
 
-        // Build nested `try/finally` blocks from the inside out. Each item's
-        // context expression, `__enter__()` call and `as` binding are
-        // evaluated inside its own try, so a failure while evaluating a later
-        // context manager still exits the earlier ones. The finally arm only
-        // calls `__exit__()` when the hidden local was actually assigned;
-        // locals start as `None`, and `if temp != None` preserves the
-        // original exception otherwise.
+        // Build the nested blocks from the inside out: the first item ends up
+        // outermost, so the last entered manager is exited first.
         let mut body = self.lower_block(with_body, fs);
         for item in items.iter().rev() {
-            let (item_line, item_col) = self.span(item.context_expr.range());
+            let (line, col) = self.span(item.context_expr.range());
             let value = self.expr(&item.context_expr, fs);
-            let (temp, temp_ref) = self.with_temp(fs, item.context_expr.range());
+            let (temp, temp_ref) = self.with_temp(fs, "$with", item.context_expr.range());
+            let (exc, exc_ref) = self.with_temp(fs, "$wexc", item.context_expr.range());
 
-            let mut inner_body = Vec::new();
-            inner_body.push(HStmt {
+            let mut prelude = Vec::new();
+            prelude.push(HStmt {
                 kind: HStmtKind::Assign {
                     target: temp,
                     value,
                 },
-                line: item_line,
-                col: item_col,
+                line,
+                col,
+            });
+            prelude.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: exc,
+                    value: self.none_expr(line, col),
+                },
+                line,
+                col,
             });
             // `with EXPR:` calls `__enter__()` even without an `as` target;
             // the result is bound to the target when one is given.
-            let enter = HExpr {
-                kind: HExprKind::MethodCall {
-                    object: Box::new(temp_ref),
-                    method: "__enter__".to_string(),
-                    args: Vec::new(),
-                    star: None,
-                    keywords: Vec::new(),
+            let enter = self.method_call_expr(temp_ref, "__enter__", Vec::new(), line, col);
+            if let Some(stmt) =
+                self.with_target_stmt(item.optional_vars.as_deref(), enter, fs, line, col)
+            {
+                prelude.push(stmt);
+            }
+
+            // `except BaseException as $wexc: if not __exit__(...): raise`
+            let exc_type = HExpr {
+                kind: HExprKind::Call {
+                    callee: Callee::Builtin(Builtin::Type),
+                    args: vec![exc_ref.clone()],
                 },
                 ty: self.infer.fresh(),
-                line: item_line,
-                col: item_col,
+                line,
+                col,
             };
-            match item.optional_vars.as_deref() {
-                None => inner_body.push(HStmt {
-                    kind: HStmtKind::Expr(enter),
-                    line: item_line,
-                    col: item_col,
-                }),
-                Some(ast::Expr::Name(name)) => match fs.lookup(name.id.as_str()) {
-                    Some(local) => inner_body.push(HStmt {
-                        kind: if fs.is_cell(local) {
-                            HStmtKind::CellAssign {
-                                target: local,
-                                value: enter,
-                            }
-                        } else {
-                            HStmtKind::Assign {
-                                target: local,
-                                value: enter,
-                            }
+            let exit_exc_none = self.none_expr(line, col);
+            let exit_recv = HExpr {
+                kind: HExprKind::Local(temp),
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            };
+            let exit_with_exc = self.method_call_expr(
+                exit_recv,
+                "__exit__",
+                vec![exc_type, exc_ref.clone(), exit_exc_none],
+                line,
+                col,
+            );
+            let suppress_check = HStmt {
+                kind: HStmtKind::If {
+                    cond: self.not_expr(exit_with_exc, line, col),
+                    then_body: vec![HStmt {
+                        kind: HStmtKind::Raise {
+                            exc: None,
+                            msg: None,
+                            cause: None,
                         },
-                        line: item_line,
-                        col: item_col,
-                    }),
-                    None => self.error_name(
+                        line,
+                        col,
+                    }],
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            };
+
+            // `finally: if $wexc is None: __exit__(None, None, None)`
+            let exc_is_none = HExpr {
+                kind: HExprKind::Bin {
+                    op: BinOp::Is,
+                    lhs: Box::new(exc_ref),
+                    rhs: Box::new(self.none_expr(line, col)),
+                },
+                ty: Ty::Concrete(Type::Bool),
+                line,
+                col,
+            };
+            let exit_norm_recv = HExpr {
+                kind: HExprKind::Local(temp),
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            };
+            let exit_norm_a1 = self.none_expr(line, col);
+            let exit_norm_a2 = self.none_expr(line, col);
+            let exit_norm_a3 = self.none_expr(line, col);
+            let exit_normally = self.method_call_expr(
+                exit_norm_recv,
+                "__exit__",
+                vec![exit_norm_a1, exit_norm_a2, exit_norm_a3],
+                line,
+                col,
+            );
+            let normal_guard = HStmt {
+                kind: HStmtKind::If {
+                    cond: exc_is_none,
+                    then_body: vec![HStmt {
+                        kind: HStmtKind::Expr(exit_normally),
+                        line,
+                        col,
+                    }],
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            };
+
+            // The entry runs outside this item's `try`; the inner body stays
+            // inside it, so an exception there reaches this item's handler.
+            let mut wrapped = prelude;
+            wrapped.push(HStmt {
+                kind: HStmtKind::Try {
+                    body,
+                    handlers: vec![HHandler {
+                        exc: Some(ExcKind::BaseException),
+                        binding: Some(exc),
+                        binding_cell: false,
+                        body: vec![suppress_check],
+                    }],
+                    else_body: Vec::new(),
+                    finally_body: vec![normal_guard],
+                },
+                line,
+                col,
+            });
+            body = wrapped;
+        }
+
+        // The prelude is at least the two hidden assignments, so the sequence
+        // always needs the block wrapper.
+        let (line, col) = self.span(range);
+        Some(if_true_block(body, line, col))
+    }
+
+    /// Statement binding the `as` target of a `with`/`async with` item to its
+    /// already-lowered entry value. Without a target the value is discarded,
+    /// but it is still evaluated (the entry call must happen).
+    fn with_target_stmt(
+        &mut self,
+        optional_vars: Option<&ast::Expr>,
+        value: HExpr,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        match optional_vars {
+            None => Some(HStmt {
+                kind: HStmtKind::Expr(value),
+                line,
+                col,
+            }),
+            Some(ast::Expr::Name(name)) => match fs.lookup(name.id.as_str()) {
+                Some(local) => Some(HStmt {
+                    kind: if fs.is_cell(local) {
+                        HStmtKind::CellAssign {
+                            target: local,
+                            value,
+                        }
+                    } else {
+                        HStmtKind::Assign {
+                            target: local,
+                            value,
+                        }
+                    },
+                    line,
+                    col,
+                }),
+                None => {
+                    self.error_name(
                         name.range,
                         name.id.as_str(),
                         fs,
                         format!("assignment to unknown name '{}'", name.id),
-                    ),
-                },
-                Some(other) => self.error_at(
+                    );
+                    None
+                }
+            },
+            Some(other) => {
+                self.error_at(
                     other.range(),
                     "with ... as only supports a simple name target",
-                ),
+                );
+                None
             }
-            inner_body.extend(body);
+        }
+    }
 
-            let object = HExpr {
+    /// Lower `async for target in iterable:` (and its optional `else:`).
+    ///
+    /// `__aiter__()` runs once and every step awaits `__anext__()`, catching
+    /// `StopAsyncIteration` as the normal end of iteration. The `else` clause
+    /// runs only after normal exhaustion, never after `break`, `return` or an
+    /// exception; it stays outside the synthetic loop so `break`/`continue`
+    /// inside it bind to an enclosing loop.
+    fn lower_async_for(
+        &mut self,
+        s: &ast::StmtAsyncFor,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        if !fs.is_async {
+            self.error_at_code(
+                s.range,
+                codes::CONTROL,
+                "'async for' is only allowed inside async functions",
+            );
+            return None;
+        }
+        let LoopTarget {
+            name,
+            unpack: unpack_targets,
+        } = self.resolve_loop_target(&s.target, fs)?;
+        let iterable = self.expr(&s.iter, fs);
+
+        // A plain-name target receives the awaited value directly; cell and
+        // unpack targets need a hidden item slot first.
+        let (item, item_ref) = match name {
+            Some(local) if !fs.is_cell(local) => (
+                local,
+                self.local_read(fs, local, Ty::Concrete(Type::Any), line, col),
+            ),
+            _ => self.async_temp(fs, "$aitem", line, col),
+        };
+
+        fs.loop_depth += 1;
+        let loop_body = self.lower_block(&s.body, fs);
+        fs.loop_depth -= 1;
+
+        // Per-iteration cells are re-created before the target binds, exactly
+        // like `ForEach`; the target then stores into the fresh cell.
+        let mut after_item = self.loop_cell_inits(fs, &s.body, Some(s.target.as_ref()), line, col);
+        match unpack_targets {
+            Some(targets) => after_item.push(HStmt {
+                kind: HStmtKind::Unpack {
+                    targets,
+                    value: item_ref,
+                },
+                line,
+                col,
+            }),
+            None => {
+                let local = name.expect("loop target validated above");
+                if fs.is_cell(local) {
+                    after_item.push(HStmt {
+                        kind: HStmtKind::CellAssign {
+                            target: local,
+                            value: item_ref,
+                        },
+                        line,
+                        col,
+                    });
+                }
+            }
+        }
+        after_item.extend(loop_body);
+
+        // `else` runs outside the loop, so a `break` there binds to an
+        // enclosing loop; `$aloop` records normal exhaustion.
+        let else_body = self.lower_block(&s.orelse, fs);
+        let (on_exhausted, exhausted) = if else_body.is_empty() {
+            (Vec::new(), None)
+        } else {
+            let (flag, flag_ref) = self.async_temp(fs, "$aloop", line, col);
+            let set_flag = HStmt {
+                kind: HStmtKind::Assign {
+                    target: flag,
+                    value: HExpr {
+                        kind: HExprKind::Const(Const::Bool(true)),
+                        ty: Ty::Concrete(Type::Bool),
+                        line,
+                        col,
+                    },
+                },
+                line,
+                col,
+            };
+            (vec![set_flag], Some((flag, flag_ref)))
+        };
+
+        let mut stmts =
+            self.async_iteration(iterable, item, on_exhausted, after_item, line, col, fs);
+        let Some((flag, flag_ref)) = exhausted else {
+            // The HIR has no block statement: the always-true `if` keeps the
+            // desugaring (iterator binding + loop) a single statement.
+            return Some(if_true_block(stmts, line, col));
+        };
+        let init_flag = HStmt {
+            kind: HStmtKind::Assign {
+                target: flag,
+                value: HExpr {
+                    kind: HExprKind::Const(Const::Bool(false)),
+                    ty: Ty::Concrete(Type::Bool),
+                    line,
+                    col,
+                },
+            },
+            line,
+            col,
+        };
+        stmts.insert(0, init_flag);
+        stmts.push(HStmt {
+            kind: HStmtKind::If {
+                cond: flag_ref,
+                then_body: else_body,
+                else_body: Vec::new(),
+            },
+            line,
+            col,
+        });
+        Some(if_true_block(stmts, line, col))
+    }
+
+    /// Lower `async with a as x, b as y:`.
+    ///
+    /// Every item expands to
+    ///
+    /// ```text
+    /// $with = <context expression>
+    /// $aexc = None
+    /// [x =] await $with.__aenter__()
+    /// try:
+    ///     <body>
+    /// except BaseException as $aexc:
+    ///     if not await $with.__aexit__(type($aexc), $aexc, None):
+    ///         raise
+    /// finally:
+    ///     if $aexc is None:
+    ///         await $with.__aexit__(None, None, None)
+    /// ```
+    ///
+    /// The entry runs before the `try`, so a failing `__aenter__` never calls
+    /// `__aexit__`. The `finally` arm covers normal completion, `break`,
+    /// `continue` and `return`, so exactly one `__aexit__` call happens on
+    /// every path. A truthy result suppresses the body exception. Managers
+    /// stack inside out. PyX has no traceback objects, so `__aexit__` receives
+    /// `None` as its third argument.
+    fn lower_async_with(
+        &mut self,
+        s: &ast::StmtAsyncWith,
+        fs: &mut FuncState,
+        _line: u32,
+        _col: u32,
+    ) -> Option<HStmt> {
+        if !fs.is_async {
+            self.error_at_code(
+                s.range,
+                codes::CONTROL,
+                "'async with' is only allowed inside async functions",
+            );
+            return None;
+        }
+        if s.items.is_empty() {
+            self.error_at_code(
+                s.range,
+                codes::CONTROL,
+                "with requires at least one context item",
+            );
+            return None;
+        }
+
+        let mut body = self.lower_block(&s.body, fs);
+        for item in s.items.iter().rev() {
+            let (line, col) = self.span(item.context_expr.range());
+            let value = self.expr(&item.context_expr, fs);
+            let (temp, temp_ref) = self.with_temp(fs, "$with", item.context_expr.range());
+            let (exc, exc_ref) = self.async_temp(fs, "$aexc", line, col);
+
+            let mut prelude = Vec::new();
+            prelude.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: temp,
+                    value,
+                },
+                line,
+                col,
+            });
+            prelude.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: exc,
+                    value: self.none_expr(line, col),
+                },
+                line,
+                col,
+            });
+            let enter = self.method_call_expr(temp_ref, "__aenter__", Vec::new(), line, col);
+            let enter = self.await_expr(enter, line, col);
+            if let Some(stmt) =
+                self.with_target_stmt(item.optional_vars.as_deref(), enter, fs, line, col)
+            {
+                prelude.push(stmt);
+            }
+
+            // `except BaseException as $aexc: if not await __aexit__(...): raise`
+            let exc_type_ty = self.infer.fresh();
+            let exc_type = HExpr {
+                kind: HExprKind::Call {
+                    callee: Callee::Builtin(Builtin::Type),
+                    args: vec![exc_ref.clone()],
+                },
+                ty: exc_type_ty,
+                line,
+                col,
+            };
+            let exit_exc_none = self.none_expr(line, col);
+            let exit_recv = HExpr {
                 kind: HExprKind::Local(temp),
-                ty: self.infer.fresh(),
-                line: item_line,
-                col: item_col,
-            };
-            let none = HExpr {
-                kind: HExprKind::Const(Const::None),
                 ty: Ty::Concrete(Type::Any),
-                line: item_line,
-                col: item_col,
+                line,
+                col,
             };
-            let condition = HExpr {
-                kind: HExprKind::Bin {
-                    op: BinOp::Ne,
-                    lhs: Box::new(object.clone()),
-                    rhs: Box::new(none.clone()),
-                },
-                ty: self.infer.fresh(),
-                line: item_line,
-                col: item_col,
-            };
-            let exit = HExpr {
-                kind: HExprKind::MethodCall {
-                    object: Box::new(object),
-                    method: "__exit__".to_string(),
-                    args: vec![none.clone(), none.clone(), none],
-                    star: None,
-                    keywords: Vec::new(),
-                },
-                ty: self.infer.fresh(),
-                line: item_line,
-                col: item_col,
-            };
-            let guard = HStmt {
+            let exit_with_exc = self.method_call_expr(
+                exit_recv,
+                "__aexit__",
+                vec![exc_type, exc_ref.clone(), exit_exc_none],
+                line,
+                col,
+            );
+            let exit_with_exc = self.await_expr(exit_with_exc, line, col);
+            let suppress_check = HStmt {
                 kind: HStmtKind::If {
-                    cond: condition,
+                    cond: self.not_expr(exit_with_exc, line, col),
                     then_body: vec![HStmt {
-                        kind: HStmtKind::Expr(exit),
-                        line: item_line,
-                        col: item_col,
+                        kind: HStmtKind::Raise {
+                            exc: None,
+                            msg: None,
+                            cause: None,
+                        },
+                        line,
+                        col,
                     }],
                     else_body: Vec::new(),
                 },
-                line: item_line,
-                col: item_col,
+                line,
+                col,
             };
-            body = vec![HStmt {
-                kind: HStmtKind::Try {
-                    body: inner_body,
-                    handlers: Vec::new(),
-                    else_body: Vec::new(),
-                    finally_body: vec![guard],
+
+            // `finally: if $aexc is None: await __aexit__(None, None, None)`
+            let exc_is_none = HExpr {
+                kind: HExprKind::Bin {
+                    op: BinOp::Is,
+                    lhs: Box::new(exc_ref),
+                    rhs: Box::new(self.none_expr(line, col)),
                 },
-                line: item_line,
-                col: item_col,
-            }];
+                ty: Ty::Concrete(Type::Bool),
+                line,
+                col,
+            };
+            let exit_norm_recv = HExpr {
+                kind: HExprKind::Local(temp),
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            };
+            let exit_norm_a1 = self.none_expr(line, col);
+            let exit_norm_a2 = self.none_expr(line, col);
+            let exit_norm_a3 = self.none_expr(line, col);
+            let exit_normally = self.method_call_expr(
+                exit_norm_recv,
+                "__aexit__",
+                vec![exit_norm_a1, exit_norm_a2, exit_norm_a3],
+                line,
+                col,
+            );
+            let exit_normally = self.await_expr(exit_normally, line, col);
+            let normal_guard = HStmt {
+                kind: HStmtKind::If {
+                    cond: exc_is_none,
+                    then_body: vec![HStmt {
+                        kind: HStmtKind::Expr(exit_normally),
+                        line,
+                        col,
+                    }],
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            };
+
+            // The entry runs outside this item's `try`; the inner body stays
+            // inside it, so an exception there reaches this item's handler.
+            let mut wrapped = prelude;
+            wrapped.push(HStmt {
+                kind: HStmtKind::Try {
+                    body,
+                    handlers: vec![HHandler {
+                        exc: Some(ExcKind::BaseException),
+                        binding: Some(exc),
+                        binding_cell: false,
+                        body: vec![suppress_check],
+                    }],
+                    else_body: Vec::new(),
+                    finally_body: vec![normal_guard],
+                },
+                line,
+                col,
+            });
+            body = wrapped;
         }
 
-        Some(body.pop().expect("with always wraps into one statement"))
+        if body.len() == 1 {
+            return body.pop();
+        }
+        let (line, col) = self.span(s.range);
+        Some(if_true_block(body, line, col))
     }
 
     // ------------------------------------------------------------------
@@ -6378,6 +8075,64 @@ impl<'a> Lowerer<'a> {
         HExpr {
             kind,
             ty,
+            line,
+            col,
+        }
+    }
+
+    /// `object.method(args...)` with no starred or keyword operands.
+    fn method_call_expr(
+        &mut self,
+        object: HExpr,
+        method: &str,
+        args: Vec<HExpr>,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        HExpr {
+            kind: HExprKind::MethodCall {
+                object: Box::new(object),
+                method: method.to_string(),
+                args,
+                star: None,
+                keywords: Vec::new(),
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
+    /// The runtime `None` sentinel, statically `Any`.
+    fn none_expr(&mut self, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::Const(Const::None),
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        }
+    }
+
+    /// `not value`.
+    fn not_expr(&mut self, value: HExpr, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::Un {
+                op: pyx_ir::UnOp::Not,
+                operand: Box::new(value),
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
+    /// `await value`; the awaited result is only known at runtime.
+    fn await_expr(&mut self, value: HExpr, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::Await {
+                value: Box::new(value),
+            },
+            ty: self.infer.fresh(),
             line,
             col,
         }
@@ -6474,6 +8229,22 @@ impl<'a> Lowerer<'a> {
                     let module = binding.module.clone();
                     let member = binding.member.clone();
                     self.deferred_import_expr(&module, member.as_deref(), line, col)
+                } else if self.session_mode && self.global_names.contains(name) {
+                    // A session name shadows builtins, functions and exception
+                    // classes: in a REPL `list = ...` or `ValueError = ...`
+                    // must win over the builtin of the same name. A local
+                    // binding and this fragment's imports were checked above,
+                    // so they still take precedence.
+                    self.used_globals.insert(name.to_string());
+                    HExpr {
+                        kind: HExprKind::GlobalGet {
+                            module: self.dunder_name.clone(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
                 } else if fs.in_lambda
                     && !self.fn_ids.contains_key(name)
                     && builtin_by_name(name).is_none()
@@ -6550,6 +8321,20 @@ impl<'a> Lowerer<'a> {
                         || self.class_names.contains(name)
                         || self.fn_ids.contains_key(name))
                 {
+                    self.used_globals.insert(name.to_string());
+                    HExpr {
+                        kind: HExprKind::GlobalGet {
+                            module: self.dunder_name.clone(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
+                } else if self.session_mode {
+                    // REPL fragments compile against a shared global table:
+                    // a name this fragment does not bind may have been bound
+                    // by an earlier fragment.
                     self.used_globals.insert(name.to_string());
                     HExpr {
                         kind: HExprKind::GlobalGet {
@@ -6755,7 +8540,7 @@ impl<'a> Lowerer<'a> {
             ast::Expr::Attribute(a) => {
                 if let Some(module) = self.resolve_module_chain(&a.value, fs) {
                     let member = a.attr.as_str();
-                    if let Some(expr) = self.module_attr_expr(module, member, line, col) {
+                    if let Some(expr) = self.module_spec_attr_expr(module, member, line, col) {
                         return expr;
                     }
                     if module.name == "os" && member == "path" {
@@ -6925,6 +8710,21 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Expr::ListComp(c) => {
+                if c.generators.iter().any(|generator| generator.is_async) {
+                    if !fs.is_async {
+                        self.error_at_code(
+                            c.range,
+                            codes::CONTROL,
+                            "asynchronous comprehension outside of an asynchronous function",
+                        );
+                    }
+                    return self.lower_async_comprehension(
+                        &c.generators,
+                        AsyncCompKind::List(&c.elt),
+                        c.range,
+                        fs,
+                    );
+                }
                 let (clauses, saved) = self.lower_comp_clauses(&c.generators, fs);
                 let element = self.expr(&c.elt, fs);
                 self.restore_comp_bindings(fs, saved);
@@ -6939,6 +8739,21 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Expr::SetComp(c) => {
+                if c.generators.iter().any(|generator| generator.is_async) {
+                    if !fs.is_async {
+                        self.error_at_code(
+                            c.range,
+                            codes::CONTROL,
+                            "asynchronous comprehension outside of an asynchronous function",
+                        );
+                    }
+                    return self.lower_async_comprehension(
+                        &c.generators,
+                        AsyncCompKind::Set(&c.elt),
+                        c.range,
+                        fs,
+                    );
+                }
                 let (clauses, saved) = self.lower_comp_clauses(&c.generators, fs);
                 let element = self.expr(&c.elt, fs);
                 self.restore_comp_bindings(fs, saved);
@@ -6953,6 +8768,21 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Expr::DictComp(c) => {
+                if c.generators.iter().any(|generator| generator.is_async) {
+                    if !fs.is_async {
+                        self.error_at_code(
+                            c.range,
+                            codes::CONTROL,
+                            "asynchronous comprehension outside of an asynchronous function",
+                        );
+                    }
+                    return self.lower_async_comprehension(
+                        &c.generators,
+                        AsyncCompKind::Dict(&c.key, &c.value),
+                        c.range,
+                        fs,
+                    );
+                }
                 let (clauses, saved) = self.lower_comp_clauses(&c.generators, fs);
                 let key = self.expr(&c.key, fs);
                 let value = self.expr(&c.value, fs);
@@ -7058,6 +8888,7 @@ impl<'a> Lowerer<'a> {
                         "await is only allowed inside async functions",
                     );
                 }
+                self.await_frames.insert(fs.fid);
                 HExpr {
                     kind: HExprKind::Await {
                         value: Box::new(self.expr(&a.value, fs)),
@@ -8515,7 +10346,9 @@ impl<'a> Lowerer<'a> {
 
         // A builtin call binds the few keywords it supports (`max(key=...)`,
         // `min(key=...)`) and rejects the rest.
-        if let Some(builtin) = builtin_by_name(name) {
+        if let Some(builtin) = builtin_by_name(name)
+            .filter(|_| !(self.session_mode && self.global_names.contains(name)))
+        {
             let Some(args) = self.builtin_call_arguments(builtin, call, fs, line, col) else {
                 return self.error_expr(call.range);
             };
@@ -8642,6 +10475,42 @@ impl<'a> Lowerer<'a> {
         // make an actual evaluation fail clearly.
         if name == "super" && call.args.is_empty() && call.keywords.is_empty() {
             return self.deferred_import_expr("super()", None, line, col);
+        }
+
+        if self.session_mode {
+            // A callable bound by an earlier fragment lives in the session
+            // global table; call it through the runtime function-value ABI.
+            self.used_globals.insert(name.to_string());
+            let (callee_line, callee_col) = self.span(name_expr.range);
+            let callee = HExpr {
+                kind: HExprKind::GlobalGet {
+                    module: self.dunder_name.clone(),
+                    name: name.to_string(),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line: callee_line,
+                col: callee_col,
+            };
+            if !call.keywords.is_empty() {
+                let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                    return self.error_expr(call.range);
+                };
+                return result;
+            }
+            let mut args = Vec::with_capacity(call.args.len());
+            for arg in &call.args {
+                args.push(self.expr(arg, fs));
+            }
+            return HExpr {
+                kind: HExprKind::IndirectCall {
+                    callee: Box::new(callee),
+                    args,
+                    star: None,
+                },
+                ty: self.infer.fresh(),
+                line,
+                col,
+            };
         }
 
         if !fs.is_module && self.module_local_names.contains(name) {
@@ -9933,14 +11802,232 @@ fn is_property_accessor_decorator(expr: &ast::Expr) -> bool {
     )
 }
 
+/// Source text for a decorator call's literal string argument.
+fn decorator_string(expr: &ast::Expr) -> Option<String> {
+    let ast::Expr::Constant(constant) = expr else {
+        return None;
+    };
+    match &constant.value {
+        ast::Constant::Str(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// `@pytest.fixture` scope: `function` unless `scope="module"`/`"session"`.
+fn pytest_fixture_scope(decorators: &[ast::Expr]) -> Option<&'static str> {
+    for decorator in decorators {
+        if decorator_final_name(decorator).as_deref() != Some("fixture") {
+            continue;
+        }
+        if let ast::Expr::Call(call) = decorator {
+            for keyword in &call.keywords {
+                if keyword.arg.as_deref() == Some("scope") {
+                    if let Some(scope) = decorator_string(&keyword.value) {
+                        if scope == "module" || scope == "session" {
+                            return Some("module");
+                        }
+                    }
+                }
+            }
+        }
+        return Some("function");
+    }
+    None
+}
+
+/// Parameter names of a function definition (positional then keyword-only).
+fn pytest_parameter_names(args: &ast::Arguments) -> Vec<String> {
+    let mut names = Vec::new();
+    for argument in args.args.iter().chain(args.kwonlyargs.iter()) {
+        names.push(argument.def.arg.to_string());
+    }
+    names
+}
+
+/// String arguments of a for-loop-like decorator parameter, e.g.
+/// `parametrize("a,b", ...)`.
+fn pytest_string_list(expr: &ast::Expr) -> Option<Vec<String>> {
+    if let Some(text) = decorator_string(expr) {
+        return Some(
+            text.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect(),
+        );
+    }
+    let elements = pytest_sequence(expr)?;
+    let mut names = Vec::with_capacity(elements.len());
+    for element in elements {
+        names.push(decorator_string(element)?);
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+/// Literal list/tuple elements of an AST expression.
+fn pytest_sequence(expr: &ast::Expr) -> Option<&[ast::Expr]> {
+    match expr {
+        ast::Expr::List(list) => Some(list.elts.as_slice()),
+        ast::Expr::Tuple(tuple) => Some(tuple.elts.as_slice()),
+        _ => None,
+    }
+}
+
+/// Reason string of a decorator call (`@pytest.mark.skip("why")` or
+/// `@pytest.mark.skip(reason="why")`).
+fn pytest_decorator_reason(decorators: &[ast::Expr], name: &str, fallback: &str) -> Option<String> {
+    for decorator in decorators {
+        if decorator_final_name(decorator).as_deref() != Some(name) {
+            continue;
+        }
+        if let ast::Expr::Call(call) = decorator {
+            if let Some(reason) = call.args.first().and_then(decorator_string) {
+                return Some(reason);
+            }
+            for keyword in &call.keywords {
+                if keyword.arg.as_deref() == Some("reason") {
+                    if let Some(reason) = decorator_string(&keyword.value) {
+                        return Some(reason);
+                    }
+                }
+            }
+        }
+        return Some(fallback.to_string());
+    }
+    None
+}
+
+fn pytest_skip(decorators: &[ast::Expr]) -> Option<String> {
+    pytest_decorator_reason(decorators, "skip", "skipped by pytest.mark.skip")
+}
+
+fn pytest_xfail(decorators: &[ast::Expr]) -> Option<String> {
+    pytest_decorator_reason(decorators, "xfail", "xfailed by pytest.mark.xfail")
+}
+
+/// Condition expression of `@pytest.mark.skipif(condition, reason=...)`.
+fn pytest_skipif(decorators: &[ast::Expr]) -> Option<ast::Expr> {
+    for decorator in decorators {
+        if decorator_final_name(decorator).as_deref() != Some("skipif") {
+            continue;
+        }
+        if let ast::Expr::Call(call) = decorator {
+            return call.args.first().cloned();
+        }
+    }
+    None
+}
+
+/// Fixture names listed by `@pytest.mark.usefixtures(...)`.
+fn pytest_usefixtures(decorators: &[ast::Expr]) -> Vec<String> {
+    let mut names = Vec::new();
+    for decorator in decorators {
+        if decorator_final_name(decorator).as_deref() != Some("usefixtures") {
+            continue;
+        }
+        let ast::Expr::Call(call) = decorator else {
+            continue;
+        };
+        for argument in &call.args {
+            if let Some(argument_names) = pytest_string_list(argument) {
+                names.extend(argument_names);
+            }
+        }
+    }
+    names
+}
+
+/// Report id text for one parametrized value: pytest keeps the value's text
+/// and replaces whitespace/characters that would break the report name.
+fn sanitize_pytest_id(text: &str) -> String {
+    let text = text.trim().trim_matches('"').trim_matches('\'');
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | '[' | ']') {
+            out.push(character);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "0".to_string()
+    } else {
+        out
+    }
+}
+
+/// True while compiling a `pyx pytest` child.
+///
+/// The child sets `PYX_PYTEST`; only then are bare `assert` statements given
+/// their source text as the `AssertionError` message, preserving the existing
+/// "no message" behaviour for normal programs.
+fn pytest_mode() -> bool {
+    static MODE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("PYX_PYTEST").is_some_and(|value| !value.is_empty())
+    });
+    *MODE
+}
+
 /// Decorators accepted and ignored by lowering.
 ///
-/// Their names come from `functools`, `abc` and `typing`; the decorator
-/// expressions are never evaluated, so parametrized forms cost nothing.
+/// Their names come from `functools`, `abc`, `typing` and `pytest`; the
+/// decorator expressions are never evaluated, so parametrized forms cost
+/// nothing.
 fn is_ignored_function_decorator(expr: &ast::Expr) -> bool {
     matches!(
         decorator_final_name(expr).as_deref(),
         Some("lru_cache" | "cache" | "wraps" | "abstractmethod" | "overload" | "runtime_checkable")
+    ) || is_pytest_decorator(expr)
+}
+
+/// Dotted names of a decorator expression (`pytest.mark.parametrize` ->
+/// `["pytest", "mark", "parametrize"]`); a call contributes its callee.
+fn decorator_path(expr: &ast::Expr) -> Vec<String> {
+    let expr = match expr {
+        ast::Expr::Call(call) => &*call.func,
+        other => other,
+    };
+    let mut path = Vec::new();
+    let mut current = expr;
+    loop {
+        match current {
+            ast::Expr::Attribute(attribute) => {
+                path.push(attribute.attr.to_string());
+                current = &attribute.value;
+            }
+            ast::Expr::Name(name) => {
+                path.push(name.id.to_string());
+                break;
+            }
+            _ => break,
+        }
+    }
+    path.reverse();
+    path
+}
+
+/// Decorators provided by `pytest`: `@pytest.fixture`, `@pytest.mark.*` and
+/// the marker helpers imported unqualified. Lowering never evaluates them;
+/// they are recognised so pytest test modules compile unchanged.
+fn is_pytest_decorator(expr: &ast::Expr) -> bool {
+    let path = decorator_path(expr);
+    let Some(last) = path.last() else {
+        return false;
+    };
+    if path.iter().any(|segment| segment == "pytest") {
+        return path
+            .iter()
+            .rev()
+            .nth(1)
+            .is_some_and(|segment| segment == "mark")
+            || matches!(
+                last.as_str(),
+                "fixture" | "parametrize" | "skip" | "skipif" | "xfail" | "usefixtures"
+            );
+    }
+    matches!(
+        last.as_str(),
+        "fixture" | "parametrize" | "skip" | "skipif" | "xfail" | "usefixtures"
     )
 }
 
@@ -10493,6 +12580,176 @@ fn collect_global_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
             ast::Stmt::With(s) => collect_global_names(&s.body, out),
             _ => {}
         }
+    }
+}
+
+/// Names bound at module level by one scope's statements.
+///
+/// Unlike [`collect_global_names`], this covers every source-level binding
+/// form the session compiler has to flush after a fragment: assignments
+/// (chained and unpacked included), annotated/augmented assignments, function
+/// and class definitions, loop and `with`/`except` targets, and import
+/// bindings. Function and class bodies are separate scopes and are not
+/// entered; module-level compound statements are.
+///
+/// `include_augassign` is false for the local-slot analysis, where an
+/// augmented assignment alone does not make a fresh module local (a session
+/// fragment updating an earlier name reads and writes the global table).
+pub(crate) fn collect_source_bound_names(
+    stmts: &[ast::Stmt],
+    out: &mut HashSet<String>,
+    include_augassign: bool,
+) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Assign(s) => {
+                for target in &s.targets {
+                    collect_target_bound_names(target, out);
+                }
+            }
+            ast::Stmt::AnnAssign(s) => {
+                // `x: int` alone binds no value at module level; only the
+                // annotated assignment with a value creates the name.
+                if s.value.is_some() {
+                    collect_target_bound_names(&s.target, out);
+                }
+            }
+            ast::Stmt::AugAssign(s) => {
+                if include_augassign {
+                    collect_target_bound_names(&s.target, out);
+                }
+            }
+            ast::Stmt::TypeAlias(s) => {
+                if let ast::Expr::Name(name) = &*s.name {
+                    out.insert(name.id.to_string());
+                }
+            }
+            ast::Stmt::FunctionDef(s) => {
+                out.insert(s.name.to_string());
+            }
+            ast::Stmt::AsyncFunctionDef(s) => {
+                out.insert(s.name.to_string());
+            }
+            ast::Stmt::ClassDef(s) => {
+                out.insert(s.name.to_string());
+            }
+            ast::Stmt::For(s) => {
+                collect_target_bound_names(&s.target, out);
+                collect_source_bound_names(&s.body, out, include_augassign);
+                collect_source_bound_names(&s.orelse, out, include_augassign);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_target_bound_names(&s.target, out);
+                collect_source_bound_names(&s.body, out, include_augassign);
+                collect_source_bound_names(&s.orelse, out, include_augassign);
+            }
+            ast::Stmt::While(s) => {
+                collect_source_bound_names(&s.body, out, include_augassign);
+                collect_source_bound_names(&s.orelse, out, include_augassign);
+            }
+            ast::Stmt::If(s) => {
+                collect_source_bound_names(&s.body, out, include_augassign);
+                collect_source_bound_names(&s.orelse, out, include_augassign);
+            }
+            ast::Stmt::With(s) => {
+                for item in &s.items {
+                    if let Some(target) = &item.optional_vars {
+                        collect_target_bound_names(target, out);
+                    }
+                }
+                collect_source_bound_names(&s.body, out, include_augassign);
+            }
+            ast::Stmt::AsyncWith(s) => {
+                for item in &s.items {
+                    if let Some(target) = &item.optional_vars {
+                        collect_target_bound_names(target, out);
+                    }
+                }
+                collect_source_bound_names(&s.body, out, include_augassign);
+            }
+            ast::Stmt::Try(s) => {
+                collect_source_bound_names(&s.body, out, include_augassign);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    if let Some(name) = &handler.name {
+                        out.insert(name.to_string());
+                    }
+                    collect_source_bound_names(&handler.body, out, include_augassign);
+                }
+                collect_source_bound_names(&s.orelse, out, include_augassign);
+                collect_source_bound_names(&s.finalbody, out, include_augassign);
+            }
+            ast::Stmt::TryStar(s) => {
+                collect_source_bound_names(&s.body, out, include_augassign);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    if let Some(name) = &handler.name {
+                        out.insert(name.to_string());
+                    }
+                    collect_source_bound_names(&handler.body, out, include_augassign);
+                }
+                collect_source_bound_names(&s.orelse, out, include_augassign);
+                collect_source_bound_names(&s.finalbody, out, include_augassign);
+            }
+            ast::Stmt::Import(s) => {
+                for alias in &s.names {
+                    out.insert(import_binding(alias));
+                }
+            }
+            ast::Stmt::ImportFrom(s) => {
+                // `from __future__ import ...` changes compiler flags and
+                // binds no name.
+                if s.module
+                    .as_ref()
+                    .is_some_and(|module| module.as_str() == "__future__")
+                {
+                    continue;
+                }
+                for alias in &s.names {
+                    if alias.name.as_str() == "*" {
+                        continue;
+                    }
+                    out.insert(import_binding(alias));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Name bound by one `import` alias (`import a.b` binds `a` unless renamed).
+fn import_binding(alias: &ast::Alias) -> String {
+    match &alias.asname {
+        Some(name) => name.to_string(),
+        None => alias
+            .name
+            .as_str()
+            .split('.')
+            .next()
+            .unwrap_or_else(|| alias.name.as_str())
+            .to_string(),
+    }
+}
+
+/// Records the simple names of an assignment target, including nested
+/// tuple/list unpacking and starred elements.
+fn collect_target_bound_names(target: &ast::Expr, out: &mut HashSet<String>) {
+    match target {
+        ast::Expr::Name(name) => {
+            out.insert(name.id.to_string());
+        }
+        ast::Expr::Tuple(tuple) => {
+            for element in &tuple.elts {
+                collect_target_bound_names(element, out);
+            }
+        }
+        ast::Expr::List(list) => {
+            for element in &list.elts {
+                collect_target_bound_names(element, out);
+            }
+        }
+        ast::Expr::Starred(starred) => collect_target_bound_names(&starred.value, out),
+        _ => {}
     }
 }
 
@@ -11464,6 +13721,29 @@ fn walk_free_comp(
     }
     for element in elements {
         walk_free_expr(element, &bound, out, seen);
+    }
+}
+
+/// Wrap a lowered statement sequence in an always-true `if`.
+///
+/// The HIR has no block statement, so a multi-statement desugaring that must
+/// stay one statement in an enclosing block uses this wrapper, like the
+/// subscript augmented-assignment lowering. The condition is a constant, so
+/// the extra branch is resolved statically.
+fn if_true_block(stmts: Vec<HStmt>, line: u32, col: u32) -> HStmt {
+    HStmt {
+        kind: HStmtKind::If {
+            cond: HExpr {
+                kind: HExprKind::Const(Const::Bool(true)),
+                ty: Ty::Concrete(Type::Bool),
+                line,
+                col,
+            },
+            then_body: stmts,
+            else_body: Vec::new(),
+        },
+        line,
+        col,
     }
 }
 

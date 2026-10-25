@@ -5,6 +5,10 @@
 //! their contents, collection never grows the registry, and garbage is
 //! reclaimed. Conservative stack scanning may retain a stale value, so the
 //! assertions tolerate partial reclamation exactly like `gc.rs`.
+//!
+//! MIXED MODE ONLY: reachable graphs are held in plain Rust locals and
+//! `Vec`s, never in precise shadow frames, so `PYX_GC_PRECISE=1` (strict)
+//! would free them. Strict coverage lives in `tests/precise_gc.rs`.
 
 use std::sync::Mutex;
 

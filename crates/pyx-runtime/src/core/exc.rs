@@ -35,6 +35,9 @@ pub(crate) struct ExcData {
     /// `raise ... from ...` (including `from None`): hide `context` in the
     /// rendered traceback even though it is stored.
     pub(crate) suppress_context: bool,
+    /// Exit status of a `SystemExit` carrying an integer code. `None` means
+    /// the payload is a message instead (`sys.exit("boom")`).
+    pub(crate) exit_code: Option<i64>,
 }
 
 // Exception tags, fixed by ARCHITECTURE §3.2.
@@ -66,9 +69,21 @@ pub(crate) const ASSERTION_ERROR: u32 = 14;
 pub(crate) const FILE_NOT_FOUND_ERROR: u32 = 15;
 /// `NameError`: raised by `del` of an unbound module global.
 pub(crate) const NAME_ERROR: u32 = 16;
-/// `SystemExit`: catchable like any other exception; uncaught it exits through
-/// the usual traceback path.
+/// `SystemExit`: catchable like any other exception; uncaught it prints no
+/// traceback and its stored code becomes the process status.
 pub(crate) const SYSTEM_EXIT: u32 = 17;
+/// `StopAsyncIteration`: the normal end of an async iterator, raised by
+/// `__anext__`/`asend`/`athrow` when the body finishes.
+pub(crate) const STOP_ASYNC_ITERATION: u32 = 18;
+/// `CancelledError`: a `BaseException` injected into a task by `cancel()`.
+/// It is deliberately excluded from the `Exception` matcher.
+pub(crate) const CANCELLED_ERROR: u32 = 19;
+/// `Skipped`: raised by `pytest.skip()`; the runner reports a skip and keeps
+/// going. Runtime-internal, like [`GENERATOR_EXIT`].
+pub(crate) const SKIPPED: u32 = 20;
+/// `XFailed`: raised when a test marked `xfail` fails; the runner reports an
+/// expected failure. Runtime-internal.
+pub(crate) const XFAILED: u32 = 21;
 
 pub(crate) fn tag_name(tag: u32) -> &'static str {
     match tag {
@@ -90,6 +105,10 @@ pub(crate) fn tag_name(tag: u32) -> &'static str {
         FILE_NOT_FOUND_ERROR => "FileNotFoundError",
         NAME_ERROR => "NameError",
         SYSTEM_EXIT => "SystemExit",
+        STOP_ASYNC_ITERATION => "StopAsyncIteration",
+        CANCELLED_ERROR => "CancelledError",
+        SKIPPED => "Skipped",
+        XFAILED => "XFailed",
         // Unknown tags are rendered as RuntimeError rather than panicking.
         _ => "RuntimeError",
     }
@@ -108,6 +127,10 @@ fn default_message(tag: u32) -> &'static str {
         // `SystemExit()` stringifies to the empty string, like `Exception`.
         SYSTEM_EXIT => "",
         GENERATOR_EXIT => "",
+        STOP_ASYNC_ITERATION => "",
+        CANCELLED_ERROR => "",
+        SKIPPED => "",
+        XFAILED => "",
         // `Exception()` and `BaseException()` stringify to the empty string.
         EXCEPTION | BASE_EXCEPTION => "",
         ASSERTION_ERROR => "",
@@ -138,6 +161,10 @@ fn known_tag(tag: u32) -> bool {
             | FILE_NOT_FOUND_ERROR
             | NAME_ERROR
             | SYSTEM_EXIT
+            | STOP_ASYNC_ITERATION
+            | CANCELLED_ERROR
+            | SKIPPED
+            | XFAILED
     )
 }
 
@@ -164,6 +191,38 @@ pub(crate) fn exception_class(tag: u32) -> i64 {
     crate::heap::add_thread_root(class);
     CLASS_CACHE.with(|cache| cache.borrow_mut().insert(tag, class));
     class
+}
+
+/// Returns the tag of the native built-in exception class `class`, if it is
+/// one created by [`exception_class`].
+///
+/// `type(ValueError('x')) is ValueError` relies on both paths resolving to
+/// the cached class for the same tag.
+pub(crate) fn exception_tag_of_class(class: i64) -> Option<u32> {
+    CLASS_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(_, cached)| **cached == class)
+            .map(|(tag, _)| *tag)
+    })
+}
+
+/// Builds a plain built-in exception object `Tag(message)` without raising
+/// it. Used by the class-call path (`ValueError('x')`).
+pub(crate) fn exception_value(tag: u32, message: &str) -> i64 {
+    value::exception_new(ExcData {
+        tag,
+        name: tag_name(tag),
+        msg: message.to_string(),
+        file: String::new(),
+        line: 0,
+        frame: String::new(),
+        cause: None,
+        context: None,
+        suppress_context: false,
+        exit_code: None,
+    })
 }
 
 #[derive(Default)]
@@ -355,6 +414,47 @@ fn raise_with_message_cause(
         cause,
         context: handled(),
         suppress_context,
+        exit_code: None,
+    };
+    publish(value::exception_new(data))
+}
+
+/// Raises `SystemExit` with the tagged Python value `code`, as `sys.exit()`
+/// and `raise SystemExit(...)` do.
+///
+/// `None` exits 0, an integer stores that status, a string stores a message
+/// (printed by [`uncaught`] before exiting 1) and any other object is
+/// rendered with `repr()`. The exception is an ordinary catchable
+/// `SystemExit`; only [`uncaught`] turns it into a process status.
+pub(crate) fn raise_exit(code: i64) -> i64 {
+    let (message, exit_code) = if code == value::NONE {
+        (String::new(), Some(0))
+    } else if let Some(status) = value::as_integer(code) {
+        (status.to_string(), Some(status))
+    } else if let Some(text) = value::as_str(code) {
+        (text.to_string(), None)
+    } else {
+        (value::repr(code), None)
+    };
+    let (file, line, frame) = STATE.with(|s| {
+        let st = s.borrow();
+        (
+            st.file.clone(),
+            st.line,
+            st.frames.last().cloned().unwrap_or_default(),
+        )
+    });
+    let data = ExcData {
+        tag: SYSTEM_EXIT,
+        name: tag_name(SYSTEM_EXIT),
+        msg: message,
+        file,
+        line,
+        frame,
+        cause: None,
+        context: handled(),
+        suppress_context: true,
+        exit_code,
     };
     publish(value::exception_new(data))
 }
@@ -398,6 +498,9 @@ fn rendered_message(tag: u32, msg: i64) -> String {
 /// prints `'k'`), while other exception types use `str()` for strings and
 /// `repr()` for non-string arguments.
 pub(crate) fn raise(tag: u32, msg: i64) -> i64 {
+    if tag == SYSTEM_EXIT {
+        return raise_exit(msg);
+    }
     raise_with_message(tag, &rendered_message(tag, msg))
 }
 
@@ -437,6 +540,9 @@ pub(crate) fn raise_value(v: i64) -> i64 {
 /// is stored as the explicit cause. Either way the implicit `context` is
 /// recorded but no longer rendered, so explicit chaining wins.
 pub(crate) fn raise_from(tag: u32, msg: i64, cause: i64) -> i64 {
+    if tag == SYSTEM_EXIT {
+        return raise_exit(msg);
+    }
     let text = rendered_message(tag, msg);
     raise_with_message_cause(tag, &text, cause_of(cause), true)
 }
@@ -466,8 +572,8 @@ pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
 /// `handler_tag`.
 ///
 /// `BaseException` matches every tag, `Exception` matches everything except
-/// `KeyboardInterrupt` and the internal `GeneratorExit` (`SystemExit` is a
-/// normal member of that set, so `except Exception` catches it), `OSError` and
+/// `KeyboardInterrupt`, the internal `GeneratorExit` and `SystemExit` (which
+/// derives from `BaseException` in CPython), `OSError` and
 /// `FileNotFoundError` match each other (the subclass relationship), and every
 /// other handler tag matches only an exception with the same tag. Without a
 /// pending exception nothing matches.
@@ -478,7 +584,12 @@ pub(crate) fn matches_handler(handler_tag: u32) -> i32 {
     };
     let matched = match handler_tag {
         BASE_EXCEPTION => true,
-        EXCEPTION => tag != KEYBOARD_INTERRUPT && tag != GENERATOR_EXIT,
+        EXCEPTION => {
+            tag != KEYBOARD_INTERRUPT
+                && tag != GENERATOR_EXIT
+                && tag != SYSTEM_EXIT
+                && tag != CANCELLED_ERROR
+        }
         // `FileNotFoundError` is an `OSError` subclass: a handler for either
         // kind catches both tags.
         OS_ERROR | FILE_NOT_FOUND_ERROR => tag == OS_ERROR || tag == FILE_NOT_FOUND_ERROR,
@@ -517,7 +628,30 @@ pub(crate) fn uncaught() -> i64 {
         cause: None,
         context: None,
         suppress_context: false,
+        exit_code: None,
     });
+
+    // `SystemExit` never renders a traceback. An integer code becomes the
+    // process status (masked to the byte the OS sees); a message is printed
+    // to stderr and exits 1.
+    if data.tag == SYSTEM_EXIT {
+        let status = match data.exit_code {
+            Some(code) => code & 0xff,
+            None => {
+                // A non-integer code (typically a string) is reported on
+                // stderr; CPython prints the newline even for an empty
+                // message.
+                let stderr = std::io::stderr();
+                let mut stderr = stderr.lock();
+                let _ = stderr.write_all(data.msg.as_bytes());
+                let _ = stderr.write_all(b"\n");
+                let _ = stderr.flush();
+                1
+            }
+        };
+        clear();
+        return status;
+    }
 
     let text = render_chain(root, &data);
     let stderr = std::io::stderr();
@@ -778,6 +912,7 @@ mod tests {
             cause,
             context: None,
             suppress_context: false,
+            exit_code: None,
         }
     }
 
@@ -814,6 +949,16 @@ mod tests {
         raise(BASE_EXCEPTION, value::str_from_bytes(b"base"));
         assert_eq!(value::type_name(pending_value()), "BaseException");
         assert_eq!(value::to_string(pending_value()), "base");
+        init();
+    }
+
+    #[test]
+    fn cancelled_error_is_a_base_exception() {
+        init();
+        raise_with_message(CANCELLED_ERROR, "");
+        assert_eq!(matches_handler(EXCEPTION), 0);
+        assert_eq!(matches_handler(BASE_EXCEPTION), 1);
+        assert_eq!(value::type_name(pending_value()), "CancelledError");
         init();
     }
 

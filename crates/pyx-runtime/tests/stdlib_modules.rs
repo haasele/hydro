@@ -108,6 +108,10 @@ fn expect_error(tag: i64) {
 fn parser() -> i64 {
     let value = module("argparse", "ArgumentParser", &[]);
     assert_no_error();
+    // The runtime tests exercise the legacy non-exiting parsing mode; the
+    // default path raises `SystemExit` like CPython.
+    method(value, "_pyx_test_mode", &[]);
+    assert_no_error();
     value
 }
 

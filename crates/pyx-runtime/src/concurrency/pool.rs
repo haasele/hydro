@@ -370,6 +370,7 @@ fn validate_callable(function: i64) -> Result<(), String> {
         | value::FunctionBody::ItemGetter { .. }
         | value::FunctionBody::Partial { .. }
         | value::FunctionBody::BoundMethod { .. }
+        | value::FunctionBody::Host { .. }
         | value::FunctionBody::Identity => {
             return Err(
                 "cannot run a derived callable in a Pool; use a named module-level function"

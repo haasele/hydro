@@ -1,11 +1,17 @@
-//! Integration tests for the slab pool that backs the interim collector.
+//! Integration tests for the size-class slab pool that backs the collector.
 //!
-//! The pool itself is private to the runtime, so these tests observe it
-//! through the tagged heap pointers returned by the ABI: `value & !7` is the
-//! address of the `PyxObj` cell, and the low three bits carry `TAG_HEAP`
-//! (`0b010`). Addresses are kept as `usize`, whose low bits are zero, so a
-//! stale copy on the stack cannot be mistaken for a conservative root by the
-//! collector.
+//! Every object is a 16-byte header plus a separately allocated payload. The
+//! pool itself is private to the runtime, so these tests observe it through
+//! the tagged heap pointers returned by the ABI: `value & !7` is the address
+//! of the header, and the low three bits carry `TAG_HEAP` (`0b010`).
+//! Addresses are kept as `usize`, whose low bits are zero, so a stale copy on
+//! the stack cannot be mistaken for a conservative root by the collector.
+//!
+//! Per-class statistics, class selection and free-list separation are covered
+//! by the allocator unit tests (`src/gc/alloc.rs`); the tests here exercise the
+//! same machinery end-to-end: payload/header alignment, object reuse across
+//! sweeps and `pyx_runtime_init`, mixed payload sizes, 12k allocations and a
+//! bounded-RSS loop.
 //!
 //! Each test runs on its own thread (and therefore on its own thread-local
 //! heap). `TEST_LOCK` serialises the runtime-global setup steps
@@ -39,7 +45,7 @@ fn scrub_stack() {
     std::hint::black_box(&buffer);
 }
 
-/// Allocates `count` strings and returns the raw cell addresses.
+/// Allocates `count` strings and returns the raw header addresses.
 ///
 /// Only untagged addresses leave this frame: the tagged values are
 /// temporaries, and the returned `Vec` lives on the Rust heap (which the
@@ -69,6 +75,12 @@ fn build_list(count: usize) -> i64 {
     pyx_list_new(items.len(), items.as_ptr())
 }
 
+/// Resident set size in pages, or `None` when `/proc` is unavailable.
+fn rss_pages() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/statm").ok()?;
+    text.split_whitespace().nth(1)?.parse().ok()
+}
+
 #[test]
 fn pool_cells_are_eight_byte_aligned() {
     let _guard = guard();
@@ -89,6 +101,15 @@ fn pool_cells_are_eight_byte_aligned() {
             "pool cell {address:#x} violates the collector's 8-byte alignment"
         );
         assert_eq!(pyx_len(value), 7 << 3);
+
+        // A fresh float object goes through a different payload size class;
+        // both kinds must keep the tagged-pointer alignment contract.
+        let float = pyx_float_new(1.5);
+        assert_eq!(float as usize & TAG_MASK, 0b010);
+        assert_eq!((float as usize & !TAG_MASK) % 8, 0);
+        // `pyx_to_int` reads the float payload; 1.5 truncates to 1.
+        assert_eq!(pyx_to_int(float), 1 << 3);
+        assert_eq!(pyx_exc_pending(), 0);
     }
     assert_eq!(pyx_exc_pending(), 0);
 }
@@ -107,7 +128,7 @@ fn sweep_returns_cells_to_the_free_list() {
     assert!(freed <= before, "collector freed more objects than existed");
     assert!(pyx_gc_objects() <= before, "registry grew during a sweep");
 
-    // The sweep pushes every freed cell onto the free list. `PYX_GC_STRESS`
+    // The sweep pushes every freed header onto the header free list. `PYX_GC_STRESS`
     // may already have reclaimed most of the batch, so the reuse assertion is
     // tied to the cells this explicit collection actually freed.
     let old_set: HashSet<usize> = old.iter().copied().collect();
@@ -154,7 +175,7 @@ fn runtime_init_recycles_cells_without_returning_slabs() {
     let before = pyx_gc_objects() as usize;
     assert!(before > 0, "no object was allocated");
 
-    // `pyx_runtime_init` releases every object into the pool's free list but
+    // `pyx_runtime_init` releases every object into the pool's free lists but
     // keeps its slabs for the next program run in this process.
     pyx_runtime_init();
     assert_eq!(pyx_gc_objects(), 0);
@@ -170,8 +191,8 @@ fn runtime_init_recycles_cells_without_returning_slabs() {
     }
 
     // Without PYX_GC_STRESS no automatic collection ran, so `free_all`
-    // released all 16 cells in registry order and the LIFO free list hands
-    // them back in reverse.
+    // released all 16 cells in registry order and the LIFO header free list
+    // hands them back in reverse.
     if before == old.len() {
         for (index, address) in after.iter().enumerate() {
             assert_eq!(
@@ -190,12 +211,49 @@ fn runtime_init_recycles_cells_without_returning_slabs() {
 }
 
 #[test]
+fn mixed_payload_sizes_reuse_their_own_payload_blocks() {
+    let _guard = guard();
+    pyx_runtime_init();
+
+    // f64 (8-byte payload class) and String (24-byte payload class) must not
+    // alias each other's payload storage. Allocate both kinds, drop them, and
+    // allocate both kinds again: each object must still read back correctly.
+    let mut floats = Vec::new();
+    let mut strings = Vec::new();
+    for index in 0..128 {
+        floats.push(pyx_float_new(index as f64));
+        strings.push(pyx_str_new(b"payload".as_ptr(), 7));
+    }
+    for (index, &value) in floats.iter().enumerate() {
+        assert_eq!(pyx_to_int(value), (index as i64) << 3);
+    }
+    for &value in &strings {
+        assert_eq!(pyx_len(value), 7 << 3);
+    }
+
+    // Drop the tagged copies on the stack, then sweep both classes.
+    floats.clear();
+    strings.clear();
+    scrub_stack();
+    let _ = pyx_gc_collect();
+
+    // Reallocate and verify both payload paths survive the recycle.
+    for index in 0..128 {
+        let float = pyx_float_new(index as f64 + 0.5);
+        assert_eq!(pyx_to_int(float), (index as i64) << 3);
+        let text = pyx_str_new(b"again!!".as_ptr(), 7);
+        assert_eq!(pyx_len(text), 7 << 3);
+    }
+    assert_eq!(pyx_exc_pending(), 0);
+}
+
+#[test]
 fn collector_survives_many_allocations_and_sweeps() {
     let _guard = guard();
     pyx_runtime_init();
 
     // More than one collection threshold, so the pool grows across several
-    // slabs and the automatic collections exercise the free list.
+    // slabs and the automatic collections exercise every class free list.
     let addresses = allocate_addresses(12_000, b"bulk");
     assert_eq!(addresses.len(), 12_000);
 
@@ -222,5 +280,49 @@ fn collector_survives_many_allocations_and_sweeps() {
         );
         assert_eq!(pyx_len(value), 11 << 3);
     }
+    assert_eq!(pyx_exc_pending(), 0);
+}
+
+#[test]
+fn bounded_rss_across_repeated_allocate_and_collect_loops() {
+    let _guard = guard();
+    pyx_runtime_init();
+
+    const ROUNDS: usize = 120;
+    const BATCH: usize = 256;
+
+    let Some(mut baseline) = rss_pages() else {
+        // `/proc` is unavailable (non-Linux); nothing to measure.
+        return;
+    };
+
+    // Warm up so the first-touch slab growth and the registry's minimum
+    // capacity are not counted as a leak.
+    for round in 0..ROUNDS {
+        for index in 0..BATCH {
+            let text = if index % 2 == 0 {
+                pyx_str_new(b"bounded-rss".as_ptr(), 9)
+            } else {
+                pyx_float_new(index as f64)
+            };
+            std::hint::black_box(text);
+        }
+        scrub_stack();
+        let _ = pyx_gc_collect();
+        if round == 8 {
+            baseline = rss_pages().unwrap_or(baseline);
+        }
+    }
+
+    let Some(end) = rss_pages() else {
+        return;
+    };
+    // 4096 pages is 16 MiB on a 4 KiB-page host and 64 MiB on a 16 KiB-page
+    // host: generous enough for allocator/registry slack, tight enough that a
+    // leaked class free list (120 * 256 * payload bytes) would trip it.
+    assert!(
+        end <= baseline + 4096,
+        "RSS grew from {baseline} to {end} pages across allocate/collect loops"
+    );
     assert_eq!(pyx_exc_pending(), 0);
 }

@@ -429,14 +429,50 @@ pub static _IO: ModuleSpec = ModuleSpec {
 
 pub static ARGPARSE: ModuleSpec = ModuleSpec {
     name: "argparse",
-    functions: &[kw(
-        "ArgumentParser",
-        0,
-        3,
-        Type::Any,
-        &["prog", "description", "formatter_class"],
-    )],
-    constants: &[c("RawTextHelpFormatter", Type::Any)],
+    functions: &[
+        kw(
+            "ArgumentParser",
+            0,
+            13,
+            Type::Any,
+            &[
+                "prog",
+                "usage",
+                "description",
+                "epilog",
+                "parents",
+                "formatter_class",
+                "prefix_chars",
+                "fromfile_prefix_chars",
+                "argument_default",
+                "conflict_handler",
+                "add_help",
+                "allow_abbrev",
+                "exit_on_error",
+            ],
+        ),
+        // `Namespace` is a class in CPython; exposing it as a native
+        // constructor keeps `Namespace(**kwargs)` and `from argparse import
+        // Namespace` working without a second object kind.
+        kw_dynamic("Namespace", 0, 0, Type::Any, &[]),
+        kw(
+            "FileType",
+            0,
+            4,
+            Type::Any,
+            &["mode", "bufsize", "encoding", "errors"],
+        ),
+    ],
+    constants: &[
+        c("SUPPRESS", Type::Any),
+        c("HelpFormatter", Type::Any),
+        c("RawTextHelpFormatter", Type::Any),
+        c("RawDescriptionHelpFormatter", Type::Any),
+        c("ArgumentDefaultsHelpFormatter", Type::Any),
+        c("MetavarTypeHelpFormatter", Type::Any),
+        c("Action", Type::Any),
+        c("BooleanOptionalAction", Type::Any),
+    ],
 };
 
 pub static COLLECTIONS: ModuleSpec = ModuleSpec {
@@ -448,24 +484,119 @@ pub static COLLECTIONS: ModuleSpec = ModuleSpec {
 pub static SOCKET: ModuleSpec = ModuleSpec {
     name: "socket",
     functions: &[
-        kw("socket", 0, 3, Type::Any, &["family", "type", "proto"]),
-        kw(
-            "create_connection",
-            1,
-            2,
-            Type::Any,
-            &["address", "timeout"],
-        ),
+        // The runtime binds these keyword names itself, so the spec keeps the
+        // parameter list empty (the frontend still validates the arity).
+        kw_dynamic("socket", 0, 3, Type::Any, &[]),
+        kw_dynamic("create_connection", 0, 2, Type::Any, &[]),
         f("gethostname", 0, 0, Type::Str),
+        f("socketpair", 0, 3, Type::Any),
+        f("getaddrinfo", 2, 6, Type::List),
+        f("gethostbyname", 1, 1, Type::Str),
+        f("inet_pton", 2, 2, Type::Bytes),
+        f("inet_ntop", 2, 2, Type::Str),
     ],
     constants: &[
+        c("AF_UNSPEC", Type::Int),
+        c("AF_UNIX", Type::Int),
         c("AF_INET", Type::Int),
+        c("AF_INET6", Type::Int),
         c("SOCK_STREAM", Type::Int),
+        c("SOCK_DGRAM", Type::Int),
+        c("SOCK_NONBLOCK", Type::Int),
+        c("SOCK_CLOEXEC", Type::Int),
         c("SOL_SOCKET", Type::Int),
         c("SO_REUSEADDR", Type::Int),
+        c("SO_REUSEPORT", Type::Int),
+        c("SO_ERROR", Type::Int),
+        c("IPPROTO_IP", Type::Int),
+        c("IPPROTO_TCP", Type::Int),
+        c("IPPROTO_UDP", Type::Int),
         c("SHUT_RD", Type::Int),
         c("SHUT_WR", Type::Int),
         c("SHUT_RDWR", Type::Int),
+        c("MSG_OOB", Type::Int),
+        c("MSG_PEEK", Type::Int),
+        c("MSG_DONTWAIT", Type::Int),
+        c("MSG_WAITALL", Type::Int),
+        c("MSG_NOSIGNAL", Type::Int),
+    ],
+};
+
+/// `select`: readiness on descriptors without external dependencies.
+pub static SELECT: ModuleSpec = ModuleSpec {
+    name: "select",
+    functions: &[
+        kw_dynamic("select", 3, 4, Type::Any, &[]),
+        f("poll", 0, 0, Type::Any),
+        // Native methods of the `poll` object. The receiver is the first
+        // argument, exactly as for builtin methods.
+        f("_poll_register", 2, 3, Type::Any),
+        f("_poll_unregister", 2, 2, Type::Any),
+        f("_poll_modify", 3, 3, Type::Any),
+        f("_poll_poll", 1, 2, Type::List),
+        f("_poll_close", 1, 1, Type::Any),
+        f("_poll_enter", 1, 1, Type::Any),
+        f("_poll_exit", 1, 4, Type::Any),
+    ],
+    constants: &[
+        c("POLLIN", Type::Int),
+        c("POLLPRI", Type::Int),
+        c("POLLOUT", Type::Int),
+        c("POLLERR", Type::Int),
+        c("POLLHUP", Type::Int),
+        c("POLLNVAL", Type::Int),
+        c("error", Type::Any),
+    ],
+};
+
+/// `selectors`: the native `DefaultSelector` object and its event bits.
+pub static SELECTORS: ModuleSpec = ModuleSpec {
+    name: "selectors",
+    functions: &[
+        f("DefaultSelector", 0, 0, Type::Any),
+        f("SelectSelector", 0, 0, Type::Any),
+        f("PollSelector", 0, 0, Type::Any),
+        f("_selector_register", 2, 4, Type::Any),
+        f("_selector_unregister", 2, 2, Type::Any),
+        f("_selector_modify", 2, 4, Type::Any),
+        f("_selector_select", 1, 2, Type::List),
+        f("_selector_get_key", 2, 2, Type::Any),
+        f("_selector_get_map", 1, 1, Type::Dict),
+        f("_selector_close", 1, 1, Type::Any),
+        f("_selector_enter", 1, 1, Type::Any),
+        f("_selector_exit", 1, 4, Type::Any),
+    ],
+    constants: &[c("EVENT_READ", Type::Int), c("EVENT_WRITE", Type::Int)],
+};
+
+/// `ssl`: client-side TLS backed by `rustls` and the Mozilla root store.
+///
+/// Server-side TLS is intentionally not exposed: `SSLContext(
+/// PROTOCOL_TLS_SERVER)` can be constructed but `wrap_socket` reports that the
+/// mode is unsupported instead of pretending to serve.
+pub static SSL: ModuleSpec = ModuleSpec {
+    name: "ssl",
+    functions: &[
+        kw_dynamic("SSLContext", 0, 1, Type::Any, &[]),
+        kw_dynamic("create_default_context", 0, 4, Type::Any, &[]),
+        kw_dynamic("wrap_socket", 0, 2, Type::Any, &[]),
+        f("_ssl_context_wrap_socket", 2, 3, Type::Any),
+        f("_ssl_context_load_verify_locations", 1, 4, Type::Any),
+        f("_ssl_context_load_cert_chain", 2, 4, Type::Any),
+    ],
+    constants: &[
+        c("CERT_NONE", Type::Int),
+        c("CERT_OPTIONAL", Type::Int),
+        c("CERT_REQUIRED", Type::Int),
+        c("PROTOCOL_TLS", Type::Int),
+        c("PROTOCOL_TLS_CLIENT", Type::Int),
+        c("PROTOCOL_TLS_SERVER", Type::Int),
+        c("PROTOCOL_TLSv1_2", Type::Int),
+        c("OP_ALL", Type::Int),
+        c("HAS_SNI", Type::Bool),
+        c("HAS_TLSv1_3", Type::Bool),
+        c("SSLError", Type::Any),
+        c("OPENSSL_VERSION", Type::Str),
     ],
 };
 
@@ -519,18 +650,28 @@ pub static RE: ModuleSpec = ModuleSpec {
 
 /// Cooperative asyncio layer over stackful coroutine fibers.
 ///
-/// `run(coro)` drives the root coroutine, `sleep(seconds)` suspends only the
-/// calling fiber, and `gather(*awaitables)` starts every coroutine as a
-/// concurrent task and returns the results in input order. Unsupported APIs
-/// surface as `AttributeError` from the runtime.
+/// `run(coro)` drives the root coroutine on a persistent loop,
+/// `sleep(seconds)` suspends only the calling fiber, `create_task(coro)`
+/// schedules a concurrent task, `current_task()` reports the running task and
+/// `gather(*awaitables)` returns the results in input order.
+/// `TaskGroup` is a native class whose instances wait for and cancel their
+/// tasks at `async with` exit. Unsupported APIs surface as `AttributeError`
+/// from the runtime.
 pub static ASYNCIO: ModuleSpec = ModuleSpec {
     name: "asyncio",
     functions: &[
         f("run", 1, 1, Type::Any),
         f("sleep", 1, 1, Type::None),
         f("gather", 0, usize::MAX, Type::List),
+        f("create_task", 1, 1, Type::Any),
+        f("current_task", 0, 0, Type::Any),
+        // `TaskGroup` is a native class; the frontend types module members
+        // uniformly as functions, so expose the constructor as one. The
+        // runtime dispatch arm returns a TaskGroup instance, keeping
+        // `from asyncio import TaskGroup; TaskGroup()` callable.
+        f("TaskGroup", 0, 0, Type::Any),
     ],
-    constants: &[],
+    constants: &[c("CancelledError", Type::Any)],
 };
 
 /// `errno`: POSIX error numbers and the `errorcode` reverse mapping.
@@ -567,6 +708,32 @@ pub static UNITTEST: ModuleSpec = ModuleSpec {
         f("_fail", 1, 2, Type::None),
     ],
     constants: &[c("TestCase", Type::Any)],
+};
+
+/// `pytest`: the PyX test runner's native support module.
+///
+/// Decorators (`fixture`, `mark.*`) are recognised and ignored by the
+/// frontend, so only the runtime helpers have real implementations. The
+/// `_`-prefixed entries are internal hooks used by generated wrappers.
+pub static PYTEST: ModuleSpec = ModuleSpec {
+    name: "pytest",
+    functions: &[
+        f("main", 0, 0, Type::None),
+        kw("raises", 1, 2, Type::Any, &["expected", "match"]),
+        kw("approx", 1, 3, Type::Any, &["expected", "rel", "abs"]),
+        kw("fail", 0, 1, Type::None, &["msg"]),
+        kw("skip", 0, 1, Type::None, &["reason"]),
+        kw("xfail", 0, 1, Type::None, &["reason"]),
+        f("fixture", 0, 1, Type::Any),
+        f("_fixture_resolve", 1, 1, Type::Any),
+        f("_fixture_module", 2, 2, Type::Any),
+        f("_xfail", 0, 1, Type::None),
+        f("_identity", 0, usize::MAX, Type::Any),
+        f("_raises_enter", 1, 1, Type::Any),
+        f("_raises_exit", 4, 4, Type::Bool),
+        f("_approx_eq", 2, 2, Type::Bool),
+    ],
+    constants: &[c("mark", Type::Any)],
 };
 
 // -------------------------------------------------------------------------

@@ -227,6 +227,7 @@ fn start_spawn(process: &ProcessState) -> Result<(), String> {
         | FunctionBody::ItemGetter { .. }
         | FunctionBody::Partial { .. }
         | FunctionBody::BoundMethod { .. }
+        | FunctionBody::Host { .. }
         | FunctionBody::Identity => {
             return Err(
                 "cannot spawn a derived callable; use a named module-level function".to_string(),
@@ -402,6 +403,170 @@ pub(crate) fn wait_for_child(pid: i64) -> Result<(), String> {
     };
     heap::blocking_leave();
     result
+}
+
+/// Grace period an orphaned child gets to exit after `SIGTERM` before it is
+/// killed outright.
+const ORPHAN_GRACE: Duration = Duration::from_millis(200);
+
+/// Upper bound for reaping a child after `SIGKILL`.
+///
+/// `SIGKILL` cannot be ignored, so this only elapses for a child stuck in
+/// uninterruptible sleep; the cleanup then gives up instead of parking a
+/// payload `Drop` indefinitely.
+const ORPHAN_KILL_GRACE: Duration = Duration::from_secs(1);
+
+/// Poll interval while waiting for an orphaned child to be reaped.
+const ORPHAN_POLL: Duration = Duration::from_millis(5);
+
+/// Outcome of the non-blocking probe used by the orphan cleanup.
+enum OrphanProbe {
+    /// Exited and was reaped by the probe; holds the raw wait status.
+    Reaped(i64),
+    /// Still running and still a child of this process.
+    Running,
+    /// Not this process's child, or already reaped elsewhere. Nothing to do:
+    /// in particular a forked child must not signal or wait for the parent's
+    /// children (its inherited copies of that state).
+    NotOurs,
+}
+
+/// Outcome of waiting for an orphaned child to exit.
+enum OrphanWait {
+    /// Exited and was reaped; holds the raw wait status.
+    Reaped(i64),
+    /// Reaped elsewhere (or not our child any more).
+    Gone,
+    /// Still running when the grace period elapsed.
+    Timeout,
+}
+
+/// `waitpid(pid, WNOHANG)` with `EINTR` retried.
+fn probe_orphan(raw_pid: i32) -> OrphanProbe {
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a valid out-pointer for the call.
+        let waited = unsafe { libc::waitpid(raw_pid, &mut status, libc::WNOHANG) };
+        if waited == raw_pid {
+            return OrphanProbe::Reaped(i64::from(status));
+        }
+        if waited == 0 {
+            return OrphanProbe::Running;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            // `ECHILD` covers both "reaped by another waiter" and "inherited
+            // state whose pid is not our child".
+            _ => return OrphanProbe::NotOurs,
+        }
+    }
+}
+
+/// Waits at most `grace` for `raw_pid` to exit, reaping it through `WNOHANG`.
+fn wait_orphan(raw_pid: i32, grace: Duration) -> OrphanWait {
+    let deadline = Instant::now() + grace;
+    loop {
+        match probe_orphan(raw_pid) {
+            OrphanProbe::Reaped(status) => return OrphanWait::Reaped(status),
+            OrphanProbe::NotOurs => return OrphanWait::Gone,
+            OrphanProbe::Running => {}
+        }
+        if Instant::now() >= deadline {
+            return OrphanWait::Timeout;
+        }
+        std::thread::sleep(ORPHAN_POLL);
+    }
+}
+
+/// Terminates and reaps an orphaned child without parking for the collector.
+///
+/// Called from payload `Drop` implementations, which run inside the collector's
+/// sweep where [`heap::blocking_enter`] is not allowed. The sequence is
+/// `SIGTERM`, a bounded non-blocking grace period, then `SIGKILL`; the child is
+/// reaped as soon as it exits. Only a direct child of this process is touched,
+/// so a forked child dropping its inherited copy leaves the parent's processes
+/// alone.
+pub(crate) fn reap_orphan_child(pid: i64) {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return;
+    };
+    if raw_pid <= 0 {
+        return;
+    }
+    match probe_orphan(raw_pid) {
+        OrphanProbe::Reaped(_) | OrphanProbe::NotOurs => {}
+        OrphanProbe::Running => {
+            // SAFETY: `kill` takes plain integers and has no other
+            // preconditions. `ESRCH` just means the child exited meanwhile.
+            unsafe { libc::kill(raw_pid, libc::SIGTERM) };
+            if let OrphanWait::Timeout = wait_orphan(raw_pid, ORPHAN_GRACE) {
+                // SAFETY: as above; `SIGKILL` cannot be caught or ignored.
+                unsafe { libc::kill(raw_pid, libc::SIGKILL) };
+                let _ = wait_orphan(raw_pid, ORPHAN_KILL_GRACE);
+            }
+        }
+    }
+}
+
+/// Reaps a started `Process` that became unreachable without `join`.
+///
+/// Best effort: the child is stopped (as [`terminate_process`] would) and
+/// reaped, and a successful reap stores the exit code, so the object keeps the
+/// `join`/`exitcode` semantics up to the moment it is dropped. A child that was
+/// already reaped -- by `join`, a liveness probe or an earlier drop -- is never
+/// waited for twice. Never parks for the collector.
+pub(crate) fn reap_orphan_process(process: &ProcessState) {
+    if !process.started.load(Ordering::Acquire) || process.reaped.load(Ordering::Acquire) {
+        return;
+    }
+    let pid = process.pid.load(Ordering::Acquire);
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return;
+    };
+    if raw_pid <= 0 {
+        return;
+    }
+    // Claim the single reap before touching the child: a concurrent waiter
+    // (or a second drop path) that already set the flag must not be joined by
+    // a second `waitpid`.
+    if process
+        .reaped
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    match probe_orphan(raw_pid) {
+        OrphanProbe::Reaped(status) => {
+            process
+                .exitcode
+                .store(exit_status(status), Ordering::Release);
+        }
+        OrphanProbe::NotOurs => {}
+        OrphanProbe::Running => {
+            // SAFETY: `kill` takes plain integers and has no preconditions.
+            unsafe { libc::kill(raw_pid, libc::SIGTERM) };
+            let status = match wait_orphan(raw_pid, ORPHAN_GRACE) {
+                OrphanWait::Reaped(status) => Some(status),
+                OrphanWait::Gone => None,
+                OrphanWait::Timeout => {
+                    // SAFETY: as above; `SIGKILL` is unignorable, so the
+                    // bounded follow-up wait reaps the child promptly.
+                    unsafe { libc::kill(raw_pid, libc::SIGKILL) };
+                    match wait_orphan(raw_pid, ORPHAN_KILL_GRACE) {
+                        OrphanWait::Reaped(status) => Some(status),
+                        OrphanWait::Gone | OrphanWait::Timeout => None,
+                    }
+                }
+            };
+            if let Some(status) = status {
+                process
+                    .exitcode
+                    .store(exit_status(status), Ordering::Release);
+            }
+        }
+    }
 }
 
 /// Non-blocking liveness probe for a raw pid.

@@ -37,16 +37,16 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 13 | 39 |
-| pure | 174 | 43 | 131 |
-| extension | 63 | 4 | 59 |
+| pure | 174 | 45 | 129 |
+| extension | 63 | 5 | 58 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 60 | 237 |
+| **Total** | 297 | 63 | 234 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:PYX0002 | 228 |
+| compile_error:PYX0002 | 225 |
 | cpython_failed | 9 |
 
 ## Modules by layer
@@ -233,7 +233,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `rlcompleter` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'rlcompleter' not found: not supported on the import search path |
 | `sched` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sched' not found: not supported on the import search path |
 | `secrets` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'secrets' not found: not supported on the import search path |
-| `selectors` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'selectors' not found: not supported on the import search path |
+| `selectors` | ok | ok | ok | - |
 | `shelve` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'shelve' not found: not supported on the import search path |
 | `shlex` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'shlex' not found: not supported on the import search path |
 | `shutil` | ok | ok | ok | - |
@@ -245,7 +245,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `sre_compile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sre_compile' not found: not supported on the import search path |
 | `sre_constants` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sre_constants' not found: not supported on the import search path |
 | `sre_parse` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sre_parse' not found: not supported on the import search path |
-| `ssl` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'ssl' not found: not supported on the import search path |
+| `ssl` | ok | ok | ok | - |
 | `statistics` | ok | ok | ok | - |
 | `string` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'string' not found: not supported on the import search path |
 | `stringprep` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'stringprep' not found: not supported on the import search path |
@@ -349,7 +349,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `pyexpat` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'pyexpat' not found: not supported on the import search path |
 | `readline` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'readline' not found: not supported on the import search path |
 | `resource` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'resource' not found: not supported on the import search path |
-| `select` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'select' not found: not supported on the import search path |
+| `select` | ok | ok | ok | - |
 | `syslog` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'syslog' not found: not supported on the import search path |
 | `termios` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'termios' not found: not supported on the import search path |
 | `unicodedata` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'unicodedata' not found: not supported on the import search path |

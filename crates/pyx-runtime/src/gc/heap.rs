@@ -32,10 +32,32 @@
 //! * A registered thread whose saved context cannot be bounded abandons the
 //!   collection (objects are leaked) rather than scanning unsafely.
 //!
-//! `PyxObj` has a single fixed layout, so storage is the slab pool in
-//! [`alloc`]: cells are allocated in fixed-size slabs, released into a free
-//! list and reused without touching the system allocator. Variable payload
-//! size classes and precise shadow-stack roots are future work.
+//! `PyxObj` is a fixed 16-byte header and every object owns a separately
+//! allocated payload, so storage is the size-class slab pool in [`alloc`]:
+//! payloads are rounded to a class (8..4096 bytes, or an exact large
+//! allocation), headers use their own slab class, and released cells return
+//! to per-class free lists instead of the system allocator.
+//! # Precise shadow-stack roots
+//!
+//! Generated code registers its live locals with [`crate::gc::roots`]. At
+//! every safepoint slow path and every [`blocking_enter`] the mutator
+//! publishes its active frames/ranges, so the collector marks exactly those
+//! slots (validated through the address index) instead of guessing. Two modes
+//! are supported, selected by `PYX_GC_PRECISE`:
+//!
+//! * **mixed** (default): precise frames/ranges are marked exactly *and*
+//!   their slot extents are excluded from the conservative stack/register
+//!   scan, so a stale precise slot cannot retain garbage. Rust-side frames
+//!   (runtime helpers, tests) are still scanned conservatively.
+//! * **strict** (`PYX_GC_PRECISE=1`): every conservative stack and register
+//!   scan is disabled. Only precise frames/ranges, pending/handled/thread
+//!   roots, suspended fiber `SavedRoots`, C-API shim roots and persistent
+//!   roots keep objects alive. Unregistered native stacks must root their
+//!   tagged locals explicitly with [`crate::gc::roots::frame_push`] or a
+//!   scope range.
+//!
+//! Persistent roots (`add_persistent_root`) belong to a thread registration
+//! and survive ordinary collections until removed or cleared by [`reset`].
 //! Stack words are read with inline assembly because they may be
 //! uninitialized; those invariants are documented where they occur.
 
@@ -47,7 +69,8 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::exc;
-use crate::value::{FunctionBody, ObjData, PyxObj, TAG_HEAP, TAG_MASK};
+use crate::gc::roots::{self, PublishedRoots};
+use crate::value::{FunctionBody, ObjData, ObjDataRef, PyxObj, TAG_HEAP, TAG_MASK};
 
 // The slab allocator is a private implementation detail of this collector. It
 // lives in `gc/alloc.rs`; the explicit path keeps the module declaration here
@@ -84,6 +107,13 @@ pub struct GcStats {
     pub threshold: u64,
     /// Whether `PYX_GC_STRESS=1` is active.
     pub stress: bool,
+    /// Whether `PYX_GC_PRECISE=1` (strict precise-root mode) is active.
+    ///
+    /// Mixed mode (the default) also marks precise frames exactly, but keeps
+    /// the conservative stack/register fallback for runtime and test frames.
+    pub precise: bool,
+    /// Precise frames marked by the most recent collection.
+    pub precise_frames: u64,
 }
 
 // Relaxed counters: they only feed a diagnostic snapshot and never
@@ -95,6 +125,8 @@ static STAT_PAUSE_MAX_US: AtomicU64 = AtomicU64::new(0);
 static STAT_MARK_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 static STAT_SWEEP_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 static STAT_FREED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Precise frames marked by the most recent collection (diagnostic only).
+static STAT_PRECISE_FRAMES: AtomicU64 = AtomicU64::new(0);
 
 /// Saturating conversion of a measured phase into whole microseconds.
 fn micros(duration: Duration) -> u64 {
@@ -130,6 +162,8 @@ pub fn gc_stats() -> GcStats {
         live_objects: objects() as u64,
         threshold: threshold as u64,
         stress,
+        precise: precise_mode(),
+        precise_frames: STAT_PRECISE_FRAMES.load(Ordering::Relaxed),
     }
 }
 
@@ -556,6 +590,11 @@ pub(crate) struct ThreadGc {
     pending: AtomicI64,
     handled: Mutex<Vec<i64>>,
     roots: Mutex<Vec<i64>>,
+    /// Persistent roots (`add_persistent_root`): tagged values that stay
+    /// reachable for the lifetime of the registration or until the explicit
+    /// slot is removed. Async loop roots and similar long-lived Rust-side
+    /// owners use them. Cleared by [`leave_thread`] and [`reset`].
+    persistent: Mutex<Vec<i64>>,
 }
 
 /// Process-wide registration table, keyed by Python-visible thread id.
@@ -700,6 +739,9 @@ pub(crate) fn safepoint() {
     if !GC_REQUESTED.load(Ordering::SeqCst) {
         return;
     }
+    // Publish the exact roots of this stopped context before parking; the
+    // collector dereferences them only while the thread stays parked.
+    roots::publish_current();
     if !gc.parked.swap(true, Ordering::SeqCst) {
         PARKED.fetch_add(1, Ordering::SeqCst);
     }
@@ -738,6 +780,9 @@ pub(crate) fn blocking_enter() {
     // Wait out a collection that is already stopping the world.
     safepoint();
     save_context(&gc);
+    // Publish the exact roots of the context that is about to block: it may
+    // stay parked for a long time and a collection must see its frames.
+    roots::publish_current();
     let _registry = lock_thread_registry();
     // If a collection started between the safepoint and here, the collector
     // either already sees this thread parked (below) or is still waiting for
@@ -832,6 +877,74 @@ pub(crate) fn release_roots(start: usize) {
     }
 }
 
+/// Registers a persistent root and returns its stable slot index.
+///
+/// A persistent root keeps `value` reachable from every subsequent
+/// collection until the slot is overwritten, removed, the owning thread
+/// exits or [`reset`] runs. It is the right tool for Rust-side owners that
+/// outlive a single call (the asyncio event loop's scheduled tasks) and that
+/// generated frames cannot describe.
+///
+/// Returns `usize::MAX` outside the runtime, where no collector can run.
+/// The function never allocates a PyX object and takes no heap lock.
+pub(crate) fn add_persistent_root(value: i64) -> usize {
+    let Some(gc) = current_gc() else {
+        return usize::MAX;
+    };
+    let mut persistent = gc
+        .persistent
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot = persistent.len();
+    persistent.push(value);
+    slot
+}
+
+/// Overwrites the persistent root in `slot`.
+///
+/// `value` may be tagged `None` to drop the root without releasing the slot.
+/// Out-of-range slots (a malformed or stale handle) are ignored with a debug
+/// assertion: a bad slot must never corrupt the registry.
+pub(crate) fn set_persistent_root(slot: usize, value: i64) {
+    let Some(gc) = current_gc() else {
+        return;
+    };
+    let mut persistent = gc
+        .persistent
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match persistent.get_mut(slot) {
+        Some(entry) => *entry = value,
+        None => debug_assert!(false, "set_persistent_root: slot {slot} out of range"),
+    }
+}
+
+/// Removes the persistent root in `slot`.
+///
+/// The slot stops retaining its value immediately; trailing empty slots are
+/// trimmed so a push after the last removal reuses their index. Like
+/// [`set_persistent_root`], an out-of-range slot is ignored (debug
+/// assertion). Never dereferences the tagged value.
+pub(crate) fn remove_persistent_root(slot: usize) {
+    let Some(gc) = current_gc() else {
+        return;
+    };
+    let mut persistent = gc
+        .persistent
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match persistent.get_mut(slot) {
+        Some(entry) => *entry = crate::value::NONE,
+        None => {
+            debug_assert!(false, "remove_persistent_root: slot {slot} out of range");
+            return;
+        }
+    }
+    while persistent.last() == Some(&crate::value::NONE) {
+        persistent.pop();
+    }
+}
+
 /// Locks the shared heap, ignoring poisoning: a panic in user code must not
 /// make the process unable to allocate. The registry is always consistent
 /// because no user code runs while the lock is held.
@@ -864,6 +977,26 @@ fn read_config() -> (usize, bool) {
         .map(|value| value.trim() == "1")
         .unwrap_or(false);
     (threshold, stress)
+}
+
+/// Whether strict precise-root mode is active (`PYX_GC_PRECISE=1`).
+///
+/// Read on every collection (not cached) so a test or an embedding process
+/// can switch modes without restarting the runtime; the lookup is off the
+/// mutator fast path. See the module documentation for the exact root set
+/// that survives in each mode.
+pub(crate) fn precise_mode() -> bool {
+    std::env::var("PYX_GC_PRECISE")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Whether precise frames/ranges participate in collection (default) or the
+/// collector ignores them and falls back to conservative scanning (`0`).
+pub(crate) fn precise_enabled() -> bool {
+    !std::env::var("PYX_GC_PRECISE")
+        .map(|value| value.trim() == "0")
+        .unwrap_or(false)
 }
 
 /// Allocates a heap object, registers it and returns its tagged value.
@@ -987,6 +1120,18 @@ pub(crate) fn reset() {
     let _registry_guard = crate::spawn::TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The async loop owns persistent roots; drop it first, then clear every
+    // registration's persistent slots. A fresh run must not inherit them.
+    crate::modules::asyncio::reset();
+    {
+        let registry = lock_thread_registry();
+        for gc in registry.values() {
+            gc.persistent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
+    }
     HEAP.with(|cell| cell.borrow_mut().free_all());
     // A fresh program run must not resolve functions from the previous one.
     crate::spawn::reset();
@@ -1023,6 +1168,9 @@ pub(crate) fn reset() {
     GC_REQUESTED.store(false, Ordering::SeqCst);
     PARKED.store(0, Ordering::SeqCst);
     GC_SELF.with(|cell| cell.borrow_mut().take());
+    // The previous run's shadow frames and their publication are stale: the
+    // slots they describe may already be gone from this thread's stack.
+    roots::clear_current();
     register_current_thread(1, Vec::new());
 }
 
@@ -1046,6 +1194,11 @@ struct RootSnapshot {
     pending: i64,
     handled: Vec<i64>,
     roots: Vec<i64>,
+    /// Persistent roots of the thread registration.
+    persistent: Vec<i64>,
+    /// Precise frames/ranges active in this thread's context (published by
+    /// the mutator at its safepoint, or read directly for the collector).
+    precise: PublishedRoots,
     /// Conservative root ranges of suspended fibers owned by this thread.
     suspended: Vec<(usize, usize)>,
 }
@@ -1081,8 +1234,13 @@ fn all_threads_registered(registry: &HashMap<i64, Arc<ThreadGc>>) -> bool {
 fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnapshot>> {
     let self_id = current_thread_id();
     // The world is stopped for the snapshot, so the global registry is
-    // stable while it is copied.
+    // stable while it is copied. Published precise roots are keyed by the
+    // per-OS-thread token used by the registration.
     let all_suspended: Vec<(u64, usize, usize)> = lock_suspended_stacks().clone();
+    let mut published: HashMap<u64, PublishedRoots> = roots::snapshot_all().into_iter().collect();
+    // The collector's own context never parked, so its publication may be
+    // older than the frames it holds right now; read the live set instead.
+    let self_precise = roots::snapshot_current();
     let mut snapshots = Vec::with_capacity(registry.len());
     for (&id, gc) in registry.iter() {
         let pending = gc.pending.load(Ordering::Acquire);
@@ -1099,6 +1257,18 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let persistent = gc
+            .persistent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let precise = if id == self_id {
+            self_precise.clone()
+        } else {
+            // A parked thread published just before parking; a missing entry
+            // means it never used precise roots.
+            published.remove(&gc.token).unwrap_or_default()
+        };
         let mut suspended: Vec<(usize, usize)> = all_suspended
             .iter()
             .filter(|&&(owner, _, _)| owner == gc.token)
@@ -1130,6 +1300,8 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
                 pending,
                 handled,
                 roots,
+                persistent,
+                precise,
                 suspended,
             });
             continue;
@@ -1154,21 +1326,74 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
             pending,
             handled,
             roots,
+            persistent,
+            precise,
             suspended,
         });
     }
     Some(snapshots)
 }
 
+/// Byte extents of the precise frames/ranges in `snapshots`, sorted and
+/// merged.
+///
+/// Conservative stack scans skip these bytes: the precise slots are marked
+/// exactly, so scanning their raw words again would only resurrect stale
+/// values that the precise shadow stack has already forgotten (a slot reused
+/// for a dead temporary). Merging makes the exclusion check a single linear
+/// pass alongside the scan cursor.
+fn precise_exclusions(snapshots: &[RootSnapshot]) -> Vec<(usize, usize)> {
+    let mut extents: Vec<(usize, usize)> = Vec::new();
+    let mut push = |precise: &PublishedRoots| {
+        for frame in precise.frames() {
+            if frame.high > frame.low {
+                extents.push((frame.low, frame.high));
+            }
+        }
+        for range in precise.ranges() {
+            let low = range.base as usize;
+            let high = low.saturating_add(range.count.saturating_mul(8));
+            if high > low {
+                extents.push((low, high));
+            }
+        }
+    };
+    for snapshot in snapshots {
+        push(&snapshot.precise);
+    }
+    extents.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(extents.len());
+    for (low, high) in extents {
+        match merged.last_mut() {
+            Some(last) if low <= last.1 => last.1 = last.1.max(high),
+            _ => merged.push((low, high)),
+        }
+    }
+    merged
+}
+
 /// Marks every root of a snapshot set plus the caller's live stack,
 /// registers and pending exception.
+///
+/// Precise frames/ranges are always marked slot by slot through
+/// [`mark_word`], so a stale tagged value can only be ignored (the address
+/// index validates it), never dereferenced. In strict mode (`strict`) no
+/// conservative stack/register scan runs at all; in mixed mode those scans
+/// skip the byte extents of the precise slots.
 fn mark_roots(
     snapshots: &[RootSnapshot],
     extra_root: Option<i64>,
     addresses: &AddressSet,
     self_sp: usize,
     self_high: usize,
+    strict: bool,
 ) {
+    let precise_on = precise_enabled();
+    let exclusions = if precise_on {
+        precise_exclusions(snapshots)
+    } else {
+        Vec::new()
+    };
     if let Some(root) = extra_root {
         mark_word(root as usize, addresses);
     }
@@ -1177,13 +1402,22 @@ fn mark_roots(
     for value in exc::handled_values() {
         mark_word(value as usize, addresses);
     }
-    scan_stack(self_sp, self_high, addresses);
-    mark_captured_registers(addresses);
+    if !strict {
+        scan_stack_excluding(self_sp, self_high, addresses, &exclusions);
+        mark_captured_registers(addresses);
+    }
 
-    // Parked threads' saved stacks/registers, pending mirrors, handler
-    // stacks and out-of-stack roots (spawn arguments held only by Rust
-    // closures).
+    // Parked threads' precise roots, pending mirrors, handler stacks,
+    // out-of-stack roots (spawn arguments held only by Rust closures),
+    // persistent roots, saved stacks/registers and suspended fiber ranges.
+    let mut precise_frames = 0u64;
     for thread in snapshots {
+        precise_frames += thread.precise.frames().len() as u64;
+        if precise_on {
+            thread
+                .precise
+                .mark(|value| mark_word(value as usize, addresses));
+        }
         mark_word(thread.pending as usize, addresses);
         for &value in &thread.handled {
             mark_word(value as usize, addresses);
@@ -1191,18 +1425,25 @@ fn mark_roots(
         for &root in &thread.roots {
             mark_word(root as usize, addresses);
         }
+        for &root in &thread.persistent {
+            mark_word(root as usize, addresses);
+        }
+        if strict {
+            continue;
+        }
         if thread.high > thread.sp {
-            scan_stack(thread.sp, thread.high, addresses);
+            scan_stack_excluding(thread.sp, thread.high, addresses, &exclusions);
         }
         for &register in &thread.regs {
             mark_word(register, addresses);
         }
         for &(low, high) in &thread.suspended {
             if high > low {
-                scan_stack(low, high, addresses);
+                scan_stack_excluding(low, high, addresses, &exclusions);
             }
         }
     }
+    STAT_PRECISE_FRAMES.store(precise_frames, Ordering::Relaxed);
 }
 
 /// Abandons a collection: resets every colour, drops the worklist and
@@ -1259,6 +1500,9 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     }
 
     let stats = gc_stats_enabled();
+    // Strict precise mode disables every conservative stack/register scan;
+    // mixed mode keeps them but excludes the precise slot extents.
+    let strict = precise_mode();
     let started = Instant::now();
 
     // A successful collection leaves the worklist empty and an aborted one
@@ -1290,7 +1534,9 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     let Some(snapshots) = snapshot_roots(&registry) else {
         return abort_shared_collection();
     };
-    mark_roots(&snapshots, extra_root, &addresses, self_sp, self_high);
+    mark_roots(
+        &snapshots, extra_root, &addresses, self_sp, self_high, strict,
+    );
     drop(snapshots);
     drop(addresses);
     // Release the world: the mutators run while the worklist drains.
@@ -1325,7 +1571,9 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     let Some(snapshots) = snapshot_roots(&registry) else {
         return abort_shared_collection();
     };
-    mark_roots(&snapshots, extra_root, &addresses, self_sp, self_high);
+    mark_roots(
+        &snapshots, extra_root, &addresses, self_sp, self_high, strict,
+    );
     drop(snapshots);
     drop(addresses);
     drain_worklist();
@@ -1416,7 +1664,7 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     if stats {
         eprintln!(
             "pyx-gc: pause_ms={:.3} mark_ms={:.3} sweep_ms={:.3} freed={} \
-             slabs={} capacity={} live={} reused={}",
+             slabs={} capacity={} live={} reused={} precise={} precise_frames={}",
             pause.as_secs_f64() * 1000.0,
             mark_time.as_secs_f64() * 1000.0,
             sweep_time.as_secs_f64() * 1000.0,
@@ -1424,7 +1672,9 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
             pool_stats.slabs,
             pool_stats.capacity,
             pool_stats.live,
-            pool_stats.reused
+            pool_stats.reused,
+            if strict { "strict" } else { "mixed" },
+            STAT_PRECISE_FRAMES.load(Ordering::Relaxed)
         );
     }
     freed as i64
@@ -1485,6 +1735,7 @@ fn register_current_thread(id: i64, roots: Vec<i64>) {
         pending: AtomicI64::new(crate::value::NONE),
         handled: Mutex::new(Vec::new()),
         roots: Mutex::new(roots),
+        persistent: Mutex::new(Vec::new()),
     });
     GC_SELF.with(|cell| *cell.borrow_mut() = Some(gc.clone()));
     let mut registry = lock_thread_registry();
@@ -1515,13 +1766,22 @@ pub(crate) fn leave_thread() {
         GC_CONDVAR.notify_all();
         // Drop the registry lock before the roots lock, matching the
         // collector's registry-then-roots order. The spawn arguments (tagged
-        // values owned by the thread's Rust closure) are released here.
+        // values owned by the thread's Rust closure) and the persistent
+        // roots are released here.
         drop(registry);
         gc.roots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        gc.persistent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
+    // No shadow frame survives the thread that owns its slots: drop the
+    // active set and the published snapshot so the collector can never see
+    // (and dereference) a dangling slot array.
+    roots::clear_current();
     ACTIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
 }
 
@@ -1546,6 +1806,12 @@ pub(crate) fn after_fork_child() {
     GC_SELF.with(|cell| cell.borrow_mut().take());
     {
         let mut registry = lock_thread_registry();
+        // Every other registration belonged to a thread that does not exist
+        // in the child. Its published precise roots and persistent roots must
+        // not be scanned against the child's address space.
+        for gc in registry.values() {
+            roots::clear_thread(gc.token);
+        }
         registry.clear();
     }
     ACTIVE_THREADS.store(1, Ordering::Release);
@@ -1623,6 +1889,37 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
     let started = Instant::now();
     clear_local_worklist();
     let mark_start = Instant::now();
+    // This collector runs on the mutator thread, so its precise roots are
+    // read directly (no publication needed).
+    let precise = roots::snapshot_current();
+    let precise_on = precise_enabled();
+    let exclusions = if !precise_on {
+        Vec::new()
+    } else {
+        let mut extents: Vec<(usize, usize)> = Vec::new();
+        for frame in precise.frames() {
+            if frame.high > frame.low {
+                extents.push((frame.low, frame.high));
+            }
+        }
+        for range in precise.ranges() {
+            let low = range.base as usize;
+            let high = low.saturating_add(range.count.saturating_mul(8));
+            if high > low {
+                extents.push((low, high));
+            }
+        }
+        extents.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(extents.len());
+        for (low, high) in extents {
+            match merged.last_mut() {
+                Some(last) if low <= last.1 => last.1 = last.1.max(high),
+                _ => merged.push((low, high)),
+            }
+        }
+        merged
+    };
+    let strict = precise_mode();
     {
         let addresses = &heap.addresses;
 
@@ -1631,8 +1928,14 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
         }
         // The pending exception is a thread-local root.
         mark_word(exc::pending_value() as usize, addresses);
+        // Precise frames/ranges of the frames currently on this stack.
+        if precise_on {
+            precise.mark(|value| mark_word(value as usize, addresses));
+            STAT_PRECISE_FRAMES.store(precise.frames().len() as u64, Ordering::Relaxed);
+        }
         // Rust-side owners registered through `add_thread_root` (the unittest
-        // class registry) are invisible to the stack scan in local mode too.
+        // class registry) and persistent roots are invisible to the stack
+        // scan in local mode too.
         if let Some(gc) = current_gc() {
             let roots = gc
                 .roots
@@ -1648,12 +1951,21 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
             for &value in handled.iter() {
                 mark_word(value as usize, addresses);
             }
+            let persistent = gc
+                .persistent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for &root in persistent.iter() {
+                mark_word(root as usize, addresses);
+            }
         }
 
-        scan_stack(sp, stack_high, addresses);
-        mark_captured_registers(addresses);
-        scan_aux_stack(addresses);
-        scan_suspended_stacks(addresses);
+        if !strict {
+            scan_stack_excluding(sp, stack_high, addresses, &exclusions);
+            mark_captured_registers(addresses);
+            scan_aux_stack(addresses, &exclusions);
+            scan_suspended_stacks(addresses, &exclusions);
+        }
     }
     drain_worklist();
     let mark_time = mark_start.elapsed();
@@ -1817,24 +2129,24 @@ unsafe fn trace(addr: usize) {
             if obj.marked.load(Ordering::Acquire) != GREY {
                 return;
             }
-            match &obj.data {
-                ObjData::List(items) => {
+            match obj.data_ref() {
+                ObjDataRef::List(items) => {
                     for &item in items {
                         mark_value(item);
                     }
                 }
-                ObjData::Dict(dict) => {
+                ObjDataRef::Dict(dict) => {
                     for &(key, value) in dict.entries() {
                         mark_value(key);
                         mark_value(value);
                     }
                 }
-                ObjData::Set(items) => {
+                ObjDataRef::Set(items) => {
                     for &item in items {
                         mark_value(item);
                     }
                 }
-                ObjData::DefaultDict(state) => {
+                ObjDataRef::DefaultDict(state) => {
                     if state.factory != crate::value::NONE {
                         mark_value(state.factory);
                     }
@@ -1843,7 +2155,13 @@ unsafe fn trace(addr: usize) {
                         mark_value(item);
                     }
                 }
-                ObjData::ArgParser(parser) => {
+                ObjDataRef::ArgParser(parser) => {
+                    if parser.formatter_class != crate::value::NONE {
+                        mark_value(parser.formatter_class);
+                    }
+                    if parser.argument_default != crate::value::NONE {
+                        mark_value(parser.argument_default);
+                    }
                     for spec in &parser.options {
                         if spec.type_fn != crate::value::NONE {
                             mark_value(spec.type_fn);
@@ -1851,25 +2169,36 @@ unsafe fn trace(addr: usize) {
                         if spec.default != crate::value::NONE {
                             mark_value(spec.default);
                         }
+                        if spec.const_value != crate::value::NONE {
+                            mark_value(spec.const_value);
+                        }
                         if let Some(choices) = &spec.choices {
                             for &choice in choices {
                                 mark_value(choice);
                             }
                         }
                     }
+                    for &(_, item) in &parser.defaults {
+                        mark_value(item);
+                    }
+                    if let Some(subparsers) = &parser.subparsers {
+                        for &(_, child, _) in &subparsers.parsers {
+                            mark_value(child);
+                        }
+                    }
                 }
-                ObjData::Namespace(namespace) => {
+                ObjDataRef::Namespace(namespace) => {
                     for &(_, item) in &namespace.pairs {
                         mark_value(item);
                     }
                 }
-                ObjData::Cell(value) => mark_value(*value),
+                ObjDataRef::Cell(value) => mark_value(value),
                 // A builder only holds a tagged value after the generic
                 // concatenation path; the growing text is native state.
-                ObjData::StrBuilder(crate::value::StrBuilderState::Materialized(value)) => {
+                ObjDataRef::StrBuilder(crate::value::StrBuilderState::Materialized(value)) => {
                     mark_value(*value);
                 }
-                ObjData::StrBuilder(crate::value::StrBuilderState::Building(_)) => {}
+                ObjDataRef::StrBuilder(crate::value::StrBuilderState::Building(_)) => {}
                 _ => {}
             }
             mark_black(addr);
@@ -1878,7 +2207,7 @@ unsafe fn trace(addr: usize) {
             if obj.marked.load(Ordering::Acquire) != GREY {
                 return;
             }
-            let ObjData::Queue(queue) = &obj.data else {
+            let ObjDataRef::Queue(queue) = obj.data_ref() else {
                 mark_black(addr);
                 return;
             };
@@ -1895,7 +2224,7 @@ unsafe fn trace(addr: usize) {
             if obj.marked.load(Ordering::Acquire) != GREY {
                 return;
             }
-            let ObjData::Class(state) = &obj.data else {
+            let ObjDataRef::Class(state) = obj.data_ref() else {
                 mark_black(addr);
                 return;
             };
@@ -1916,7 +2245,7 @@ unsafe fn trace(addr: usize) {
             if obj.marked.load(Ordering::Acquire) != GREY {
                 return;
             }
-            let ObjData::Instance(state) = &obj.data else {
+            let ObjDataRef::Instance(state) = obj.data_ref() else {
                 mark_black(addr);
                 return;
             };
@@ -1935,28 +2264,28 @@ unsafe fn trace(addr: usize) {
             if obj.marked.load(Ordering::Acquire) != GREY {
                 return;
             }
-            match &obj.data {
+            match obj.data_ref() {
                 // An iterator's target is immutable; its index belongs to the
                 // owning loop and is not a GC edge.
-                ObjData::Iter(state) => mark_value(state.target),
-                ObjData::Tuple(items) => {
+                ObjDataRef::Iter(state) => mark_value(state.target),
+                ObjDataRef::Tuple(items) => {
                     for &item in items {
                         mark_value(item);
                     }
                 }
-                ObjData::Thread(thread) => {
+                ObjDataRef::Thread(thread) => {
                     mark_value(thread.target);
                     for &arg in &thread.args {
                         mark_value(arg);
                     }
                 }
-                ObjData::Process(process) => {
+                ObjDataRef::Process(process) => {
                     mark_value(process.target);
                     for &arg in &process.args {
                         mark_value(arg);
                     }
                 }
-                ObjData::Pool(pool) => {
+                ObjDataRef::Pool(pool) => {
                     // The queue vectors are immutable after construction.
                     for &queue in &pool.task_queues {
                         mark_value(queue);
@@ -1965,17 +2294,17 @@ unsafe fn trace(addr: usize) {
                         mark_value(queue);
                     }
                 }
-                ObjData::CsvWriter(writer) => mark_value(writer.file),
+                ObjDataRef::CsvWriter(writer) => mark_value(writer.file),
                 // A fiber owns its call arguments and result; its suspended
                 // stack is registered as a separate root range. Join requests
                 // reference the gathered tasks.
-                ObjData::Fiber(fiber) => {
+                ObjDataRef::Fiber(fiber) => {
                     fiber.trace(mark_value);
                 }
                 // Wrapper functions own their captured values; item getters
                 // own their keys and partials own the callable and bound
                 // arguments. Names of attribute getters are plain strings.
-                ObjData::Function(function) => {
+                ObjDataRef::Function(function) => {
                     for param in &function.signature {
                         if let Some(default) = param.default {
                             mark_value(default);
@@ -2008,6 +2337,12 @@ unsafe fn trace(addr: usize) {
                         FunctionBody::BoundMethod { receiver, .. } => {
                             mark_value(*receiver);
                         }
+                        // Interpreter functions own their closure captures.
+                        FunctionBody::Host { captures, .. } => {
+                            for &capture in captures {
+                                mark_value(capture);
+                            }
+                        }
                         FunctionBody::AttributeGetter { .. }
                         | FunctionBody::Identity
                         | FunctionBody::Native { .. }
@@ -2017,7 +2352,7 @@ unsafe fn trace(addr: usize) {
                 // The explicit cause (`raise X from Y`) and the implicit
                 // context are GC edges; `from None` stores no cause but may
                 // keep the handled exception as a context.
-                ObjData::Exception(exception) => {
+                ObjDataRef::Exception(exception) => {
                     if let Some(cause) = exception.cause {
                         mark_value(cause);
                     }
@@ -2028,40 +2363,40 @@ unsafe fn trace(addr: usize) {
                 // Scalars, ranges, locks, events, cross-process
                 // queues, files, csv readers, paths, compiled patterns and
                 // matches hold no PyX values.
-                ObjData::Str(_)
-                | ObjData::Float(_)
-                | ObjData::Range { .. }
-                | ObjData::Lock(_)
-                | ObjData::Event(_)
-                | ObjData::MpQueue(_)
-                | ObjData::File(_)
-                | ObjData::Bytes(_)
-                | ObjData::Random(_)
-                | ObjData::Path(_)
-                | ObjData::Pattern(_)
-                | ObjData::Match(_)
-                | ObjData::Socket(_)
-                | ObjData::CsvReader(_)
-                | ObjData::ExtFunction(_)
-                | ObjData::Capsule { .. }
-                | ObjData::Module(_)
-                | ObjData::StdStream(_)
-                | ObjData::BigInt(_) => {}
+                ObjDataRef::Str(_)
+                | ObjDataRef::Float(_)
+                | ObjDataRef::Range { .. }
+                | ObjDataRef::Lock(_)
+                | ObjDataRef::Event(_)
+                | ObjDataRef::MpQueue(_)
+                | ObjDataRef::File(_)
+                | ObjDataRef::Bytes(_)
+                | ObjDataRef::Random(_)
+                | ObjDataRef::Path(_)
+                | ObjDataRef::Pattern(_)
+                | ObjDataRef::Match(_)
+                | ObjDataRef::Socket(_)
+                | ObjDataRef::CsvReader(_)
+                | ObjDataRef::ExtFunction(_)
+                | ObjDataRef::Capsule { .. }
+                | ObjDataRef::Module(_)
+                | ObjDataRef::StdStream(_)
+                | ObjDataRef::BigInt(_) => {}
                 // A string accumulator is traced with its own kind above,
                 // where the graph lock protects its materialised edge.
-                ObjData::StrBuilder(_) => {}
+                ObjDataRef::StrBuilder(_) => {}
                 // The mutable containers were handled above; they cannot
                 // appear here.
-                ObjData::List(_)
-                | ObjData::Dict(_)
-                | ObjData::Set(_)
-                | ObjData::DefaultDict(_)
-                | ObjData::ArgParser(_)
-                | ObjData::Namespace(_)
-                | ObjData::Queue(_)
-                | ObjData::Class(_)
-                | ObjData::Instance(_)
-                | ObjData::Cell(_) => {}
+                ObjDataRef::List(_)
+                | ObjDataRef::Dict(_)
+                | ObjDataRef::Set(_)
+                | ObjDataRef::DefaultDict(_)
+                | ObjDataRef::ArgParser(_)
+                | ObjDataRef::Namespace(_)
+                | ObjDataRef::Queue(_)
+                | ObjDataRef::Class(_)
+                | ObjDataRef::Instance(_)
+                | ObjDataRef::Cell(_) => {}
             }
             mark_black(addr);
         }
@@ -2069,10 +2404,14 @@ unsafe fn trace(addr: usize) {
 }
 
 /// Conservatively scans the native caller range of a running fiber, if any.
-fn scan_aux_stack(addresses: &AddressSet) {
+///
+/// `exclude` holds the merged byte extents of the precise shadow frames and
+/// ranges of the collection, so their slots are marked exactly instead of
+/// being scanned again here.
+fn scan_aux_stack(addresses: &AddressSet, exclude: &[(usize, usize)]) {
     for (low, high) in AUX_STACK.with(Cell::get) {
         if high > low {
-            scan_stack(low, high, addresses);
+            scan_stack_excluding(low, high, addresses, exclude);
         }
     }
 }
@@ -2080,7 +2419,7 @@ fn scan_aux_stack(addresses: &AddressSet) {
 /// Conservatively scans every lifetime-registered fiber root range of this
 /// thread (private stack and both register contexts, including the running
 /// fiber's own stack).
-fn scan_suspended_stacks(addresses: &AddressSet) {
+fn scan_suspended_stacks(addresses: &AddressSet, exclude: &[(usize, usize)]) {
     let owner = current_gc_token();
     let ranges: Vec<(usize, usize)> = lock_suspended_stacks()
         .iter()
@@ -2089,7 +2428,7 @@ fn scan_suspended_stacks(addresses: &AddressSet) {
         .collect();
     for (low, high) in ranges {
         if high > low {
-            scan_stack(low, high, addresses);
+            scan_stack_excluding(low, high, addresses, exclude);
         }
     }
 }
@@ -2097,16 +2436,41 @@ fn scan_suspended_stacks(addresses: &AddressSet) {
 /// Conservatively scans the native stack from `sp` (inclusive) up to `high`
 /// (exclusive). Every aligned word is inspected; only tagged values whose
 /// object is registered are marked.
-fn scan_stack(sp: usize, high: usize, addresses: &AddressSet) {
+///
+/// `exclude` is a sorted, merged list of half-open byte ranges that belong to
+/// precise frames/ranges. Those bytes are skipped: the precise marker already
+/// visited every live slot there, so a scan would only see dead temporaries
+/// the shadow frame has stopped reporting. The exclusion list is consumed
+/// with a monotonic index that advances alongside `cursor`, keeping the scan
+/// linear.
+fn scan_stack_excluding(
+    sp: usize,
+    high: usize,
+    addresses: &AddressSet,
+    exclude: &[(usize, usize)],
+) {
+    let word_size = std::mem::size_of::<usize>();
     let mut cursor = sp & !(std::mem::align_of::<usize>() - 1);
-    while cursor + std::mem::size_of::<usize>() <= high {
+    let mut excluded = 0usize;
+    while cursor + word_size <= high {
+        while excluded < exclude.len() && exclude[excluded].1 <= cursor {
+            excluded += 1;
+        }
+        if let Some(&(low, end)) = exclude.get(excluded) {
+            if low <= cursor && cursor < end {
+                // Jump past the whole precise extent; `end` is aligned by
+                // construction (slot arrays are `i64`-aligned).
+                cursor = end;
+                continue;
+            }
+        }
         // SAFETY: `cursor` lies inside the current thread's stack mapping
         // (bounds obtained from `pthread_attr_getstack`); the load is a plain
         // machine word read that is opaque to the compiler, so it cannot
         // assume the stack slot holds an initialized `usize`.
         let word = unsafe { load_stack_word(cursor) };
         mark_word(word, addresses);
-        cursor += std::mem::size_of::<usize>();
+        cursor += word_size;
     }
 }
 
@@ -2353,9 +2717,9 @@ fn mark_captured_registers(addresses: &AddressSet) {
 /// chose that register to hold `regs.as_mut_ptr()`. In the latter case the
 /// register's previous live value must have been spilled to the stack before
 /// the asm block (the pointer is an input operand, so the value is live up to
-/// that point), and [`scan_stack`] covers that spill slot. All other GPRs are
-/// captured verbatim. Because the whole buffer is marked, no register needs
-/// special casing.
+/// that point), and [`scan_stack_excluding`] covers that spill slot. All
+/// other GPRs are captured verbatim. Because the whole buffer is marked, no
+/// register needs special casing.
 ///
 /// No clobbers are declared: the block only reads registers and writes the
 /// buffer through the pointer. Default asm options are kept so the memory

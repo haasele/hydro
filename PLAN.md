@@ -65,10 +65,10 @@ counts are in [`AGENTS.md`](AGENTS.md#current-state). The gate is
 `scripts/verify.sh` on a fresh checkout.
 
 - **Phase 1 — done.**
-- **Phase 2 — largely done.** Lazy generators and generator expressions,
-  coroutines/event loop, shared heap with concurrent GC and no GIL. Open:
-  precise GC roots/stack maps, async generators/comprehensions, mutable
-  closures.
+- **Phase 2 — done.** Lazy/async generators, coroutines/event loop and task
+  groups, exception chaining, precise shadow-stack GC + size-classed payload
+  allocator, shared heap/concurrency without a GIL, TLS/UDP/select networking,
+  argparse/pytest, and the IR interpreter/REPL are verified by the gate.
 - **Phase 3 — core present.** `new`/`init`/`test`/`fmt`/`lint`/`clean`, build
   cache, uv passthrough. Open: uv interpreter injection, reproducible builds,
   packaging.
@@ -106,8 +106,10 @@ declared now; pre-production releases track the moving 3.14.x target (P4-12).
 - **C-API/ABI compatibility** is the largest cost driver; option B preserves
   the PyX startup/GC advantages, but the full `PyTypeObject`/refcount/GC/GIL
   surface for NumPy and `pydantic-core` remains (P4-04c/d).
-- **Precise GC roots/stack maps** are still open; conservative scanning is an
-  interim measure, not the target design (P2-06/P2-07).
+- **Precise GC roots** cover generated frames/arrays and strict mode; the
+  remaining risk is native Rust owners that hold tagged locals across
+  allocations and must root them explicitly. Optional codegen stack maps are
+  not required for correctness.
 - **uv coupling** may force a fork; current decision is passthrough with no
   fork without an architectural blocker.
 - **Dynamic features** (monkey-patching, `eval`, metaclasses) conflict with

@@ -78,7 +78,8 @@ fn render_json(stats: &GcStats) -> String {
     format!(
         "{{\"collections\":{},\"live_objects\":{},\"threshold\":{},\
          \"pause_total_us\":{},\"pause_max_us\":{},\"mark_total_us\":{},\
-         \"sweep_total_us\":{},\"freed_total\":{},\"stress\":{}}}",
+         \"sweep_total_us\":{},\"freed_total\":{},\"stress\":{},\
+         \"precise\":{},\"precise_frames\":{}}}",
         stats.collections,
         stats.live_objects,
         stats.threshold,
@@ -87,7 +88,9 @@ fn render_json(stats: &GcStats) -> String {
         stats.mark_total_us,
         stats.sweep_total_us,
         stats.freed_total,
-        stats.stress
+        stats.stress,
+        stats.precise,
+        stats.precise_frames
     )
 }
 
@@ -101,4 +104,9 @@ fn print_human(stats: &GcStats) {
     println!("  mark total     {} us", stats.mark_total_us);
     println!("  sweep total    {} us", stats.sweep_total_us);
     println!("  freed total    {}", stats.freed_total);
+    println!(
+        "  precise mode   {}",
+        if stats.precise { "strict" } else { "mixed" }
+    );
+    println!("  precise frames {}", stats.precise_frames);
 }

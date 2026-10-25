@@ -19,7 +19,7 @@ conceptually Bun for Python. Sources of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | done | CI, README, licenses, changelog, hyperfine adapter, release workflow |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | largely done; containers, classes, closures, lazy generators, coroutines/event loop, exceptions/chaining, threads/processes/pool, shared heap + concurrent GC (no GIL) | per-crate tests below |
+| P2 Runtime | **done & verified**: containers/classes/closures, lazy generators + async generators/TaskGroup, exception hierarchy/chaining, precise shadow-stack GC + size-classed payload allocator, threads/processes/pool with shutdown cleanup, TLS/UDP/select networking, argparse/pytest, IR interpreter/REPL, fuzz gate | `scripts/verify.sh` ALL GREEN |
 | P3 Toolchain | core present (`new`/`init`/`test`/`fmt`/`lint`/`clean`, build cache, uv passthrough) | E2E/cache tests |
 | P4 Compatibility | **CPython 3.14.9 target; option B (PyX-native ABI, no `libpython`); abi3 slice + import matrix + official-test gate**; full ABI/stdlib/ecosystem open | `docs/C_API.md`, `docs/COMPATIBILITY.md`, `docs/CPYTHON_TESTS.md` |
 | P5 Performance | baseline + local threshold gate + CPython/PyX/PyPy/Go engine comparison | `benchmarks/pyx/results/latest.md`, `thresholds.json`, `compare_engines.py` |
@@ -32,24 +32,25 @@ in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
 ### Test counts (canonical — update only here)
 
-`cargo test --workspace` on 2026-10-25: **1490 tests**:
+`cargo test --workspace` on 2026-10-26: **1679 tests**:
 
 | Suite | Tests |
 |---|---:|
-| runtime unit | 523 |
-| runtime integration | 201 |
-| frontend | 436 |
-| codegen | 56 |
+| runtime unit | 531 |
+| runtime integration | 275 |
+| frontend | 476 (incl. 4 fuzz smoke) |
+| codegen | 57 |
 | IR | 18 |
-| CLI/E2E | 256 (incl. 154 E2E) |
+| interpreter unit | 11 |
+| CLI/E2E | 311 |
 
 Other docs must link here instead of repeating the total; future agents add
 tests, so this block is the only exact count.
 
 ### Compatibility checkpoint (2026-10-25)
 
-- **Import matrix:** **60/297 modules importable** (13 builtin/frozen, 43 pure,
-  4 extension; 39/131/59 + 8 platform missing; 9 modules fail under CPython
+- **Import matrix:** **63/297 modules importable** (13 builtin/frozen, 45 pure,
+  5 extension; 39/129/58 + 8 platform missing; 9 modules fail under CPython
   3.14.9 itself). Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
 - **Official suite:** **1/398 passing** (`test_errno.py`), 334 `pyx_fail`,
@@ -60,31 +61,38 @@ tests, so this block is the only exact count.
   CPython 3.14 headers, loads from a sibling `.so` and runs under JIT and AOT;
   neither the CLI nor the AOT binary links `libpython`. Multi-phase init and
   wheel-tag validation work; wheels/venvs and the full ABI are open.
-- **`bench_all.py` under PyX:** the full suite completes with
-  `PYX_GC_THRESHOLD` raised (official pure-Python `rich` renders; native
-  `rich.status.Status` shim; AOT report written). Default-GC rendering still
-  loses live values — precise roots (P2-06/P2-07) are the fix.
-- **Benchmarks:** micro harness + tracked baselines; `math_loop` at parity
-  (AOT 1.01x, JIT 0.94x at n=200000); 100k generator sum CPython 10.2 /
-  JIT 7.7 / AOT 6.8 ms. `compare_engines.py` covers CPython/PyX/PyPy/Go and
-  skips missing engines without inventing numbers.
+- **`bench_all.py` under PyX:** the PyX group completes at the **default GC
+  threshold** (official pure-Python `rich` renders; AOT report written). The
+  full suite was previously green with `PYX_GC_THRESHOLD` raised; the default
+  gate is now the normal path. Precise roots are active by default, with
+  `PYX_GC_PRECISE=1` strict and `PYX_GC_PRECISE=0` conservative fallback.
+- **Benchmarks:** micro harness + tracked baselines; default-GC n=200000
+  PyX group: hello JIT/AOT 1.88/1.19 ms, while_sum 3.94/2.96 ms,
+  math_loop 4.52/2.62 ms, async_gather 24.04/22.11 ms. Root-frame emission
+  made generator resume the current weak spot (JIT/AOT 16.07/14.61 ms vs
+  CPython 11.23 ms); P5 performance work owns that regression.
+  `compare_engines.py` covers CPython/PyX/PyPy/Go and skips missing engines.
 
 ### Known limits (details in `docs/TODO.md` / `ARCHITECTURE.md` §10)
 
-- GC is conservative with a shared heap; precise roots/stack maps and variable
-  payload size classes are open.
-- Async generators/comprehensions and `asyncio` beyond run/sleep/gather are
-  open; generator expressions are lazy (synthetic generator function); mutable
-  closure bindings use shared heap cells with `nonlocal` support. `range`
-  bounds still use native i64; async generators/comprehensions and full
-  `asyncio` are explicit open programs.
+- GC is precise for generated frames/arrays, with a conservative fallback for
+  Rust-side frames/tests; strict mode (`PYX_GC_PRECISE=1`) removes it.
+  Native Rust owners must still root tagged locals explicitly.
+- Async generators/comprehensions, `async for`/`async with`, cancellation and
+  `TaskGroup` are implemented; `ExceptionGroup`, `wait_for` and the wider
+  `asyncio` API remain open. Generator expressions are lazy; loops root-heavy
+  generator resumes are the current performance weak spot.
+- Full CPython stdlib/P7 parity, C extensions/full ABI, and the ecosystem
+  suites remain open; P2-13 covers the core named modules only.
 - Imports: packages, dotted/relative imports and site-packages work; no general
   `sys.path`/`sys.modules`, namespace/zip/frozen imports or `from x import *`.
 - Language: no user decorators, metaclasses, multiple inheritance, pattern
   matching, `except*`, positional-only params, dict views or
   `bytearray`/`memoryview`; `*args` + `**kwargs` in one call is still deferred.
-- Stdlib is a curated subset; `re` is Rust syntax, `socket` is blocking TCP,
-  `argparse`/`unittest` are subsets, pickle uses PYX1.
+- Stdlib is a curated subset; `re` is Rust syntax, `socket` supports TCP/UDP/
+  IPv6, TLS client, non-blocking I/O and selectors; argparse covers the
+  documented CPython surface, pytest is the native runner, and pickle uses
+  PYX1. Full P7 parity is open.
 - C-API is a defined limited subset; no real wheels, NumPy/pydantic-core, GIL
   emulation or `ctypes`/`cffi` yet.
 - `uv` is a passthrough: no interpreter injection/lockfile interpretation;
@@ -94,21 +102,19 @@ tests, so this block is the only exact count.
 
 ## Next Steps
 
-1. **P2-06/P2-07:** precise GC roots/stack maps + variable payload size
-   classes; this unblocks the default-GC `bench_all.py` gate (P7-22) and
-   P5-04 tuning.
-2. **P7 stdlib:** continue Batches B/C/D/E/F, wire P7-05 per-module
+1. **P7 stdlib:** continue Batches B/C/D/E/F, wire P7-05 per-module
    `Lib/test` subsets, then the dependency-ordered remaining batches.
-3. **P4:** P4-04c/d full ABI/GIL, P4-05 wheel install, P4-06 `ctypes`/`cffi`,
+2. **P4:** P4-04c/d full ABI/GIL, P4-05 wheel install, P4-06 `ctypes`/`cffi`,
    then ecosystem suites/benchmarks (P4-10/P4-11).
-4. **P2-12:** async generators/comprehensions, async for/with and broader
-   asyncio.
-5. **P3:** uv interpreter injection, reproducible builds (P3-05), packaging
+3. **P5:** recover the generator-resume root-frame overhead (default-GC
+   `generator_sum` is currently slower than CPython), then PGO/inlining and
+   threshold tuning.
+4. **P3:** uv interpreter injection, reproducible builds (P3-05), packaging
    (P3-08).
-6. **P6:** troubleshooting/migration docs (P6-09), progress/exit summary
+5. **P6:** troubleshooting/migration docs (P6-09), progress/exit summary
    (P6-10).
-7. **Cross-cutting:** fuzzing (Q-03/Q-04), `unsafe` security review (Q-05),
-   debugger (Q-01), cross-platform (Q-09).
+6. **Cross-cutting:** long fuzz campaigns (Q-03/Q-04), `unsafe` security
+   review (Q-05), debugger (Q-01), cross-platform (Q-09).
 
 ## Commands
 

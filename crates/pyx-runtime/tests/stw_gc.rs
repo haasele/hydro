@@ -7,6 +7,11 @@
 //! test binary forever.
 //!
 //! Values are tagged `i64`s; `pyx_to_int` decodes tagged integers.
+//!
+//! MIXED MODE ONLY: the worker closures and the main test body hold tagged
+//! values in unregistered Rust locals/registers. Strict precise-root coverage
+//! (the only mode that disables conservative scanning) lives in
+//! `tests/precise_gc.rs`, which roots every value explicitly.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc;

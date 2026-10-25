@@ -53,9 +53,14 @@ pub(crate) fn usage_text() -> String {
          pyx init [path] [--force]          scaffold a project in an existing directory\n  \
          pyx check <file.py> [options]      parse and type-check only\n  \
          pyx run <file.py> [options]        compile with the JIT and run\n  \
+         pyx run --interpret <file.py>      run the IR tree-walk interpreter\n  \
+         pyx repl [--no-echo] [--no-banner]  run a persistent interpreter session\n  \
+         pyx -c <code> [args...]            run code with the interpreter (sys.argv[0] = -c)\n  \
+         pyx -i [<file> | -c <code>] [args...]  run the file/code, then enter the interpreter\n  \
          pyx gc [--json] <file.py> [options]   run and report GC statistics\n  \
          pyx build <file.py> [options]      compile and link a native executable\n  \
          pyx test [paths...] [options]      run test_*.py / *_test.py files with `pyx run`\n  \
+         pyx pytest [paths...] [options]    run pytest-style tests, one process per file\n  \
          pyx fmt [paths...] [--check]       strip trailing whitespace and fix the final newline\n  \
          pyx lint [paths...] [options]      type-check every .py file in the given paths\n  \
          pyx clean [--dry-run]              remove .pyx/cache and target/pyx-tmp\n  \
@@ -80,12 +85,34 @@ pub(crate) fn usage_text() -> String {
          explicit files are always used as given\n  \
          a test passes when its program exits with status 0; there are no\n  \
          pytest-style assertions\n  \
+         pytest runs test_*.py / *_test.py files in a fresh child process each,\n  \
+         with `pytest.fixture`, `pytest.mark.parametrize`, `raises`, `approx`,\n  \
+         skip/xfail markers and ancestor conftest.py files\n  \
+         -q, --quiet              (pytest) print one status character per test\n  \
+         -x, --exitfirst          (pytest) stop after the first failure\n  \
+         --maxfail=N              (pytest) stop after N failures\n  \
+         -k EXPR                  (pytest) only run tests matching EXPR\n  \
+                                  (substring, `not`, `and`, `or`)\n  \
+         --json                   (pytest) print the aggregated result as JSON\n  \
+                                  exit codes: 0 pass, 1 failure, 2 collection,\n  \
+                                  5 no tests\n  \
          --check                  (fmt) report files that need formatting, do not write\n  \
          --json                   (test) print a JSON array of results on stdout\n  \
                                   (lint) print diagnostics as a JSON array on stderr\n  \
          --color=<WHEN>           colorize output: auto, always or never (default: auto)\n  \
          --no-color               disable colors (same as --color=never)\n\n\
-         diagnostic options (check, run, gc, build, test, lint):\n  \
+         repl / -c / -i:\n  \
+         one persistent tree-walk interpreter session: every input is compiled\n  \
+         and executed in the same namespace, so earlier bindings, functions and\n  \
+         classes stay usable and imports are initialized once\n  \
+         the value of a trailing top-level expression is printed and stored in\n  \
+         `_`; assignments and compound statements print nothing\n  \
+         prompts and the banner go to stderr and only appear when stdin is a\n  \
+         terminal; program output and echoed values go to stdout\n  \
+         --no-echo                do not echo expression values\n  \
+         --no-banner              do not print the version banner\n  \
+         --quiet                  suppress the banner and prompts\n\n\
+         diagnostic options (check, run, gc, build, test, lint, repl, -c, -i):\n  \
          --json                   print diagnostics as a JSON array on stderr\n  \
          --color=<WHEN>           colorize diagnostics: auto, always or never (default: auto)\n  \
          --no-color               disable colors (same as --color=never)\n\n\

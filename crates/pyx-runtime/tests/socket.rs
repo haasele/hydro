@@ -1,4 +1,5 @@
-//! Integration tests for the blocking TCP `socket` module.
+//! Integration tests for the TCP/UDP `socket` module (blocking and
+//! non-blocking paths, IPv6, socketpair and address helpers).
 //!
 //! The heap and thread registry are process-global, so every test takes
 //! `TEST_LOCK` and starts from `pyx_runtime_init`. The server thread is a
@@ -263,9 +264,9 @@ fn recv_timeout_and_flags_errors() {
     clear_error();
     assert!(started.elapsed() < Duration::from_secs(5));
 
-    // Flags other than zero are not supported.
+    // Flags must be integers.
     assert_eq!(
-        method(connection, "send", &[bytes(b"x"), int(1)]),
+        method(connection, "send", &[bytes(b"x"), text("peek")]),
         pyx_none()
     );
     clear_error();
@@ -362,17 +363,20 @@ fn constants_and_sockopts() {
     let value = method(socket, "getsockopt", &[int(1), int(2)]);
     assert_eq!(decode(value), 1);
 
-    // Unsupported family/type are rejected.
+    // Unsupported family/type are rejected; AF_INET6 and SOCK_DGRAM are not.
     assert_eq!(
-        module("socket", "socket", &[int(10), int(1), int(0)]),
+        module("socket", "socket", &[int(99), int(1), int(0)]),
         pyx_none()
     );
     clear_error();
     assert_eq!(
-        module("socket", "socket", &[int(2), int(2), int(0)]),
+        module("socket", "socket", &[int(2), int(3), int(0)]),
         pyx_none()
     );
     clear_error();
+    assert_eq!(module_get("socket", "AF_INET6"), int(10));
+    assert_eq!(module_get("socket", "SOCK_DGRAM"), int(2));
+    assert_eq!(module_get("socket", "IPPROTO_UDP"), int(17));
     assert_eq!(method(socket, "close", &[]), pyx_none());
 
     let host = module("socket", "gethostname", &[]);
@@ -394,4 +398,225 @@ fn gc_collects_closed_sockets_without_panicking() {
     assert_no_error();
     let _ = pyx_gc_collect();
     assert_no_error();
+}
+
+#[test]
+fn datagram_echo_uses_udp_and_addresses() {
+    let _guard = guard();
+    pyx_runtime_init();
+
+    let first = module("socket", "socket", &[int(2), int(2), int(0)]);
+    assert_no_error();
+    let second = module("socket", "socket", &[int(2), int(2), int(0)]);
+    assert_no_error();
+
+    let second_address = tuple(&[text("127.0.0.1"), int(0)]);
+    assert_eq!(method(second, "bind", &[second_address]), pyx_none());
+    assert_no_error();
+    let second_name = method(second, "getsockname", &[]);
+    assert_no_error();
+    let second_port = decode(pyx_subscript(second_name, int(1)));
+    assert!(second_port > 0);
+
+    let first_address = tuple(&[text("127.0.0.1"), int(0)]);
+    assert_eq!(method(first, "bind", &[first_address]), pyx_none());
+    assert_no_error();
+
+    let written = method(
+        first,
+        "sendto",
+        &[
+            bytes(b"udp-ping"),
+            tuple(&[text("127.0.0.1"), int(second_port)]),
+        ],
+    );
+    assert_no_error();
+    assert_eq!(decode(written), 8);
+
+    settimeout(second, 2.0);
+    let received = method(second, "recvfrom", &[int(64)]);
+    assert_no_error();
+    assert_bytes(pyx_subscript(received, int(0)), b"udp-ping");
+    let peer = pyx_subscript(received, int(1));
+    assert!(eq(pyx_subscript(peer, int(0)), text("127.0.0.1")));
+    let first_name = method(first, "getsockname", &[]);
+    assert_no_error();
+    assert_eq!(
+        decode(pyx_subscript(peer, int(1))),
+        decode(pyx_subscript(first_name, int(1)))
+    );
+
+    assert_eq!(method(first, "close", &[]), pyx_none());
+    assert_eq!(method(second, "close", &[]), pyx_none());
+    assert_no_error();
+}
+
+#[test]
+fn nonblocking_recv_reports_blocking_io_error() {
+    let _guard = guard();
+    pyx_runtime_init();
+
+    let server = new_socket();
+    let port = bind_loopback(server);
+    assert_eq!(method(server, "listen", &[int(1)]), pyx_none());
+    settimeout(server, 5.0);
+
+    let client = new_socket();
+    settimeout(client, 5.0);
+    assert_eq!(method(client, "connect", &[address(port)]), pyx_none());
+    assert_no_error();
+    let accepted = method(server, "accept", &[]);
+    assert_no_error();
+    let connection = pyx_subscript(accepted, int(0));
+    settimeout(connection, 5.0);
+
+    assert_eq!(method(client, "setblocking", &[pyx_false()]), pyx_none());
+    assert_eq!(method(client, "getblocking", &[]), pyx_false());
+    let started = Instant::now();
+    assert_eq!(method(client, "recv", &[int(8)]), pyx_none());
+    assert!(eq(
+        error_message(),
+        text("[Errno 11] Resource temporarily unavailable")
+    ));
+    clear_error();
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    assert_eq!(method(client, "setblocking", &[pyx_true()]), pyx_none());
+    assert_eq!(method(client, "getblocking", &[]), pyx_true());
+
+    assert_eq!(method(connection, "sendall", &[bytes(b"data")]), pyx_none());
+    assert_bytes(method(client, "recv", &[int(4)]), b"data");
+
+    assert_eq!(method(connection, "close", &[]), pyx_none());
+    assert_eq!(method(client, "close", &[]), pyx_none());
+    assert_eq!(method(server, "close", &[]), pyx_none());
+}
+
+#[test]
+fn socketpair_returns_connected_streams() {
+    let _guard = guard();
+    pyx_runtime_init();
+
+    let pair = module("socket", "socketpair", &[]);
+    assert_no_error();
+    let left = pyx_subscript(pair, int(0));
+    let right = pyx_subscript(pair, int(1));
+    settimeout(left, 2.0);
+    settimeout(right, 2.0);
+
+    assert_eq!(method(left, "sendall", &[bytes(b"pair")]), pyx_none());
+    assert_no_error();
+    assert_bytes(method(right, "recv", &[int(4)]), b"pair");
+
+    assert_eq!(method(left, "close", &[]), pyx_none());
+    assert_eq!(method(right, "close", &[]), pyx_none());
+}
+
+#[test]
+fn address_helpers_convert_and_resolve() {
+    let _guard = guard();
+    pyx_runtime_init();
+
+    assert_eq!(module_get("socket", "AF_INET6"), int(10));
+    assert_eq!(module_get("socket", "SOCK_DGRAM"), int(2));
+    assert_eq!(module_get("socket", "IPPROTO_TCP"), int(6));
+    assert_eq!(module_get("socket", "IPPROTO_UDP"), int(17));
+
+    let packed = module("socket", "inet_pton", &[int(2), text("127.0.0.1")]);
+    assert_bytes(packed, &[127, 0, 0, 1]);
+    assert!(eq(
+        module("socket", "inet_ntop", &[int(2), packed]),
+        text("127.0.0.1")
+    ));
+
+    let packed6 = module("socket", "inet_pton", &[int(10), text("::1")]);
+    assert_no_error();
+    assert!(eq(
+        module("socket", "inet_ntop", &[int(10), packed6]),
+        text("::1")
+    ));
+
+    let entries = module(
+        "socket",
+        "getaddrinfo",
+        &[text("127.0.0.1"), int(80), int(2), int(1), int(6)],
+    );
+    assert_no_error();
+    assert!(decode(pyx_len(entries)) >= 1);
+    let first = pyx_subscript(entries, int(0));
+    assert_eq!(decode(pyx_subscript(first, int(0))), 2);
+    assert_eq!(decode(pyx_subscript(first, int(1))), 1);
+    assert_eq!(decode(pyx_subscript(first, int(2))), 6);
+    let sockaddr = pyx_subscript(first, int(4));
+    assert!(eq(pyx_subscript(sockaddr, int(0)), text("127.0.0.1")));
+    assert_eq!(decode(pyx_subscript(sockaddr, int(1))), 80);
+
+    assert!(eq(
+        module("socket", "gethostbyname", &[text("127.0.0.1")]),
+        text("127.0.0.1")
+    ));
+    assert_no_error();
+}
+
+#[test]
+fn ipv6_loopback_echo_when_available() {
+    let _guard = guard();
+    pyx_runtime_init();
+
+    let server = module("socket", "socket", &[int(10), int(1), int(0)]);
+    assert_no_error();
+    let bound = method(server, "bind", &[tuple(&[text("::1"), int(0)])]);
+    if pyx_exc_pending() == 1 {
+        // No IPv6 loopback on this host: the bind failure is the skip signal.
+        clear_error();
+        assert_eq!(method(server, "close", &[]), pyx_none());
+        return;
+    }
+    assert_eq!(bound, pyx_none());
+    let name = method(server, "getsockname", &[]);
+    assert_no_error();
+    assert_eq!(decode(pyx_len(name)), 4);
+    assert!(eq(pyx_subscript(name, int(0)), text("::1")));
+    let port = decode(pyx_subscript(name, int(1)));
+    assert!(port > 0);
+
+    assert_eq!(method(server, "listen", &[int(1)]), pyx_none());
+    settimeout(server, 5.0);
+
+    let client = module("socket", "socket", &[int(10), int(1), int(0)]);
+    settimeout(client, 5.0);
+    assert_eq!(
+        method(client, "connect", &[tuple(&[text("::1"), int(port)])]),
+        pyx_none()
+    );
+    assert_no_error();
+    let accepted = method(server, "accept", &[]);
+    assert_no_error();
+    let connection = pyx_subscript(accepted, int(0));
+    settimeout(connection, 5.0);
+    assert_eq!(method(client, "sendall", &[bytes(b"v6")]), pyx_none());
+    assert_bytes(method(connection, "recv", &[int(2)]), b"v6");
+
+    assert_eq!(method(client, "close", &[]), pyx_none());
+    assert_eq!(method(connection, "close", &[]), pyx_none());
+    assert_eq!(method(server, "close", &[]), pyx_none());
+}
+
+#[test]
+fn context_manager_enter_and_exit() {
+    let _guard = guard();
+    pyx_runtime_init();
+
+    let socket = new_socket();
+    assert!(eq(method(socket, "__enter__", &[]), socket));
+    assert_no_error();
+    assert!(eq(pyx_to_str(socket), text("<socket object, unbound>")));
+    assert_eq!(
+        method(socket, "__exit__", &[pyx_none(), pyx_none(), pyx_none()]),
+        pyx_none()
+    );
+    assert_no_error();
+    assert!(eq(pyx_to_str(socket), text("<socket closed>")));
+    assert_eq!(method(socket, "recv", &[int(1)]), pyx_none());
+    clear_error();
 }

@@ -22,9 +22,14 @@ async def main():
 print(asyncio.run(main()))
 
 
+async def values():
+    yield 1
+    yield 2
+
+
 async def collect():
     out = []
-    async for value in [1, 2]:
+    async for value in values():
         out.append(value)
     return out
 
