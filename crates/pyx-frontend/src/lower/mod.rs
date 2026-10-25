@@ -1160,12 +1160,14 @@ pub struct Lowerer<'a> {
     /// Module-level names mirrored into the runtime global table.
     global_names: HashSet<String>,
     /// Global names actually read by a function or method of this unit.
-    /// Single-source checks only mirror those; multi-module programs mirror
-    /// every exported name because importers read them.
+    /// Single-source checks and the entry module only mirror those; imported
+    /// units mirror every exported name because importers read them.
     used_globals: HashSet<String>,
     /// Mirror every module-level assignment and class definition into the
-    /// global table. Enabled when linking imported modules, whose globals are
-    /// read by other compilation units.
+    /// global table. Enabled for imported units, whose globals are read by
+    /// other compilation units. The entry module leaves it off: it has no
+    /// importers, and mirroring every assignment would add a global store to
+    /// each top-level loop iteration.
     mirror_all_globals: bool,
     /// `from X import f [as g]` bindings: name -> (module, function spec).
     imported_functions: HashMap<String, (&'static ModuleSpec, &'static FunctionSpec)>,
@@ -1329,8 +1331,10 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Mirrors every module-level assignment and class definition into the
-    /// runtime global table. Multi-module programs enable this because an
-    /// importer may read any exported name.
+    /// runtime global table. Imported units enable this because an importer
+    /// may read any exported name. The entry module leaves it disabled: only
+    /// the names its own functions read are mirrored (see
+    /// `collect_function_read_globals`).
     pub fn set_mirror_all_globals(&mut self, enabled: bool) {
         self.mirror_all_globals = enabled;
     }
@@ -1389,6 +1393,12 @@ impl<'a> Lowerer<'a> {
         //    The exported global names are known first: `from . import name`
         //    inside a package may refer to a name defined by this unit.
         collect_global_names(&module.body, &mut self.global_names);
+        // Functions may read module globals, so those names must be mirrored
+        // even when the assignment is lowered before the function body. Scan
+        // the function and method bodies up front; this also keeps the entry
+        // module, which does not mirror every global, correct regardless of
+        // lowering order.
+        self.collect_function_read_globals(&module.body);
         // A function may assign a module global without the module body
         // assigning it: `global x` makes the name an export and forces the
         // runtime global table to be its home.
@@ -1546,8 +1556,8 @@ impl<'a> Lowerer<'a> {
     /// initializing when the importer is lowered (an ancestor package, or a
     /// module reached by a deferred import that closes a cycle). Those members
     /// are read by name from the module's global table, whose function entries
-    /// this statement creates. Only multi-module programs mirror, because only
-    /// they have importers.
+    /// this statement creates. Only imported units mirror, because only they
+    /// have importers.
     fn mirror_module_function(
         &mut self,
         index: usize,
@@ -1748,6 +1758,25 @@ impl<'a> Lowerer<'a> {
     // ------------------------------------------------------------------
     // Imports
     // ------------------------------------------------------------------
+
+    /// Records module-level names that this unit's own functions and methods
+    /// read, so their module-body assignments and class definitions mirror
+    /// into the runtime global table.
+    ///
+    /// This must run before the module body is lowered: a `def` nested in a
+    /// module-level compound statement is only discovered while its enclosing
+    /// block is lowered, so a preceding assignment would otherwise be missed.
+    /// Names are intersected with [`Self::global_names`]: only bindings this
+    /// module actually creates can be mirrored.
+    fn collect_function_read_globals(&mut self, stmts: &[ast::Stmt]) {
+        let mut names = Vec::new();
+        collect_module_function_free_names(stmts, &mut names);
+        for name in names {
+            if self.global_names.contains(&name) {
+                self.used_globals.insert(name);
+            }
+        }
+    }
 
     /// Collects module-level imports, which the loader links eagerly.
     ///
@@ -3733,14 +3762,16 @@ impl<'a> Lowerer<'a> {
     /// Appends one lowered statement and, for module-body assignments and
     /// class definitions, the matching [`HStmtKind::GlobalSet`].
     ///
-    /// Every module-level value is mirrored in multi-module programs:
-    /// importers read it through the runtime global table, so whether the
-    /// value is used cannot be decided while lowering a dependency. Single-
-    /// source checks only mirror names their own functions read. The global
-    /// store reads the just-assigned local, so the right-hand side is evaluated
-    /// exactly once even when it has side effects. Compound module-level blocks
-    /// (`if`, `for`, `try`, ...) lower through [`Self::lower_block`], so
-    /// conditional assignments are mirrored on the path that actually runs.
+    /// Imported modules mirror every module-level value: an importer may read
+    /// it through the runtime global table, so whether the value is used cannot
+    /// be decided while lowering a dependency. The entry module (and a
+    /// single-source check) has no importers and only mirrors the names its own
+    /// functions read, keeping top-level loops free of a global store per
+    /// iteration. The global store reads the just-assigned local, so the
+    /// right-hand side is evaluated exactly once even when it has side effects.
+    /// Compound module-level blocks (`if`, `for`, `try`, ...) lower through
+    /// [`Self::lower_block`], so conditional assignments are mirrored on the
+    /// path that actually runs.
     fn push_lowered_stmt(
         &mut self,
         stmt: &ast::Stmt,
@@ -3756,7 +3787,10 @@ impl<'a> Lowerer<'a> {
         };
         let (line, col) = (h.line, h.col);
         let class_global = match &h.kind {
-            HStmtKind::ClassDef { target, name, .. } if fs.is_module && self.mirror_all_globals => {
+            HStmtKind::ClassDef { target, name, .. }
+                if fs.is_module
+                    && (self.mirror_all_globals || self.used_globals.contains(name)) =>
+            {
                 Some((name.clone(), *target))
             }
             _ => None,
@@ -9883,6 +9917,61 @@ fn collect_global_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// Free names read by the functions and class methods defined at module level,
+/// including definitions nested in module-level compound statements.
+///
+/// Function bodies are not descended into for further definitions: a nested
+/// `def` is a binding inside the function, and `function_free_names` already
+/// folds the names such nested functions read into its result. Class bodies
+/// are separate scopes, so their methods are scanned explicitly; other class
+/// body statements execute at module level and read module locals directly.
+fn collect_module_function_free_names(stmts: &[ast::Stmt], out: &mut Vec<String>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::FunctionDef(f) => out.extend(function_free_names(&f.body, f.args.as_ref())),
+            ast::Stmt::AsyncFunctionDef(f) => {
+                out.extend(function_free_names(&f.body, f.args.as_ref()))
+            }
+            ast::Stmt::ClassDef(c) => {
+                for member in &c.body {
+                    match member {
+                        ast::Stmt::FunctionDef(f) => {
+                            out.extend(function_free_names(&f.body, f.args.as_ref()))
+                        }
+                        ast::Stmt::AsyncFunctionDef(f) => {
+                            out.extend(function_free_names(&f.body, f.args.as_ref()))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ast::Stmt::If(s) => {
+                collect_module_function_free_names(&s.body, out);
+                collect_module_function_free_names(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_module_function_free_names(&s.body, out);
+                collect_module_function_free_names(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_module_function_free_names(&s.body, out);
+                collect_module_function_free_names(&s.orelse, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_module_function_free_names(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_module_function_free_names(&handler.body, out);
+                }
+                collect_module_function_free_names(&s.orelse, out);
+                collect_module_function_free_names(&s.finalbody, out);
+            }
+            ast::Stmt::With(s) => collect_module_function_free_names(&s.body, out),
+            _ => {}
+        }
+    }
+}
+
 /// True when a call has a starred positional operand or a `**` keyword. Such
 /// operands cannot be expanded at compile time.
 fn call_has_dynamic_arguments(call: &ast::ExprCall) -> bool {
@@ -9999,9 +10088,12 @@ fn collect_declared_globals(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     }
 }
 
-/// The `(name, local)` pair mirrored by a module-body assignment or class
-/// definition, if the statement is a simple-name `Assign`/`AnnAssign`/
-/// `AugAssign` or a `ClassDef`.
+/// The `(name, local)` pair mirrored by a module-body simple-name
+/// `Assign`/`AnnAssign`/`AugAssign`.
+///
+/// Class definitions are mirrored by `push_lowered_stmt` itself, because the
+/// class object is created by the statement rather than by a simple-name
+/// store.
 fn global_assignment_target(stmt: &ast::Stmt, h: &HStmt) -> Option<(String, LocalId)> {
     match (stmt, &h.kind) {
         (ast::Stmt::Assign(s), HStmtKind::Assign { target, .. }) => match s.targets.as_slice() {
@@ -10016,9 +10108,6 @@ fn global_assignment_target(stmt: &ast::Stmt, h: &HStmt) -> Option<(String, Loca
             ast::Expr::Name(name) => Some((name.id.to_string(), *target)),
             _ => None,
         },
-        (ast::Stmt::ClassDef(s), HStmtKind::ClassDef { target, .. }) => {
-            Some((s.name.to_string(), *target))
-        }
         _ => None,
     }
 }

@@ -33,6 +33,39 @@ fn assigned<'a>(hir: &'a LHir, name: &str) -> &'a HExpr {
     panic!("no assignment to '{name}'");
 }
 
+/// True when `stmts` or any nested block emits a `GlobalSet`.
+fn has_global_set(stmts: &[HStmt]) -> bool {
+    stmts.iter().any(|stmt| match &stmt.kind {
+        HStmtKind::GlobalSet { .. } => true,
+        HStmtKind::If {
+            then_body,
+            else_body,
+            ..
+        } => has_global_set(then_body) || has_global_set(else_body),
+        HStmtKind::While {
+            body, else_body, ..
+        }
+        | HStmtKind::ForRange {
+            body, else_body, ..
+        }
+        | HStmtKind::ForEach {
+            body, else_body, ..
+        } => has_global_set(body) || has_global_set(else_body),
+        HStmtKind::Try {
+            body,
+            handlers,
+            else_body,
+            finally_body,
+        } => {
+            has_global_set(body)
+                || handlers.iter().any(|handler| has_global_set(&handler.body))
+                || has_global_set(else_body)
+                || has_global_set(finally_body)
+        }
+        _ => false,
+    })
+}
+
 #[test]
 fn import_forms_resolve_to_module_nodes() {
     let source = "import math, sys as system\n\
@@ -5252,6 +5285,121 @@ fn functions_read_module_level_names_as_globals() {
         }
         other => panic!("expected a global read, got {other:?}"),
     }
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn module_loop_variables_are_not_mirrored_when_no_function_reads_them() {
+    // Entry modules only mirror the names their own functions read. A
+    // benchmark-style top-level loop must therefore stay entirely local:
+    // no per-iteration store into the runtime global table.
+    let sources = [
+        "\
+n = 0
+total = 0
+while n < 10:
+    i = 0
+    while i < 10:
+        total = total + i
+        i = i + 1
+    n = n + 1
+",
+        "\
+acc = 0
+for k in range(10):
+    acc = acc + k
+",
+    ];
+    for source in sources {
+        let (hir, _, diags) = lower_source(source, &parse(source));
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(
+            !has_global_set(&hir.functions[0].body),
+            "loop locals must not be mirrored: {:?}",
+            hir.functions[0].body
+        );
+    }
+}
+
+#[test]
+fn module_assignment_read_by_a_method_mirrors_before_the_class_definition() {
+    // The method body is lowered before the module body, so the name it reads
+    // must be known before the assignment is lowered; the assignment then
+    // stores the value its method reads.
+    let source = "value = 41\nclass C:\n    def get(self):\n        return value\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = &hir.functions[0].body;
+    let HStmtKind::Assign { target, .. } = &body[0].kind else {
+        panic!("expected the local assignment, got {:?}", body[0].kind);
+    };
+    let HStmtKind::GlobalSet {
+        module,
+        name,
+        value,
+    } = &body[1].kind
+    else {
+        panic!("expected a global store, got {:?}", body[1].kind);
+    };
+    assert_eq!(module, "__main__");
+    assert_eq!(name, "value");
+    assert!(matches!(&value.kind, HExprKind::Local(local) if *local == *target));
+
+    let get = function(&hir, "C.get");
+    let HStmtKind::Return(Some(value)) = &get.body[0].kind else {
+        panic!("expected a return, got {:?}", get.body[0].kind);
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::GlobalGet { module, name } if module == "__main__" && name == "value"),
+        "the method must read the mirrored global, got {:?}",
+        value.kind
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn module_class_read_by_a_function_mirrors_with_selective_entry_mirroring() {
+    // `lower_source` mirrors selectively, like the entry module. A class read
+    // by a function of the same unit must still be mirrored, or the function
+    // would read an undefined global.
+    let source = "class C:\n    pass\n\ndef make():\n    return C()\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = &hir.functions[0].body;
+    assert_eq!(
+        body.len(),
+        2,
+        "the class must be mirrored exactly once: {body:?}"
+    );
+    assert!(
+        matches!(body[0].kind, HStmtKind::ClassDef { .. }),
+        "expected a class definition, got {:?}",
+        body[0].kind
+    );
+    let HStmtKind::GlobalSet {
+        module,
+        name,
+        value,
+    } = &body[1].kind
+    else {
+        panic!("expected the class to be mirrored, got {:?}", body[1].kind);
+    };
+    assert_eq!(module, "__main__");
+    assert_eq!(name, "C");
+    assert!(matches!(&value.kind, HExprKind::Local(_)), "{value:?}");
+
+    let make = function(&hir, "make");
+    let HStmtKind::Return(Some(value)) = &make.body[0].kind else {
+        panic!("expected a return, got {:?}", make.body[0].kind);
+    };
+    let HExprKind::IndirectCall { callee, .. } = &value.kind else {
+        panic!("expected an indirect call, got {:?}", value.kind);
+    };
+    assert!(
+        matches!(&callee.kind, HExprKind::GlobalGet { module, name } if module == "__main__" && name == "C"),
+        "the constructor must read the mirrored class, got {:?}",
+        callee.kind
+    );
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 

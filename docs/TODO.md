@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** 1373 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** 1377 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -258,13 +258,13 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-25: 1373 tests total — 673 runtime (494 unit, 179 ABI
+      As of 2026-10-25: 1377 tests total — 673 runtime (494 unit, 179 ABI
       integration: among others 22 bytes, 19 IO, 18 stdlib modules, 16 stdlib
       utils, 12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 413 frontend, 48 codegen, 18 IR, 221 CLI/E2E (143 E2E incl.
+      tests), 417 frontend, 48 codegen, 18 IR, 221 CLI/E2E (143 E2E incl.
       the abi3 extension fixture, 24 fibers, 6 closures, 11 user modules,
       10 exceptions, 8 completions, extension path/dotted/multi-phase,
       2 unittest-runner, 2 stdlib-batch-a, 2 stdlib-batch-b,

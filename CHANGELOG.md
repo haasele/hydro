@@ -8,7 +8,7 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **1373 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25: **1377 tests**, `scripts/verify.sh` ALL GREEN. The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
@@ -294,6 +294,13 @@ heavier rich rendering. See the package-loader entry below.
 
 ### Changed
 
+- **Entry-module global mirroring:** only names read by the entry module's own
+  functions are mirrored into the runtime global table; imported modules keep
+  full mirroring. This removes a `GlobalSet` per top-level loop iteration
+  (300k-iteration top-level while: ~30.5 ms → ~3.1 ms) while preserving
+  function access to module globals. AOT benchmarks must clear `.pyx/cache`
+  after frontend changes because the cache key does not embed the compiler
+  build.
 - **Source restructuring:** `pyx-ir/{model,ir,stdlib}`,
   `pyx-frontend/{lower,sema}`, `pyx-codegen/{backend,lower}`,
   `pyx-runtime/{abi,core,gc,modules,concurrency,support,csv}`,

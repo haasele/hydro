@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-25**. Phase 1 is complete; Phase 2 is largely
-implemented (1373 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (1377 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -515,7 +515,10 @@ implement the protocol; without `as`, `__enter__` still runs.
   Module-level simple-name assignments that are read by a function are
   mirrored into a keyed global store (`GlobalSet`/`GlobalGet`,
   `pyx_global_set`/`pyx_global_get`); other module locals remain invisible
-  inside functions.
+  inside functions. Imported units mirror every export because an importer may
+  read any name; the entry module mirrors only names its own functions read
+  (precomputed before lowering), so top-level loops do not emit a global store
+  per iteration.
 - **User modules and packages** (Phase 2.30; package loader extended in the
   P7 checkpoint): `import foo` / `from foo import f` resolve `foo.py` and
   packages (`foo/__init__.py`), including dotted names, submodules and
@@ -1029,7 +1032,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **1373 tests** (413 frontend, 48 codegen, 18 IR, 494
+- As of 2026-10-25: **1377 tests** (417 frontend, 48 codegen, 18 IR, 494
   runtime unit, 179 runtime integration, 221 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,

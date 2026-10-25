@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1373 tests, JIT+AOT |
+| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1377 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -86,7 +86,7 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
 
 **Verification (as of 2026-10-25):**
 
-- `cargo test --workspace`: **1373 tests** — 413 frontend, 48 codegen, 18 IR,
+- `cargo test --workspace`: **1377 tests** — 417 frontend, 48 codegen, 18 IR,
   494 runtime unit, 221 CLI/E2E (143 E2E incl. the abi3 extension fixture,
   24 fibers, 6 closures, 11 user modules, 10 exception tests, 8
   completions, extension path/dotted/multi-phase, 2 unittest-runner tests,
@@ -579,7 +579,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 1373 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 1377 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -873,7 +873,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (1373)
+cargo test                             # unit/integration tests (1377)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1349,5 +1349,23 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   groups green in both. PyX workload medians: list_comp 4.36/2.79 ms,
   dict_insert 2.64/1.71 ms, json 3.46/1.81 ms, generator 8.36/7.91 ms,
   async_gather 23.38/21.62 ms, while_sum 29.34/31.48 ms, math_loop
-  48.50/47.05 ms (JIT/AOT). **1373 tests**, clippy `-D warnings` and
-  `scripts/verify.sh` green.
+  48.50/47.05 ms (JIT/AOT). These loop numbers included the entry-module
+  global-mirroring regression; corrected in continuation 56. **1373 tests**,
+  clippy `-D warnings` and `scripts/verify.sh` green.
+
+
+- 2026-10-25 (continuation 56): top-level loop regression diagnosed and
+  fixed. The entry module was mirroring every module-level assignment into
+  the runtime global table, so each iteration of a top-level `while`/`for`
+  paid a `GlobalSet` hash-table store. Evidence: top-level while 30.47 ms vs
+  the same loop in a function 3.16 ms (release). `lower_modules` now enables
+  full mirroring only for imported units; the entry module precomputes the
+  global names its functions/methods read and mirrors only those. Imported
+  module globals still mirror everything. Direct `bench_pyx.py` with default
+  GC (uv/CPython 3.13.13, n=200000, repeat 5): while_sum JIT/AOT
+  2.90/1.73 ms, for_range 2.46/1.66, list_append 5.43/3.65, math_loop
+  24.05/22.05, generator 8.72/8.22, async_gather 23.13/21.40. Full
+  `bench_all.py` without `--only` ran green under PyX (152 s, high GC
+  threshold) and CPython (151 s). AOT results require clearing `.pyx/cache`
+  after frontend changes; the cache key does not embed the compiler build.
+  **1377 tests**, clippy `-D warnings` and `scripts/verify.sh` green.

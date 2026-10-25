@@ -1364,7 +1364,13 @@ fn lower_modules(units: &[LoadedModule]) -> Result<Program, Vec<Diagnostic>> {
         let mut infer = Infer::new();
         let mut lowerer = Lowerer::new(&unit.source, &unit.display, &mut infer);
         lowerer.set_fid_base(base);
-        lowerer.set_mirror_all_globals(true);
+        // Imported units may be read by name from their global table while
+        // they are still initializing, so they mirror every module-level
+        // binding. The entry module has no importers: mirroring every
+        // assignment would add a global store to every loop iteration, so it
+        // mirrors only the names its own functions read (see
+        // `Lowerer::collect_function_read_globals`).
+        lowerer.set_mirror_all_globals(index != entry_index);
         lowerer.set_imported_classes(class_registry.clone(), function_registry.clone());
         if index != entry_index {
             lowerer.set_dunder_name(&unit.name);
@@ -1621,6 +1627,57 @@ mod tests {
             }
             _ => false,
         }
+    }
+
+    /// Names stored into the runtime global table by `stmts`, nested blocks
+    /// included.
+    fn global_set_names(stmts: &[pyx_ir::Stmt]) -> Vec<String> {
+        fn walk(stmts: &[pyx_ir::Stmt], out: &mut Vec<String>) {
+            use pyx_ir::StmtKind;
+            for stmt in stmts {
+                match &stmt.kind {
+                    StmtKind::GlobalSet { name, .. } => out.push(name.clone()),
+                    StmtKind::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        walk(then_body, out);
+                        walk(else_body, out);
+                    }
+                    StmtKind::While {
+                        body, else_body, ..
+                    }
+                    | StmtKind::ForRange {
+                        body, else_body, ..
+                    }
+                    | StmtKind::ForEach {
+                        body, else_body, ..
+                    } => {
+                        walk(body, out);
+                        walk(else_body, out);
+                    }
+                    StmtKind::Try {
+                        body,
+                        handlers,
+                        else_body,
+                        finally_body,
+                    } => {
+                        walk(body, out);
+                        for handler in handlers {
+                            walk(&handler.body, out);
+                        }
+                        walk(else_body, out);
+                        walk(finally_body, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut names = Vec::new();
+        walk(stmts, &mut names);
+        names
     }
 
     /// Returns the callee of a top-level `print(<call>)` statement.
@@ -2333,6 +2390,38 @@ mod tests {
             program.initializers.len(),
             1,
             "only a's module body is an initializer"
+        );
+    }
+
+    #[test]
+    fn entry_module_does_not_mirror_unread_loop_locals_but_imported_modules_do() {
+        let dir = TestDir::new("entry-mirror");
+        dir.write(
+            "helper.py",
+            "total = 0\nfor i in range(3):\n    total = total + i\n",
+        );
+        let main = dir.write(
+            "main.py",
+            "from helper import total\n\nn = 0\nacc = 0\nwhile n < 3:\n    acc = acc + n\n    n = n + 1\nprint(total + acc)\n",
+        );
+        let program = program(&main);
+
+        // The entry module has no importers, so its top-level loop locals stay
+        // local: storing them on every iteration is pure overhead.
+        let entry_names = global_set_names(&program.main_function().body);
+        assert!(
+            !entry_names.iter().any(|name| name == "n" || name == "acc"),
+            "entry loop locals must not be mirrored: {entry_names:?}"
+        );
+
+        // Imported units stay fully mirrored because an importer may read any
+        // exported name.
+        assert_eq!(program.initializers.len(), 1);
+        let helper_names =
+            global_set_names(&program.functions[program.initializers[0] as usize].body);
+        assert!(
+            helper_names.iter().any(|name| name == "total"),
+            "the imported module must still mirror its globals: {helper_names:?}"
         );
     }
 
