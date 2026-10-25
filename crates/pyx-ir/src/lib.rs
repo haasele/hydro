@@ -28,8 +28,8 @@ mod tests;
 
 pub use crate::compat::{PYTHON_ABI_TAG, PYTHON_VERSION, PYTHON_VERSION_STRING};
 pub use crate::ir::{
-    ClassAttr, ClassMethod, CompClause, CompTarget, Expr, ExprKind, Function, Handler, LocalInfo,
-    MethodKind, Param, ParamKind, Program, Stmt, StmtKind, UnpackTarget,
+    ClassAttr, ClassMethod, CompClause, CompTarget, DeleteTarget, Expr, ExprKind, Function,
+    Handler, LocalInfo, MethodKind, Param, ParamKind, Program, Stmt, StmtKind, UnpackTarget,
 };
 pub use crate::model::{
     BinOp, BoolOp, Builtin, Callee, Const, ExcKind, FunctionId, LocalId, Type, UnOp,

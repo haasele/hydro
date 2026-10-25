@@ -79,6 +79,10 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         pyx_dict_merge,
         pyx_subscript,
         pyx_subscript_set,
+        pyx_delete_subscript,
+        pyx_global_delete,
+        pyx_delete_attr,
+        pyx_delete_slice,
         pyx_slice,
         pyx_slice_set,
         pyx_module_call,
@@ -153,5 +157,12 @@ mod tests {
             0
         );
         assert_ne!(pyx_runtime::abi::pyx_setattr as *const () as usize, 0);
+        assert_ne!(pyx_runtime::abi::pyx_delete_attr as *const () as usize, 0);
+        assert_ne!(
+            pyx_runtime::abi::pyx_delete_subscript as *const () as usize,
+            0
+        );
+        assert_ne!(pyx_runtime::abi::pyx_delete_slice as *const () as usize, 0);
+        assert_ne!(pyx_runtime::abi::pyx_global_delete as *const () as usize, 0);
     }
 }

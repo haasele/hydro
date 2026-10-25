@@ -58,6 +58,11 @@ pub(crate) const ASSERTION_ERROR: u32 = 14;
 /// `FileNotFoundError`: a subclass of [`OS_ERROR`]. `except FileNotFoundError`
 /// and `except OSError` both match either tag.
 pub(crate) const FILE_NOT_FOUND_ERROR: u32 = 15;
+/// `NameError`: raised by `del` of an unbound module global.
+pub(crate) const NAME_ERROR: u32 = 16;
+/// `SystemExit`: catchable like any other exception; uncaught it exits through
+/// the usual traceback path.
+pub(crate) const SYSTEM_EXIT: u32 = 17;
 
 pub(crate) fn tag_name(tag: u32) -> &'static str {
     match tag {
@@ -77,6 +82,8 @@ pub(crate) fn tag_name(tag: u32) -> &'static str {
         BASE_EXCEPTION => "BaseException",
         ASSERTION_ERROR => "AssertionError",
         FILE_NOT_FOUND_ERROR => "FileNotFoundError",
+        NAME_ERROR => "NameError",
+        SYSTEM_EXIT => "SystemExit",
         // Unknown tags are rendered as RuntimeError rather than panicking.
         _ => "RuntimeError",
     }
@@ -91,6 +98,9 @@ fn default_message(tag: u32) -> &'static str {
         ATTRIBUTE_ERROR => "attribute not found",
         OS_ERROR => "I/O error",
         FILE_NOT_FOUND_ERROR => "No such file or directory",
+        NAME_ERROR => "name is not defined",
+        // `SystemExit()` stringifies to the empty string, like `Exception`.
+        SYSTEM_EXIT => "",
         GENERATOR_EXIT => "",
         // `Exception()` and `BaseException()` stringify to the empty string.
         EXCEPTION | BASE_EXCEPTION => "",
@@ -120,6 +130,8 @@ fn known_tag(tag: u32) -> bool {
             | BASE_EXCEPTION
             | ASSERTION_ERROR
             | FILE_NOT_FOUND_ERROR
+            | NAME_ERROR
+            | SYSTEM_EXIT
     )
 }
 
@@ -364,7 +376,8 @@ pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
 /// `handler_tag`.
 ///
 /// `BaseException` matches every tag, `Exception` matches everything except
-/// `KeyboardInterrupt` and the internal `GeneratorExit`, `OSError` and
+/// `KeyboardInterrupt` and the internal `GeneratorExit` (`SystemExit` is a
+/// normal member of that set, so `except Exception` catches it), `OSError` and
 /// `FileNotFoundError` match each other (the subclass relationship), and every
 /// other handler tag matches only an exception with the same tag. Without a
 /// pending exception nothing matches.

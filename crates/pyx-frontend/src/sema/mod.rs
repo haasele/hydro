@@ -9,14 +9,15 @@
 
 use pyx_ir::stdlib;
 use pyx_ir::{
-    BinOp, Builtin, Callee, ClassAttr, ClassMethod, CompClause, CompTarget, Const, Expr as IrExpr,
-    ExprKind, Function as IrFunction, Handler as IrHandler, LocalInfo, Param, Program,
-    Stmt as IrStmt, StmtKind, Type, UnOp, UnpackTarget,
+    BinOp, Builtin, Callee, ClassAttr, ClassMethod, CompClause, CompTarget, Const, DeleteTarget,
+    Expr as IrExpr, ExprKind, Function as IrFunction, Handler as IrHandler, LocalInfo, Param,
+    Program, Stmt as IrStmt, StmtKind, Type, UnOp, UnpackTarget,
 };
 
 use crate::diag::{self, codes, Diagnostic};
 use crate::lower::{
-    HCompClause, HCompTarget, HExpr, HExprKind, HFunction, HStmt, HStmtKind, HUnpackTarget, LHir,
+    HCompClause, HCompTarget, HDeleteTarget, HExpr, HExprKind, HFunction, HStmt, HStmtKind,
+    HUnpackTarget, LHir,
 };
 
 /// A type slot: either a concrete type or an inference variable.
@@ -299,7 +300,10 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
     ),
     ("find", MethodSig::new(1, 1, &[ArgKind::Str], Type::Int)),
     ("count", MethodSig::new(1, 1, &[ArgKind::Str], Type::Int)),
-    ("encode", MethodSig::new(0, 1, &[ArgKind::Str], Type::Bytes)),
+    (
+        "encode",
+        MethodSig::new(0, 2, &[ArgKind::Str, ArgKind::Str], Type::Bytes),
+    ),
     (
         "translate",
         MethodSig::new(1, 1, &[ArgKind::Any], Type::Str),
@@ -786,17 +790,24 @@ impl<'a> Checker<'a> {
                 self.check_expr(value, f);
                 let local_ty = f.locals[*target as usize].ty;
                 if let Err((expected, got)) = self.inf.unify(local_ty, value.ty) {
-                    let name = &f.locals[*target as usize].name;
-                    self.error(
-                        stmt.line,
-                        stmt.col,
-                        format!(
-                            "cannot assign type {} to variable '{}' of type {}",
-                            got.name(),
-                            name,
-                            expected.name()
-                        ),
-                    );
+                    if (expected == Type::None) != (got == Type::None) {
+                        // `x = None` followed by a value (or vice versa) is a
+                        // common optional/dynamic pattern; widen the slot.
+                        self.force_any(local_ty);
+                        self.force_any(value.ty);
+                    } else {
+                        let name = &f.locals[*target as usize].name;
+                        self.error(
+                            stmt.line,
+                            stmt.col,
+                            format!(
+                                "cannot assign type {} to variable '{}' of type {}",
+                                got.name(),
+                                name,
+                                expected.name()
+                            ),
+                        );
+                    }
                 }
             }
             HStmtKind::GlobalSet { value, .. } => {
@@ -907,9 +918,14 @@ impl<'a> Checker<'a> {
                 self.check_stmts(then_body, f, has_value, has_bare);
                 self.check_stmts(else_body, f, has_value, has_bare);
             }
-            HStmtKind::While { cond, body } => {
+            HStmtKind::While {
+                cond,
+                body,
+                else_body,
+            } => {
                 self.check_expr(cond, f);
                 self.check_stmts(body, f, has_value, has_bare);
+                self.check_stmts(else_body, f, has_value, has_bare);
             }
             HStmtKind::ForRange {
                 var,
@@ -917,6 +933,7 @@ impl<'a> Checker<'a> {
                 stop,
                 step,
                 body,
+                else_body,
             } => {
                 let var_ty = f.locals[*var as usize].ty;
                 match self.inf.resolve(var_ty) {
@@ -942,11 +959,13 @@ impl<'a> Checker<'a> {
                     self.check_range_arg("step", step, f);
                 }
                 self.check_stmts(body, f, has_value, has_bare);
+                self.check_stmts(else_body, f, has_value, has_bare);
             }
             HStmtKind::ForEach {
                 var,
                 iterable,
                 body,
+                else_body,
             } => {
                 self.check_expr(iterable, f);
                 let iterable_ty = self.inf.resolve(iterable.ty);
@@ -980,25 +999,46 @@ impl<'a> Checker<'a> {
                 };
                 let _ = self.inf.unify(var_ty, Ty::Concrete(element));
                 self.check_stmts(body, f, has_value, has_bare);
+                self.check_stmts(else_body, f, has_value, has_bare);
             }
             HStmtKind::Return(value) => match value {
                 Some(value) => {
                     *has_value = true;
                     self.check_expr(value, f);
                     if !f.is_generator {
+                        let expected = self.inf.resolve(f.ret_ty);
+                        let got = self.inf.resolve(value.ty);
+                        if (matches!(expected, Ty::Concrete(Type::None)))
+                            != (matches!(got, Ty::Concrete(Type::None)))
+                        {
+                            // Mixed `return value` / `return None` functions
+                            // are dynamic, regardless of which branch was
+                            // checked first.
+                            self.force_any(f.ret_ty);
+                            self.force_any(value.ty);
+                        }
                         match f.ret_ty {
                             Ty::Concrete(expected) => match self.inf.resolve(value.ty) {
                                 Ty::Concrete(got) => {
                                     if !annotation_accepts(expected, got) {
-                                        self.error(
-                                            value.line,
-                                            value.col,
-                                            format!(
-                                                "return type {} does not match declared return type {}",
-                                                got.name(),
-                                                expected.name()
-                                            ),
-                                        );
+                                        if expected == Type::None || got == Type::None {
+                                            // A function that returns both a
+                                            // value and `None` is dynamic; the
+                                            // implicit return typing must not
+                                            // reject the second branch.
+                                            let _ =
+                                                self.inf.unify(f.ret_ty, Ty::Concrete(Type::Any));
+                                        } else {
+                                            self.error(
+                                                value.line,
+                                                value.col,
+                                                format!(
+                                                    "return type {} does not match declared return type {}",
+                                                    got.name(),
+                                                    expected.name()
+                                                ),
+                                            );
+                                        }
                                     }
                                 }
                                 Ty::Var(_) => {
@@ -1040,6 +1080,34 @@ impl<'a> Checker<'a> {
                 // Python, so unlike `raise` it is not restricted to `str`.
                 if let Some(msg) = msg {
                     self.check_expr(msg, f);
+                }
+            }
+            HStmtKind::Delete { targets } => {
+                // Receivers, indices and slice bounds are ordinary
+                // expressions. Deleting from an immutable receiver or a class
+                // namespace raises at runtime, so it is not a compile error.
+                for target in targets {
+                    match target {
+                        HDeleteTarget::Name(_) | HDeleteTarget::Global { .. } => {}
+                        HDeleteTarget::Attr { object, .. } => self.check_expr(object, f),
+                        HDeleteTarget::Subscript { object, index } => {
+                            self.check_expr(object, f);
+                            self.check_expr(index, f);
+                            self.check_subscript_assignment(object, index);
+                        }
+                        HDeleteTarget::Slice {
+                            object,
+                            start,
+                            stop,
+                            step,
+                        } => {
+                            self.check_expr(object, f);
+                            self.check_slice_bound(start, f);
+                            self.check_slice_bound(stop, f);
+                            self.check_slice_bound(step, f);
+                            self.check_slice_assignment_target(object);
+                        }
+                    }
                 }
             }
             HStmtKind::Try {
@@ -1521,7 +1589,12 @@ impl<'a> Checker<'a> {
                 }
                 match stdlib::function(module, function) {
                     Some(spec) => {
-                        let supplied = args.len() + keywords.len();
+                        let supplied = args.len()
+                            + if spec.dynamic_keywords {
+                                0
+                            } else {
+                                keywords.len()
+                            };
                         if args.len() < spec.min_args || supplied > spec.max_args {
                             let expected = if spec.min_args == spec.max_args {
                                 spec.min_args.to_string()
@@ -1873,6 +1946,12 @@ impl<'a> Checker<'a> {
     fn bind_type(&mut self, out: Ty, ty: Type, line: u32, col: u32) {
         if self.inf.unify(out, Ty::Concrete(ty)).is_err() {
             let existing = self.inf.name_of(out);
+            if existing == "None" {
+                // An output slot previously constrained to `None` (usually
+                // through an implicit/explicit return) stays dynamic.
+                self.force_any(out);
+                return;
+            }
             self.error(
                 line,
                 col,
@@ -2732,6 +2811,18 @@ impl<'a> Checker<'a> {
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::List));
             }
+            Builtin::AnyValue => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("any() takes exactly one argument ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Bool));
+            }
             Builtin::All => {
                 if count != 1 {
                     self.error_code(
@@ -2868,6 +2959,45 @@ impl<'a> Checker<'a> {
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Dict));
             }
+            Builtin::Input => {
+                if count > 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("input() takes at most one argument ({count} given)"),
+                    );
+                    return;
+                }
+                if let Some((ty, arg_line, arg_col)) = args.first() {
+                    match self.inf.resolve(*ty) {
+                        Ty::Var(_) => {
+                            let _ = self.inf.unify(*ty, Ty::Concrete(Type::Str));
+                        }
+                        Ty::Concrete(Type::Str) | Ty::Concrete(Type::Any) => {}
+                        Ty::Concrete(t) => self.error(
+                            *arg_line,
+                            *arg_col,
+                            format!("input() argument must be str, not {}", t.name()),
+                        ),
+                    }
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Str));
+            }
+            Builtin::GetIpython => {
+                if count != 0 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("get_ipython() takes no arguments ({count} given)"),
+                    );
+                    return;
+                }
+                // The result is an opaque object inspected through dynamic
+                // attribute access (`.__class__.__name__`).
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
         }
     }
 
@@ -2900,11 +3030,9 @@ impl<'a> Checker<'a> {
             let Check::RaiseMsg { ty, line, col } = check else {
                 continue;
             };
-            if let Ty::Concrete(t) = self.inf.resolve(ty) {
-                if t != Type::Str && t != Type::Any {
-                    self.error(line, col, "exception message must be str");
-                }
-            }
+            // Python exceptions accept any arguments; the runtime renders
+            // non-strings for the traceback.
+            let _ = (ty, line, col);
         }
     }
 
@@ -3326,9 +3454,14 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
             then_body: emit_stmts(then_body, inf),
             else_body: emit_stmts(else_body, inf),
         },
-        HStmtKind::While { cond, body } => StmtKind::While {
+        HStmtKind::While {
+            cond,
+            body,
+            else_body,
+        } => StmtKind::While {
             cond: emit_expr(cond, inf),
             body: emit_stmts(body, inf),
+            else_body: emit_stmts(else_body, inf),
         },
         HStmtKind::ForRange {
             var,
@@ -3336,21 +3469,25 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
             stop,
             step,
             body,
+            else_body,
         } => StmtKind::ForRange {
             var: *var,
             start: emit_expr(start, inf),
             stop: emit_expr(stop, inf),
             step: step.as_ref().map(|s| emit_expr(s, inf)),
             body: emit_stmts(body, inf),
+            else_body: emit_stmts(else_body, inf),
         },
         HStmtKind::ForEach {
             var,
             iterable,
             body,
+            else_body,
         } => StmtKind::ForEach {
             var: *var,
             iterable: emit_expr(iterable, inf),
             body: emit_stmts(body, inf),
+            else_body: emit_stmts(else_body, inf),
         },
         HStmtKind::SetSubscript {
             object,
@@ -3397,6 +3534,37 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
         HStmtKind::Assert { test, msg } => StmtKind::Assert {
             test: emit_expr(test, inf),
             msg: msg.as_ref().map(|e| emit_expr(e, inf)),
+        },
+        HStmtKind::Delete { targets } => StmtKind::Delete {
+            targets: targets
+                .iter()
+                .map(|target| match target {
+                    HDeleteTarget::Name(local) => DeleteTarget::Name(*local),
+                    HDeleteTarget::Global { module, name } => DeleteTarget::Global {
+                        module: module.clone(),
+                        name: name.clone(),
+                    },
+                    HDeleteTarget::Attr { object, name } => DeleteTarget::Attr {
+                        object: emit_expr(object, inf),
+                        name: name.clone(),
+                    },
+                    HDeleteTarget::Subscript { object, index } => DeleteTarget::Subscript {
+                        object: emit_expr(object, inf),
+                        index: emit_expr(index, inf),
+                    },
+                    HDeleteTarget::Slice {
+                        object,
+                        start,
+                        stop,
+                        step,
+                    } => DeleteTarget::Slice {
+                        object: Box::new(emit_expr(object, inf)),
+                        start: Box::new(emit_slice_bound(start, inf, stmt.line)),
+                        stop: Box::new(emit_slice_bound(stop, inf, stmt.line)),
+                        step: Box::new(emit_slice_bound(step, inf, stmt.line)),
+                    },
+                })
+                .collect(),
         },
         HStmtKind::Try {
             body,

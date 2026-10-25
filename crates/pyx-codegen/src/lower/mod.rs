@@ -17,9 +17,9 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Linkage, Module};
 use pyx_ir::{
-    BinOp, BoolOp, Builtin, Callee, CompClause, CompTarget, Const, ExcKind, Expr, ExprKind,
-    Function, FunctionId, Handler, LocalId, LocalInfo, Param, ParamKind, Program, Stmt, StmtKind,
-    Type, UnpackTarget,
+    BinOp, BoolOp, Builtin, Callee, CompClause, CompTarget, Const, DeleteTarget, ExcKind, Expr,
+    ExprKind, Function, FunctionId, Handler, LocalId, LocalInfo, Param, ParamKind, Program, Stmt,
+    StmtKind, Type, UnpackTarget,
 };
 
 use crate::CodegenError;
@@ -153,8 +153,10 @@ struct Runtime {
     dict_merge: FuncId,
     subscript: FuncId,
     subscript_set: FuncId,
+    delete_subscript: FuncId,
     slice: FuncId,
     slice_set: FuncId,
+    delete_slice: FuncId,
     module_call: FuncId,
     module_call_kw: FuncId,
     module_get: FuncId,
@@ -162,11 +164,13 @@ struct Runtime {
     deferred_import: FuncId,
     global_get: FuncId,
     global_set: FuncId,
+    global_delete: FuncId,
     extension_call: FuncId,
     extension_get: FuncId,
     getattr: FuncId,
     hasattr: FuncId,
     setattr: FuncId,
+    delete_attr: FuncId,
     class_new: FuncId,
     /// Hidden ABI: the cached native class object of a built-in exception.
     exception_class: FuncId,
@@ -337,6 +341,15 @@ impl Runtime {
                 &[i64t, i64t, i64t],
                 Some(i64t),
             )?,
+            // `del object[index]`: removes a list element or a dict entry.
+            // Returns the runtime `None`; errors are reported through the
+            // pending exception.
+            delete_subscript: declare_runtime(
+                module,
+                "pyx_delete_subscript",
+                &[i64t, i64t],
+                Some(i64t),
+            )?,
             slice: declare_runtime(module, "pyx_slice", &[i64t, i64t, i64t, i64t], Some(i64t))?,
             // `target[start:stop:step] = value`; bounds and value are tagged
             // values, omitted bounds are `None`. Returns the runtime `None`;
@@ -345,6 +358,14 @@ impl Runtime {
                 module,
                 "pyx_slice_set",
                 &[i64t, i64t, i64t, i64t, i64t],
+                Some(i64t),
+            )?,
+            // `del target[start:stop:step]`; bounds are tagged values, omitted
+            // bounds are `None`. Only lists accept slice deletion.
+            delete_slice: declare_runtime(
+                module,
+                "pyx_delete_slice",
+                &[i64t, i64t, i64t, i64t],
                 Some(i64t),
             )?,
             // `module_len`, `function_len` and `argc` are `size_t`/`uint64_t`
@@ -393,6 +414,15 @@ impl Runtime {
                 &[ptr, ptr, ptr, ptr, i64t],
                 Some(i64t),
             )?,
+            // Module name plus global name, each a pointer/length pair. The
+            // helper removes the entry and raises `NameError` when it is
+            // missing.
+            global_delete: declare_runtime(
+                module,
+                "pyx_global_delete",
+                &[ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
             // Compiled CPython extension member: `path_len`, `member_len` and
             // `argc` are `size_t`/`usize` in the ABI: pointer-width. `argv`
             // points to `argc` tagged values and `path` is the shared-object
@@ -415,6 +445,9 @@ impl Runtime {
             hasattr: declare_runtime(module, "pyx_hasattr", &[i64t, ptr, ptr], Some(i64t))?,
             // `name_len` is a `size_t` in the ABI: pointer-width.
             setattr: declare_runtime(module, "pyx_setattr", &[i64t, ptr, ptr, i64t], Some(i64t))?,
+            // `del obj.name`: `name_len` is a `size_t` in the ABI. Removes an
+            // instance attribute; classes and other receivers raise.
+            delete_attr: declare_runtime(module, "pyx_delete_attr", &[i64t, ptr, ptr], Some(i64t))?,
             // `name_len`, `method_count` and `attr_count` are `usize` in the
             // ABI: pointer-width. `names_ptr`/`funcs_ptr`/`kinds_ptr` hold the
             // method names, function values and raw binding-kind tags;
@@ -736,6 +769,9 @@ fn wrapper_const<M: Module>(
         Const::Bool(false) => builder.ins().iconst(types::I64, FALSE_TAG),
         Const::None => builder.ins().iconst(types::I64, NONE_TAG),
         Const::NotImplemented => builder.ins().iconst(types::I64, NOT_IMPLEMENTED_TAG),
+        // Documented limitation: PyX has no distinct `Ellipsis` sentinel, so
+        // `...` materialises as `None`.
+        Const::Ellipsis => builder.ins().iconst(types::I64, NONE_TAG),
         Const::Float(value) => {
             let float = builder.ins().f64const(*value);
             call_val_extern(module, builder, runtime.float_new, &[float])
@@ -1594,10 +1630,23 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 }
                 self.switch_to(after);
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While {
+                cond,
+                body,
+                else_body,
+            } => {
                 let condition_block = self.builder.create_block();
                 let body_block = self.builder.create_block();
+                // A false condition falls into `else`; `break` jumps to
+                // `after`, skipping it. Loops without `else` keep their
+                // original shape (exhaustion goes straight to `after`).
+                let has_else = !else_body.is_empty();
                 let after = self.builder.create_block();
+                let else_block = if has_else {
+                    self.builder.create_block()
+                } else {
+                    after
+                };
                 self.jump(condition_block);
                 self.switch_to(condition_block);
                 // Backedge landing pad: poll every 64th iteration before
@@ -1605,7 +1654,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_loop_safepoint();
                 let condition = self.lower_expr(cond)?;
                 let branch = self.truthy_cond(condition)?;
-                self.builder.ins().brif(branch, body_block, &[], after, &[]);
+                self.builder
+                    .ins()
+                    .brif(branch, body_block, &[], else_block, &[]);
                 self.loops.push(LoopTargets {
                     break_block: after,
                     continue_block: condition_block,
@@ -1616,6 +1667,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     self.jump(condition_block);
                 }
                 self.loops.pop();
+                if has_else {
+                    // `else` is outside the loop: `break`/`continue` inside
+                    // it target an enclosing loop.
+                    self.switch_to(else_block);
+                    self.lower_stmts(else_body.as_slice())?;
+                    if !self.terminated {
+                        self.jump(after);
+                    }
+                }
                 self.switch_to(after);
             }
             StmtKind::ForRange {
@@ -1624,15 +1684,24 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 stop,
                 step,
                 body,
+                else_body,
             } => {
-                self.lower_for_range(*var, start, stop, step.as_ref(), body.as_slice())?;
+                self.lower_for_range(
+                    *var,
+                    start,
+                    stop,
+                    step.as_ref(),
+                    body.as_slice(),
+                    else_body.as_slice(),
+                )?;
             }
             StmtKind::ForEach {
                 var,
                 iterable,
                 body,
+                else_body,
             } => {
-                self.lower_for_each(*var, iterable, body.as_slice())?;
+                self.lower_for_each(*var, iterable, body.as_slice(), else_body.as_slice())?;
             }
             StmtKind::SetSubscript {
                 object,
@@ -1919,6 +1988,75 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.lower_raise(Some(ExcKind::AssertionError), msg.as_ref(), None)?;
                 self.switch_to(after);
             }
+            StmtKind::Delete { targets } => {
+                for target in targets {
+                    match target {
+                        DeleteTarget::Name(local) => {
+                            // Documented limitation: PyX does not track unbound
+                            // locals, so deleting a name clears its slot to
+                            // `None` instead of making later reads raise
+                            // `NameError`.
+                            let var = self.local_var(*local)?;
+                            let none = self.none();
+                            self.builder.def_var(var, none);
+                        }
+                        DeleteTarget::Global { module, name } => {
+                            let module_args = self.module_name_args(module)?;
+                            let name_args = self.module_name_args(name)?;
+                            let id = self.runtime.global_delete;
+                            let _ = self.call_rt(
+                                id,
+                                &[module_args.0, module_args.1, name_args.0, name_args.1],
+                            )?;
+                            self.emit_exc_check()?;
+                        }
+                        DeleteTarget::Attr { object, name } => {
+                            // The receiver must survive the name allocation,
+                            // which may collect and raise.
+                            let object = self.lower_expr(object)?;
+                            let object_holder = self.temp_var();
+                            self.builder.def_var(object_holder, object);
+                            let (name_slot, name_len) =
+                                make_bytes_slot(&mut self.builder, name.as_bytes())?;
+                            let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+                            let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
+                            let object = self.builder.use_var(object_holder);
+                            let id = self.runtime.delete_attr;
+                            let _ = self.call_rt(id, &[object, name_ptr, name_len])?;
+                            self.emit_exc_check()?;
+                        }
+                        DeleteTarget::Subscript { object, index } => {
+                            // Python evaluates the receiver before the index;
+                            // the receiver stays parked while the index runs.
+                            let object = self.lower_expr(object)?;
+                            let object_holder = self.temp_var();
+                            self.builder.def_var(object_holder, object);
+                            let index = self.lower_expr(index)?;
+                            let object = self.builder.use_var(object_holder);
+                            let id = self.runtime.delete_subscript;
+                            let _ = self.call_rt(id, &[object, index])?;
+                            self.emit_exc_check()?;
+                        }
+                        DeleteTarget::Slice {
+                            object,
+                            start,
+                            stop,
+                            step,
+                        } => {
+                            let object = self.lower_expr(object)?;
+                            let object_holder = self.temp_var();
+                            self.builder.def_var(object_holder, object);
+                            let start = self.lower_expr(start)?;
+                            let stop = self.lower_expr(stop)?;
+                            let step = self.lower_expr(step)?;
+                            let object = self.builder.use_var(object_holder);
+                            let id = self.runtime.delete_slice;
+                            let _ = self.call_rt(id, &[object, start, stop, step])?;
+                            self.emit_exc_check()?;
+                        }
+                    }
+                }
+            }
             StmtKind::Try {
                 body,
                 handlers,
@@ -1943,6 +2081,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         stop: &'a Expr,
         step: Option<&'a Expr>,
         body: &'a [Stmt],
+        else_body: &'a [Stmt],
     ) -> Result<(), CodegenError> {
         let local = self.local_var(var)?;
         let statically_zero = match step {
@@ -2013,7 +2152,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let negative = self.builder.create_block();
         let body_block = self.builder.create_block();
         let increment = self.builder.create_block();
+        // Normal exhaustion enters `else`; `break` jumps to `after`, skipping
+        // it. Loops without `else` keep their original shape.
+        let has_else = !else_body.is_empty();
         let after = self.builder.create_block();
+        let else_block = if has_else {
+            self.builder.create_block()
+        } else {
+            after
+        };
 
         self.jump(condition);
         self.switch_to(condition);
@@ -2050,7 +2197,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         } else {
             self.truthy_cond(comparison)?
         };
-        self.builder.ins().brif(branch, body_block, &[], after, &[]);
+        self.builder
+            .ins()
+            .brif(branch, body_block, &[], else_block, &[]);
 
         self.switch_to(negative);
         let current = self.builder.use_var(local);
@@ -2065,7 +2214,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         } else {
             self.truthy_cond(comparison)?
         };
-        self.builder.ins().brif(branch, body_block, &[], after, &[]);
+        self.builder
+            .ins()
+            .brif(branch, body_block, &[], else_block, &[]);
 
         self.loops.push(LoopTargets {
             break_block: after,
@@ -2092,6 +2243,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.jump(condition);
         self.loops.pop();
 
+        if has_else {
+            // `else` is outside the loop: `break`/`continue` inside it target
+            // an enclosing loop.
+            self.switch_to(else_block);
+            self.lower_stmts(else_body)?;
+            if !self.terminated {
+                self.jump(after);
+            }
+        }
         self.switch_to(after);
         Ok(())
     }
@@ -2107,6 +2267,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         var: LocalId,
         iterable: &'a Expr,
         body: &'a [Stmt],
+        else_body: &'a [Stmt],
     ) -> Result<(), CodegenError> {
         let local = self.local_var(var)?;
 
@@ -2126,7 +2287,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
 
         let next_block = self.builder.create_block();
         let body_block = self.builder.create_block();
+        // Iterator exhaustion enters `else`; `break` jumps to `after`,
+        // skipping it. Loops without `else` keep their original shape.
+        let has_else = !else_body.is_empty();
         let after = self.builder.create_block();
+        let else_block = if has_else {
+            self.builder.create_block()
+        } else {
+            after
+        };
 
         self.jump(next_block);
         self.switch_to(next_block);
@@ -2140,7 +2309,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let exhausted = self.builder.ins().icmp_imm(IntCC::Equal, produced, 0);
         self.builder
             .ins()
-            .brif(exhausted, after, &[], body_block, &[]);
+            .brif(exhausted, else_block, &[], body_block, &[]);
 
         self.loops.push(LoopTargets {
             break_block: after,
@@ -2158,6 +2327,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         }
         self.loops.pop();
 
+        if has_else {
+            // `else` is outside the loop: `break`/`continue` inside it target
+            // an enclosing loop.
+            self.switch_to(else_block);
+            self.lower_stmts(else_body)?;
+            if !self.terminated {
+                self.jump(after);
+            }
+        }
         self.switch_to(after);
         Ok(())
     }
@@ -3687,6 +3865,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             Const::Bool(false) => Ok(self.tagged_int(FALSE_TAG)),
             Const::None => Ok(self.none()),
             Const::NotImplemented => Ok(self.tagged_int(NOT_IMPLEMENTED_TAG)),
+            // Documented limitation: PyX has no distinct `Ellipsis` sentinel,
+            // so `...` materialises as `None`.
+            Const::Ellipsis => Ok(self.none()),
             Const::Float(value) => {
                 let float = self.builder.ins().f64const(*value);
                 let id = self.runtime.float_new;
@@ -4091,7 +4272,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             | Builtin::Reversed
             | Builtin::Divmod
             | Builtin::Callable
-            | Builtin::Import => self.lower_builtin_values(builtin, values),
+            | Builtin::Import
+            | Builtin::Input
+            | Builtin::GetIpython
+            | Builtin::AnyValue => self.lower_builtin_values(builtin, values),
             Builtin::Max | Builtin::Min => {
                 // The frontend always appends the key slot as the final
                 // argument (`None` without `key=`, the callable otherwise) and
@@ -4454,6 +4638,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_exc_check()?;
                 Ok(result)
             }
+            Builtin::Int if values.len() != 1 => self.lower_builtin_values(builtin, values),
             Builtin::Len
             | Builtin::Str
             | Builtin::Repr
@@ -4620,12 +4805,24 @@ fn build_pyx_main<M: Module>(
         // Imported module bodies run once, in dependency order, before the
         // entry module. A spawned child skipped this block entirely, so it
         // never re-runs them.
+        let init_error = builder.create_block();
         for &initializer in &program.initializers {
             let symbol = *symbols.get(&initializer).ok_or_else(|| {
                 CodegenError::new(format!("module initializer {initializer} was not declared"))
             })?;
             let reference = declare_ref(module, &mut builder, symbol);
             builder.ins().call(reference, &[]);
+            // An exception raised while initializing an imported module must
+            // stop the program before the next module body runs: a pending
+            // exception would make that body skip the rest of its statements
+            // and could even be cleared by a later runtime call.
+            let init_pending = call_val_extern(module, &mut builder, runtime.exc_pending, &[]);
+            let init_ok = builder.create_block();
+            let init_has_error = builder.ins().icmp_imm(IntCC::NotEqual, init_pending, 0);
+            builder
+                .ins()
+                .brif(init_has_error, init_error, &[], init_ok, &[]);
+            builder.switch_to_block(init_ok);
         }
         let module_main = program.main;
         let body = *symbols.get(&module_main).ok_or_else(|| {
@@ -4643,6 +4840,9 @@ fn build_pyx_main<M: Module>(
         builder
             .ins()
             .brif(has_exception, uncaught_block, &[], ok_block, &[]);
+
+        builder.switch_to_block(init_error);
+        builder.ins().jump(uncaught_block, &[]);
 
         builder.switch_to_block(uncaught_block);
         let code = call_val_extern(module, &mut builder, runtime.uncaught, &[]);
@@ -5754,6 +5954,7 @@ mod tests {
                                 },
                                 3,
                             )],
+                            else_body: Vec::new(),
                         },
                         2,
                     ),
@@ -5780,6 +5981,7 @@ mod tests {
                                 },
                                 5,
                             )],
+                            else_body: Vec::new(),
                         },
                         4,
                     ),
@@ -6053,6 +6255,7 @@ mod tests {
                         stop: int(3),
                         step: Some(int(1)),
                         body: Vec::new(),
+                        else_body: Vec::new(),
                     },
                     1,
                 )],
@@ -6458,6 +6661,82 @@ mod tests {
             runtime_call_sites(&object, "pyx_list_new") > 0,
             "the right-hand side list must be materialised"
         );
+    }
+
+    #[test]
+    fn delete_lowers_each_target_to_its_runtime_helper() {
+        let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let none = || Expr::new(ExprKind::Const(Const::None), Type::None, 1);
+        let text =
+            |value: &str| Expr::new(ExprKind::Const(Const::Str(value.to_string())), Type::Str, 1);
+        let local = |id: LocalId, ty: Type| Expr::new(ExprKind::Local(id), ty, 1);
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![
+                    LocalInfo {
+                        name: "xs".to_string(),
+                        ty: Type::List,
+                    },
+                    LocalInfo {
+                        name: "table".to_string(),
+                        ty: Type::Dict,
+                    },
+                    LocalInfo {
+                        name: "obj".to_string(),
+                        ty: Type::Any,
+                    },
+                ],
+                body: vec![Stmt::new(
+                    StmtKind::Delete {
+                        targets: vec![
+                            DeleteTarget::Subscript {
+                                object: local(0, Type::List),
+                                index: int(0),
+                            },
+                            DeleteTarget::Subscript {
+                                object: local(1, Type::Dict),
+                                index: text("k"),
+                            },
+                            DeleteTarget::Slice {
+                                object: Box::new(local(0, Type::List)),
+                                start: Box::new(none()),
+                                stop: Box::new(none()),
+                                step: Box::new(none()),
+                            },
+                            DeleteTarget::Attr {
+                                object: local(2, Type::Any),
+                                name: "value".to_string(),
+                            },
+                            DeleteTarget::Global {
+                                module: "__main__".to_string(),
+                                name: "x".to_string(),
+                            },
+                            DeleteTarget::Name(0),
+                        ],
+                    },
+                    1,
+                )],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program).expect("delete must lower to object code");
+        assert!(!object.is_empty());
+        assert_eq!(
+            runtime_call_sites(&object, "pyx_delete_subscript"),
+            2,
+            "each item deletion is one runtime call"
+        );
+        assert!(runtime_call_sites(&object, "pyx_delete_slice") > 0);
+        assert!(runtime_call_sites(&object, "pyx_delete_attr") > 0);
+        assert!(runtime_call_sites(&object, "pyx_global_delete") > 0);
     }
 
     #[test]

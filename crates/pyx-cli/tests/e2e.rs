@@ -1166,6 +1166,150 @@ fn run_range_step_zero() {
 }
 
 #[test]
+fn run_loop_else_semantics() {
+    let dir = TestDir::new("loop-else");
+    let program = dir.path().join("loop_else.py");
+    std::fs::write(
+        &program,
+        concat!(
+            // Normal exhaustion runs `else`.
+            "for i in range(3):\n",
+            "    print(i)\n",
+            "else:\n",
+            "    print('range done')\n",
+            // `break` skips it.
+            "for i in range(3):\n",
+            "    if i == 1:\n",
+            "        print('break', i)\n",
+            "        break\n",
+            "else:\n",
+            "    print('range else')\n",
+            // `continue` does not.
+            "for i in range(3):\n",
+            "    if i == 1:\n",
+            "        continue\n",
+            "    print('cont', i)\n",
+            "else:\n",
+            "    print('cont done')\n",
+            // The runtime iterator form, including an empty iterable.
+            "for x in [10, 20]:\n",
+            "    print(x)\n",
+            "else:\n",
+            "    print('each done')\n",
+            "for x in []:\n",
+            "    print('never')\n",
+            "else:\n",
+            "    print('empty done')\n",
+            // Nested loops: each `else` belongs to its own loop only.
+            "for i in range(2):\n",
+            "    for j in range(2):\n",
+            "        if j == 1:\n",
+            "            break\n",
+            "    else:\n",
+            "        print('inner else')\n",
+            "    print('outer', i)\n",
+            "    if i == 0:\n",
+            "        continue\n",
+            "else:\n",
+            "    print('outer else')\n",
+            // `break` in a loop `else` targets the enclosing loop, so the
+            // outer `else` is skipped.
+            "for i in range(3):\n",
+            "    for j in range(2):\n",
+            "        pass\n",
+            "    else:\n",
+            "        if i == 1:\n",
+            "            break\n",
+            "        print('inner else', i)\n",
+            "else:\n",
+            "    print('outer else skipped')\n",
+            // `continue` in a loop `else` targets the enclosing loop too.
+            "for i in range(3):\n",
+            "    for j in range(2):\n",
+            "        pass\n",
+            "    else:\n",
+            "        if i == 0:\n",
+            "            continue\n",
+            "        print('cont inner else', i)\n",
+            // `while ... else`.
+            "n = 0\n",
+            "while n < 3:\n",
+            "    n += 1\n",
+            "    if n == 2:\n",
+            "        continue\n",
+            "else:\n",
+            "    print('while done', n)\n",
+            "while True:\n",
+            "    print('once')\n",
+            "    break\n",
+            "else:\n",
+            "    print('never')\n",
+            "while False:\n",
+            "    print('never')\n",
+            "else:\n",
+            "    print('false else')\n",
+            // `break` through a `finally` inside the loop still skips `else`.
+            "for i in range(3):\n",
+            "    try:\n",
+            "        if i == 1:\n",
+            "            break\n",
+            "    finally:\n",
+            "        print('cleanup', i)\n",
+            "else:\n",
+            "    print('unreachable else')\n",
+            "print('after break')\n",
+            // An exception in the body skips `else` and still runs `finally`.
+            "try:\n",
+            "    for i in range(2):\n",
+            "        try:\n",
+            "            if i == 1:\n",
+            "                raise ValueError('boom')\n",
+            "        finally:\n",
+            "            print('finally', i)\n",
+            "    else:\n",
+            "        print('for else after raise')\n",
+            "except ValueError as exc:\n",
+            "    print('caught', exc)\n",
+        ),
+    )
+    .expect("failed to write temp program");
+    let program = program.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &program]);
+
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(
+        stdout,
+        "0\n\
+         1\n\
+         2\n\
+         range done\n\
+         break 1\n\
+         cont 0\n\
+         cont 2\n\
+         cont done\n\
+         10\n\
+         20\n\
+         each done\n\
+         empty done\n\
+         outer 0\n\
+         outer 1\n\
+         outer else\n\
+         inner else 0\n\
+         cont inner else 1\n\
+         cont inner else 2\n\
+         while done 3\n\
+         once\n\
+         false else\n\
+         cleanup 0\n\
+         cleanup 1\n\
+         after break\n\
+         finally 0\n\
+         finally 1\n\
+         caught boom\n"
+    );
+}
+
+#[test]
 fn check_set_unhashable() {
     let program = example("errors/set_unhashable.py");
     let (code, stdout, stderr) = run(&["check", &program]);
@@ -2728,4 +2872,107 @@ fn help_lists_uv_commands() {
             "help output is missing '{needle}':\n{stdout}"
         );
     }
+}
+
+#[test]
+fn run_del_ellipsis_and_console_probes() {
+    let dir = TestDir::new("console-language");
+    let program = dir.path().join("console_language.py");
+    std::fs::write(
+        &program,
+        concat!(
+            "values = [1, 2, 3, 4]\n",
+            "del values[1]\n",
+            "print(values)\n",
+            "del values[1:3]\n",
+            "print(values)\n",
+            "del values[:]\n",
+            "print(values)\n",
+            "table = {'a': 1, 'b': 2}\n",
+            "del table['a']\n",
+            "print(table)\n",
+            "print(...)\n",
+            "def f():\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    return x\n",
+            "print(f())\n",
+            "class C:\n",
+            "    def __init__(self):\n",
+            "        self.value = 7\n",
+            "c = C()\n",
+            "del c.value\n",
+            "print(hasattr(c, 'value'))\n",
+            "try:\n",
+            "    raise SystemExit\n",
+            "except SystemExit:\n",
+            "    print('caught')\n",
+            "try:\n",
+            "    get_ipython\n",
+            "except NameError:\n",
+            "    print('missing')\n",
+            "print('probe')\n",
+            "ipython = get_ipython()\n",
+            "print(ipython.__class__.__name__)\n",
+        ),
+    )
+    .expect("failed to write temp program");
+    let program = program.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &program]);
+
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(
+        stdout,
+        "[1, 3, 4]\n[1]\n[]\n{'b': 2}\nNone\nNone\nFalse\ncaught\nprobe\nTerminalInteractiveShell\n"
+    );
+}
+
+#[test]
+fn typing_alias_subscripts_are_runtime_values() {
+    let dir = TestDir::new("typing-alias");
+    let program = dir.path().join("typing_alias.py");
+    std::fs::write(
+        &program,
+        concat!(
+            "from typing import Tuple, Optional\n",
+            "Span = Tuple[int, int]\n",
+            "MaybeSpan = Optional[Span]\n",
+            "print(Span.__name__, MaybeSpan.__name__)\n",
+        ),
+    )
+    .expect("failed to write temp program");
+    let program = program.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &program]);
+
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(stdout, "Tuple Optional\n");
+}
+
+#[test]
+fn uncaught_system_exit_and_input_eof_fail_with_a_traceback() {
+    let dir = TestDir::new("console-errors");
+    let system_exit = dir.path().join("system_exit.py");
+    std::fs::write(&system_exit, "raise SystemExit\n").expect("failed to write temp program");
+    let system_exit = system_exit.to_string_lossy().into_owned();
+    let (code, _, stderr) = run(&["run", &system_exit]);
+    assert_eq!(code, 1, "uncaught SystemExit must exit nonzero");
+    assert!(
+        stderr.contains("SystemExit"),
+        "missing SystemExit traceback:\n{stderr}"
+    );
+
+    let eof = dir.path().join("input_eof.py");
+    std::fs::write(&eof, "input('prompt: ')\n").expect("failed to write temp program");
+    let eof = eof.to_string_lossy().into_owned();
+    // `Command::output` gives the child a closed stdin, so `input()` reads EOF.
+    let (code, stdout, stderr) = run(&["run", &eof]);
+    assert_eq!(code, 1, "input() at EOF must exit nonzero");
+    assert_eq!(
+        stdout, "prompt: ",
+        "the prompt is written without a newline"
+    );
+    assert!(
+        stderr.contains("EOF when reading a line"),
+        "missing EOF diagnostic:\n{stderr}"
+    );
 }

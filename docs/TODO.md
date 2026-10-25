@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** 1329 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** 1368 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -28,7 +28,8 @@ core, the benchmark-critical batch, the package/site-packages loader and the
 new native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
 `importlib`/`__future__` modules) and the first official CPython test pass
 (`test_errno.py`). `benchmarks/bench_all.py` does **not** yet run under PyX;
-the first blocker is `rich/console.py` (see P7).
+the first observed blockers are native bound-method values and dynamic
+`*args`/`**kwargs` calls in `rich` (see P7).
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -255,14 +256,14 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-25: 1329 tests total — 658 runtime (479 unit, 179 ABI
+      As of 2026-10-25: 1368 tests total — 671 runtime (492 unit, 179 ABI
       integration: among others 22 bytes, 19 IO, 18 stdlib modules, 16 stdlib
       utils, 12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 395 frontend, 47 codegen, 16 IR, 213 CLI/E2E (136 E2E incl.
-      the abi3 extension fixture, 24 fibers, 6 closures, 10 user modules,
+      tests), 413 frontend, 48 codegen, 18 IR, 218 CLI/E2E (140 E2E incl.
+      the abi3 extension fixture, 24 fibers, 6 closures, 11 user modules,
       10 exceptions, 8 completions, extension path/dotted/multi-phase,
       2 unittest-runner, 2 stdlib-batch-a, 2 stdlib-batch-b,
       3 stdlib-bench-batch and 5 CLI argument-parser unit tests; new suites
@@ -347,9 +348,11 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       iterators, exception hierarchy/chaining/`except*`, descriptors,
       properties, `__slots__`, metaclasses, user-defined `__iter__`/`__next__`,
       `__dunder__` protocols, pattern matching, positional-only/keyword-only/
-      `*args`/`**kwargs`, `del`, dict views, `bytearray`/
-      `memoryview`, BigInt (parity for arbitrary-size integers), and the full
-      format mini-language.
+      `*args`/`**kwargs`, dict views, `bytearray`/`memoryview`, BigInt
+      (parity for arbitrary-size integers), and the full format
+      mini-language. `del`, loop `else` and dataclass field defaults are
+      implemented; decorators, generic user classes and dynamic
+      `*args`/`**kwargs` calls remain open.
       Acceptance: the CPython language-feature tests in scope pass; every
       remaining deviation is listed in `docs/COMPATIBILITY.md`.
 - [ ] P4-03 Import system and module model for real packages.
@@ -631,12 +634,11 @@ Imported module bodies run once as initializers, and nested imports stay
 deferred. No native `rich` is shipped: the official pure-Python `rich`
 distribution is resolved through this loader.
 
-**`bench_all.py` under PyX: not yet green.** The first concrete blocker is
-`rich/console.py`: `dataclasses.field`, `os.PathLike`, ellipsis, `del`,
-`get_ipython`, `sys.stdin`/`__stdin__`/`__stdout__`/`__stderr__`,
-`os.get_terminal_size`/`open`/`dup2`, `SystemExit`, `input()` and
-`threading.local`. Further `rich` modules will likely add more; do not claim
-the benchmark harness runs until it actually does.
+**`bench_all.py` under PyX: not yet green.** `rich/console.py` compiles, but
+native bound-method values (`rich/cells.py:35`, `_SINGLE_CELLS.issuperset`)
+and dynamic `*args`/`**kwargs` calls (`rich/style.py:560`) are still missing.
+Further `rich` modules will likely add more; do not claim the benchmark
+harness runs until it actually does.
 
 Acceptance: 297/297 modules accounted for on CPython 3.14.9 — every module
 is either importable **and** green in its CPython `Lib/test/test_*.py`
@@ -823,11 +825,10 @@ ledger below is the per-layer checklist that tracks the actual work.
       five import and their benchmark-used APIs pass; `bench_all.py --only
       pyx` completes. Running `bench_all.py` itself under PyX is **not** part
       of this gate and is **not yet green**: the official pure-Python `rich`
-      package now resolves through the loader, but `rich/console.py` still
-      fails on `dataclasses.field`, `os.PathLike`, ellipsis, `del`,
-      `get_ipython`, `sys.stdin`/`__stdin__`/`__stdout__`/`__stderr__`,
-      `os.get_terminal_size`/`open`/`dup2`, `SystemExit`, `input()` and
-      `threading.local`; further `rich` modules will likely add more.
+      package resolves through the loader and `rich/console.py` compiles,
+      but runtime support is still missing for native bound-method values
+      (`rich/cells.py:35`) and dynamic `*args`/`**kwargs` calls
+      (`rich/style.py:560`); further `rich` modules will likely add more.
       `bench_pyx.py` runs under CPython and drives `pyx run`/`pyx build`
       over embedded workloads; the harness scripts themselves are not PyX
       targets in this gate. The remaining `rich` work is P4-02/P7-01.

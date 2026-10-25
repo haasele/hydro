@@ -250,15 +250,30 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("access", 2, 2, Type::Bool),
         f("sysconf", 1, 1, Type::Int),
         f("getloadavg", 0, 0, Type::Tuple),
+        // `os.get_terminal_size(fd=1)`: a `(columns, lines)`-style namespace.
+        kw("get_terminal_size", 0, 1, Type::Any, &["fd"]),
+        // `os.open(path, flags, mode=0o777)` returns the new descriptor.
+        f("open", 2, 3, Type::Int),
+        f("dup2", 2, 2, Type::Int),
     ],
     constants: &[
         c("name", Type::Str),
         c("sep", Type::Str),
         c("environ", Type::Dict),
+        c("PathLike", Type::Any),
+        c("devnull", Type::Str),
         c("F_OK", Type::Int),
         c("X_OK", Type::Int),
         c("W_OK", Type::Int),
         c("R_OK", Type::Int),
+        // `os.open` flags.
+        c("O_RDONLY", Type::Int),
+        c("O_WRONLY", Type::Int),
+        c("O_RDWR", Type::Int),
+        c("O_CREAT", Type::Int),
+        c("O_TRUNC", Type::Int),
+        c("O_APPEND", Type::Int),
+        c("O_CLOEXEC", Type::Int),
     ],
 };
 
@@ -272,7 +287,10 @@ pub static THREADING: ModuleSpec = ModuleSpec {
         f("get_ident", 0, 0, Type::Int),
         f("active_count", 0, 0, Type::Int),
     ],
-    constants: &[],
+    constants: &[
+        // Empty base class; PyX has no per-thread attribute storage.
+        c("local", Type::Any),
+    ],
 };
 
 pub static QUEUE: ModuleSpec = ModuleSpec {
@@ -312,10 +330,17 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("pyx_version", Type::Str),
         c("pyx_version_info", Type::Tuple),
         c("maxsize", Type::Int),
-        // Native text streams over fd 1/2 (`write`, `flush`, `isatty`). The
-        // static type is dynamic because PyX has no stream class hierarchy.
+        // Native text streams over the standard descriptors (`read`,
+        // `readline`, `write`, `flush`, `isatty`, `fileno`). The static type
+        // is dynamic because PyX has no stream class hierarchy.
+        // `__stdin__`/`__stdout__`/`__stderr__` are the originals; this
+        // runtime never rebinds them, so both spellings resolve alike.
+        c("stdin", Type::Any),
         c("stdout", Type::Any),
         c("stderr", Type::Any),
+        c("__stdin__", Type::Any),
+        c("__stdout__", Type::Any),
+        c("__stderr__", Type::Any),
     ],
 };
 
@@ -989,11 +1014,20 @@ pub static TIMEIT: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
-/// `dataclasses`: the decorator is expanded by the frontend; only the import
-/// name needs a value at runtime.
+/// `dataclasses`: the decorator is expanded by the frontend, which reads a
+/// field's `field(...)` call from the class-body AST. Both names still need a
+/// runtime value: `dataclass` is inert, while `field` returns a marker
+/// namespace so executing the class body succeeds.
+///
+/// `replace(obj, **changes)` takes its single positional argument plus
+/// arbitrary keyword names, so it forwards every keyword to the runtime
+/// ([`kw_dynamic`]); the runtime shallow-copies the instance attributes.
 pub static DATACLASSES: ModuleSpec = ModuleSpec {
     name: "dataclasses",
-    functions: &[],
+    functions: &[
+        kw("field", 0, 2, Type::Any, &["default", "default_factory"]),
+        kw_dynamic("replace", 1, 1, Type::Any, &["obj"]),
+    ],
     constants: &[c("dataclass", Type::Any)],
 };
 
@@ -1182,6 +1216,20 @@ mod tests {
             2
         );
         assert_eq!(constant("dataclasses", "dataclass").unwrap().ty, Type::Any);
+        let field = function("dataclasses", "field").expect("dataclasses.field");
+        assert_eq!((field.min_args, field.max_args), (0, 2));
+        assert_eq!(
+            field.params,
+            &["default", "default_factory"][..],
+            "field() accepts both marker attributes by name"
+        );
+        let replace = function("dataclasses", "replace").expect("dataclasses.replace");
+        assert_eq!((replace.min_args, replace.max_args), (1, 1));
+        assert_eq!(replace.params, &["obj"][..]);
+        assert!(
+            replace.dynamic_keywords,
+            "replace() forwards arbitrary keyword names to the runtime"
+        );
     }
 
     #[test]
@@ -1189,6 +1237,44 @@ mod tests {
         assert_eq!(function("os", "sysconf").unwrap().ret, Type::Int);
         assert_eq!(function("os", "getloadavg").unwrap().ret, Type::Tuple);
         assert_eq!(function("platform", "processor").unwrap().ret, Type::Str);
+    }
+
+    #[test]
+    fn os_console_surface_is_registered() {
+        let open = function("os", "open").expect("os.open");
+        assert_eq!((open.min_args, open.max_args, open.ret), (2, 3, Type::Int));
+        let dup2 = function("os", "dup2").expect("os.dup2");
+        assert_eq!((dup2.min_args, dup2.max_args, dup2.ret), (2, 2, Type::Int));
+        let size = function("os", "get_terminal_size").expect("os.get_terminal_size");
+        assert_eq!((size.min_args, size.max_args), (0, 1));
+        assert_eq!(size.params, &["fd"][..]);
+        assert_eq!(size.ret, Type::Any);
+
+        assert_eq!(constant("os", "PathLike").unwrap().ty, Type::Any);
+        assert_eq!(constant("os", "devnull").unwrap().ty, Type::Str);
+        for name in [
+            "O_RDONLY",
+            "O_WRONLY",
+            "O_RDWR",
+            "O_CREAT",
+            "O_TRUNC",
+            "O_APPEND",
+            "O_CLOEXEC",
+        ] {
+            assert_eq!(constant("os", name).unwrap().ty, Type::Int, "{name}");
+        }
+
+        assert_eq!(constant("threading", "local").unwrap().ty, Type::Any);
+        for name in [
+            "stdin",
+            "stdout",
+            "stderr",
+            "__stdin__",
+            "__stdout__",
+            "__stderr__",
+        ] {
+            assert_eq!(constant("sys", name).unwrap().ty, Type::Any, "{name}");
+        }
     }
 
     #[test]

@@ -87,6 +87,12 @@ pub enum Const {
     /// reserved `NotImplemented` immediate; PyX has no `NotImplementedType`,
     /// so its static type is [`Type::Any`].
     NotImplemented,
+    /// Python's `...` literal. Documented limitation: PyX has no distinct
+    /// `EllipsisType` sentinel yet, so codegen materialises the runtime `None`
+    /// value and the static type is [`Type::None`]. Expression statements such
+    /// as `def f(): ...` therefore behave exactly like `None`, but `... is
+    /// None` is `True` instead of `False`.
+    Ellipsis,
 }
 
 impl Const {
@@ -99,6 +105,7 @@ impl Const {
             Const::Bytes(_) => Type::Bytes,
             Const::None => Type::None,
             Const::NotImplemented => Type::Any,
+            Const::Ellipsis => Type::None,
         }
     }
 }
@@ -332,6 +339,7 @@ pub enum Builtin {
     Isinstance,
     /// `all(iterable)`: `True` when every element is truthy.
     All,
+    AnyValue,
     /// `ord(character)`: the Unicode scalar value of a one-character `str`.
     /// Any other string length or a non-`str` argument raises `TypeError`.
     Ord,
@@ -351,6 +359,16 @@ pub enum Builtin {
     /// wins, insertion order preserved). Produced by dict literals that
     /// contain `**unpacking`; not reachable from source code.
     DictMerge,
+    /// `input([prompt])`: writes `prompt` to stdout (no newline), reads one
+    /// line from stdin, strips the trailing newline and returns it as a `str`.
+    /// End of file raises `RuntimeError`.
+    Input,
+    /// `get_ipython()`: interactive-shell probe used by libraries such as
+    /// rich. PyX has no IPython, so the call returns an object whose
+    /// `__class__.__name__` is `"TerminalInteractiveShell"`; probing code
+    /// therefore reports "not a Jupyter kernel". The bare name also resolves,
+    /// so `try: get_ipython / except NameError:` never takes the handler.
+    GetIpython,
 }
 
 impl Builtin {
@@ -391,11 +409,14 @@ impl Builtin {
             Builtin::Format => "format",
             Builtin::Isinstance => "isinstance",
             Builtin::All => "all",
+            Builtin::AnyValue => "any",
             Builtin::Ord => "ord",
             Builtin::Chr => "chr",
             Builtin::Divmod => "divmod",
             Builtin::Callable => "callable",
             Builtin::DictMerge => "dict merge",
+            Builtin::Input => "input",
+            Builtin::GetIpython => "get_ipython",
         }
     }
 
@@ -437,10 +458,13 @@ impl Builtin {
             "format" => Builtin::Format,
             "isinstance" => Builtin::Isinstance,
             "all" => Builtin::All,
+            "any" => Builtin::AnyValue,
             "ord" => Builtin::Ord,
             "chr" => Builtin::Chr,
             "divmod" => Builtin::Divmod,
             "callable" => Builtin::Callable,
+            "input" => Builtin::Input,
+            "get_ipython" => Builtin::GetIpython,
             _ => return None,
         })
     }
@@ -466,6 +490,15 @@ pub enum ExcKind {
     /// `AssertionError`: raised by `assert` statements and unittest
     /// assertions.
     AssertionError,
+    /// `NameError`: an undefined name. PyX type-checks name resolution, so
+    /// this mostly exists as a catchable tag for library probes
+    /// (`try: get_ipython / except NameError:`) and for `del` of an unbound
+    /// module global.
+    NameError,
+    /// `SystemExit`: raised by `sys.exit()`. It is catchable like any other
+    /// exception (`except SystemExit`, `except Exception`); when it stays
+    /// uncaught the existing traceback path exits with status 1.
+    SystemExit,
     /// `GeneratorExit`: injected by `generator.close()`; it is also exposed
     /// as a first-class class value.
     GeneratorExit,
@@ -498,6 +531,8 @@ impl ExcKind {
             // `AssertionError`, raised by `assert` statements.
             ExcKind::AssertionError => 14,
             ExcKind::FileNotFoundError => 15,
+            ExcKind::NameError => 16,
+            ExcKind::SystemExit => 17,
         }
     }
 
@@ -516,6 +551,8 @@ impl ExcKind {
             ExcKind::OSError => "OSError",
             ExcKind::FileNotFoundError => "FileNotFoundError",
             ExcKind::AssertionError => "AssertionError",
+            ExcKind::NameError => "NameError",
+            ExcKind::SystemExit => "SystemExit",
             ExcKind::GeneratorExit => "GeneratorExit",
             ExcKind::Exception => "Exception",
             ExcKind::BaseException => "BaseException",
@@ -538,6 +575,8 @@ impl ExcKind {
             "OSError" => ExcKind::OSError,
             "FileNotFoundError" => ExcKind::FileNotFoundError,
             "AssertionError" => ExcKind::AssertionError,
+            "NameError" => ExcKind::NameError,
+            "SystemExit" => ExcKind::SystemExit,
             "Exception" => ExcKind::Exception,
             "BaseException" => ExcKind::BaseException,
             "IOError" => ExcKind::OSError,

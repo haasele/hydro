@@ -12,6 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
@@ -550,10 +551,12 @@ fn call_native_kw_at(
     dispatch_kw(module_name, function_name, &args, keywords)
 }
 
-/// Keyword-aware dispatch; only `functools.partial` binds names.
+/// Keyword-aware dispatch; `functools.partial` and `dataclasses.replace` bind
+/// names.
 fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
     match module {
         "functools" | "_functools" => functools_call_kw(function, args, keywords),
+        "dataclasses" => dataclasses_call_kw(function, args, keywords),
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("{module}.{function}() does not accept keyword arguments"),
@@ -610,6 +613,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "textwrap" => textwrap::call(function, args),
         "timeit" => timeit::call(function, args),
         "datetime" => datetime::call(function, args),
+        "dataclasses" => dataclasses_call(function, args),
         "typing" => typing::call(function, args),
         "abc" => abc::call(function, args),
         "enum" => r#enum::call(function, args),
@@ -659,10 +663,13 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `i64::MAX` does not fit into the 61-bit tagged integer; the
         // documented value is `2^60 - 1` (`value::MAX_INT`).
         ("sys", "maxsize") => encode_int(value::MAX_INT),
-        // Fresh native streams over fd 1/2 on every resolution. They hold no
-        // PyX children, so no rooting is required.
-        ("sys", "stdout") => value::std_stream_new(1),
-        ("sys", "stderr") => value::std_stream_new(2),
+        // Fresh native streams over the standard descriptors on every
+        // resolution; `__std*__` are the original streams, which this runtime
+        // never rebinds, so both spellings resolve alike. They hold no PyX
+        // children, so no rooting is required.
+        ("sys", "stdin") | ("sys", "__stdin__") => value::std_stream_new(0),
+        ("sys", "stdout") | ("sys", "__stdout__") => value::std_stream_new(1),
+        ("sys", "stderr") | ("sys", "__stderr__") => value::std_stream_new(2),
         ("os", "name") => {
             let name = if cfg!(windows) { "nt" } else { "posix" };
             value::str_from_bytes(name.as_bytes())
@@ -672,10 +679,33 @@ fn constant_value(module: &str, name: &str) -> i64 {
             value::str_from_bytes(sep.as_bytes())
         }
         ("os", "environ") => environ_dict(),
+        // `os.PathLike` is the abstract base of path objects; PyX path values
+        // are plain strings (`pathlib.Path` included), so the class carries no
+        // members and exists for attribute/import compatibility.
+        ("os", "PathLike") => value::class_new("PathLike".to_string(), NONE, Vec::new()),
+        ("os", "devnull") => {
+            let devnull = if cfg!(windows) { "nul" } else { "/dev/null" };
+            value::str_from_bytes(devnull.as_bytes())
+        }
         ("os", "F_OK") => encode_int(libc::F_OK as i64),
         ("os", "X_OK") => encode_int(libc::X_OK as i64),
         ("os", "W_OK") => encode_int(libc::W_OK as i64),
         ("os", "R_OK") => encode_int(libc::R_OK as i64),
+        // `file_control` flags for `os.open`: the libc bit values (identical
+        // on every supported Unix; Windows has no `os.open` here).
+        ("os", "O_RDONLY") => encode_int(libc::O_RDONLY as i64),
+        ("os", "O_WRONLY") => encode_int(libc::O_WRONLY as i64),
+        ("os", "O_RDWR") => encode_int(libc::O_RDWR as i64),
+        ("os", "O_CREAT") => encode_int(libc::O_CREAT as i64),
+        ("os", "O_TRUNC") => encode_int(libc::O_TRUNC as i64),
+        ("os", "O_APPEND") => encode_int(libc::O_APPEND as i64),
+        ("os", "O_CLOEXEC") => encode_int(libc::O_CLOEXEC as i64),
+        // `threading.local` is an empty base class: it exists so thread-local
+        // subclasses (`class X(threading.local)`) and `local()` calls work.
+        // PyX stores attributes per instance, not per thread; the documented
+        // limitation is that concurrent instances share nothing, which is the
+        // usual pattern for console/render state.
+        ("threading", "local") => value::class_new("local".to_string(), NONE, Vec::new()),
         // Accepted for `ArgumentParser(formatter_class=...)`; the help
         // renderer is fixed, so the formatter is always the default.
         ("argparse", "RawTextHelpFormatter") => NONE,
@@ -702,6 +732,51 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // value only has to exist for the import.
         ("dataclasses", "dataclass") => NONE,
         _ => missing_attribute(module, name),
+    }
+}
+
+/// `dataclasses` functions. The frontend reads `field(...)` from the class-body
+/// AST to synthesize `__init__`; executing the class body still evaluates the
+/// call, so it returns a marker namespace carrying both settings.
+///
+/// `replace(obj, **changes)` copies the instance; the positional form binds no
+/// changes, the keyword form goes through [`dataclasses_call_kw`].
+fn dataclasses_call(function: &str, args: &[i64]) -> i64 {
+    match function {
+        "field" => {
+            // Omitted slots arrive as `None` (the frontend fills them).
+            let default = args.first().copied().unwrap_or(NONE);
+            let default_factory = args.get(1).copied().unwrap_or(NONE);
+            value::namespace_new(vec![
+                ("default".to_string(), default),
+                ("default_factory".to_string(), default_factory),
+            ])
+        }
+        "replace" => dataclasses_replace(args[0], Vec::new()),
+        _ => missing_attribute("dataclasses", function),
+    }
+}
+
+/// Keyword-aware `dataclasses` dispatch: only `replace` binds names.
+fn dataclasses_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    match function {
+        "replace" => dataclasses_replace(args[0], keywords),
+        _ => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("dataclasses.{function}() does not accept keyword arguments"),
+        ),
+    }
+}
+
+/// `dataclasses.replace(obj, **changes)`: shallow copy of an instance's
+/// attribute table with the named slots replaced or added.
+fn dataclasses_replace(instance: i64, changes: Vec<(String, i64)>) -> i64 {
+    match value::instance_replace(instance, changes) {
+        Some(copy) => copy,
+        None => exc::raise_with_message(
+            TYPE_ERROR,
+            "replace() should be called on dataclass instances",
+        ),
     }
 }
 
@@ -3193,6 +3268,9 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "access" => os_access(args),
         "sysconf" => os_sysconf(args),
         "getloadavg" => os_getloadavg(),
+        "open" => os_open(args),
+        "dup2" => os_dup2(args),
+        "get_terminal_size" => os_get_terminal_size(args),
         _ => missing_attribute("os", function),
     }
 }
@@ -3291,6 +3369,133 @@ fn os_getloadavg() -> i64 {
         RUNTIME_ERROR,
         "os.getloadavg is not supported on this platform",
     )
+}
+
+/// `os.get_terminal_size(fd=1)`: the `columns`/`lines` of the terminal behind
+/// `fd`, as a namespace. Raises `OSError` when `fd` is not a terminal.
+#[cfg(unix)]
+fn os_get_terminal_size(args: &[i64]) -> i64 {
+    let fd = match args.first() {
+        None => 1,
+        Some(arg) => match value::as_integer(*arg) {
+            Some(fd) => fd,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "get_terminal_size() argument must be an integer, not {}",
+                        value::type_name(*arg)
+                    ),
+                )
+            }
+        },
+    };
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `TIOCGWINSZ` writes one `winsize` through the valid pointer.
+    let result = unsafe {
+        libc::ioctl(
+            fd as libc::c_int,
+            libc::TIOCGWINSZ,
+            &mut size as *mut libc::winsize,
+        )
+    };
+    if result != 0 {
+        return os_error_from_io("get_terminal_size", std::io::Error::last_os_error(), None);
+    }
+    value::namespace_new(vec![
+        ("columns".to_string(), encode_int(i64::from(size.ws_col))),
+        ("lines".to_string(), encode_int(i64::from(size.ws_row))),
+    ])
+}
+
+#[cfg(not(unix))]
+fn os_get_terminal_size(_args: &[i64]) -> i64 {
+    exc::raise_with_message(
+        RUNTIME_ERROR,
+        "os.get_terminal_size is not supported on this platform",
+    )
+}
+
+/// `os.open(path, flags, mode=0o777)`: opens a file and returns the new
+/// descriptor. The caller owns it; `os.close` is not part of this slice.
+fn os_open(args: &[i64]) -> i64 {
+    let Some(path) = value::as_path_like(args[0]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "open() argument must be a path string, not {}",
+                value::type_name(args[0])
+            ),
+        );
+    };
+    let Some(flags) = value::as_integer(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "open() flags must be an integer, not {}",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    let mode = match args.get(2) {
+        None => 0o777,
+        Some(arg) => match value::as_integer(*arg) {
+            Some(mode) => mode,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "open() mode must be an integer, not {}",
+                        value::type_name(*arg)
+                    ),
+                )
+            }
+        },
+    };
+    let Ok(c_path) = CString::new(path) else {
+        return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+    };
+    // SAFETY: `c_path` is NUL-terminated and both flags values are integers;
+    // the variadic mode is only read when `O_CREAT` is set.
+    let fd = unsafe { libc::open(c_path.as_ptr(), flags as libc::c_int, mode as libc::c_uint) };
+    if fd < 0 {
+        return os_error_from_io("open", std::io::Error::last_os_error(), Some(path));
+    }
+    encode_int(i64::from(fd))
+}
+
+/// `os.dup2(fd, fd2)`: duplicates `fd` onto `fd2` and returns `fd2`.
+fn os_dup2(args: &[i64]) -> i64 {
+    let (Some(fd), Some(target)) = (value::as_integer(args[0]), value::as_integer(args[1])) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "dup2() arguments must be file descriptors (integers)",
+        );
+    };
+    // SAFETY: both arguments are plain descriptors; the kernel validates them.
+    let result = unsafe { libc::dup2(fd as libc::c_int, target as libc::c_int) };
+    if result < 0 {
+        return os_error_from_io("dup2", std::io::Error::last_os_error(), None);
+    }
+    encode_int(i64::from(result))
+}
+
+/// Raises `OSError` in CPython's `[Errno N] message[: 'path']` form and
+/// returns the `None` dummy value.
+fn os_error_from_io(function: &str, error: std::io::Error, path: Option<&str>) -> i64 {
+    let text = error.to_string();
+    let detail = text.split(" (os error").next().unwrap_or(text.as_str());
+    let suffix = match path {
+        Some(path) => format!(": '{path}'"),
+        None => String::new(),
+    };
+    match error.raw_os_error() {
+        Some(code) => exc::raise_with_message(
+            OS_ERROR,
+            &format!("{function}: [Errno {code}] {detail}{suffix}"),
+        ),
+        None => exc::raise_with_message(OS_ERROR, &format!("{function}: {detail}{suffix}")),
+    }
 }
 
 /// `os.access(path, mode)`: Linux permission bits, no exception on failure.
@@ -4017,10 +4222,26 @@ mod tests {
         assert_eq!(as_int(pyx_info[4]), 0);
         assert_eq!(as_int(get("sys", "maxsize")), value::MAX_INT);
         assert!(stdlib::function("sys", "exit").is_some());
-        for name in ["stdout", "stderr"] {
+        for name in [
+            "stdin",
+            "stdout",
+            "stderr",
+            "__stdin__",
+            "__stdout__",
+            "__stderr__",
+        ] {
             let stream = get("sys", name);
             assert!(value::as_std_stream(stream).is_some(), "{name}");
             assert_eq!(value::type_name(stream), "TextIOWrapper");
+            let expected = match name {
+                "stdin" | "__stdin__" => 0,
+                "stdout" | "__stdout__" => 1,
+                _ => 2,
+            };
+            assert_eq!(
+                value::as_std_stream(stream).map(|state| state.fd()),
+                Some(expected)
+            );
         }
     }
 
@@ -4124,6 +4345,237 @@ mod tests {
             ),
             FALSE
         );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn os_pathlike_devnull_and_open_flags() {
+        exc::init();
+        let pathlike = get("os", "PathLike");
+        assert_eq!(value::class_display_name(pathlike), Some("PathLike"));
+        assert!(value::as_class(pathlike).is_some());
+        assert!(stdlib::constant("os", "PathLike").is_some());
+
+        let devnull = if cfg!(windows) { "nul" } else { "/dev/null" };
+        assert_eq!(value::as_str(get("os", "devnull")), Some(devnull));
+
+        // The flags match the libc constants used by `os.open`.
+        assert_eq!(as_int(get("os", "O_RDONLY")), i64::from(libc::O_RDONLY));
+        assert_eq!(as_int(get("os", "O_WRONLY")), i64::from(libc::O_WRONLY));
+        assert_eq!(as_int(get("os", "O_RDWR")), i64::from(libc::O_RDWR));
+        assert_eq!(as_int(get("os", "O_CREAT")), i64::from(libc::O_CREAT));
+        assert_eq!(as_int(get("os", "O_TRUNC")), i64::from(libc::O_TRUNC));
+        assert_eq!(as_int(get("os", "O_APPEND")), i64::from(libc::O_APPEND));
+        assert_eq!(as_int(get("os", "O_CLOEXEC")), i64::from(libc::O_CLOEXEC));
+        for name in [
+            "O_RDONLY",
+            "O_WRONLY",
+            "O_RDWR",
+            "O_CREAT",
+            "O_TRUNC",
+            "O_APPEND",
+            "O_CLOEXEC",
+        ] {
+            assert!(stdlib::constant("os", name).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn os_open_dup2_and_terminal_size() {
+        exc::init();
+        let path = std::env::temp_dir().join(format!("pyx-os-open-{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_value = string(&path.to_string_lossy());
+        let flags = as_int(get("os", "O_WRONLY"))
+            | as_int(get("os", "O_CREAT"))
+            | as_int(get("os", "O_TRUNC"));
+        let fd = as_int(call("os", "open", &[path_value, int(flags), int(0o600)]));
+        assert!(
+            fd >= 0,
+            "os.open failed: {}",
+            if exc::pending() {
+                message()
+            } else {
+                String::new()
+            }
+        );
+        assert!(!exc::pending());
+
+        let payload = b"pyx-os-open";
+        // SAFETY: `fd` is a live descriptor and the buffer is valid.
+        let written = unsafe {
+            libc::write(
+                fd as libc::c_int,
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+            )
+        };
+        assert_eq!(written as usize, payload.len());
+
+        // `dup2(fd, fd)` is the identity case and returns the descriptor.
+        assert_eq!(as_int(call("os", "dup2", &[int(fd), int(fd)])), fd);
+        assert!(!exc::pending());
+
+        // A regular file is not a terminal, so the ioctl reports `OSError`.
+        exc::init();
+        assert_eq!(call("os", "get_terminal_size", &[int(fd)]), NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::OS_ERROR as i64);
+        let text = message();
+        assert!(text.starts_with("get_terminal_size: [Errno"), "{text}");
+
+        exc::init();
+        assert_eq!(call("os", "get_terminal_size", &[string("fd")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "get_terminal_size() argument must be an integer, not str"
+        );
+
+        // SAFETY: `fd` was opened above and is closed exactly once.
+        unsafe { libc::close(fd as libc::c_int) };
+        assert_eq!(
+            std::fs::read(&path).expect("read back").as_slice(),
+            &payload[..]
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // Opening a missing path and passing non-integer arguments fail.
+        exc::init();
+        let readonly = as_int(get("os", "O_RDONLY"));
+        assert_eq!(
+            call(
+                "os",
+                "open",
+                &[string("/nonexistent/pyx-open-test"), int(readonly)]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), crate::exc::OS_ERROR as i64);
+        let text = message();
+        assert!(text.starts_with("open: [Errno 2]"), "{text}");
+
+        exc::init();
+        assert_eq!(call("os", "open", &[int(1), int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
+        assert_eq!(call("os", "open", &[string("x"), string("y")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
+        assert_eq!(
+            call("os", "open", &[string("x"), int(0), string("mode")]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+
+        exc::init();
+        assert_eq!(call("os", "dup2", &[string("fd"), int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+
+        // An invalid descriptor is rejected by the kernel with `OSError`.
+        exc::init();
+        assert_eq!(call("os", "dup2", &[int(-1), int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::OS_ERROR as i64);
+    }
+
+    #[test]
+    fn dataclasses_field_returns_a_marker_namespace() {
+        exc::init();
+        let factory = value::builtin_function_new(pyx_ir::Builtin::List);
+        let marker = call("dataclasses", "field", &[NONE, factory]);
+        assert!(!exc::pending());
+        let pairs = value::as_namespace(marker).expect("field() marker namespace");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "default");
+        assert_eq!(pairs[0].1, NONE);
+        assert_eq!(pairs[1].0, "default_factory");
+        assert_eq!(pairs[1].1, factory);
+
+        // Both settings omitted default to `None`.
+        let empty = call("dataclasses", "field", &[]);
+        let pairs = value::as_namespace(empty).expect("field() marker namespace");
+        assert!(pairs.iter().all(|(_, value)| *value == NONE));
+
+        // `from dataclasses import field` resolves to a callable value.
+        let function = get("dataclasses", "field");
+        assert!(value::as_function(function).is_some());
+    }
+
+    #[test]
+    fn dataclasses_replace_copies_the_instance() {
+        exc::init();
+        let class = value::class_new("Point".to_string(), NONE, Vec::new());
+        let instance = value::instance_new(class);
+        value::instance_setattr(instance, "x".to_string(), int(1));
+        value::instance_setattr(instance, "y".to_string(), int(2));
+
+        // `replace(self, y=9, z=3)`: `y` overwrites the copied slot, `z` is
+        // added after the existing attributes.
+        let y_name = string("y");
+        let z_name = string("z");
+        let keywords = [y_name, int(9), z_name, int(3)];
+        let copy = module_call_kw(
+            b"dataclasses".as_ptr(),
+            11,
+            b"replace".as_ptr(),
+            7,
+            1,
+            &instance,
+            2,
+            keywords.as_ptr(),
+        );
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        let state = value::as_instance(copy).expect("instance copy");
+        assert_eq!(state.class, class);
+        let pairs: Vec<(String, i64)> = state.lock_attrs().clone();
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y", "z"],
+            "insertion order is preserved and the new name is appended"
+        );
+        assert_eq!(pairs[0].1, int(1));
+        assert_eq!(pairs[1].1, int(9));
+        assert_eq!(pairs[2].1, int(3));
+
+        // The original instance is untouched.
+        assert_eq!(value::instance_attr(instance, "y"), Some(int(2)));
+        assert_eq!(value::instance_attr(instance, "z"), None);
+        assert_eq!(value::instance_attr(instance, "x"), Some(int(1)));
+
+        // The positional form copies without changes.
+        let plain = call("dataclasses", "replace", &[instance]);
+        assert!(!exc::pending());
+        assert_ne!(plain, instance);
+        assert_eq!(value::instance_attr(plain, "x"), Some(int(1)));
+        assert_eq!(value::instance_attr(plain, "y"), Some(int(2)));
+
+        // `get` exposes the same callable value.
+        assert!(value::as_function(get("dataclasses", "replace")).is_some());
+
+        // A non-instance is rejected.
+        exc::init();
+        assert_eq!(call("dataclasses", "replace", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "replace() should be called on dataclass instances"
+        );
+        exc::init();
+    }
+
+    #[test]
+    fn threading_local_is_an_empty_base_class() {
+        exc::init();
+        let class = get("threading", "local");
+        assert_eq!(value::class_display_name(class), Some("local"));
+        assert!(value::as_class(class).is_some());
+        assert!(stdlib::constant("threading", "local").is_some());
         assert!(!exc::pending());
     }
 
@@ -4747,8 +5199,7 @@ mod tests {
     fn typing_abc_and_enum_resolve_through_the_module_surface() {
         exc::init();
         assert_eq!(get("typing", "TYPE_CHECKING"), FALSE);
-        assert_eq!(get("typing", "Any"), NONE);
-        for name in ["Generic", "NamedTuple", "Protocol"] {
+        for name in ["Any", "Generic", "NamedTuple", "Protocol", "Tuple"] {
             let class = value::as_class(get("typing", name)).expect("class value");
             assert_eq!(class.name, name);
         }

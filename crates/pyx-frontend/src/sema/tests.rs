@@ -818,6 +818,42 @@ fn for_range_stays_a_range_loop() {
 }
 
 #[test]
+fn loop_else_bodies_reach_the_ir() {
+    let source = "def f(xs):\n\
+                  \x20   for x in xs:\n        print(x)\n    else:\n        print('each')\n\
+                  \x20   for i in range(3):\n        print(i)\n    else:\n        print('range')\n\
+                  \x20   while False:\n        print('never')\n    else:\n        print('while')\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .expect("function f");
+    let mut loops = 0;
+    for stmt in &function.body {
+        match &stmt.kind {
+            pyx_ir::StmtKind::ForEach { else_body, .. } => {
+                assert_eq!(else_body.len(), 1, "for-each else must reach the IR");
+                loops += 1;
+            }
+            pyx_ir::StmtKind::ForRange { else_body, .. } => {
+                assert_eq!(else_body.len(), 1, "for-range else must reach the IR");
+                loops += 1;
+            }
+            pyx_ir::StmtKind::While {
+                body, else_body, ..
+            } => {
+                assert!(body.is_empty(), "the `while False:` body is dead");
+                assert_eq!(else_body.len(), 1, "while else must reach the IR");
+                loops += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(loops, 3, "every loop must keep its else clause");
+}
+
+#[test]
 fn iterable_builtin_result_types() {
     let source = "a = list()\nb = list((1, 2))\nc = list('ab')\nd = list({'x': 1})\ne = dict()\nf = dict([(1, 'a')])\ng = dict(zip([1], ['a']))\nh = enumerate(['a'])\ni = enumerate(['a'], 5)\nj = zip([1], [2])\nk = zip()\n";
     let program = crate::check_source(source, "test.py").expect("valid program");
@@ -1216,8 +1252,8 @@ fn bytes_builtin_and_method_arity_errors_are_reported() {
         vec!["bytes() takes 0 to 2 positional arguments (3 given)"]
     );
     assert_eq!(
-        check_errors("a = 'x'.encode('utf-8', 'strict')\n"),
-        vec!["str.encode() takes 0 to 1 positional argument(s) (2 given)"]
+        check_errors("a = 'x'.encode('utf-8', 'strict', 'extra')\n"),
+        vec!["str.encode() takes 0 to 2 positional argument(s) (3 given)"]
     );
     assert_eq!(
         check_errors("a = b'a'.replace(b'a')\n"),
@@ -1607,6 +1643,51 @@ fn raise_from_emits_the_cause_expression() {
         "cause must reference the parameter: {:?}",
         cause.kind
     );
+}
+
+#[test]
+fn del_emits_ir_delete_targets() {
+    let source = "def f(xs, table):\n    del xs[0], table['k'], xs[1:]\n";
+    let program = crate::check_source(source, "test.py").expect("valid del");
+    let f = program_function(&program, "f");
+    let StmtKind::Delete { targets } = &f.body[0].kind else {
+        panic!("expected a delete statement, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(targets.len(), 3);
+    assert!(matches!(&targets[0], DeleteTarget::Subscript { .. }));
+    assert!(matches!(&targets[1], DeleteTarget::Subscript { .. }));
+    let DeleteTarget::Slice { stop, .. } = &targets[2] else {
+        panic!("expected a slice target, got {:?}", targets[2]);
+    };
+    // An omitted bound becomes the runtime `None` sentinel.
+    assert!(matches!(&stop.kind, ExprKind::Const(Const::None)));
+}
+
+#[test]
+fn system_exit_and_name_error_handlers_keep_their_tags() {
+    let source = "def f():\n    try:\n        pass\n    except SystemExit:\n        pass\n    except NameError:\n        pass\n";
+    let program = crate::check_source(source, "test.py").expect("valid handlers");
+    let f = program_function(&program, "f");
+    let StmtKind::Try { handlers, .. } = &f.body[0].kind else {
+        panic!("expected a try statement, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(handlers[0].exc, Some(pyx_ir::ExcKind::SystemExit));
+    assert_eq!(handlers[1].exc, Some(pyx_ir::ExcKind::NameError));
+}
+
+#[test]
+fn input_and_get_ipython_calls_are_typed() {
+    let source = "def f():\n    a = input('> ')\n    return get_ipython()\n";
+    let program = crate::check_source(source, "test.py").expect("valid probes");
+    let f = program_function(&program, "f");
+    let StmtKind::Assign { value, .. } = &f.body[0].kind else {
+        panic!("expected an assignment, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(value.ty, pyx_ir::Type::Str);
+    let StmtKind::Return(Some(value)) = &f.body[1].kind else {
+        panic!("expected a return, got {:?}", f.body[1].kind);
+    };
+    assert_eq!(value.ty, pyx_ir::Type::Any);
 }
 
 #[test]

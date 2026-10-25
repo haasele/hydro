@@ -30,7 +30,7 @@ Machine-readable results are written to `benchmarks/compat/latest.json`.
 
 <!-- BEGIN GENERATED TABLE -->
 
-Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · PyX `pyx 0.1.0` · binary `/mnt/Vault/GitHub/pyx/target/release/pyx`
+Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · PyX `pyx 0.1.0` · binary `/mnt/Vault/GitHub/pyx/target/debug/pyx`
 
 ## Summary
 

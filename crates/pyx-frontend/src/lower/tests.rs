@@ -1584,6 +1584,159 @@ fn builtin_names_lower_to_builtin_refs() {
 }
 
 #[test]
+fn del_lowers_name_attr_subscript_and_slice_targets() {
+    let source =
+        "def f(obj, xs, table):\n    y = 1\n    del y, obj.name, table['k'], xs[0], xs[1:]\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = hir
+        .functions
+        .iter()
+        .find(|function| function.name == "f")
+        .expect("function f");
+    let HStmtKind::Delete { targets } = &f.body[1].kind else {
+        panic!("expected a delete statement, got {:?}", f.body[1].kind);
+    };
+    assert_eq!(targets.len(), 5);
+
+    let HDeleteTarget::Name(local) = &targets[0] else {
+        panic!("expected a name target, got {:?}", targets[0]);
+    };
+    assert_eq!(f.locals[*local as usize].name, "y");
+
+    let HDeleteTarget::Attr { object, name } = &targets[1] else {
+        panic!("expected an attribute target, got {:?}", targets[1]);
+    };
+    assert!(matches!(&object.kind, HExprKind::Local(_)));
+    assert_eq!(name, "name");
+
+    let HDeleteTarget::Subscript { object, index } = &targets[2] else {
+        panic!("expected a subscript target, got {:?}", targets[2]);
+    };
+    assert!(matches!(&object.kind, HExprKind::Local(_)));
+    assert!(matches!(
+        &index.kind,
+        HExprKind::Const(Const::Str(text)) if text == "k"
+    ));
+
+    let HDeleteTarget::Subscript { index, .. } = &targets[3] else {
+        panic!("expected a subscript target, got {:?}", targets[3]);
+    };
+    assert!(matches!(&index.kind, HExprKind::Const(Const::Int(0))));
+
+    let HDeleteTarget::Slice {
+        object,
+        start,
+        stop,
+        step,
+    } = &targets[4]
+    else {
+        panic!("expected a slice target, got {:?}", targets[4]);
+    };
+    assert!(matches!(&object.kind, HExprKind::Local(_)));
+    assert!(matches!(
+        start.as_deref().map(|bound| &bound.kind),
+        Some(HExprKind::Const(Const::Int(1)))
+    ));
+    assert!(stop.is_none());
+    assert!(step.is_none());
+}
+
+#[test]
+fn module_level_del_clears_the_mirrored_global() {
+    let source = "x = 1\ndef read():\n    return x\ndel x\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let targets = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Delete { targets } => Some(targets),
+            _ => None,
+        })
+        .expect("module-level delete");
+    assert_eq!(targets.len(), 2, "a module local mirrors its global");
+    assert!(matches!(&targets[0], HDeleteTarget::Name(_)));
+    let HDeleteTarget::Global { module, name } = &targets[1] else {
+        panic!("expected a global target, got {:?}", targets[1]);
+    };
+    assert_eq!(module, "__main__");
+    assert_eq!(name, "x");
+}
+
+#[test]
+fn del_of_a_declared_global_lowers_to_a_global_target() {
+    let source = "x = 1\ndef f():\n    global x\n    del x\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = hir
+        .functions
+        .iter()
+        .find(|function| function.name == "f")
+        .expect("function f");
+    let HStmtKind::Delete { targets } = &f.body[0].kind else {
+        panic!("expected a delete statement, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(targets.len(), 1);
+    let HDeleteTarget::Global { module, name } = &targets[0] else {
+        panic!("expected a global target, got {:?}", targets[0]);
+    };
+    assert_eq!(module, "__main__");
+    assert_eq!(name, "x");
+}
+
+#[test]
+fn deleting_an_unknown_name_is_a_compile_error() {
+    let source = "def f():\n    del missing\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(
+        diags.iter().any(|diag| diag
+            .message
+            .contains("cannot delete unknown name 'missing'")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn ellipsis_lowers_to_the_none_typed_constant() {
+    let source = "x = ...\ndef f():\n    ...\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let value = assigned(&hir, "x");
+    assert!(matches!(&value.kind, HExprKind::Const(Const::Ellipsis)));
+    assert_eq!(value.ty, Ty::Concrete(Type::None));
+}
+
+#[test]
+fn input_and_get_ipython_resolve_to_builtins() {
+    let source = "def f():\n    a = input('> ')\n    return get_ipython()\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = hir
+        .functions
+        .iter()
+        .find(|function| function.name == "f")
+        .expect("function f");
+    let HStmtKind::Assign { value, .. } = &f.body[0].kind else {
+        panic!("expected an assignment, got {:?}", f.body[0].kind);
+    };
+    let HExprKind::Call { callee, args } = &value.kind else {
+        panic!("expected an input() call, got {:?}", value.kind);
+    };
+    assert_eq!(*callee, Callee::Builtin(Builtin::Input));
+    assert_eq!(args.len(), 1);
+
+    let HStmtKind::Return(Some(value)) = &f.body[1].kind else {
+        panic!("expected a return, got {:?}", f.body[1].kind);
+    };
+    let HExprKind::Call { callee, args } = &value.kind else {
+        panic!("expected a get_ipython() call, got {:?}", value.kind);
+    };
+    assert_eq!(*callee, Callee::Builtin(Builtin::GetIpython));
+    assert!(args.is_empty());
+}
+
+#[test]
 fn builtin_value_drives_map_lowering() {
     let source = "x = list(map(int, ['1', '2']))\n";
     let (hir, mut infer, diags) = lower_source(source, &parse(source));
@@ -2582,7 +2735,7 @@ fn varargs_and_keyword_only_parameters_materialize_slots() {
             ParamKind::KwArg,
         ]
     );
-    assert_eq!(f.params[1].ty, Ty::Concrete(Type::List));
+    assert_eq!(f.params[1].ty, Ty::Concrete(Type::Any));
     assert_eq!(f.params[3].ty, Ty::Concrete(Type::Dict));
     assert_eq!(f.params[2].default, Some(Const::Int(1)));
     assert!(f.locals.iter().any(|local| local.name == "args"));
@@ -4267,10 +4420,120 @@ fn literal_conditions_drop_dead_statements() {
     assert!(matches!(&body[3].kind, HStmtKind::Assign { .. }));
 }
 
+#[test]
+fn while_else_lowers_the_else_body_outside_the_loop() {
+    let source = "i = 0\n\
+                  while i < 3:\n    i += 1\n\
+                  else:\n    print('done')\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let loop_stmt = hir.functions[0]
+        .body
+        .iter()
+        .find(|stmt| matches!(&stmt.kind, HStmtKind::While { .. }))
+        .expect("expected a while loop");
+    let HStmtKind::While {
+        body, else_body, ..
+    } = &loop_stmt.kind
+    else {
+        unreachable!();
+    };
+    assert_eq!(body.len(), 1, "the loop body must stay in `body`");
+    assert_eq!(else_body.len(), 1, "the else clause must be lowered");
+}
+
+#[test]
+fn for_range_and_for_each_else_lower_the_else_body() {
+    let range_source = "for i in range(3):\n    print(i)\n\
+                        else:\n    print('done')\n";
+    let (hir, _, diags) = lower_source(range_source, &parse(range_source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::ForRange {
+        body, else_body, ..
+    } = &hir.functions[0].body[0].kind
+    else {
+        panic!("expected a range loop");
+    };
+    assert_eq!(body.len(), 1);
+    assert_eq!(else_body.len(), 1);
+
+    let each_source = "xs = [1]\nfor x in xs:\n    print(x)\n\
+                       else:\n    print('done')\n";
+    let (hir, _, diags) = lower_source(each_source, &parse(each_source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let loop_stmt = hir.functions[0]
+        .body
+        .iter()
+        .find(|stmt| matches!(&stmt.kind, HStmtKind::ForEach { .. }))
+        .expect("expected a for-each loop");
+    let HStmtKind::ForEach {
+        body, else_body, ..
+    } = &loop_stmt.kind
+    else {
+        unreachable!();
+    };
+    assert_eq!(body.len(), 1);
+    assert_eq!(else_body.len(), 1);
+}
+
+#[test]
+fn break_in_a_loop_else_binds_to_the_enclosing_loop() {
+    // The inner `else` is outside the inner loop, so `break` targets the
+    // outer loop; the same clause with no enclosing loop is an error.
+    let source = "for i in range(3):\n\
+                  \x20   for j in range(3):\n        pass\n\
+                  \x20   else:\n        break\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::ForRange {
+        body, else_body, ..
+    } = &hir.functions[0].body[0].kind
+    else {
+        panic!("expected the outer range loop");
+    };
+    assert!(else_body.is_empty(), "the outer loop has no else clause");
+    let HStmtKind::ForRange {
+        body: inner_body,
+        else_body: inner_else,
+        ..
+    } = &body[0].kind
+    else {
+        panic!("expected the inner range loop in the outer body");
+    };
+    assert_eq!(inner_body.len(), 1);
+    assert!(
+        matches!(&inner_else[0].kind, HStmtKind::Break),
+        "break in a loop else must bind to the enclosing loop"
+    );
+
+    let source = "while True:\n    pass\nelse:\n    break\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(
+        diags
+            .iter()
+            .any(|diag| diag.message.contains("break outside a loop")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn while_false_with_else_keeps_only_the_else_body() {
+    let source = "while False:\n    print('body')\nelse:\n    print('done')\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::While {
+        body, else_body, ..
+    } = &hir.functions[0].body[0].kind
+    else {
+        panic!("a `while False` with `else` must keep the else clause");
+    };
+    assert!(body.is_empty(), "the dead loop body was lowered");
+    assert_eq!(else_body.len(), 1);
+}
+
 // ----------------------------------------------------------------------
 // Compiled extensions
 // ----------------------------------------------------------------------
-
 static EXT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Temporary directory holding a source file and compiled-extension stubs.
@@ -5101,6 +5364,229 @@ class Bench:
         );
     }
     assert!(matches!(&init.body[2].kind, HStmtKind::Return(None)));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn dataclass_literal_defaults_and_field_factories() {
+    let source = "\
+from dataclasses import dataclass, field
+@dataclass
+class Bench:
+    key: str
+    items: list = field(default_factory=list)
+    fallback: int = field(default=5)
+    count: int = 0
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let init = function(&hir, "Bench.__init__");
+    assert_eq!(
+        init.params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["self", "key", "items", "fallback", "count"]
+    );
+    // Required fields have no default; `field(...)` parameters default to
+    // `None` and let the body resolve the real value; literal defaults are
+    // recorded on the parameter.
+    assert_eq!(init.params[1].default, None);
+    assert_eq!(init.params[2].default, Some(Const::None));
+    assert_eq!(init.params[3].default, Some(Const::None));
+    assert_eq!(init.params[4].default, Some(Const::Int(0)));
+
+    assert_eq!(init.body.len(), 5, "{:?}", init.body);
+    let HStmtKind::SetAttr { name, value, .. } = &init.body[0].kind else {
+        panic!("expected the key assignment, got {:?}", init.body[0].kind);
+    };
+    assert_eq!(name, "key");
+    assert!(matches!(&value.kind, HExprKind::Local(1)));
+
+    // `field(default_factory=list)` checks for `None` and calls the factory.
+    let HStmtKind::SetAttr { name, value, .. } = &init.body[1].kind else {
+        panic!("expected the items assignment, got {:?}", init.body[1].kind);
+    };
+    assert_eq!(name, "items");
+    let HExprKind::IfExp { test, then, orelse } = &value.kind else {
+        panic!("expected a default fallback, got {:?}", value.kind);
+    };
+    assert!(matches!(&test.kind, HExprKind::Bin { op: BinOp::Is, .. }));
+    assert!(
+        matches!(&then.kind, HExprKind::IndirectCall { callee, args, .. }
+            if args.is_empty() && matches!(&callee.kind, HExprKind::BuiltinRef(Builtin::List))),
+        "the factory must be called with no arguments: {:?}",
+        then.kind
+    );
+    assert!(matches!(&orelse.kind, HExprKind::Local(2)));
+
+    // `field(default=5)` assigns the supplied default when the arg is `None`.
+    let HStmtKind::SetAttr { value, .. } = &init.body[2].kind else {
+        panic!(
+            "expected the fallback assignment, got {:?}",
+            init.body[2].kind
+        );
+    };
+    let HExprKind::IfExp { then, orelse, .. } = &value.kind else {
+        panic!("expected a default fallback, got {:?}", value.kind);
+    };
+    assert!(matches!(&then.kind, HExprKind::Const(Const::Int(5))));
+    assert!(matches!(&orelse.kind, HExprKind::Local(3)));
+
+    // A literal default is simply stored.
+    let HStmtKind::SetAttr { name, value, .. } = &init.body[3].kind else {
+        panic!("expected the count assignment, got {:?}", init.body[3].kind);
+    };
+    assert_eq!(name, "count");
+    assert!(matches!(&value.kind, HExprKind::Local(4)));
+    assert!(matches!(&init.body[4].kind, HStmtKind::Return(None)));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn field_default_and_factory_together_are_rejected() {
+    let source = "\
+from dataclasses import dataclass, field
+@dataclass
+class Bad:
+    value: int = field(default=1, default_factory=int)
+";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(
+        diags[0].message,
+        "field() cannot specify both default and default_factory"
+    );
+}
+
+#[test]
+fn same_unit_class_constructor_keywords_are_reordered() {
+    let source = "\
+class Point:
+    def __init__(self, x, y=2):
+        self.x = x
+        self.y = y
+p = Point(y=3, x=1)
+q = Point(4)
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let HExprKind::IndirectCall { callee, args, .. } = &assigned(&hir, "p").kind else {
+        panic!(
+            "expected an indirect class call, got {:?}",
+            assigned(&hir, "p").kind
+        );
+    };
+    assert!(matches!(&callee.kind, HExprKind::Local(_)));
+    assert_eq!(args.len(), 2);
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::Int(1))));
+    assert!(matches!(&args[1].kind, HExprKind::Const(Const::Int(3))));
+
+    // Omitted parameters receive the literal default.
+    let HExprKind::IndirectCall { args, .. } = &assigned(&hir, "q").kind else {
+        panic!(
+            "expected an indirect class call, got {:?}",
+            assigned(&hir, "q").kind
+        );
+    };
+    assert_eq!(args.len(), 2);
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::Int(4))));
+    assert!(matches!(&args[1].kind, HExprKind::Const(Const::Int(2))));
+}
+
+#[test]
+fn console_thread_locals_style_dataclass_constructs_with_keywords() {
+    let source = "\
+from dataclasses import dataclass, field
+import threading
+
+class ThemeStack:
+    def __init__(self, themes=None):
+        self.themes = themes
+
+@dataclass
+class ConsoleThreadLocals(threading.local):
+    theme_stack: ThemeStack
+    buffer: list = field(default_factory=list)
+    buffer_index: int = 0
+
+class Console:
+    def __init__(self, theme):
+        self._thread_locals = ConsoleThreadLocals(
+            theme_stack=ThemeStack(themes=[theme])
+        )
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let HStmtKind::ClassDef { base, .. } = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::ClassDef { name, .. } if name == "ConsoleThreadLocals" => Some(&stmt.kind),
+            _ => None,
+        })
+        .expect("ConsoleThreadLocals class")
+    else {
+        panic!("expected the ConsoleThreadLocals class");
+    };
+    assert!(
+        matches!(
+            base.as_ref().map(|base| &base.kind),
+            Some(HExprKind::ModuleAttr { module, name })
+                if module == "threading" && name == "local"
+        ),
+        "threading.local must stay the base class"
+    );
+
+    let init = function(&hir, "ConsoleThreadLocals.__init__");
+    assert_eq!(
+        init.params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["self", "theme_stack", "buffer", "buffer_index"]
+    );
+    assert_eq!(init.params[1].default, None);
+    assert_eq!(init.params[2].default, Some(Const::None));
+    assert_eq!(init.params[3].default, Some(Const::Int(0)));
+
+    let console_init = function(&hir, "Console.__init__");
+    let HStmtKind::SetAttr { name, value, .. } = &console_init.body[0].kind else {
+        panic!(
+            "expected the thread-locals assignment, got {:?}",
+            console_init.body[0].kind
+        );
+    };
+    assert_eq!(name, "_thread_locals");
+    let HExprKind::IndirectCall { callee, args, .. } = &value.kind else {
+        panic!("expected a class call, got {:?}", value.kind);
+    };
+    assert!(matches!(
+        &callee.kind,
+        HExprKind::GlobalGet { name, .. } if name == "ConsoleThreadLocals"
+    ));
+    assert_eq!(args.len(), 3, "{args:?}");
+    // The keyword value is the nested `ThemeStack(themes=[theme])` call.
+    let HExprKind::IndirectCall {
+        callee,
+        args: theme_args,
+        ..
+    } = &args[0].kind
+    else {
+        panic!("expected the ThemeStack call, got {:?}", args[0].kind);
+    };
+    assert!(matches!(
+        &callee.kind,
+        HExprKind::GlobalGet { name, .. } if name == "ThemeStack"
+    ));
+    assert_eq!(theme_args.len(), 1);
+    assert!(matches!(&theme_args[0].kind, HExprKind::List(items) if items.len() == 1));
+    // Omitted factory and literal fields become `None` placeholders; the
+    // generated body fills the real values.
+    assert!(matches!(&args[1].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(&args[2].kind, HExprKind::Const(Const::Int(0))));
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 

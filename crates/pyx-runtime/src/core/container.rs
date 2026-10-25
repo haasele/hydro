@@ -839,6 +839,14 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
             None => exc::raise_with_message(KEY_ERROR, &value::repr(index)),
         };
     }
+    // Generic aliases (`typing.Tuple[int]`, `list[str]`) and ordinary classes
+    // are treated as subscriptable: PyX has no generic substitution, so the
+    // class value itself is the alias. User code that evaluates a typing alias
+    // at runtime (for example a module-level `CellSpan = Tuple[int, int]`)
+    // gets a usable value instead of `TypeError`/`None[...]`.
+    if value::as_class(obj).is_some() {
+        return obj;
+    }
     type_error(format!(
         "'{}' object is not subscriptable",
         value::type_name(obj)
@@ -882,6 +890,55 @@ pub(crate) fn subscript_set(obj: i64, index: i64, new_value: i64) -> i64 {
     }
     type_error(format!(
         "'{}' object does not support item assignment",
+        value::type_name(obj)
+    ))
+}
+
+/// `del object[index]` for lists and dicts. Always returns `None`; errors are
+/// reported through the pending exception.
+///
+/// A list index out of range raises `IndexError`, a missing dict key
+/// `KeyError` (with the key's `repr`) and every other receiver `TypeError`.
+pub(crate) fn delete_subscript(obj: i64, index: i64) -> i64 {
+    if let Some(mut items) = value::list_items_mut(obj) {
+        let Some(raw) = value::as_integer(index) else {
+            // Drop the graph lock before allocating the exception object.
+            drop(items);
+            return type_error(format!(
+                "list indices must be integers or slices, not {}",
+                value::type_name(index)
+            ));
+        };
+        return match normalize_index(raw, items.len()) {
+            Some(pos) => {
+                items.remove(pos);
+                NONE
+            }
+            None => {
+                drop(items);
+                exc::raise_with_message(INDEX_ERROR, "list assignment index out of range")
+            }
+        };
+    }
+    if let Some(mut dict) = value::dict_pairs_mut(obj) {
+        if let Some(name) = unhashable_name(index) {
+            drop(dict);
+            return type_error(unhashable_message(name));
+        }
+        return match dict.remove(index) {
+            Some(_) => NONE,
+            // Python's `KeyError` message is the repr of the missing key.
+            None => {
+                drop(dict);
+                exc::raise_with_message(KEY_ERROR, &value::repr(index))
+            }
+        };
+    }
+    if value::as_defaultdict(obj).is_some() {
+        return crate::modules::collections::delitem(obj, index);
+    }
+    type_error(format!(
+        "'{}' object does not support item deletion",
         value::type_name(obj)
     ))
 }
@@ -1065,6 +1122,68 @@ pub(crate) fn slice_set(obj: i64, start: i64, stop: i64, step: i64, new_value: i
         items[position] = value;
         crate::heap::write_barrier_edge(obj, value);
     }
+    NONE
+}
+
+/// `del object[start:stop:step]` for lists.
+///
+/// `start`, `stop` and `step` are tagged values; [`NONE`] means the argument
+/// was omitted. Bounds follow Python's `slice.indices` exactly, so
+/// `del xs[:]` clears the list and negative steps delete the visited
+/// positions. Strings, bytes and tuples are immutable (`TypeError`); a dict
+/// reports the unhashable `slice` key like a slice read. Every remaining
+/// element keeps its object; dropped edges are reclaimed by the next
+/// collection. Returns `None`; errors are reported through the pending
+/// exception.
+pub(crate) fn delete_slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
+    if value::as_list(obj).is_none() {
+        if value::as_dict(obj).is_some() || value::as_defaultdict(obj).is_some() {
+            let _ = type_error(unhashable_message("slice"));
+        } else {
+            let _ = type_error(format!(
+                "'{}' object does not support item deletion",
+                value::type_name(obj)
+            ));
+        }
+        return NONE;
+    }
+    if let Err(err) = validate_slice_args(start, stop, step) {
+        let _ = slice_error(err);
+        return NONE;
+    }
+    // Clamp against the length observed after any user code ran.
+    let Some(len) = value::as_list(obj).map(|items| items.len()) else {
+        return NONE;
+    };
+    let Ok((start, stop, step)) = slice_indices(start, stop, step, len) else {
+        return NONE;
+    };
+    let Some(mut items) = value::list_items_mut(obj) else {
+        return NONE;
+    };
+    if step == 1 {
+        // In-range indices are monotonic; clamp again in case another thread
+        // changed the list between the length read and the lock.
+        let length = items.len();
+        let low = (start.max(0) as usize).min(length);
+        let high = (stop.max(0) as usize).min(length).max(low);
+        items.drain(low..high);
+        return NONE;
+    }
+    let positions = slice_positions(start, stop, step);
+    let length = items.len();
+    let mut dropped = vec![false; length];
+    for position in positions {
+        if position < length {
+            dropped[position] = true;
+        }
+    }
+    let mut position = 0usize;
+    items.retain(|_| {
+        let keep = !dropped[position];
+        position += 1;
+        keep
+    });
     NONE
 }
 
@@ -2063,5 +2182,83 @@ mod tests {
         assert_eq!(value::as_dict(d).map(|p| p.len()), Some(1));
         assert_eq!(subscript(d, int(5)), int(50));
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn delete_subscript_removes_list_items_and_dict_keys() {
+        exc::init();
+        let xs = list(&[int(1), int(2), int(3)]);
+        assert_eq!(delete_subscript(xs, int(1)), NONE);
+        assert_eq!(value::as_list(xs), Some(&[int(1), int(3)][..]));
+        assert_eq!(delete_subscript(xs, int(-1)), NONE);
+        assert_eq!(value::as_list(xs), Some(&[int(1)][..]));
+        assert!(!exc::pending());
+
+        assert_eq!(delete_subscript(xs, int(5)), NONE);
+        assert_eq!(exc::pending_tag(), INDEX_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "list assignment index out of range"
+        );
+        exc::clear();
+
+        let keys = [string("a"), string("b")];
+        let values = [int(1), int(2)];
+        let d = dict_new(keys.len(), keys.as_ptr(), values.as_ptr());
+        assert_eq!(delete_subscript(d, string("a")), NONE);
+        assert_eq!(value::as_dict(d).map(|pairs| pairs.len()), Some(1));
+        assert_eq!(subscript(d, string("b")), int(2));
+        assert!(!exc::pending());
+
+        assert_eq!(delete_subscript(d, string("a")), NONE);
+        assert_eq!(exc::pending_tag(), KEY_ERROR as i64);
+        assert_eq!(value::to_string(exc::pending_value()), "'a'");
+        exc::clear();
+
+        // Immutable receivers reject deletion.
+        assert_eq!(delete_subscript(string("ab"), int(0)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "'str' object does not support item deletion"
+        );
+    }
+
+    #[test]
+    fn delete_slice_clears_and_removes_selected_positions() {
+        exc::init();
+        let cleared = list(&[int(1), int(2), int(3)]);
+        assert_eq!(delete_slice(cleared, NONE, NONE, NONE), NONE);
+        assert_eq!(value::as_list(cleared), Some(&[][..]));
+        assert!(!exc::pending());
+
+        let plain = list(&[int(1), int(2), int(3), int(4), int(5)]);
+        assert_eq!(delete_slice(plain, int(1), int(3), NONE), NONE);
+        assert_eq!(value::as_list(plain), Some(&[int(1), int(4), int(5)][..]));
+
+        let stepped = list(&[int(1), int(2), int(3), int(4), int(5)]);
+        assert_eq!(delete_slice(stepped, int(0), int(5), int(2)), NONE);
+        assert_eq!(value::as_list(stepped), Some(&[int(2), int(4)][..]));
+
+        let backwards = list(&[int(1), int(2), int(3), int(4)]);
+        assert_eq!(delete_slice(backwards, NONE, NONE, int(-1)), NONE);
+        assert_eq!(value::as_list(backwards), Some(&[][..]));
+
+        assert_eq!(delete_slice(tuple(&[int(1)]), NONE, NONE, NONE), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "'tuple' object does not support item deletion"
+        );
+        exc::clear();
+
+        let zero = list(&[int(1)]);
+        assert_eq!(delete_slice(zero, NONE, NONE, int(0)), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "slice step cannot be zero"
+        );
+        assert_eq!(value::as_list(zero), Some(&[int(1)][..]));
     }
 }

@@ -64,11 +64,37 @@ fn const_types() {
     assert_eq!(Const::Int(1).ty(), Type::Int);
     assert_eq!(Const::None.ty(), Type::None);
     assert_eq!(Const::NotImplemented.ty(), Type::Any);
+    // Documented limitation: `...` has no distinct sentinel and is `None`.
+    assert_eq!(Const::Ellipsis.ty(), Type::None);
     assert_eq!(UnOp::Invert.symbol(), "~");
     assert!(Type::Bool.is_numeric());
     assert!(!Type::Str.is_numeric());
     assert_eq!(Type::List.name(), "list");
     assert_eq!(Type::Dict.name(), "dict");
+}
+
+#[test]
+fn console_builtins_and_exception_tags() {
+    assert_eq!(Builtin::from_name("input"), Some(Builtin::Input));
+    assert_eq!(Builtin::Input.name(), "input");
+    assert_eq!(Builtin::from_name("get_ipython"), Some(Builtin::GetIpython));
+    assert_eq!(Builtin::GetIpython.name(), "get_ipython");
+
+    // New tags extend the fixed encoding without renumbering existing ones.
+    assert_eq!(ExcKind::NameError.tag(), 16);
+    assert_eq!(ExcKind::SystemExit.tag(), 17);
+    assert_eq!(ExcKind::NameError.name(), "NameError");
+    assert_eq!(ExcKind::SystemExit.name(), "SystemExit");
+    assert_eq!(ExcKind::from_name("NameError"), Some(ExcKind::NameError));
+    assert_eq!(ExcKind::from_name("SystemExit"), Some(ExcKind::SystemExit));
+    assert_eq!(
+        ExcKind::from_class_name("NameError"),
+        Some(ExcKind::NameError)
+    );
+    assert_eq!(
+        ExcKind::from_class_name("SystemExit"),
+        Some(ExcKind::SystemExit)
+    );
 }
 
 #[test]

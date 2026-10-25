@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-25**. Phase 1 is complete; Phase 2 is largely
-implemented (1329 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (1368 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -509,9 +509,11 @@ implement the protocol; without `as`, `__enter__` still runs.
   (module cache at compile time), loads dependencies first and diagnoses
   cycles made only of module-level imports. Imported module bodies are
   compiled into the `Program` and run once as initializers, so import side
-  effects execute in dependency order; top-level functions, classes and
-  mirrored module-level values are exported, while `from x import *` is not
-  supported. Module-level bindings are also mirrored into the runtime global
+  effects execute in dependency order; an exception raised by an initializer
+  is reported through the uncaught path before the next module or the entry
+  body runs, so its pending error cannot be silently overwritten.
+  Top-level functions, classes and mirrored module-level values are
+  exported, while `from x import *` is not supported. Module-level bindings are also mirrored into the runtime global
   table, so importers read them regardless of lowering order. All units end
   up in one `Program`; JIT and AOT execute the same code (AOT embeds the
   modules into the binary).
@@ -710,8 +712,8 @@ it. The cache is not a shared artifact store.
 - Statements: `Expr`, `Assign`, `AugAssign`, `If`, `While`, `ForRange`,
   `ForEach`, `Unpack`, `SetSubscript`, `SetSlice` (list slice assignment;
   omitted bounds are `Const::None`), `Closure` (nested def), `Yield`,
-  `ClassDef { target, name, base, methods }`, `SetAttr`, `Return`, `Break`,
-  `Continue`, `Pass`, `Raise`,
+  `ClassDef { target, name, base, methods }`, `SetAttr`, `Delete { targets }`,
+  `Return`, `Break`, `Continue`, `Pass`, `Raise`,
   `Try { body, handlers, else_body, finally_body }`.
 - `Handler.exc == None` is a bare `except:` (catches every tag). `else` runs
   only after an error-free body; `finally` runs on every path (normal, `return`,
@@ -725,6 +727,20 @@ it. The cache is not a shared artifact store.
   `ForRange` remains the syntactically specialized `range(...)` form (since
   Phase 2.7, `range` is additionally a value). Negative step is
   allowed, step `0` is a runtime `ValueError`.
+- `Delete { targets }` evaluates targets left to right and deletes each one
+  immediately: locals (slot cleared to `None`; PyX does not track unbound
+  locals), module globals (`NameError` when missing), instance attributes,
+  list/dict subscripts and list slices. Receivers/bounds are evaluated in
+  Python order, immutable receivers and class namespaces raise `TypeError`,
+  and the first failing target stops the statement. Slice bounds are boxed
+  in the IR because a delete slice carries four `Expr` nodes.
+- `While`/`ForRange`/`ForEach` carry an `else_body` that runs only when the
+  loop exhausts normally: `break`, `return` and exceptions skip it, while
+  `continue` does not. Codegen branches normal exhaustion to the else entry
+  and `break` past it, and emits the clause after popping the loop, so loop
+  actions inside it bind to an enclosing loop. A loop without `else` keeps
+  the previous block shape, and `while False: ... else: ...` keeps only the
+  else body.
 - `Raise { exc, msg, cause }`: `exc == msg == None` is a bare re-raise;
   `cause` is the optional explicit chaining expression. A raise of a class
   declared in the unit lowers to `RuntimeError` with a
@@ -983,8 +999,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **1329 tests** (395 frontend, 47 codegen, 16 IR, 479
-  runtime unit, 179 runtime integration, 213 CLI/E2E). E2E coverage
+- As of 2026-10-25: **1368 tests** (413 frontend, 48 codegen, 18 IR, 492
+  runtime unit, 179 runtime integration, 218 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
@@ -992,7 +1008,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - Generated stdlib import matrix (2026-10-25): **58/297 importable** (13
   builtin/frozen, 41 pure, 4 extension; report in
   [`COMPATIBILITY.md`](COMPATIBILITY.md)). `benchmarks/bench_all.py` does
-  **not** yet run under PyX; the first blocker is `rich/console.py`.
+  **not** yet run under PyX; the first observed blockers are native
+  bound-method values and dynamic `*args`/`**kwargs` calls in `rich`.
 - New unit tests cover the dict hash index, the GC statistics and
   fiber iteration; `examples/generators_async.py` runs under JIT and AOT.
 - E2E compares stdout/exit code of `pyx run` and the AOT binary; negative tests

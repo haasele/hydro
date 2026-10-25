@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1329 tests, JIT+AOT |
+| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1368 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -56,25 +56,33 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   Nested imports are recorded and stay unloaded until the enclosing code
   runs.
 - **`rich` progress:** the native `rich` implementation was removed. The
-  official pure-Python `rich` distribution is resolved through the loader,
-  but `rich/console.py` (and likely further modules) still lack runtime
-  features, so no working `rich` path exists under PyX yet.
+  official pure-Python `rich` distribution is resolved through the loader.
+  The console-compatibility surface now covers `del`, loop `else`,
+  `dataclasses.field` defaults/factories and keyword construction,
+  `...`, `input()`, `get_ipython()`, `SystemExit`, `os.PathLike`/
+  `devnull`/`open`/`dup2`/`get_terminal_size`, `sys.stdin`/`stdout`/
+  `stderr` (plus `__std*__`), `threading.local`, and runtime-evaluated
+  typing aliases (`Tuple[int, ...]`). `rich/console.py` compiles; the next
+  runtime blockers are native bound-method values (`rich/cells.py:35`,
+  `_SINGLE_CELLS.issuperset`) and dynamic `*args`/`**kwargs` calls
+  (`Style(..., **attributes)`). No working `rich` path exists under PyX
+  yet.
 - **Import matrix:** **58/297 modules importable** (13 builtin/frozen,
   41 pure, 4 extension; 230 `PYX0002`, 9 modules where CPython 3.14.9
   itself fails). Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **`benchmarks/bench_all.py` under PyX: not yet green.** The first concrete
-  blocker is `rich/console.py`: `dataclasses.field`, `os.PathLike`, ellipsis,
-  `del`, `get_ipython`, `sys.stdin`/`__stdin__`/`__stdout__`/`__stderr__`,
-  `os.get_terminal_size`/`open`/`dup2`, `SystemExit`, `input()` and
-  `threading.local`. Further `rich` modules will likely add more.
+- **`benchmarks/bench_all.py` under PyX: not yet green.** The console/
+  dataclass/typing compile blockers are implemented; the first observed
+  runtime blockers are native bound-method values (`rich/cells.py:35`) and
+  dynamic `*args`/`**kwargs` calls (`rich/style.py:560`). Further `rich`
+  modules will likely add more.
   `bench_all.py --only pyx` still completes under CPython.
 
 **Verification (as of 2026-10-25):**
 
-- `cargo test --workspace`: **1329 tests** — 395 frontend, 47 codegen, 16 IR,
-  479 runtime unit, 213 CLI/E2E (136 E2E incl. the abi3 extension fixture,
-  24 fibers, 6 closures, 10 user modules, 10 exception tests, 8
+- `cargo test --workspace`: **1368 tests** — 413 frontend, 48 codegen, 18 IR,
+  492 runtime unit, 218 CLI/E2E (140 E2E incl. the abi3 extension fixture,
+  24 fibers, 6 closures, 11 user modules, 10 exception tests, 8
   completions, extension path/dotted/multi-phase, 2 unittest-runner tests,
   2 stdlib-batch-a, 2 stdlib-batch-b, 3 stdlib-bench-batch tests and 5 CLI
   argument-parser unit tests), 179 further runtime integration tests
@@ -565,7 +573,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 1329 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 1368 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -833,9 +841,9 @@ Windows/cross-compilation missing.
    benchmark-critical batch, the package/site-packages loader and the new
    native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
    `importlib`/`__future__` modules are importable/API-tested. Next are
-   P7-03 builtin shims, the remaining Batch B/C/E/F modules and the
-   `rich/console.py` blockers for `bench_all.py` under PyX, then the
-   dependency-ordered batches in `docs/TODO.md`. P4: extend the working abi3
+   P7-03 builtin shims, the remaining Batch B/C/E/F modules and the native
+   bound-method/dynamic-keyword-call blockers for `bench_all.py` under PyX,
+   then the dependency-ordered batches in `docs/TODO.md`. P4: extend the working abi3
    slice (capsules, buffer, container constructors, wheels/venv discovery),
    then the full CPython 3.14 ABI/NumPy/pydantic-core (P4-04c/d),
    P4-05/P4-06; ecosystem suites/benchmarks P4-10/P4-11.
@@ -852,7 +860,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (1329)
+cargo test                             # unit/integration tests (1368)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1254,3 +1262,16 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   `open`/`dup2`, `SystemExit`, `input()`, `threading.local`), with further
   `rich` modules likely to add more. **1329 tests**, clippy `-D warnings` and
   `scripts/verify.sh` green.
+
+- 2026-10-25 (continuation 51): rich console compatibility surface.
+  Added `del` statements (name/global/attribute/subscript/slice with
+  left-to-right evaluation and runtime errors), loop `else` clauses,
+  `...`, `input()`, `get_ipython()`, `NameError`/`SystemExit` tags,
+  `dataclasses.field` defaults/factories with keyword construction and
+  `dataclasses.replace`, subscriptable `typing` aliases, `os.PathLike`/
+  `devnull`/`open`/`dup2`/`get_terminal_size`, native stdin/stdout/stderr
+  streams and `threading.local`. Imported-module initializer exceptions now
+  stop the program with the original error instead of being overwritten by a
+  later entry-body failure. `rich/console.py` compiles; native bound-method
+  values and dynamic `*args`/`**kwargs` calls are the next observed blockers.
+  **1368 tests**, clippy `-D warnings` and `scripts/verify.sh` green.

@@ -112,6 +112,28 @@ pub(crate) fn setitem(dd: i64, key: i64, new_value: i64) -> i64 {
     NONE
 }
 
+/// `del dd[key]`: removes the entry. A missing key raises `KeyError` with the
+/// key's `repr` and unhashable keys raise `TypeError`.
+pub(crate) fn delitem(dd: i64, key: i64) -> i64 {
+    if let Some(name) = container::unhashable_name(key) {
+        return type_error(&container::unhashable_message(name));
+    }
+    let mut state = match value::defaultdict_state_mut(dd) {
+        Some(state) => state,
+        None => return type_error("'defaultdict' object does not support item deletion"),
+    };
+    match container::dict_find(&state.pairs, key) {
+        Some(position) => {
+            state.pairs.remove(position);
+            NONE
+        }
+        None => {
+            drop(state);
+            exc::raise_with_message(KEY_ERROR, &value::repr(key))
+        }
+    }
+}
+
 fn check_arity(method: &str, argc: usize, min: usize, max: usize) -> Option<i64> {
     if argc >= min && argc <= max {
         return None;

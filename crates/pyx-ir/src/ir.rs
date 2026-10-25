@@ -286,6 +286,42 @@ impl Stmt {
     }
 }
 
+/// One target of a `del` statement.
+///
+/// Python evaluates each target's receiver (and index or slice bounds) in
+/// source order and performs the deletion immediately, before the next target
+/// is evaluated. Codegen must preserve that order and stop at the first
+/// failing target. Missing attributes, keys, indices and out-of-range list
+/// positions raise at runtime; immutable receivers (`str`, `bytes`, `tuple`)
+/// and class namespaces reject deletion (`TypeError`).
+#[derive(Clone, Debug)]
+pub enum DeleteTarget {
+    /// Delete a local slot binding. Deleting a name with no slot is a
+    /// compile-time diagnostic; at runtime the slot is cleared to `None`
+    /// (documented limitation: PyX does not track unbound locals, so a later
+    /// read yields `None` instead of raising `NameError`).
+    Name(LocalId),
+    /// Delete a module-level binding from the runtime global table
+    /// (`global name; del name`, or `del name` in a module body). A missing
+    /// entry raises `NameError`.
+    Global { module: String, name: String },
+    /// `del object.name`: evaluates `object`, then removes the instance
+    /// attribute.
+    Attr { object: Expr, name: String },
+    /// `del object[index]`: evaluates `object`, then `index`, then removes the
+    /// list element or dict entry.
+    Subscript { object: Expr, index: Expr },
+    /// `del object[start:stop:step]`: evaluates `object` and then the bounds
+    /// in source order, then removes the list slice. An omitted bound is a
+    /// `Const::None` expression, as in [`StmtKind::SetSlice`].
+    Slice {
+        object: Box<Expr>,
+        start: Box<Expr>,
+        stop: Box<Expr>,
+        step: Box<Expr>,
+    },
+}
+
 /// One `except [exc] [as <local>]:` arm. `exc == None` is a bare `except:`.
 ///
 /// `exc` is always a runtime tag. The frontend approximates handlers that name
@@ -326,23 +362,39 @@ pub enum StmtKind {
         then_body: Vec<Stmt>,
         else_body: Vec<Stmt>,
     },
+    /// `while cond:` with an optional `else:` clause.
+    ///
+    /// `else_body` runs only when the loop finishes by evaluating `cond` as
+    /// false: a `break`, `return`, `raise` (or any other exception) in `body`
+    /// skips it. `continue` never skips it, because the loop may still
+    /// exhaust normally afterwards.
     While {
         cond: Expr,
         body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
     },
-    /// `for var in range(start, stop[, step])`.
+    /// `for var in range(start, stop[, step])`, with an optional `else:`.
+    ///
+    /// `else_body` runs only when the iterator is exhausted: `break`,
+    /// `return` and exceptions in `body` skip it.
     ForRange {
         var: LocalId,
         start: Expr,
         stop: Expr,
         step: Option<Expr>,
         body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
     },
-    /// `for var in <iterable>` over a runtime iterable (list, str, dict).
+    /// `for var in <iterable>` over a runtime iterable (list, str, dict), with
+    /// an optional `else:`.
+    ///
+    /// `else_body` runs only when the iterator is exhausted: `break`,
+    /// `return` and exceptions in `body` skip it.
     ForEach {
         var: LocalId,
         iterable: Expr,
         body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
     },
     /// `a, b, c = value`. `value` may be any iterable; codegen materialises it
     /// (lists and tuples are used as-is) and checks that it has exactly
@@ -424,6 +476,12 @@ pub enum StmtKind {
     Assert {
         test: Expr,
         msg: Option<Expr>,
+    },
+    /// `del a, obj.name, obj[key], obj[start:stop:step]`: evaluates and
+    /// deletes each target left to right. See [`DeleteTarget`] for the exact
+    /// evaluation order and the runtime error contract.
+    Delete {
+        targets: Vec<DeleteTarget>,
     },
     /// `try: ... except ...: ... else: ... finally: ...`.
     /// At least one of `handlers` and `finally_body` is non-empty. `else_body`

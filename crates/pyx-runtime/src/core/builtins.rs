@@ -9,7 +9,7 @@ use pyx_ir::{Builtin, MethodKind};
 
 use crate::container;
 use crate::exc::{
-    self, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
+    self, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
 };
 use crate::format;
 use crate::iter;
@@ -1458,6 +1458,15 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             RUNTIME_ERROR,
             "dynamic imports are not supported at runtime",
         ),
+        Builtin::Input => match args {
+            [] => input_value(None),
+            [prompt] => input_value(Some(*prompt)),
+            _ => builtin_arity_error("input", "at most 1", argc),
+        },
+        Builtin::GetIpython => match args {
+            [] => get_ipython_value(),
+            _ => builtin_arity_error("get_ipython", "exactly 0", argc),
+        },
         Builtin::Max => max(argc, argv),
         Builtin::Min => min(argc, argv),
         Builtin::Sorted => sorted(argc, argv),
@@ -1488,6 +1497,10 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [iterable] => all(*iterable),
             _ => builtin_arity_error("all", "exactly 1", argc),
         },
+        Builtin::AnyValue => match args {
+            [iterable] => any(*iterable),
+            _ => builtin_arity_error("any", "exactly 1", argc),
+        },
         Builtin::Ord => match args {
             [value] => ord_value(*value),
             _ => builtin_arity_error("ord", "exactly 1", argc),
@@ -1509,6 +1522,63 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             _ => builtin_arity_error("dict merge", "exactly 2", argc),
         },
     }
+}
+
+/// `input([prompt])`: writes the prompt to stdout without a newline, flushes,
+/// reads one line from stdin and returns it as a `str` without the trailing
+/// line terminator.
+///
+/// A non-`str` prompt raises `TypeError`; end of file raises `RuntimeError`
+/// (CPython's `EOFError`); an I/O failure raises `OSError`.
+fn input_value(prompt: Option<i64>) -> i64 {
+    if let Some(prompt) = prompt {
+        let Some(text) = value::as_str(prompt) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "input(): argument must be str, not '{}'",
+                    value::type_name(prompt)
+                ),
+            );
+        };
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        let _ = stdout.write_all(text.as_bytes());
+        let _ = stdout.flush();
+    }
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) => exc::raise_with_message(RUNTIME_ERROR, "EOF when reading a line"),
+        Ok(_) => value::str_alloc(strip_input_newline(line)),
+        Err(error) => exc::raise_with_message(OS_ERROR, &format!("input() failed: {error}")),
+    }
+}
+
+/// Removes one trailing `\n` and the `\r` of a `\r\n` terminator from an
+/// input line.
+fn strip_input_newline(mut line: String) -> String {
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    line
+}
+
+/// `get_ipython()`: the probe libraries such as rich use to detect a Jupyter
+/// kernel.
+///
+/// PyX has no IPython, so the call returns a fresh instance whose class is
+/// named `TerminalInteractiveShell`. `get_ipython().__class__.__name__` is
+/// therefore `"TerminalInteractiveShell"` (neither `"ZMQInteractiveShell"` nor
+/// a Colab shell), and every string rendering is a plain PyX repr without
+/// `google.colab` or `ZMQInteractiveShell`.
+fn get_ipython_value() -> i64 {
+    // The class stays reachable from the instance; the conservative stack scan
+    // keeps it alive while the instance is allocated.
+    let class = value::class_new("TerminalInteractiveShell".to_string(), NONE, Vec::new());
+    value::instance_new(class)
 }
 
 /// `map(function, iterable)`: materialises a list with one call per source
@@ -1597,6 +1667,27 @@ pub(crate) fn filter(function: i64, iterable: i64) -> i64 {
 /// `all(iterable)`: `True` when every element is truthy, `False` otherwise.
 /// An empty iterable is `True`, like CPython. A pending exception from the
 /// iteration or a falsy element short-circuits the result.
+/// `any(iterable)`: `True` when at least one element is truthy.
+pub(crate) fn any(iterable: i64) -> i64 {
+    let iterator = iter::iter_new(iterable);
+    if exc::pending() {
+        return NONE;
+    }
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            return value::bool_value(false);
+        }
+        if value::truthy(item) {
+            return value::bool_value(true);
+        }
+    }
+}
+
 pub(crate) fn all(iterable: i64) -> i64 {
     let iterator = iter::iter_new(iterable);
     if exc::pending() {
@@ -3531,5 +3622,48 @@ mod tests {
             pending_message(),
             "callable() takes exactly 1 argument(s) (0 given)"
         );
+    }
+
+    #[test]
+    fn input_lines_drop_the_trailing_newline() {
+        assert_eq!(strip_input_newline("value\n".to_string()), "value");
+        assert_eq!(strip_input_newline("value\r\n".to_string()), "value");
+        assert_eq!(strip_input_newline("value".to_string()), "value");
+        assert_eq!(strip_input_newline("".to_string()), "");
+        assert_eq!(strip_input_newline("\n".to_string()), "");
+    }
+
+    #[test]
+    fn input_rejects_a_non_string_prompt() {
+        exc::init();
+        assert_eq!(input_value(Some(int(1))), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "input(): argument must be str, not 'int'"
+        );
+        // Arity is enforced by the builtin dispatcher.
+        assert_eq!(
+            builtin_call(Builtin::Input, &[string("a"), string("b")]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn get_ipython_reports_a_terminal_shell() {
+        exc::init();
+        let shell = builtin_call(Builtin::GetIpython, &[]);
+        assert!(!exc::pending());
+        let class = crate::methods::getattr(shell, "__class__".as_ptr(), 9);
+        assert!(!exc::pending());
+        let name = crate::methods::getattr(class, "__name__".as_ptr(), 8);
+        assert_eq!(rendered(name), "TerminalInteractiveShell");
+        let text = rendered(shell);
+        assert!(!text.contains("ZMQInteractiveShell"), "{text}");
+        assert!(!text.contains("google.colab"), "{text}");
+        // The probe takes no arguments.
+        assert_eq!(builtin_call(Builtin::GetIpython, &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
     }
 }

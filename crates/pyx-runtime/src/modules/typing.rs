@@ -2,11 +2,12 @@
 //! supported corpus.
 //!
 //! Type annotations are consumed by the frontend and the runtime never
-//! introspects these values, so generic aliases and special forms are `None`
-//! placeholders. `TYPE_CHECKING` is `False`, which keeps guarded imports from
-//! running. The three names that commonly appear as a class base
-//! (`Generic`, `NamedTuple`, `Protocol`) are empty native classes so a class
-//! definition can subclass them; no tuple or protocol semantics are attached.
+//! introspects these values. Generic aliases and special forms are empty
+//! native classes: classes are subscriptable in PyX, so runtime-evaluated
+//! aliases such as `CellSpan = Tuple[int, int, int]` produce a value instead
+//! of failing on `None[...]`. No generic substitution or `isinstance`
+//! semantics are attached; annotations themselves are not evaluated.
+//! `TYPE_CHECKING` is `False`, which keeps guarded imports from running.
 //!
 //! Every access to a class constant allocates a fresh class, matching
 //! CPython's stable identity semantics closely enough for subclassing while
@@ -15,11 +16,9 @@
 use crate::exc::{self, ATTRIBUTE_ERROR};
 use crate::value::{self, FALSE, NONE};
 
-/// Constants materialised as empty native classes (usable as class bases).
-const CLASSES: &[&str] = &["Generic", "NamedTuple", "Protocol"];
-
-/// Constants materialised as `None`: annotations are not evaluated at runtime.
-const PLACEHOLDERS: &[&str] = &[
+/// Constants materialised as empty native classes: usable as class bases and
+/// subscriptable when a library evaluates an alias at runtime.
+const CLASSES: &[&str] = &[
     "Any",
     "AnyStr",
     "BinaryIO",
@@ -33,6 +32,7 @@ const PLACEHOLDERS: &[&str] = &[
     "Final",
     "ForwardRef",
     "Generator",
+    "Generic",
     "IO",
     "Iterable",
     "Iterator",
@@ -40,9 +40,11 @@ const PLACEHOLDERS: &[&str] = &[
     "Literal",
     "Mapping",
     "Match",
+    "NamedTuple",
     "NoReturn",
     "Optional",
     "Pattern",
+    "Protocol",
     "Sequence",
     "Set",
     "TextIO",
@@ -58,9 +60,6 @@ pub(crate) fn constant(name: &str) -> i64 {
     }
     if CLASSES.contains(&name) {
         return value::class_new(name.to_string(), NONE, Vec::new());
-    }
-    if PLACEHOLDERS.contains(&name) {
-        return NONE;
     }
     exc::raise_with_message(
         ATTRIBUTE_ERROR,
@@ -107,12 +106,13 @@ mod tests {
     }
 
     #[test]
-    fn generic_aliases_are_none_placeholders() {
+    fn generic_aliases_are_subscriptable_classes() {
         exc::init();
-        for name in PLACEHOLDERS {
-            assert_eq!(constant(name), NONE, "{name}");
+        for name in CLASSES {
+            let class = as_class(constant(name)).expect("class value");
+            assert_eq!(class.name, *name);
+            assert!(!exc::pending());
         }
-        assert!(!exc::pending());
     }
 
     #[test]
@@ -124,6 +124,17 @@ mod tests {
             assert_eq!(class.base, NONE);
             assert!(class.methods.is_empty());
         }
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn generic_aliases_and_classes_are_subscriptable() {
+        exc::init();
+        let index = crate::core::value::str_alloc("int".to_string());
+        let alias = constant("Tuple");
+        assert_eq!(crate::core::container::subscript(alias, index), alias);
+        let class = value::class_new("Plain".to_string(), NONE, Vec::new());
+        assert_eq!(crate::core::container::subscript(class, index), class);
         assert!(!exc::pending());
     }
 

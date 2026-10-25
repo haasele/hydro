@@ -12,7 +12,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::exc::{self, RUNTIME_ERROR};
+use crate::exc::{self, NAME_ERROR, RUNTIME_ERROR};
 use crate::heap;
 use crate::value::NONE;
 
@@ -57,6 +57,22 @@ pub(crate) fn get(module: &str, name: &str) -> i64 {
 /// Forgets every stored global (a fresh program run).
 pub(crate) fn reset() {
     GLOBALS.with(|globals| globals.borrow_mut().clear());
+}
+
+/// Removes `module.name`, reporting whether the binding existed.
+pub(crate) fn remove(module: &str, name: &str) -> bool {
+    GLOBALS.with(|globals| globals.borrow_mut().remove(&key(module, name)).is_some())
+}
+
+/// `del module.name`: removes the binding and returns the ABI dummy value.
+/// A missing binding raises `NameError`, like CPython's `del` of an undefined
+/// module name.
+pub(crate) fn delete_value(module: &str, name: &str) -> i64 {
+    if remove(module, name) {
+        NONE
+    } else {
+        exc::raise_with_message(NAME_ERROR, &format!("name '{name}' is not defined"))
+    }
 }
 
 /// Stores `value` and returns the ABI dummy value (`None`).

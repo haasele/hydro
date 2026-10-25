@@ -1429,6 +1429,26 @@ impl Attributes {
         }
         crate::heap::write_barrier_edge(owner, value);
     }
+
+    /// Copies the `(name, value)` pairs in insertion order.
+    ///
+    /// The snapshot takes the table lock only for the clone and owns its names,
+    /// so the caller may allocate (which can collect) afterwards without
+    /// holding the guard.
+    pub(crate) fn snapshot(&self) -> Vec<(String, i64)> {
+        self.lock().clone()
+    }
+
+    /// Removes `name` and returns its value, or `None` when the attribute does
+    /// not exist. The dropped edge is safe for an in-progress marking cycle:
+    /// the value was already marked when the edge was published.
+    pub(crate) fn remove(&self, name: &str) -> Option<i64> {
+        let mut entries = self.lock();
+        let position = entries
+            .iter()
+            .position(|(existing, _)| existing.as_str() == name)?;
+        Some(entries.remove(position).1)
+    }
 }
 
 /// State of a class object: its Python-visible name, its base class (or
@@ -1489,27 +1509,28 @@ impl ModuleState {
     }
 }
 
-/// Native text stream behind `sys.stdout` / `sys.stderr`.
+/// Native text stream behind `sys.stdin` / `sys.stdout` / `sys.stderr`.
 ///
-/// The stream stores only its file descriptor (1 or 2); writing goes through
-/// `std::io`, one unbuffered-and-flushed call per `write`. It holds no PyX
-/// values, so the collector never traces children.
+/// The stream stores only its standard descriptor (0, 1 or 2); reading goes
+/// through `std::io::stdin` and writing through `std::io::stdout`/`stderr`,
+/// one unbuffered-and-flushed call per `write`. It holds no PyX values, so the
+/// collector never traces children.
 pub(crate) struct StdStreamState {
     fd: i32,
 }
 
 impl StdStreamState {
-    /// The descriptor (`1` stdout, `2` stderr).
+    /// The descriptor (`0` stdin, `1` stdout, `2` stderr).
     pub(crate) fn fd(&self) -> i32 {
         self.fd
     }
 
     /// Python-visible name used in error messages.
     pub(crate) fn name(&self) -> &'static str {
-        if self.fd == 2 {
-            "stderr"
-        } else {
-            "stdout"
+        match self.fd {
+            0 => "stdin",
+            2 => "stderr",
+            _ => "stdout",
         }
     }
 }
@@ -1961,7 +1982,8 @@ pub(crate) fn as_module(v: i64) -> Option<&'static ModuleState> {
     }
 }
 
-/// Borrows the state of a native standard stream (`sys.stdout`/`sys.stderr`).
+/// Borrows the state of a native standard stream (`sys.stdin`/`sys.stdout`/
+/// `sys.stderr`).
 pub(crate) fn as_std_stream(v: i64) -> Option<&'static StdStreamState> {
     if !is_heap(v) {
         return None;
@@ -1978,7 +2000,7 @@ pub(crate) fn as_std_stream(v: i64) -> Option<&'static StdStreamState> {
     }
 }
 
-/// Allocates a fresh `sys.stdout`/`sys.stderr` stream over `fd`.
+/// Allocates a fresh standard stream over `fd` (0, 1 or 2).
 ///
 /// A fresh object per resolution keeps the value GC-safe without a rooted
 /// singleton; identity (`sys.stdout is sys.stdout`) is therefore not stable,
@@ -2078,6 +2100,37 @@ pub(crate) fn instance_setattr(instance: i64, name: String, value: i64) {
     if let Some(state) = as_instance(instance) {
         state.attrs.set(instance, name, value);
     }
+}
+
+/// `dataclasses.replace(obj, **changes)`: shallow copy of `instance`'s
+/// attribute table into a fresh instance of the same class.
+///
+/// Attributes keep their insertion order; each `(name, value)` in `changes`
+/// overwrites the copied slot or is appended when the name is new. Names are
+/// not validated against the class's declared dataclass fields: the frontend
+/// expands `@dataclass` and the runtime keeps no field metadata, so an
+/// unknown name is added as an ordinary attribute (CPython would raise
+/// `TypeError`).
+///
+/// Every copied and replaced value is installed through
+/// [`instance_setattr`], which publishes the insertion barrier for the new
+/// instance, so a concurrent marker cannot miss a copied child.
+///
+/// Returns `None` when `instance` is not a class instance.
+pub(crate) fn instance_replace(instance: i64, changes: Vec<(String, i64)>) -> Option<i64> {
+    let state = as_instance(instance)?;
+    let class = state.class;
+    // Snapshot before allocating: `instance_new` can collect, and the pairs
+    // are owned Rust data afterwards.
+    let pairs = state.attrs.snapshot();
+    let copy = instance_new(class);
+    for (name, value) in pairs {
+        instance_setattr(copy, name, value);
+    }
+    for (name, value) in changes {
+        instance_setattr(copy, name, value);
+    }
+    Some(copy)
 }
 
 /// Guarded kind checks: `None` for every non-heap value and for heap objects

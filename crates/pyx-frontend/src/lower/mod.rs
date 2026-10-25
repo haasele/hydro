@@ -24,7 +24,7 @@ use crate::sema::{Infer, Ty};
 
 pub const MODULE_NAME: &str = "<module>";
 
-const BUILTIN_NAMES: [&str; 22] = [
+const BUILTIN_NAMES: [&str; 24] = [
     "print",
     "len",
     "str",
@@ -47,6 +47,8 @@ const BUILTIN_NAMES: [&str; 22] = [
     "sorted",
     "ord",
     "chr",
+    "input",
+    "get_ipython",
 ];
 
 /// A resolved source unit prior to type inference.
@@ -126,6 +128,36 @@ pub struct HStmt {
     pub col: u32,
 }
 
+/// One target of a `del` statement: a local name, a module global, an
+/// attribute, a subscript or a slice. Receivers and bounds are lowered
+/// expressions, so they are evaluated in source order at runtime.
+#[derive(Clone, Debug)]
+pub enum HDeleteTarget {
+    Name(LocalId),
+    /// Module-level binding in the runtime global table (`global name` in a
+    /// function, or the mirror of a module-body assignment).
+    Global {
+        module: String,
+        name: String,
+    },
+    Attr {
+        object: HExpr,
+        name: String,
+    },
+    Subscript {
+        object: HExpr,
+        index: HExpr,
+    },
+    /// `del object[start:stop:step]`; omitted bounds stay `None` and become
+    /// `Const::None` in the IR.
+    Slice {
+        object: HExpr,
+        start: Option<Box<HExpr>>,
+        stop: Option<Box<HExpr>>,
+        step: Option<Box<HExpr>>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub enum HStmtKind {
     Expr(HExpr),
@@ -156,21 +188,30 @@ pub enum HStmtKind {
         then_body: Vec<HStmt>,
         else_body: Vec<HStmt>,
     },
+    /// `while cond:` with an optional `else:` clause that runs only when the
+    /// condition becomes false (not after `break`, `return` or an exception).
     While {
         cond: HExpr,
         body: Vec<HStmt>,
+        else_body: Vec<HStmt>,
     },
+    /// `for var in range(...)` with an optional `else:` clause that runs only
+    /// on normal exhaustion (not after `break`, `return` or an exception).
     ForRange {
         var: LocalId,
         start: HExpr,
         stop: HExpr,
         step: Option<HExpr>,
         body: Vec<HStmt>,
+        else_body: Vec<HStmt>,
     },
+    /// `for var in iterable` with an optional `else:` clause that runs only on
+    /// normal exhaustion (not after `break`, `return` or an exception).
     ForEach {
         var: LocalId,
         iterable: HExpr,
         body: Vec<HStmt>,
+        else_body: Vec<HStmt>,
     },
     SetSubscript {
         object: HExpr,
@@ -231,6 +272,11 @@ pub enum HStmtKind {
     Assert {
         test: HExpr,
         msg: Option<HExpr>,
+    },
+    /// `del a, obj.name, obj[key], obj[start:stop:step]`: each target is
+    /// evaluated and deleted left to right.
+    Delete {
+        targets: Vec<HDeleteTarget>,
     },
     Try {
         body: Vec<HStmt>,
@@ -531,6 +577,32 @@ impl<'a> FnDecl<'a> {
             type_params: &f.type_params,
         }
     }
+}
+
+/// How a dataclass/NamedTuple field produces its value when a constructor
+/// call omits the argument.
+#[derive(Clone, Debug)]
+enum FieldDefault<'a> {
+    /// No default: the parameter is required.
+    Required,
+    /// Literal default (`x: int = 0`). The generated `__init__` stores it on
+    /// the parameter, so call sites fill it at compile time.
+    Literal(Const),
+    /// `field(default=expr)`. The parameter defaults to `None`; the generated
+    /// body evaluates `expr` when the argument is `None`.
+    Expr(&'a ast::Expr),
+    /// `field(default_factory=factory)`. The parameter defaults to `None`; the
+    /// generated body calls the factory when the argument is `None`.
+    Factory(&'a ast::Expr),
+}
+
+/// One annotated dataclass/NamedTuple field, with the default the frontend
+/// read from the class-body AST.
+#[derive(Clone, Debug)]
+struct DataclassField<'a> {
+    name: &'a str,
+    ty: Ty,
+    default: FieldDefault<'a>,
 }
 
 /// A class header/body registered before any function body is lowered.
@@ -1047,6 +1119,10 @@ pub struct Lowerer<'a> {
     /// classes uses the documented `RuntimeError` fallback (see
     /// [`Lowerer::lower_raise`]) instead of being rejected.
     class_names: HashSet<String>,
+    /// Same-unit class name -> its `__init__` `FunctionId`. Constructor calls
+    /// use it to bind keywords into parameter slots and fill omitted defaults
+    /// at compile time; classes without an `__init__` are absent.
+    class_inits: HashMap<String, FunctionId>,
     /// Class attributes visible while evaluating a class body's attribute
     /// values; the innermost scope is last.
     class_attr_scopes: Vec<HashMap<String, HExpr>>,
@@ -1102,6 +1178,7 @@ impl<'a> Lowerer<'a> {
             multi_counter: 0,
             class_defs: HashMap::new(),
             class_names: HashSet::new(),
+            class_inits: HashMap::new(),
             class_attr_scopes: Vec::new(),
             diags: Vec::new(),
         }
@@ -2626,7 +2703,7 @@ impl<'a> Lowerer<'a> {
     /// everything else (nested classes, `if` blocks, ...) is rejected with a
     /// diagnostic. The returned plan is used to lower the class statement and
     /// its method bodies later.
-    fn register_class(&mut self, s: &ast::StmtClassDef) -> ClassPlan {
+    fn register_class<'s>(&mut self, s: &'s ast::StmtClassDef) -> ClassPlan {
         let class = s.name.to_string();
         self.class_names.insert(class.clone());
         // `@dataclass` is the one supported class decorator. It is never
@@ -2674,7 +2751,7 @@ impl<'a> Lowerer<'a> {
             .is_some_and(|base| self.is_typing_namedtuple(base));
 
         let mut methods: Vec<(String, FunctionId, Option<usize>, MethodKind)> = Vec::new();
-        let mut fields: Vec<(String, Ty)> = Vec::new();
+        let mut fields: Vec<DataclassField<'s>> = Vec::new();
         let mut attributes: Vec<(String, usize)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for (idx, stmt) in s.body.iter().enumerate() {
@@ -2708,7 +2785,21 @@ impl<'a> Lowerer<'a> {
                     continue;
                 }
                 let ty = self.annotation_ty(&ann.annotation);
-                fields.push((field.clone(), ty));
+                // Only a synthesized `__init__` consumes defaults; plain
+                // classes keep their frozen class attributes untouched.
+                let default = if is_dataclass || is_namedtuple {
+                    match ann.value.as_deref() {
+                        None => FieldDefault::Required,
+                        Some(value) => self.annotated_field_default(value),
+                    }
+                } else {
+                    FieldDefault::Required
+                };
+                fields.push(DataclassField {
+                    name: target.id.as_str(),
+                    ty,
+                    default,
+                });
                 if ann.value.is_some() {
                     attributes.push((field, idx));
                 }
@@ -2791,6 +2882,16 @@ impl<'a> Lowerer<'a> {
             methods.push(("__init__".to_string(), id, None, MethodKind::Normal));
         }
 
+        // Constructor calls of this unit bind keywords and omitted defaults
+        // against the registered `__init__` signature. `fid_base` is added so
+        // `call_signature` resolves the id in multi-module programs too.
+        if let Some((_, id, _, _)) = methods
+            .iter()
+            .find(|(name, _, _, _)| name.as_str() == "__init__")
+        {
+            self.class_inits.insert(class.clone(), self.fid_base + *id);
+        }
+
         ClassPlan {
             base,
             methods,
@@ -2867,16 +2968,109 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Whether `expr` names `dataclasses.field`, imported either directly
+    /// (`from dataclasses import field [as name]`) or through the module
+    /// (`import dataclasses [as d]` plus `d.field`).
+    fn is_dataclasses_field(&self, expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::Name(name) => {
+                // A same-unit `def field(...)` shadows the import.
+                !self.fn_ids.contains_key(name.id.as_str())
+                    && self.imported_functions.get(name.id.as_str()).is_some_and(
+                        |(module, function)| {
+                            module.name == "dataclasses" && function.name == "field"
+                        },
+                    )
+            }
+            ast::Expr::Attribute(attr) => {
+                if attr.attr.as_str() != "field" {
+                    return false;
+                }
+                let ast::Expr::Name(module) = &*attr.value else {
+                    return false;
+                };
+                self.module_aliases
+                    .get(module.id.as_str())
+                    .is_some_and(|spec| spec.name == "dataclasses")
+            }
+            _ => false,
+        }
+    }
+
+    /// Recognises a `field(...)` call in a class-body assignment.
+    fn dataclasses_field_call<'e>(&self, expr: &'e ast::Expr) -> Option<&'e ast::ExprCall> {
+        let ast::Expr::Call(call) = expr else {
+            return None;
+        };
+        self.is_dataclasses_field(&call.func).then_some(call)
+    }
+
+    /// Classifies the value of an annotated class field.
+    ///
+    /// The `field(...)` call is read from the AST, never executed: its
+    /// `default`/`default_factory` arguments become the synthesized
+    /// `__init__`'s behavior. Every other literal value is a parameter
+    /// default; a non-literal value stays a required parameter (its class
+    /// attribute is still frozen into the class namespace as before).
+    fn annotated_field_default<'e>(&mut self, value: &'e ast::Expr) -> FieldDefault<'e> {
+        if let Some(call) = self.dataclasses_field_call(value) {
+            return self.dataclass_field_default(call);
+        }
+        match self.const_default(value) {
+            Some(constant) => FieldDefault::Literal(constant),
+            None => FieldDefault::Required,
+        }
+    }
+
+    /// Extracts `field(default=...)` / `field(default_factory=...)`.
+    ///
+    /// Keyword binding errors (unknown names, duplicated arguments) stay with
+    /// the ordinary call lowering of the class attribute, so this only reads
+    /// the values it understands.
+    fn dataclass_field_default<'e>(&mut self, call: &'e ast::ExprCall) -> FieldDefault<'e> {
+        let mut default: Option<&'e ast::Expr> = None;
+        let mut factory: Option<&'e ast::Expr> = None;
+        if let Some(arg) = call.args.first() {
+            default = Some(arg);
+        }
+        for keyword in &call.keywords {
+            match keyword.arg.as_deref() {
+                Some("default") if default.is_none() => default = Some(&keyword.value),
+                Some("default_factory") if factory.is_none() => factory = Some(&keyword.value),
+                _ => {}
+            }
+        }
+        match (default, factory) {
+            (Some(_), Some(_)) => {
+                self.error_at(
+                    call.range,
+                    "field() cannot specify both default and default_factory",
+                );
+                FieldDefault::Required
+            }
+            (Some(default), None) => FieldDefault::Expr(default),
+            (None, Some(factory)) => FieldDefault::Factory(factory),
+            (None, None) => FieldDefault::Required,
+        }
+    }
+
     /// Synthesize a dataclass/NamedTuple `__init__(self, <fields...>)`.
     ///
     /// The result is an ordinary method: `self` is local 0, each field is one
     /// following local, and the body assigns every field through `SetAttr` in
     /// declaration order before returning `None`. Only annotated fields take
     /// part; methods, properties and class attributes never become parameters.
-    fn create_dataclass_init(
+    ///
+    /// Defaults follow the class-body AST:
+    /// - a literal default (`x: int = 0`) is stored on the parameter, so a
+    ///   same-unit constructor call can fill it while binding the call;
+    /// - `field(default=expr)` and `field(default_factory=factory)` make the
+    ///   parameter default to `None` and evaluate `expr` or call `factory` in
+    ///   the body when the argument is `None`.
+    fn create_dataclass_init<'s>(
         &mut self,
         class: &str,
-        fields: &[(String, Ty)],
+        fields: &[DataclassField<'s>],
         line: u32,
         col: u32,
     ) -> FunctionId {
@@ -2895,35 +3089,102 @@ impl<'a> Lowerer<'a> {
             ty: self_ty,
         });
 
-        let mut body = Vec::with_capacity(fields.len() + 1);
-        for (name, ty) in fields {
+        for field in fields {
             let local = locals.len() as LocalId;
+            let default = match &field.default {
+                FieldDefault::Required => None,
+                FieldDefault::Literal(constant) => Some(constant.clone()),
+                // The body turns `None` into the real default or a factory
+                // result, so a class-value call that omits the argument still
+                // records a literal `None` parameter default.
+                FieldDefault::Expr(_) | FieldDefault::Factory(_) => Some(Const::None),
+            };
             params.push(HParam {
                 local,
-                name: name.clone(),
-                ty: *ty,
-                default: None,
+                name: field.name.to_string(),
+                ty: field.ty,
+                default,
                 kind: ParamKind::Positional,
             });
             locals.push(HLocal {
-                name: name.clone(),
-                ty: *ty,
+                name: field.name.to_string(),
+                ty: field.ty,
             });
+        }
+
+        // Register the function before lowering the default expressions:
+        // a comprehension or call in `field(...)` may need a temporary local.
+        let id = self.functions.len() as FunctionId;
+        self.functions.push(HFunction {
+            name: format!("{class}.__init__"),
+            params,
+            capture_count: 0,
+            ret_ty: Ty::Concrete(Type::None),
+            locals,
+            body: Vec::new(),
+            is_async: false,
+            is_generator: false,
+            is_module: false,
+            line,
+            col,
+        });
+
+        // Default expressions are evaluated by the class body, where field
+        // names are not bound: lower them with an empty local scope so a name
+        // matching a field resolves as a module global instead of a parameter.
+        let mut fs = FuncState {
+            fid: id,
+            is_module: false,
+            locals: HashMap::new(),
+            comp_shadowed: HashMap::new(),
+            globals: HashSet::new(),
+            loop_depth: 0,
+            in_lambda: false,
+            is_async: false,
+            is_generator: false,
+        };
+
+        let self_expr = HExpr {
+            kind: HExprKind::Local(0),
+            ty: self_ty,
+            line,
+            col,
+        };
+        let mut body = Vec::with_capacity(fields.len() + 1);
+        for (index, field) in fields.iter().enumerate() {
+            let local = (index + 1) as LocalId;
+            let argument = HExpr {
+                kind: HExprKind::Local(local),
+                ty: field.ty,
+                line,
+                col,
+            };
+            let value = match &field.default {
+                FieldDefault::Required | FieldDefault::Literal(_) => argument,
+                FieldDefault::Expr(default) => {
+                    let fallback = self.expr(default, &mut fs);
+                    self.default_if_none(argument, fallback, line, col)
+                }
+                FieldDefault::Factory(factory) => {
+                    let callee = self.expr(factory, &mut fs);
+                    let fallback = HExpr {
+                        kind: HExprKind::IndirectCall {
+                            callee: Box::new(callee),
+                            args: Vec::new(),
+                            star: None,
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
+                    self.default_if_none(argument, fallback, line, col)
+                }
+            };
             body.push(HStmt {
                 kind: HStmtKind::SetAttr {
-                    object: HExpr {
-                        kind: HExprKind::Local(0),
-                        ty: self_ty,
-                        line,
-                        col,
-                    },
-                    name: name.clone(),
-                    value: HExpr {
-                        kind: HExprKind::Local(local),
-                        ty: *ty,
-                        line,
-                        col,
-                    },
+                    object: self_expr.clone(),
+                    name: field.name.to_string(),
+                    value,
                 },
                 line,
                 col,
@@ -2934,22 +3195,37 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
+        self.functions[id as usize].body = body;
+        id
+    }
 
-        let id = self.functions.len() as FunctionId;
-        self.functions.push(HFunction {
-            name: format!("{class}.__init__"),
-            params,
-            capture_count: 0,
-            ret_ty: Ty::Concrete(Type::None),
-            locals,
-            body,
-            is_async: false,
-            is_generator: false,
-            is_module: false,
+    /// `fallback if argument is None else argument`, evaluated lazily.
+    fn default_if_none(&mut self, argument: HExpr, fallback: HExpr, line: u32, col: u32) -> HExpr {
+        let test = HExpr {
+            kind: HExprKind::Bin {
+                op: BinOp::Is,
+                lhs: Box::new(argument.clone()),
+                rhs: Box::new(HExpr {
+                    kind: HExprKind::Const(Const::None),
+                    ty: Ty::Concrete(Type::None),
+                    line,
+                    col,
+                }),
+            },
+            ty: Ty::Concrete(Type::Bool),
             line,
             col,
-        });
-        id
+        };
+        HExpr {
+            kind: HExprKind::IfExp {
+                test: Box::new(test),
+                then: Box::new(fallback),
+                orelse: Box::new(argument),
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
     }
 
     fn add_param(
@@ -2970,10 +3246,11 @@ impl<'a> Lowerer<'a> {
             );
             return;
         }
-        // `*args` and `**kwargs` bind a list and a dict; an annotation on
-        // them only describes the elements.
+        // `*args` binds a list and `**kwargs` a dict. The variadic local is
+        // dynamically retyped by real code (`args = (...,)`), so it stays
+        // `Any`; an annotation on it only describes the elements.
         let ty = match kind {
-            ParamKind::VarArg => Ty::Concrete(Type::List),
+            ParamKind::VarArg => Ty::Concrete(Type::Any),
             ParamKind::KwArg => Ty::Concrete(Type::Dict),
             _ => match &arg.annotation {
                 Some(ann) => self.annotation_ty(ann),
@@ -3031,6 +3308,7 @@ impl<'a> Lowerer<'a> {
                 ast::Constant::Str(v) => Some(Const::Str(v.clone())),
                 ast::Constant::None => Some(Const::None),
                 ast::Constant::Bytes(value) => Some(Const::Bytes(value.clone())),
+                ast::Constant::Ellipsis => Some(Const::Ellipsis),
                 _ => None,
             },
             ast::Expr::UnaryOp(unary) if matches!(unary.op, ast::UnaryOp::USub) => {
@@ -3265,7 +3543,35 @@ impl<'a> Lowerer<'a> {
             None
         };
         let (line, col) = (h.line, h.col);
+        let class_global = match &h.kind {
+            HStmtKind::ClassDef { target, name, .. } if fs.is_module && self.mirror_all_globals => {
+                Some((name.clone(), *target))
+            }
+            _ => None,
+        };
         out.push(h);
+        if let Some((name, local)) = class_global {
+            let ty = self
+                .functions
+                .get(fs.fid as usize)
+                .and_then(|function| function.locals.get(local as usize))
+                .map(|local| local.ty)
+                .unwrap_or(Ty::Concrete(Type::Any));
+            out.push(HStmt {
+                kind: HStmtKind::GlobalSet {
+                    module: self.dunder_name.clone(),
+                    name,
+                    value: HExpr {
+                        kind: HExprKind::Local(local),
+                        ty,
+                        line,
+                        col,
+                    },
+                },
+                line,
+                col,
+            });
+        }
         let Some((name, local)) = target else {
             return;
         };
@@ -3451,19 +3757,31 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Stmt::While(s) => {
-                if !s.orelse.is_empty() {
-                    self.error_at(s.range, "while-else is not supported in Phase 1");
-                }
                 let cond = self.expr(&s.test, fs);
-                // `while False:` never runs its body; drop the loop. `while
-                // True:` stays a real loop so `break` keeps working.
-                if matches!(&cond.kind, HExprKind::Const(Const::Bool(false))) {
+                // `while False:` never runs its body; drop the loop unless an
+                // `else:` clause still has to run. `while True:` stays a real
+                // loop so `break` keeps working.
+                let never_runs = matches!(&cond.kind, HExprKind::Const(Const::Bool(false)));
+                if never_runs && s.orelse.is_empty() {
                     return None;
                 }
-                fs.loop_depth += 1;
-                let body = self.lower_block(&s.body, fs);
-                fs.loop_depth -= 1;
-                HStmtKind::While { cond, body }
+                let body = if never_runs {
+                    Vec::new()
+                } else {
+                    fs.loop_depth += 1;
+                    let body = self.lower_block(&s.body, fs);
+                    fs.loop_depth -= 1;
+                    body
+                };
+                // `else` is not part of the loop: `break` and `continue` in it
+                // bind to an enclosing loop, so it is lowered after the loop
+                // depth is restored.
+                let else_body = self.lower_block(&s.orelse, fs);
+                HStmtKind::While {
+                    cond,
+                    body,
+                    else_body,
+                }
             }
             ast::Stmt::For(s) => return self.lower_for(s, fs, line, col),
             ast::Stmt::Return(s) => {
@@ -3587,9 +3905,7 @@ impl<'a> Lowerer<'a> {
                 return self.lower_with_items(&s.items, &s.body, s.range, fs)
             }
             ast::Stmt::AsyncFor(s) => {
-                return self.lower_for_parts(
-                    &s.target, &s.iter, &s.body, &s.orelse, s.range, fs, line, col,
-                )
+                return self.lower_for_parts(&s.target, &s.iter, &s.body, &s.orelse, fs, line, col)
             }
             ast::Stmt::Assert(s) => {
                 let test = self.expr(&s.test, fs);
@@ -3598,10 +3914,7 @@ impl<'a> Lowerer<'a> {
                 let msg = s.msg.as_deref().map(|msg| self.expr(msg, fs));
                 HStmtKind::Assert { test, msg }
             }
-            ast::Stmt::Delete(s) => {
-                self.error_at(s.range, "del is not supported in Phase 1");
-                return None;
-            }
+            ast::Stmt::Delete(s) => return self.lower_delete(s, fs, line, col),
             ast::Stmt::Global(_) => {
                 // Declarations are handled by `collect_scope_globals` before
                 // the body is lowered; the statement itself emits nothing.
@@ -3710,6 +4023,98 @@ impl<'a> Lowerer<'a> {
                 None
             }
         }
+    }
+
+    /// Lower `del a, obj.name, obj[key], obj[start:stop:step]`.
+    ///
+    /// Python evaluates and deletes each target in source order: the deletion
+    /// of one target happens before the next target's receiver is evaluated.
+    /// The IR keeps that order, so codegen emits the deletion immediately
+    /// after each target's operands. A name must resolve to a local slot or a
+    /// module global; `del` of an unknown (or unbound local) name is a
+    /// compile-time diagnostic. In a module body a name also mirrors its
+    /// module-level binding, which is removed from the runtime global table
+    /// when functions of the unit read that binding.
+    fn lower_delete(
+        &mut self,
+        s: &ast::StmtDelete,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let mut targets = Vec::with_capacity(s.targets.len());
+        for target in &s.targets {
+            match target {
+                ast::Expr::Name(name) => {
+                    let text = name.id.as_str();
+                    if fs.is_global(text) {
+                        self.used_globals.insert(text.to_string());
+                        targets.push(HDeleteTarget::Global {
+                            module: self.dunder_name.clone(),
+                            name: text.to_string(),
+                        });
+                        continue;
+                    }
+                    let Some(local) = fs.lookup(text) else {
+                        self.error_name(
+                            name.range,
+                            text,
+                            fs,
+                            format!("cannot delete unknown name '{}'", name.id),
+                        );
+                        return None;
+                    };
+                    targets.push(HDeleteTarget::Name(local));
+                    // A module-body name is mirrored into the runtime global
+                    // table (see `push_lowered_stmt`), so a later read from a
+                    // function must miss it too.
+                    if fs.is_module && (self.mirror_all_globals || self.used_globals.contains(text))
+                    {
+                        targets.push(HDeleteTarget::Global {
+                            module: self.dunder_name.clone(),
+                            name: text.to_string(),
+                        });
+                    }
+                }
+                ast::Expr::Attribute(attr) => {
+                    let object = self.expr(&attr.value, fs);
+                    targets.push(HDeleteTarget::Attr {
+                        object,
+                        name: attr.attr.to_string(),
+                    });
+                }
+                ast::Expr::Subscript(sub) => {
+                    if let ast::Expr::Slice(slice) = &*sub.slice {
+                        let object = self.expr(&sub.value, fs);
+                        let start = slice.lower.as_ref().map(|e| Box::new(self.expr(e, fs)));
+                        let stop = slice.upper.as_ref().map(|e| Box::new(self.expr(e, fs)));
+                        let step = slice.step.as_ref().map(|e| Box::new(self.expr(e, fs)));
+                        targets.push(HDeleteTarget::Slice {
+                            object,
+                            start,
+                            stop,
+                            step,
+                        });
+                    } else {
+                        let object = self.expr(&sub.value, fs);
+                        let index = self.expr(&sub.slice, fs);
+                        targets.push(HDeleteTarget::Subscript { object, index });
+                    }
+                }
+                other => {
+                    self.error_at(
+                        other.range(),
+                        "delete target must be a name, attribute or subscript",
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(HStmt {
+            kind: HStmtKind::Delete { targets },
+            line,
+            col,
+        })
     }
 
     /// Lower `a = b = value` (chained assignment).
@@ -4427,9 +4832,7 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
-        self.lower_for_parts(
-            &s.target, &s.iter, &s.body, &s.orelse, s.range, fs, line, col,
-        )
+        self.lower_for_parts(&s.target, &s.iter, &s.body, &s.orelse, fs, line, col)
     }
 
     /// Shared `for`/`async for` lowering. `async for` is sequential: it uses
@@ -4441,14 +4844,10 @@ impl<'a> Lowerer<'a> {
         iter: &ast::Expr,
         loop_body: &[ast::Stmt],
         orelse: &[ast::Stmt],
-        range: TextRange,
         fs: &mut FuncState,
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
-        if !orelse.is_empty() {
-            self.error_at(range, "for-else is not supported in Phase 1");
-        }
         let target_expr = target;
         let unpack_target = matches!(target_expr, ast::Expr::Tuple(_) | ast::Expr::List(_));
         let name_target = match target_expr {
@@ -4521,11 +4920,15 @@ impl<'a> Lowerer<'a> {
                 }
                 (None, None) => return None,
             };
+            // `else` runs after normal exhaustion only; it is outside the
+            // loop, so `break`/`continue` in it bind to an enclosing loop.
+            let else_body = self.lower_block(orelse, fs);
             return Some(HStmt {
                 kind: HStmtKind::ForEach {
                     var,
                     iterable,
                     body,
+                    else_body,
                 },
                 line,
                 col,
@@ -4596,6 +4999,8 @@ impl<'a> Lowerer<'a> {
         fs.loop_depth += 1;
         let body = self.lower_block(loop_body, fs);
         fs.loop_depth -= 1;
+        // As for `ForEach`, `else` is outside the loop scope.
+        let else_body = self.lower_block(orelse, fs);
         Some(HStmt {
             kind: HStmtKind::ForRange {
                 var,
@@ -4603,6 +5008,7 @@ impl<'a> Lowerer<'a> {
                 stop,
                 step,
                 body,
+                else_body,
             },
             line,
             col,
@@ -6285,10 +6691,7 @@ impl<'a> Lowerer<'a> {
                 self.error_at(range, "tuple literals are not supported in Phase 1");
                 (Const::None, Ty::Concrete(Type::Any))
             }
-            ast::Constant::Ellipsis => {
-                self.error_at(range, "ellipsis is not supported in Phase 1");
-                (Const::None, Ty::Concrete(Type::Any))
-            }
+            ast::Constant::Ellipsis => (Const::Ellipsis, Ty::Concrete(Type::None)),
         };
         HExpr {
             kind: HExprKind::Const(constant),
@@ -6622,6 +7025,36 @@ impl<'a> Lowerer<'a> {
         let name = name_expr.id.as_str();
 
         if let Some(local) = fs.lookup(name) {
+            // A class of this unit reorders keywords into its `__init__`
+            // parameter slots and fills omitted defaults at compile time.
+            // Only the module body holds the class value directly; inside a
+            // function a local slot with the same name shadows it.
+            if fs.is_module {
+                if let Some(signature) = self.class_init_signature(name) {
+                    let Some(args) =
+                        self.class_constructor_arguments(name, &signature, call, fs, line, col)
+                    else {
+                        return self.error_expr(call.range);
+                    };
+                    let (callee_line, callee_col) = self.span(name_expr.range);
+                    let callee = HExpr {
+                        kind: HExprKind::Local(local),
+                        ty: Ty::Concrete(Type::Any),
+                        line: callee_line,
+                        col: callee_col,
+                    };
+                    return HExpr {
+                        kind: HExprKind::IndirectCall {
+                            callee: Box::new(callee),
+                            args,
+                            star: None,
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
+                }
+            }
             // Keyword binding for a function value is not part of the static
             // ABI; the call still compiles and fails at execution.
             if !call.keywords.is_empty() {
@@ -6914,10 +7347,40 @@ impl<'a> Lowerer<'a> {
         }
 
         if self.global_names.contains(name) {
-            // A module-level value (class or function) used as a callee; its
-            // signature is not statically known. Keyword binding (notably
-            // constructor kwargs) is not part of this phase: compile the call
-            // and report it at runtime instead of the call site.
+            // A same-unit class used as a callee from a function or method:
+            // bind its constructor arguments exactly like a module-body call.
+            if let Some(signature) = self.class_init_signature(name) {
+                let Some(args) =
+                    self.class_constructor_arguments(name, &signature, call, fs, line, col)
+                else {
+                    return self.error_expr(call.range);
+                };
+                self.used_globals.insert(name.to_string());
+                let (callee_line, callee_col) = self.span(name_expr.range);
+                let callee = HExpr {
+                    kind: HExprKind::GlobalGet {
+                        module: self.dunder_name.clone(),
+                        name: name.to_string(),
+                    },
+                    ty: Ty::Concrete(Type::Any),
+                    line: callee_line,
+                    col: callee_col,
+                };
+                return HExpr {
+                    kind: HExprKind::IndirectCall {
+                        callee: Box::new(callee),
+                        args,
+                        star: None,
+                    },
+                    ty: self.infer.fresh(),
+                    line,
+                    col,
+                };
+            }
+            // A module-level value (class or function) whose signature is not
+            // statically known. Keyword binding (notably constructor kwargs)
+            // is not part of this phase: compile the call and report it at
+            // runtime instead of the call site.
             if !call.keywords.is_empty() {
                 return self.lower_deferred_call(call, fs, line, col);
             }
@@ -7482,6 +7945,116 @@ impl<'a> Lowerer<'a> {
                     );
                     return None;
                 }
+            }
+        }
+        Some(args)
+    }
+
+    /// Signature of a same-unit class's `__init__`, or `None` when the class
+    /// has no `__init__` or its signature needs the runtime binder
+    /// (`*args`, keyword-only parameters or `**kwargs`).
+    fn class_init_signature(&self, class: &str) -> Option<CallSignature> {
+        let &init = self.class_inits.get(class)?;
+        let signature = self.call_signature(init)?;
+        if signature.has_dynamic_signature() || signature.capture_count != 0 {
+            return None;
+        }
+        // Slot 0 is `self`; a class constructor supplies the rest.
+        (signature.params.len() > 1).then_some(signature)
+    }
+
+    /// Bind `Class(args..., name=value...)` against its `__init__` signature.
+    ///
+    /// The runtime fills `self` when it instantiates the class, so only the
+    /// remaining parameters take call arguments. Keywords move into their
+    /// parameter slots; omitted parameters use the parameter's literal default
+    /// (a `field(...)` default is recorded as `None` and resolved by the
+    /// generated body). The caller always passes the full positional arity.
+    fn class_constructor_arguments(
+        &mut self,
+        class: &str,
+        signature: &CallSignature,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<Vec<HExpr>> {
+        let fixed = signature.params.len() - 1;
+        let mut slots: Vec<Option<HExpr>> = vec![None; fixed];
+
+        for (position, arg) in call.args.iter().enumerate() {
+            if let ast::Expr::Starred(starred) = arg {
+                // Unbound call shapes are intercepted by `call_expr`.
+                self.error_at_code(
+                    starred.range,
+                    codes::CALL,
+                    "a starred argument cannot bind a class constructor here",
+                );
+                return None;
+            }
+            let Some(slot) = slots.get_mut(position) else {
+                self.error_at_code(
+                    call.range,
+                    codes::CALL,
+                    format!("{class}() takes at most {fixed} positional argument(s)"),
+                );
+                return None;
+            };
+            *slot = Some(self.expr(arg, fs));
+        }
+
+        for keyword in &call.keywords {
+            let Some(keyword_name) = keyword.arg.as_ref() else {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    "**kwargs arguments are not supported here",
+                );
+                return None;
+            };
+            let Some(index) = signature.params[1..]
+                .iter()
+                .position(|(name, _, _)| name.as_str() == keyword_name.as_str())
+            else {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!("{class}() got an unexpected keyword argument '{keyword_name}'"),
+                );
+                return None;
+            };
+            if slots[index].is_some() {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!("{class}() got multiple values for argument '{keyword_name}'"),
+                );
+                return None;
+            }
+            slots[index] = Some(self.expr(&keyword.value, fs));
+        }
+
+        let mut args = Vec::with_capacity(fixed);
+        for (index, slot) in slots.into_iter().enumerate() {
+            let (name, default, _) = &signature.params[index + 1];
+            match slot {
+                Some(value) => args.push(value),
+                None => match default.clone() {
+                    Some(default) => args.push(HExpr {
+                        kind: HExprKind::Const(default),
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }),
+                    None => {
+                        self.error_at_code(
+                            call.range,
+                            codes::CALL,
+                            format!("{class}() missing required argument '{name}'"),
+                        );
+                        return None;
+                    }
+                },
             }
         }
         Some(args)
@@ -8405,9 +8978,18 @@ fn collect_declared_globals(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
             }
             ast::Stmt::With(s) => collect_declared_globals(&s.body, out),
             ast::Stmt::AsyncWith(s) => collect_declared_globals(&s.body, out),
-            ast::Stmt::While(s) => collect_declared_globals(&s.body, out),
-            ast::Stmt::For(s) => collect_declared_globals(&s.body, out),
-            ast::Stmt::AsyncFor(s) => collect_declared_globals(&s.body, out),
+            ast::Stmt::While(s) => {
+                collect_declared_globals(&s.body, out);
+                collect_declared_globals(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_declared_globals(&s.body, out);
+                collect_declared_globals(&s.orelse, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_declared_globals(&s.body, out);
+                collect_declared_globals(&s.orelse, out);
+            }
             _ => {}
         }
     }

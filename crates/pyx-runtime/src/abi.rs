@@ -671,6 +671,27 @@ pub extern "C" fn pyx_global_set(
     crate::core::globals::set_value(&module, &name, value)
 }
 
+/// `del module.name`: removes a module-level global. A missing binding raises
+/// `NameError` and returns `None`; malformed names raise `TypeError`.
+#[no_mangle]
+pub extern "C" fn pyx_global_delete(
+    module_ptr: *const c_uchar,
+    module_len: usize,
+    name_ptr: *const c_uchar,
+    name_len: usize,
+) -> i64 {
+    let (Some(module), Some(name)) = (
+        required_name(module_ptr, module_len),
+        required_name(name_ptr, name_len),
+    ) else {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "module global name must be a non-empty string",
+        );
+    };
+    crate::core::globals::delete_value(&module, &name)
+}
+
 /// `module.name` for a module-level global.
 ///
 /// A missing entry raises `RuntimeError` (`name '<name>' is not defined in
@@ -820,6 +841,15 @@ pub extern "C" fn pyx_subscript_set(obj: i64, index: i64, new_value: i64) -> i64
     container::subscript_set(obj, index, new_value)
 }
 
+/// `del object[index]` for lists and dicts. A list index out of range raises
+/// `IndexError`, a missing dict key `KeyError` and any other receiver
+/// `TypeError`. Returns `None`; errors are reported through the pending
+/// exception.
+#[no_mangle]
+pub extern "C" fn pyx_delete_subscript(obj: i64, index: i64) -> i64 {
+    container::delete_subscript(obj, index)
+}
+
 /// `object[start:stop:step]` for lists, strings and tuples. A tagged `None` in any
 /// bound position means the argument was omitted. Errors are reported
 /// through the pending exception and yield `None`.
@@ -836,6 +866,16 @@ pub extern "C" fn pyx_slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn pyx_slice_set(obj: i64, start: i64, stop: i64, step: i64, new_value: i64) -> i64 {
     container::slice_set(obj, start, stop, step, new_value)
+}
+
+/// `del object[start:stop:step]` for lists. A tagged `None` in any bound
+/// position means the argument was omitted; `del xs[:]` clears the list.
+/// Strings, bytes and tuples are immutable (`TypeError`), and a dict reports
+/// the unhashable `slice` key. Returns `None`; errors are reported through the
+/// pending exception.
+#[no_mangle]
+pub extern "C" fn pyx_delete_slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
+    container::delete_slice(obj, start, stop, step)
 }
 
 /// `obj.name` for a data attribute of a native value or class instance.
@@ -864,6 +904,15 @@ pub extern "C" fn pyx_setattr(
     new_value: i64,
 ) -> i64 {
     methods::setattr(obj, name, name_len, new_value)
+}
+
+/// `del obj.name` for class instances. A missing attribute raises
+/// `AttributeError`, deleting from a class raises `TypeError` (the namespace is
+/// frozen) and every other receiver raises `AttributeError`. Returns `None` on
+/// success.
+#[no_mangle]
+pub extern "C" fn pyx_delete_attr(obj: i64, name: *const c_uchar, name_len: usize) -> i64 {
+    methods::delete_attr(obj, name, name_len)
 }
 
 /// Dynamic method call: `obj.<name>(args...)`. Dispatch is by receiver

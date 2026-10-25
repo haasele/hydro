@@ -8,16 +8,46 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **1329 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25: **1368 tests**, `scripts/verify.sh` ALL GREEN. The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
 58/297 standard-library modules are importable (13 builtin/frozen, 41 pure,
-4 extension). `benchmarks/bench_all.py` does **not** yet run under PyX: its
-first blocker is `rich/console.py` (see the package-loader entry below).
+4 extension). `benchmarks/bench_all.py` does **not** yet run under PyX: the
+first observed blockers are native bound-method values and dynamic
+`*args`/`**kwargs` calls in the `rich` package (see the package-loader
+entry below).
 
 ### Added
+
+- **`for ... else` / `while ... else`:** a loop `else` clause now lowers to
+  the new `else_body` on `StmtKind::ForRange`/`StmtKind::ForEach`/
+  `StmtKind::While` and runs only when the loop exhausts normally: `break`,
+  `return` and exceptions skip it while `continue` does not. The clause is
+  emitted outside the loop, so `break`/`continue` inside it bind to an
+  enclosing loop (and remain "outside a loop" diagnostics at module level),
+  and an exception in the body still runs the enclosing `finally` without
+  running `else`. Loops without `else` keep their previous code shape, and
+  `while False: ... else: ...` keeps only the else body.
+- **Fixed:** an exception raised while an imported module body initializes now
+  stops the program with the original traceback instead of letting a later
+  module or the entry body overwrite the pending error.
+
+- **`del`, loop `else`, console probes and dataclass fields:** `del` removes
+  locals/globals, instance attributes, list/dict items and list slices,
+  evaluating targets left to right; local deletion clears the slot to
+  `None` (documented limitation). `for`/`while` `else` clauses run only on
+  normal exhaustion. `...` lowers to `None`, `input()` reads a line,
+  `get_ipython()` reports a non-Jupyter shell, and `NameError`/`SystemExit`
+  are catchable tags. `dataclasses.field(default=..., default_factory=...)`
+  synthesizes defaults, `replace()` copies instances, and keyword
+  construction binds by field name. Native `typing` aliases are empty
+  classes and classes are subscriptable, so module-level aliases such as
+  `Span = Tuple[int, int]` evaluate. `os.PathLike`/`devnull`/`open`/`dup2`/
+  `get_terminal_size`, `sys.stdin`/`stdout`/`stderr` and
+  `threading.local` are available; imported-module initializer exceptions
+  now stop the program with the original error.
 
 - **Package/site-packages loader and official `rich` source:** `check_file`
   now resolves packages (`__init__.py`), dotted names, submodules and
@@ -28,11 +58,12 @@ first blocker is `rich/console.py` (see the package-loader entry below).
   until the enclosing code runs. A native `rich` implementation is no longer
   shipped: the official pure-Python `rich` distribution resolves through
   this loader. `benchmarks/bench_all.py` still does not run under PyX; the
-  first concrete failure is `rich/console.py` (`dataclasses.field`,
-  `os.PathLike`, ellipsis, `del`, `get_ipython`, `sys.stdin`/`__stdin__`/
-  `__stdout__`/`__stderr__`, `os.get_terminal_size`/`open`/`dup2`,
-  `SystemExit`, `input()`, `threading.local`), and further `rich` modules
-  will likely add more.
+  console-compatibility surface (`dataclasses.field`, `os.PathLike`,
+  ellipsis, `del`, `get_ipython`, `sys.stdin`/`__stdin__`/`__stdout__`/
+  `__stderr__`, `os.get_terminal_size`/`open`/`dup2`, `SystemExit`,
+  `input()`, `threading.local`, subscriptable `typing` aliases) is
+  implemented, and `rich/console.py` compiles. Native bound-method values
+  and dynamic `*args`/`**kwargs` calls are the next observed blockers.
 - **List slice assignment:** `xs[start:stop:step] = value` lowers to the new
   `StmtKind::SetSlice` (omitted bounds are `Const::None`) and the
   `pyx_slice_set` ABI. Python's evaluation order is preserved (right-hand

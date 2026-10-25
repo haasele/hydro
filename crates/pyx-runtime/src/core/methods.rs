@@ -15,7 +15,7 @@
 //! exception *instance* only (PyX has no exception class objects) and supports
 //! just the single-argument form.
 
-use std::io::{IsTerminal, Write as _};
+use std::io::{BufRead as _, IsTerminal, Read as _, Write as _};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -588,6 +588,31 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
     }
     if let Some(class) = value::as_class(obj) {
         return type_error(format!("cannot set attributes of class '{}'", class.name));
+    }
+    attribute_error(obj, &attr)
+}
+
+/// `del obj.name` for class instances.
+///
+/// Only instance attributes can be removed, matching Python's `__delattr__`
+/// for plain classes: an unknown name raises `AttributeError`, deleting from
+/// a class object raises `TypeError` (the namespace is frozen) and every other
+/// receiver reports `AttributeError`. Returns `None` on success.
+pub(crate) fn delete_attr(obj: i64, name: *const u8, name_len: usize) -> i64 {
+    let Some(attr) = decode_name(name, name_len) else {
+        return attribute_error(obj, "");
+    };
+    if let Some(state) = value::as_instance(obj) {
+        if state.attrs.remove(&attr).is_some() {
+            return NONE;
+        }
+        return attribute_error(obj, &attr);
+    }
+    if let Some(class) = value::as_class(obj) {
+        return type_error(format!(
+            "cannot delete attributes of class '{}'",
+            class.name
+        ));
     }
     attribute_error(obj, &attr)
 }
@@ -2546,12 +2571,16 @@ fn pool_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     }
 }
 
-/// Methods of the native `sys.stdout` / `sys.stderr` stream.
+/// Methods of the native standard streams.
 ///
 /// `write(text)` appends the string and flushes (so output interleaves with
 /// `print`), returning the number of characters; `flush()` flushes; `isatty()`
-/// reports whether the descriptor is a terminal. No other attribute exists:
-/// unlike `io.open` there is no read side and the stream is never closed.
+/// reports whether the descriptor is a terminal; `fileno()` returns the
+/// descriptor (0, 1 or 2). `readline()` and `read(n=-1)` read text from
+/// `std::io::stdin` and exist only on `sys.stdin`; writing to `sys.stdin` and
+/// reading from the output streams report `OSError`, like CPython's
+/// `io.UnsupportedOperation`. Standard streams are never closed and expose no
+/// other attributes.
 fn std_stream_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     let Some(stream) = value::as_std_stream(obj) else {
         return attribute_error(obj, method);
@@ -2567,6 +2596,9 @@ fn std_stream_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                     value::type_name(args[0])
                 ));
             };
+            if stream.fd() == 0 {
+                return exc::raise_with_message(OS_ERROR, "write: stream is not writable");
+            }
             match write_std_stream(stream.fd(), text) {
                 Ok(count) => ops::int_result(count as i64),
                 Err(error) => exc::raise_with_message(OS_ERROR, &format!("write: {error}")),
@@ -2587,8 +2619,77 @@ fn std_stream_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             }
             value::bool_value(std_stream_is_tty(stream.fd()))
         }
+        "fileno" => {
+            if let Some(err) = check_arity(stream.name(), method, args.len(), 0, 0) {
+                return err;
+            }
+            ops::int_result(i64::from(stream.fd()))
+        }
+        "readline" => {
+            if let Some(err) = check_arity(stream.name(), method, args.len(), 0, 0) {
+                return err;
+            }
+            if stream.fd() != 0 {
+                return exc::raise_with_message(OS_ERROR, "readline: stream is not readable");
+            }
+            match read_std_stream_line() {
+                Ok(text) => value::str_alloc(text),
+                Err(error) => exc::raise_with_message(OS_ERROR, &format!("readline: {error}")),
+            }
+        }
+        "read" => {
+            if let Some(err) = check_arity(stream.name(), method, args.len(), 0, 1) {
+                return err;
+            }
+            let size = match args.first() {
+                None => -1,
+                Some(arg) => match value::as_integer(*arg) {
+                    Some(size) => size,
+                    None => {
+                        return type_error(format!(
+                            "read() argument must be an integer, not {}",
+                            value::type_name(*arg)
+                        ))
+                    }
+                },
+            };
+            if stream.fd() != 0 {
+                return exc::raise_with_message(OS_ERROR, "read: stream is not readable");
+            }
+            match read_std_stream(size) {
+                Ok(text) => value::str_alloc(text),
+                Err(error) => exc::raise_with_message(OS_ERROR, &format!("read: {error}")),
+            }
+        }
         _ => attribute_error(obj, method),
     }
+}
+
+/// Reads one line (including its newline, if any) from `std::io::stdin`.
+fn read_std_stream_line() -> std::io::Result<String> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut bytes = Vec::new();
+    input.read_until(b'\n', &mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Reads text from `std::io::stdin`.
+///
+/// A negative `size` reads everything up to EOF (Python's `read()` default);
+/// a non-negative `size` bounds the number of bytes consumed. Invalid UTF-8 is
+/// replaced rather than reported, so a size that splits a character cannot
+/// fail.
+fn read_std_stream(size: i64) -> std::io::Result<String> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut bytes = Vec::new();
+    if size < 0 {
+        input.read_to_end(&mut bytes)?;
+    } else {
+        input.take(size as u64).read_to_end(&mut bytes)?;
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Writes `text` to fd 1/2 and flushes it; returns the character count.
@@ -2608,18 +2709,18 @@ fn write_std_stream(fd: i32, text: &str) -> std::io::Result<usize> {
 }
 
 fn flush_std_stream(fd: i32) -> std::io::Result<()> {
-    if fd == 2 {
-        std::io::stderr().flush()
-    } else {
-        std::io::stdout().flush()
+    match fd {
+        0 => Ok(()),
+        2 => std::io::stderr().flush(),
+        _ => std::io::stdout().flush(),
     }
 }
 
 fn std_stream_is_tty(fd: i32) -> bool {
-    if fd == 2 {
-        std::io::stderr().is_terminal()
-    } else {
-        std::io::stdout().is_terminal()
+    match fd {
+        0 => std::io::stdin().is_terminal(),
+        2 => std::io::stderr().is_terminal(),
+        _ => std::io::stdout().is_terminal(),
     }
 }
 
@@ -3380,7 +3481,7 @@ fn generator_method(obj: i64, method: &str, args: &[i64]) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{call, getattr};
+    use super::{call, delete_attr, getattr};
     use crate::container;
     use crate::value::{self, encode_int, FALSE, NONE, TRUE};
     use pyx_ir::MethodKind;
@@ -4052,6 +4153,105 @@ mod tests {
         reset();
         let stdout = value::std_stream_new(1);
         assert_eq!(invoke(stdout, "close", &[]), NONE);
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+    }
+
+    #[test]
+    fn std_stream_fileno_and_read_surface() {
+        // `fileno` reports the standard descriptor; stdin flushes as a no-op
+        // and reports a (possibly false) tty without consuming input.
+        reset();
+        let stdin = value::std_stream_new(0);
+        assert_eq!(invoke(stdin, "fileno", &[]), int(0));
+        assert_eq!(invoke(stdin, "flush", &[]), NONE);
+        let tty = invoke(stdin, "isatty", &[]);
+        assert!(tty == TRUE || tty == FALSE);
+        assert!(!crate::exc::pending());
+
+        // Each error case starts from a fresh heap so the stream handle stays
+        // valid.
+        reset();
+        assert_eq!(invoke(value::std_stream_new(1), "fileno", &[]), int(1));
+        reset();
+        assert_eq!(invoke(value::std_stream_new(2), "fileno", &[]), int(2));
+
+        // Writing to stdin is rejected like CPython's `UnsupportedOperation`.
+        reset();
+        let stdin = value::std_stream_new(0);
+        assert_eq!(invoke(stdin, "write", &[string("")]), NONE);
+        assert_eq!(error_tag(), crate::exc::OS_ERROR as i64);
+        assert_eq!(message(), "write: stream is not writable");
+
+        // Reading is not attempted against the interactive stdin; the output
+        // streams reject it with `OSError` like `io.UnsupportedOperation`.
+        reset();
+        let stdout = value::std_stream_new(1);
+        assert_eq!(invoke(stdout, "readline", &[]), NONE);
+        assert_eq!(error_tag(), crate::exc::OS_ERROR as i64);
+        assert_eq!(message(), "readline: stream is not readable");
+
+        reset();
+        let stdout = value::std_stream_new(2);
+        assert_eq!(invoke(stdout, "read", &[]), NONE);
+        assert_eq!(error_tag(), crate::exc::OS_ERROR as i64);
+        assert_eq!(message(), "read: stream is not readable");
+
+        reset();
+        let stdout = value::std_stream_new(1);
+        assert_eq!(invoke(stdout, "read", &[int(-1)]), NONE);
+        assert_eq!(error_tag(), crate::exc::OS_ERROR as i64);
+
+        // A non-integer size is a `TypeError`, checked before readability.
+        reset();
+        let stdout = value::std_stream_new(1);
+        assert_eq!(invoke(stdout, "read", &[string("x")]), NONE);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "read() argument must be an integer, not str");
+
+        // Arity is enforced per method.
+        reset();
+        let stdin = value::std_stream_new(0);
+        assert_eq!(invoke(stdin, "fileno", &[int(1)]), NONE);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        reset();
+        let stdin = value::std_stream_new(0);
+        assert_eq!(invoke(stdin, "readline", &[int(1)]), NONE);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        reset();
+        let stdin = value::std_stream_new(0);
+        assert_eq!(invoke(stdin, "read", &[int(1), int(2)]), NONE);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn delete_attr_removes_instance_attributes_only() {
+        reset();
+        let class = value::class_new("Thing".to_string(), NONE, Vec::new());
+        let instance = value::instance_new(class);
+        value::instance_setattr(instance, "value".to_string(), int(7));
+        assert_eq!(getattr(instance, "value".as_ptr(), 5), int(7));
+        assert!(!crate::exc::pending());
+
+        assert_eq!(delete_attr(instance, "value".as_ptr(), 5), NONE);
+        assert!(!crate::exc::pending());
+        assert_eq!(getattr(instance, "value".as_ptr(), 5), NONE);
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        assert_eq!(message(), "'Thing' object has no attribute 'value'");
+        crate::exc::clear();
+
+        // Deleting the same attribute twice reports the missing name.
+        assert_eq!(delete_attr(instance, "value".as_ptr(), 5), NONE);
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        crate::exc::clear();
+
+        // Class namespaces are frozen.
+        assert_eq!(delete_attr(class, "value".as_ptr(), 5), NONE);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "cannot delete attributes of class 'Thing'");
+        crate::exc::clear();
+
+        // Non-instance receivers report AttributeError.
+        assert_eq!(delete_attr(int(1), "value".as_ptr(), 5), NONE);
         assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
     }
 }

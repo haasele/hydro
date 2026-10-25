@@ -232,3 +232,18 @@ fn submodule_imports_initializing_package_member_at_runtime() {
     assert_eq!(code, 0, "pyx run failed:\n{stderr}");
     assert_eq!(stdout, "hi\n");
 }
+
+#[test]
+fn module_initializer_exception_stops_before_entry_body() {
+    let dir = TestDir::new("initializer-error");
+    dir.write("bad.py", "raise ValueError(\"boom\")\n");
+    let main = dir.write("main.py", "import bad\nprint(\"after\")\n");
+    let main = main.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", main.as_str()]);
+    assert_eq!(code, 1, "initializer error must fail:\n{stderr}");
+    assert_eq!(stdout, "", "the entry body must not run after the failure");
+    assert!(
+        stderr.contains("ValueError: boom"),
+        "the original initializer error must be reported, stderr:\n{stderr}"
+    );
+}
