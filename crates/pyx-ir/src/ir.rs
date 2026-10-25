@@ -15,8 +15,9 @@
 //! - Each [`FunctionId`] indexes `Program::functions`.
 //! - `line` is 1-based and refers to the source file given by
 //!   [`Program::source_name`].
-//! - Nested functions are closures by value: [`StmtKind::Closure`] captures
-//!   the current values of enclosing locals. Classes are limited to a single
+//! - Nested functions are closures: [`StmtKind::Closure`] captures the
+//!   current values of enclosing locals, or the cell (`StmtKind::CellInit`)
+//!   for bindings that are mutated through `nonlocal`. Classes are limited to a single
 //!   optional base, methods (plain, property, classmethod or staticmethod) and
 //!   attributes frozen at class creation.
 
@@ -34,6 +35,8 @@ use crate::model::{
 pub enum UnpackTarget {
     /// Bind a local slot.
     Name(LocalId),
+    /// Bind through the closure cell stored in a local slot.
+    Cell(LocalId),
     /// `*name = element`: `element` is a fresh list holding the elements the
     /// plain targets around it did not consume (`a, *rest, b = value`). At
     /// most one starred target is allowed, and it never nests inside another
@@ -82,6 +85,14 @@ impl Expr {
 pub enum ExprKind {
     Const(Const),
     Local(LocalId),
+    /// Read through a closure cell stored in `local` (`pyx_cell_get`).
+    CellGet(LocalId),
+    /// Store `value` into the closure cell held by `local` and yield the
+    /// stored value (`x := v` where `x` is a captured mutable local).
+    CellSet {
+        target: LocalId,
+        value: Box<Expr>,
+    },
     /// `(target := value)` (an assignment expression). Evaluates `value`,
     /// stores it in the local `target` and yields the same value. The local is
     /// the enclosing function's slot, so later reads of the name in that scope
@@ -327,6 +338,8 @@ pub enum DeleteTarget {
     /// (documented limitation: PyX does not track unbound locals, so a later
     /// read yields `None` instead of raising `NameError`).
     Name(LocalId),
+    /// Clear the closure cell held by a local slot to `None`.
+    Cell(LocalId),
     /// Delete a module-level binding from the runtime global table
     /// (`global name; del name`, or `del name` in a module body). A missing
     /// entry raises `NameError`.
@@ -358,6 +371,8 @@ pub enum DeleteTarget {
 pub struct Handler {
     pub exc: Option<ExcKind>,
     pub binding: Option<LocalId>,
+    /// The binding local holds a closure cell; store the exception through it.
+    pub binding_cell: bool,
     pub body: Vec<Stmt>,
 }
 
@@ -366,6 +381,19 @@ pub enum StmtKind {
     /// Evaluate an expression for its side effects (calls).
     Expr(Expr),
     Assign {
+        target: LocalId,
+        value: Expr,
+    },
+    /// Allocate a closure cell holding `value` (or `None`) and store it in
+    /// `target`. Emitted at function entry for every local that is captured
+    /// and mutated, and again at the top of a loop body for per-iteration
+    /// cells.
+    CellInit {
+        target: LocalId,
+        value: Option<Expr>,
+    },
+    /// Store `value` through the closure cell held by `target`.
+    CellAssign {
         target: LocalId,
         value: Expr,
     },

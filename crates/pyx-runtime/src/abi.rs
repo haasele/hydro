@@ -524,6 +524,24 @@ pub extern "C" fn pyx_closure_new(
     value::closure_new_with_flags(wrapper as usize, arity, name, captures, flags)
 }
 
+/// Allocates a closure cell holding `value`.
+#[no_mangle]
+pub extern "C" fn pyx_cell_new(value: i64) -> i64 {
+    value::cell_new(value)
+}
+
+/// Reads the current value of a closure cell.
+#[no_mangle]
+pub extern "C" fn pyx_cell_get(cell: i64) -> i64 {
+    value::cell_get(cell)
+}
+
+/// Stores `value` into a closure cell (shared by `nonlocal` writers).
+#[no_mangle]
+pub extern "C" fn pyx_cell_set(cell: i64, value: i64) {
+    value::cell_set(cell, value)
+}
+
 /// Stores full parameter metadata and the uniform full-argv trampoline on a
 /// generated function value.
 ///

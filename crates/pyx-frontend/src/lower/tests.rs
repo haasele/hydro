@@ -419,7 +419,7 @@ fn undefined_name_without_a_close_match_has_no_help() {
 
 #[test]
 fn unsupported_construct_sets_the_span_and_help() {
-    let source = "nonlocal x\n";
+    let source = "match x:\n    case 1:\n        pass\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, codes::UNSUPPORTED);
@@ -4270,6 +4270,72 @@ fn nested_function_does_not_capture_names_assigned_in_its_body() {
             .count(),
         1,
         "the assignment must create a nested local, not a capture"
+    );
+}
+
+#[test]
+fn captured_mutations_lower_to_shared_cells() {
+    let source = "\ndef outer():\n    x = 0\n    def inc():\n        nonlocal x\n        x += 1\n    def get():\n        return x\n    return inc, get\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "outer");
+    let x_local = outer
+        .locals
+        .iter()
+        .position(|local| local.name == "x")
+        .expect("outer x") as LocalId;
+
+    // The first statement allocates the cell that both closures share.
+    assert!(
+        matches!(&outer.body[0].kind, HStmtKind::CellInit { target, .. } if *target == x_local),
+        "expected a cell init, got {:?}",
+        outer.body[0].kind
+    );
+    assert!(matches!(
+        &outer.body[1].kind,
+        HStmtKind::CellAssign { target, .. } if *target == x_local
+    ));
+
+    let HStmtKind::Closure { captures, .. } = &outer.body[2].kind else {
+        panic!("expected inc closure, got {:?}", outer.body[2].kind);
+    };
+    assert_eq!(captures, &vec![x_local]);
+    let HStmtKind::Closure { captures, .. } = &outer.body[3].kind else {
+        panic!("expected get closure, got {:?}", outer.body[3].kind);
+    };
+    assert_eq!(captures, &vec![x_local]);
+
+    let inc = function(&hir, "outer.inc");
+    assert!(matches!(&inc.body[0].kind, HStmtKind::CellAssign { .. }));
+    let get = function(&hir, "outer.get");
+    let HStmtKind::Return(Some(value)) = &get.body[0].kind else {
+        panic!("expected get return, got {:?}", get.body[0].kind);
+    };
+    assert!(matches!(value.kind, HExprKind::CellGet(_)));
+}
+
+#[test]
+fn nonlocal_without_an_enclosing_binding_is_rejected() {
+    let source = "\ndef outer():\n    def inner():\n        nonlocal absent\n        absent = 1\n    return inner\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0]
+            .message
+            .contains("no binding for nonlocal 'absent' found"),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn nonlocal_conflicting_with_global_is_rejected() {
+    let source = "\ndef outer():\n    x = 1\n    def inner():\n        global x\n        nonlocal x\n    return inner\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0].message.contains("name 'x' is nonlocal and global"),
+        "{diags:?}"
     );
 }
 

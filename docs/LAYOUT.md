@@ -18,6 +18,7 @@ repository root.
 │   ├── check_benchmarks.py    local benchmark regression gate (--check/--update)
 │   ├── test_check_benchmarks.py  deterministic tests for the threshold gate
 │   ├── bench_hyperfine.sh     hyperfine adapter for benchmark harnesses
+│   ├── repro_check.sh         same-host AOT reproducibility check (docs/REPRODUCIBLE.md)
 │   ├── stdlib_compat.py       stdlib import matrix (pinned CPython 3.14.9)
 │   └── cpython_compat.py      official Lib/test differential gate
 ├── benchmarks/
@@ -35,6 +36,7 @@ repository root.
 │   ├── COMPATIBILITY.md       generated stdlib import matrix
 │   ├── CPYTHON_TESTS.md       official-test gate policy + baseline
 │   ├── DIAGNOSTICS.md         diagnostic codes/spans/JSON, CLI flags, exit codes
+│   ├── REPRODUCIBLE.md        AOT build reproducibility contract + evidence
 │   ├── pyx.1                  roff manpage
 │   ├── TODO.md                single work list
 │   └── LAYOUT.md              this file
@@ -50,12 +52,13 @@ repository root.
     │       │   └── specs.rs
     │       └── tests.rs
     ├── pyx-frontend/          parsing, lowering, type checking, user modules
-    │   └── src/
-    │       ├── lib.rs         check_file, module loader/import resolution
-    │       │                  (siblings, packages, site-packages, PYTHONPATH)
-    │       ├── diag.rs        diagnostics, spans, codes
-    │       ├── lower/         AST → HIR/lowering
-    │       └── sema/          type inference, constraints, IR emission
+    │   ├── src/
+    │   │   ├── lib.rs         check_file, module loader/import resolution
+    │   │   │                  (siblings, packages, site-packages, PYTHONPATH)
+    │   │   ├── diag.rs        diagnostics, spans, codes
+    │   │   ├── lower/         AST → HIR/lowering
+    │   │   └── sema/          type inference, constraints, IR emission
+    │   └── tests/             fuzz-smoke parse/lower/check coverage
     ├── pyx-codegen/           Cranelift backend
     │   └── src/
     │       ├── lib.rs

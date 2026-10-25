@@ -1810,7 +1810,8 @@ unsafe fn trace(addr: usize) {
         | crate::value::KIND_SET
         | crate::value::KIND_DEFAULTDICT
         | crate::value::KIND_ARG_PARSER
-        | crate::value::KIND_NAMESPACE => {
+        | crate::value::KIND_NAMESPACE
+        | crate::value::KIND_CELL => {
             let _graph = graph_lock();
             if obj.marked.load(Ordering::Acquire) != GREY {
                 return;
@@ -1861,6 +1862,7 @@ unsafe fn trace(addr: usize) {
                         mark_value(item);
                     }
                 }
+                ObjData::Cell(value) => mark_value(*value),
                 _ => {}
             }
             mark_black(addr);
@@ -2048,7 +2050,8 @@ unsafe fn trace(addr: usize) {
                 | ObjData::Namespace(_)
                 | ObjData::Queue(_)
                 | ObjData::Class(_)
-                | ObjData::Instance(_) => {}
+                | ObjData::Instance(_)
+                | ObjData::Cell(_) => {}
             }
             mark_black(addr);
         }

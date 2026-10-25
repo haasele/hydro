@@ -14,8 +14,9 @@
 //! - Each [`FunctionId`] indexes `Program::functions`.
 //! - `line` is 1-based and refers to the source file given by
 //!   [`Program::source_name`].
-//! - Nested functions are closures by value: [`StmtKind::Closure`] captures
-//!   the current values of enclosing locals. Classes are limited to a single
+//! - Nested functions are closures: [`StmtKind::Closure`] captures the
+//!   current values of enclosing locals, or the cell for bindings mutated
+//!   through `nonlocal`. Classes are limited to a single
 //!   optional base and plain methods.
 
 pub mod compat;

@@ -125,7 +125,8 @@ Limitations:
   process creation, and serialization (PYX1). Small work amounts are
   dominated by these fixed costs.
 - Concurrency measurements fluctuate with machine load; the thresholds are
-  therefore generous (factor 3.0) and the gate does not run in CI.
+  therefore generous (factor 3.0). CI only **reports** the gate
+  non-blockingly (see Q-06 below); enforcement stays local/release-only.
 
 ## Regression thresholds (P5-01c)
 
@@ -141,13 +142,13 @@ python3 scripts/check_benchmarks.py            # gate
 python3 scripts/check_benchmarks.py --update   # rewrite baseline
 ```
 
-The factors are deliberately generous (default 1.75; threads, pool, and processes
-3.0; process startup 4.0) and are additionally backed by `floor_ms`. The
-gate does **not** enforce in CI, because timing fluctuates too much on shared
-runners; it is intended as a local/release gate. CPython measurements are
-not gated. `--check` is the explicit form of the default mode and
-`scripts/test_check_benchmarks.py` covers threshold, skip, failure and
-`--update` behavior.
+The factors are deliberately generous (default 1.75; `json_*` 2.0; threads,
+pool, and processes 3.0; process startup 4.0) and are additionally backed by
+`floor_ms`. The gate does **not** enforce in CI, because timing fluctuates too
+much on shared runners; CI only reports it non-blockingly. Enforcement is a
+local/release gate. CPython measurements are not gated. `--check` is the
+explicit form of the default mode and `scripts/test_check_benchmarks.py`
+covers threshold, skip, failure, `--update` and the CI policy itself.
 
 **Q-06 policy.** Threshold enforcement stays local/release-only. CI runs the
 gate as a **non-blocking** report (`continue-on-error`) over the checked-in

@@ -32,16 +32,16 @@ in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
 ### Test counts (canonical — update only here)
 
-`cargo test --workspace` on 2026-10-25: **1444 tests**:
+`cargo test --workspace` on 2026-10-25: **1463 tests**:
 
 | Suite | Tests |
 |---|---:|
 | runtime unit | 519 |
-| runtime integration | 188 |
-| frontend | 425 |
+| runtime integration | 195 |
+| frontend | 428 |
 | codegen | 51 |
 | IR | 18 |
-| CLI/E2E | 243 (incl. 150 E2E) |
+| CLI/E2E | 252 (incl. 150 E2E) |
 
 Other docs must link here instead of repeating the total; future agents add
 tests, so this block is the only exact count.
@@ -74,8 +74,8 @@ tests, so this block is the only exact count.
 - GC is conservative with a shared heap; precise roots/stack maps and variable
   payload size classes are open.
 - Async generators/comprehensions and `asyncio` beyond run/sleep/gather are
-  open; generator expressions are lazy (synthetic generator function); closures
-  capture by value.
+  open; generator expressions are lazy (synthetic generator function); mutable
+  closure bindings use shared heap cells with `nonlocal` support.
 - Imports: packages, dotted/relative imports and site-packages work; no general
   `sys.path`/`sys.modules`, namespace/zip/frozen imports or `from x import *`.
 - Language: no user decorators, metaclasses, multiple inheritance, pattern
@@ -99,8 +99,8 @@ tests, so this block is the only exact count.
    `Lib/test` subsets, then the dependency-ordered remaining batches.
 3. **P4:** P4-04c/d full ABI/GIL, P4-05 wheel install, P4-06 `ctypes`/`cffi`,
    then ecosystem suites/benchmarks (P4-10/P4-11).
-4. **P2-10/P2-12:** mutable closures, async generators/comprehensions and
-   broader asyncio.
+4. **P2-12:** async generators/comprehensions, async for/with and broader
+   asyncio.
 5. **P3:** uv interpreter injection, reproducible builds (P3-05), packaging
    (P3-08).
 6. **P6:** troubleshooting/migration docs (P6-09), progress/exit summary
@@ -117,6 +117,7 @@ cargo test                             # unit/integration tests
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
+scripts/repro_check.sh                 # same-host AOT determinism (docs/REPRODUCIBLE.md)
 cargo run -q -p pyx-cli -- new /tmp/demo
 cargo run -q -p pyx-cli -- run examples/fib.py
 cargo run -q -p pyx-cli -- build examples/fib.py -o /tmp/fib && /tmp/fib
@@ -171,7 +172,11 @@ See `CHANGELOG.md` for details; this is only the resume pointer.
 - CLI `--verbose`/`--quiet` (conflicts exit 2), phase timings/cache decisions,
   multi-character semantic spans and an ICE classification test; diagnostic
   catalog (`docs/DIAGNOSTICS.md`) and manpage refreshed.
-- Deterministic container/GC property tests (SplitMix64 models, no new deps).
+- Deterministic container/GC property tests (SplitMix64 models, no new deps)
+  and dependency-free fuzz smoke tests for the frontend and runtime ABI.
+- Same-host AOT reproducibility: contract/evidence in
+  `docs/REPRODUCIBLE.md`, checked by `scripts/repro_check.sh` and before
+  release packaging.
 - Hyperfine adapter, engine comparison, explicit threshold `--check` +
   deterministic gate tests, non-blocking CI threshold report, tag-driven
   `release.yml` for Linux x64.

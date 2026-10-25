@@ -193,8 +193,8 @@ no CPython is needed at runtime.
       `@property`/`@classmethod`/`@staticmethod`, and deterministic
       representation. Limits: user decorators, metaclasses, multiple
       inheritance and the general descriptor protocol are absent (P4-02).
-- [ ] P2-10 Generators, `yield`, closures/cell variables.
-      Delivered: closures (nested `def`, by value), real **lazy**
+- [x] P2-10 Generators, `yield`, closures/cell variables.
+      Delivered: closures with mutable cell captures and `nonlocal`, real **lazy**
       generators (stackful fibers, `yield [value]`, bare `yield`, `return`
       terminates, exceptions propagate, `iter`/`next`, `send`/`throw`/`close`,
       `yield` expressions and `yield from`) and lazy generator expressions
@@ -202,10 +202,10 @@ no CPython is needed at runtime.
       creation, the remaining clauses/filters and the element run per resume,
       and enclosing locals are capture parameters; an assignment expression
       inside one is rejected because it would have to bind in the enclosing
-      frame). Program: mutable (cell) closure captures and `nonlocal`.
-      Acceptance: `nonlocal` mutation is shared between outer and inner
-      functions; tests cover that plus lazy generator expressions
-      (laziness/partial consumption, captures, exception propagation).
+      frame). Cells are GC-traced; outer/inner mutations are shared, sibling
+      closures share a cell, and loop-created closures get per-iteration cells.
+      Tests cover mutation, `nonlocal`, missing-binding diagnostics, GC stress,
+      JIT+AOT, laziness/partial consumption and exception propagation.
 - [x] P2-11 Exceptions complete: `else`, `finally`, exception hierarchy, chaining.
       `except Exception`/`BaseException`, tuple handlers
       (`except (A, B) as e`), explicit `raise ... from ...` and implicit
@@ -329,12 +329,14 @@ cover cycles; container semantics tested against CPython behavior.
       modules, target, version and runtime archive; `--no-cache`, `pyx clean`,
       hit/invalidation tests.
 - [ ] P3-05 Reproducible builds (deterministic objects, path stripping).
-      Program: deterministic object/binary output independent of build
-      directory and timestamps, `SOURCE_DATE_EPOCH` support, and stripped
-      absolute paths (Q-10 tracks telemetry-free defaults and relies on this
-      item). Acceptance: two builds from different checkout paths and times
-      are byte-identical; the CI/local gate compares checksums; the stripping
-      logic is unit-tested.
+      Delivered: `scripts/repro_check.sh` compares two `--no-cache` builds,
+      cache/fresh links, hashes and program output; `docs/REPRODUCIBLE.md`
+      records the current contract. Same spelling/path is deterministic;
+      relative vs absolute source paths still change embedded path immediates.
+      Program: path-independent output, `SOURCE_DATE_EPOCH`, stripped
+      absolute paths (Q-10 relies on this). Acceptance: two builds from
+      different checkout paths/times are byte-identical and the gate compares
+      checksums.
 - [x] P3-06 `pyx test`, `pyx fmt`, `pyx lint`, `pyx check`.
       Implemented; `test` is **not** pytest-compatible (success = exit 0,
       `--json`), `fmt` only normalizes whitespace/final newline.
@@ -631,7 +633,13 @@ ecosystem benchmarks show where PyX is faster, equal or slower than CPython
       (P2-11). Frame fidelity is function/line-level; full CPython frame
       objects are not claimed.
 - [ ] Q-03 Fuzzing: parser, lowering, codegen (cargo-fuzz).
+      Delivered: deterministic `tests/fuzz_smoke.rs` token/Unicode/mutation
+      corpus in the frontend (no panic, valid diagnostics). Cargo-fuzz targets
+      remain open.
 - [ ] Q-04 Fuzzing: runtime/GC (allocation/object operations).
+      Delivered: deterministic ABI operation-sequence fuzz smoke in
+      `crates/pyx-runtime/tests/fuzz_smoke.rs`; cargo-fuzz targets remain
+      open.
 - [ ] Q-05 Security review of `unsafe` code; policy in ARCHITECTURE.md.
       `unsafe` is encapsulated and justified in GC/ABI; formal review open.
 - [x] Q-06 Performance regression CI (thresholds).

@@ -159,9 +159,9 @@ options must precede the file.
 
 - `def`, parameters, default return, recursion; functions and lambdas are
   values, builtins likewise (`f = int`); `map`/`filter` materialize lists.
-- **Closures by value:** nested `def` capture the values of the outer
-  locals at definition time. Recursive nested functions are
-  a diagnostic.
+- **Closures:** mutable captured bindings use shared heap cells and support
+  `nonlocal`; read-only captures keep by-value semantics. Recursive nested
+  functions are a diagnostic.
 - **Classes:** `class Name(Base)` with a single base, methods, `__init__`,
   `self` attributes (`pyx_getattr`/`pyx_setattr`), inheritance/overrides,
   class attributes (`x = value`), `@property`/`@classmethod`/
@@ -345,7 +345,9 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Releases: tag-driven `.github/workflows/release.yml` builds and packages the
   Linux x64 `pyx` binary plus AOT runtime archive with tests, checksums
   and a smoke test, without
-  repository secrets (other platforms: Q-09).
+  repository secrets (other platforms: Q-09). Same-host artifact
+  determinism is asserted before packaging and documented in
+  [`docs/REPRODUCIBLE.md`](docs/REPRODUCIBLE.md).
 
 ## Contributing
 

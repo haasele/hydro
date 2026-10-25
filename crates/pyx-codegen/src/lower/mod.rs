@@ -158,6 +158,9 @@ struct Runtime {
     dict_from: FuncId,
     function_new: FuncId,
     closure_new: FuncId,
+    cell_new: FuncId,
+    cell_get: FuncId,
+    cell_set: FuncId,
     function_params: FuncId,
     function_meta: FuncId,
     coroutine_new: FuncId,
@@ -312,6 +315,10 @@ impl Runtime {
                 &[i64t, ptr, ptr, ptr, ptr, ptr, i32t],
                 Some(i64t),
             )?,
+            // Closure cells: allocate with an initial value, read, store.
+            cell_new: declare_runtime(module, "pyx_cell_new", &[i64t], Some(i64t))?,
+            cell_get: declare_runtime(module, "pyx_cell_get", &[i64t], Some(i64t))?,
+            cell_set: declare_runtime(module, "pyx_cell_set", &[i64t, i64t], None)?,
             // `function`, the parameter count and a pointer to `2 * count`
             // words (name pointer, name length) of user-visible parameter
             // names. Returns the function value unchanged.
@@ -1853,6 +1860,31 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let value = self.lower_expr(value)?;
                 self.builder.def_var(var, value);
             }
+            StmtKind::CellInit { target, value } => {
+                let value = match value {
+                    Some(expr) => {
+                        // Park the initial value in a stack slot so a
+                        // collection during `cell_new` still sees it.
+                        let holder = self.temp_var();
+                        let value = self.lower_expr(expr)?;
+                        self.builder.def_var(holder, value);
+                        self.builder.use_var(holder)
+                    }
+                    None => self.none(),
+                };
+                let var = self.local_var(*target)?;
+                let id = self.runtime.cell_new;
+                let cell = self.call_rt(id, &[value])?;
+                self.emit_exc_check()?;
+                self.builder.def_var(var, cell);
+            }
+            StmtKind::CellAssign { target, value } => {
+                let value = self.lower_expr(value)?;
+                let var = self.local_var(*target)?;
+                let cell = self.builder.use_var(var);
+                let id = self.runtime.cell_set;
+                self.call_void(id, &[cell, value]);
+            }
             StmtKind::GlobalSet {
                 module,
                 name,
@@ -2273,6 +2305,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             StmtKind::Delete { targets } => {
                 for target in targets {
                     match target {
+                        DeleteTarget::Cell(local) => {
+                            let var = self.local_var(*local)?;
+                            let cell = self.builder.use_var(var);
+                            let none = self.none();
+                            let id = self.runtime.cell_set;
+                            self.call_void(id, &[cell, none]);
+                        }
                         DeleteTarget::Name(local) => {
                             // Documented limitation: PyX does not track unbound
                             // locals, so deleting a name clears its slot to
@@ -2817,9 +2856,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         value: Value,
     ) -> Result<(), CodegenError> {
         match target {
-            UnpackTarget::Name(id) => {
+            UnpackTarget::Name(id) | UnpackTarget::Cell(id) => {
                 let var = self.local_var(*id)?;
-                self.builder.def_var(var, value);
+                if matches!(target, UnpackTarget::Cell(_)) {
+                    let cell = self.builder.use_var(var);
+                    let id = self.runtime.cell_set;
+                    self.call_void(id, &[cell, value]);
+                } else {
+                    self.builder.def_var(var, value);
+                }
             }
             UnpackTarget::Attr { object, name } => {
                 // Park the element while the receiver expression runs: the
@@ -3045,7 +3090,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.builder.def_var(exc_var, value);
                 if let Some(binding) = handler.binding {
                     let binding_var = self.local_var(binding)?;
-                    self.builder.def_var(binding_var, value);
+                    if handler.binding_cell {
+                        let cell = self.builder.use_var(binding_var);
+                        let id = self.runtime.cell_set;
+                        self.call_void(id, &[cell, value]);
+                    } else {
+                        self.builder.def_var(binding_var, value);
+                    }
                 }
                 let clear_id = self.runtime.exc_clear;
                 self.call_rt(clear_id, &[])?;
@@ -3252,6 +3303,20 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             ExprKind::Local(id) => {
                 let var = self.local_var(*id)?;
                 Ok(self.builder.use_var(var))
+            }
+            ExprKind::CellGet(id) => {
+                let var = self.local_var(*id)?;
+                let cell = self.builder.use_var(var);
+                let id = self.runtime.cell_get;
+                self.call_rt(id, &[cell])
+            }
+            ExprKind::CellSet { target, value } => {
+                let value = self.lower_expr(value)?;
+                let var = self.local_var(*target)?;
+                let cell = self.builder.use_var(var);
+                let id = self.runtime.cell_set;
+                self.call_void(id, &[cell, value]);
+                Ok(value)
             }
             ExprKind::NamedExpr { target, value } => {
                 // The value is evaluated first, then stored in the local; the
@@ -7130,11 +7195,13 @@ mod tests {
                                 Handler {
                                     exc: Some(ExcKind::Exception),
                                     binding: None,
+                                    binding_cell: false,
                                     body: vec![pass()],
                                 },
                                 Handler {
                                     exc: Some(ExcKind::BaseException),
                                     binding: None,
+                                    binding_cell: false,
                                     body: vec![pass()],
                                 },
                             ],

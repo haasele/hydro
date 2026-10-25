@@ -23,6 +23,37 @@ heavier rich rendering. See the package-loader entry below.
 
 ### Added
 
+- **Mutable closures and `nonlocal`:** locals captured and mutated by a
+  nested function now live in traced heap cells (`pyx_cell_new/get/set`,
+  registered for JIT and exported for AOT), so outer mutations and
+  `nonlocal` writes are shared between the enclosing function and every
+  closure. Read-only captures keep by-value semantics; loop bodies create
+  a fresh cell per iteration for mutated cells. `nonlocal name` resolves to
+  the nearest enclosing binding and reports a stable diagnostic when the
+  binding is missing or conflicts with `global`. ABI additions:
+  `pyx_cell_new/get/set`.
+- **Dependency-free fuzz smoke tests:** `crates/pyx-frontend/tests/fuzz_smoke.rs`
+  drives random token soup, random Unicode, mutations of a valid program and a
+  pathological corpus through `check_source`, asserting the public contract
+  (no panic, non-empty diagnostics with the requested filename).
+  `crates/pyx-runtime/tests/fuzz_smoke.rs` drives random ABI operation
+  sequences (containers, operators, methods, iteration, unpacking, raising)
+  built only from ABI values, asserting every pending exception exposes a
+  tag/value and clears. Both use a fixed-seed SplitMix64 and stay under the
+  2 s budget; no new dependencies.
+- **Reproducible-build contract:** `docs/REPRODUCIBLE.md` records the AOT
+  inputs (source bytes, source-name spelling, runtime archive, `CC`, linker),
+  the same-host determinism evidence, and the open cross-host/path
+  normalization items. `scripts/repro_check.sh` compiles one source four times
+  (two uncached output paths, cached link plus cache hit), compares sha256 sums
+  and runtime behavior, and runs in `release.yml` before packaging. The source
+  path spelling is part of the contract: relative and absolute builds differ
+  only in the embedded source name.
+- **CI threshold policy test:** `scripts/test_check_benchmarks.py` now checks
+  that `ci.yml` runs `check_benchmarks.py --check` exactly once with
+  `continue-on-error: true`, that the harness self-tests are blocking, and that
+  `--check` reports the same regression as the default mode. `benchmarks/PYX.md`
+  no longer claims the gate is absent from CI.
 - **Lazy generator expressions:** `(e for ...)` no longer builds an eager
   list. The frontend synthesizes a generator function whose hidden first
   parameter is the outermost iterable (evaluated when the generator is

@@ -2,8 +2,8 @@
 //! values followed by user arguments, and the collector keeps captures alive.
 
 use pyx_runtime::abi::{
-    pyx_binop, pyx_call, pyx_closure_new, pyx_exc_clear, pyx_exc_pending, pyx_gc_collect, pyx_int,
-    pyx_len, pyx_runtime_init, pyx_str_new,
+    pyx_binop, pyx_call, pyx_cell_get, pyx_cell_new, pyx_cell_set, pyx_closure_new, pyx_exc_clear,
+    pyx_exc_pending, pyx_gc_collect, pyx_int, pyx_len, pyx_runtime_init, pyx_str_new,
 };
 
 extern "C" fn add_captured(argv: *const i64) -> i64 {
@@ -103,6 +103,31 @@ fn collector_traces_captured_heap_values() {
     let result = pyx_call(closure, 0, std::ptr::null());
     assert_eq!(pyx_exc_pending(), 0);
     assert_eq!(pyx_len(result), pyx_int(3));
+}
+
+#[inline(never)]
+fn make_text_cell_closure() -> i64 {
+    let text = pyx_str_new(b"abc".as_ptr(), 3);
+    let cell = pyx_cell_new(text);
+    new_closure(first_capture, 0, "cell", &[cell])
+}
+
+#[test]
+fn cells_share_mutations_and_trace_their_value() {
+    pyx_runtime_init();
+    let cell = pyx_cell_new(pyx_int(1));
+    assert_eq!(pyx_cell_get(cell), pyx_int(1));
+    pyx_cell_set(cell, pyx_int(2));
+    assert_eq!(pyx_cell_get(cell), pyx_int(2));
+
+    // The string is only reachable through the closure's captured cell.
+    let closure = make_text_cell_closure();
+    scrub_stack();
+    let _ = pyx_gc_collect();
+    let cell = pyx_call(closure, 0, std::ptr::null());
+    assert_eq!(pyx_exc_pending(), 0);
+    let text = pyx_cell_get(cell);
+    assert_eq!(pyx_len(text), pyx_int(3));
 }
 
 #[test]

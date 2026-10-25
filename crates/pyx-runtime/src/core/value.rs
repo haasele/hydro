@@ -132,6 +132,9 @@ pub(crate) const KIND_STD_STREAM: u32 = 35;
 /// Arbitrary-precision Python `int` outside the tagged-immediate range. The
 /// payload is immutable and holds no PyX values.
 pub(crate) const KIND_BIGINT: u32 = 36;
+/// Mutable binding shared between a function and its nested closures
+/// (`nonlocal`). Traces the single value it currently holds.
+pub(crate) const KIND_CELL: u32 = 37;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
 pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
@@ -1659,6 +1662,9 @@ pub(crate) enum ObjData {
     StdStream(StdStreamState),
     /// Arbitrary-precision Python `int` (immutable, no PyX children).
     BigInt(BigInt),
+    /// Mutable closure cell. Internal to generated code; holds one traced
+    /// value that reads and writes go through.
+    Cell(i64),
 }
 
 // Tag helpers
@@ -3100,6 +3106,48 @@ pub(crate) fn iter_new(target: i64) -> i64 {
     )
 }
 
+/// Allocates a closure cell holding `value`.
+///
+/// Generated code keeps the cell in the local slot of a variable that a nested
+/// function captures and mutates; the closure captures the cell value itself,
+/// so every reader observes the current binding.
+pub(crate) fn cell_new(value: i64) -> i64 {
+    alloc(KIND_CELL, ObjData::Cell(value))
+}
+
+/// Reads the value held by `cell`. Non-cell values yield [`NONE`]; generated
+/// code only calls this for locals the frontend typed as cells.
+pub(crate) fn cell_get(cell: i64) -> i64 {
+    let Some(_graph) = lock_container(cell, KIND_CELL) else {
+        return NONE;
+    };
+    // SAFETY: heap tag/kind checked under the graph lock.
+    let obj = unsafe { &*((cell & !TAG_MASK) as *const PyxObj) };
+    match &obj.data {
+        ObjData::Cell(value) => *value,
+        _ => NONE,
+    }
+}
+
+/// Stores `value` into `cell` and publishes the new GC edge.
+pub(crate) fn cell_set(cell: i64, value: i64) {
+    let Some(_graph) = lock_container(cell, KIND_CELL) else {
+        return;
+    };
+    {
+        // SAFETY: heap tag/kind checked under the graph lock; the collector
+        // only frees unreachable objects.
+        let obj = unsafe { &mut *((cell & !TAG_MASK) as *mut PyxObj) };
+        let ObjData::Cell(slot) = &mut obj.data else {
+            return;
+        };
+        *slot = value;
+    }
+    // Publish the new edge while the mutation is still serialised against the
+    // marker.
+    crate::heap::write_barrier_edge(cell, value);
+}
+
 /// Allocates a function value. `wrapper` is the generated entry point and
 /// must be non-zero; `name` is the Python-visible name.
 pub(crate) fn function_new(wrapper: usize, arity: usize, name: String) -> i64 {
@@ -3651,6 +3699,7 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             Some(ObjData::Capsule { .. }) => "PyCapsule",
             Some(ObjData::Module(_)) => "module",
             Some(ObjData::StdStream(_)) => "TextIOWrapper",
+            Some(ObjData::Cell(_)) => "cell",
             Some(ObjData::Fiber(state)) => match state.kind {
                 crate::fiber::FiberKind::Generator => "generator",
                 crate::fiber::FiberKind::Coroutine => "coroutine",
@@ -3763,6 +3812,8 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjData::Capsule { .. }) | Some(ObjData::Module(_)) => true,
             // A standard stream is always truthy.
             Some(ObjData::StdStream(_)) => true,
+            // Cells are internal; they are always truthy.
+            Some(ObjData::Cell(_)) => true,
             None => true,
         };
     }
@@ -3911,6 +3962,7 @@ pub(crate) fn to_string(v: i64) -> String {
                 },
                 ObjData::Module(state) => format!("<module '{}'>", state.name),
                 ObjData::StdStream(stream) => format!("<pyx.{}>", stream.name()),
+                ObjData::Cell(value) => to_string(*value),
             };
         }
     }

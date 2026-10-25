@@ -3,7 +3,8 @@
 
 These cover the policy decisions behind P5-01c/Q-06: threshold checks stay a
 local/release gate, `--check` is explicit, `--update` re-baselines with the
-documented factor/floor, and malformed or missing input fails loudly.
+documented factor/floor, malformed or missing input fails loudly, and the CI
+workflow keeps the report non-blocking while the harness self-tests block.
 
 Run directly: `python3 scripts/test_check_benchmarks.py`
 """
@@ -11,6 +12,7 @@ Run directly: `python3 scripts/test_check_benchmarks.py`
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,14 @@ import unittest
 from pathlib import Path
 
 CHECK = Path(__file__).resolve().with_name("check_benchmarks.py")
+ROOT = CHECK.parents[1]
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+
+
+def workflow_steps(path: Path) -> list[str]:
+    """Splits a workflow file into step blocks (six-space list items)."""
+    text = path.read_text(encoding="utf-8")
+    return re.split(r"(?m)^      - ", text)[1:]
 
 
 def results(*rows: dict) -> dict:
@@ -86,6 +96,16 @@ class CheckBenchmarksTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout)
         self.assertIn("FAIL", proc.stdout)
         self.assertIn("regression", proc.stderr)
+
+    def test_check_flag_reports_the_same_failure(self) -> None:
+        self.write(self.results_path, results(row("w", "pyx-jit", 25.0)))
+        self.write(self.thresholds_path, thresholds(20.0))
+        default = self.run_check()
+        explicit = self.run_check("--check")
+        self.assertEqual(default.returncode, 1, default.stdout)
+        self.assertEqual(explicit.returncode, 1, explicit.stdout)
+        self.assertIn("1 failed", explicit.stdout)
+        self.assertIn("FAIL", explicit.stdout)
 
     def test_missing_results_fails(self) -> None:
         self.write(self.thresholds_path, thresholds(20.0))
@@ -163,6 +183,50 @@ class CheckBenchmarksTests(unittest.TestCase):
         proc = self.run_check()
         self.assertEqual(proc.returncode, 1)
         self.assertIn("expected an object", proc.stderr)
+
+
+class CiThresholdPolicyTests(unittest.TestCase):
+    """The docs promise a non-blocking report and blocking harness self-tests."""
+
+    def test_ci_workflow_exists(self) -> None:
+        self.assertTrue(CI_WORKFLOW.is_file(), CI_WORKFLOW)
+
+    def test_threshold_report_is_non_blocking_and_uses_check(self) -> None:
+        steps = workflow_steps(CI_WORKFLOW)
+        # Match the `run:` line only: comments in the preceding step also
+        # mention the script name.
+        report = [
+            s
+            for s in steps
+            if re.search(r"(?m)^\s+run:.*scripts/check_benchmarks\.py", s)
+        ]
+        self.assertEqual(
+            len(report), 1, "exactly one CI step may run check_benchmarks.py"
+        )
+        step = report[0]
+        self.assertIn(
+            "run: python3 scripts/check_benchmarks.py --check",
+            step,
+            "the report must use the explicit --check form",
+        )
+        self.assertRegex(
+            step,
+            r"(?m)^\s{8}continue-on-error: true\s*$",
+            "the threshold report must not fail the build",
+        )
+        self.assertIn("non-blocking", step)
+
+    def test_harness_self_tests_block(self) -> None:
+        steps = workflow_steps(CI_WORKFLOW)
+        self_tests = [
+            s
+            for s in steps
+            if re.search(r"(?m)^\s+run:.*scripts/test_check_benchmarks\.py", s)
+        ]
+        self.assertEqual(len(self_tests), 1)
+        step = self_tests[0]
+        self.assertIn("run: python3 scripts/test_check_benchmarks.py", step)
+        self.assertNotIn("continue-on-error", step)
 
 
 if __name__ == "__main__":

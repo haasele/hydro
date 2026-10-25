@@ -47,6 +47,11 @@ jobs:
       - name: Build release
         run: cargo build --release --locked -p pyx-cli -p pyx-runtime
 
+      # Same source, four builds into different paths: fails the release if the
+      # host is not deterministic (docs/REPRODUCIBLE.md). No cargo invocation.
+      - name: Reproducibility check
+        run: ./scripts/repro_check.sh examples/modules.py
+
       - name: Package
         shell: bash
         run: |

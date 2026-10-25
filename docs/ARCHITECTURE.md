@@ -181,6 +181,9 @@ i64  pyx_closure_new(const uint8_t* wrapper, uint64_t arity,
                      const uint8_t* name, size_t name_len,
                      uint64_t capture_count, const i64* captures,
                      uint32_t flags);
+i64  pyx_cell_new(i64 value);      // mutable closure binding
+i64  pyx_cell_get(i64 cell);       // current value
+void pyx_cell_set(i64 cell, i64 value);  // publishes the GC edge
 i64  pyx_class_new(const uint8_t* name, size_t name_len, i64 base,
                    uint64_t method_count, const i64* names, const i64* funcs,
                    const i64* kinds,
@@ -392,12 +395,18 @@ built-in kinds), so the fallback never matches a user handler.
   access to outer names inside a lambda is a diagnostic.
 - Builtins are values as well: `f = int`, `map(f, xs)` etc. materialize
   a `FunctionBody::Builtin` object via `pyx_builtin_function`.
-- **Closures are by value** (Phase 2.28): `def inner` inside a function
-  creates `pyx_closure_new` with the *current values* of the referenced
-  locals. Later changes of the outer variable are invisible to an already
-  created closure; every execution creates its own captures (also in
-  loops). Captures are passed as leading parameters to the wrapper
-  (`capture_count` in the signature). Recursive nested functions and
+- **Closures capture cells for mutable bindings** (Phase 2.39): a local
+  that a nested function reads and that is assigned here (or through
+  `nonlocal`) lives in a heap `Cell` (`pyx_cell_new/get/set`). The outer
+  function reads and writes through the cell and the closure captures the
+  cell value, so mutations are shared in both directions. Read-only
+  captures keep by-value semantics, and a loop creates a fresh cell per
+  iteration for every cell the body mutates and a closure created in that
+  body captures (closures created outside keep the enclosing cell).
+  `nonlocal name` resolves to
+  the nearest enclosing binding; a missing or conflicting binding is a
+  compile diagnostic. Captures are passed as leading parameters to the
+  wrapper (`capture_count` in the signature). Recursive nested functions and
   closures in lambdas are diagnosed.
 - **Classes** (Phase 2.27): `class Name(Base):` with at most one simple
   base. Allowed are methods, `__init__`, class attributes (`x = value`,
@@ -1087,9 +1096,10 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   by the first base (additional bases are ignored). General dynamic calls
   combine at most one `*` operand; `*args` plus `**kwargs` together still
   need a deferred call, while class constructors can bind `**mapping`.
-- **Closures:** by value at definition time; recursive nested
-  functions and closures in lambdas are diagnostics. No cell/mutable
-  capture.
+- **Closures:** captured bindings are by value unless the outer function
+  mutates them (or a descendant declares `nonlocal`), in which case the
+  binding lives in a traced heap cell shared with every closure; recursive
+  nested functions and closures in lambdas are diagnostics.
 - **Generators/async:** real lazy generators (stackful fibers) and
   coroutines with a cooperative event loop. Open: async generators, async
   comprehensions and `asyncio` beyond `run`/`sleep`/`gather`; generator

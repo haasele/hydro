@@ -672,7 +672,7 @@ enum Check {
 /// End column of expressions whose source spelling has a known width.
 fn simple_expr_end(expr: &HExpr, f: &HFunction) -> Option<u32> {
     let width = match &expr.kind {
-        HExprKind::Local(id) => {
+        HExprKind::Local(id) | HExprKind::CellGet(id) => {
             let name = &f.locals.get(*id as usize)?.name;
             if name.starts_with('$') {
                 return None;
@@ -852,6 +852,33 @@ impl<'a> Checker<'a> {
                     if (expected == Type::None) != (got == Type::None) {
                         // `x = None` followed by a value (or vice versa) is a
                         // common optional/dynamic pattern; widen the slot.
+                        self.force_any(local_ty);
+                        self.force_any(value.ty);
+                    } else {
+                        let name = &f.locals[*target as usize].name;
+                        self.error(
+                            stmt.line,
+                            stmt.col,
+                            format!(
+                                "cannot assign type {} to variable '{}' of type {}",
+                                got.name(),
+                                name,
+                                expected.name()
+                            ),
+                        );
+                    }
+                }
+            }
+            HStmtKind::CellInit { value, .. } => {
+                if let Some(value) = value {
+                    self.check_expr(value, f);
+                }
+            }
+            HStmtKind::CellAssign { target, value } => {
+                self.check_expr(value, f);
+                let local_ty = f.locals[*target as usize].ty;
+                if let Err((expected, got)) = self.inf.unify(local_ty, value.ty) {
+                    if (expected == Type::None) != (got == Type::None) {
                         self.force_any(local_ty);
                         self.force_any(value.ty);
                     } else {
@@ -1147,7 +1174,9 @@ impl<'a> Checker<'a> {
                 // namespace raises at runtime, so it is not a compile error.
                 for target in targets {
                     match target {
-                        HDeleteTarget::Name(_) | HDeleteTarget::Global { .. } => {}
+                        HDeleteTarget::Name(_)
+                        | HDeleteTarget::Cell(_)
+                        | HDeleteTarget::Global { .. } => {}
                         HDeleteTarget::Attr { object, .. } => self.check_expr(object, f),
                         HDeleteTarget::Subscript { object, index } => {
                             self.check_expr(object, f);
@@ -1247,7 +1276,7 @@ impl<'a> Checker<'a> {
     /// expressions; nested targets recurse.
     fn check_unpack_target(&mut self, target: &HUnpackTarget, f: &HFunction) {
         match target {
-            HUnpackTarget::Name(id) => {
+            HUnpackTarget::Name(id) | HUnpackTarget::Cell(id) => {
                 let ty = f.locals[*id as usize].ty;
                 let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
             }
@@ -1408,6 +1437,18 @@ impl<'a> Checker<'a> {
             HExprKind::Local(id) => {
                 let local_ty = f.locals[*id as usize].ty;
                 let _ = self.inf.unify(local_ty, expr.ty);
+            }
+            HExprKind::CellGet(id) => {
+                let local_ty = f.locals[*id as usize].ty;
+                let _ = self.inf.unify(local_ty, expr.ty);
+            }
+            HExprKind::CellSet { target, value } => {
+                self.check_expr(value, f);
+                let slot = f.locals[*target as usize].ty;
+                if matches!(self.inf.resolve(slot), Ty::Var(_)) {
+                    let _ = self.inf.unify(slot, Ty::Concrete(Type::Any));
+                }
+                let _ = self.inf.unify(expr.ty, value.ty);
             }
             HExprKind::NamedExpr { target, value } => {
                 self.check_expr(value, f);
@@ -3496,6 +3537,14 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
             target: *target,
             value: emit_expr(value, inf),
         },
+        HStmtKind::CellInit { target, value } => StmtKind::CellInit {
+            target: *target,
+            value: value.as_ref().map(|value| emit_expr(value, inf)),
+        },
+        HStmtKind::CellAssign { target, value } => StmtKind::CellAssign {
+            target: *target,
+            value: emit_expr(value, inf),
+        },
         HStmtKind::GlobalSet {
             module,
             name,
@@ -3656,6 +3705,7 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
                 .iter()
                 .map(|target| match target {
                     HDeleteTarget::Name(local) => DeleteTarget::Name(*local),
+                    HDeleteTarget::Cell(local) => DeleteTarget::Cell(*local),
                     HDeleteTarget::Global { module, name } => DeleteTarget::Global {
                         module: module.clone(),
                         name: name.clone(),
@@ -3694,6 +3744,7 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
                 .map(|h| IrHandler {
                     exc: h.exc,
                     binding: h.binding,
+                    binding_cell: h.binding_cell,
                     body: emit_stmts(&h.body, inf),
                 })
                 .collect(),
@@ -3707,6 +3758,7 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
 fn emit_unpack_target(target: &HUnpackTarget, inf: &mut Infer) -> UnpackTarget {
     match target {
         HUnpackTarget::Name(id) => UnpackTarget::Name(*id),
+        HUnpackTarget::Cell(id) => UnpackTarget::Cell(*id),
         HUnpackTarget::Attr { object, name } => UnpackTarget::Attr {
             object: emit_expr(object, inf),
             name: name.clone(),
@@ -3741,6 +3793,11 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
     let kind = match &expr.kind {
         HExprKind::Const(c) => ExprKind::Const(c.clone()),
         HExprKind::Local(id) => ExprKind::Local(*id),
+        HExprKind::CellGet(id) => ExprKind::CellGet(*id),
+        HExprKind::CellSet { target, value } => ExprKind::CellSet {
+            target: *target,
+            value: Box::new(emit_expr(value, inf)),
+        },
         HExprKind::NamedExpr { target, value } => ExprKind::NamedExpr {
             target: *target,
             value: Box::new(emit_expr(value, inf)),

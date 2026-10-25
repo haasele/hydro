@@ -110,6 +110,8 @@ pub struct HLocal {
 #[derive(Clone, Debug)]
 pub enum HUnpackTarget {
     Name(LocalId),
+    /// Bind through the closure cell stored in a local slot.
+    Cell(LocalId),
     Attr {
         object: HExpr,
         name: String,
@@ -138,6 +140,8 @@ pub struct HStmt {
 #[derive(Clone, Debug)]
 pub enum HDeleteTarget {
     Name(LocalId),
+    /// Clear the closure cell held by a local slot to `None`.
+    Cell(LocalId),
     /// Module-level binding in the runtime global table (`global name` in a
     /// function, or the mirror of a module-body assignment).
     Global {
@@ -166,6 +170,16 @@ pub enum HDeleteTarget {
 pub enum HStmtKind {
     Expr(HExpr),
     Assign {
+        target: LocalId,
+        value: HExpr,
+    },
+    /// Allocate a closure cell holding `value` (or `None`) in `target`.
+    CellInit {
+        target: LocalId,
+        value: Option<HExpr>,
+    },
+    /// Store `value` through the closure cell held by `target`.
+    CellAssign {
         target: LocalId,
         value: HExpr,
     },
@@ -296,6 +310,8 @@ pub struct HHandler {
     /// handler per type by the lowering pass.
     pub exc: Option<ExcKind>,
     pub binding: Option<LocalId>,
+    /// The binding local holds a closure cell; store the exception through it.
+    pub binding_cell: bool,
     pub body: Vec<HStmt>,
 }
 
@@ -335,6 +351,14 @@ type LoweredCallArguments = (Vec<HExpr>, Option<HExpr>, Vec<(String, HExpr)>);
 pub enum HExprKind {
     Const(Const),
     Local(LocalId),
+    /// Read through the closure cell stored in a local slot.
+    CellGet(LocalId),
+    /// Store `value` through a closure cell and yield the stored value
+    /// (assignment expressions targeting a captured mutable local).
+    CellSet {
+        target: LocalId,
+        value: Box<HExpr>,
+    },
     /// `(target := value)`: evaluate `value`, store it in the local `target`
     /// (a slot of the enclosing function, never a comprehension target) and
     /// yield the value.
@@ -664,10 +688,26 @@ struct ClassPlan {
     attributes: Vec<(String, usize)>,
 }
 
+/// Cell analysis for one function, computed from its AST before the body is
+/// lowered. Names are resolved to local ids once the body's slots exist.
+#[derive(Default)]
+struct CellPlan {
+    /// Locals this function owns a cell for: captured by a nested function and
+    /// mutated here (or through `nonlocal`).
+    owned: HashSet<String>,
+    /// Capture parameters that already hold an enclosing function's cell.
+    aliases: HashSet<String>,
+}
+
 struct FuncState {
     fid: FunctionId,
     is_module: bool,
     locals: HashMap<String, LocalId>,
+    /// Locals whose slot holds a heap cell; reads and writes go through the
+    /// cell ABI.
+    cells: HashSet<LocalId>,
+    /// Capture locals holding an enclosing function's cell (no fresh cell).
+    cell_aliases: HashSet<LocalId>,
     /// Names currently shadowed by a comprehension target, with the number of
     /// active bindings (nested comprehensions can bind the same name). An
     /// assignment expression may not rebind one of them.
@@ -695,6 +735,10 @@ impl FuncState {
 
     fn is_global(&self, name: &str) -> bool {
         self.globals.contains(name)
+    }
+
+    fn is_cell(&self, local: LocalId) -> bool {
+        self.cells.contains(&local)
     }
 }
 
@@ -1187,6 +1231,11 @@ pub struct Lowerer<'a> {
     /// Next synthetic `$multiN` local holding the right-hand side of a
     /// chained assignment so it is evaluated exactly once.
     multi_counter: u32,
+    /// Next synthetic `$forN` local receiving a loop target that is a cell.
+    for_counter: u32,
+    /// Per-function cell analysis: locals whose binding lives in a heap cell
+    /// and capture parameters that alias an enclosing cell.
+    cell_plans: HashMap<FunctionId, CellPlan>,
     /// Registered class headers, keyed by the class statement's start offset.
     /// Method signatures exist before any body is lowered; the key lets
     /// `lower_stmt` find the plan without threading it through every call.
@@ -1271,6 +1320,8 @@ impl<'a> Lowerer<'a> {
             aug_counter: 0,
             cmp_counter: 0,
             multi_counter: 0,
+            for_counter: 0,
+            cell_plans: HashMap::new(),
             class_defs: HashMap::new(),
             class_names: HashSet::new(),
             imported_classes: HashMap::new(),
@@ -1518,6 +1569,8 @@ impl<'a> Lowerer<'a> {
             fid: 0,
             is_module: true,
             locals: module_locals,
+            cells: HashSet::new(),
+            cell_aliases: HashSet::new(),
             comp_shadowed: HashMap::new(),
             globals: HashSet::new(),
             loop_depth: 0,
@@ -2683,18 +2736,20 @@ impl<'a> Lowerer<'a> {
         global: bool,
         decorator_kind: Option<MethodKind>,
     ) -> Option<FunctionId> {
-        self.create_function_with_captures(decl, name, global, &[], decorator_kind)
+        self.create_function_with_captures(decl, name, global, &[], &[], decorator_kind)
     }
 
     /// Lower a function signature with optional leading closure-capture
     /// parameters. Captures are typed `Any` and become locals too, so the
-    /// body resolves their names exactly like parameters.
+    /// body resolves their names exactly like parameters. `capture_cells`
+    /// marks the captures whose enclosing local is a cell.
     fn create_function_with_captures(
         &mut self,
         decl: &FnDecl<'_>,
         name: String,
         global: bool,
         captures: &[String],
+        capture_cells: &[bool],
         decorator_kind: Option<MethodKind>,
     ) -> Option<FunctionId> {
         // Method decorators were classified by `create_method_function`, which
@@ -2711,10 +2766,14 @@ impl<'a> Lowerer<'a> {
         let mut params = Vec::new();
         let mut locals = Vec::new();
         let mut seen = HashSet::new();
+        let mut aliases: HashSet<String> = HashSet::new();
 
-        for capture in captures {
+        for (index, capture) in captures.iter().enumerate() {
             if !seen.insert(capture.clone()) {
                 continue;
+            }
+            if capture_cells.get(index).copied().unwrap_or(false) {
+                aliases.insert(capture.clone());
             }
             let local = locals.len() as LocalId;
             let ty = Ty::Concrete(Type::Any);
@@ -2808,6 +2867,36 @@ impl<'a> Lowerer<'a> {
 
         let (line, col) = self.span(decl.range);
         let id = self.functions.len() as FunctionId;
+
+        // Cell analysis: a local becomes a cell when a nested function
+        // captures it and this function (or a descendant's `nonlocal`)
+        // mutates it. Loop targets bind a fresh iteration value and only count
+        // as mutations when they are also assigned in the loop body.
+        let mut nonlocal_decls = Vec::new();
+        collect_scope_nonlocals(decl.body, &mut nonlocal_decls);
+        let nonlocal_names: HashSet<String> =
+            nonlocal_decls.into_iter().map(|(name, _)| name).collect();
+        let mut scope_globals = HashSet::new();
+        collect_scope_globals(decl.body, &mut scope_globals);
+        let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+        let mut assigned = Vec::new();
+        collect_names(decl.body, &mut assigned, true);
+        bound.extend(assigned);
+        collect_import_bindings(decl.body, &mut bound);
+        bound.retain(|name| !scope_globals.contains(name) && !nonlocal_names.contains(name));
+        let mut mutated = HashSet::new();
+        collect_scope_mutations(decl.body, &mut mutated);
+        collect_nested_nonlocals(decl.body, &mut mutated);
+        let mut needed = HashSet::new();
+        collect_nested_needed(decl.body, &mut needed);
+        let owned = bound
+            .iter()
+            .filter(|name| needed.contains(*name) && mutated.contains(*name))
+            .filter(|name| !aliases.contains(*name))
+            .cloned()
+            .collect();
+        self.cell_plans.insert(id, CellPlan { owned, aliases });
+
         self.functions.push(HFunction {
             name: name.clone(),
             params,
@@ -3311,6 +3400,8 @@ impl<'a> Lowerer<'a> {
             fid: id,
             is_module: false,
             locals: HashMap::new(),
+            cells: HashSet::new(),
+            cell_aliases: HashSet::new(),
             comp_shadowed: HashMap::new(),
             globals: HashSet::new(),
             loop_depth: 0,
@@ -3457,6 +3548,8 @@ impl<'a> Lowerer<'a> {
             fid: 0,
             is_module: true,
             locals: HashMap::new(),
+            cells: HashSet::new(),
+            cell_aliases: HashSet::new(),
             comp_shadowed: HashMap::new(),
             globals: HashSet::new(),
             loop_depth: 0,
@@ -3580,15 +3673,22 @@ impl<'a> Lowerer<'a> {
         collect_names(body, &mut names, true);
         let mut globals = HashSet::new();
         collect_scope_globals(body, &mut globals);
+        let mut nonlocals = Vec::new();
+        collect_scope_nonlocals(body, &mut nonlocals);
+        let nonlocal_names: HashSet<String> =
+            nonlocals.iter().map(|(name, _)| name.clone()).collect();
 
         let mut local_map: HashMap<String, LocalId> = HashMap::new();
         for (idx, local) in self.functions[fid as usize].locals.iter().enumerate() {
             local_map.insert(local.name.clone(), idx as LocalId);
         }
         for name in names {
-            // A name declared `global` refers to the runtime global table; it
-            // never gets a local slot.
-            if local_map.contains_key(&name) || globals.contains(&name) {
+            // A name declared `global` refers to the runtime global table and
+            // a `nonlocal` name to an enclosing scope; neither gets a slot.
+            if local_map.contains_key(&name)
+                || globals.contains(&name)
+                || nonlocal_names.contains(&name)
+            {
                 continue;
             }
             let id = self.functions[fid as usize].locals.len() as LocalId;
@@ -3600,11 +3700,29 @@ impl<'a> Lowerer<'a> {
             local_map.insert(name, id);
         }
 
+        let plan = self.cell_plans.remove(&fid).unwrap_or_default();
+        let cell_aliases: HashSet<LocalId> = plan
+            .aliases
+            .iter()
+            .filter_map(|name| local_map.get(name).copied())
+            .collect();
+        let cells: HashSet<LocalId> = plan
+            .owned
+            .iter()
+            .filter_map(|name| local_map.get(name).copied())
+            .chain(cell_aliases.iter().copied())
+            .collect();
+        let param_ids: HashSet<LocalId> = {
+            let function = &self.functions[fid as usize];
+            function.params.iter().map(|param| param.local).collect()
+        };
         let function = &self.functions[fid as usize];
         let mut fs = FuncState {
             fid,
             is_module: false,
             locals: local_map,
+            cells,
+            cell_aliases,
             comp_shadowed: HashMap::new(),
             globals,
             loop_depth: 0,
@@ -3613,10 +3731,74 @@ impl<'a> Lowerer<'a> {
             is_generator: function.is_generator,
             genexp_frame: false,
         };
+
+        // `nonlocal` must name a binding captured from an enclosing function.
+        for (name, range) in &nonlocals {
+            if fs.is_global(name) {
+                self.error_at_code(
+                    *range,
+                    codes::DECL,
+                    format!("name '{name}' is nonlocal and global"),
+                );
+            } else {
+                match fs.lookup(name) {
+                    Some(local) if fs.cell_aliases.contains(&local) => {}
+                    Some(_) => self.error_at_code(
+                        *range,
+                        codes::DECL,
+                        format!("name '{name}' is assigned to before nonlocal declaration"),
+                    ),
+                    None => {
+                        self.error_at_code(
+                            *range,
+                            codes::NAME,
+                            format!("no binding for nonlocal '{name}' found"),
+                        );
+                        // Give the invalid declaration a local slot so later
+                        // references do not cascade into name diagnostics.
+                        let id = self.functions[fid as usize].locals.len() as LocalId;
+                        let ty = self.infer.fresh();
+                        self.functions[fid as usize].locals.push(HLocal {
+                            name: name.clone(),
+                            ty,
+                        });
+                        fs.locals.insert(name.clone(), id);
+                    }
+                }
+            }
+        }
+
         let saved_method = self.current_class_method.clone();
         self.current_class_method = self.class_methods.get(&fid).cloned();
-        let result = self.lower_block(body, &mut fs);
+        let mut result = self.lower_block(body, &mut fs);
         self.current_class_method = saved_method;
+
+        // Cells are created once at function entry. Parameter cells start
+        // with their argument; every other cell starts unbound (`None`).
+        let (line, col) = {
+            let function = &self.functions[fid as usize];
+            (function.line, function.col)
+        };
+        let mut owned: Vec<LocalId> = fs.cells.difference(&fs.cell_aliases).copied().collect();
+        owned.sort_unstable();
+        if !owned.is_empty() {
+            let mut init = Vec::with_capacity(owned.len());
+            for target in owned {
+                let value = param_ids.contains(&target).then_some(HExpr {
+                    kind: HExprKind::Local(target),
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                });
+                init.push(HStmt {
+                    kind: HStmtKind::CellInit { target, value },
+                    line,
+                    col,
+                });
+            }
+            init.append(&mut result);
+            result = init;
+        }
         result
     }
 
@@ -3625,9 +3807,10 @@ impl<'a> Lowerer<'a> {
     /// The nested function is appended to the function table with its
     /// captured names as leading `Any` parameters. The enclosing function
     /// stores the closure value in the nested function's local slot, so later
-    /// references use the ordinary local/indirect-call path. Captures are
-    /// evaluated (copied) at the definition site; later mutation of the
-    /// enclosing local does not affect an existing closure.
+    /// references use the ordinary local/indirect-call path. A captured local
+    /// whose binding is a cell passes the cell itself, so reads and `nonlocal`
+    /// writes observe the enclosing function's current value; other captures
+    /// keep by-value semantics.
     fn lower_nested_function(
         &mut self,
         decl: FnDecl<'_>,
@@ -3662,6 +3845,13 @@ impl<'a> Lowerer<'a> {
         // `global` names resolve through the runtime global table, never
         // through an enclosing local.
         collect_scope_globals(decl.body, &mut nested_locals);
+        // `nonlocal` names resolve to an enclosing function's binding even
+        // when the nested body only assigns to them.
+        let mut nested_nonlocals = Vec::new();
+        collect_scope_nonlocals(decl.body, &mut nested_nonlocals);
+        for (nonlocal_name, _) in nested_nonlocals {
+            nested_locals.remove(&nonlocal_name);
+        }
         for arg in decl
             .args
             .posonlyargs
@@ -3692,6 +3882,7 @@ impl<'a> Lowerer<'a> {
         // Deterministic capture order: first use in the nested body.
         let mut capture_names = Vec::new();
         let mut capture_locals = Vec::new();
+        let mut capture_cells = Vec::new();
         for loaded_name in &loaded {
             if nested_locals.contains(loaded_name) {
                 continue;
@@ -3699,13 +3890,20 @@ impl<'a> Lowerer<'a> {
             if let Some(local) = fs.lookup(loaded_name) {
                 capture_names.push(loaded_name.clone());
                 capture_locals.push(local);
+                capture_cells.push(fs.is_cell(local));
             }
         }
 
         let outer_name = self.functions[fs.fid as usize].name.clone();
         let display = format!("{outer_name}.{name}");
-        let fid =
-            self.create_function_with_captures(&decl, display, false, &capture_names, None)?;
+        let fid = self.create_function_with_captures(
+            &decl,
+            display,
+            false,
+            &capture_names,
+            &capture_cells,
+            None,
+        )?;
         let body = self.lower_function_body(fid, decl.body);
         self.functions[fid as usize].body = body;
 
@@ -3917,10 +4115,31 @@ impl<'a> Lowerer<'a> {
                         return None;
                     };
                     let value = self.expr(&s.value, fs);
-                    HStmtKind::AugAssign {
-                        target: local,
-                        op,
-                        value,
+                    if fs.is_cell(local) {
+                        // Read and write both go through the shared cell so a
+                        // nested `nonlocal` writer sees the update.
+                        let ty = self.infer.fresh();
+                        let lhs = self.local_read(fs, local, ty, line, col);
+                        let value = HExpr {
+                            kind: HExprKind::Bin {
+                                op,
+                                lhs: Box::new(lhs),
+                                rhs: Box::new(value),
+                            },
+                            ty: self.infer.fresh(),
+                            line,
+                            col,
+                        };
+                        HStmtKind::CellAssign {
+                            target: local,
+                            value,
+                        }
+                    } else {
+                        HStmtKind::AugAssign {
+                            target: local,
+                            op,
+                            value,
+                        }
                     }
                 }
             }
@@ -3992,7 +4211,11 @@ impl<'a> Lowerer<'a> {
                     fs.loop_depth += 1;
                     let body = self.lower_block(&s.body, fs);
                     fs.loop_depth -= 1;
-                    body
+                    // Each iteration rebinds mutated cells, so closures made
+                    // in the body capture that iteration's binding.
+                    let mut inits = self.loop_cell_inits(fs, &s.body, None, line, col);
+                    inits.extend(body);
+                    inits
                 };
                 // `else` is not part of the loop: `break` and `continue` in it
                 // bind to an enclosing loop, so it is lowered after the loop
@@ -4142,7 +4365,15 @@ impl<'a> Lowerer<'a> {
                 return None;
             }
             ast::Stmt::Nonlocal(s) => {
-                self.error_at(s.range, "nonlocal is not supported in Phase 1");
+                // Validated when the enclosing function body's state was
+                // built; the declaration itself emits no code.
+                if fs.is_module {
+                    self.error_at_code(
+                        s.range,
+                        codes::SYNTAX,
+                        "nonlocal declaration not allowed at module level",
+                    );
+                }
                 return None;
             }
             ast::Stmt::Match(s) => {
@@ -4184,9 +4415,16 @@ impl<'a> Lowerer<'a> {
                         value,
                     })
                 } else if let Some(local) = fs.lookup(name_text) {
-                    Some(HStmtKind::Assign {
-                        target: local,
-                        value,
+                    Some(if fs.is_cell(local) {
+                        HStmtKind::CellAssign {
+                            target: local,
+                            value,
+                        }
+                    } else {
+                        HStmtKind::Assign {
+                            target: local,
+                            value,
+                        }
                     })
                 } else {
                     self.error_name(
@@ -4285,7 +4523,11 @@ impl<'a> Lowerer<'a> {
                         );
                         return None;
                     };
-                    targets.push(HDeleteTarget::Name(local));
+                    targets.push(if fs.is_cell(local) {
+                        HDeleteTarget::Cell(local)
+                    } else {
+                        HDeleteTarget::Name(local)
+                    });
                     // A module-body name is mirrored into the runtime global
                     // table (see `push_lowered_stmt`), so a later read from a
                     // function must miss it too.
@@ -4501,7 +4743,11 @@ impl<'a> Lowerer<'a> {
     fn unpack_single(&mut self, elem: &ast::Expr, fs: &mut FuncState) -> Option<HUnpackTarget> {
         match elem {
             ast::Expr::Name(n) => match fs.lookup(n.id.as_str()) {
-                Some(local) => Some(HUnpackTarget::Name(local)),
+                Some(local) => Some(if fs.is_cell(local) {
+                    HUnpackTarget::Cell(local)
+                } else {
+                    HUnpackTarget::Name(local)
+                }),
                 None => {
                     self.error_name(
                         n.range,
@@ -4562,6 +4808,73 @@ impl<'a> Lowerer<'a> {
             col,
         };
         (var, value)
+    }
+
+    /// Create the hidden `$forN` local that receives the value bound by a
+    /// `for` statement whose target is a closure cell.
+    fn for_temp(&mut self, fs: &mut FuncState, range: TextRange) -> (LocalId, HExpr) {
+        let name = format!("$for{}", self.for_counter);
+        self.for_counter += 1;
+        let var = self.functions[fs.fid as usize].locals.len() as LocalId;
+        self.functions[fs.fid as usize].locals.push(HLocal {
+            name: name.clone(),
+            ty: Ty::Concrete(Type::Any),
+        });
+        fs.locals.insert(name, var);
+        let (line, col) = self.span(range);
+        let value = HExpr {
+            kind: HExprKind::Local(var),
+            ty: self.infer.fresh(),
+            line,
+            col,
+        };
+        (var, value)
+    }
+
+    /// Fresh cells created at the top of one loop iteration for every function
+    /// cell the iteration mutates (including a cell used as the loop target).
+    /// Closures created inside the iteration capture that iteration's cell.
+    fn loop_cell_inits(
+        &mut self,
+        fs: &FuncState,
+        body: &[ast::Stmt],
+        target_expr: Option<&ast::Expr>,
+        line: u32,
+        col: u32,
+    ) -> Vec<HStmt> {
+        let mut mutated = HashSet::new();
+        collect_scope_mutations(body, &mut mutated);
+        if let Some(target) = target_expr {
+            let mut names = Vec::new();
+            collect_target_names(target, &mut names);
+            mutated.extend(names);
+        }
+        // Only cells captured by a closure defined inside this loop need a
+        // per-iteration binding; a closure created outside the loop must keep
+        // observing the enclosing function's single cell.
+        let mut captured_here = HashSet::new();
+        collect_nested_needed(body, &mut captured_here);
+        let mut cells: Vec<LocalId> = mutated
+            .iter()
+            .filter(|name| captured_here.contains(*name))
+            .filter_map(|name| fs.lookup(name))
+            // Alias cells belong to an enclosing function: a fresh cell here
+            // would break the shared binding.
+            .filter(|local| fs.is_cell(*local) && !fs.cell_aliases.contains(local))
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        cells
+            .into_iter()
+            .map(|target| HStmt {
+                kind: HStmtKind::CellInit {
+                    target,
+                    value: None,
+                },
+                line,
+                col,
+            })
+            .collect()
     }
 
     /// Create the hidden `$withN` local that holds a `with` context object so
@@ -5047,12 +5360,14 @@ impl<'a> Lowerer<'a> {
         walk_free_expr(&c.elt, &bound, &mut free, &mut seen);
         let mut capture_names = Vec::new();
         let mut captures = Vec::new();
+        let mut capture_cells = Vec::new();
         let mut globals = HashSet::new();
         for name in free {
             if fs.is_global(&name) {
                 globals.insert(name);
             } else if let Some(local) = fs.lookup(&name) {
                 capture_names.push(name);
+                capture_cells.push(fs.is_cell(local));
                 captures.push(HExpr {
                     kind: HExprKind::Local(local),
                     ty: Ty::Concrete(Type::Any),
@@ -5068,6 +5383,7 @@ impl<'a> Lowerer<'a> {
                 // A class body has no frame of its own: the attribute value is
                 // evaluated where the generator is created.
                 capture_names.push(name);
+                capture_cells.push(false);
                 captures.push(value);
             }
         }
@@ -5095,8 +5411,12 @@ impl<'a> Lowerer<'a> {
             local
         };
         let iter_local = push_param("$geniter", &mut params, &mut locals);
-        for name in &capture_names {
-            push_param(name, &mut params, &mut locals);
+        let mut genexp_cells = HashSet::new();
+        for (index, name) in capture_names.iter().enumerate() {
+            let local = push_param(name, &mut params, &mut locals);
+            if capture_cells.get(index).copied().unwrap_or(false) {
+                genexp_cells.insert(local);
+            }
         }
         let (fid_line, fid_col) = self.span(c.range);
         self.functions.push(HFunction {
@@ -5121,6 +5441,8 @@ impl<'a> Lowerer<'a> {
                 .enumerate()
                 .map(|(index, local)| (local.name.clone(), index as LocalId))
                 .collect(),
+            cells: genexp_cells.clone(),
+            cell_aliases: genexp_cells,
             comp_shadowed: HashMap::new(),
             globals,
             loop_depth: 0,
@@ -5365,12 +5687,20 @@ impl<'a> Lowerer<'a> {
 
         let Some(call) = range_call else {
             let iterable = self.expr(iter, fs);
-            let (var, body) = match (var, unpack_targets) {
-                (Some(var), _) => {
+            let (var, cell_target, mut lowered_body) = match (var, unpack_targets) {
+                (Some(user_var), _) => {
+                    // A cell target is bound through a hidden slot: the cell
+                    // itself must stay in the user local.
+                    let (var, cell_assign) = if fs.is_cell(user_var) {
+                        let (temp, temp_expr) = self.for_temp(fs, target_expr.range());
+                        (temp, Some((user_var, temp_expr)))
+                    } else {
+                        (user_var, None)
+                    };
                     fs.loop_depth += 1;
                     let body = self.lower_block(loop_body, fs);
                     fs.loop_depth -= 1;
-                    (var, body)
+                    (var, cell_assign, body)
                 }
                 (None, Some(targets)) => {
                     // `for a, b in xs` desugars to a loop over a hidden local
@@ -5386,10 +5716,19 @@ impl<'a> Lowerer<'a> {
                     });
                     body.extend(self.lower_block(loop_body, fs));
                     fs.loop_depth -= 1;
-                    (var, body)
+                    (var, None, body)
                 }
                 (None, None) => return None,
             };
+            let mut body = self.loop_cell_inits(fs, loop_body, Some(target_expr), line, col);
+            if let Some((target, value)) = cell_target {
+                body.push(HStmt {
+                    kind: HStmtKind::CellAssign { target, value },
+                    line,
+                    col,
+                });
+            }
+            body.append(&mut lowered_body);
             // `else` runs after normal exhaustion only; it is outside the
             // loop, so `break`/`continue` in it bind to an enclosing loop.
             let else_body = self.lower_block(orelse, fs);
@@ -5413,6 +5752,12 @@ impl<'a> Lowerer<'a> {
             return None;
         }
         let var = var.expect("name target validated above");
+        let (var, cell_target) = if fs.is_cell(var) {
+            let (temp, temp_expr) = self.for_temp(fs, target_expr.range());
+            (temp, Some((var, temp_expr)))
+        } else {
+            (var, None)
+        };
 
         if fs.lookup("range").is_some() {
             self.error_at_code(
@@ -5467,8 +5812,17 @@ impl<'a> Lowerer<'a> {
         };
 
         fs.loop_depth += 1;
-        let body = self.lower_block(loop_body, fs);
+        let mut lowered_body = self.lower_block(loop_body, fs);
         fs.loop_depth -= 1;
+        let mut body = self.loop_cell_inits(fs, loop_body, Some(target_expr), line, col);
+        if let Some((target, value)) = cell_target {
+            body.push(HStmt {
+                kind: HStmtKind::CellAssign { target, value },
+                line,
+                col,
+            });
+        }
+        body.append(&mut lowered_body);
         // As for `ForEach`, `else` is outside the loop scope.
         let else_body = self.lower_block(orelse, fs);
         Some(HStmt {
@@ -5804,12 +6158,14 @@ impl<'a> Lowerer<'a> {
                 },
                 None => None,
             };
+            let binding_cell = binding.is_some_and(|local| fs.is_cell(local));
             // Lower the handler body once; tuple handlers share it.
             let handler_body = self.lower_block(&h.body, fs);
             if is_bare {
                 handlers.push(HHandler {
                     exc: None,
                     binding,
+                    binding_cell,
                     body: handler_body,
                 });
             } else {
@@ -5817,6 +6173,7 @@ impl<'a> Lowerer<'a> {
                     handlers.push(HHandler {
                         exc: Some(kind),
                         binding,
+                        binding_cell,
                         body: handler_body.clone(),
                     });
                 }
@@ -5916,9 +6273,16 @@ impl<'a> Lowerer<'a> {
                 }),
                 Some(ast::Expr::Name(name)) => match fs.lookup(name.id.as_str()) {
                     Some(local) => inner_body.push(HStmt {
-                        kind: HStmtKind::Assign {
-                            target: local,
-                            value: enter,
+                        kind: if fs.is_cell(local) {
+                            HStmtKind::CellAssign {
+                                target: local,
+                                value: enter,
+                            }
+                        } else {
+                            HStmtKind::Assign {
+                                target: local,
+                                value: enter,
+                            }
                         },
                         line: item_line,
                         col: item_col,
@@ -6003,6 +6367,22 @@ impl<'a> Lowerer<'a> {
     // Expressions
     // ------------------------------------------------------------------
 
+    /// Read a local slot, through its closure cell when the frontend lowered
+    /// the binding as a cell.
+    fn local_read(&self, fs: &FuncState, local: LocalId, ty: Ty, line: u32, col: u32) -> HExpr {
+        let kind = if fs.is_cell(local) {
+            HExprKind::CellGet(local)
+        } else {
+            HExprKind::Local(local)
+        };
+        HExpr {
+            kind,
+            ty,
+            line,
+            col,
+        }
+    }
+
     fn expr(&mut self, e: &ast::Expr, fs: &mut FuncState) -> HExpr {
         let (line, col) = self.span(e.range());
         match e {
@@ -6011,12 +6391,7 @@ impl<'a> Lowerer<'a> {
                 let name = n.id.as_str();
                 if let Some(local) = fs.lookup(name) {
                     let ty = self.infer.fresh();
-                    HExpr {
-                        kind: HExprKind::Local(local),
-                        ty,
-                        line,
-                        col,
-                    }
+                    self.local_read(fs, local, ty, line, col)
                 } else if fs.is_global(name) {
                     // `global name`: the value lives in the runtime global
                     // table of this module.
@@ -6657,11 +7032,19 @@ impl<'a> Lowerer<'a> {
                 // local for the whole function and raises `UnboundLocalError`).
                 let value = self.expr(&n.value, fs);
                 let local = self.walrus_local(fs, name);
-                HExpr {
-                    kind: HExprKind::NamedExpr {
+                let kind = if fs.is_cell(local) {
+                    HExprKind::CellSet {
                         target: local,
                         value: Box::new(value),
-                    },
+                    }
+                } else {
+                    HExprKind::NamedExpr {
+                        target: local,
+                        value: Box::new(value),
+                    }
+                };
+                HExpr {
+                    kind,
                     ty: self.infer.fresh(),
                     line,
                     col,
@@ -6824,6 +7207,8 @@ impl<'a> Lowerer<'a> {
             fid,
             is_module: false,
             locals: local_map,
+            cells: HashSet::new(),
+            cell_aliases: HashSet::new(),
             comp_shadowed: HashMap::new(),
             globals: HashSet::new(),
             loop_depth: 0,
@@ -7796,23 +8181,15 @@ impl<'a> Lowerer<'a> {
                 Ty::Concrete(Type::Function) | Ty::Concrete(Type::Any)
             );
             if !call.keywords.is_empty() || callable {
-                let callee = HExpr {
-                    kind: HExprKind::Local(local),
-                    ty: self.infer.fresh(),
-                    line: callee_line,
-                    col: callee_col,
-                };
+                let ty = self.infer.fresh();
+                let callee = self.local_read(fs, local, ty, callee_line, callee_col);
                 let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
                     return self.error_expr(call.range);
                 };
                 return result;
             }
-            let callee = HExpr {
-                kind: HExprKind::Local(local),
-                ty: self.infer.fresh(),
-                line: callee_line,
-                col: callee_col,
-            };
+            let ty = self.infer.fresh();
+            let callee = self.local_read(fs, local, ty, callee_line, callee_col);
             let mut args = Vec::with_capacity(call.args.len());
             for arg in &call.args {
                 args.push(self.expr(arg, fs));
@@ -10240,6 +10617,286 @@ fn collect_scope_globals(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// `nonlocal` declarations of one function scope, with their source ranges.
+/// Nested `def`/`class` bodies are separate scopes and are not visited.
+fn collect_scope_nonlocals(stmts: &[ast::Stmt], out: &mut Vec<(String, TextRange)>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Nonlocal(s) => {
+                for name in &s.names {
+                    out.push((name.to_string(), s.range));
+                }
+            }
+            ast::Stmt::If(s) => {
+                collect_scope_nonlocals(&s.body, out);
+                collect_scope_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_scope_nonlocals(&s.body, out);
+                collect_scope_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_scope_nonlocals(&s.body, out);
+                collect_scope_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_scope_nonlocals(&s.body, out);
+                collect_scope_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_scope_nonlocals(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_scope_nonlocals(&handler.body, out);
+                }
+                collect_scope_nonlocals(&s.orelse, out);
+                collect_scope_nonlocals(&s.finalbody, out);
+            }
+            ast::Stmt::With(s) => collect_scope_nonlocals(&s.body, out),
+            ast::Stmt::AsyncWith(s) => collect_scope_nonlocals(&s.body, out),
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_scope_nonlocals(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Names assigned in one function scope without descending into nested
+/// functions or classes. `for` targets are skipped: they bind a fresh value
+/// per iteration, so a read-only closure capture keeps by-value semantics.
+fn collect_scope_mutations(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    let mut targets = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Assign(s) => {
+                for target in &s.targets {
+                    targets.clear();
+                    collect_target_names(target, &mut targets);
+                    out.extend(targets.iter().cloned());
+                }
+            }
+            ast::Stmt::AnnAssign(s) => {
+                if s.value.is_some() {
+                    targets.clear();
+                    collect_target_names(&s.target, &mut targets);
+                    out.extend(targets.iter().cloned());
+                }
+            }
+            ast::Stmt::AugAssign(s) => {
+                if let ast::Expr::Name(name) = &*s.target {
+                    out.insert(name.id.to_string());
+                }
+            }
+            ast::Stmt::Delete(s) => {
+                for target in &s.targets {
+                    if let ast::Expr::Name(name) = target {
+                        out.insert(name.id.to_string());
+                    }
+                }
+            }
+            ast::Stmt::If(s) => {
+                collect_scope_mutations(&s.body, out);
+                collect_scope_mutations(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_scope_mutations(&s.body, out);
+                collect_scope_mutations(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_scope_mutations(&s.body, out);
+                collect_scope_mutations(&s.orelse, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_scope_mutations(&s.body, out);
+                collect_scope_mutations(&s.orelse, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_scope_mutations(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    if let Some(name) = &handler.name {
+                        out.insert(name.to_string());
+                    }
+                    collect_scope_mutations(&handler.body, out);
+                }
+                collect_scope_mutations(&s.orelse, out);
+                collect_scope_mutations(&s.finalbody, out);
+            }
+            ast::Stmt::With(s) => {
+                for item in &s.items {
+                    if let Some(target) = &item.optional_vars {
+                        targets.clear();
+                        collect_target_names(target, &mut targets);
+                        out.extend(targets.iter().cloned());
+                    }
+                }
+                collect_scope_mutations(&s.body, out);
+            }
+            ast::Stmt::AsyncWith(s) => {
+                for item in &s.items {
+                    if let Some(target) = &item.optional_vars {
+                        targets.clear();
+                        collect_target_names(target, &mut targets);
+                        out.extend(targets.iter().cloned());
+                    }
+                }
+                collect_scope_mutations(&s.body, out);
+            }
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_scope_mutations(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Names needed by nested named functions (captures), including names their
+/// descendants read. `for`/`while`/`try`/`with` bodies are searched; nested
+/// function bodies are summarised by `function_free_names`.
+fn collect_nested_needed(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::FunctionDef(f) => {
+                out.extend(function_free_names(&f.body, f.args.as_ref()));
+            }
+            ast::Stmt::AsyncFunctionDef(f) => {
+                out.extend(function_free_names(&f.body, f.args.as_ref()));
+            }
+            ast::Stmt::If(s) => {
+                collect_nested_needed(&s.body, out);
+                collect_nested_needed(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_nested_needed(&s.body, out);
+                collect_nested_needed(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_nested_needed(&s.body, out);
+                collect_nested_needed(&s.orelse, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_nested_needed(&s.body, out);
+                collect_nested_needed(&s.orelse, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_nested_needed(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_nested_needed(&handler.body, out);
+                }
+                collect_nested_needed(&s.orelse, out);
+                collect_nested_needed(&s.finalbody, out);
+            }
+            ast::Stmt::With(s) => collect_nested_needed(&s.body, out),
+            ast::Stmt::AsyncWith(s) => collect_nested_needed(&s.body, out),
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_nested_needed(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `nonlocal` names declared by any descendant scope, used so a binding that a
+/// deeply nested function rebinds becomes a cell in every enclosing function.
+fn collect_nested_nonlocals(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::FunctionDef(f) => collect_all_nonlocals(&f.body, out),
+            ast::Stmt::AsyncFunctionDef(f) => collect_all_nonlocals(&f.body, out),
+            ast::Stmt::If(s) => {
+                collect_nested_nonlocals(&s.body, out);
+                collect_nested_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_nested_nonlocals(&s.body, out);
+                collect_nested_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_nested_nonlocals(&s.body, out);
+                collect_nested_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_nested_nonlocals(&s.body, out);
+                collect_nested_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_nested_nonlocals(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_nested_nonlocals(&handler.body, out);
+                }
+                collect_nested_nonlocals(&s.orelse, out);
+                collect_nested_nonlocals(&s.finalbody, out);
+            }
+            ast::Stmt::With(s) => collect_nested_nonlocals(&s.body, out),
+            ast::Stmt::AsyncWith(s) => collect_nested_nonlocals(&s.body, out),
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_nested_nonlocals(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every `nonlocal` name reachable from `stmts`, including nested scopes.
+fn collect_all_nonlocals(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Nonlocal(s) => {
+                for name in &s.names {
+                    out.insert(name.to_string());
+                }
+            }
+            ast::Stmt::FunctionDef(f) => collect_all_nonlocals(&f.body, out),
+            ast::Stmt::AsyncFunctionDef(f) => collect_all_nonlocals(&f.body, out),
+            ast::Stmt::ClassDef(c) => collect_all_nonlocals(&c.body, out),
+            ast::Stmt::If(s) => {
+                collect_all_nonlocals(&s.body, out);
+                collect_all_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_all_nonlocals(&s.body, out);
+                collect_all_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_all_nonlocals(&s.body, out);
+                collect_all_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_all_nonlocals(&s.body, out);
+                collect_all_nonlocals(&s.orelse, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_all_nonlocals(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_all_nonlocals(&handler.body, out);
+                }
+                collect_all_nonlocals(&s.orelse, out);
+                collect_all_nonlocals(&s.finalbody, out);
+            }
+            ast::Stmt::With(s) => collect_all_nonlocals(&s.body, out),
+            ast::Stmt::AsyncWith(s) => collect_all_nonlocals(&s.body, out),
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_all_nonlocals(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Every name declared `global` by a function or method of a module body.
 ///
 /// Such names may be assigned inside a function, so the module body must
@@ -10565,6 +11222,13 @@ fn walk_free_stmts(
                     walk_free_expr(msg, shadowed, out, seen);
                 }
             }
+            // A `nonlocal` declaration makes the name a free variable of this
+            // scope even when the body only assigns to it.
+            ast::Stmt::Nonlocal(s) => {
+                for name in &s.names {
+                    record_name_load(name.as_str(), shadowed, out, seen);
+                }
+            }
             // Named nested functions are separate scopes, but names they
             // need from *this* scope must be captured here so they remain
             // available when the inner function runs. Their own locals are
@@ -10610,8 +11274,14 @@ fn function_free_names(body: &[ast::Stmt], args: &ast::Arguments) -> Vec<String>
     // An import binds the name in this scope, so it is not a free name of the
     // enclosing function (imports are resolved through the module tables).
     collect_import_bindings(body, &mut locals);
-    // `global` names resolve through the module's global table.
+    // `global` names resolve through the module's global table, and
+    // `nonlocal` names belong to an enclosing scope.
     collect_scope_globals(body, &mut locals);
+    let mut nonlocals = Vec::new();
+    collect_scope_nonlocals(body, &mut nonlocals);
+    for (name, _) in nonlocals {
+        locals.remove(&name);
+    }
 
     let mut loads = Vec::new();
     collect_free_name_loads(body, &mut loads);
