@@ -581,10 +581,12 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "stat" | "_stat" => stat::call(function, args),
         "time" => time_call(function, args),
         "_thread" => thread_call(function, args),
+        "rich.status" => rich_status_call(function, args),
         "threading" => threading_call(function, args),
         "queue" => queue_call(function, args),
         "multiprocessing" => multiprocessing_call(function, args),
         "pickle" => pickle_call(function, args),
+        "html" => html_call(function, args),
         "json" => json_call(function, args),
         "csv" => csv_call(function, args),
         "io" | "_io" => io_call(function, args),
@@ -2080,6 +2082,134 @@ fn default_process_counter() -> &'static AtomicUsize {
     &NEXT
 }
 
+/// Base class used when a user subclasses `threading.Thread`.
+/// The subclass keeps normal user-class storage while `start`/`join`/
+/// `is_alive` delegate to a native Thread object stored on the instance.
+pub(crate) fn threading_thread_base() -> i64 {
+    let methods = vec![
+        (
+            "__init__".to_string(),
+            value::native_function_new("threading", "_threadbase_init", 4),
+        ),
+        (
+            "start".to_string(),
+            value::native_function_new("threading", "_threadbase_start", 1),
+        ),
+        (
+            "join".to_string(),
+            value::native_function_new("threading", "_threadbase_join", 2),
+        ),
+        (
+            "is_alive".to_string(),
+            value::native_function_new("threading", "_threadbase_is_alive", 1),
+        ),
+        (
+            "run".to_string(),
+            value::native_function_new("threading", "_threadbase_run", 1),
+        ),
+    ];
+    value::class_new("Thread".to_string(), NONE, methods)
+}
+
+fn threadbase_native(instance: i64) -> Option<i64> {
+    value::instance_attr(instance, "_pyx_thread")
+}
+
+fn threadbase_start(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Thread.start() missing self");
+    };
+    if threadbase_native(instance).is_some() {
+        return exc::raise_with_message(RUNTIME_ERROR, "threads can only be started once");
+    }
+    let run = crate::core::methods::getattr(instance, b"run".as_ptr(), 3);
+    if exc::pending() {
+        return NONE;
+    }
+    let thread = value::thread_new(run, Vec::new(), "Thread".to_string());
+    let result = crate::core::methods::call(thread, b"start".as_ptr(), 5, 0, std::ptr::null());
+    if exc::pending() {
+        return result;
+    }
+    value::instance_setattr(instance, "_pyx_thread".to_string(), thread);
+    NONE
+}
+
+fn threadbase_join(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Thread.join() missing self");
+    };
+    let Some(thread) = threadbase_native(instance) else {
+        return NONE;
+    };
+    crate::core::methods::call(
+        thread,
+        b"join".as_ptr(),
+        4,
+        args.len().saturating_sub(1),
+        args[1..].as_ptr(),
+    )
+}
+
+fn threadbase_is_alive(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Thread.is_alive() missing self");
+    };
+    let Some(thread) = threadbase_native(instance) else {
+        return value::FALSE;
+    };
+    crate::core::methods::call(thread, b"is_alive".as_ptr(), 8, 0, std::ptr::null())
+}
+
+/// Minimal native `rich.status` implementation.
+///
+/// `Status` is materialized as a user instance whose methods are native
+/// functions. The object stores the status text and the console; `with`
+/// protocol and update/start/stop are the parts used by report-style tools.
+fn rich_status_class() -> i64 {
+    let methods = vec![
+        (
+            "__enter__".to_string(),
+            value::native_function_new("rich.status", "_status_enter", 1),
+        ),
+        (
+            "__exit__".to_string(),
+            value::native_function_new("rich.status", "_status_exit", 4),
+        ),
+        (
+            "start".to_string(),
+            value::native_function_new("rich.status", "_status_start", 1),
+        ),
+        (
+            "stop".to_string(),
+            value::native_function_new("rich.status", "_status_stop", 1),
+        ),
+        (
+            "update".to_string(),
+            value::native_function_new("rich.status", "_status_update", 3),
+        ),
+    ];
+    value::class_new("Status".to_string(), NONE, methods)
+}
+
+fn rich_status_call(function: &str, args: &[i64]) -> i64 {
+    match function {
+        "Status" => {
+            let instance = value::instance_new(rich_status_class());
+            if let Some(&status) = args.first() {
+                value::instance_setattr(instance, "status".to_string(), status);
+            }
+            if let Some(&console) = args.get(1) {
+                value::instance_setattr(instance, "console".to_string(), console);
+            }
+            instance
+        }
+        "_status_enter" => args.first().copied().unwrap_or(NONE),
+        "_status_exit" | "_status_start" | "_status_stop" | "_status_update" => NONE,
+        _ => missing_attribute("rich.status", function),
+    }
+}
+
 fn threading_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "Thread" => {
@@ -2107,6 +2237,11 @@ fn threading_call(function: &str, args: &[i64]) -> i64 {
         "Event" => value::event_new(),
         "get_ident" => encode_int(heap::current_thread_id()),
         "active_count" => encode_int(heap::active_threads() as i64),
+        "_threadbase_init" => NONE,
+        "_threadbase_run" => NONE,
+        "_threadbase_start" => threadbase_start(args),
+        "_threadbase_join" => threadbase_join(args),
+        "_threadbase_is_alive" => threadbase_is_alive(args),
         _ => missing_attribute("threading", function),
     }
 }
@@ -2265,6 +2400,43 @@ fn csv_call(function: &str, args: &[i64]) -> i64 {
 }
 
 // -------------------------------------------------------------------------
+// html
+fn html_call(function: &str, args: &[i64]) -> i64 {
+    match function {
+        "escape" => {
+            let Some(text) = args.first().and_then(|value| value::as_str(*value)) else {
+                return exc::raise_with_message(TYPE_ERROR, "escape() argument must be str");
+            };
+            let quote = args.get(1).is_none_or(|value| value::truthy(*value));
+            let mut out = String::with_capacity(text.len());
+            for character in text.chars() {
+                match character {
+                    '&' => out.push_str("&amp;"),
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    '"' if quote => out.push_str("&quot;"),
+                    '\'' if quote => out.push_str("&#x27;"),
+                    other => out.push(other),
+                }
+            }
+            value::str_alloc(out)
+        }
+        "unescape" => {
+            let Some(text) = args.first().and_then(|value| value::as_str(*value)) else {
+                return exc::raise_with_message(TYPE_ERROR, "unescape() argument must be str");
+            };
+            value::str_alloc(
+                text.replace("&amp;", "&")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&#x27;", "'"),
+            )
+        }
+        _ => missing_attribute("html", function),
+    }
+}
+
 // json
 // -------------------------------------------------------------------------
 

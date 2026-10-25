@@ -18,7 +18,7 @@ conceptually Bun for Python. Source of truth: `PLAN.md` (strategy),
 |---|---|---|
 | P0 Foundation | largely done | CI/README/license/changelog present; Hyperfine harness open |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
-| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1369 tests, JIT+AOT |
+| P2 Runtime | **largely done; exceptions (hierarchy/tuples/raise-from), stdlib Batches A/B-native/benchmark/module values/globals, shared heap + concurrent GC + threads/processes/pool + file I/O/bytes/classes/closures/user modules/packages/site-packages + lazy generators/coroutines/event loop (no GIL)** | 1370 tests, JIT+AOT |
 | P3 Toolchain | **core present (new/init/test/fmt/lint/clean, build cache, uv passthrough)** | E2E, cache tests |
 | P4 Compatibility | **target CPython 3.14.9; P4-04a/b complete for the defined subset; official CPython test gate + import matrix established; full ABI/stdlib/ecosystem open (P4-04c…P4-12)** | `docs/C_API.md`, `docs/CPYTHON_TESTS.md`, `docs/COMPATIBILITY.md` |
 | P5 Performance | **baseline + local regression gate** | `benchmarks/pyx/results/latest.md`, `thresholds.json` |
@@ -53,37 +53,40 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   package-chain root, `PYX_SITE_PACKAGES`, the `VIRTUAL_ENV`/
   `CONDA_PREFIX` site-packages trees, then `PYTHONPATH`. Every unit loads
   once per canonical path; imported module bodies run once as initializers.
-  Nested imports are recorded and stay unloaded until the enclosing code
-  runs.
+  Nested imports are recorded; declaration-only site-packages modules that
+  are only referenced from nested blocks are preloaded after the graph is
+  complete (the entry module is moved back to the end), while executable
+  optional modules stay runtime stubs.
 - **`rich` progress:** the native `rich` implementation was removed. The
   official pure-Python `rich` distribution is resolved through the loader.
   All console/dataclass/typing compile blockers and the first runtime
   surfaces are implemented: bound native/user methods, dynamic class and
   function keyword calls (`Class(**kwargs)`, `f(*args, **kwargs)`-shaped
-  constructors), runtime-evaluated defaults, `super().__init__`-free
-  dataclass construction, `del`, loop `else`, typing aliases, and the rich
-  console/table/panel/rule rendering path (table/panel/rule output matches
-  the CPython layout in smoke tests). The default conservative GC still
-  loses live values during heavier rich rendering; with
-  `PYX_GC_THRESHOLD` raised the table/panel/rule report renders. The
-  remaining official-package blocker for `bench_all.py` is `rich.status`/
-  `Live`: native `threading.Thread` is not a class base and zero-argument
-  `super()` is unsupported (`_RefreshThread`).
-- **Import matrix:** **59/297 modules importable** (13 builtin/frozen,
-  42 pure, 4 extension; 229 `PYX0002`, 9 modules where CPython 3.14.9
+  constructors), runtime-evaluated defaults, zero-argument `super().__init__(...)`
+  dispatch to the direct base initializer, user `__getitem__`, native
+  `threading.Thread` subclass bases, `del`, loop `else`, typing aliases,
+  `html.escape/unescape`, JSON keyword compatibility, `str.format` named
+  fields, `dict.setdefault`, regex `Match` bound methods, and the rich
+  console/table/panel/rule rendering path. A native `rich.status.Status`
+  context-manager shim covers the report progress API. The default
+  conservative GC still loses live values during heavier rich rendering;
+  with `PYX_GC_THRESHOLD` raised the report renders.
+- **Import matrix:** **60/297 modules importable** (13 builtin/frozen,
+  43 pure, 4 extension; 228 `PYX0002`, 9 modules where CPython 3.14.9
   itself fails). Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **`benchmarks/bench_all.py` under PyX: not yet green.** `rich.console`,
-  `rich.table`, `rich.panel` and `rich.rule` render; the benchmark report
-  header is produced. It stops at `Console.status` (`rich.status`/`Live`,
-  native Thread subclassing + `super()`), and default-GC rich rendering
-  still exposes the conservative-root retention issue. `bench_all.py
-  --only pyx` still completes under CPython.
+- **`benchmarks/bench_all.py` under PyX: green with a raised GC threshold.**
+  `PYX_GC_THRESHOLD=100000000 PYX_SITE_PACKAGES=/usr/lib/python3.14/site-packages
+  target/release/pyx run benchmarks/bench_all.py --only pyx` exits 0,
+  builds the AOT binaries and writes `report.{md,html,txt}` +
+  `results.json`. The default GC threshold still loses live `Segment`
+  values during the final report rendering (`conservative-root retention
+  issue`, P2-06).
 
 **Verification (as of 2026-10-25):**
 
-- `cargo test --workspace`: **1369 tests** — 413 frontend, 48 codegen, 18 IR,
-  492 runtime unit, 219 CLI/E2E (141 E2E incl. the abi3 extension fixture,
+- `cargo test --workspace`: **1370 tests** — 413 frontend, 48 codegen, 18 IR,
+  492 runtime unit, 220 CLI/E2E (142 E2E incl. the abi3 extension fixture,
   24 fibers, 6 closures, 11 user modules, 10 exception tests, 8
   completions, extension path/dotted/multi-phase, 2 unittest-runner tests,
   2 stdlib-batch-a, 2 stdlib-batch-b, 3 stdlib-bench-batch tests and 5 CLI
@@ -118,8 +121,8 @@ and the C-API implementation itself. Details: `docs/TODO.md`.
   `next`/`send` echo, `close` running `finally`, `throw(caught_exception)`
   re-raised inside the generator, StopIteration after completion.
 - **Stdlib compatibility baseline:** `python3 scripts/stdlib_compat.py`
-  (CPython 3.14.9, PyX 0.1.0): **59/297 modules importable** (13 builtin/frozen,
-  42 pure, 4 extension; 9 modules fail under CPython too). Batches A,
+  (CPython 3.14.9, PyX 0.1.0): **60/297 modules importable** (13 builtin/frozen,
+  43 pure, 4 extension; 9 modules fail under CPython too). Batches A,
   the native core of B, the benchmark-critical batch and the new native
   `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
   `__future__` modules are importable and API-tested; `dataclasses` and
@@ -575,7 +578,7 @@ parallel benchmarks and race/stress tests.
   (`p.name()` instead of `p.name`); method keywords were not yet supported.
   Since Phase 2.24, data attributes (`p.name`) and method keywords
   (`mkdir(parents=True)`) are available.
-- Verified: **545 tests** (state of this slice; today 1369 tests; 111 E2E
+- Verified: **545 tests** (state of this slice; today 1370 tests; 111 E2E
   incl. pathlib JIT+AOT, 169 frontend,
   3 codegen, 2 IR, 152 runtime unit, 22 bytes, 5 concurrent GC, 8 CSV,
   6 GC, 18 IO, 1 JSON-GC, 6 JSON-IO, 9 native concurrency, 11 pathlib,
@@ -797,9 +800,10 @@ a hash index (O(1) on average, Python equality, numeric key equivalence).
 handlers and explicit `raise ... from` are implemented; implicit context
 chaining and `except*` remain open; tracebacks are simplified (one frame).
 **Classes:** multiple bases are approximated by the first base; no class
-attributes/decorators/metaclasses/descriptors; zero-argument `super()` is
-unsupported; native `threading.Thread` cannot be subclassed; instance
-representation `<Name object>`; class namespace immutable.
+attributes/decorators/metaclasses/descriptors; zero-argument
+`super().__init__(...)` targets the direct base, other `super()` forms are
+unsupported; native `threading.Thread` is available as a subclass base;
+instance representation `<Name object>`; class namespace immutable.
 **Closures:** by value; no mutable captures, no recursive nested
 functions, no closures in lambdas.
 **Generators/async:** real lazy generators (stackful fibers) and coroutines
@@ -866,7 +870,7 @@ Windows/cross-compilation missing.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # whole workspace
-cargo test                             # unit/integration tests (1369)
+cargo test                             # unit/integration tests (1370)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # full phase gate
@@ -1296,5 +1300,23 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   and wrapper argument buffers, and 1 MiB fiber stacks. Rich
   console/table/panel/rule output renders (with a raised GC threshold);
   `bench_all.py` is blocked at `rich.status`/`Live` native Thread
-  subclassing + `super()`. **1369 tests**, clippy `-D warnings` and
+  subclassing + `super()`. **1370 tests**, clippy `-D warnings` and
   `scripts/verify.sh` green.
+
+- 2026-10-25 (continuation 53): `bench_all.py --only pyx` runs under PyX.
+  Added bound regex `Match` methods and `groupdict`, user `__getitem__`
+  dispatch, a native `threading.Thread` base plus zero-argument
+  `super().__init__(...)` dispatch to the direct base, native `rich.status.Status`,
+  `dict.setdefault`, `str.format` named fields, extended `json.dumps`
+  keywords, native `html.escape`/`unescape`, a width-valid Unicode
+  `CellTable` placeholder, path-like `subprocess.cwd`, and transactional
+  post-load preloading/reordering of declaration-only nested
+  site-packages modules. `PYX_GC_THRESHOLD=100000000
+  PYX_SITE_PACKAGES=/usr/lib/python3.14/site-packages
+  target/release/pyx run benchmarks/bench_all.py --only pyx` exits 0 and
+  writes the full rich report; all eleven AOT binaries build (hello AOT
+  0.97 ms, while_sum 31.52 ms, for_range 15.68 ms, list_comp 2.64 ms,
+  dict_insert 1.72 ms, json 3.24 ms, math_loop 49.33 ms, generator sum
+  8.04 ms, async gather 21.35 ms). Default GC still loses live `Segment`
+  values in the final report (P2-06). **1370 tests**, clippy
+  `-D warnings` and `scripts/verify.sh` green.

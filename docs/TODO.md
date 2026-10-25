@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** 1369 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** 1370 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
@@ -23,14 +23,13 @@ ecosystem suites (NumPy, pandas, pydantic, FastAPI, Django, …) and their
 benchmarks. **New in this slice:** generator `send`/`throw`/`close` and
 `yield` expressions; C-API container/unicode/float/bytes accessors; a
 generated stdlib compatibility baseline (`docs/COMPATIBILITY.md`,
-59/297 modules importable on 2026-10-25 with Batch A, the Batch B native
+60/297 modules importable on 2026-10-25 with Batch A, the Batch B native
 core, the benchmark-critical batch, the package/site-packages loader and the
 new native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
 `importlib`/`__future__` modules) and the first official CPython test pass
-(`test_errno.py`). `benchmarks/bench_all.py` does **not** yet run under PyX;
-rich console/table/panel/rule rendering works, and the remaining blocker is
-`rich.status`/`Live` (native Thread subclassing and zero-argument
-`super()`), plus default-GC retention under heavy rich allocation (see P7).
+(`test_errno.py`). `benchmarks/bench_all.py --only pyx` now runs under PyX
+with `PYX_GC_THRESHOLD` raised and writes its full report; default-GC
+rendering still exposes the conservative-root retention issue (see P7).
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -257,13 +256,13 @@ no CPython is needed at runtime.
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
 - [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-25: 1369 tests total — 671 runtime (492 unit, 179 ABI
+      As of 2026-10-25: 1370 tests total — 671 runtime (492 unit, 179 ABI
       integration: among others 22 bytes, 19 IO, 18 stdlib modules, 16 stdlib
       utils, 12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
       6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
       5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
       container round-trips, generator methods and extension-value/loader
-      tests), 413 frontend, 48 codegen, 18 IR, 219 CLI/E2E (141 E2E incl.
+      tests), 413 frontend, 48 codegen, 18 IR, 220 CLI/E2E (142 E2E incl.
       the abi3 extension fixture, 24 fibers, 6 closures, 11 user modules,
       10 exceptions, 8 completions, extension path/dotted/multi-phase,
       2 unittest-runner, 2 stdlib-batch-a, 2 stdlib-batch-b,
@@ -322,8 +321,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
       Manifest `tests/compat/cpython-3.14.9.json` records **1** pass
       (`test_errno.py`); it grows only from real `pyx_pass` results.
-      Stdlib import baseline 2026-10-25: **59/297 importable** (13
-      builtin/frozen, 42 pure, 4 extension; 9 `cpython_failed`). Batch A of
+      Stdlib import baseline 2026-10-25: **60/297 importable** (13
+      builtin/frozen, 43 pure, 4 extension; 9 `cpython_failed`). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
       `_operator`, `_functools`, `_io`), the Batch B native core
@@ -355,7 +354,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       and the common `__dunder__` operators/`__call__`/`__str__`/`__repr__`/
       `__len__`/`__contains__`/`__dict__`/`__new__` are implemented.
       Open: general dynamic `*args` **and** `**kwargs` in one call,
-      zero-argument `super()`, native Thread subclassing, decorators and
+      other `super()` forms, native Thread subclassing, decorators and
       full multiple inheritance.
       Acceptance: the CPython language-feature tests in scope pass; every
       remaining deviation is listed in `docs/COMPATIBILITY.md`.
@@ -626,7 +625,7 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the PyX runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-25: **59/297 modules importable**, **238 missing**
+from it). Status 2026-10-25: **60/297 modules importable**, **237 missing**
 (39 builtin/frozen, 133 pure Python, 59 extension, 8 unknown/platform),
 with 9 modules where CPython 3.14.9 itself fails on this host.
 
@@ -638,13 +637,12 @@ Imported module bodies run once as initializers, and nested imports stay
 deferred. No native `rich` is shipped: the official pure-Python `rich`
 distribution is resolved through this loader.
 
-**`bench_all.py` under PyX: not yet green.** Rich `console`/`table`/`panel`/
-`rule` rendering works and the report header is produced. The remaining
-blocker is `Console.status` (`rich.status`/`Live`): native
-`threading.Thread` is not usable as a class base and zero-argument `super()`
-is unsupported. The default conservative GC also loses live values under
-heavier rich rendering; raising `PYX_GC_THRESHOLD` makes the smoke render
-succeed. Do not claim the benchmark harness runs until it actually does.
+**`bench_all.py` under PyX: green with a raised GC threshold.** Rich
+`console`/`table`/`panel`/`rule` rendering works, native Thread subclassing
+and zero-argument `super().__init__` are supported, and a native
+`rich.status.Status` shim covers `Console.status`. The complete report is
+written; the default conservative GC still loses live values under heavier
+rich rendering, so raising `PYX_GC_THRESHOLD` is required.
 
 Acceptance: 297/297 modules accounted for on CPython 3.14.9 — every module
 is either importable **and** green in its CPython `Lib/test/test_*.py`
@@ -829,12 +827,12 @@ ledger below is the per-layer checklist that tracks the actual work.
       `benchmarks/bench_all.py` and the bench scripts: `subprocess`,
       `tempfile`, `shutil`, `textwrap`, `timeit`. Gate (under CPython): all
       five import and their benchmark-used APIs pass; `bench_all.py --only
-      pyx` completes. Running `bench_all.py` itself under PyX is **not** part
-      of this gate and is **not yet green**: the official pure-Python `rich`
-      package resolves through the loader; rich console/table/panel/rule
-      rendering works, but `rich.status`/`Live` still needs native Thread
-      subclassing and zero-argument `super()`. The default conservative GC
-      also needs precise roots for heavy rich rendering.
+      pyx` completes. Running `bench_all.py` itself under PyX now also
+      completes when `PYX_GC_THRESHOLD` is raised: the official pure-Python
+      `rich` package renders console/table/panel/rule, a native
+      `rich.status.Status` shim provides the progress context manager, and
+      the AOT report is written. The default conservative GC still needs
+      precise roots for heavier rich rendering.
       `bench_pyx.py` runs under CPython and drives `pyx run`/`pyx build`
       over embedded workloads; the harness scripts themselves are not PyX
       targets in this gate. The remaining `rich` work is P4-02/P7-01.

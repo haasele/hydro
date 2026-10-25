@@ -30,23 +30,23 @@ Machine-readable results are written to `benchmarks/compat/latest.json`.
 
 <!-- BEGIN GENERATED TABLE -->
 
-Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · PyX `pyx 0.1.0` · binary `/mnt/Vault/GitHub/pyx/target/debug/pyx`
+Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · PyX `pyx 0.1.0` · binary `/mnt/Vault/GitHub/pyx/target/release/pyx`
 
 ## Summary
 
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 13 | 39 |
-| pure | 174 | 42 | 132 |
+| pure | 174 | 43 | 131 |
 | extension | 63 | 4 | 59 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 59 | 238 |
+| **Total** | 297 | 60 | 237 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:PYX0002 | 229 |
+| compile_error:PYX0002 | 228 |
 | cpython_failed | 9 |
 
 ## Modules by layer
@@ -186,7 +186,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `hashlib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'hashlib' not found: not supported on the import search path |
 | `heapq` | ok | ok | ok | - |
 | `hmac` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'hmac' not found: not supported on the import search path |
-| `html` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'html' not found: not supported on the import search path |
+| `html` | ok | ok | ok | - |
 | `http` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'http' not found: not supported on the import search path |
 | `idlelib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'idlelib' not found: not supported on the import search path |
 | `imaplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'imaplib' not found: not supported on the import search path |

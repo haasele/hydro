@@ -7175,6 +7175,74 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> HExpr {
+        // Zero-argument `super()` is only approximated for the common
+        // `super().__init__(...)` form: the base initializer is skipped, while
+        // the subclass body continues to initialize its own state.
+        if let ast::Expr::Attribute(attribute) = &*call.func {
+            if attribute.attr.as_str() == "__init__" {
+                if let ast::Expr::Call(super_call) = &*attribute.value {
+                    if let ast::Expr::Name(name) = &*super_call.func {
+                        if name.id.as_str() == "super"
+                            && super_call.args.is_empty()
+                            && super_call.keywords.is_empty()
+                        {
+                            // Zero-argument `super().__init__` is lowered to a
+                            // runtime helper that invokes the direct base
+                            // initializer with this instance. Other `super()`
+                            // forms remain unsupported.
+                            let Some(local) = fs.lookup("self") else {
+                                self.error_at_code(
+                                    call.range(),
+                                    codes::NAME,
+                                    "super().__init__() requires a method receiver named 'self'",
+                                );
+                                return HExpr {
+                                    kind: HExprKind::Const(Const::None),
+                                    ty: Ty::Concrete(Type::None),
+                                    line,
+                                    col,
+                                };
+                            };
+                            let receiver = HExpr {
+                                kind: HExprKind::Local(local),
+                                ty: self.infer.fresh(),
+                                line,
+                                col,
+                            };
+                            let mut args = Vec::with_capacity(call.args.len());
+                            for arg in &call.args {
+                                args.push(self.expr(arg, fs));
+                            }
+                            let mut keywords = Vec::with_capacity(call.keywords.len());
+                            for keyword in &call.keywords {
+                                let Some(identifier) = &keyword.arg else {
+                                    self.error_at_code(
+                                        keyword.value.range(),
+                                        codes::UNSUPPORTED,
+                                        "super().__init__(**kwargs) is not supported",
+                                    );
+                                    continue;
+                                };
+                                keywords
+                                    .push((identifier.to_string(), self.expr(&keyword.value, fs)));
+                            }
+                            return HExpr {
+                                kind: HExprKind::MethodCall {
+                                    object: Box::new(receiver),
+                                    method: "$super_init".to_string(),
+                                    args,
+                                    star: None,
+                                    keywords,
+                                },
+                                ty: self.infer.fresh(),
+                                line,
+                                col,
+                            };
+                        }
+                    }
+                }
+            }
+        }
         // A starred positional or `**kwargs` operand can only be expanded at
         // runtime. Receiver method calls with a single starred operand keep
         // their dedicated ABI (`pyx_method_star`); the other shapes lower to

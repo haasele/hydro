@@ -796,6 +796,15 @@ pub(crate) fn match_method(obj: i64, name: &str, args: &[i64]) -> i64 {
     let Some(state) = value::as_match(obj) else {
         return attribute_error("Match", name);
     };
+    if name == "groupdict" {
+        if !args.is_empty() {
+            return type_error(&format!(
+                "Match.groupdict() takes no arguments ({} given)",
+                args.len()
+            ));
+        }
+        return value::dict_new(Vec::new());
+    }
     if name == "groups" {
         if args.len() > 1 {
             return type_error(&format!(

@@ -183,9 +183,20 @@ pub static JSON: ModuleSpec = ModuleSpec {
         kw(
             "dumps",
             1,
-            5,
+            10,
             Type::Str,
-            &["obj", "indent", "ensure_ascii", "separators", "sort_keys"],
+            &[
+                "obj",
+                "indent",
+                "ensure_ascii",
+                "separators",
+                "sort_keys",
+                "skipkeys",
+                "check_circular",
+                "allow_nan",
+                "default",
+                "cls",
+            ],
         ),
         f("loads", 1, 1, Type::Any),
         kw(
@@ -286,11 +297,57 @@ pub static THREADING: ModuleSpec = ModuleSpec {
         f("Event", 0, 0, Type::Any),
         f("get_ident", 0, 0, Type::Int),
         f("active_count", 0, 0, Type::Int),
+        f("_threadbase_init", 1, 4, Type::None),
+        f("_threadbase_start", 1, 1, Type::None),
+        f("_threadbase_join", 1, 2, Type::None),
+        f("_threadbase_is_alive", 1, 1, Type::Bool),
+        f("_threadbase_run", 1, 1, Type::None),
     ],
     constants: &[
         // Empty base class; PyX has no per-thread attribute storage.
         c("local", Type::Any),
     ],
+};
+
+/// Minimal native `rich.status` shim used by tools that only need the
+/// context-manager and update API while the rest of `rich` is loaded from
+/// site-packages. Rendering is delegated to the caller's console; the status
+/// itself is display-neutral.
+/// The two `html` helpers used by HTML exporters. `quote=False` is accepted
+/// and disables quote escaping; the four entity escapes match CPython.
+pub static HTML: ModuleSpec = ModuleSpec {
+    name: "html",
+    functions: &[
+        kw("escape", 1, 2, Type::Str, &["s", "quote"]),
+        f("unescape", 1, 1, Type::Str),
+    ],
+    constants: &[],
+};
+
+pub static RICH_STATUS: ModuleSpec = ModuleSpec {
+    name: "rich.status",
+    functions: &[
+        kw(
+            "Status",
+            1,
+            6,
+            Type::Any,
+            &[
+                "status",
+                "console",
+                "spinner",
+                "spinner_style",
+                "speed",
+                "refresh_per_second",
+            ],
+        ),
+        f("_status_enter", 1, 1, Type::Any),
+        f("_status_exit", 1, 4, Type::None),
+        f("_status_start", 1, 1, Type::None),
+        f("_status_stop", 1, 1, Type::None),
+        f("_status_update", 1, 3, Type::None),
+    ],
+    constants: &[],
 };
 
 pub static QUEUE: ModuleSpec = ModuleSpec {
@@ -1208,11 +1265,12 @@ mod tests {
     #[test]
     fn json_keyword_defaults_are_declared() {
         let dumps = function("json", "dumps").expect("json.dumps");
-        assert_eq!(dumps.max_args, 5);
+        assert_eq!(dumps.max_args, 10);
         assert_eq!(
-            dumps.params,
+            &dumps.params[..5],
             &["obj", "indent", "ensure_ascii", "separators", "sort_keys"][..]
         );
+        assert_eq!(dumps.params.last().copied(), Some("cls"));
         let dump = function("json", "dump").expect("json.dump");
         assert_eq!(dump.max_args, 6);
         assert_eq!(dump.params.last().copied(), Some("sort_keys"));

@@ -895,6 +895,13 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
                     );
                 }
             } else if arity != argc {
+                // Indirect calls (imported aliases, values) bypass the
+                // frontend's static default filling. When full metadata is
+                // available, let the runtime binder fill omitted defaults
+                // and report missing/extra positional arguments precisely.
+                if func.full_entry != 0 && !func.signature.is_empty() {
+                    return call_kw(function, argc, argv, 0, std::ptr::null());
+                }
                 return exc::raise_with_message(
                     TYPE_ERROR,
                     &format!("function takes {arity} arguments ({argc} given)"),
@@ -1228,7 +1235,9 @@ pub(crate) fn call_kw(
             return call(function, argc, argv);
         }
     }
-    if kw_argv.is_null() || kwargc > isize::MAX as usize / (2 * std::mem::size_of::<i64>()) {
+    if kwargc > 0
+        && (kw_argv.is_null() || kwargc > isize::MAX as usize / (2 * std::mem::size_of::<i64>()))
+    {
         return exc::raise_with_message(
             TYPE_ERROR,
             "keyword arguments were passed without an argument buffer",
@@ -1313,7 +1322,11 @@ pub(crate) fn call_kw(
             for (index, value) in args.into_iter().enumerate() {
                 slots[index] = Some(value);
             }
-            let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+            let pairs = if kwargc == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) }
+            };
             for pair in pairs.as_chunks::<2>().0 {
                 let Some(keyword) = value::as_str(pair[0]) else {
                     return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
@@ -1359,7 +1372,11 @@ pub(crate) fn call_kw(
         // SAFETY: checked above; caller contract.
         unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
     };
-    let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+    let pairs = if kwargc == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) }
+    };
     let mut keywords: Vec<(String, i64)> = Vec::with_capacity(kwargc);
     for pair in pairs.as_chunks::<2>().0 {
         let Some(keyword) = value::as_str(pair[0]) else {

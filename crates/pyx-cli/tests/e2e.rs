@@ -2949,6 +2949,57 @@ fn typing_alias_subscripts_are_runtime_values() {
 }
 
 #[test]
+fn thread_subclass_and_stdlib_helpers_run() {
+    let dir = TestDir::new("thread-subclass");
+    let source = dir.path().join("main.py");
+    std::fs::write(
+        &source,
+        r#"import html
+import json
+import re
+import threading
+
+class T(threading.Thread):
+    def __init__(self, n, daemon=False):
+        super().__init__(daemon=daemon)
+        self.n = n
+        self.result = 0
+
+    def run(self):
+        self.result = self.n * 2
+
+class Base:
+    def __init__(self, value):
+        self.value = value
+
+class Derived(Base):
+    def __init__(self):
+        super().__init__(9)
+
+t = T(21)
+t.start()
+t.join()
+print(t.result, t.is_alive(), Derived().value, html.escape('<a&"'))
+print(json.dumps({'a': 1}, skipkeys=True, check_circular=False, allow_nan=True))
+print('{name:04d}'.format(name=7))
+d = {'a': 1}
+print(d.setdefault('b', 2), d)
+m = re.compile(r'(x)').search('axb')
+span = m.span
+print(span(), m.group(1), m.groupdict())
+"#,
+    )
+    .expect("failed to write temp program");
+    let source = source.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &source]);
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(
+        stdout,
+        "42 False 9 &lt;a&amp;&quot;\n{\"a\": 1}\n0007\n2 {'a': 1, 'b': 2}\n(1, 2) x {}\n"
+    );
+}
+
+#[test]
 fn user_dunders_and_defaults_are_dispatched() {
     let dir = TestDir::new("user-dunders");
     let program = dir.path().join("dunders.py");

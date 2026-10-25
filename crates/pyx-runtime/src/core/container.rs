@@ -839,6 +839,20 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
             None => exc::raise_with_message(KEY_ERROR, &value::repr(index)),
         };
     }
+    if value::as_instance(obj).is_some() {
+        let entry = value::as_instance(obj)
+            .and_then(|state| value::class_lookup(state.class, "__getitem__"));
+        if matches!(entry, Some(value::ClassEntry::Method(_, _))) {
+            let args = [index];
+            return crate::core::methods::call(
+                obj,
+                b"__getitem__".as_ptr(),
+                11,
+                args.len(),
+                args.as_ptr(),
+            );
+        }
+    }
     // Generic aliases (`typing.Tuple[int]`, `list[str]`) and ordinary classes
     // are treated as subscriptable: PyX has no generic substitution, so the
     // class value itself is the alias. User code that evaluates a typing alias

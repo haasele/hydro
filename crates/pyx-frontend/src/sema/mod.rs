@@ -404,6 +404,10 @@ const DICT_METHODS: &[(&str, MethodSig)] = &[
         MethodSig::new(1, 2, &[ArgKind::Any, ArgKind::Any], Type::Any),
     ),
     ("update", MethodSig::new(1, 1, &[ArgKind::Dict], Type::None)),
+    (
+        "setdefault",
+        MethodSig::new(1, 2, &[ArgKind::Any, ArgKind::Any], Type::Any),
+    ),
     ("clear", MethodSig::new(0, 0, &[], Type::None)),
 ];
 

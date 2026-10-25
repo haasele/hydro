@@ -44,8 +44,22 @@ fn import_module(name_arg: i64) -> i64 {
         return value::module_value(name.to_string());
     }
     // Placeholder for the generated Unicode tables (and any other module the
-    // runtime cannot import natively).
-    let cell_table = value::dict_new(Vec::new());
+    // runtime cannot import natively). The table exposes the `CellTable`
+    // fields as a namespace; one full-width range keeps the binary search in
+    // rich.cells valid and reports width 1 for every codepoint.
+    let range = value::tuple_new(vec![
+        crate::ops::int_result(0),
+        crate::ops::int_result(0x10FFFF),
+        crate::ops::int_result(1),
+    ]);
+    let cell_table = value::namespace_new(vec![
+        (
+            "unicode_version".to_string(),
+            value::str_alloc("0.0.0".to_string()),
+        ),
+        ("widths".to_string(), value::list_new(vec![range])),
+        ("narrow_to_wide".to_string(), value::set_new(Vec::new())),
+    ]);
     value::namespace_new(vec![("cell_table".to_string(), cell_table)])
 }
 
@@ -74,8 +88,8 @@ mod tests {
         let pairs = as_namespace(loaded).expect("placeholder namespace");
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "cell_table");
-        let table = value::as_dict(pairs[0].1).expect("dict cell_table");
-        assert!(table.is_empty());
+        let table = as_namespace(pairs[0].1).expect("cell table namespace");
+        assert_eq!(table.len(), 3);
         assert!(!exc::pending());
     }
 

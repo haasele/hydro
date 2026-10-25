@@ -26,6 +26,13 @@ pub(crate) struct FormatError {
 }
 
 impl FormatError {
+    fn key_error(message: impl Into<String>) -> FormatError {
+        FormatError {
+            tag: crate::exc::KEY_ERROR,
+            message: message.into(),
+        }
+    }
+
     fn value_error(message: impl Into<String>) -> FormatError {
         FormatError {
             tag: crate::exc::VALUE_ERROR,
@@ -185,6 +192,23 @@ pub(crate) fn format_value(
 
 /// `"template".format(args...)`.
 pub(crate) fn call_format(template: &str, args: &[i64]) -> Result<String, FormatError> {
+    format_template(template, args, &[])
+}
+
+/// `"template".format(args..., name=value...)`.
+pub(crate) fn call_format_kw(
+    template: &str,
+    args: &[i64],
+    named: &[(String, i64)],
+) -> Result<String, FormatError> {
+    format_template(template, args, named)
+}
+
+fn format_template(
+    template: &str,
+    args: &[i64],
+    named: &[(String, i64)],
+) -> Result<String, FormatError> {
     let chars: Vec<char> = template.chars().collect();
     let mut out = String::with_capacity(template.len() + 16);
     let mut i = 0;
@@ -236,9 +260,13 @@ pub(crate) fn call_format(template: &str, args: &[i64]) -> Result<String, Format
                     used_manual = true;
                     name.parse().unwrap_or(usize::MAX)
                 } else {
-                    return Err(FormatError::value_error(format!(
-                        "str.format does not support named field '{name}'"
-                    )));
+                    let Some((_, value)) = named.iter().find(|(key, _)| key == &name) else {
+                        return Err(FormatError::key_error(format!(
+                            "str.format() missing named field '{name}'"
+                        )));
+                    };
+                    out.push_str(&format_value(*value, &spec_text, conversion)?);
+                    continue;
                 };
 
                 let Some(arg) = args.get(index).copied() else {
@@ -1188,8 +1216,19 @@ mod tests {
         assert_eq!(text(call_format("{0:04d}", &[int(42)])), "0042");
         assert_eq!(text(call_format("{0} {0}", &[int(5)])), "5 5");
         assert_eq!(
+            text(call_format_kw(
+                "{name}: {value:04d}",
+                &[],
+                &[
+                    ("name".to_string(), string("x")),
+                    ("value".to_string(), int(7))
+                ]
+            )),
+            "x: 0007"
+        );
+        assert_eq!(
             error_tag(call_format("{name}", &[int(1)])),
-            crate::exc::VALUE_ERROR
+            crate::exc::KEY_ERROR
         );
         assert_eq!(error_tag(call_format("{}", &[])), crate::exc::INDEX_ERROR);
         assert_eq!(

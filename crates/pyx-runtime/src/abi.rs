@@ -230,6 +230,17 @@ pub extern "C" fn pyx_class_new(
     let Some(name) = required_name(name_ptr, name_len) else {
         return exc::raise_with_message(exc::TYPE_ERROR, "class name must be a non-empty string");
     };
+    let base = if let Some(function) = value::as_function(base) {
+        match &function.body {
+            value::FunctionBody::Native {
+                module: "threading",
+                name: "Thread",
+            } => crate::modules::threading_thread_base(),
+            _ => base,
+        }
+    } else {
+        base
+    };
     if base != value::NONE && value::as_class(base).is_none() {
         return exc::raise_with_message(
             exc::TYPE_ERROR,
@@ -753,10 +764,6 @@ pub extern "C" fn pyx_call_kw(
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn pyx_deferred_call(argc: usize, argv: *const i64) -> i64 {
-    if argc > 0 && !argv.is_null() {
-        let first = unsafe { *argv };
-        eprintln!("DEFERRED_RT argc={argc} callee={}", value::repr(first));
-    }
     // The evaluated operands are intentionally unused: their evaluation
     // already happened, and the call cannot be represented by the static ABI.
     let _ = (argc, argv);

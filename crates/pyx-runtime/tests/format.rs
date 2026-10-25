@@ -9,6 +9,7 @@ use pyx_runtime::abi::*;
 const VALUE_ERROR: i64 = 0;
 const TYPE_ERROR: i64 = 1;
 const INDEX_ERROR: i64 = 6;
+const KEY_ERROR: i64 = 7;
 const OP_MOD: u32 = 5;
 const OP_EQ: u32 = 7;
 
@@ -100,7 +101,7 @@ fn str_format_method_through_the_abi() {
     assert_str(result, "'x'");
 
     let _ = method(text("{name}"), "format", &[int(1)]);
-    assert_error(VALUE_ERROR);
+    assert_error(KEY_ERROR);
 
     let _ = method(text("{}"), "format", &[]);
     assert_error(INDEX_ERROR);

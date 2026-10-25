@@ -148,6 +148,9 @@ fn path_option(argument: i64, name: &str) -> Result<Option<String>, i64> {
     if argument == NONE {
         return Ok(None);
     }
+    if let Some(path) = value::as_path_like(argument) {
+        return Ok(Some(path.to_string()));
+    }
     match text_of(argument) {
         Some(text) => Ok(Some(text)),
         None => Err(type_error(&format!(

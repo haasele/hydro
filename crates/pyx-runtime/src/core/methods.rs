@@ -43,6 +43,19 @@ pub(crate) fn call(
     let Some(method) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    if method == "$super_init" {
+        let args = if argc == 0 {
+            Vec::new()
+        } else if argv.is_null() {
+            return type_error(
+                "super().__init__() received arguments without an argument buffer".to_string(),
+            );
+        } else {
+            // SAFETY: the ABI requires `argv..argv+argc` to be readable.
+            unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+        };
+        return super_init(obj, &args, &[]);
+    }
     // Instances bind `self` while collecting the arguments, so they skip the
     // generic copy below (one allocation instead of two).
     if value::as_instance(obj).is_some() {
@@ -154,6 +167,34 @@ pub(crate) fn call(
 /// `@classmethod` binds the class instead of the instance and
 /// `@staticmethod` binds no receiver; a property getter is called with the
 /// instance and no extra arguments.
+/// Implements the lowered `super().__init__(...)` form. Python resolves the
+/// initializer on the class after the one that defines the current method;
+/// with PyX's single-base approximation the direct base of the instance class
+/// is the correct target.
+fn super_init(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let Some(state) = value::as_instance(obj) else {
+        return type_error("super(): __self__ is not a class instance".to_string());
+    };
+    let Some(class) = value::as_class(state.class) else {
+        return type_error("super(): instance has no class".to_string());
+    };
+    let base = class.base;
+    if base == NONE {
+        return NONE;
+    }
+    let Some((kind, function)) = value::class_member(base, "__init__") else {
+        return NONE;
+    };
+    if let Some(function) = value::as_function(function) {
+        if let value::FunctionBody::Native { module, name } = &function.body {
+            if *module == "threading" && *name == "_threadbase_init" {
+                return NONE;
+            }
+        }
+    }
+    call_user_method(obj, base, kind, function, "__init__", args, keywords)
+}
+
 fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && (argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>()) {
         return type_error(format!(
@@ -578,6 +619,9 @@ pub(crate) fn call_kw(
         Ok(keywords) => keywords,
         Err(err) => return err,
     };
+    if method == "$super_init" {
+        return super_init(obj, &args, &keywords.items);
+    }
     if value::as_list(obj).is_some() {
         let (params, min_args): (&[&str], usize) = match method.as_str() {
             "sort" => (&["key", "reverse"], 0),
@@ -617,14 +661,6 @@ pub(crate) fn call_kw(
             if let Some(value::ClassEntry::Method(kind, function)) =
                 value::class_lookup(state.class, &method)
             {
-                if method == "add_column" {
-                    eprintln!(
-                        "ADD_COLUMN_META sig={} full={} kind={:?}",
-                        value::function_signature(function).len(),
-                        value::function_full_entry(function),
-                        kind
-                    );
-                }
                 if kind != MethodKind::Property
                     && !value::function_signature(function).is_empty()
                     && value::function_full_entry(function) != 0
@@ -668,6 +704,12 @@ fn str_method_kw(
     args: &mut Vec<i64>,
     keywords: &KeywordArgs,
 ) -> i64 {
+    if method == "format" {
+        return match crate::format::call_format_kw(&s, args, &keywords.items) {
+            Ok(text) => value::str_alloc(text),
+            Err(error) => exc::raise_with_message(error.tag, &error.message),
+        };
+    }
     let (params, min_args): (&[&str], usize) = match method {
         "split" | "rsplit" => (&["sep", "maxsplit"], 0),
         "splitlines" => (&["keepends"], 0),
@@ -752,6 +794,7 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 | "items"
                 | "pop"
                 | "update"
+                | "setdefault"
                 | "clear"
                 | "copy"
                 | "__getitem__"
@@ -807,6 +850,15 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         }
         if let Some(result) = crate::modules::re::pattern_attr(obj, &attr) {
             return result;
+        }
+        return attribute_error(obj, &attr);
+    }
+    if value::as_match(obj).is_some() {
+        if matches!(
+            attr.as_str(),
+            "group" | "groups" | "groupdict" | "start" | "end" | "span"
+        ) {
+            return value::bound_method_new(obj, attr);
         }
         return attribute_error(obj, &attr);
     }
@@ -2484,6 +2536,25 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                     }
                 }
             }
+        }
+        "setdefault" => {
+            if let Some(err) = check_arity("dict", method, args.len(), 1, 2) {
+                return err;
+            }
+            if let Some(err) = check_hashable(args[0]) {
+                return err;
+            }
+            let key = args[0];
+            let default = args.get(1).copied().unwrap_or(NONE);
+            if let Some(position) = value::as_dict_data(obj).and_then(|dict| dict.find(key)) {
+                return value::as_dict_data(obj)
+                    .map(|dict| dict.entries()[position].1)
+                    .unwrap_or(default);
+            }
+            if let Some(mut pairs) = value::dict_pairs_mut(obj) {
+                container::dict_insert_barrier(obj, &mut pairs, key, default);
+            }
+            default
         }
         "keys" | "values" | "items" => {
             if let Some(err) = check_arity("dict", method, args.len(), 0, 0) {

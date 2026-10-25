@@ -99,7 +99,22 @@ pub fn check_file(path: &Path) -> Result<Program, Vec<Diagnostic>> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    let _ = loader.load_file(key, display, "__main__".to_string(), String::new(), root);
+    let entry = loader.load_file(
+        key,
+        display,
+        "__main__".to_string(),
+        String::new(),
+        root.clone(),
+    );
+    if let Some(entry) = entry {
+        if loader.diags.is_empty() {
+            // Nested imports are deferred while the importing module is still
+            // being scanned. Once every dependency is initialized, a
+            // declaration-only site-packages module can be linked eagerly and
+            // its member becomes a normal import target at runtime.
+            loader.preload_deferred_site_modules(entry, &root);
+        }
+    }
 
     if !loader.diags.is_empty() {
         return Err(loader.diags);
@@ -395,10 +410,247 @@ impl ModuleLoader {
         }
     }
 
+    /// Whether `from` (transitively) depends on `to` in the current unit graph.
+    fn depends_on(&self, from: usize, to: usize) -> bool {
+        let mut pending = vec![from];
+        let mut seen = HashSet::new();
+        while let Some(index) = pending.pop() {
+            if !seen.insert(index) {
+                continue;
+            }
+            if let Some(unit) = self.units.get(index) {
+                if unit.deps.contains(&to) {
+                    return true;
+                }
+                pending.extend(unit.deps.iter().copied());
+            }
+        }
+        false
+    }
+
+    /// Whether every module-level import of `name` is already linked, native,
+    /// or itself a declaration-only site-packages module whose dependencies
+    /// are available. Used as a dry run so preloading never pulls a chain
+    /// with missing third-party/stdlib dependencies (for example
+    /// `rich.pretty` -> `inspect`).
+    fn preload_dependencies_available(
+        &self,
+        name: &str,
+        root: &Path,
+        visiting: &mut HashSet<String>,
+    ) -> bool {
+        if pyx_ir::stdlib::module(name).is_some() || self.by_name.contains_key(name) {
+            return true;
+        }
+        if !visiting.insert(name.to_string()) {
+            return true;
+        }
+        let roots = module_search_roots(root, root);
+        let Some(chain) = resolve_module(&roots, name) else {
+            return false;
+        };
+        let Some(final_module) = chain.last() else {
+            return false;
+        };
+        let Ok(source) = fs::read_to_string(&final_module.path) else {
+            return false;
+        };
+        let Ok(ast::Mod::Module(module)) =
+            rustpython_parser::parse(&source, Mode::Module, &final_module.path.to_string_lossy())
+        else {
+            return false;
+        };
+        let package = name.rsplit_once('.').map_or("", |(parent, _)| parent);
+        for stmt in &module.body {
+            let (level, module_name) = match stmt {
+                ast::Stmt::Import(s) => {
+                    for alias in &s.names {
+                        if !self.preload_dependencies_available(alias.name.as_str(), root, visiting)
+                        {
+                            return false;
+                        }
+                    }
+                    continue;
+                }
+                ast::Stmt::ImportFrom(s) => (
+                    s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0),
+                    s.module.as_ref().map(|module| module.as_str()),
+                ),
+                _ => continue,
+            };
+            let module_name = if level == 0 {
+                module_name.unwrap_or("").to_string()
+            } else {
+                let Ok(resolved) = lower::resolve_import_name(level, module_name, package) else {
+                    return false;
+                };
+                resolved
+            };
+            if pyx_ir::stdlib::module(&module_name).is_some()
+                || self.by_name.contains_key(&module_name)
+            {
+                continue;
+            }
+            if !self.preloadable_nested_module(&module_name, root, root)
+                || !self.preload_dependencies_available(&module_name, root, visiting)
+            {
+                return false;
+            }
+        }
+        visiting.remove(name);
+        true
+    }
+
+    /// Links declaration-only site-packages modules that are referenced only
+    /// from nested blocks.
+    ///
+    /// They are loaded after the importer graph is complete, so package cycles
+    /// (`rich.console` <-> `rich.status`) are no longer initializing. Each
+    /// candidate is transactional: a module that triggers diagnostics stays
+    /// deferred and leaves the loader state untouched.
+    fn preload_deferred_site_modules(&mut self, entry: usize, root: &Path) {
+        let old_len = self.units.len();
+        let candidates: Vec<String> = self
+            .units
+            .iter()
+            .flat_map(|unit| unit.deferred.iter())
+            .map(|(module, _)| module.clone())
+            .filter(|module| {
+                let basic = !self.by_name.contains_key(module)
+                    && pyx_ir::stdlib::module(module).is_none()
+                    && self.preloadable_nested_module(module, root, root);
+                basic && self.preload_dependencies_available(module, root, &mut HashSet::new())
+            })
+            .collect();
+        for module in candidates {
+            let units_before = self.units.len();
+            let diags_before = self.diags.len();
+            let loaded_before: Vec<PathBuf> = self.loaded.keys().cloned().collect();
+            let names_before: Vec<String> = self.by_name.keys().cloned().collect();
+            let loaded = self.probe_named(&module, root, root);
+            if self.diags.len() > diags_before {
+                self.diags.truncate(diags_before);
+                self.units.truncate(units_before);
+                self.loaded.retain(|path, _| loaded_before.contains(path));
+                self.by_name.retain(|name, _| names_before.contains(name));
+                continue;
+            }
+            let Some(index) = loaded else {
+                continue;
+            };
+            let importers: Vec<usize> = self
+                .units
+                .iter()
+                .enumerate()
+                .filter(|(_, unit)| {
+                    unit.deferred
+                        .iter()
+                        .any(|(deferred, _)| deferred == &module)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for importer in importers {
+                // Adding the edge makes the loaded exports visible to the
+                // lowerer. Skip only if it would introduce a dependency cycle
+                // (the nested import then keeps its runtime stub).
+                if !self.depends_on(index, importer) {
+                    if !self.units[importer].deps.contains(&index) {
+                        self.units[importer].deps.push(index);
+                    }
+                    self.units[importer]
+                        .deferred
+                        .retain(|(deferred, _)| deferred != &module);
+                }
+            }
+        }
+        if self.units.len() > old_len {
+            self.reorder_preloaded(entry, old_len);
+        }
+    }
+
+    /// Places modules loaded after the entry module before the earliest unit
+    /// that references them, then moves the entry back to the end.
+    ///
+    /// Lowering is single-pass in unit order: an importer can only see exports
+    /// of modules lowered before it. The loaded modules keep their own load
+    /// order (dependencies first), and the insertion point is pushed behind
+    /// every already-existing dependency.
+    fn reorder_preloaded(&mut self, entry: usize, old_len: usize) {
+        let old_entry = entry;
+        debug_assert_eq!(old_entry, old_len - 1);
+        let new_count = self.units.len() - old_len;
+        if new_count == 0 {
+            return;
+        }
+        let mut insert = self.units[..old_len]
+            .iter()
+            .position(|unit| unit.deps.iter().any(|dep| *dep >= old_len))
+            .unwrap_or(old_len - 1);
+        loop {
+            let mut changed = false;
+            for index in old_len..self.units.len() {
+                for dep in &self.units[index].deps {
+                    if *dep < old_len && *dep != old_entry && *dep >= insert {
+                        insert = dep + 1;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let old_units_len = old_len - 1;
+        insert = insert.min(old_units_len);
+
+        let mut slots: Vec<Option<LoadedModule>> = self.units.drain(..).map(Some).collect();
+        let entry_unit = slots[old_entry].take().expect("entry unit");
+        let new_units: Vec<LoadedModule> = slots[old_len..]
+            .iter_mut()
+            .map(|slot| slot.take().expect("preloaded unit"))
+            .collect();
+        let mut old_units: Vec<Option<LoadedModule>> = slots[..old_units_len]
+            .iter_mut()
+            .map(|slot| slot.take())
+            .collect();
+        let mut ordered: Vec<LoadedModule> = Vec::with_capacity(old_len + new_count);
+        for unit in old_units.iter_mut().take(insert) {
+            ordered.push(unit.take().expect("old unit"));
+        }
+        ordered.extend(new_units);
+        for unit in old_units.iter_mut().skip(insert) {
+            ordered.push(unit.take().expect("old unit"));
+        }
+        ordered.push(entry_unit);
+
+        let map = |index: usize| -> usize {
+            if index == old_entry {
+                old_len + new_count - 1
+            } else if index >= old_len {
+                insert + (index - old_len)
+            } else if index >= insert {
+                index + new_count
+            } else {
+                index
+            }
+        };
+        for unit in &mut ordered {
+            unit.deps = unit.deps.iter().map(|dep| map(*dep)).collect();
+        }
+        let by_name = std::mem::take(&mut self.by_name);
+        for (name, index) in by_name {
+            self.by_name.insert(name, map(index));
+        }
+        let loaded = std::mem::take(&mut self.loaded);
+        for (path, index) in loaded {
+            self.loaded.insert(path, map(index));
+        }
+        self.units = ordered;
+    }
+
     /// Whether the final module file for `name` has no imports of its own.
-    /// Such data-only modules can be preloaded safely for nested imports;
-    /// optional modules with dependencies stay deferred and never pollute the
-    /// diagnostic stream.
+    /// These data-only modules are safe to preload during scanning, even while
+    /// another package module is still initializing.
     fn import_free_module(&self, name: &str, importer_dir: &Path, module_root: &Path) -> bool {
         let roots = module_search_roots(importer_dir, module_root);
         let Some(chain) = resolve_module(&roots, name) else {
@@ -428,6 +680,52 @@ impl ModuleLoader {
             .body
             .iter()
             .all(|stmt| !matches!(stmt, ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_)))
+    }
+
+    /// Whether a nested import of a site-packages module may be preloaded.
+    ///
+    /// Only declaration-only modules (imports, functions, classes and a
+    /// skipped `__main__` guard) qualify: their compile-time initializer has
+    /// no observable side effects. Modules with executable top-level code
+    /// stay deferred so optional dependency graphs keep their lazy semantics.
+    fn preloadable_nested_module(
+        &self,
+        name: &str,
+        importer_dir: &Path,
+        module_root: &Path,
+    ) -> bool {
+        let roots = module_search_roots(importer_dir, module_root);
+        let Some(chain) = resolve_module(&roots, name) else {
+            return false;
+        };
+        let Some(final_module) = chain.last() else {
+            return false;
+        };
+        let site_package = final_module.path.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some("site-packages") | Some("dist-packages")
+            )
+        });
+        if !site_package {
+            return false;
+        }
+        let Ok(source) = fs::read_to_string(&final_module.path) else {
+            return false;
+        };
+        let Ok(ast::Mod::Module(module)) =
+            rustpython_parser::parse(&source, Mode::Module, &final_module.path.to_string_lossy())
+        else {
+            return false;
+        };
+        module.body.iter().all(|stmt| match stmt {
+            ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) => true,
+            ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) | ast::Stmt::ClassDef(_) => {
+                true
+            }
+            ast::Stmt::If(s) => lower::static_if_branch(&s.test, name) == Some(false),
+            _ => false,
+        })
     }
 
     /// Whether `name` is the module currently being scanned or one of its

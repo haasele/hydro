@@ -8,20 +8,29 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **1369 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25: **1370 tests**, `scripts/verify.sh` ALL GREEN. The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
 API/ABI, stdlib parity and ecosystem work remain open (see `docs/C_API.md`).
-59/297 standard-library modules are importable (13 builtin/frozen, 42 pure,
-4 extension). `benchmarks/bench_all.py` does **not** yet run under PyX: the
-rich console/table/panel/rule report rendering works; the remaining
-`bench_all.py` blocker is `rich.status`/`Live` (native Thread subclassing
-and zero-argument `super()`), plus a conservative-GC retention issue under
-heavy rich allocation. See the package-loader entry below.
+60/297 standard-library modules are importable (13 builtin/frozen, 43 pure,
+4 extension). `benchmarks/bench_all.py --only pyx` runs under PyX with
+`PYX_GC_THRESHOLD` raised: the rich report renders, all AOT binaries build,
+and the default-GC path still exposes a conservative-root retention issue
+under heavier rich rendering. See the package-loader entry below.
 
 ### Added
 
+- **Runtime dispatch and rich report slice:** bound `Match` methods,
+  user `__getitem__` dispatch, native `threading.Thread` subclass bases
+  with `start`/`join`/`is_alive`, zero-argument `super().__init__(...)` dispatch to the direct base,
+  `dict.setdefault`, `str.format` named fields, JSON dumps keyword
+  compatibility (`skipkeys`/`check_circular`/`allow_nan`/`default`/`cls`),
+  native `html.escape`/`unescape`, a Unicode `CellTable` placeholder that
+  keeps rich's width search valid, `subprocess` path-like `cwd`, and a
+  declaration-only nested-module preload/reorder pass. `bench_all.py
+  --only pyx` now renders the complete rich report; a native
+  `rich.status.Status` shim covers the progress context manager.
 - **`for ... else` / `while ... else`:** a loop `else` clause now lowers to
   the new `else_body` on `StmtKind::ForRange`/`StmtKind::ForEach`/
   `StmtKind::While` and runs only when the loop exhausts normally: `break`,

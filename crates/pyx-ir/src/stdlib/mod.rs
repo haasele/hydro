@@ -115,6 +115,8 @@ pub static MODULES: &[&ModuleSpec] = &[
     &THREAD,
     &THREADING,
     &QUEUE,
+    &HTML,
+    &RICH_STATUS,
     &MULTIPROCESSING,
     &PICKLE,
     &ARGPARSE,

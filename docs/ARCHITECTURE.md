@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-25**. Phase 1 is complete; Phase 2 is largely
-implemented (1369 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (1370 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -408,9 +408,10 @@ built-in kinds), so the fallback never matches a user handler.
   receiver selected by the method kind. Methods are resolved dynamically via
   `pyx_method` by receiver type and class chain; attributes via
   `pyx_getattr`/`pyx_setattr`. Instances expose `__class__`; classes expose
-  their frozen attributes and `__name__`. Not supported: other class
-  decorators, metaclasses, `class` keywords, multiple inheritance,
-  zero-argument `super()`, `__repr__`/descriptor protocols. Instances render
+  their frozen attributes and `__name__`. Zero-argument
+  `super().__init__(...)` calls the direct base initializer; not supported:
+  other class decorators, metaclasses, `class` keywords, multiple inheritance,
+  other `super()` forms, `__repr__`/descriptor protocols. Instances render
   deterministically as `<ClassName object>` (no heap address), classes as
   `<class 'Name'>`.
 - **Attributes** (`pyx_getattr`): `pathlib.Path` (`name`, `stem`, `suffix`,
@@ -575,9 +576,13 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
   `None` factory → `KeyError`.
 - `re` (Phase 2.26): wrapper around the `regex` crate with `search`, `match`,
   `fullmatch`, `findall`, `sub`, `split`, `escape`, `compile`; `Pattern` and
-  `Match` are native objects with `group`/`start`/`end`/`span`/`findall`/
-  `search`. Syntax is Rust `regex` (no lookarounds/backreferences);
-  invalid patterns → `ValueError`.
+  `Match` are native objects with `group`/`groups`/`start`/`end`/`span`/
+  `groupdict` (named groups are not retained, so named styles are absent) and
+  bound method values (`m.span`). Syntax is Rust `regex` (no
+  lookarounds/backreferences); invalid patterns → `ValueError`.
+- `html`: native `escape`/`unescape` (the two helpers used by HTML
+  exporters). `rich.status`: native `Status` context-manager shim for report
+  progress; the remaining `rich` modules come from site-packages.
 - `socket` (Phase 2.26): blocking TCP (`AF_INET`/`SOCK_STREAM`) via
   `std::net`: `socket`, `create_connection`, `bind`, `listen`, `accept`,
   `connect`, `send`/`sendall`, `recv`, `close`, `settimeout`, `gettimeout`,
@@ -1015,20 +1020,19 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **1369 tests** (413 frontend, 48 codegen, 18 IR, 492
-  runtime unit, 179 runtime integration, 219 CLI/E2E). E2E coverage
+- As of 2026-10-25: **1370 tests** (413 frontend, 48 codegen, 18 IR, 492
+  runtime unit, 179 runtime integration, 220 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
   socket echo, pathlib, build cache, `pyx gc` and uv passthrough.
-- Generated stdlib import matrix (2026-10-25): **59/297 importable** (13
-  builtin/frozen, 42 pure, 4 extension; report in
+- Generated stdlib import matrix (2026-10-25): **60/297 importable** (13
+  builtin/frozen, 43 pure, 4 extension; report in
   [`COMPATIBILITY.md`](COMPATIBILITY.md)). `benchmarks/bench_all.py` does
-  **not** yet run under PyX; rich console/table/panel/rule rendering works,
-  and the remaining blocker is `rich.status`/`Live` (native `Thread` cannot
-  be a class base; zero-argument `super()` is unsupported). The default
-  conservative collector also loses live values under heavier rich
-  rendering; a raised `PYX_GC_THRESHOLD` makes the smoke render pass.
+  run under PyX with `PYX_GC_THRESHOLD` raised; rich
+  console/table/panel/rule rendering works and a native `rich.status.Status`
+  shim covers `Console.status`. The default conservative collector still
+  loses live values under heavier rich rendering.
 - New unit tests cover the dict hash index, the GC statistics and
   fiber iteration; `examples/generators_async.py` runs under JIT and AOT.
 - E2E compares stdout/exit code of `pyx run` and the AOT binary; negative tests
@@ -1042,8 +1046,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   `lru_cache`/`cache`/`wraps`/`abstractmethod`/`overload`/
   `runtime_checkable`), pattern matching,
   metaclasses, descriptor/`__dunder__` protocols, `except*`,
-  implicit exception context, `bytearray`/`memoryview`; zero-argument
-  `super()`; class namespace immutable. Multiple inheritance is approximated
+  implicit exception context, `bytearray`/`memoryview`; other `super()` forms; class namespace immutable. Multiple inheritance is approximated
   by the first base (additional bases are ignored). General dynamic calls
   combine at most one `*` operand; `*args` plus `**kwargs` together still
   need a deferred call, while class constructors can bind `**mapping`.
@@ -1066,6 +1069,10 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   fiber switch is register-only (two switches per yield, no syscalls); a
   100k generator sum reaches release AOT 6.8 ms / JIT 7.7 ms versus CPython
   10.2 ms (`strace -c`: 94 syscalls total).
+- **Nested imports:** declaration-only site-packages modules referenced
+  only from nested blocks are preloaded after the import graph is complete
+  and inserted before their importer; modules with executable top-level
+  code remain runtime-error stubs.
 - **Modules:** native modules, sibling `.py` files and packages
   (`__init__.py`, dotted names, submodules, relative imports,
   site-packages). Imported module bodies run once as initializers. Stdlib
