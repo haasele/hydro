@@ -34,23 +34,28 @@ covers unit, integration and E2E tests (current count and breakdown:
 
 ## Performance
 
-Medians over 5 runs, fresh process per run; AOT excludes build time. **Historical snapshot** measured on Linux x86_64 (Intel Core Ultra 7 255H, 16 cores, 24 GB) with CPython 3.13.13; the project oracle is now CPython 3.14.9, and current engine numbers come from `python3 benchmarks/compare_engines.py` or `benchmarks/pyx/run_micro.py`. Snapshot command: `uv run benchmarks/bench_all.py --only pyx`; full report under the untracked `bench_results/`.
+Medians over 5 runs, fresh process per run, AOT excluding build time. Measured on Linux x86_64 (Intel Core Ultra 7 255H, 16 cores, 24 GB); CPython 3.13.13 via `uv` is the benchmark reference, while CPython **3.14.9** is the compatibility oracle. Every benchmark subprocess is capped at 10 seconds.
+
+```bash
+uv run benchmarks/bench_pyx.py --pyx ./target/release/pyx \
+  --n 200000 --repeat 5 --timeout 10
+```
 
 | Workload | CPython | PyX JIT | PyX AOT | CPython/JIT | CPython/AOT |
 |---|---:|---:|---:|---:|---:|
-| hello | 7.35 ms | 2.17 ms | 0.80 ms | 3.39× | 9.18× |
-| while_sum | 20.86 ms | 2.73 ms | 1.68 ms | 7.65× | 12.39× |
-| for_range_sum | 15.60 ms | 2.45 ms | 1.95 ms | 6.37× | 8.00× |
-| list_append | 18.41 ms | 5.09 ms | 4.08 ms | 3.62× | 4.51× |
-| list_comp | 11.56 ms | 3.18 ms | 2.54 ms | 3.64× | 4.54× |
-| dict_insert | 7.89 ms | 2.22 ms | 1.76 ms | 3.55× | 4.48× |
-| string_concat | 8.28 ms | 6.39 ms | 5.57 ms | 1.30× | 1.49× |
-| json_roundtrip | 13.31 ms | 2.71 ms | 2.16 ms | 4.90× | 6.17× |
-| math_loop | 22.65 ms | 24.08 ms | 22.50 ms | 0.94× | 1.01× |
-| generator_sum | 10.19 ms | 7.68 ms | 6.78 ms | 1.33× | 1.50× |
-| async_gather | 57.93 ms | 23.17 ms | 21.44 ms | 2.50× | 2.70× |
+| hello | 7.50 ms | 2.12 ms | 1.18 ms | 3.54× | 6.33× |
+| while_sum | 19.67 ms | 2.59 ms | 2.26 ms | 7.59× | 8.69× |
+| for_range_sum | 14.53 ms | 2.80 ms | 1.35 ms | 5.19× | 10.74× |
+| list_append | 16.11 ms | 5.00 ms | 4.10 ms | 3.22× | 3.93× |
+| list_comp | 10.15 ms | 4.18 ms | 2.95 ms | 2.43× | 3.44× |
+| dict_insert | 7.83 ms | 2.30 ms | 1.60 ms | 3.40× | 4.89× |
+| string_concat | 8.59 ms | 2.55 ms | 1.25 ms | 3.37× | 6.86× |
+| json_roundtrip | 12.70 ms | 3.08 ms | 2.57 ms | 4.13× | 4.94× |
+| math_loop | 21.85 ms | 2.88 ms | 2.01 ms | 7.57× | 10.87× |
+| generator_sum | 9.73 ms | 6.92 ms | 6.46 ms | 1.40× | 1.51× |
+| async_gather | 62.78 ms | 22.83 ms | 21.51 ms | 2.75× | 2.92× |
 
-PyX AOT is faster than CPython on 10/11 workloads; `math_loop` is at parity (1.01× AOT, 0.94× JIT) after native-module dispatch moved to a thread-local spec cache (no per-call name allocations or table scans). In the 50k-iteration micro harness the same loop is 2.2× faster end-to-end (6.2 ms vs 13.6 ms). `async_gather` runs four coroutines with `asyncio.sleep(0.02)`; wall time is ≈ one sleep, confirming the cooperative event loop runs them concurrently. The 100k-element lazy generator (`sum(gen(100000))`) takes ~10.2 ms under CPython, ~7.7 ms under PyX JIT and ~6.8 ms under PyX AOT (register-switch fibers, no syscalls per yield).
+PyX is faster than CPython on all 11 workloads: JIT median **3.40×**, AOT median **4.94×**. Loop, container, JSON and math workloads show the widest margins; `generator_sum` is the narrowest because every yield resumes a fiber, and `async_gather` is bounded by the sleep duration.
 
 ## Requirements
 
@@ -318,13 +323,10 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   CPython vs. PyX JIT vs. PyX AOT (incl. thread/process/pool scaling) and
   writes `benchmarks/pyx/results/latest.json`. `benchmarks/bench_pyx.py`
   compares 11 pure Python workloads (incl. lazy generator and async
-  `gather`) under CPython/JIT/AOT and is registered as `pyx` in `bench_all.py`
-  (`uv run benchmarks/bench_all.py --only pyx`). Remaining weak spots are
-  string concatenation (O(n²)) and float boxing; native module dispatch is
-  no longer a bottleneck, and the
-  register-only fiber switch makes the lazy generator sum over 100k
-  elements faster than CPython (release: CPython 11.0 ms, JIT 7.7 ms,
-  AOT 6.8 ms; 94 syscalls total instead of 200,097).
+  `gather`) under CPython/JIT/AOT and is registered as `pyx` in `bench_all.py`;
+  the 10-second per-run configuration is documented in the Performance
+  section. Generic aliased string concatenation remains O(n²), and generator
+  suspension is the narrowest compute-bound result.
 - Regression thresholds: `benchmarks/pyx/thresholds.json` check the JIT/AOT
   medians of the core workloads:
 
