@@ -298,9 +298,9 @@ heavier rich rendering. See the package-loader entry below.
   functions are mirrored into the runtime global table; imported modules keep
   full mirroring. This removes a `GlobalSet` per top-level loop iteration
   (300k-iteration top-level while: ~30.5 ms → ~3.1 ms) while preserving
-  function access to module globals. AOT benchmarks must clear `.pyx/cache`
-  after frontend changes because the cache key does not embed the compiler
-  build.
+  function access to module globals. AOT cache keys now include the compiler
+  executable's size and mtime, so frontend/codegen rebuilds invalidate stale
+  binaries instead of silently reusing them in benchmarks.
 - **Source restructuring:** `pyx-ir/{model,ir,stdlib}`,
   `pyx-frontend/{lower,sema}`, `pyx-codegen/{backend,lower}`,
   `pyx-runtime/{abi,core,gc,modules,concurrency,support,csv}`,

@@ -1366,6 +1366,7 @@ python3 scripts/check_benchmarks.py    # local threshold gate
   2.90/1.73 ms, for_range 2.46/1.66, list_append 5.43/3.65, math_loop
   24.05/22.05, generator 8.72/8.22, async_gather 23.13/21.40. Full
   `bench_all.py` without `--only` ran green under PyX (152 s, high GC
-  threshold) and CPython (151 s). AOT results require clearing `.pyx/cache`
-  after frontend changes; the cache key does not embed the compiler build.
-  **1377 tests**, clippy `-D warnings` and `scripts/verify.sh` green.
+  threshold) and CPython (151 s). AOT cache keys now include the compiler
+  executable fingerprint (size + mtime), so frontend rebuilds invalidate
+  stale binaries. **1377 tests**, clippy `-D warnings` and
+  `scripts/verify.sh` green.
