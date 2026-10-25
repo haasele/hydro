@@ -146,7 +146,7 @@ options must precede the file.
 **Values and operators**
 
 - `int` (arbitrary precision: tagged i64 fast path with automatic `BigInt`
-  promotion; native i64 boundaries remain documented), `float`, `bool`,
+  promotion; native i64 boundaries such as `range` bounds remain documented), `float`, `bool`,
   `None`, `str` (UTF-8, Unicode scalar values), `bytes`; `list`, `tuple`,
   `dict` (insertion order, O(1) lookup via hash index), `set`, `range`,
   iterators, generator/coroutine objects, function/class values.

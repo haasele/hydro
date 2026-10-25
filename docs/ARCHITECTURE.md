@@ -614,9 +614,8 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
   and no `socket.timeout` class (timeout → `OSError`).
 - `random`: global SplitMix64 PRNG and seedable `Random(seed=...)` with
   `seed`/`random`/`randint`/`randrange`/`choice`/`uniform`/`shuffle`/
-  `getrandbits`; `getrandbits(k)` returns a non-negative `k`-bit int and
-  raises `OverflowError` for `k > 60` (native i64 boundary; BigInt support
-  is still open for this helper).
+  `getrandbits`; `getrandbits(k)` returns an exact non-negative `k`-bit
+  tagged/BigInt integer (bounded by the runtime BigInt cap).
   Deterministic per seed, but **not CPython-reproducible**.
 - `sys.stdout`/`sys.stderr`: small native text streams over fd 1/2 with
   `write(str)` (returns the character count, flushes), `flush()` and
@@ -1086,8 +1085,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 **Limits (deliberate, documented):**
 
 - **Language:** arbitrary-precision `int` is implemented via a tagged fast
-  path plus `BigInt`; some native i64 boundaries (e.g. `getrandbits(k>60)`,
-  `range` bounds) remain. No general decorators (only
+  path plus `BigInt`; `range` bounds and a few native i64 interfaces remain.
+  No general decorators (only
   `property`/`classmethod`/`staticmethod` on methods and the ignored
   `lru_cache`/`cache`/`wraps`/`abstractmethod`/`overload`/
   `runtime_checkable`), pattern matching,

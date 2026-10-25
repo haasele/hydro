@@ -75,7 +75,9 @@ tests, so this block is the only exact count.
   payload size classes are open.
 - Async generators/comprehensions and `asyncio` beyond run/sleep/gather are
   open; generator expressions are lazy (synthetic generator function); mutable
-  closure bindings use shared heap cells with `nonlocal` support.
+  closure bindings use shared heap cells with `nonlocal` support. `range`
+  bounds still use native i64; async generators/comprehensions and full
+  `asyncio` are explicit open programs.
 - Imports: packages, dotted/relative imports and site-packages work; no general
   `sys.path`/`sys.modules`, namespace/zip/frozen imports or `from x import *`.
 - Language: no user decorators, metaclasses, multiple inheritance, pattern
