@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-24T23:13:24Z",
+    "date": "2026-10-25T00:07:45Z",
     "python": "CPython 3.14.9",
     "python_version": "3.14.9",
     "python_executable": "/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14",
@@ -17,15 +17,15 @@
       "tests": null
     },
     "cwd": "/mnt/Vault/GitHub/pyx",
-    "elapsed_seconds": 4.7,
+    "elapsed_seconds": 4.3,
     "counts": {
       "total": 297,
-      "ok": 42,
-      "failed": 255,
+      "ok": 47,
+      "failed": 250,
       "by_status": {
-        "compile_error:PYX0002": 246,
+        "compile_error:PYX0002": 241,
         "cpython_failed": 9,
-        "ok": 42
+        "ok": 47
       },
       "by_layer": {
         "builtin/frozen": {
@@ -35,8 +35,8 @@
         },
         "pure": {
           "total": 174,
-          "ok": 27,
-          "failed": 147
+          "ok": 32,
+          "failed": 142
         },
         "extension": {
           "total": 63,
@@ -59,7 +59,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 20.1
+        "duration_ms": 9.3
       },
       "pyx": {
         "exit": 1,
@@ -78,13 +78,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 8.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_abc' not found: not supported unless a sibling _abc.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -97,13 +97,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.3
+        "duration_ms": 10.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_aix_support' not found: not supported unless a sibling _aix_support.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -116,13 +116,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.4
+        "duration_ms": 9.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_android_support' not found: not supported unless a sibling _android_support.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -135,13 +135,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 9.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module '_apple_support' not found: not supported unless a sibling _apple_support.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -154,13 +154,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.5
+        "duration_ms": 12.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.8,
         "error": "error[PYX0002]: module '_ast' not found: not supported unless a sibling _ast.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -173,7 +173,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 20.3
+        "duration_ms": 14.2
       },
       "pyx": {
         "exit": 1,
@@ -192,13 +192,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 70.3
+        "duration_ms": 46.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_asyncio' not found: not supported unless a sibling _asyncio.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -211,13 +211,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 8.4
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.6,
         "error": null
       },
       "status": "ok",
@@ -230,13 +230,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 8.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_blake2' not found: not supported unless a sibling _blake2.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -249,13 +249,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 8.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module '_bz2' not found: not supported unless a sibling _bz2.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -268,13 +268,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 9.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.6,
         "error": "error[PYX0002]: module '_codecs' not found: not supported unless a sibling _codecs.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -287,7 +287,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 8.0
       },
       "pyx": {
         "exit": 1,
@@ -306,13 +306,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 9.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module '_codecs_hk' not found: not supported unless a sibling _codecs_hk.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -325,13 +325,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 8.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_codecs_iso2022' not found: not supported unless a sibling _codecs_iso2022.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -344,13 +344,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 9.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_codecs_jp' not found: not supported unless a sibling _codecs_jp.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -363,13 +363,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.5
+        "duration_ms": 8.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_codecs_kr' not found: not supported unless a sibling _codecs_kr.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -382,7 +382,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.5
+        "duration_ms": 8.6
       },
       "pyx": {
         "exit": 1,
@@ -407,7 +407,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module '_collections' not found: not supported unless a sibling _collections.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -420,13 +420,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 8.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module '_collections_abc' not found: not supported unless a sibling _collections_abc.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -439,13 +439,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 23.5
+        "duration_ms": 22.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_colorize' not found: not supported unless a sibling _colorize.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -458,13 +458,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.3
+        "duration_ms": 7.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.8,
         "error": "error[PYX0002]: module '_compat_pickle' not found: not supported unless a sibling _compat_pickle.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -477,13 +477,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 9.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.0,
         "error": "error[PYX0002]: module '_contextvars' not found: not supported unless a sibling _contextvars.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -496,13 +496,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 7.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_csv' not found: not supported unless a sibling _csv.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -515,13 +515,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 8.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_ctypes' not found: not supported unless a sibling _ctypes.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -534,13 +534,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.8
+        "duration_ms": 7.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module '_curses' not found: not supported unless a sibling _curses.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -553,13 +553,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_curses_panel' not found: not supported unless a sibling _curses_panel.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -572,13 +572,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 7.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_datetime' not found: not supported unless a sibling _datetime.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -591,13 +591,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.1
+        "duration_ms": 7.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 0.7,
         "error": "error[PYX0002]: module '_dbm' not found: not supported unless a sibling _dbm.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -610,13 +610,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.0
+        "duration_ms": 9.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_decimal' not found: not supported unless a sibling _decimal.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -629,13 +629,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 18.5
+        "duration_ms": 15.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_elementtree' not found: not supported unless a sibling _elementtree.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -648,13 +648,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 7.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module '_frozen_importlib' not found: not supported unless a sibling _frozen_importlib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -667,13 +667,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 8.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_frozen_importlib_external' not found: not supported unless a sibling _frozen_importlib_external.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -686,13 +686,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 8.2
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -705,13 +705,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 25.3
+        "duration_ms": 24.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module '_gdbm' not found: not supported unless a sibling _gdbm.py exists"
       },
       "status": "cpython_failed",
@@ -724,13 +724,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.1
+        "duration_ms": 9.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module '_hashlib' not found: not supported unless a sibling _hashlib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -743,13 +743,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 8.8
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -762,7 +762,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 8.8
       },
       "pyx": {
         "exit": 1,
@@ -781,13 +781,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 7.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_imp' not found: not supported unless a sibling _imp.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -800,13 +800,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 7.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_interpchannels' not found: not supported unless a sibling _interpchannels.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -819,13 +819,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 8.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_interpqueues' not found: not supported unless a sibling _interpqueues.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -838,13 +838,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 8.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module '_interpreters' not found: not supported unless a sibling _interpreters.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -857,13 +857,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 7.2
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.5,
         "error": null
       },
       "status": "ok",
@@ -876,13 +876,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 36.0
+        "duration_ms": 28.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module '_ios_support' not found: not supported unless a sibling _ios_support.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -895,13 +895,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_json' not found: not supported unless a sibling _json.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -914,13 +914,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 8.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.9,
         "error": "error[PYX0002]: module '_locale' not found: not supported unless a sibling _locale.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -933,13 +933,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 10.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.1,
         "error": "error[PYX0002]: module '_lsprof' not found: not supported unless a sibling _lsprof.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -952,7 +952,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
@@ -971,13 +971,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.7
+        "duration_ms": 13.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_markupbase' not found: not supported unless a sibling _markupbase.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -990,13 +990,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 8.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_md5' not found: not supported unless a sibling _md5.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1009,13 +1009,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module '_multibytecodec' not found: not supported unless a sibling _multibytecodec.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1028,13 +1028,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 7.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module '_multiprocessing' not found: not supported unless a sibling _multiprocessing.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1047,13 +1047,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_opcode' not found: not supported unless a sibling _opcode.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1066,13 +1066,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.3
+        "duration_ms": 7.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 0.8,
         "error": "error[PYX0002]: module '_opcode_metadata' not found: not supported unless a sibling _opcode_metadata.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1091,7 +1091,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 1.6,
         "error": null
       },
       "status": "ok",
@@ -1104,13 +1104,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.0
+        "duration_ms": 16.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module '_osx_support' not found: not supported unless a sibling _osx_support.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1123,7 +1123,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 24.8
+        "duration_ms": 27.1
       },
       "pyx": {
         "exit": 1,
@@ -1142,13 +1142,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.5
+        "duration_ms": 10.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module '_pickle' not found: not supported unless a sibling _pickle.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1161,13 +1161,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.2
+        "duration_ms": 7.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module '_posixshmem' not found: not supported unless a sibling _posixshmem.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1180,13 +1180,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 8.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module '_posixsubprocess' not found: not supported unless a sibling _posixsubprocess.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1199,13 +1199,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 8.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module '_py_abc' not found: not supported unless a sibling _py_abc.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1218,13 +1218,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 7.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 0.8,
         "error": "error[PYX0002]: module '_py_warnings' not found: not supported unless a sibling _py_warnings.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1237,7 +1237,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.6
+        "duration_ms": 9.2
       },
       "pyx": {
         "exit": 1,
@@ -1262,7 +1262,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module '_pydecimal' not found: not supported unless a sibling _pydecimal.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1275,13 +1275,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.9
+        "duration_ms": 10.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_pyio' not found: not supported unless a sibling _pyio.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1294,13 +1294,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.9
+        "duration_ms": 13.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_pylong' not found: not supported unless a sibling _pylong.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1313,13 +1313,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 7.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_pyrepl' not found: not supported unless a sibling _pyrepl.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1332,13 +1332,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.0
+        "duration_ms": 7.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_queue' not found: not supported unless a sibling _queue.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1351,13 +1351,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 8.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module '_random' not found: not supported unless a sibling _random.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1370,13 +1370,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module '_remote_debugging' not found: not supported unless a sibling _remote_debugging.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1389,13 +1389,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 26.2
+        "duration_ms": 27.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.1,
         "error": "error[PYX0002]: module '_scproxy' not found: not supported unless a sibling _scproxy.py exists"
       },
       "status": "cpython_failed",
@@ -1408,13 +1408,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 9.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.0,
         "error": "error[PYX0002]: module '_sha1' not found: not supported unless a sibling _sha1.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1427,13 +1427,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 9.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module '_sha2' not found: not supported unless a sibling _sha2.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1446,13 +1446,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 8.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_sha3' not found: not supported unless a sibling _sha3.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1465,13 +1465,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 8.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_signal' not found: not supported unless a sibling _signal.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1484,13 +1484,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 7.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module '_sitebuiltins' not found: not supported unless a sibling _sitebuiltins.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1503,13 +1503,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 8.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_socket' not found: not supported unless a sibling _socket.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1522,13 +1522,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.1
+        "duration_ms": 10.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module '_sqlite3' not found: not supported unless a sibling _sqlite3.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1541,7 +1541,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 7.7
       },
       "pyx": {
         "exit": 1,
@@ -1560,13 +1560,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.4
+        "duration_ms": 9.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module '_ssl' not found: not supported unless a sibling _ssl.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1579,13 +1579,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.2
+        "duration_ms": 7.9
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.7,
         "error": null
       },
       "status": "ok",
@@ -1598,13 +1598,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.1
+        "duration_ms": 7.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.8,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module '_statistics' not found: not supported unless a sibling _statistics.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1617,13 +1617,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 7.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_string' not found: not supported unless a sibling _string.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1636,13 +1636,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 18.0
+        "duration_ms": 15.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module '_strptime' not found: not supported unless a sibling _strptime.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1655,13 +1655,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_struct' not found: not supported unless a sibling _struct.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1674,13 +1674,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 8.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module '_suggestions' not found: not supported unless a sibling _suggestions.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1693,13 +1693,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 8.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module '_symtable' not found: not supported unless a sibling _symtable.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1712,13 +1712,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 7.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.8,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module '_sysconfig' not found: not supported unless a sibling _sysconfig.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1731,13 +1731,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4
+        "duration_ms": 7.8
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -1750,13 +1750,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.5
+        "duration_ms": 12.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_threading_local' not found: not supported unless a sibling _threading_local.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1769,13 +1769,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.6
+        "duration_ms": 11.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_tkinter' not found: not supported unless a sibling _tkinter.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1788,7 +1788,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.1
+        "duration_ms": 8.9
       },
       "pyx": {
         "exit": 1,
@@ -1807,13 +1807,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 9.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_tracemalloc' not found: not supported unless a sibling _tracemalloc.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1826,13 +1826,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 7.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module '_types' not found: not supported unless a sibling _types.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1851,7 +1851,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.6,
         "error": "error[PYX0002]: module '_typing' not found: not supported unless a sibling _typing.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1864,13 +1864,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 8.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module '_uuid' not found: not supported unless a sibling _uuid.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1883,13 +1883,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 7.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_warnings' not found: not supported unless a sibling _warnings.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1902,13 +1902,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.3
+        "duration_ms": 7.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module '_weakref' not found: not supported unless a sibling _weakref.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1921,13 +1921,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 8.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module '_weakrefset' not found: not supported unless a sibling _weakrefset.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1940,13 +1940,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 26.0
+        "duration_ms": 30.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module '_winapi' not found: not supported unless a sibling _winapi.py exists"
       },
       "status": "cpython_failed",
@@ -1959,13 +1959,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 24.8
+        "duration_ms": 24.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module '_wmi' not found: not supported unless a sibling _wmi.py exists"
       },
       "status": "cpython_failed",
@@ -1978,13 +1978,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.8
+        "duration_ms": 10.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module '_zoneinfo' not found: not supported unless a sibling _zoneinfo.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -1997,13 +1997,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.9
+        "duration_ms": 7.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 0.8,
         "error": "error[PYX0002]: module '_zstd' not found: not supported unless a sibling _zstd.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2016,13 +2016,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'abc' not found: not supported unless a sibling abc.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2035,13 +2035,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.5
+        "duration_ms": 11.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'annotationlib' not found: not supported unless a sibling annotationlib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2054,13 +2054,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 255.6
+        "duration_ms": 165.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module 'antigravity' not found: not supported unless a sibling antigravity.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2073,13 +2073,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.3
+        "duration_ms": 14.9
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -2092,7 +2092,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 10.1
       },
       "pyx": {
         "exit": 1,
@@ -2111,7 +2111,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 9.6
       },
       "pyx": {
         "exit": 1,
@@ -2130,13 +2130,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 40.6
+        "duration_ms": 43.5
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 1.9,
         "error": null
       },
       "status": "ok",
@@ -2149,13 +2149,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module 'atexit' not found: not supported unless a sibling atexit.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2174,7 +2174,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 1.5,
         "error": null
       },
       "status": "ok",
@@ -2187,13 +2187,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 21.9
+        "duration_ms": 19.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'bdb' not found: not supported unless a sibling bdb.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2206,26 +2206,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
-      },
-      "pyx": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 1.7,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "bisect",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.5
+        "duration_ms": 8.0
       },
       "pyx": {
         "exit": 0,
@@ -2238,19 +2219,38 @@
       "error": null
     },
     {
+      "name": "bisect",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.6
+      },
+      "pyx": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 1.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
       "name": "builtins",
       "layer": "builtin/frozen",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 7.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2263,13 +2263,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 8.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.8,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'bz2' not found: not supported unless a sibling bz2.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2282,13 +2282,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.1
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'cProfile' not found: not supported unless a sibling cProfile.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2301,13 +2301,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.6
+        "duration_ms": 11.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'calendar' not found: not supported unless a sibling calendar.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2320,7 +2320,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.5
       },
       "pyx": {
         "exit": 1,
@@ -2339,13 +2339,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.4
+        "duration_ms": 7.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'cmd' not found: not supported unless a sibling cmd.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2358,13 +2358,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 27.2
+        "duration_ms": 27.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'code' not found: not supported unless a sibling code.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2377,13 +2377,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.8
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2396,13 +2396,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.4
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'codeop' not found: not supported unless a sibling codeop.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2415,13 +2415,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.1
+        "duration_ms": 9.2
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 2.1,
         "error": null
       },
       "status": "ok",
@@ -2434,13 +2434,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 7.4
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.5,
         "error": null
       },
       "status": "ok",
@@ -2453,13 +2453,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 31.2
+        "duration_ms": 27.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'compileall' not found: not supported unless a sibling compileall.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2472,13 +2472,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 8.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'compression' not found: not supported unless a sibling compression.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2491,13 +2491,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 8.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module 'concurrent' not found: not supported unless a sibling concurrent.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2510,13 +2510,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.0
+        "duration_ms": 17.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.6,
         "error": "error[PYX0002]: module 'configparser' not found: not supported unless a sibling configparser.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2529,13 +2529,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 10.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2548,13 +2548,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 8.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module 'contextvars' not found: not supported unless a sibling contextvars.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2567,13 +2567,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 9.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'copy' not found: not supported unless a sibling copy.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2586,13 +2586,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.3
+        "duration_ms": 8.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.8,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'copyreg' not found: not supported unless a sibling copyreg.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2605,13 +2605,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 9.9
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.7,
         "error": null
       },
       "status": "ok",
@@ -2624,13 +2624,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.5
+        "duration_ms": 11.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'ctypes' not found: not supported unless a sibling ctypes.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2643,13 +2643,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 8.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.8,
+        "duration_ms": 1.6,
         "error": "error[PYX0002]: module 'curses' not found: not supported unless a sibling curses.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2662,13 +2662,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 18.0
+        "duration_ms": 19.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'dataclasses' not found: not supported unless a sibling dataclasses.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2681,13 +2681,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.3
+        "duration_ms": 7.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.8,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'datetime' not found: not supported unless a sibling datetime.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2700,13 +2700,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 9.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.8,
+        "duration_ms": 1.8,
         "error": "error[PYX0002]: module 'dbm' not found: not supported unless a sibling dbm.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2719,13 +2719,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 10.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.8,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module 'decimal' not found: not supported unless a sibling decimal.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2738,13 +2738,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.5
+        "duration_ms": 9.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module 'difflib' not found: not supported unless a sibling difflib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2757,7 +2757,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 10.2
       },
       "pyx": {
         "exit": 1,
@@ -2776,13 +2776,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 68.0
+        "duration_ms": 55.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2795,7 +2795,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.4
+        "duration_ms": 8.4
       },
       "pyx": {
         "exit": 1,
@@ -2814,13 +2814,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 7.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module 'encodings' not found: not supported unless a sibling encodings.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2833,13 +2833,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 41.8
+        "duration_ms": 34.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module 'ensurepip' not found: not supported unless a sibling ensurepip.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2852,13 +2852,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.5
+        "duration_ms": 9.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'enum' not found: not supported unless a sibling enum.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2871,13 +2871,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 9.6
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 2.1,
         "error": null
       },
       "status": "ok",
@@ -2890,7 +2890,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4
+        "duration_ms": 8.9
       },
       "pyx": {
         "exit": 1,
@@ -2909,13 +2909,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4
+        "duration_ms": 8.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'fcntl' not found: not supported unless a sibling fcntl.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2928,13 +2928,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 7.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module 'filecmp' not found: not supported unless a sibling filecmp.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -2947,7 +2947,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 9.4
       },
       "pyx": {
         "exit": 1,
@@ -2966,64 +2966,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.3
-      },
-      "pyx": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 1.9,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "fractions",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 17.4
-      },
-      "pyx": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.4,
-        "error": "error[PYX0002]: module 'fractions' not found: not supported unless a sibling fractions.py exists"
-      },
-      "status": "compile_error:PYX0002",
-      "error": "error[PYX0002]: module 'fractions' not found: not supported unless a sibling fractions.py exists"
-    },
-    {
-      "name": "ftplib",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 16.4
-      },
-      "pyx": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.9,
-        "error": "error[PYX0002]: module 'ftplib' not found: not supported unless a sibling ftplib.py exists"
-      },
-      "status": "compile_error:PYX0002",
-      "error": "error[PYX0002]: module 'ftplib' not found: not supported unless a sibling ftplib.py exists"
-    },
-    {
-      "name": "functools",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 11.8
       },
       "pyx": {
         "exit": 0,
@@ -3036,45 +2979,45 @@
       "error": null
     },
     {
-      "name": "gc",
-      "layer": "builtin/frozen",
+      "name": "fractions",
+      "layer": "pure",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 12.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
-        "error": "error[PYX0002]: module 'gc' not found: not supported unless a sibling gc.py exists"
+        "duration_ms": 1.2,
+        "error": "error[PYX0002]: module 'fractions' not found: not supported unless a sibling fractions.py exists"
       },
       "status": "compile_error:PYX0002",
-      "error": "error[PYX0002]: module 'gc' not found: not supported unless a sibling gc.py exists"
+      "error": "error[PYX0002]: module 'fractions' not found: not supported unless a sibling fractions.py exists"
     },
     {
-      "name": "genericpath",
-      "layer": "builtin/frozen",
+      "name": "ftplib",
+      "layer": "pure",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.5
+        "duration_ms": 19.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
         "duration_ms": 1.3,
-        "error": "error[PYX0002]: module 'genericpath' not found: not supported unless a sibling genericpath.py exists"
+        "error": "error[PYX0002]: module 'ftplib' not found: not supported unless a sibling ftplib.py exists"
       },
       "status": "compile_error:PYX0002",
-      "error": "error[PYX0002]: module 'genericpath' not found: not supported unless a sibling genericpath.py exists"
+      "error": "error[PYX0002]: module 'ftplib' not found: not supported unless a sibling ftplib.py exists"
     },
     {
-      "name": "getopt",
+      "name": "functools",
       "layer": "pure",
       "cpython": {
         "exit": 0,
@@ -3093,13 +3036,70 @@
       "error": null
     },
     {
+      "name": "gc",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.1
+      },
+      "pyx": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 1.1,
+        "error": "error[PYX0002]: module 'gc' not found: not supported unless a sibling gc.py exists"
+      },
+      "status": "compile_error:PYX0002",
+      "error": "error[PYX0002]: module 'gc' not found: not supported unless a sibling gc.py exists"
+    },
+    {
+      "name": "genericpath",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.0
+      },
+      "pyx": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 0.9,
+        "error": "error[PYX0002]: module 'genericpath' not found: not supported unless a sibling genericpath.py exists"
+      },
+      "status": "compile_error:PYX0002",
+      "error": "error[PYX0002]: module 'genericpath' not found: not supported unless a sibling genericpath.py exists"
+    },
+    {
+      "name": "getopt",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.6
+      },
+      "pyx": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 1.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
       "name": "getpass",
       "layer": "pure",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.6
+        "duration_ms": 13.7
       },
       "pyx": {
         "exit": 1,
@@ -3118,7 +3118,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.4
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
@@ -3137,13 +3137,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.9
+        "duration_ms": 14.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module 'glob' not found: not supported unless a sibling glob.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3156,13 +3156,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 8.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'graphlib' not found: not supported unless a sibling graphlib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3175,13 +3175,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 7.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module 'grp' not found: not supported unless a sibling grp.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3194,13 +3194,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 12.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module 'gzip' not found: not supported unless a sibling gzip.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3213,13 +3213,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.4
+        "duration_ms": 9.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module 'hashlib' not found: not supported unless a sibling hashlib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3232,13 +3232,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.0
+        "duration_ms": 8.1
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 1.6,
         "error": null
       },
       "status": "ok",
@@ -3251,7 +3251,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.6
+        "duration_ms": 9.1
       },
       "pyx": {
         "exit": 1,
@@ -3270,13 +3270,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 20.7
+        "duration_ms": 16.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'html' not found: not supported unless a sibling html.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3289,13 +3289,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.9
+        "duration_ms": 9.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'http' not found: not supported unless a sibling http.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3308,13 +3308,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 8.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module 'idlelib' not found: not supported unless a sibling idlelib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3327,13 +3327,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 25.8
+        "duration_ms": 23.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.8,
         "error": "error[PYX0002]: module 'imaplib' not found: not supported unless a sibling imaplib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3346,13 +3346,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 10.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'importlib' not found: not supported unless a sibling importlib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3365,13 +3365,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.7
+        "duration_ms": 21.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3384,13 +3384,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4
+        "duration_ms": 10.4
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.9,
         "error": null
       },
       "status": "ok",
@@ -3403,13 +3403,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.9
+        "duration_ms": 14.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'ipaddress' not found: not supported unless a sibling ipaddress.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3422,13 +3422,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.1
+        "duration_ms": 10.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3441,13 +3441,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.8
+        "duration_ms": 16.7
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.1,
         "error": null
       },
       "status": "ok",
@@ -3460,13 +3460,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 10.3
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -3479,13 +3479,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4
+        "duration_ms": 9.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.6,
         "error": "error[PYX0002]: module 'linecache' not found: not supported unless a sibling linecache.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3498,13 +3498,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.2
+        "duration_ms": 13.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.0,
         "error": "error[PYX0002]: module 'locale' not found: not supported unless a sibling locale.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3517,13 +3517,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 25.7
+        "duration_ms": 36.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.2,
         "error": "error[PYX0002]: module 'logging' not found: not supported unless a sibling logging.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3536,13 +3536,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 10.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'lzma' not found: not supported unless a sibling lzma.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3555,13 +3555,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 33.7
+        "duration_ms": 28.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'mailbox' not found: not supported unless a sibling mailbox.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3580,7 +3580,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'marshal' not found: not supported unless a sibling marshal.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3593,13 +3593,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 8.1
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 1.7,
         "error": null
       },
       "status": "ok",
@@ -3612,7 +3612,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.1
+        "duration_ms": 9.5
       },
       "pyx": {
         "exit": 0,
@@ -3631,13 +3631,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 8.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'mmap' not found: not supported unless a sibling mmap.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3650,13 +3650,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.5
+        "duration_ms": 13.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.6,
         "error": "error[PYX0002]: module 'modulefinder' not found: not supported unless a sibling modulefinder.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3669,13 +3669,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 29.4
+        "duration_ms": 26.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'msvcrt' not found: not supported unless a sibling msvcrt.py exists"
       },
       "status": "cpython_failed",
@@ -3688,13 +3688,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 20.8
+        "duration_ms": 17.6
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 1.5,
         "error": null
       },
       "status": "ok",
@@ -3707,13 +3707,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 10.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'netrc' not found: not supported unless a sibling netrc.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3726,13 +3726,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 29.6
+        "duration_ms": 27.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'nt' not found: not supported unless a sibling nt.py exists"
       },
       "status": "cpython_failed",
@@ -3745,13 +3745,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 8.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'ntpath' not found: not supported unless a sibling ntpath.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3764,13 +3764,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.7
+        "duration_ms": 16.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'nturl2path' not found: not supported unless a sibling nturl2path.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3783,13 +3783,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.2
+        "duration_ms": 8.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module 'numbers' not found: not supported unless a sibling numbers.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3802,7 +3802,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.4
+        "duration_ms": 7.9
       },
       "pyx": {
         "exit": 1,
@@ -3821,13 +3821,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 8.4
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -3840,13 +3840,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.3
+        "duration_ms": 13.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module 'optparse' not found: not supported unless a sibling optparse.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3859,13 +3859,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.1
+        "duration_ms": 8.9
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.4,
+        "duration_ms": 1.9,
         "error": null
       },
       "status": "ok",
@@ -3878,13 +3878,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.7
+        "duration_ms": 14.9
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 1.6,
         "error": null
       },
       "status": "ok",
@@ -3897,13 +3897,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 59.8
+        "duration_ms": 52.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module 'pdb' not found: not supported unless a sibling pdb.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3916,13 +3916,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.5
+        "duration_ms": 11.8
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.6,
         "error": null
       },
       "status": "ok",
@@ -3935,13 +3935,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.4
+        "duration_ms": 18.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'pickletools' not found: not supported unless a sibling pickletools.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3954,13 +3954,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.2
+        "duration_ms": 10.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'pkgutil' not found: not supported unless a sibling pkgutil.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -3973,13 +3973,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.8
+        "duration_ms": 14.2
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -3998,7 +3998,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'plistlib' not found: not supported unless a sibling plistlib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4011,13 +4011,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 21.2
+        "duration_ms": 18.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'poplib' not found: not supported unless a sibling poplib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4030,13 +4030,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 7.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module 'posix' not found: not supported unless a sibling posix.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4049,13 +4049,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.3
+        "duration_ms": 8.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module 'posixpath' not found: not supported unless a sibling posixpath.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4068,13 +4068,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.0
+        "duration_ms": 10.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'pprint' not found: not supported unless a sibling pprint.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4087,13 +4087,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.2
+        "duration_ms": 8.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module 'profile' not found: not supported unless a sibling profile.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4106,7 +4106,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 22.9
+        "duration_ms": 23.3
       },
       "pyx": {
         "exit": 1,
@@ -4125,7 +4125,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 8.5
       },
       "pyx": {
         "exit": 1,
@@ -4144,7 +4144,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 7.6
       },
       "pyx": {
         "exit": 1,
@@ -4163,13 +4163,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 26.1
+        "duration_ms": 27.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module 'py_compile' not found: not supported unless a sibling py_compile.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4182,13 +4182,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.2
+        "duration_ms": 11.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.6,
         "error": "error[PYX0002]: module 'pyclbr' not found: not supported unless a sibling pyclbr.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4201,13 +4201,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 31.9
+        "duration_ms": 34.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'pydoc' not found: not supported unless a sibling pydoc.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4220,13 +4220,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.4
+        "duration_ms": 7.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'pydoc_data' not found: not supported unless a sibling pydoc_data.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4239,13 +4239,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 7.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'pyexpat' not found: not supported unless a sibling pyexpat.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4258,13 +4258,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.8
+        "duration_ms": 11.0
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.6,
+        "duration_ms": 2.0,
         "error": null
       },
       "status": "ok",
@@ -4277,13 +4277,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 7.7
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.5,
         "error": null
       },
       "status": "ok",
@@ -4296,13 +4296,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 10.2
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.6,
         "error": null
       },
       "status": "ok",
@@ -4315,7 +4315,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.8
+        "duration_ms": 14.2
       },
       "pyx": {
         "exit": 0,
@@ -4334,13 +4334,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.2
+        "duration_ms": 8.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'readline' not found: not supported unless a sibling readline.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4353,13 +4353,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 9.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module 'reprlib' not found: not supported unless a sibling reprlib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4372,13 +4372,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 11.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.9,
         "error": "error[PYX0002]: module 'resource' not found: not supported unless a sibling resource.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4391,13 +4391,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.8
+        "duration_ms": 19.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module 'rlcompleter' not found: not supported unless a sibling rlcompleter.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4410,13 +4410,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.5
+        "duration_ms": 11.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'runpy' not found: not supported unless a sibling runpy.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4429,13 +4429,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.1
+        "duration_ms": 11.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'sched' not found: not supported unless a sibling sched.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4448,13 +4448,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.0
+        "duration_ms": 11.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'secrets' not found: not supported unless a sibling secrets.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4467,13 +4467,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 8.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'select' not found: not supported unless a sibling select.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4486,13 +4486,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 9.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'selectors' not found: not supported unless a sibling selectors.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4505,13 +4505,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.4
+        "duration_ms": 12.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'shelve' not found: not supported unless a sibling shelve.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4524,13 +4524,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 9.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'shlex' not found: not supported unless a sibling shlex.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4543,17 +4543,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.4
+        "duration_ms": 15.2
       },
       "pyx": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.5,
-        "error": "error[PYX0002]: module 'shutil' not found: not supported unless a sibling shutil.py exists"
+        "duration_ms": 1.7,
+        "error": null
       },
-      "status": "compile_error:PYX0002",
-      "error": "error[PYX0002]: module 'shutil' not found: not supported unless a sibling shutil.py exists"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "signal",
@@ -4562,13 +4562,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.9
+        "duration_ms": 10.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'signal' not found: not supported unless a sibling signal.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4581,13 +4581,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 7.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'site' not found: not supported unless a sibling site.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4600,13 +4600,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 28.1
+        "duration_ms": 24.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'smtplib' not found: not supported unless a sibling smtplib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4619,13 +4619,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.9
+        "duration_ms": 10.0
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -4638,13 +4638,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.1
+        "duration_ms": 16.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'socketserver' not found: not supported unless a sibling socketserver.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4657,13 +4657,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.5
+        "duration_ms": 11.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'sqlite3' not found: not supported unless a sibling sqlite3.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4676,13 +4676,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.7
+        "duration_ms": 14.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'sre_compile' not found: not supported unless a sibling sre_compile.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4695,13 +4695,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.7
+        "duration_ms": 13.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module 'sre_constants' not found: not supported unless a sibling sre_constants.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4714,13 +4714,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.9
+        "duration_ms": 13.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'sre_parse' not found: not supported unless a sibling sre_parse.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4733,13 +4733,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.0
+        "duration_ms": 16.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.9,
         "error": "error[PYX0002]: module 'ssl' not found: not supported unless a sibling ssl.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4752,13 +4752,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.0
+        "duration_ms": 8.4
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.9,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -4771,13 +4771,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 21.3
+        "duration_ms": 17.8
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 2.1,
         "error": null
       },
       "status": "ok",
@@ -4790,13 +4790,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.8
+        "duration_ms": 9.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'string' not found: not supported unless a sibling string.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4815,7 +4815,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'stringprep' not found: not supported unless a sibling stringprep.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4828,13 +4828,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.1
+        "duration_ms": 8.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module 'struct' not found: not supported unless a sibling struct.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4847,17 +4847,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.6
+        "duration_ms": 16.4
       },
       "pyx": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.6,
-        "error": "error[PYX0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists"
+        "duration_ms": 1.7,
+        "error": null
       },
-      "status": "compile_error:PYX0002",
-      "error": "error[PYX0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "symtable",
@@ -4866,13 +4866,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.3
+        "duration_ms": 10.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module 'symtable' not found: not supported unless a sibling symtable.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4885,13 +4885,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.2
+        "duration_ms": 8.0
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 3.1,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -4904,13 +4904,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.4
+        "duration_ms": 9.3
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module 'sysconfig' not found: not supported unless a sibling sysconfig.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4923,13 +4923,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 8.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.8,
         "error": "error[PYX0002]: module 'syslog' not found: not supported unless a sibling syslog.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4942,7 +4942,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.6
+        "duration_ms": 14.7
       },
       "pyx": {
         "exit": 1,
@@ -4961,13 +4961,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 22.4
+        "duration_ms": 21.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.9,
         "error": "error[PYX0002]: module 'tarfile' not found: not supported unless a sibling tarfile.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -4980,17 +4980,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.9
+        "duration_ms": 18.1
       },
       "pyx": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.6,
-        "error": "error[PYX0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists"
+        "duration_ms": 2.1,
+        "error": null
       },
-      "status": "compile_error:PYX0002",
-      "error": "error[PYX0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "termios",
@@ -4999,13 +4999,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.8
+        "duration_ms": 8.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'termios' not found: not supported unless a sibling termios.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5018,17 +5018,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.5
+        "duration_ms": 12.6
       },
       "pyx": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
         "duration_ms": 1.6,
-        "error": "error[PYX0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists"
+        "error": null
       },
-      "status": "compile_error:PYX0002",
-      "error": "error[PYX0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "this",
@@ -5037,13 +5037,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.9
+        "duration_ms": 8.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'this' not found: not supported unless a sibling this.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5056,13 +5056,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.4
+        "duration_ms": 10.0
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 1.8,
         "error": null
       },
       "status": "ok",
@@ -5075,13 +5075,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 8.4
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 1.3,
         "error": null
       },
       "status": "ok",
@@ -5094,17 +5094,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 8.5
       },
       "pyx": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.0,
-        "error": "error[PYX0002]: module 'timeit' not found: not supported unless a sibling timeit.py exists"
+        "duration_ms": 1.8,
+        "error": null
       },
-      "status": "compile_error:PYX0002",
-      "error": "error[PYX0002]: module 'timeit' not found: not supported unless a sibling timeit.py exists"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "tkinter",
@@ -5113,13 +5113,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 18.2
+        "duration_ms": 16.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'tkinter' not found: not supported unless a sibling tkinter.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5132,13 +5132,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 7.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 0.9,
         "error": "error[PYX0002]: module 'token' not found: not supported unless a sibling token.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5151,7 +5151,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.7
+        "duration_ms": 14.4
       },
       "pyx": {
         "exit": 1,
@@ -5170,13 +5170,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.5
+        "duration_ms": 13.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'tomllib' not found: not supported unless a sibling tomllib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5189,13 +5189,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 24.1
+        "duration_ms": 22.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'trace' not found: not supported unless a sibling trace.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5208,13 +5208,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 27.5
+        "duration_ms": 24.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'traceback' not found: not supported unless a sibling traceback.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5227,13 +5227,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.8
+        "duration_ms": 13.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'tracemalloc' not found: not supported unless a sibling tracemalloc.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5246,13 +5246,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 8.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'tty' not found: not supported unless a sibling tty.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5265,13 +5265,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 41.7
+        "duration_ms": 39.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module 'turtle' not found: not supported unless a sibling turtle.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5284,13 +5284,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.4
+        "duration_ms": 8.0
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'turtledemo' not found: not supported unless a sibling turtledemo.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5303,13 +5303,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 7.7
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.6,
         "error": "error[PYX0002]: module 'types' not found: not supported unless a sibling types.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5322,13 +5322,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.0
+        "duration_ms": 13.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 1.6,
         "error": "error[PYX0002]: module 'typing' not found: not supported unless a sibling typing.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5341,13 +5341,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 8.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'unicodedata' not found: not supported unless a sibling unicodedata.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5360,13 +5360,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 30.4
+        "duration_ms": 29.6
       },
       "pyx": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 1.9,
         "error": null
       },
       "status": "ok",
@@ -5379,13 +5379,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.9,
         "error": "error[PYX0002]: module 'urllib' not found: not supported unless a sibling urllib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5398,13 +5398,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.7
+        "duration_ms": 10.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'uuid' not found: not supported unless a sibling uuid.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5417,13 +5417,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 33.8
+        "duration_ms": 33.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.6,
         "error": "error[PYX0002]: module 'venv' not found: not supported unless a sibling venv.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5436,13 +5436,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 9.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'warnings' not found: not supported unless a sibling warnings.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5455,13 +5455,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.7
+        "duration_ms": 10.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.7,
         "error": "error[PYX0002]: module 'wave' not found: not supported unless a sibling wave.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5480,7 +5480,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'weakref' not found: not supported unless a sibling weakref.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5493,13 +5493,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.1
+        "duration_ms": 19.8
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.4,
         "error": "error[PYX0002]: module 'webbrowser' not found: not supported unless a sibling webbrowser.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5512,13 +5512,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 27.8
+        "duration_ms": 28.1
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'winreg' not found: not supported unless a sibling winreg.py exists"
       },
       "status": "cpython_failed",
@@ -5531,13 +5531,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 27.0
+        "duration_ms": 25.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'winsound' not found: not supported unless a sibling winsound.py exists"
       },
       "status": "cpython_failed",
@@ -5550,13 +5550,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 7.6
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 0.8,
         "error": "error[PYX0002]: module 'wsgiref' not found: not supported unless a sibling wsgiref.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5569,13 +5569,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.8
+        "duration_ms": 7.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.3,
         "error": "error[PYX0002]: module 'xml' not found: not supported unless a sibling xml.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5588,13 +5588,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 9.5
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 1.2,
         "error": "error[PYX0002]: module 'xmlrpc' not found: not supported unless a sibling xmlrpc.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5607,13 +5607,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 22.9
+        "duration_ms": 20.9
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module 'zipapp' not found: not supported unless a sibling zipapp.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5626,13 +5626,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 18.8
+        "duration_ms": 20.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 1.0,
         "error": "error[PYX0002]: module 'zipfile' not found: not supported unless a sibling zipfile.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5645,7 +5645,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 7.8
       },
       "pyx": {
         "exit": 1,
@@ -5664,13 +5664,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 9.4
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.5,
         "error": "error[PYX0002]: module 'zlib' not found: not supported unless a sibling zlib.py exists"
       },
       "status": "compile_error:PYX0002",
@@ -5683,13 +5683,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 10.2
       },
       "pyx": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 1.1,
         "error": "error[PYX0002]: module 'zoneinfo' not found: not supported unless a sibling zoneinfo.py exists"
       },
       "status": "compile_error:PYX0002",

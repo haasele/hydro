@@ -52,4 +52,39 @@ pub fn set_jit_source(path: impl Into<std::path::PathBuf>) {
     process::set_jit_source(path.into());
 }
 
+/// Process-wide `sys.argv`, set before a JIT program starts or filled from
+/// the process arguments by [`abi::pyx_runtime_init`] for AOT binaries.
+static ARGV: std::sync::LazyLock<std::sync::Mutex<Option<Vec<String>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Records the program name and its arguments as `sys.argv`.
+///
+/// The JIT front end calls this before running the program; an explicit
+/// setting is preserved across [`abi::pyx_runtime_init`].
+pub fn set_argv(program: String, args: Vec<String>) {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(program);
+    argv.extend(args);
+    let mut store = ARGV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *store = Some(argv);
+}
+
+/// Fills `sys.argv` from the process arguments unless a caller set it.
+pub(crate) fn init_argv() {
+    let mut store = ARGV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if store.is_none() {
+        *store = Some(
+            std::env::args_os()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect(),
+        );
+    }
+}
+
+/// Returns a copy of `sys.argv` (empty before initialization).
+pub(crate) fn argv() -> Vec<String> {
+    let store = ARGV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    store.clone().unwrap_or_default()
+}
+
 pub mod abi;

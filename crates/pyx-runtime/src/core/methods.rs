@@ -166,6 +166,23 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
     builtins::call(function, call_args.len(), call_args.as_ptr())
 }
 
+/// Keyword parameter names for native class methods that bind keywords.
+///
+/// Only the `timeit.Timer` methods declare names today; generated user methods
+/// have no parameter metadata, so every other instance method rejects
+/// keywords. `self` is implicit and excluded from the returned names.
+fn native_instance_params(obj: i64, method: &str) -> Option<(&'static [&'static str], usize)> {
+    let state = value::as_instance(obj)?;
+    let function = value::class_method(state.class, method)?;
+    let value::FunctionBody::Native { module, name } = &value::as_function(function)?.body else {
+        return None;
+    };
+    if *module != "timeit" {
+        return None;
+    }
+    crate::modules::timeit::method_keyword_params(name).map(|params| (params, 0))
+}
+
 /// Keyword arguments decoded from the `[name, value, ...]` buffer passed by
 /// generated code. Names are tagged strings.
 pub(crate) struct KeywordArgs {
@@ -314,6 +331,15 @@ pub(crate) fn call_kw(
         return crate::modules::argparse::method_kw(obj, &method, &mut args, &keywords);
     }
     if value::as_instance(obj).is_some() {
+        // Native class methods with declared parameter names bind keywords;
+        // generated user methods have no names in this ABI.
+        if let Some((params, min_args)) = native_instance_params(obj, &method) {
+            let receiver = value::instance_class_name(obj).unwrap_or("instance");
+            if let Err(err) = keywords.bind(receiver, &method, params, min_args, &mut args) {
+                return err;
+            }
+            return instance_method(obj, &method, args.len(), args.as_ptr());
+        }
         // Function values carry no parameter names in this ABI, so user
         // methods only support positional arguments.
         return keywords.reject(&value::type_name_of(obj), &method);

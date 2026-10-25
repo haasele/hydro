@@ -37,16 +37,16 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 11 | 41 |
-| pure | 174 | 27 | 147 |
+| pure | 174 | 32 | 142 |
 | extension | 63 | 4 | 59 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 42 | 255 |
+| **Total** | 297 | 47 | 250 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:PYX0002 | 246 |
+| compile_error:PYX0002 | 241 |
 | cpython_failed | 9 |
 
 ## Modules by layer
@@ -236,7 +236,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `selectors` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'selectors' not found: not supported unless a sibling selectors.py… |
 | `shelve` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'shelve' not found: not supported unless a sibling shelve.py exists |
 | `shlex` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'shlex' not found: not supported unless a sibling shlex.py exists |
-| `shutil` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'shutil' not found: not supported unless a sibling shutil.py exists |
+| `shutil` | ok | ok | ok | - |
 | `signal` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'signal' not found: not supported unless a sibling signal.py exists |
 | `smtplib` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'smtplib' not found: not supported unless a sibling smtplib.py exi… |
 | `socket` | ok | ok | ok | - |
@@ -250,16 +250,16 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `string` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'string' not found: not supported unless a sibling string.py exists |
 | `stringprep` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'stringprep' not found: not supported unless a sibling stringprep.… |
 | `struct` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'struct' not found: not supported unless a sibling struct.py exists |
-| `subprocess` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'subprocess' not found: not supported unless a sibling subprocess.… |
+| `subprocess` | ok | ok | ok | - |
 | `symtable` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'symtable' not found: not supported unless a sibling symtable.py e… |
 | `sysconfig` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'sysconfig' not found: not supported unless a sibling sysconfig.py… |
 | `tabnanny` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tabnanny' not found: not supported unless a sibling tabnanny.py e… |
 | `tarfile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tarfile' not found: not supported unless a sibling tarfile.py exi… |
-| `tempfile` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py e… |
-| `textwrap` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py e… |
+| `tempfile` | ok | ok | ok | - |
+| `textwrap` | ok | ok | ok | - |
 | `this` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'this' not found: not supported unless a sibling this.py exists |
 | `threading` | ok | ok | ok | - |
-| `timeit` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'timeit' not found: not supported unless a sibling timeit.py exists |
+| `timeit` | ok | ok | ok | - |
 | `tkinter` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tkinter' not found: not supported unless a sibling tkinter.py exi… |
 | `token` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'token' not found: not supported unless a sibling token.py exists |
 | `tokenize` | ok | exit 1 | compile_error:PYX0002 | error[PYX0002]: module 'tokenize' not found: not supported unless a sibling tokenize.py e… |

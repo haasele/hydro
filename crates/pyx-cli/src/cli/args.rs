@@ -50,7 +50,8 @@ pub(crate) fn apply_diag_flag(
     }
 }
 
-/// Parse the arguments of `check`/`run`: exactly one source file, `--` allowed.
+/// Parse the arguments of commands that take exactly one source file and no
+/// program arguments: `check`, `gc` and the hidden `__spawn`; `--` is allowed.
 pub(crate) fn parse_single_source(
     args: &[OsString],
     command: &str,
@@ -74,21 +75,54 @@ pub(crate) fn parse_single_source(
             )));
         }
         if file.is_some() {
-            let message = if command == "run" {
-                format!(
-                    "pyx: run: program arguments are not supported yet \
-                     (unexpected argument '{text}')"
-                )
-            } else {
-                format!("pyx: {command}: unexpected argument '{text}'")
-            };
-            return Err(CliError::usage(message));
+            return Err(CliError::usage(format!(
+                "pyx: {command}: unexpected argument '{text}'"
+            )));
         }
         file = Some(PathBuf::from(arg.as_os_str()));
     }
     let file =
         file.ok_or_else(|| CliError::usage(format!("pyx: {command}: missing source file")))?;
     Ok((file, options))
+}
+
+/// Parse the arguments of `run`: one source file followed by program arguments.
+///
+/// Diagnostic flags are only recognized before the source file; the first
+/// positional argument selects the file and every later token, including `--`,
+/// is forwarded to the program verbatim. `run -- file.py a` works as well.
+pub(crate) fn parse_source_and_args(
+    args: &[OsString],
+    command: &str,
+) -> Result<(PathBuf, diag::Options, Vec<String>), CliError> {
+    let mut file: Option<PathBuf> = None;
+    let mut program_args = Vec::new();
+    let mut positional_only = false;
+    let mut options = diag::Options::default();
+    for arg in args {
+        if file.is_some() {
+            program_args.push(arg.to_string_lossy().into_owned());
+            continue;
+        }
+        let text = arg.to_string_lossy();
+        if !positional_only && text == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !positional_only && text.starts_with('-') && text != "-" {
+            if let Some(result) = apply_diag_flag(text.as_ref(), &mut options, command) {
+                result?;
+                continue;
+            }
+            return Err(CliError::usage(format!(
+                "pyx: {command}: unsupported option '{text}'"
+            )));
+        }
+        file = Some(PathBuf::from(arg.as_os_str()));
+    }
+    let file =
+        file.ok_or_else(|| CliError::usage(format!("pyx: {command}: missing source file")))?;
+    Ok((file, options, program_args))
 }
 
 /// Options of `new`/`init`: one destination and the overwrite switch.
@@ -298,4 +332,64 @@ pub(crate) fn parse_build(args: &[OsString]) -> Result<BuildOptions, CliError> {
         no_cache,
         diagnostics,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_source_and_args;
+    use std::path::PathBuf;
+
+    fn args(values: &[&str]) -> Vec<std::ffi::OsString> {
+        values.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn run_forwards_arguments_after_source() {
+        let (file, options, program_args) =
+            parse_source_and_args(&args(&["a.py", "--x", "-h"]), "run").unwrap();
+        assert_eq!(file, PathBuf::from("a.py"));
+        assert!(!options.json);
+        assert_eq!(program_args, ["--x", "-h"]);
+    }
+
+    #[test]
+    fn run_accepts_separator_before_source() {
+        let (file, _, program_args) =
+            parse_source_and_args(&args(&["--", "a.py", "--x"]), "run").unwrap();
+        assert_eq!(file, PathBuf::from("a.py"));
+        assert_eq!(program_args, ["--x"]);
+    }
+
+    #[test]
+    fn run_requires_source_file() {
+        let error = parse_source_and_args(&args(&["--json"]), "run").unwrap_err();
+        assert_eq!(error.code, 2);
+        assert!(error
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing source file"));
+    }
+
+    #[test]
+    fn run_accepts_options_before_source() {
+        let (file, options, program_args) =
+            parse_source_and_args(&args(&["--json", "--color=never", "a.py", "--x"]), "run")
+                .unwrap();
+        assert_eq!(file, PathBuf::from("a.py"));
+        assert!(options.json);
+        assert_eq!(options.color, crate::cli::diag::ColorMode::Never);
+        assert_eq!(program_args, ["--x"]);
+    }
+
+    #[test]
+    fn run_rejects_unsupported_option_before_source() {
+        let error = parse_source_and_args(&args(&["--bogus", "a.py"]), "run").unwrap_err();
+        assert_eq!(error.code, 2);
+        assert!(error
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unsupported option '--bogus'"));
+    }
 }

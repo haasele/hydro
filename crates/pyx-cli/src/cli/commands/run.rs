@@ -7,13 +7,13 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use super::{exit_code, read_source, unwrap_or_report};
-use crate::cli::args::parse_single_source;
+use crate::cli::args::{parse_single_source, parse_source_and_args};
 use crate::cli::diag;
 use crate::cli::{CliError, CliResult};
 
 pub(crate) fn cmd_run(args: &[OsString]) -> CliResult {
-    let (file, options) = parse_single_source(args, "run")?;
-    compile_and_run_jit(&file, &options)
+    let (file, options, program_args) = parse_source_and_args(args, "run")?;
+    compile_and_run_jit(&file, &options, program_args)
 }
 
 /// Hidden entry point used by `multiprocessing` spawn children.
@@ -32,12 +32,16 @@ pub(crate) fn cmd_spawn(args: &[OsString]) -> CliResult {
         ));
     }
     let (file, options) = parse_single_source(args, "__spawn")?;
-    compile_and_run_jit(&file, &options)
+    compile_and_run_jit(&file, &options, Vec::new())
 }
 
 /// Compiles and JIT-executes one source file, recording its canonical path so
 /// a spawned child can recompile the same program.
-fn compile_and_run_jit(file: &Path, options: &diag::Options) -> CliResult {
+fn compile_and_run_jit(
+    file: &Path,
+    options: &diag::Options,
+    program_args: Vec<String>,
+) -> CliResult {
     let source = read_source(file)?;
     let program = unwrap_or_report(
         pyx_frontend::check_file(file),
@@ -51,6 +55,7 @@ fn compile_and_run_jit(file: &Path, options: &diag::Options) -> CliResult {
     // diagnostics.
     let canonical = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
     pyx_runtime::set_jit_source(canonical);
+    pyx_runtime::set_argv(file.display().to_string(), program_args);
     let code = pyx_codegen::run_jit(&program)
         .map_err(|error| CliError::new(2, format!("pyx: internal codegen error: {error}")))?;
     Ok(ExitCode::from(exit_code(code)))

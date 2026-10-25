@@ -210,8 +210,17 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("_exit", 1, 1, Type::None),
         f("remove", 1, 1, Type::None),
         f("rename", 2, 2, Type::None),
+        f("access", 2, 2, Type::Bool),
     ],
-    constants: &[c("name", Type::Str), c("sep", Type::Str)],
+    constants: &[
+        c("name", Type::Str),
+        c("sep", Type::Str),
+        c("environ", Type::Dict),
+        c("F_OK", Type::Int),
+        c("X_OK", Type::Int),
+        c("W_OK", Type::Int),
+        c("R_OK", Type::Int),
+    ],
 };
 
 pub static THREADING: ModuleSpec = ModuleSpec {
@@ -254,9 +263,10 @@ pub static PICKLE: ModuleSpec = ModuleSpec {
 
 pub static SYS: ModuleSpec = ModuleSpec {
     name: "sys",
-    functions: &[],
+    functions: &[f("exit", 0, 1, Type::None)],
     constants: &[
         c("argv", Type::List),
+        c("executable", Type::Str),
         c("platform", Type::Str),
         c("version", Type::Str),
         c("version_info", Type::Tuple),
@@ -293,11 +303,11 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
     functions: &[kw(
         "ArgumentParser",
         0,
-        2,
+        3,
         Type::Any,
-        &["prog", "description"],
+        &["prog", "description", "formatter_class"],
     )],
-    constants: &[],
+    constants: &[c("RawTextHelpFormatter", Type::Any)],
 };
 
 pub static COLLECTIONS: ModuleSpec = ModuleSpec {
@@ -743,4 +753,162 @@ pub static MIMETYPES: ModuleSpec = ModuleSpec {
         c("encodings_map", Type::Dict),
         c("suffix_map", Type::Dict),
     ],
+};
+
+// -------------------------------------------------------------------------
+// Standard library batch B: process/filesystem/text helpers
+// -------------------------------------------------------------------------
+
+/// `subprocess`: external command execution.
+///
+/// `run` returns a `CompletedProcess` namespace and `Popen` a native process
+/// object; the `_popen_*` entries are the internal methods of that object and
+/// are not part of the Python-visible module API.
+pub static SUBPROCESS: ModuleSpec = ModuleSpec {
+    name: "subprocess",
+    functions: &[
+        kw(
+            "run",
+            1,
+            11,
+            Type::Any,
+            &[
+                "args",
+                "stdin",
+                "input",
+                "stdout",
+                "stderr",
+                "capture_output",
+                "text",
+                "cwd",
+                "timeout",
+                "check",
+                "env",
+            ],
+        ),
+        // `text=True` switches the captured result from `bytes` to `str`.
+        kw(
+            "check_output",
+            1,
+            8,
+            Type::Any,
+            &[
+                "args", "stdin", "input", "stderr", "cwd", "timeout", "text", "env",
+            ],
+        ),
+        kw(
+            "Popen",
+            1,
+            6,
+            Type::Any,
+            &["args", "cwd", "stdout", "stderr", "text", "env"],
+        ),
+        f("_popen_wait", 1, 2, Type::Int),
+        f("_popen_poll", 1, 1, Type::Int),
+        f("_popen_terminate", 1, 1, Type::None),
+        f("_popen_kill", 1, 1, Type::None),
+    ],
+    constants: &[
+        c("PIPE", Type::Int),
+        c("STDOUT", Type::Int),
+        c("DEVNULL", Type::Int),
+    ],
+};
+
+/// `tempfile`: temporary files and directories.
+///
+/// `TemporaryDirectory` returns a native object exposing `name`; the
+/// `_tempdir_*` entries are its internal context-manager methods.
+pub static TMPFILE: ModuleSpec = ModuleSpec {
+    name: "tempfile",
+    functions: &[
+        f("gettempdir", 0, 0, Type::Str),
+        kw("mkdtemp", 0, 3, Type::Str, &["suffix", "prefix", "dir"]),
+        kw(
+            "TemporaryDirectory",
+            0,
+            3,
+            Type::Any,
+            &["suffix", "prefix", "dir"],
+        ),
+        f("_tempdir_enter", 1, 1, Type::Str),
+        f("_tempdir_exit", 4, 4, Type::None),
+        f("_tempdir_cleanup", 1, 1, Type::None),
+    ],
+    constants: &[],
+};
+
+/// `shutil`: high-level file operations.
+pub static SHUTIL: ModuleSpec = ModuleSpec {
+    name: "shutil",
+    functions: &[
+        // Returns the resolved executable path, or `None` when not found.
+        kw("which", 1, 3, Type::Any, &["cmd", "mode", "path"]),
+        kw("get_terminal_size", 0, 1, Type::Any, &["fallback"]),
+        kw("copyfile", 2, 2, Type::Str, &["src", "dst"]),
+        kw("copy", 2, 2, Type::Str, &["src", "dst"]),
+        kw("copy2", 2, 2, Type::Str, &["src", "dst"]),
+        kw("rmtree", 1, 2, Type::None, &["path", "ignore_errors"]),
+        kw("move", 2, 2, Type::Str, &["src", "dst"]),
+    ],
+    constants: &[],
+};
+
+/// `textwrap`: text wrapping and indentation helpers.
+///
+/// The `TextWrapper` class is intentionally not provided; only the
+/// module-level convenience functions are available.
+pub static TEXTWRAP: ModuleSpec = ModuleSpec {
+    name: "textwrap",
+    functions: &[
+        f("dedent", 1, 1, Type::Str),
+        kw("indent", 2, 3, Type::Str, &["text", "prefix", "predicate"]),
+        kw("wrap", 1, 2, Type::List, &["text", "width"]),
+        kw("fill", 1, 2, Type::Str, &["text", "width"]),
+        kw(
+            "shorten",
+            2,
+            3,
+            Type::Str,
+            &["text", "width", "placeholder"],
+        ),
+    ],
+    constants: &[],
+};
+
+/// `timeit`: micro-benchmark timing.
+///
+/// Statements must be callables in PyX; source strings are rejected by the
+/// runtime. `Timer` is a native object whose internal methods are
+/// `_timer_timeit`, `_timer_repeat` and `_timer_autorange`.
+pub static TIMEIT: ModuleSpec = ModuleSpec {
+    name: "timeit",
+    functions: &[
+        f("default_timer", 0, 0, Type::Float),
+        kw(
+            "timeit",
+            1,
+            5,
+            Type::Float,
+            &["stmt", "setup", "timer", "number", "globals"],
+        ),
+        kw(
+            "repeat",
+            1,
+            6,
+            Type::List,
+            &["stmt", "setup", "timer", "repeat", "number", "globals"],
+        ),
+        kw(
+            "Timer",
+            1,
+            4,
+            Type::Any,
+            &["stmt", "setup", "timer", "globals"],
+        ),
+        f("_timer_timeit", 1, 2, Type::Float),
+        f("_timer_repeat", 1, 3, Type::List),
+        f("_timer_autorange", 1, 2, Type::Tuple),
+    ],
+    constants: &[],
 };

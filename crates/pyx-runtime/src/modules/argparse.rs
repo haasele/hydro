@@ -1,12 +1,16 @@
-//! `argparse`: a small, non-exiting subset of the argument parser.
+//! `argparse`: a small subset of the argument parser.
 //!
 //! Only the common shape is supported: one `ArgumentParser`, positional
 //! arguments, long/short options, `type`, `default`, `required`, `choices`,
-//! `help`, `store_true` and `nargs="?"`. `parse_args` never raises
-//! `SystemExit` (the runtime has no exit mechanism for it); unknown or
-//! missing arguments raise `RuntimeError`, malformed option definitions raise
-//! `TypeError`/`ValueError`. `-h`/`--help` prints the help text and returns a
-//! namespace carrying `_help=True`.
+//! `help`, `store_true` and `nargs="?"`. `parse_args()` without an explicit
+//! argument reads `sys.argv[1:]` and exits with status 0 on `-h`/`--help`
+//! (as a real program must). An explicit argv list never exits: `-h`/`--help`
+//! prints the help text and returns a namespace carrying `_help=True`.
+//! Unknown or missing arguments raise `RuntimeError`, malformed option
+//! definitions raise `TypeError`/`ValueError`.
+//!
+//! `ArgumentParser(formatter_class=...)` is accepted and ignored; the help
+//! renderer is fixed (`RawTextHelpFormatter` is provided as `None`).
 
 use std::io::Write;
 
@@ -70,7 +74,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-/// `ArgumentParser(prog=None, description=None)`.
+/// `ArgumentParser(prog=None, description=None, formatter_class=None)`.
+///
+/// `formatter_class` is accepted and ignored: the help renderer is fixed and
+/// `RawTextHelpFormatter` is exposed as `None`.
 fn new_parser(args: &[i64]) -> i64 {
     let prog = match args.first().copied().unwrap_or(NONE) {
         NONE => None,
@@ -390,9 +397,26 @@ fn parse_args(parser: i64, args: &[i64]) -> i64 {
             args.len()
         ));
     }
-    let argv = match argv_items(args.first().copied().unwrap_or(NONE)) {
-        Ok(argv) => argv,
-        Err(err) => return err,
+    // Parsed values and default-argv tokens stay reachable from this list so
+    // a collection triggered by a later allocation cannot free them.
+    let roots = value::list_new(Vec::new());
+    // No explicit argv: read `sys.argv[1:]` like CPython. In that mode
+    // `-h`/`--help` terminates the program; an explicit list keeps the
+    // non-exiting `_help` namespace used by tests and embedded callers.
+    let default_argv = args.is_empty();
+    let argv = if default_argv {
+        let mut tokens = Vec::new();
+        for argument in crate::argv().into_iter().skip(1) {
+            let token = value::str_alloc(argument);
+            root_value(roots, token);
+            tokens.push(token);
+        }
+        tokens
+    } else {
+        match argv_items(args[0]) {
+            Ok(argv) => argv,
+            Err(err) => return err,
+        }
     };
     let (prog, description, specs) = {
         let Some(state) = value::as_arg_parser(parser) else {
@@ -405,18 +429,18 @@ fn parse_args(parser: i64, args: &[i64]) -> i64 {
         )
     };
     let _ = (prog, description);
-    // Parsed values that are not reachable from the parser or argv are kept
-    // in this list while parsing so a collection triggered by a later
-    // conversion cannot free them.
-    let roots = value::list_new(Vec::new());
 
-    // `-h`/`--help` always prints the help text, mirroring argparse's
-    // automatic help action without exiting the process.
+    // `-h`/`--help` prints the help text. A real invocation (no explicit
+    // argv) exits successfully, mirroring argparse's automatic help action;
+    // an explicit list keeps the non-exiting `_help` namespace.
     if argv
         .iter()
         .any(|token| matches!(value::as_str(*token), Some("-h") | Some("--help")))
     {
         print_help(parser);
+        if default_argv {
+            std::process::exit(0);
+        }
         return value::namespace_new(vec![("_help".to_string(), value::TRUE)]);
     }
 

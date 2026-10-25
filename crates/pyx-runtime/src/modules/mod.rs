@@ -12,6 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -36,11 +37,17 @@ pub(crate) mod keyword;
 pub(crate) mod mimetypes;
 pub(crate) mod quopri;
 pub(crate) mod re;
+pub(crate) mod shutil;
 pub(crate) mod socket;
 pub(crate) mod stat;
+pub(crate) mod subprocess;
+pub(crate) mod tempfile;
+pub(crate) mod textwrap;
+pub(crate) mod timeit;
 pub(crate) mod unittest;
 
 use crate::builtins;
+use crate::container;
 use crate::exc::{
     self, ATTRIBUTE_ERROR, INDEX_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR,
     VALUE_ERROR,
@@ -402,6 +409,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "csv" => csv_call(function, args),
         "io" | "_io" => io_call(function, args),
         "os" => os_call(function, args),
+        "sys" => sys_call(function, args),
         "os.path" => os_path_call(function, args),
         "random" => random_call(function, args),
         "pathlib" => pathlib_call(function, args),
@@ -419,6 +427,11 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "fnmatch" => fnmatch::call(function, args),
         "getopt" => getopt::call(function, args),
         "mimetypes" => mimetypes::call(function, args),
+        "subprocess" => subprocess::call(function, args),
+        "tempfile" => tempfile::call(function, args),
+        "shutil" => shutil::call(function, args),
+        "textwrap" => textwrap::call(function, args),
+        "timeit" => timeit::call(function, args),
         _ => missing_attribute(module, function),
     }
 }
@@ -434,10 +447,12 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("math", "tau") => value::float_new(std::f64::consts::TAU),
         ("math", "inf") => value::float_new(f64::INFINITY),
         ("math", "nan") => value::float_new(f64::NAN),
-        ("sys", "argv") => {
-            let program = value::str_from_bytes(b"pyx");
-            value::list_new(vec![program])
-        }
+        ("sys", "argv") => argv_list(),
+        ("sys", "executable") => value::str_alloc(
+            std::env::current_exe()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
         ("sys", "platform") => value::str_from_bytes(platform().as_bytes()),
         ("sys", "version") => value::str_alloc(format!(
             "{PYTHON_VERSION_STRING} (PyX {})",
@@ -469,6 +484,14 @@ fn constant_value(module: &str, name: &str) -> i64 {
             let sep = if cfg!(windows) { "\\" } else { "/" };
             value::str_from_bytes(sep.as_bytes())
         }
+        ("os", "environ") => environ_dict(),
+        ("os", "F_OK") => encode_int(libc::F_OK as i64),
+        ("os", "X_OK") => encode_int(libc::X_OK as i64),
+        ("os", "W_OK") => encode_int(libc::W_OK as i64),
+        ("os", "R_OK") => encode_int(libc::R_OK as i64),
+        // Accepted for `ArgumentParser(formatter_class=...)`; the help
+        // renderer is fixed, so the formatter is always the default.
+        ("argparse", "RawTextHelpFormatter") => NONE,
         ("socket", "AF_INET") => encode_int(2),
         ("socket", "SOCK_STREAM") => encode_int(1),
         ("socket", "SOL_SOCKET") => encode_int(1),
@@ -476,12 +499,43 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("socket", "SHUT_RD") => encode_int(0),
         ("socket", "SHUT_WR") => encode_int(1),
         ("socket", "SHUT_RDWR") => encode_int(2),
+        ("subprocess", "PIPE") => encode_int(subprocess::PIPE),
+        ("subprocess", "STDOUT") => encode_int(subprocess::STDOUT),
+        ("subprocess", "DEVNULL") => encode_int(subprocess::DEVNULL),
         ("keyword", "kwlist") => keyword::kwlist(),
         ("keyword", "softkwlist") => keyword::softkwlist(),
         ("stat" | "_stat", name) => stat::constant(name),
         ("mimetypes", name) => mimetypes::constant(name),
         _ => missing_attribute(module, name),
     }
+}
+
+/// Fresh list for `sys.argv`; each string is appended through the list so a
+/// collection during a later allocation cannot free an earlier entry.
+fn argv_list() -> i64 {
+    let values = crate::argv();
+    let list = value::list_new(Vec::with_capacity(values.len()));
+    for argument in values {
+        let item = value::str_alloc(argument);
+        container::list_append(list, item);
+    }
+    list
+}
+
+/// Fresh dict for `os.environ`. Keys and values are inserted as they are
+/// allocated; lossy conversion keeps non-UTF-8 entries from panicking.
+fn environ_dict() -> i64 {
+    let dict = value::dict_new(Vec::new());
+    for (name, contents) in std::env::vars_os() {
+        let key = value::str_alloc(name.to_string_lossy().into_owned());
+        let item = value::str_alloc(contents.to_string_lossy().into_owned());
+        if let Some(mut entries) = value::dict_pairs_mut(dict) {
+            entries.set(key, item);
+        }
+        crate::heap::write_barrier_edge(dict, key);
+        crate::heap::write_barrier_edge(dict, item);
+    }
+    dict
 }
 
 fn platform() -> &'static str {
@@ -2668,8 +2722,80 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
                 }
             }
         }
+        "access" => os_access(args),
         _ => missing_attribute("os", function),
     }
+}
+
+/// `os.access(path, mode)`: Linux permission bits, no exception on failure.
+fn os_access(args: &[i64]) -> i64 {
+    let Some(path) = value::as_path_like(args[0]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "access() argument must be a path string, not {}",
+                value::type_name(args[0])
+            ),
+        );
+    };
+    let Some(mode) = value::as_integer(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "access() mode must be an integer, not {}",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    // F_OK / X_OK / W_OK / R_OK only; any other mode is not supported.
+    let mode = match mode {
+        0 => libc::F_OK,
+        1 => libc::X_OK,
+        2 => libc::W_OK,
+        4 => libc::R_OK,
+        _ => return FALSE,
+    };
+    let Ok(path) = std::ffi::CString::new(path) else {
+        return FALSE;
+    };
+    // SAFETY: `path` is a valid NUL-terminated C string and `mode` is one of
+    // the `access(2)` flags above.
+    let accessible = unsafe { libc::access(path.as_ptr(), mode) } == 0;
+    if accessible {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+// -------------------------------------------------------------------------
+// sys
+// -------------------------------------------------------------------------
+
+fn sys_call(function: &str, args: &[i64]) -> i64 {
+    match function {
+        "exit" => sys_exit(args),
+        _ => missing_attribute("sys", function),
+    }
+}
+
+/// `sys.exit(code=None)`: `None` and `0` exit successfully; an integer exits
+/// with that status; a string is reported on stderr with status 1.
+fn sys_exit(args: &[i64]) -> i64 {
+    let code = args.first().copied().unwrap_or(NONE);
+    if code == NONE {
+        process::exit_now(0);
+    }
+    if let Some(status) = value::as_integer(code) {
+        process::exit_now(i32::try_from(status).unwrap_or(1));
+    }
+    let mut stderr = std::io::stderr();
+    let message = value::as_str(code)
+        .map(str::to_string)
+        .unwrap_or_else(|| value::repr(code));
+    let _ = writeln!(stderr, "{message}");
+    let _ = stderr.flush();
+    process::exit_now(1)
 }
 
 // -------------------------------------------------------------------------
@@ -3263,10 +3389,12 @@ mod tests {
     #[test]
     fn sys_constants() {
         exc::init();
+        // The contents depend on which process argument initialized the
+        // store; the shape is always a list of strings.
         let argv = get("sys", "argv");
         let items = value::as_list(argv).expect("list");
-        assert_eq!(items.len(), 1);
-        assert_eq!(value::as_str(items[0]), Some("pyx"));
+        assert!(items.iter().all(|item| value::as_str(*item).is_some()));
+        assert!(value::as_str(get("sys", "executable")).is_some());
 
         assert_eq!(value::as_str(get("sys", "platform")), Some(platform()));
         let version = value::as_str(get("sys", "version")).expect("version string");
@@ -3296,6 +3424,80 @@ mod tests {
         assert_eq!(value::as_str(pyx_info[3]), Some("dev"));
         assert_eq!(as_int(pyx_info[4]), 0);
         assert_eq!(as_int(get("sys", "maxsize")), value::MAX_INT);
+        assert!(stdlib::function("sys", "exit").is_some());
+    }
+
+    #[test]
+    fn os_environ_lists_the_process_environment() {
+        exc::init();
+        std::env::set_var("PYX_TEST_OS_ENVIRON", "value");
+        let environ = get("os", "environ");
+        std::env::remove_var("PYX_TEST_OS_ENVIRON");
+        let entries = value::as_dict(environ).expect("environ dict");
+        let mut found = None;
+        for (key, item) in entries {
+            if value::as_str(*key) == Some("PYX_TEST_OS_ENVIRON") {
+                found = Some(*item);
+                break;
+            }
+        }
+        let stored = found.expect("os.environ must contain PYX_TEST_OS_ENVIRON");
+        assert_eq!(value::as_str(stored), Some("value"));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn os_access_checks_permission_bits() {
+        exc::init();
+        assert_eq!(as_int(get("os", "F_OK")), 0);
+        assert_eq!(as_int(get("os", "X_OK")), 1);
+        assert_eq!(as_int(get("os", "W_OK")), 2);
+        assert_eq!(as_int(get("os", "R_OK")), 4);
+
+        let executable = std::env::current_exe().expect("current executable");
+        let path = string(&executable.to_string_lossy());
+        assert_eq!(call("os", "access", &[path, int(0)]), TRUE);
+        assert_eq!(call("os", "access", &[path, int(4)]), TRUE);
+        // Modes other than the four supported bits report false.
+        assert_eq!(call("os", "access", &[path, int(8)]), FALSE);
+        assert_eq!(
+            call(
+                "os",
+                "access",
+                &[string("/nonexistent/pyx-access-test"), int(0)]
+            ),
+            FALSE
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn argparse_explicit_argv_help_does_not_exit() {
+        exc::init();
+        // `formatter_class` is accepted and ignored; the constant resolves to
+        // `None`.
+        let parser = call(
+            "argparse",
+            "ArgumentParser",
+            &[
+                string("prog"),
+                NONE,
+                get("argparse", "RawTextHelpFormatter"),
+            ],
+        );
+        assert!(!exc::pending());
+        let argv = value::list_new(vec![string("--help")]);
+        let parsed = argparse::method(parser, "parse_args", &[argv]);
+        assert!(!exc::pending());
+        let entries = value::as_namespace(parsed).expect("namespace");
+        let mut help = None;
+        for (name, entry) in entries {
+            if name.as_str() == "_help" {
+                help = Some(*entry);
+                break;
+            }
+        }
+        assert_eq!(help, Some(TRUE));
     }
 
     #[test]

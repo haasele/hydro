@@ -17,6 +17,7 @@ use std::process::ExitCode;
 ///
 /// `message` is `None` when the command already printed its output (for
 /// example a list of frontend diagnostics or the C compiler's stderr).
+#[derive(Debug)]
 pub(crate) struct CliError {
     pub(crate) code: u8,
     pub(crate) message: Option<String>,

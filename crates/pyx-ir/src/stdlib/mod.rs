@@ -104,6 +104,11 @@ pub static MODULES: &[&ModuleSpec] = &[
     &FNMATCH,
     &GETOPT,
     &MIMETYPES,
+    &SUBPROCESS,
+    &TMPFILE,
+    &SHUTIL,
+    &TEXTWRAP,
+    &TIMEIT,
 ];
 
 pub fn module(name: &str) -> Option<&'static ModuleSpec> {

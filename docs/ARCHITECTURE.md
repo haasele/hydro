@@ -1,7 +1,7 @@
 # PyX — Architecture
 
 As of: **2026-10-24**. Phase 1 is complete; Phase 2 is largely
-implemented (1011 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (1064 tests, `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -452,8 +452,9 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
 - `argparse` (Phase 2.25): an `ArgumentParser` with positional arguments,
   long/short options, `type`, `default`, `required`, `choices`, `help`,
   `store_true`, `nargs="?"`; `parse_args` returns a `Namespace`. Errors
-  are `RuntimeError` (no `SystemExit`); `-h` prints help and sets
-  `_help=True`.
+  are `RuntimeError` (no `SystemExit`). With no explicit argv it reads
+  `sys.argv[1:]`, and `-h`/`--help` prints help and exits 0; an explicit
+  argv list keeps `_help=True` without exiting.
 - `collections.defaultdict`: insertion-ordered `(key, value)` pairs plus
   `default_factory`; a missing key calls the factory, inserts and returns;
   `None` factory → `KeyError`.
@@ -841,10 +842,10 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **1011 tests** (289 frontend, 23 codegen, 4 IR, 326
-  runtime unit, 173 runtime integration, 196 CLI/E2E). E2E coverage
+- As of 2026-10-25: **1064 tests** (289 frontend, 23 codegen, 4 IR, 371
+  runtime unit, 173 runtime integration, 204 CLI/E2E). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
-  (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B,
+  (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
   socket echo, pathlib, build cache, `pyx gc` and uv passthrough.
 - New unit tests cover the dict hash index, the GC statistics and
@@ -881,8 +882,9 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   top-level side effects in imported modules, or general runtime module
   objects/`sys.modules`.
 - **Stdlib:** curated subset (see §3.3); `re` uses the Rust
-  `regex` syntax, `socket` only blocking TCP, `argparse` without
-  `SystemExit`, `random` not CPython-reproducible.
+  `regex` syntax, `socket` only blocking TCP, `argparse` with a fixed help
+  renderer (and no `SystemExit` for an explicit argv), `random` not
+  CPython-reproducible.
 - **GC:** conservative, no precise roots/stack maps, no
   size-class allocator; STW root window. P2-05/06/07 open.
 - **Concurrency:** no GIL; unprotected mutations of shared containers are

@@ -907,6 +907,9 @@ pub extern "C" fn pyx_runtime_init() {
     crate::process::reset_start_method();
     exc::init();
     heap::reset();
+    // AOT binaries have no CLI front end; fill `sys.argv` from the process
+    // arguments. An explicit `set_argv` call (the JIT front end) wins.
+    crate::init_argv();
     // A fresh program run starts with no module globals (the unittest class
     // registry is cleared by `heap::reset`).
     crate::core::globals::reset();
@@ -960,6 +963,30 @@ mod tests {
         let s = pyx_str_new(b"hi".as_ptr(), 2);
         assert_eq!(value::as_str(s), Some("hi"));
         assert_eq!(value::as_float(pyx_float_new(1.5)), Some(1.5));
+    }
+
+    #[test]
+    fn argv_is_preserved_across_runtime_init() {
+        crate::set_argv(
+            "bench_pyx.py".to_string(),
+            vec!["--help".to_string(), "--n=1".to_string()],
+        );
+        pyx_runtime_init();
+        assert_eq!(
+            crate::argv(),
+            vec![
+                "bench_pyx.py".to_string(),
+                "--help".to_string(),
+                "--n=1".to_string()
+            ]
+        );
+        let argv = crate::modules::module_get_by_name("sys", "argv");
+        let items = value::as_list(argv).expect("argv list");
+        assert_eq!(items.len(), 3);
+        assert_eq!(value::as_str(items[0]), Some("bench_pyx.py"));
+        assert_eq!(value::as_str(items[1]), Some("--help"));
+        assert_eq!(value::as_str(items[2]), Some("--n=1"));
+        assert_eq!(pyx_exc_pending(), 0);
     }
 
     #[test]

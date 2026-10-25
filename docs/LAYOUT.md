@@ -87,7 +87,7 @@ repository root.
         └── tests/             E2E, fibers, closures, user modules, extensions
                                (paths, dotted, multi-phase), completions,
                                exceptions, unittest_runner, stdlib_batch_a,
-                               stdlib_batch_b
+                               stdlib_batch_b, stdlib_bench_batch
                                (+ fixtures/abi3_probe.c, abi3_multiphase.c)
 ```
 
