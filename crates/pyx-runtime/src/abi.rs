@@ -47,6 +47,28 @@ pub extern "C" fn pyx_str_new(ptr: *const c_uchar, len: usize) -> i64 {
     value::str_from_ptr(ptr, len)
 }
 
+/// Starts a mutable string accumulator for a proved `s = ""` / `s += ...`
+/// loop and returns it. `init` is a `str`; the value never reaches user code,
+/// [`pyx_str_builder_finish`] turns it back into a normal `str`.
+#[no_mangle]
+pub extern "C" fn pyx_str_builder_new(init: i64) -> i64 {
+    value::str_builder_new(init)
+}
+
+/// `accumulator = accumulator + value` for a builder: appends strings without
+/// copying the accumulated prefix and keeps the exact `+` semantics (and the
+/// raised `TypeError`) for every other value. Returns the builder.
+#[no_mangle]
+pub extern "C" fn pyx_str_builder_append(builder: i64, value: i64) -> i64 {
+    value::str_builder_append(builder, value)
+}
+
+/// Ends a builder and returns the accumulated text as a normal `str`.
+#[no_mangle]
+pub extern "C" fn pyx_str_builder_finish(builder: i64) -> i64 {
+    value::str_builder_finish(builder)
+}
+
 /// `bytes` literal: copies `len` bytes from `ptr` into a bytes object.
 #[no_mangle]
 pub extern "C" fn pyx_bytes_new(ptr: *const c_uchar, len: usize) -> i64 {
@@ -822,6 +844,17 @@ pub extern "C" fn pyx_module_call(
     argv: *const i64,
 ) -> i64 {
     modules::module_call(module, module_len, function, function_len, argc, argv)
+}
+
+/// Fast-path fallback for `math.floor(math.sqrt(x))` with an `int` `x`.
+///
+/// Codegen inlines the non-negative tagged-int case as unboxed `f64`
+/// operations; this helper handles the remaining values with the generic
+/// semantics (negative inputs raise the `math.sqrt` domain `ValueError`).
+/// Returns the tagged `int` result or `None` with a pending exception.
+#[no_mangle]
+pub extern "C" fn pyx_math_floor_sqrt_int(value: i64) -> i64 {
+    modules::floor_sqrt_int(value)
 }
 
 /// Keyword variant of [`pyx_module_call`]: `kw_argv` holds `2 * kwargc` tagged

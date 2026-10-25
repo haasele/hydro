@@ -1811,6 +1811,7 @@ unsafe fn trace(addr: usize) {
         | crate::value::KIND_DEFAULTDICT
         | crate::value::KIND_ARG_PARSER
         | crate::value::KIND_NAMESPACE
+        | crate::value::KIND_STR_BUILDER
         | crate::value::KIND_CELL => {
             let _graph = graph_lock();
             if obj.marked.load(Ordering::Acquire) != GREY {
@@ -1863,6 +1864,12 @@ unsafe fn trace(addr: usize) {
                     }
                 }
                 ObjData::Cell(value) => mark_value(*value),
+                // A builder only holds a tagged value after the generic
+                // concatenation path; the growing text is native state.
+                ObjData::StrBuilder(crate::value::StrBuilderState::Materialized(value)) => {
+                    mark_value(*value);
+                }
+                ObjData::StrBuilder(crate::value::StrBuilderState::Building(_)) => {}
                 _ => {}
             }
             mark_black(addr);
@@ -2040,6 +2047,9 @@ unsafe fn trace(addr: usize) {
                 | ObjData::Module(_)
                 | ObjData::StdStream(_)
                 | ObjData::BigInt(_) => {}
+                // A string accumulator is traced with its own kind above,
+                // where the graph lock protects its materialised edge.
+                ObjData::StrBuilder(_) => {}
                 // The mutable containers were handled above; they cannot
                 // appear here.
                 ObjData::List(_)

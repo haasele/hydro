@@ -23,6 +23,29 @@ heavier rich rendering. See the package-loader entry below.
 
 ### Added
 
+- **Math intrinsic fast path:** `math.floor(math.sqrt(int))` lowers to an
+  unboxed Cranelift f64 `sqrt`/floor with a runtime fallback for negatives and
+  non-integers, removing one heap `float` per iteration and both native-module
+  dispatches. `math.sqrt(int)` also avoids dispatch on the fast path.
+- **Generator `sum` fast path:** `sum(generator)` drives the generator fiber
+  directly instead of allocating/wrapping an iterator and re-checking the
+  fiber kind/output pointer per yield. Errors, exhaustion, `start` values and
+  `send(None)` semantics are unchanged.
+- **Linear string accumulators:** a loop that only appends to a string local
+  (`s = ""` ... `s += x` / `s = s + x`) now lowers to a mutable runtime string
+  builder instead of copying the whole prefix per iteration, which removes the
+  O(n²) growth of the `string_concat` benchmark pattern. The frontend applies
+  the rewrite only after proving the local is a pure accumulator (seeded with
+  a `str`, appended unconditionally at the top level of the loop body, never
+  read, aliased, captured or deleted inside the loop, and read after it);
+  everything else keeps the generic `pyx_binop` path, so aliasing, conditional
+  appends, closure captures, early returns, module globals observed by other
+  functions and non-`str` operands behave exactly as before (non-string
+  operands still raise the same `TypeError`). The builder is GC-traced, is
+  created right after the seed and finished right after the loop, so an empty
+  loop yields the seed and `break` yields the partial text. ABI additions:
+  `pyx_str_builder_new/append/finish` (registered for JIT and exported for
+  AOT).
 - **Mutable closures and `nonlocal`:** locals captured and mutated by a
   nested function now live in traced heap cells (`pyx_cell_new/get/set`,
   registered for JIT and exported for AOT), so outer mutations and

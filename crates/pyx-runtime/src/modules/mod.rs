@@ -1532,6 +1532,29 @@ fn float_to_int(function: &str, x: f64) -> i64 {
     ops::int_result(rounded as i64)
 }
 
+/// `pyx_math_floor_sqrt_int`: fallback for the codegen fast path of
+/// `math.floor(math.sqrt(x))` with a statically `int` `x`.
+///
+/// The generated code handles non-negative tagged ints inline; this helper
+/// covers the remaining values (negatives raise the `math.sqrt` domain
+/// `ValueError`, bools and small `BigInt`s keep their numeric conversion, and
+/// values the generic path cannot convert keep its exact error).
+pub(crate) fn floor_sqrt_int(v: i64) -> i64 {
+    let Some(n) = value::as_integer(v) else {
+        let root = math_call("sqrt", &[v]);
+        if failed() {
+            return root;
+        }
+        return math_call("floor", &[root]);
+    };
+    if n < 0 {
+        return domain_error();
+    }
+    // `sqrt(n) < 2^31` for every `i64`, so the result always fits a tagged
+    // immediate and never overflows the conversion.
+    ops::int_result((n as f64).sqrt().floor() as i64)
+}
+
 // functools
 
 /// Dispatches a native `functools` function.
@@ -4121,6 +4144,55 @@ mod tests {
         exc::init();
         assert_eq!(call("math", "pow", &[int(1)]), NONE);
         assert_eq!(message(), "math.pow() takes 2 arguments (1 given)");
+    }
+
+    /// The codegen fast path handles non-negative tagged ints inline and
+    /// delegates every other value to `pyx_math_floor_sqrt_int`; both must
+    /// match the generic `math.floor(math.sqrt(x))` composition exactly.
+    #[test]
+    fn math_floor_sqrt_fast_path_matches_the_generic_composition() {
+        exc::init();
+        let fast = crate::abi::pyx_math_floor_sqrt_int;
+        let generic = |argument: i64| {
+            let root = call("math", "sqrt", &[argument]);
+            if exc::pending() {
+                return root;
+            }
+            call("math", "floor", &[root])
+        };
+        // Positive tagged ints, including the largest tagged payload.
+        for value in [0, 1, 2, 81, 1 << 40, (1i64 << 60) - 1] {
+            assert_eq!(
+                fast(int(value)),
+                generic(int(value)),
+                "floor(sqrt({value}))"
+            );
+            assert!(!exc::pending());
+        }
+        assert_eq!(as_int(fast(int(81))), 9);
+        // `sqrt(2^60)` is exactly `2^30`; the tagged result stays exact.
+        assert_eq!(as_int(fast(int((1i64 << 60) - 1))), 1 << 30);
+
+        // Bools and small `BigInt`s keep their numeric conversion.
+        assert_eq!(as_int(fast(TRUE)), 1);
+        assert_eq!(as_int(fast(big("81"))), 9);
+
+        // Negative inputs raise the `math.sqrt` domain error.
+        assert_eq!(fast(int(-1)), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "math domain error");
+        exc::init();
+        assert_eq!(fast(value::bigint_new(BigInt::from(-4))), NONE);
+        assert_eq!(message(), "math domain error");
+        exc::init();
+
+        // Floats and non-numeric values fall back to the generic path.
+        assert_eq!(as_int(fast(value::float_new(2.7))), 1);
+        assert!(!exc::pending());
+        assert_eq!(fast(string("x")), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "must be real number, not str");
+        exc::init();
     }
 
     #[test]

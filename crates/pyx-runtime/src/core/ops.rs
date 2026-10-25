@@ -401,7 +401,10 @@ pub(crate) fn instance_method_call(instance: i64, name: &str, args: &[i64]) -> O
     Some(builtins::call(function, args.len(), args.as_ptr()))
 }
 
-fn add(a: i64, b: i64) -> i64 {
+/// `a + b` with full Python semantics (`__add__`/`__radd__`, big integers,
+/// numeric promotion, container concatenation). The string accumulator's
+/// generic path reuses it so `s += value` behaves exactly like `s + value`.
+pub(crate) fn add(a: i64, b: i64) -> i64 {
     if let Some(result) = instance_dunder_binop(a, b, "__add__", "__radd__") {
         return result;
     }

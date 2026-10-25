@@ -22,6 +22,8 @@ use crate::lower::{
     HUnpackTarget, LHir,
 };
 
+mod str_acc;
+
 /// A type slot: either a concrete type or an inference variable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
@@ -3476,12 +3478,15 @@ pub fn emit(prog: &LHir, inf: &mut Infer) -> Program {
     for function in &prog.functions {
         functions.push(emit_function(function, inf));
     }
-    Program {
+    let mut program = Program {
         source_name: prog.source_name.clone(),
         functions,
         main: 0,
         initializers: Vec::new(),
-    }
+    };
+    // The rewrite needs the resolved `str` types, so it runs on the typed IR.
+    str_acc::apply(&mut program);
+    program
 }
 
 fn emit_function(function: &HFunction, inf: &mut Infer) -> IrFunction {

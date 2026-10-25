@@ -26,6 +26,9 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         pyx_bool,
         pyx_int,
         pyx_str_new,
+        pyx_str_builder_new,
+        pyx_str_builder_append,
+        pyx_str_builder_finish,
         pyx_bigint_from_str,
         pyx_bytes_new,
         pyx_bytes_build,
@@ -92,6 +95,7 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         pyx_slice_set,
         pyx_module_call,
         pyx_module_call_kw,
+        pyx_math_floor_sqrt_int,
         pyx_module_get,
         pyx_module_value,
         pyx_deferred_import,
@@ -161,6 +165,199 @@ pub(crate) fn run(program: &Program) -> Result<i32, CodegenError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use pyx_ir::{Expr, ExprKind, Function, LocalInfo, Stmt, StmtKind, Type};
+
+    /// Module body assigning `x = math.floor(math.sqrt(x))` with an `int`
+    /// local: the shape that imports `pyx_math_floor_sqrt_int`.
+    fn math_fast_path_program() -> Program {
+        let argument = Expr::new(ExprKind::Local(0), Type::Int, 1);
+        let sqrt = Expr::new(
+            ExprKind::ModuleCall {
+                module: "math".to_string(),
+                function: "sqrt".to_string(),
+                args: vec![argument],
+                keywords: Vec::new(),
+            },
+            Type::Float,
+            1,
+        );
+        let floor = Expr::new(
+            ExprKind::ModuleCall {
+                module: "math".to_string(),
+                function: "floor".to_string(),
+                args: vec![sqrt],
+                keywords: Vec::new(),
+            },
+            Type::Int,
+            1,
+        );
+        Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![LocalInfo {
+                    name: "x".to_string(),
+                    ty: Type::Int,
+                }],
+                body: vec![Stmt::new(
+                    StmtKind::Assign {
+                        target: 0,
+                        value: floor,
+                    },
+                    1,
+                )],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+            initializers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn math_fast_path_symbol_is_registered_for_the_jit() {
+        let isa = build_isa(false).expect("native ISA");
+        let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
+        register_runtime_symbols(&mut builder);
+        let mut module = JITModule::new(builder);
+        lower_program(&mut module, &math_fast_path_program()).expect("math fast path must lower");
+        // Finalization resolves every import, so a missing JIT binding for
+        // `pyx_math_floor_sqrt_int` (declared by the lowering) fails here.
+        module
+            .finalize_definitions()
+            .expect("every runtime import must be bound for the JIT");
+        assert_ne!(
+            pyx_runtime::abi::pyx_math_floor_sqrt_int as *const () as usize,
+            0
+        );
+    }
+
+    #[test]
+    fn string_accumulator_symbols_are_registered_for_the_jit() {
+        use pyx_ir::{Builtin, Callee};
+
+        let line = 1;
+        let text = |value: &str| {
+            Expr::new(
+                ExprKind::Const(pyx_ir::Const::Str(value.to_string())),
+                Type::Str,
+                line,
+            )
+        };
+        let local = |id| Expr::new(ExprKind::Local(id), Type::Any, line);
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: vec![
+                    LocalInfo {
+                        name: "s".to_string(),
+                        ty: Type::Str,
+                    },
+                    LocalInfo {
+                        name: "builder".to_string(),
+                        ty: Type::Any,
+                    },
+                ],
+                body: vec![
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 0,
+                            value: text("a"),
+                        },
+                        line,
+                    ),
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 1,
+                            value: Expr::new(
+                                ExprKind::StrBuilderNew {
+                                    init: Box::new(Expr::new(ExprKind::Local(0), Type::Str, line)),
+                                },
+                                Type::Any,
+                                line,
+                            ),
+                        },
+                        line,
+                    ),
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 1,
+                            value: Expr::new(
+                                ExprKind::StrBuilderAppend {
+                                    builder: Box::new(local(1)),
+                                    value: Box::new(text("b")),
+                                },
+                                Type::Any,
+                                line,
+                            ),
+                        },
+                        line,
+                    ),
+                    Stmt::new(
+                        StmtKind::Assign {
+                            target: 0,
+                            value: Expr::new(
+                                ExprKind::StrBuilderFinish {
+                                    builder: Box::new(local(1)),
+                                },
+                                Type::Str,
+                                line,
+                            ),
+                        },
+                        line,
+                    ),
+                    Stmt::new(
+                        StmtKind::Expr(Expr::new(
+                            ExprKind::Call {
+                                callee: Callee::Builtin(Builtin::Len),
+                                args: vec![Expr::new(ExprKind::Local(0), Type::Str, line)],
+                            },
+                            Type::Int,
+                            line,
+                        )),
+                        line,
+                    ),
+                ],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+            initializers: Vec::new(),
+        };
+
+        let isa = build_isa(false).expect("native ISA");
+        let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
+        register_runtime_symbols(&mut builder);
+        let mut module = JITModule::new(builder);
+        lower_program(&mut module, &program).expect("string accumulator must lower");
+        // Finalization resolves every import, so a missing JIT binding for one
+        // of the `pyx_str_builder_*` symbols (declared by the lowering) fails
+        // here.
+        module
+            .finalize_definitions()
+            .expect("every runtime import must be bound for the JIT");
+        assert_ne!(
+            pyx_runtime::abi::pyx_str_builder_new as *const () as usize,
+            0
+        );
+        assert_ne!(
+            pyx_runtime::abi::pyx_str_builder_append as *const () as usize,
+            0
+        );
+        assert_ne!(
+            pyx_runtime::abi::pyx_str_builder_finish as *const () as usize,
+            0
+        );
+    }
+
     #[test]
     fn class_runtime_symbols_are_available_to_the_jit() {
         assert_ne!(pyx_runtime::abi::pyx_class_new as *const () as usize, 0);

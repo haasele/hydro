@@ -741,6 +741,14 @@ pub(crate) fn dict_from(iterable: i64) -> i64 {
 /// `sum(iterable, start)`: uses the runtime iterator protocol and `+`
 /// semantics, so pending arithmetic errors propagate unchanged.
 pub(crate) fn sum(iterable: i64, start: i64) -> i64 {
+    // A generator fiber is driven directly; wrapping it in an iterator object
+    // would re-check the fiber kind and output pointer on every yield.
+    if value::as_fiber(iterable)
+        .map(|fiber| fiber.kind == crate::fiber::FiberKind::Generator)
+        .unwrap_or(false)
+    {
+        return sum_generator(iterable, start);
+    }
     let iterator = iter::iter_new(iterable);
     if exc::pending() {
         return NONE;
@@ -761,6 +769,40 @@ pub(crate) fn sum(iterable: i64, start: i64) -> i64 {
         }
     }
     accumulator
+}
+
+/// `sum` over a generator fiber, without the iterator wrapper.
+///
+/// Mirrors [`iter::iter_next`]'s generator path: a finished fiber ends the
+/// loop (re-raising its captured exception first), a yield supplies the item.
+/// The fiber is resumed with `None`, matching iteration `send` semantics.
+fn sum_generator(generator: i64, start: i64) -> i64 {
+    let mut accumulator = start;
+    loop {
+        match crate::fiber::resume_value(generator) {
+            // Yielded: the suspension point stored the item in the fiber.
+            Some(false) => {
+                accumulator = ops::binop(
+                    ops::OP_ADD,
+                    accumulator,
+                    crate::fiber::yielded_value(generator),
+                );
+                if exc::pending() {
+                    return NONE;
+                }
+            }
+            // Finished, now or before this call.
+            Some(true) => {
+                if crate::fiber::has_error(generator) {
+                    crate::fiber::raise_error(generator);
+                    return NONE;
+                }
+                return accumulator;
+            }
+            // Unreachable: the caller checked that this is a generator fiber.
+            None => return NONE,
+        }
+    }
 }
 
 /// `enumerate(iterable, start)`: a list of `(index, value)` tuples. The
@@ -3227,6 +3269,95 @@ mod tests {
         assert_eq!(sum(int(3), int(0)), NONE);
         assert_eq!(pending_message(), "'int' object is not iterable");
         exc::init();
+    }
+
+    fn generator(entry: extern "C" fn(*const i64) -> i64) -> i64 {
+        exc::init();
+        value::fiber_generator_new(entry as usize, "gen".to_string(), Vec::new())
+            .expect("generator stack")
+    }
+
+    extern "C" fn yields_one_to_three(_argv: *const i64) -> i64 {
+        for n in 1..=3 {
+            crate::fiber::yield_value(int(n));
+        }
+        NONE
+    }
+
+    extern "C" fn yields_nothing(_argv: *const i64) -> i64 {
+        NONE
+    }
+
+    extern "C" fn yields_one_then_raises(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(int(1));
+        exc::raise_with_message(VALUE_ERROR, "boom");
+        NONE
+    }
+
+    extern "C" fn yields_text(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(string("a"));
+        NONE
+    }
+
+    #[test]
+    fn sum_of_generators() {
+        exc::init();
+        assert_eq!(
+            value::as_integer(sum(generator(yields_one_to_three), int(0))),
+            Some(6)
+        );
+        assert_eq!(
+            value::as_integer(sum(generator(yields_one_to_three), int(10))),
+            Some(16)
+        );
+        assert_eq!(
+            value::as_float(sum(generator(yields_one_to_three), value::float_new(0.5))),
+            Some(6.5)
+        );
+        assert_eq!(
+            value::as_integer(sum(generator(yields_nothing), int(7))),
+            Some(7)
+        );
+        assert!(!exc::pending());
+
+        // An exhausted generator keeps the start value and raises nothing.
+        let exhausted = generator(yields_one_to_three);
+        assert_eq!(value::as_integer(sum(exhausted, int(0))), Some(6));
+        assert_eq!(value::as_integer(sum(exhausted, int(5))), Some(5));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn sum_of_generator_propagates_errors() {
+        exc::init();
+        let failing = generator(yields_one_then_raises);
+        assert_eq!(sum(failing, int(0)), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(pending_message(), "boom");
+        exc::init();
+
+        // The captured exception re-raises on later drives, like iteration.
+        assert_eq!(sum(failing, int(0)), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::init();
+
+        assert_eq!(sum(generator(yields_text), int(0)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for +: 'int' and 'str'"
+        );
+        exc::init();
+    }
+
+    #[test]
+    fn generator_collection_is_unchanged() {
+        exc::init();
+        assert_eq!(
+            integers(list_from(generator(yields_one_to_three))),
+            vec![1, 2, 3]
+        );
+        assert!(!exc::pending());
     }
 
     #[test]

@@ -32,16 +32,16 @@ in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
 ### Test counts (canonical — update only here)
 
-`cargo test --workspace` on 2026-10-25: **1463 tests**:
+`cargo test --workspace` on 2026-10-25: **1490 tests**:
 
 | Suite | Tests |
 |---|---:|
-| runtime unit | 519 |
-| runtime integration | 195 |
-| frontend | 428 |
-| codegen | 51 |
+| runtime unit | 523 |
+| runtime integration | 201 |
+| frontend | 436 |
+| codegen | 56 |
 | IR | 18 |
-| CLI/E2E | 252 (incl. 150 E2E) |
+| CLI/E2E | 256 (incl. 154 E2E) |
 
 Other docs must link here instead of repeating the total; future agents add
 tests, so this block is the only exact count.

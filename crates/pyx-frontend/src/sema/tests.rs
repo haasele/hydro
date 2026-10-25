@@ -1956,3 +1956,197 @@ fn bigint_literals_satisfy_numeric_annotations() {
     assert!(check_errors("def f(x: int) -> int:\n    return 1152921504606846976\n").is_empty());
     assert!(check_errors("def f(x: float):\n    return x\nf(1152921504606846976)\n").is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// String-accumulator pass
+// ---------------------------------------------------------------------------
+
+/// Top-level body of the emitted `<module>` function.
+fn module_body(source: &str) -> Vec<pyx_ir::Stmt> {
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    program.functions[0].body.clone()
+}
+
+/// Body of the first top-level loop of `stmts`.
+fn loop_body(stmts: &[pyx_ir::Stmt]) -> &[pyx_ir::Stmt] {
+    stmts
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            StmtKind::While { body, .. }
+            | StmtKind::ForRange { body, .. }
+            | StmtKind::ForEach { body, .. } => Some(body.as_slice()),
+            _ => None,
+        })
+        .expect("a top-level loop")
+}
+
+fn builder_appends(stmts: &[pyx_ir::Stmt]) -> usize {
+    stmts
+        .iter()
+        .filter(|stmt| {
+            matches!(
+                &stmt.kind,
+                StmtKind::Assign { value, .. }
+                    if matches!(&value.kind, ExprKind::StrBuilderAppend { .. })
+            )
+        })
+        .count()
+}
+
+fn is_finish(stmt: &pyx_ir::Stmt) -> bool {
+    matches!(
+        &stmt.kind,
+        StmtKind::Assign { value, .. }
+            if matches!(&value.kind, ExprKind::StrBuilderFinish { .. })
+    )
+}
+
+fn is_builder_new(stmt: &pyx_ir::Stmt) -> bool {
+    matches!(
+        &stmt.kind,
+        StmtKind::Assign { value, .. }
+            if matches!(&value.kind, ExprKind::StrBuilderNew { .. })
+    )
+}
+
+/// String concatenations inside `stmts`: `s += <str>` or `s = s + <str>`.
+///
+/// Narrowed to `str` results so loop counters such as `i += 1` are not
+/// mistaken for accumulator appends; a rewritten append yields a builder
+/// (typed `Any`) and is therefore not counted either.
+fn string_additions(stmts: &[pyx_ir::Stmt]) -> usize {
+    stmts
+        .iter()
+        .filter(|stmt| match &stmt.kind {
+            StmtKind::AugAssign { op, value, .. } => *op == BinOp::Add && value.ty == Type::Str,
+            StmtKind::Assign { value, .. } => match &value.kind {
+                ExprKind::Bin { op, .. } => *op == BinOp::Add && value.ty == Type::Str,
+                _ => false,
+            },
+            _ => false,
+        })
+        .count()
+}
+
+fn all_locals(source: &str) -> Vec<pyx_ir::LocalInfo> {
+    crate::check_source(source, "test.py")
+        .expect("valid program")
+        .functions
+        .into_iter()
+        .flat_map(|function| function.locals)
+        .collect()
+}
+
+fn has_builder_local(source: &str) -> bool {
+    all_locals(source)
+        .iter()
+        .any(|local| local.name.contains("#builder") && local.ty == Type::Any)
+}
+
+#[test]
+fn module_body_accumulator_uses_the_builder() {
+    // The benchmark shape: `s += "x"` in a `while` loop, read afterwards.
+    let body = module_body(
+        "n = 3\ns = \"\"\ni = 0\nwhile i < n:\n    s += \"x\"\n    i += 1\nprint(len(s))\n",
+    );
+    let seed = body
+        .iter()
+        .position(|stmt| {
+            matches!(
+                &stmt.kind,
+                StmtKind::Assign { value, .. }
+                    if matches!(&value.kind, ExprKind::Const(pyx_ir::Const::Str(text)) if text.is_empty())
+            )
+        })
+        .expect("string seed");
+    let loop_index = body
+        .iter()
+        .position(|stmt| matches!(&stmt.kind, StmtKind::While { .. }))
+        .expect("while loop");
+    assert_eq!(builder_appends(loop_body(&body)), 1);
+    assert_eq!(string_additions(loop_body(&body)), 0);
+    // The builder is created right after the seed and finished right after
+    // the loop, before the first read.
+    assert!(is_builder_new(&body[seed + 1]));
+    assert!(is_finish(&body[loop_index + 1]));
+}
+
+#[test]
+fn function_local_accumulator_uses_the_builder() {
+    let source = "def build(n):\n    s = \"\"\n    for i in range(n):\n        s = s + str(i)\n    return s\n";
+    assert!(has_builder_local(source));
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    let function = program
+        .functions
+        .iter()
+        .find(|function| function.name == "build")
+        .expect("function build");
+    let loop_index = function
+        .body
+        .iter()
+        .position(|stmt| matches!(stmt.kind, StmtKind::ForRange { .. }))
+        .expect("for loop");
+    assert_eq!(builder_appends(loop_body(&function.body)), 1);
+    assert_eq!(string_additions(loop_body(&function.body)), 0);
+    assert!(is_finish(&function.body[loop_index + 1]));
+    assert_eq!(function.ret_ty, Type::Str);
+}
+
+#[test]
+fn multiple_accumulators_are_rewritten_independently() {
+    let source = "first = \"\"\nsecond = \"\"\nfor i in range(3):\n    first += \"a\"\n    second += \"b\"\nprint(first, second)\n";
+    let builders = all_locals(source)
+        .iter()
+        .filter(|local| local.name.contains("#builder"))
+        .count();
+    assert_eq!(builders, 2, "one hidden builder per accumulator");
+    let body = module_body(source);
+    let first_loop = loop_body(&body);
+    assert_eq!(builder_appends(first_loop), 2);
+    assert_eq!(string_additions(first_loop), 0);
+    // Both results are materialised before the first read.
+    assert_eq!(body.iter().filter(|stmt| is_finish(stmt)).count(), 2);
+}
+
+#[test]
+fn aliasing_before_the_loop_keeps_concatenation() {
+    // `t = s` escapes the seed, so the loop must keep immutable concatenation.
+    let source = "s = \"\"\nt = s\nfor _ in range(3):\n    s += \"x\"\nprint(len(s), len(t))\n";
+    assert!(!has_builder_local(source));
+    let body = module_body(source);
+    assert_eq!(string_additions(loop_body(&body)), 1);
+    assert_eq!(builder_appends(loop_body(&body)), 0);
+}
+
+#[test]
+fn conditional_append_keeps_concatenation() {
+    let source =
+        "s = \"\"\nfor i in range(4):\n    if i % 2 == 0:\n        s += \"x\"\nprint(len(s))\n";
+    assert!(!has_builder_local(source));
+    assert_eq!(builder_appends(loop_body(&module_body(source))), 0);
+}
+
+#[test]
+fn reading_the_accumulator_inside_the_loop_keeps_concatenation() {
+    let source = "s = \"\"\nwhile len(s) < 4:\n    s += \"x\"\nprint(len(s))\n";
+    assert!(!has_builder_local(source));
+    let body = module_body(source);
+    assert_eq!(string_additions(loop_body(&body)), 1);
+    assert_eq!(builder_appends(loop_body(&body)), 0);
+}
+
+#[test]
+fn accumulator_without_a_read_after_the_loop_keeps_concatenation() {
+    let source = "s = \"\"\nfor _ in range(3):\n    s += \"x\"\n";
+    assert!(!has_builder_local(source));
+    assert_eq!(builder_appends(loop_body(&module_body(source))), 0);
+}
+
+#[test]
+fn module_global_read_by_a_function_keeps_concatenation() {
+    // The per-iteration `GlobalSet` makes the accumulator observable as a
+    // module global, so the pattern must fall back.
+    let source = "s = \"\"\nfor _ in range(3):\n    s += \"x\"\ndef read():\n    return s\nprint(len(read()))\n";
+    assert!(!has_builder_local(source));
+    assert_eq!(builder_appends(loop_body(&module_body(source))), 0);
+}

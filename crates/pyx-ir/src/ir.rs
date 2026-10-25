@@ -102,6 +102,29 @@ pub enum ExprKind {
         target: LocalId,
         value: Box<Expr>,
     },
+    /// Start of a proved string accumulator: allocates a mutable builder
+    /// seeded with `init`, which must be a `str`. Emitted only by the
+    /// frontend's string-accumulator pass for a hidden local the program
+    /// never observes directly; every other `str` operation keeps using
+    /// [`ExprKind::Bin`].
+    StrBuilderNew {
+        init: Box<Expr>,
+    },
+    /// Appends `value` to the builder and yields the builder again: the
+    /// exact semantics of `accumulator = accumulator + value`, but without
+    /// copying the accumulated text. The runtime preserves `+` semantics
+    /// (including the raised `TypeError`) when `value` is not a `str`.
+    StrBuilderAppend {
+        builder: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// Ends a builder and yields the accumulated text as a normal `str`.
+    /// Generated code calls this exactly once, right after the loop; a repeated
+    /// call on an already emptied builder yields the empty string. A builder
+    /// that never received an append yields its seed.
+    StrBuilderFinish {
+        builder: Box<Expr>,
+    },
     Bin {
         op: BinOp,
         lhs: Box<Expr>,

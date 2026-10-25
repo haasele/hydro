@@ -127,6 +127,10 @@ fn declare_runtime<M: Module>(
 /// Declared runtime entry points used by the generated code.
 struct Runtime {
     str_new: FuncId,
+    /// Internal string accumulator (`StrBuilderNew/Append/Finish`).
+    str_builder_new: FuncId,
+    str_builder_append: FuncId,
+    str_builder_finish: FuncId,
     bigint_from_str: FuncId,
     bytes_new: FuncId,
     bytes_build: FuncId,
@@ -191,6 +195,8 @@ struct Runtime {
     delete_slice: FuncId,
     module_call: FuncId,
     module_call_kw: FuncId,
+    /// Fallback for the inline `math.floor(math.sqrt(int))` fast path.
+    math_floor_sqrt_int: FuncId,
     module_get: FuncId,
     module_value: FuncId,
     deferred_import: FuncId,
@@ -250,6 +256,22 @@ impl Runtime {
         let i32t = types::I32;
         Ok(Runtime {
             str_new: declare_runtime(module, "pyx_str_new", &[ptr, ptr], Some(i64t))?,
+            // String accumulator for a proved `s += ...` loop: build (seed,
+            // value) -> builder, append (builder, value) -> builder, finish
+            // (builder) -> str.
+            str_builder_new: declare_runtime(module, "pyx_str_builder_new", &[i64t], Some(i64t))?,
+            str_builder_append: declare_runtime(
+                module,
+                "pyx_str_builder_append",
+                &[i64t, i64t],
+                Some(i64t),
+            )?,
+            str_builder_finish: declare_runtime(
+                module,
+                "pyx_str_builder_finish",
+                &[i64t],
+                Some(i64t),
+            )?,
             // Decimal literal bytes (the ABI parses an optional leading `-`);
             // the result is a tagged `int` or a heap `BigInt` value.
             bigint_from_str: declare_runtime(
@@ -442,6 +464,14 @@ impl Runtime {
                 module,
                 "pyx_module_call_kw",
                 &[ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
+            // Fallback for the inline `math.floor(math.sqrt(int))` fast path:
+            // one tagged value in, one tagged value out.
+            math_floor_sqrt_int: declare_runtime(
+                module,
+                "pyx_math_floor_sqrt_int",
+                &[i64t],
                 Some(i64t),
             )?,
             // `module_len`/`name_len` are `size_t` in the ABI: pointer-width.
@@ -3327,6 +3357,29 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.builder.def_var(var, value);
                 Ok(value)
             }
+            // Internal string accumulator; the frontend only emits these for
+            // a local it proved to be a pure `s += ...` accumulator.
+            ExprKind::StrBuilderNew { init } => {
+                let init = self.lower_expr(init)?;
+                let id = self.runtime.str_builder_new;
+                self.call_rt(id, &[init])
+            }
+            ExprKind::StrBuilderAppend { builder, value } => {
+                // `s += rhs` evaluates the right-hand side before reading the
+                // target. Appending may raise (`TypeError`, `__radd__`), so
+                // the result is exception-checked.
+                let value = self.lower_expr(value)?;
+                let builder = self.lower_expr(builder)?;
+                let id = self.runtime.str_builder_append;
+                let result = self.call_rt(id, &[builder, value])?;
+                self.emit_exc_check()?;
+                Ok(result)
+            }
+            ExprKind::StrBuilderFinish { builder } => {
+                let builder = self.lower_expr(builder)?;
+                let id = self.runtime.str_builder_finish;
+                self.call_rt(id, &[builder])
+            }
             ExprKind::Bin { op, lhs, rhs } => {
                 // Both operands are evaluated left to right before the
                 // operation itself, as in Python.
@@ -3551,6 +3604,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     fn is_tagged_immediate(&mut self, value: Value) -> Value {
         let tag = self.builder.ins().band_imm(value, TAG_MASK);
         self.builder.ins().icmp_imm(IntCC::NotEqual, tag, TAG_HEAP)
+    }
+
+    /// Condition: `true` when `value` is a tagged `int` with a non-negative
+    /// payload. Bools carry the special tag, so they take the generic path.
+    fn tagged_non_negative_int(&mut self, value: Value) -> Value {
+        let tag = self.builder.ins().band_imm(value, TAG_MASK);
+        let is_int = self.builder.ins().icmp_imm(IntCC::Equal, tag, 0);
+        let non_negative = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::SignedGreaterThanOrEqual, value, 0);
+        self.builder.ins().band(is_int, non_negative)
     }
 
     /// Condition: `true` when neither operand needs the dynamic operator.
@@ -3942,6 +4007,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         args: &'a [Expr],
         keywords: &'a [(String, Expr)],
     ) -> Result<Value, CodegenError> {
+        if keywords.is_empty() {
+            if let Some(value) = self.try_lower_math_fast_path(module, function, args)? {
+                return Ok(value);
+            }
+        }
         let argv_slot = self.stack_array_slot(args.len(), "module call arguments")?;
         for (index, arg) in args.iter().enumerate() {
             let value = self.lower_expr(arg)?;
@@ -4015,6 +4085,153 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         )?;
         self.emit_exc_check()?;
         Ok(result)
+    }
+
+    /// Recognizes the statically-`int` `math` patterns that skip the module
+    /// bridge: `math.floor(math.sqrt(x))` and `math.sqrt(x)`.
+    fn try_lower_math_fast_path(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: &'a [Expr],
+    ) -> Result<Option<Value>, CodegenError> {
+        if module != "math" || args.len() != 1 {
+            return Ok(None);
+        }
+        match function {
+            "sqrt" if args[0].ty == Type::Int => self.lower_int_sqrt(&args[0]).map(Some),
+            "floor" => {
+                let ExprKind::ModuleCall {
+                    module: inner_module,
+                    function: inner_function,
+                    args: inner_args,
+                    keywords: inner_keywords,
+                } = &args[0].kind
+                else {
+                    return Ok(None);
+                };
+                if inner_module.as_str() != "math"
+                    || inner_function.as_str() != "sqrt"
+                    || !inner_keywords.is_empty()
+                    || inner_args.len() != 1
+                    || inner_args[0].ty != Type::Int
+                {
+                    return Ok(None);
+                }
+                self.lower_int_floor_sqrt(&inner_args[0]).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Lowers `math.floor(math.sqrt(x))` for a statically `int` `x` to an
+    /// unboxed `f64` sqrt/floor and a direct integer retag.
+    ///
+    /// The fast branch requires a tagged non-negative int; negatives, bools
+    /// and promoted `BigInt`s fall back to `pyx_math_floor_sqrt_int`, which
+    /// reproduces the generic path (including the domain `ValueError`).
+    fn lower_int_floor_sqrt(&mut self, arg: &'a Expr) -> Result<Value, CodegenError> {
+        let value = self.lower_expr(arg)?;
+        let fast_cond = self.tagged_non_negative_int(value);
+
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+        self.builder.ins().brif(fast_cond, fast, &[], slow, &[]);
+
+        self.switch_to(fast);
+        let n = self.untag_int(value);
+        let x = self.builder.ins().fcvt_from_sint(types::F64, n);
+        let root = self.builder.ins().sqrt(x);
+        let floored = self.builder.ins().floor(root);
+        let truncated = self.builder.ins().fcvt_to_sint(types::I64, floored);
+        // `sqrt` of a tagged int is at most `2^30`, so the floor result always
+        // fits the tagged immediate range.
+        let tagged = self.builder.ins().ishl_imm(truncated, INT_TAG_SHIFT);
+        self.builder.ins().jump(join, &[ir::BlockArg::from(tagged)]);
+        self.terminated = true;
+
+        self.switch_to(slow);
+        let id = self.runtime.math_floor_sqrt_int;
+        let fallback = self.call_rt(id, &[value])?;
+        self.emit_exc_check()?;
+        self.builder
+            .ins()
+            .jump(join, &[ir::BlockArg::from(fallback)]);
+        self.terminated = true;
+
+        self.switch_to(join);
+        self.builder
+            .block_params(join)
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                CodegenError::new("internal error: math fast path join has no parameter")
+            })
+    }
+
+    /// Lowers `math.sqrt(x)` for a statically `int` `x` to an unboxed `f64`
+    /// sqrt plus one `pyx_float_new` allocation.
+    ///
+    /// The fast branch requires a tagged non-negative int; everything else
+    /// keeps the generic `pyx_module_call` path, which boxes the float and
+    /// raises the same errors.
+    fn lower_int_sqrt(&mut self, arg: &'a Expr) -> Result<Value, CodegenError> {
+        let value = self.lower_expr(arg)?;
+        // The fallback passes the value through the ordinary argv pointer.
+        let argv_slot = self.stack_array_slot(1, "math.sqrt argument")?;
+        self.builder.ins().stack_store(value, argv_slot, 0);
+        let fast_cond = self.tagged_non_negative_int(value);
+
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+        self.builder.ins().brif(fast_cond, fast, &[], slow, &[]);
+
+        self.switch_to(fast);
+        let n = self.untag_int(value);
+        let x = self.builder.ins().fcvt_from_sint(types::F64, n);
+        let root = self.builder.ins().sqrt(x);
+        let id = self.runtime.float_new;
+        let boxed = self.call_rt(id, &[root])?;
+        self.builder.ins().jump(join, &[ir::BlockArg::from(boxed)]);
+        self.terminated = true;
+
+        self.switch_to(slow);
+        let (module_slot, module_len) = make_bytes_slot(&mut self.builder, b"math")?;
+        let module_ptr = self.builder.ins().stack_addr(self.ptr_ty, module_slot, 0);
+        let module_len = self.builder.ins().iconst(self.ptr_ty, module_len as i64);
+        let (function_slot, function_len) = make_bytes_slot(&mut self.builder, b"sqrt")?;
+        let function_ptr = self.builder.ins().stack_addr(self.ptr_ty, function_slot, 0);
+        let function_len = self.builder.ins().iconst(self.ptr_ty, function_len as i64);
+        let argc = self.builder.ins().iconst(self.ptr_ty, 1);
+        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        let id = self.runtime.module_call;
+        let result = self.call_rt(
+            id,
+            &[
+                module_ptr,
+                module_len,
+                function_ptr,
+                function_len,
+                argc,
+                argv,
+            ],
+        )?;
+        self.emit_exc_check()?;
+        self.builder.ins().jump(join, &[ir::BlockArg::from(result)]);
+        self.terminated = true;
+
+        self.switch_to(join);
+        self.builder
+            .block_params(join)
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                CodegenError::new("internal error: math fast path join has no parameter")
+            })
     }
 
     /// Lower `module` used as a value to `pyx_module_value`.
@@ -7709,6 +7926,79 @@ mod tests {
         let object =
             crate::compile_object(&program_assigning(call)).expect("keyword module call lowers");
         assert!(runtime_call_sites(&object, "pyx_module_call_kw") > 0);
+    }
+
+    /// Module body assigning `x = math.floor(math.sqrt(x))` where the argument
+    /// local has `argument_ty`.
+    fn math_floor_sqrt_program(argument_ty: Type) -> Program {
+        let argument = Expr::new(ExprKind::Local(0), argument_ty, 1);
+        let sqrt = Expr::new(
+            ExprKind::ModuleCall {
+                module: "math".to_string(),
+                function: "sqrt".to_string(),
+                args: vec![argument],
+                keywords: Vec::new(),
+            },
+            Type::Float,
+            1,
+        );
+        let floor = Expr::new(
+            ExprKind::ModuleCall {
+                module: "math".to_string(),
+                function: "floor".to_string(),
+                args: vec![sqrt],
+                keywords: Vec::new(),
+            },
+            Type::Int,
+            1,
+        );
+        let mut program = program_assigning(floor);
+        program.functions[0].locals[0].ty = argument_ty;
+        program
+    }
+
+    #[test]
+    fn math_floor_sqrt_of_int_skips_the_module_bridge() {
+        let object = crate::compile_object(&math_floor_sqrt_program(Type::Int))
+            .expect("math fast path must lower");
+        // No module dispatch and no boxed intermediate float: the unboxed
+        // f64 branch handles tagged non-negative ints, the helper the rest.
+        assert_eq!(runtime_call_sites(&object, "pyx_module_call"), 0);
+        assert_eq!(runtime_call_sites(&object, "pyx_module_call_kw"), 0);
+        assert_eq!(runtime_call_sites(&object, "pyx_float_new"), 0);
+        assert!(runtime_call_sites(&object, "pyx_math_floor_sqrt_int") > 0);
+    }
+
+    #[test]
+    fn math_floor_sqrt_of_non_int_keeps_the_module_bridge() {
+        let object = crate::compile_object(&math_floor_sqrt_program(Type::Any))
+            .expect("generic module call must lower");
+        // Both calls stay on `pyx_module_call`.
+        assert_eq!(runtime_call_sites(&object, "pyx_module_call"), 2);
+        assert_eq!(runtime_call_sites(&object, "pyx_math_floor_sqrt_int"), 0);
+    }
+
+    #[test]
+    fn math_sqrt_of_int_boxes_only_the_final_float() {
+        let argument = Expr::new(ExprKind::Local(0), Type::Int, 1);
+        let call = Expr::new(
+            ExprKind::ModuleCall {
+                module: "math".to_string(),
+                function: "sqrt".to_string(),
+                args: vec![argument],
+                keywords: Vec::new(),
+            },
+            Type::Float,
+            1,
+        );
+        let mut program = program_assigning(call);
+        program.functions[0].locals[0].ty = Type::Int;
+        let object = crate::compile_object(&program).expect("sqrt fast path must lower");
+        // One inline `pyx_float_new` for the result and one generic fallback
+        // dispatch for negatives and promoted `BigInt`s.
+        assert_eq!(runtime_call_sites(&object, "pyx_float_new"), 1);
+        assert_eq!(runtime_call_sites(&object, "pyx_module_call"), 1);
+        assert_eq!(runtime_call_sites(&object, "pyx_math_floor_sqrt_int"), 0);
     }
 
     #[test]

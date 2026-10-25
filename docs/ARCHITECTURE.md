@@ -107,6 +107,12 @@ Object kinds (stable `kind` values):
 | 14 | `Process` | 29 | `Class` |
 | 30 | `Instance` | 31 | `Fiber` |
 
+Kinds 32–37 (`ExtFunction`, `Capsule`, `Module`, `StdStream`, `BigInt`,
+`Cell`) were added after this table. Kind 38 is `StrBuilder`, the internal
+mutable string accumulator created by `pyx_str_builder_new`: it appends in
+place for a proved `s += ...` loop and `pyx_str_builder_finish` returns a
+normal `str`, so it never reaches user code.
+
 Lists/dicts/sets are insertion-ordered (sets deterministically; Python
 guarantees no order). `Iter` holds target and index. `Class` carries name,
 optional base and an immutable method table; `Instance` carries the
@@ -124,9 +130,14 @@ i64  pyx_false(void);                 // 9
 i64  pyx_bool(i64 b);                 // Truthiness -> True/False
 i64  pyx_int(i64 v);                  // identity (range check)
 i64  pyx_str_new(const uint8_t* ptr, size_t len);   // copies UTF-8
+i64  pyx_str_builder_new(i64 init);   // mutable accumulator, seeded with init
+i64  pyx_str_builder_append(i64 builder, i64 value);
+                                      // builder + value, appends a str in place
+i64  pyx_str_builder_finish(i64 builder);  // accumulated text as a str
 i64  pyx_bytes_new(const uint8_t* ptr, size_t len);
 i64  pyx_bytes_build(uint64_t argc, const i64* argv); // bytes(...)
 i64  pyx_float_new(double f);
+i64  pyx_math_floor_sqrt_int(i64 value); // floor(sqrt(int)) fast/error path
 i64  pyx_bigint_from_str(const uint8_t* ptr, size_t len); // decimal literal
 i64  pyx_binop(uint32_t op, i64 a, i64 b);          // incl. comparisons
 i64  pyx_unop(uint32_t op, i64 a);

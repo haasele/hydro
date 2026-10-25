@@ -3249,3 +3249,134 @@ fn uncaught_system_exit_and_input_eof_fail_with_a_traceback() {
         "missing EOF diagnostic:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// String accumulator (`s += ...` loop lowering)
+// ---------------------------------------------------------------------------
+
+/// The benchmark shape (`s += "x"` in a loop) plus the cases the frontend's
+/// accumulator proof must keep semantically identical: an empty loop, a
+/// `break` that keeps the partial value, two accumulators in one loop and a
+/// function-local accumulator.
+const STRING_ACCUMULATOR_SOURCE: &str = concat!(
+    "n = 20000\n",
+    "s = \"\"\n",
+    "i = 0\n",
+    "while i < n:\n",
+    "    s += \"x\"\n",
+    "    i += 1\n",
+    "print(len(s))\n",
+    "empty = \"seed\"\n",
+    "j = 0\n",
+    "while j < 0:\n",
+    "    empty += \"y\"\n",
+    "    j += 1\n",
+    "print(empty)\n",
+    "part = \"\"\n",
+    "k = 0\n",
+    "while True:\n",
+    "    if k == 5:\n",
+    "        break\n",
+    "    part += \"ab\"\n",
+    "    k += 1\n",
+    "print(part)\n",
+    "pair_a = \"\"\n",
+    "pair_b = \"\"\n",
+    "m = 0\n",
+    "while m < 3:\n",
+    "    pair_a += \"1\"\n",
+    "    pair_b += \"2\"\n",
+    "    m += 1\n",
+    "print(pair_a, pair_b)\n",
+    "def build(count):\n",
+    "    out = \"\"\n",
+    "    for index in range(count):\n",
+    "        out += str(index)\n",
+    "    return out\n",
+    "text = build(10)\n",
+    "print(len(text), text)\n",
+);
+
+const STRING_ACCUMULATOR_STDOUT: &str = "20000\nseed\nababababab\n111 222\n10 0123456789\n";
+
+fn write_string_accumulator(dir: &TestDir) -> String {
+    let program = dir.path().join("string_accumulator.py");
+    std::fs::write(&program, STRING_ACCUMULATOR_SOURCE).expect("failed to write temp program");
+    program.to_string_lossy().into_owned()
+}
+
+#[test]
+fn run_string_accumulator() {
+    let dir = TestDir::new("string-accumulator");
+    let program = write_string_accumulator(&dir);
+    let (code, stdout, stderr) = run(&["run", &program]);
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, STRING_ACCUMULATOR_STDOUT);
+}
+
+#[test]
+fn run_string_accumulator_gc_stress() {
+    let dir = TestDir::new("string-accumulator-gc");
+    let program = write_string_accumulator(&dir);
+    for env in [("PYX_GC_STRESS", "1"), ("PYX_GC_THRESHOLD", "8")] {
+        let (code, stdout, stderr) = run_with_env(&["run", &program], &[env]);
+        assert_eq!(code, 0, "pyx run failed with {env:?}: {stderr}");
+        assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+        assert_eq!(stdout, STRING_ACCUMULATOR_STDOUT);
+    }
+}
+
+#[test]
+fn run_string_accumulator_fallbacks() {
+    // Aliasing before the loop and a conditional append must keep the generic
+    // concatenation path and the exact Python values.
+    let dir = TestDir::new("string-accumulator-fallback");
+    let program = dir.path().join("fallback.py");
+    std::fs::write(
+        &program,
+        concat!(
+            "s = \"\"\n",
+            "alias = s\n",
+            "for i in range(3):\n",
+            "    s += \"x\"\n",
+            "print(s, len(alias))\n",
+            "t = \"\"\n",
+            "for i in range(5):\n",
+            "    if i % 2 == 0:\n",
+            "        t += str(i)\n",
+            "print(t)\n",
+        ),
+    )
+    .expect("failed to write temp program");
+    let program = program.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = run(&["run", &program]);
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(stdout, "xxx 0\n024\n");
+}
+
+#[test]
+fn build_string_accumulator() {
+    if !runtime_lib_present() {
+        eprintln!(
+            "skipping build_string_accumulator: libpyx_runtime.a not found next to the test \
+             profile (AOT is covered by scripts/verify.sh, which builds it first)"
+        );
+        return;
+    }
+
+    let dir = TestDir::new("build_string_accumulator");
+    let program = write_string_accumulator(&dir);
+    let binary = dir.path().join("string_accumulator");
+    let binary_arg = binary.to_string_lossy().into_owned();
+
+    let (code, stdout, stderr) = run(&["build", &program, "-o", &binary_arg]);
+    assert_eq!(
+        code, 0,
+        "pyx build failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let (code, stdout, stderr) = run_executable(&binary);
+    assert_eq!(code, 0, "AOT binary failed: {stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, STRING_ACCUMULATOR_STDOUT);
+}

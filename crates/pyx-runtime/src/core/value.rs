@@ -135,6 +135,12 @@ pub(crate) const KIND_BIGINT: u32 = 36;
 /// Mutable binding shared between a function and its nested closures
 /// (`nonlocal`). Traces the single value it currently holds.
 pub(crate) const KIND_CELL: u32 = 37;
+/// Mutable string accumulator created by the frontend's string-accumulator
+/// pass (`pyx_str_builder_new`). Internal to generated code: it never escapes
+/// to user code, and `pyx_str_builder_finish` turns it into a normal `str`.
+/// Holds native text only, plus the value of a defensive non-string
+/// concatenation as a traced edge.
+pub(crate) const KIND_STR_BUILDER: u32 = 38;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
 pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
@@ -1576,11 +1582,25 @@ pub(crate) struct ExtFunctionState {
     pub(crate) name: String,
 }
 
+/// Payload of a string accumulator ([`KIND_STR_BUILDER`]).
+pub(crate) enum StrBuilderState {
+    /// Text accumulated so far; `append` extends it in place, so the loop
+    /// stays linear instead of copying the whole prefix per iteration.
+    Building(String),
+    /// A non-string right operand forced the generic `+` path. The result of
+    /// that concatenation is stored here (and traced) until the next append
+    /// or [`str_builder_finish`]; a later string append still works, because
+    /// the generic path materialises the accumulated value first.
+    Materialized(i64),
+}
+
 #[repr(C)]
 pub(crate) enum ObjData {
     Str(String),
     Float(f64),
     Exception(ExcData),
+    /// Text accumulator for a proved `s += ...` loop ([`KIND_STR_BUILDER`]).
+    StrBuilder(StrBuilderState),
     /// Insertion-ordered list elements.
     List(Vec<i64>),
     /// Insertion-ordered `(key, value)` pairs with a hash index over the
@@ -3148,6 +3168,134 @@ pub(crate) fn cell_set(cell: i64, value: i64) {
     crate::heap::write_barrier_edge(cell, value);
 }
 
+// String accumulators (frontend string-accumulator pass)
+
+/// Seeding of a builder. The static proof guarantees a `str`; a non-string
+/// value is kept verbatim so the defensive path still ends with it.
+pub(crate) fn str_builder_new(init: i64) -> i64 {
+    let state = match as_str(init) {
+        Some(text) => StrBuilderState::Building(text.to_string()),
+        None => StrBuilderState::Materialized(init),
+    };
+    alloc(KIND_STR_BUILDER, ObjData::StrBuilder(state))
+}
+
+/// Runs `f` with exclusive access to a builder payload.
+///
+/// The caller keeps `builder` reachable (generated code holds it in a
+/// GC-scanned local) and performs no allocation, user call or safepoint
+/// inside `f` (container-guard contract).
+fn with_str_builder<R>(builder: i64, f: impl FnOnce(&mut StrBuilderState) -> R) -> Option<R> {
+    let _graph = lock_container(builder, KIND_STR_BUILDER)?;
+    // SAFETY: heap tag and kind checked under the graph lock; the calling
+    // ABI entry keeps the value rooted for the borrow.
+    let obj = unsafe { &mut *((builder & !TAG_MASK) as *mut PyxObj) };
+    match &mut obj.data {
+        ObjData::StrBuilder(state) => Some(f(state)),
+        _ => None,
+    }
+}
+
+/// The accumulated value extracted for one append/finish step.
+enum BuilderCurrent {
+    /// Text moved out of a [`StrBuilderState::Building`] payload.
+    Text(String),
+    /// A materialised tagged value; the builder still traces it until the
+    /// caller replaces the payload.
+    Value(i64),
+}
+
+/// Moves the accumulated value out of the builder, leaving an empty buffer.
+fn take_builder_value(builder: i64) -> Option<BuilderCurrent> {
+    with_str_builder(builder, |state| match state {
+        StrBuilderState::Building(buffer) => BuilderCurrent::Text(std::mem::take(buffer)),
+        StrBuilderState::Materialized(value) => BuilderCurrent::Value(*value),
+    })
+}
+
+/// Stores a generic concatenation result and publishes its GC edge.
+fn store_builder_value(builder: i64, value: i64) {
+    // A generic `+` that still produced a string keeps the fast append path
+    // (one copy) instead of degrading to one copy per iteration.
+    let state = match as_str(value) {
+        Some(text) => StrBuilderState::Building(text.to_string()),
+        None => StrBuilderState::Materialized(value),
+    };
+    let edge = match &state {
+        StrBuilderState::Materialized(value) => Some(*value),
+        StrBuilderState::Building(_) => None,
+    };
+    let Some(_graph) = lock_container(builder, KIND_STR_BUILDER) else {
+        return;
+    };
+    {
+        // SAFETY: heap tag/kind checked under the graph lock.
+        let obj = unsafe { &mut *((builder & !TAG_MASK) as *mut PyxObj) };
+        let ObjData::StrBuilder(slot) = &mut obj.data else {
+            return;
+        };
+        *slot = state;
+    }
+    // Publish the new edge while the payload stays serialised against the
+    // marker, exactly like [`cell_set`].
+    if let Some(edge) = edge {
+        crate::heap::write_barrier_edge(builder, edge);
+    }
+}
+
+/// `accumulator += value` for a proved accumulator: appends strings in place
+/// and keeps the exact `+` semantics (including the raised `TypeError`, the
+/// overflow check and `__radd__`) for anything else. Always returns the
+/// builder, which the generated code writes back to its slot.
+pub(crate) fn str_builder_append(builder: i64, value: i64) -> i64 {
+    // Fast path: no PyX allocation (and therefore no collection) happens
+    // while the buffer grows, matching `str + str` without the copy.
+    if let Some(text) = as_str(value) {
+        let appended = with_str_builder(builder, |state| match state {
+            StrBuilderState::Building(buffer) => {
+                buffer.push_str(text);
+                true
+            }
+            StrBuilderState::Materialized(_) => false,
+        });
+        if matches!(appended, Some(true)) {
+            return builder;
+        }
+    }
+    // Generic path: `ops::add` may collect, raise or call user code, so both
+    // operands and the materialised prefix are rooted for its duration.
+    let start = crate::heap::root_values(&[builder, value]);
+    let Some(current) = take_builder_value(builder) else {
+        crate::heap::release_roots(start);
+        return builder;
+    };
+    let current = match current {
+        BuilderCurrent::Text(text) => str_alloc(text),
+        BuilderCurrent::Value(value) => value,
+    };
+    let inner = crate::heap::root_values(&[current]);
+    let sum = crate::ops::add(current, value);
+    store_builder_value(builder, sum);
+    crate::heap::release_roots(inner);
+    crate::heap::release_roots(start);
+    builder
+}
+
+/// Ends a builder and returns the accumulated text as a normal `str`.
+pub(crate) fn str_builder_finish(builder: i64) -> i64 {
+    let start = crate::heap::root_values(&[builder]);
+    let Some(current) = take_builder_value(builder) else {
+        crate::heap::release_roots(start);
+        return NONE;
+    };
+    let result = match current {
+        BuilderCurrent::Text(text) => str_alloc(text),
+        BuilderCurrent::Value(value) => value,
+    };
+    crate::heap::release_roots(start);
+    result
+}
+
 /// Allocates a function value. `wrapper` is the generated entry point and
 /// must be non-zero; `name` is the Python-visible name.
 pub(crate) fn function_new(wrapper: usize, arity: usize, name: String) -> i64 {
@@ -3670,6 +3818,9 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             Some(ObjData::List(_)) => "list",
             Some(ObjData::Dict(_)) => "dict",
             Some(ObjData::Iter(_)) => "iterator",
+            // Internal accumulator: unreachable from user code, but reported
+            // as the value it will finish as.
+            Some(ObjData::StrBuilder(_)) => "str",
             Some(ObjData::Tuple(_)) => "tuple",
             Some(ObjData::Set(_)) => "set",
             Some(ObjData::Range { .. }) => "range",
@@ -3768,6 +3919,11 @@ pub(crate) fn truthy(v: i64) -> bool {
         // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
         return match unsafe { as_obj(v) }.map(|o| &o.data) {
             Some(ObjData::Str(s)) => !s.is_empty(),
+            // Internal accumulator: truthy exactly when its text is.
+            Some(ObjData::StrBuilder(state)) => match state {
+                StrBuilderState::Building(text) => !text.is_empty(),
+                StrBuilderState::Materialized(value) => truthy(*value),
+            },
             Some(ObjData::Float(f)) => *f != 0.0,
             Some(ObjData::BigInt(n)) => n.sign() != Sign::NoSign,
             Some(ObjData::Exception(_)) => true,
@@ -3866,6 +4022,11 @@ pub(crate) fn to_string(v: i64) -> String {
         if let Some(obj) = unsafe { as_obj(v) } {
             return match &obj.data {
                 ObjData::Str(s) => s.clone(),
+                // Internal accumulator: renders the text it will finish as.
+                ObjData::StrBuilder(state) => match state {
+                    StrBuilderState::Building(text) => text.clone(),
+                    StrBuilderState::Materialized(value) => to_string(*value),
+                },
                 ObjData::Float(f) => format_float(*f),
                 ObjData::BigInt(n) => n.to_string(),
                 // `str(exception)` is its message (Python behaviour).
