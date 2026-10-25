@@ -8,17 +8,23 @@ use std::ffi::OsString;
 use std::process::{Command, ExitCode};
 
 use super::build::runtime_lib_status;
+use crate::cli::args::{apply_verbosity, Verbosity};
 use crate::cli::diag;
 use crate::cli::CliError;
 
 /// Maximum characters of the C compiler's version banner that are printed.
 const VERSION_LIMIT: usize = 120;
 
-pub(crate) fn cmd_doctor(args: &[OsString]) -> Result<ExitCode, CliError> {
+pub(crate) fn cmd_doctor(args: &[OsString], verbosity: Verbosity) -> Result<ExitCode, CliError> {
     let mut json = false;
+    let mut verbosity = verbosity;
 
     for arg in args {
         let text = arg.to_string_lossy();
+        if let Some(result) = apply_verbosity(text.as_ref(), &mut verbosity, "doctor") {
+            result?;
+            continue;
+        }
         match text.as_ref() {
             "--json" => json = true,
             // Color flags are accepted for symmetry with the compiler

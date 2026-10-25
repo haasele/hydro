@@ -6,6 +6,68 @@ use std::path::PathBuf;
 use super::diag;
 use super::CliError;
 
+/// Amount of non-error status the CLI prints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Verbosity {
+    /// Suppress non-error status output.
+    Quiet,
+    Normal,
+    /// Print phase timings, cache decisions and extra command detail.
+    Verbose,
+}
+
+impl Verbosity {
+    pub(crate) fn is_quiet(self) -> bool {
+        self == Verbosity::Quiet
+    }
+
+    pub(crate) fn is_verbose(self) -> bool {
+        self == Verbosity::Verbose
+    }
+}
+
+/// Consume leading global `--verbose`/`--quiet` flags.
+pub(crate) fn parse_global(args: &[OsString]) -> Result<(Verbosity, Vec<OsString>), CliError> {
+    let mut verbosity = Verbosity::Normal;
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_string_lossy();
+        match apply_verbosity(text.as_ref(), &mut verbosity, "pyx") {
+            Some(result) => {
+                result?;
+                index += 1;
+            }
+            None => break,
+        }
+    }
+    Ok((verbosity, args[index..].to_vec()))
+}
+
+/// Applies a `--verbose`/`--quiet` flag and reports whether it was one.
+pub(crate) fn apply_verbosity(
+    text: &str,
+    verbosity: &mut Verbosity,
+    command: &str,
+) -> Option<Result<(), CliError>> {
+    let requested = match text {
+        "--verbose" => Verbosity::Verbose,
+        "--quiet" => Verbosity::Quiet,
+        _ => return None,
+    };
+    Some(match *verbosity {
+        Verbosity::Normal => {
+            *verbosity = requested;
+            Ok(())
+        }
+        current if current == requested => Ok(()),
+        _ => Err(CliError::usage(if command == "pyx" {
+            "pyx: '--verbose' and '--quiet' cannot be used together".to_string()
+        } else {
+            format!("pyx: {command}: '--verbose' and '--quiet' cannot be used together")
+        })),
+    })
+}
+
 /// Applies a diagnostic-related flag and reports whether it was one.
 ///
 /// Returns `None` for unrelated arguments; unsupported values are usage errors.
@@ -14,6 +76,9 @@ pub(crate) fn apply_diag_flag(
     options: &mut diag::Options,
     command: &str,
 ) -> Option<Result<(), CliError>> {
+    if let Some(result) = apply_verbosity(text, &mut options.verbosity, command) {
+        return Some(result);
+    }
     match text {
         "--json" => {
             options.json = true;
@@ -55,10 +120,14 @@ pub(crate) fn apply_diag_flag(
 pub(crate) fn parse_single_source(
     args: &[OsString],
     command: &str,
+    verbosity: Verbosity,
 ) -> Result<(PathBuf, diag::Options), CliError> {
     let mut file: Option<PathBuf> = None;
     let mut positional_only = false;
-    let mut options = diag::Options::default();
+    let mut options = diag::Options {
+        verbosity,
+        ..diag::Options::default()
+    };
     for arg in args {
         let text = arg.to_string_lossy();
         if !positional_only && text == "--" {
@@ -94,11 +163,15 @@ pub(crate) fn parse_single_source(
 pub(crate) fn parse_source_and_args(
     args: &[OsString],
     command: &str,
+    verbosity: Verbosity,
 ) -> Result<(PathBuf, diag::Options, Vec<String>), CliError> {
     let mut file: Option<PathBuf> = None;
     let mut program_args = Vec::new();
     let mut positional_only = false;
-    let mut options = diag::Options::default();
+    let mut options = diag::Options {
+        verbosity,
+        ..diag::Options::default()
+    };
     for arg in args {
         if file.is_some() {
             program_args.push(arg.to_string_lossy().into_owned());
@@ -129,6 +202,7 @@ pub(crate) fn parse_source_and_args(
 pub(crate) struct ProjectOptions {
     pub(crate) path: PathBuf,
     pub(crate) force: bool,
+    pub(crate) verbosity: Verbosity,
 }
 
 /// Parse `new <path> [--force]` / `init [path] [--force]`.
@@ -138,9 +212,11 @@ pub(crate) fn parse_project(
     args: &[OsString],
     command: &str,
     path_required: bool,
+    verbosity: Verbosity,
 ) -> Result<ProjectOptions, CliError> {
     let mut path: Option<PathBuf> = None;
     let mut force = false;
+    let mut verbosity = verbosity;
     let mut positional_only = false;
 
     for arg in args {
@@ -150,6 +226,10 @@ pub(crate) fn parse_project(
             continue;
         }
         if !positional_only && text.starts_with('-') && text != "-" {
+            if let Some(result) = apply_verbosity(text.as_ref(), &mut verbosity, command) {
+                result?;
+                continue;
+            }
             match text.as_ref() {
                 "--force" => {
                     force = true;
@@ -179,7 +259,11 @@ pub(crate) fn parse_project(
         }
         None => PathBuf::from("."),
     };
-    Ok(ProjectOptions { path, force })
+    Ok(ProjectOptions {
+        path,
+        force,
+        verbosity,
+    })
 }
 
 /// Parse the arguments of a command that accepts a list of paths.
@@ -197,9 +281,13 @@ pub(crate) fn parse_scan(
     args: &[OsString],
     command: &str,
     allow_check: bool,
+    verbosity: Verbosity,
 ) -> Result<ScanOptions, CliError> {
     let mut paths = Vec::new();
-    let mut diagnostics = diag::Options::default();
+    let mut diagnostics = diag::Options {
+        verbosity,
+        ..diag::Options::default()
+    };
     let mut check = false;
     let mut positional_only = false;
 
@@ -235,11 +323,19 @@ pub(crate) fn parse_scan(
     })
 }
 
-/// Parse `clean [--dry-run]`.
-pub(crate) fn parse_clean(args: &[OsString]) -> Result<bool, CliError> {
+/// Parse `clean [--dry-run]` and the global verbosity switches.
+pub(crate) fn parse_clean(
+    args: &[OsString],
+    verbosity: Verbosity,
+) -> Result<(bool, Verbosity), CliError> {
     let mut dry_run = false;
+    let mut verbosity = verbosity;
     for arg in args {
         let text = arg.to_string_lossy();
+        if let Some(result) = apply_verbosity(text.as_ref(), &mut verbosity, "clean") {
+            result?;
+            continue;
+        }
         match text.as_ref() {
             "--dry-run" => dry_run = true,
             other => {
@@ -249,7 +345,7 @@ pub(crate) fn parse_clean(args: &[OsString]) -> Result<bool, CliError> {
             }
         }
     }
-    Ok(dry_run)
+    Ok((dry_run, verbosity))
 }
 
 pub(crate) struct BuildOptions {
@@ -260,12 +356,18 @@ pub(crate) struct BuildOptions {
     pub(crate) diagnostics: diag::Options,
 }
 
-pub(crate) fn parse_build(args: &[OsString]) -> Result<BuildOptions, CliError> {
+pub(crate) fn parse_build(
+    args: &[OsString],
+    verbosity: Verbosity,
+) -> Result<BuildOptions, CliError> {
     let mut file: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut runtime_lib: Option<PathBuf> = None;
     let mut no_cache = false;
-    let mut diagnostics = diag::Options::default();
+    let mut diagnostics = diag::Options {
+        verbosity,
+        ..diag::Options::default()
+    };
     let mut positional_only = false;
     let mut index = 0;
 
@@ -336,7 +438,7 @@ pub(crate) fn parse_build(args: &[OsString]) -> Result<BuildOptions, CliError> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_source_and_args;
+    use super::{parse_source_and_args, Verbosity};
     use std::path::PathBuf;
 
     fn args(values: &[&str]) -> Vec<std::ffi::OsString> {
@@ -346,7 +448,7 @@ mod tests {
     #[test]
     fn run_forwards_arguments_after_source() {
         let (file, options, program_args) =
-            parse_source_and_args(&args(&["a.py", "--x", "-h"]), "run").unwrap();
+            parse_source_and_args(&args(&["a.py", "--x", "-h"]), "run", Verbosity::Normal).unwrap();
         assert_eq!(file, PathBuf::from("a.py"));
         assert!(!options.json);
         assert_eq!(program_args, ["--x", "-h"]);
@@ -355,14 +457,15 @@ mod tests {
     #[test]
     fn run_accepts_separator_before_source() {
         let (file, _, program_args) =
-            parse_source_and_args(&args(&["--", "a.py", "--x"]), "run").unwrap();
+            parse_source_and_args(&args(&["--", "a.py", "--x"]), "run", Verbosity::Normal).unwrap();
         assert_eq!(file, PathBuf::from("a.py"));
         assert_eq!(program_args, ["--x"]);
     }
 
     #[test]
     fn run_requires_source_file() {
-        let error = parse_source_and_args(&args(&["--json"]), "run").unwrap_err();
+        let input = args(&["--json"]);
+        let error = parse_source_and_args(&input, "run", Verbosity::Normal).unwrap_err();
         assert_eq!(error.code, 2);
         assert!(error
             .message
@@ -373,9 +476,9 @@ mod tests {
 
     #[test]
     fn run_accepts_options_before_source() {
+        let input = args(&["--json", "--color=never", "a.py", "--x"]);
         let (file, options, program_args) =
-            parse_source_and_args(&args(&["--json", "--color=never", "a.py", "--x"]), "run")
-                .unwrap();
+            parse_source_and_args(&input, "run", Verbosity::Normal).unwrap();
         assert_eq!(file, PathBuf::from("a.py"));
         assert!(options.json);
         assert_eq!(options.color, crate::cli::diag::ColorMode::Never);
@@ -384,7 +487,8 @@ mod tests {
 
     #[test]
     fn run_rejects_unsupported_option_before_source() {
-        let error = parse_source_and_args(&args(&["--bogus", "a.py"]), "run").unwrap_err();
+        let input = args(&["--bogus", "a.py"]);
+        let error = parse_source_and_args(&input, "run", Verbosity::Normal).unwrap_err();
         assert_eq!(error.code, 2);
         assert!(error
             .message

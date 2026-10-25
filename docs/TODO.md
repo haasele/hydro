@@ -1,23 +1,24 @@
 # PyX — Work Plan & ToDos
 
 Source: [PLAN.md](../PLAN.md). This document is the **only** work list.
-Status: `[ ]` open · `[~]` in progress · `[x]` done & verified · `[!]` blocked (reason follows).
+Status: `[ ]` open, scoped program · `[x]` done & verified · `[!]` blocked (reason follows).
 
 ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** 1403 tests, CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN.
+**As of 2026-10-25 (latest):** CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN. The current test count and per-crate breakdown live in [`AGENTS.md`](../AGENTS.md#current-state).
 Phase 1 is complete; Phase 2 has real lazy generators and coroutines with a
 cooperative event loop. Generator `send`/`throw`/`close`, `yield`
 expressions and `yield from` are implemented (`throw` takes exception
 instances only). Open are async generators/comprehensions, GC precision
-(P2-05/06/07) and the remaining performance work. **P4-04 is unblocked and decided:** CPython
+(P2-06/07), variable payload size classes (P2-05) and the remaining
+performance work. **P4-04 is unblocked and decided:** CPython
 3.14 development files are available, and the project follows **option B** —
 a PyX-native CPython C-API/ABI layer without embedded `libpython`; evidence and
 gates in [`docs/C_API.md`](C_API.md). The **first abi3 slice is implemented**:
 a limited-API extension (`.so`) next to the source can be imported and called
-under JIT and AOT without `libpython` (P4-04a/b partial). The
+under JIT and AOT without `libpython` (limited ABI slice; P4-04a/b). The
 **P4-09/P4-10/P4-11** program tracks full stdlib parity (297 modules),
 ecosystem suites (NumPy, pandas, pydantic, FastAPI, Django, …) and their
 benchmarks. **New in this slice:** generator `send`/`throw`/`close` and
@@ -56,10 +57,11 @@ default-GC rendering still exposes the conservative-root retention issue
 - [x] P0-08 CI (GitHub Actions): Linux x64, fmt + clippy + test + e2e.
       `.github/workflows/ci.yml`: stable Rust, Cargo cache, read-only
       permissions, concurrency cancel, `scripts/verify.sh` as the full gate.
-- [~] P0-09 Set up benchmark harness (hyperfine script, CPython baseline).
-      `benchmarks/pyx/run_micro.py` (CPython/JIT/AOT, RSS, build time) +
-      baseline/thresholds exist; a hyperfine script for the
-      existing `bench_*.py` harnesses is still missing.
+- [x] P0-09 Set up benchmark harness (hyperfine script, CPython baseline).
+      `benchmarks/pyx/run_micro.py` (CPython/JIT/AOT, RSS, build time) + the
+      tracked baseline/thresholds; `scripts/bench_hyperfine.sh` wraps the
+      existing `bench_*.py` harnesses with output validation and clean
+      skip/error behavior when hyperfine or uv is missing.
 - [x] P0-10 Error/diagnostic conventions (span, exit codes, stderr format).
       Stable codes (`PYXnnnn`), spans (`end_col`), help/hints, snippets,
       `--json` schema and exit codes 0/1/2 are implemented and tested.
@@ -68,7 +70,7 @@ default-GC rendering still exposes the conservative-root retention issue
 - [x] P0-12 License, README, versioning (SemVer from the first runnable release).
       `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `LICENSE-MIT` +
       `LICENSE-APACHE` (matching `MIT OR Apache-2.0`); version 0.1.0.
-      Tag/release process remains Q-08.
+      Tag-driven releases are Q-08.
 
 **Acceptance P0:** `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`,
 `scripts/verify.sh` green; no undocumented contracts.
@@ -103,7 +105,7 @@ exceptions and native output. No full Python compatibility yet.
 - [x] P1-15 Truthiness, `str()` conversion, `print` with `sep`/newline.
 - [x] P1-16 Exception protocol: pending exception, tags, message, uncaught traceback.
 - [x] P1-17 Frame/line tracking for tracebacks (function name, line).
-- [x] P1-18 i64 overflow behavior explicit (OverflowError); documentation of the limit.
+- [x] P1-18 Integer overflow behavior explicit: tagged immediates promote to `BigInt`; native i64 boundaries documented.
 
 ### Codegen
 - [x] P1-19 Cranelift IR generation for all IR statements/expressions.
@@ -146,29 +148,39 @@ no CPython is needed at runtime.
 - [x] P2-04 Modules: import system, builtin modules, `__name__`, module cache.
       Native modules + user modules (`import foo`, `from foo import f`) with
       cache per canonical path, cycle detection, `__name__` (`__main__` in
-      the entry file) and AOT embedding. Stdlib modules are first-class
-      values (`m = errno`, `getattr(m, name)`); module-level assignments are
-      visible inside functions via a keyed global store. Limits: user-module
-      values are rejected, only sibling `.py`, no packages/dots/relative
-      imports, no top-level side effects in imported modules, no general
-      runtime module object/`sys.modules`.
+      the entry file) and AOT embedding. Packages (`__init__.py`, dotted and
+      relative imports), site-packages resolution and one-time module
+      initializers work (P7-01). Stdlib modules are first-class values
+      (`m = errno`, `getattr(m, name)`); module-level assignments are visible
+      inside functions via a keyed global store. Limits: user-module values are
+      rejected; no general runtime module object/`sys.modules` or
+      multiple-module `from x import *` (P4-03/P7-01).
 - [ ] P2-05 Allocator: size classes, arena/chunk allocation, alignment, statistics.
-      Object registry + GC heap + fixed `PyxObj` slab/free-list allocator
-      (`gc/alloc.rs`, 64-slot chunks, stats) are present; variable payload
-      size classes remain open.
-- [~] P2-06 GC: precise roots (shadow stack/frames) before the conservative interim;
-      mark & sweep correct, then concurrent (Go-like), measure pauses.
-      A conservative, concurrent mark & sweep (edge barriers,
-      concurrent sweep, STW root snapshot/rescan) is implemented;
-      the fiber stack as well as `ctx`/`caller_ctx` (callee-saved register frames) run
-      as lifetime-registered conservative roots; at run time
-      `push_stack_bounds` overrides the stack bounds, the outermost resume publishes
-      two aux ranges.
-      Precise roots/handles/stack maps open.
-- [~] P2-07 Anchor GC safepoints + stack maps or shadow stack in codegen.
-      Safepoints at entry/backedges (every 64 iterations), conservative
-      stack scan including fiber stack bounds; precise stack maps/shadow stack
-      open.
+      Delivered: object registry + GC heap + fixed `PyxObj` slab/free-list
+      allocator (`gc/alloc.rs`, 64-slot chunks, stats). Program: variable
+      payload size classes and arena/chunk sizing driven by live-size
+      statistics. Acceptance: `tests/allocator.rs` covers size classes,
+      alignment, reuse and stats; loop benchmarks show bounded RSS; no object
+      is allocated outside the registry.
+- [ ] P2-06 GC: precise roots (shadow stack/frames) replacing the conservative interim;
+      concurrent mark & sweep, then measure pauses.
+      Delivered: a conservative, concurrent mark & sweep (edge barriers,
+      concurrent sweep, STW root snapshot/rescan). The fiber stack as well as
+      `ctx`/`caller_ctx` (callee-saved register frames) are lifetime-registered
+      conservative roots; at run time `push_stack_bounds` overrides the stack
+      bounds, and the outermost resume publishes two aux ranges. Program:
+      precise root sets for JIT/AOT frames (shadow stack or stack maps) and
+      handles, with no conservative retainer of dead values. Acceptance:
+      `tests/concurrent_gc.rs`/`stw_gc.rs` stay green under heap pressure;
+      `bench_all.py` runs at the default GC threshold; a stress program with
+      known dead temporaries does not retain them across collections.
+- [ ] P2-07 Anchor GC safepoints + stack maps or shadow stack in codegen.
+      Delivered: safepoints at entry/backedges (every 64 iterations) and
+      conservative stack scanning including fiber stack bounds. Program:
+      codegen-emitted stack maps or a shadow stack for every safepoint.
+      Acceptance: the collector reads only precise roots at safepoints;
+      P2-06's stress gate and the GC tests pass with conservative scanning
+      disabled; codegen has no unsafepoint call into allocating runtime code.
 - [x] P2-08 GC metrics (`pyx gc [--json]`), heap profiling foundation.
       `pyx gc [--json] <file.py>` runs the program like `pyx run` and
       reports collections/live_objects/threshold/pause_total_us/pause_max_us/
@@ -177,40 +189,53 @@ no CPython is needed at runtime.
       `pyx_gc_collect`, `pyx_gc_objects`. Deep heap profiling remains P5-05.
 - [x] P2-09 Classes/objects, methods, inheritance, `__init__`, attributes.
       Single-base classes with methods, `__init__`, inheritance/overrides,
-      `pyx_getattr`/`pyx_setattr`, dynamic dispatch and deterministic
-      representation. Limits: no class attributes, decorators, metaclasses,
-      multiple inheritance or descriptor protocols.
-- [~] P2-10 Generators, `yield`, closures/cell variables.
-      Closures (nested `def`, by value) and real **lazy** generators
-      (stackful fibers, `yield [value]`, bare `yield`, `return` terminates,
-      exceptions propagate, `iter`/`next`, `send`/`throw`/`close`,
-      `yield` expressions and `yield from`) are done. Open: mutable captures.
-      Generator expressions are eagerly materialized into an iterator
-      (single-pass, `next()` works; not lazy).
-- [~] P2-11 Exceptions complete: `else`, `finally`, exception hierarchy, chaining.
+      `pyx_getattr`/`pyx_setattr`, dynamic dispatch, frozen class attributes,
+      `@property`/`@classmethod`/`@staticmethod`, and deterministic
+      representation. Limits: user decorators, metaclasses, multiple
+      inheritance and the general descriptor protocol are absent (P4-02).
+- [ ] P2-10 Generators, `yield`, closures/cell variables.
+      Delivered: closures (nested `def`, by value), real **lazy**
+      generators (stackful fibers, `yield [value]`, bare `yield`, `return`
+      terminates, exceptions propagate, `iter`/`next`, `send`/`throw`/`close`,
+      `yield` expressions and `yield from`) and lazy generator expressions
+      (a synthetic generator function: the outermost iterable is evaluated at
+      creation, the remaining clauses/filters and the element run per resume,
+      and enclosing locals are capture parameters; an assignment expression
+      inside one is rejected because it would have to bind in the enclosing
+      frame). Program: mutable (cell) closure captures and `nonlocal`.
+      Acceptance: `nonlocal` mutation is shared between outer and inner
+      functions; tests cover that plus lazy generator expressions
+      (laziness/partial consumption, captures, exception propagation).
+- [x] P2-11 Exceptions complete: `else`, `finally`, exception hierarchy, chaining.
       `except Exception`/`BaseException`, tuple handlers
-      (`except (A, B) as e`) and explicit `raise ... from ...` chaining
-      (deepest-first traceback, `from None` suppression) are implemented;
-      `OSError`/`IOError` are tags. Open: implicit context chaining
-      ("During handling ...") and `except*`.
-- [~] P2-12 `async`/`await`, event loop foundation.
-      `async def` creates coroutine objects; `await`/`pyx_await` drives them,
-      `asyncio.run` drives a cooperative single-thread loop, `sleep`
-      suspends only the current fiber (blocking outside a loop),
-      `gather` starts concurrent tasks and returns the
-      results in input order (first error propagates).
-      `async for`/`async with` still use the synchronous protocol.
-      Open: async generators/comprehensions and `asyncio` beyond
-      `run`/`sleep`/`gather`.
-- [~] P2-13 Standard library core in Rust: `os`, `pathlib`, `json`, `re`, `math`,
+      (`except (A, B) as e`), explicit `raise ... from ...` and implicit
+      `__context__` chaining (`__suppress_context__`, "During handling of the
+      above exception ...") are implemented with deepest-first
+      tracebacks. `except*` remains a language-completeness item under P4-02.
+- [ ] P2-12 `async`/`await`, event loop foundation.
+      Delivered: `async def` creates coroutine objects; `await`/`pyx_await`
+      drives them, `asyncio.run` drives a cooperative single-thread loop,
+      `sleep` suspends only the current fiber (blocking outside a loop),
+      `gather` starts concurrent tasks and returns the results in input
+      order (first error propagates). Program: async generators/async
+      comprehensions, real `async for`/`async with`, and `asyncio` beyond
+      `run`/`sleep`/`gather`. Acceptance: an async generator with `asend`/
+      `athrow`/`aclose` and an `async for` over it match CPython; async
+      context managers call `__aenter__`/`__aexit__`; a task group or
+      equivalent concurrent workload runs on the loop with deterministic
+      error propagation.
+- [ ] P2-13 Standard library core in Rust: `os`, `pathlib`, `json`, `re`, `math`,
       `time`, `random`; the rest via the compatibility layer.
-      Present: `math`, `operator`, `functools.reduce`, `time`, `sys`, `json`
+      Delivered: `math`, `operator`, `functools.reduce`, `time`, `sys`, `json`
       (incl. dump/load), `os` base + remove/rename/fork/waitpid/_exit,
       `os.path`, `io` (text+bytes), `csv`, `random`, `platform`, `statistics`,
       `pathlib.Path`, `argparse` (subset), `collections.defaultdict`,
-      `re` (Rust `regex`), `socket` (TCP), `asyncio` (`run`/`sleep`/`gather`).
-      Broad CPython stdlib, TLS/UDP, non-blocking I/O, complete
-      `argparse` and pytest compatibility open.
+      `re` (Rust `regex`), `socket` (blocking TCP), `asyncio`
+      (`run`/`sleep`/`gather`). Program: the P7 module batches plus
+      TLS/UDP/non-blocking I/O, complete `argparse` and a pytest-compatible
+      runner. Acceptance: P2-13 is met when the P7 batches covering these
+      modules are green in their CPython test subsets; no module is counted
+      from import alone.
 - [ ] P2-14 Interpreter/bytecode mode for REPL and fast dev loops (optional).
 - [x] P2-15 Document and implement the threading/GIL decision.
       Decision: **no GIL**, shared heap + concurrent GC
@@ -243,36 +268,34 @@ no CPython is needed at runtime.
         memory/startup cost vs. CPython; CI thresholds.
         `threads_serial`/`threads_parallel`, `pool_serial`, `pool_parallel`,
         `pool_map`, `process_queue` are in the micro harness, in
-        `results/latest.{json,md}` and in `thresholds.json`. The thresholds
-        run locally (`scripts/check_benchmarks.py`), not in CI
-        (runner noise; Q-06).
-      - [~] P2-20f Race/stress tests, fuzzing, deadlock/shutdown behavior.
-        Concurrent GC/thread/pool stress tests and deadlock watchdogs
-        present; fuzzing (Q-03/Q-04) open.
+        `results/latest.{json,md}` and in `thresholds.json`. Thresholds are
+        enforced locally (`scripts/check_benchmarks.py`) and reported
+        non-blockingly in CI (runner noise; P5-01c/Q-06).
+      - [ ] P2-20f Race/stress tests, fuzzing, deadlock/shutdown behavior.
+        Delivered: concurrent GC/thread/pool stress tests and deadlock
+        watchdogs (`concurrent_gc.rs`, `stw_gc.rs`, `pool.rs`,
+        `native_concurrency.rs`). Program: cargo-fuzz targets for the runtime
+        and GC (Q-03/Q-04) and shutdown/panic tests. Acceptance: fuzz targets
+        run a bounded corpus in CI, find no UB/crash in 24 h of local fuzzing,
+        and shutdown leaves no live threads or unreclaimed pools.
 - [x] P2-17 Comprehensions: list/set/dict + generator expressions, multiple
       `for` clauses, `if` filters, tuple targets, shadowing without leaks.
-      Generator expressions are eagerly materialized as a list
-      (documented); function generators are lazy since P2-10.
+      List/set/dict comprehensions stay eager containers; generator
+      expressions are lazy since P2-10 (synthesized generator function over
+      the fiber ABI).
 - [x] P2-18 First-class functions: function values, lambdas (without closures for
       lambdas), indirect calls, `map`/`filter` (materialized lists);
       builtin function values (`f = int`), closure, default and
       star-parameter diagnostics.
-- [~] P2-16 Runtime unit tests + property tests for containers/GC.
-      As of 2026-10-25: 1403 tests total — 688 runtime (509 unit, 179 ABI
-      integration: among others 22 bytes, 19 IO, 18 stdlib modules, 16 stdlib
-      utils, 12 classes, 12 pathlib, 9 native concurrency, 8 CSV, 7 socket,
-      6 attrs, 6 GC, 6 JSON, 5 concurrent GC, 5 pool, 5 threads, 5 OS path,
-      5 closures, 3 STW GC, 1 JSON GC; the unit count includes the C-API shim,
-      container round-trips, generator methods and extension-value/loader
-      tests), 424 frontend, 51 codegen, 18 IR, 222 CLI/E2E (144 E2E incl.
-      the abi3 extension fixture, 24 fibers, 6 closures, 11 user modules,
-      10 exceptions, 8 completions, extension path/dotted/multi-phase,
-      2 unittest-runner, 2 stdlib-batch-a, 2 stdlib-batch-b,
-      3 stdlib-bench-batch and 5 CLI argument-parser unit tests; new suites
-      cover slice assignment, starred unpacking/calls, deferred imports,
-      exception classes as values, the package/site-packages loader and the
-      shared `rich` surface).
-      Property tests open. The CPython official-test manifest is checked offline by
+- [x] P2-16 Runtime unit tests + property tests for containers/GC.
+      The current total and per-crate breakdown are maintained in
+      [`AGENTS.md`](../AGENTS.md#current-state); do not duplicate them here.
+      Deterministic property tests use a SplitMix64 model without new
+      dependencies: `tests/container_properties.rs` (list/dict/set/tuple
+      operations vs. Vec/HashMap/HashSet models) and `tests/gc_properties.rs`
+      (randomized churn, reachable-graph tracing, allocation/collection
+      invariants, cycle reclamation). Fuzzing remains Q-03/Q-04. The CPython
+      official-test manifest is checked offline by
       `scripts/verify.sh`/CI; the full suite is a release gate.
 
 **Acceptance P2:** memory does not grow unboundedly in loop benchmarks; GC tests
@@ -284,18 +307,34 @@ cover cycles; container semantics tested against CPython behavior.
       `new`/`init` create `main.py`, `pyproject.toml`, `.gitignore`;
       add/remove/sync/lock are an unchanged passthrough to `uv`
       (`PYX_UV`), including the exit status.
-- [~] P3-02 Keep `pyproject.toml`/lockfile behavior compatible with `uv`.
-      Scaffold and passthrough present; PyX does not interpret the files,
-      uv remains the owner. Own lockfile/venv semantics open.
-- [~] P3-03 Integrate uv as a library/process; redirect interpreter selection to
-      `pyx` (`.python-version`, venv marker, `sys.executable` equivalent).
-      Process passthrough implemented; interpreter injection/venv marker/
-      `sys.executable` equivalent open.
+- [ ] P3-02 Keep `pyproject.toml`/lockfile behavior compatible with `uv`.
+      Delivered: scaffold and an unchanged uv passthrough (`add`/`remove`/
+      `sync`/`lock`); PyX does not interpret the files. Program: read
+      `pyproject.toml` for the entry point and dependency intent, honor
+      `uv.lock`/`pyproject.toml` without forking uv semantics, and document
+      which fields PyX interprets. Acceptance: a foreign project with
+      `pyproject.toml` + `uv.lock` runs via `pyx sync && pyx run`; a fixture
+      asserts that PyX and `uv` agree on the environment, with no silent
+      rewrite of project files.
+- [ ] P3-03 Integrate uv as a library/process; redirect interpreter selection to
+      `pyx` (`.python-version`, venv marker, `sys.executable`).
+      Delivered: process passthrough and a real `sys.executable`
+      (`current_exe`). Program: write a venv marker/`.python-version` that
+      makes uv select PyX instead of CPython, and inject the PyX interpreter
+      into uv-driven environments. Acceptance: after `pyx sync`, `pyx run`
+      and `uv run` in the same project use PyX (no CPython interpreter
+      needed), with the marker/version content covered by a test.
 - [x] P3-04 Build cache: hash over source + flags + runtime version, incremental.
       `.pyx/cache`, deterministic key over source, reachable
       modules, target, version and runtime archive; `--no-cache`, `pyx clean`,
       hit/invalidation tests.
 - [ ] P3-05 Reproducible builds (deterministic objects, path stripping).
+      Program: deterministic object/binary output independent of build
+      directory and timestamps, `SOURCE_DATE_EPOCH` support, and stripped
+      absolute paths (Q-10 tracks telemetry-free defaults and relies on this
+      item). Acceptance: two builds from different checkout paths and times
+      are byte-identical; the CI/local gate compares checksums; the stripping
+      logic is unit-tested.
 - [x] P3-06 `pyx test`, `pyx fmt`, `pyx lint`, `pyx check`.
       Implemented; `test` is **not** pytest-compatible (success = exit 0,
       `--json`), `fmt` only normalizes whitespace/final newline.
@@ -315,7 +354,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
 [`docs/C_API.md`](C_API.md): **option B, a PyX-native CPython ABI layer; no
 `libpython` in the production runtime.**
 
-- [~] P4-01 CPython test-suite harness and official gate.
+- [x] P4-01 CPython test-suite harness and official gate.
       **Implemented:** `scripts/stdlib_compat.py` (import matrix,
       `docs/COMPATIBILITY.md`) and `scripts/cpython_compat.py` (official
       `Lib/test/test_*.py` differential runs against the pinned CPython
@@ -338,36 +377,43 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       baseline 2026-10-25: **1/398 passing** (334 `pyx_fail`, 63
       `expected_fail` where CPython also fails; 0 timeouts). No test is marked
       passing unless CPython 3.14.9 and PyX both exit 0.
-      Run a defined subset of CPython 3.14 `Lib/test` against `pyx`, and emit a
-      machine-readable report (per test: pass/skip/fail, plus the reason).
-      Acceptance: `scripts/compat_report.py` produces a deterministic report
-      and `docs/COMPATIBILITY.md` is generated from it; no hand-written pass
-      claims. Gating: a test counts as passed only if CPython 3.14 passes it
-      too (differential oracle).
+      The harness runs a defined subset of CPython 3.14 `Lib/test` against
+      `pyx` and emits a machine-readable report (per test: pass/skip/fail,
+      plus the reason).
+      Acceptance: `scripts/stdlib_compat.py` generates
+      `docs/COMPATIBILITY.md` + `benchmarks/compat/latest.json`, and
+      `scripts/cpython_compat.py` generates `docs/CPYTHON_TESTS.md` +
+      `benchmarks/compat/cpython-3.14.9.json` and updates the manifest only
+      from real `pyx_pass` runs. Both are deterministic and offline-checkable
+      (`--check-manifest`); no hand-written pass claims. Gating: a test counts
+      as passed only if CPython 3.14.9 and PyX both exit 0. Growing the
+      manifest is P7-05/P7-06.
 - [ ] P4-02 Language completeness required by the stdlib and ecosystem.
-      Decorators (function/class, parametrised), async generators and
-      async comprehensions, `async for`/`async with` with real async
-      iterators, exception hierarchy/chaining/`except*`, descriptors,
-      properties, `__slots__`, metaclasses, pattern matching,
-      positional-only parameters, dict views, `bytearray`/`memoryview`,
-      and the full format mini-language. Arbitrary-precision integers are
-      implemented via a tagged i64 fast path plus `BigInt`; native i64
-      boundaries remain documented. `del`, loop `else`, dataclass field defaults,
-      keyword-only/`*args`/`**kwargs` binding, user `__iter__`/`__next__`
-      and the common `__dunder__` operators/`__call__`/`__str__`/`__repr__`/
-      `__len__`/`__contains__`/`__dict__`/`__new__` are implemented.
-      Open: general dynamic `*args` **and** `**kwargs` in one call,
-      other `super()` forms, native Thread subclassing, decorators and
-      full multiple inheritance.
+      Delivered: arbitrary-precision `int` (tagged i64 fast path + `BigInt`),
+      `del`, loop `else`, dataclass field defaults, keyword-only/`*args`/
+      `**kwargs` binding, class attributes and properties, user
+      `__iter__`/`__next__`, the common `__dunder__` operators and
+      `__call__`/`__str__`/`__repr__`/`__len__`/`__contains__`/`__dict__`/
+      `__new__`, and native `Thread` subclassing (including zero-argument
+      `super().__init__`).
+      Program: user decorators (function/class, parametrised),
+      `except*`, `match`, positional-only parameters, `__slots__`,
+      metaclasses, multiple inheritance, the general descriptor protocol,
+      dict views, `bytearray`/`memoryview`, the full format mini-language,
+      a single call combining dynamic `*args` **and** `**kwargs`, and the
+      remaining `super()` forms.
       Acceptance: the CPython language-feature tests in scope pass; every
       remaining deviation is listed in `docs/COMPATIBILITY.md`.
 - [ ] P4-03 Import system and module model for real packages.
-      Packages/`__init__.py`, dotted and relative imports, `sys.path`,
-      `sys.modules`, `importlib` core, `site`, `.pth`, namespace packages,
-      zip imports, frozen modules, correct circular-import behaviour, module
-      `__all__`, and top-level module execution (side effects).
+      Delivered: packages (`__init__.py`), dotted and relative imports,
+      `PYX_SITE_PACKAGES`/`VIRTUAL_ENV`/`CONDA_PREFIX`/`PYTHONPATH` search,
+      one-time module initializers, cycle diagnostics and `importlib` core
+      modules. Program: a general runtime `sys.path`/`sys.modules` model,
+      `site`/`.pth`, namespace packages, zip and frozen imports, module
+      `__all__`, and full top-level side-effect semantics.
       Acceptance: a standard venv `site-packages` tree can be imported;
-      package/relative-import fixtures pass.
+      package/relative-import fixtures pass; `sys.modules` and namespace/zip
+      fixtures behave like CPython 3.14.9.
 - [x] P4-04 C-API/ABI strategy: decision recorded (2026-10-24).
       **Option B** (PyX-native ABI shim, no `libpython` in production; CPython
       3.14 headers at build time and the CPython interpreter as differential
@@ -414,25 +460,39 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       - [ ] P4-04d GIL emulation at extension boundaries and callback safety.
         Gate: threaded extension callbacks under GC stress without
         deadlock/data race.
-- [~] P4-05 Native extension loading (`.so`) + wheel support.
-      **Implemented:** `.so` loading, sibling/`PYX_EXTENSION_PATH`/`PYTHONPATH`/
+- [ ] P4-05 Native extension loading (`.so`) + wheel support.
+      Delivered: `.so` loading, sibling/`PYX_EXTENSION_PATH`/`PYTHONPATH`/
       venv `site-packages` discovery, package submodules
       (`pkg/sub_ext.abi3.so`), wheel ABI-tag validation (`.so`, `.abi3.so`,
       `.cpython-314-<platform>.so`; other tags are compile-time errors),
       symbol resolution from the PyX shim, explicit init/ABI errors, and
-      multi-phase (`PyModuleDef_Init`) initialisation. Depends on P4-04a/b.
+      multi-phase (`PyModuleDef_Init`) initialisation. Program: unpack and
+      install `.whl` archives into a venv-like prefix, resolve
+      `*.dist-info`/RECORD paths, and import extensions from the installed
+      tree. Acceptance: an `abi3` wheel installs via the documented command
+      and imports under JIT/AOT without `libpython`; real ecosystem wheels
+      remain gated by P4-04c/d.
 - [ ] P4-06 `ctypes`/`cffi` boundaries.
       `ctypes.CDLL` on libc and `cffi` ABI-mode smoke; pointer/struct/array
       conversion rules documented. Depends on P4-04a.
-- [~] P4-07 Pickle/serialization, encoding details, numeric limits.
+- [ ] P4-07 Pickle/serialization, encoding details, numeric limits.
       PYX1 is deliberately not CPython-compatible; `bytes`/UTF-8/string escapes
-      tested; the tagged-int fast path and BigInt promotion are documented.
-      Required: CPython pickle protocols 2–5, `marshal` subset,
-      `datetime`/`decimal` encodings, and BigInt serialization (P4-02).
+      are tested; BigInt promotion is documented.
+      Program: CPython pickle protocols 2–5, a `marshal` subset and
+      `datetime`/`decimal` encodings. Acceptance: CPython-written pickles
+      round-trip for the supported types and the protocol matrix is tested;
+      every unsupported opcode/protocol is an explicit error.
+      - [x] P4-07a BigInt in PYX1: the serializer stores sign + big-endian
+        magnitude and normalizes a canonical small BigInt back to the tagged
+        form (`support/serialize.rs`; covered by the serialization tests).
 - [ ] P4-08 Compatibility matrix and support policy.
-      Generated matrix per module/library with CPython version, pass counts,
-      unsupported reasons and startup/RSS numbers. Covers stdlib (P4-09),
-      C-ABI (P4-04/05) and ecosystem suites (P4-10).
+      Delivered: a generated per-module import/status matrix
+      (`docs/COMPATIBILITY.md`) with the pinned CPython version and
+      unsupported reasons. Program: per-library and C-ABI columns plus
+      startup/RSS numbers, covering stdlib (P4-09), C-ABI (P4-04/05) and
+      ecosystem suites (P4-10). Acceptance: one reproducible matrix is
+      generated by a script, contains no hand-written cells, and a documented
+      support policy states what an importable entry guarantees.
 - [ ] P4-09 Full standard-library parity (297 CPython **3.14.9** modules).
       Split tracked in the compatibility report; no module is "done" without
       its CPython test subset. The executable module-by-module program
@@ -443,7 +503,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       - [ ] P4-09b Pure-Python stdlib: run the 174 pure-Python modules
         unmodified from a CPython 3.14 stdlib tree (PSF license, optional
         sysroot); adapt through shims, never forks; per-module test runs.
-      - [ ] P4-09c Native/extension modules (71): implement in Rust where
+      - [ ] P4-09c Native/extension modules (63): implement in Rust where
         performance/semantics matter (e.g. `_io`, `_json`, `_csv`, `_struct`,
         `_datetime`, `_decimal`, `_hashlib`, `_socket`, `_ssl`, `_sqlite3`,
         `select`, `zlib`, `_bz2`, `_lzma`, `array`, `binascii`,
@@ -488,66 +548,73 @@ ecosystem benchmarks show where PyX is faster, equal or slower than CPython
 
 ## P5 — Performance & JIT
 
-- [~] P5-01 Benchmarks vs. CPython/PyPy/Go (startup time, throughput, memory).
+- [x] P5-01 Benchmarks vs. CPython/PyPy/Go (startup time, throughput, memory).
       Readiness matrix `benchmarks/PYX.md`; PyX micro harness and baseline
-      (`benchmarks/pyx/results/latest.{json,md}`), incl. comprehensions,
-      map/filter, lambda calls, reduce, math loop, JSON dumps/loads and
-      thread/process/pool scaling. Additionally `benchmarks/bench_pyx.py`
-      (11 workloads incl. lazy generator sum and async `gather`, output-
-      equality gate) as `pyx` in `bench_all.py`. PyPy/Go comparisons open.
-- [~] P5-01a PyX adapter: run the existing `bench_*.py` with PyX as the implementation
+      (`benchmarks/pyx/results/latest.{json,md}`) cover throughput, RSS and
+      build/startup time, incl. comprehensions, map/filter, lambda calls,
+      reduce, math loop, JSON dumps/loads and thread/process/pool scaling.
+      `benchmarks/bench_pyx.py` runs 11 workloads (incl. lazy generator sum
+      and async `gather`) under CPython/JIT/AOT and is registered as `pyx` in
+      `bench_all.py`. `benchmarks/compare_engines.py` compares loop and
+      startup under CPython/PyX/PyPy/Go (Go = equivalent compiled native
+      reference) with output validation; missing engines are reported as
+      skipped, so PyPy numbers require an installed PyPy. Memory/RSS is
+      measured by the PyX micro harness; cross-engine RSS is not claimed.
+- [ ] P5-01a PyX adapter: run the existing `bench_*.py` with PyX as the implementation
       (subprocess/`PYX_BIN`), without modifying the user harnesses.
-      Micro harness `benchmarks/pyx/run_micro.py` (CPython/JIT/AOT) and
+      Delivered: micro harness `benchmarks/pyx/run_micro.py` (CPython/JIT/AOT),
       `benchmarks/bench_pyx.py` (same pure Python workloads under three
-      runners); adapter for the large harnesses still open.
-- [~] P5-01b Benchmark readiness per benchmark: loops (comprehensions/lambdas/
+      runners) and `compare_engines.py` (equivalent loop/startup scripts).
+      Program: a `PYX_BIN` adapter that runs `bench_loops.py`, `bench_csv.py`,
+      `bench_startup.py` and `bench_request_handling.py` unchanged with PyX.
+      Acceptance: each harness produces validated output through the adapter;
+      missing `PYX_BIN` is a skip, not a fabricated number.
+- [ ] P5-01b Benchmark readiness per benchmark: loops (comprehensions/lambdas/
       builtins), csv (modules/IO/with), startup (AOT/JIT subprocess),
       request (async/socket/json), fastapi (framework/C API).
-      Matrix in `benchmarks/PYX.md`; loops/startup (JIT/AOT) measurable,
-      csv partially; request has real coroutines/event loop, but no
-      non-blocking I/O yet; fastapi remains blocked by C API/decorators.
+      Delivered: matrix in `benchmarks/PYX.md`; loops and startup (JIT/AOT)
+      measurable; csv rows documented. Program: request needs non-blocking I/O
+      (P7-17/P2-13); fastapi needs decorators + C API (P4-02/P4-04c) and the
+      adapter from P5-01a. Acceptance: every matrix row has a measured,
+      output-validated CPython/PyX result or an explicit blocker with the
+      blocking item.
 - [x] P5-01c CI regression thresholds + baseline artifacts for PyX.
       Baseline artifacts + `benchmarks/pyx/thresholds.json` +
-      `scripts/check_benchmarks.py` as a local gate (deliberately not in CI,
-      runner noise); `bench_all.py` resolves its output directory absolutely,
-      AOT builds are excluded from the measured runs and
-      deviating outputs result in exit code 1. Threshold enforcement in
-      CI remains Q-06.
+      `scripts/check_benchmarks.py` (`--check`/`--update`) as a local/release
+      gate; `bench_all.py` resolves its output directory absolutely, AOT
+      builds are excluded from the measured runs and deviating outputs result
+      in exit code 1. Q-06 is resolved as local enforcement plus a
+      non-blocking CI report and deterministic harness self-tests.
 - [x] P5-01e Parallel benchmarks (after P2-20): threads/processes, scaling,
       startup cost, memory; CPython/PyX comparison.
       `threads_serial`, `threads_parallel`, `pool_serial`, `pool_parallel`,
       `pool_map`, `process_queue` (JIT/AOT/CPython, RSS/startup time).
 - [ ] P5-02 PGO + LTO for AOT. (`lto = "thin"` is set in the profile;
       PGO/LLVM LTO measurement open.)
-- [~] P5-03 Inlining, constant folding, escape analysis, devirtualization.
-      Constant folding (int/float/str/binops/comparisons/unary, overflow- and
-      zero-division-protected), dead `if`/`while False` and typed
-      int fast paths (`+`/`-`/`*`, comparisons, AugAssign, fully
-      int-typed `for range` counters; checked overflow →
-      `pyx_binop` slow path) are implemented. Native module calls resolve
-      through a thread-local spec cache (no name allocations, no table scan);
-      `math_loop` moved from 0.81x to parity (AOT 1.01x, JIT 0.94x at
-      n=200000) and to 2.2x end-to-end in the 50k micro harness
-      (AOT 6.2 ms vs CPython 13.6 ms). Measured (release, n=200000):
-      while_sum 7.7x JIT / 12.4x AOT versus CPython,
-      for_range_sum 6.4x/8.0x. The x86_64 fiber switch is a
-      register-only `global_asm!` switch without syscalls; a
-      100k generator sum runs in release with CPython 10.2 / JIT 7.7 / AOT
-      6.8 ms (`strace -c`: 94 syscalls total). Inlining/escape analysis/
-      devirtualization and float boxing remain open; safepoints at backedges
-      remain measurable.
-- [~] P5-04 GC tuning based on measurements (pauses, allocation rate).
-      Growth-based threshold, relaxed-safepoint fast path,
+- [ ] P5-03 Inlining, constant folding, escape analysis, devirtualization.
+      Delivered: constant folding (int/float/str/binops/comparisons/unary,
+      overflow- and zero-division-protected), dead `if`/`while False`, typed
+      int fast paths (`+`/`-`/`*`, comparisons, AugAssign, fully int-typed
+      `for range` counters; checked overflow → `pyx_binop` slow path), native
+      module dispatch through a thread-local spec cache, and the
+      register-only x86_64 fiber switch. Measured (release, n=200000):
+      `math_loop` parity (AOT 1.01x, JIT 0.94x), while_sum 7.7x/12.4x,
+      for_range_sum 6.4x/8.0x; 100k generator sum CPython 10.2 / JIT 7.7 /
+      AOT 6.8 ms. Program: an inliner, escape analysis/devirtualization and
+      unboxed floats. Acceptance: each optimization is behind a measurement
+      that shows a gain without correctness regressions; no optimization
+      claim without a tracked result.
+- [ ] P5-04 GC tuning based on measurements (pauses, allocation rate).
+      Delivered: growth-based threshold, relaxed-safepoint fast path,
       edge barriers, concurrent sweep, `PYX_GC_STATS`, `gc_stats()`/
-      `GcStats` and `pyx gc [--json]` provide pause/mark/sweep times.
-      The dict hash index lowers insert/lookup costs (dict_insert AOT 2.1 ms
-      vs. CPython 12.7 ms). Fiber `ctx`/`caller_ctx` are
-      lifetime-registered roots; shared mode mirrors the two aux ranges,
-      local mode gets by without atomics per switch. The address index uses a
-      fast non-cryptographic hasher and the local sweep rebuilds it in place
-      with reused capacity (300k-short-lived-list AOT: 44.95 → 40.91 ms
-      median, ≈9%). Precise roots/allocator (P2-05/06) and pause tuning
-      remain open.
+      `GcStats` and `pyx gc [--json]` pause/mark/sweep times; dict hash
+      index; fiber `ctx`/`caller_ctx` lifetime roots; a fast non-cryptographic
+      address hasher and in-place sweep rebuild (300k-short-lived-list AOT:
+      44.95 → 40.91 ms median, ≈9%). Program: pause/allocation-rate targets
+      driven by the P2-05/P2-06 precise allocator and roots, including
+      safepoint frequency at backedges. Acceptance: a documented pause/RSS
+      budget is met on the tracked micro harness at default settings, with
+      before/after measurements.
 - [ ] P5-05 Profiling (CPU/heap) + trace integration.
 - [ ] P5-06 JIT decision **only** with measurement data; otherwise discard.
 - [ ] P5-07 If JIT: LLVM ORC or Cranelift, tiering, deopt strategy.
@@ -557,51 +624,67 @@ ecosystem benchmarks show where PyX is faster, equal or slower than CPython
 ## Cross-cutting (parallel, permanent)
 
 - [ ] Q-01 Debugger integration (DAP), source maps/DWARF.
-- [~] Q-02 Python-like tracebacks incl. chained exceptions; stable error codes.
-      Simplified tracebacks, stable codes and explicit `raise ... from`
-      chaining (deepest-first, cycle-guarded) are present. Open: implicit
-      context chaining and fuller frame stacks.
+- [x] Q-02 Python-like tracebacks incl. chained exceptions; stable error codes.
+      Simplified tracebacks, stable codes, explicit `raise ... from`
+      (deepest-first, cycle-guarded) and implicit `__context__` chaining
+      (with `__suppress_context__` and "During handling ...") are present
+      (P2-11). Frame fidelity is function/line-level; full CPython frame
+      objects are not claimed.
 - [ ] Q-03 Fuzzing: parser, lowering, codegen (cargo-fuzz).
 - [ ] Q-04 Fuzzing: runtime/GC (allocation/object operations).
 - [ ] Q-05 Security review of `unsafe` code; policy in ARCHITECTURE.md.
       `unsafe` is encapsulated and justified in GC/ABI; formal review open.
-- [ ] Q-06 Performance regression CI (thresholds).
+- [x] Q-06 Performance regression CI (thresholds).
+      Owned by P5-01c: threshold enforcement is local/release-only
+      (`scripts/check_benchmarks.py --check`), CI validates the tracked
+      baseline as a non-blocking report (`continue-on-error`) and runs
+      `scripts/test_check_benchmarks.py`. Shared-runner timing never fails CI.
 - [x] Q-07 Documentation: language scope, CLI, architecture, contribution.
-      README/ARCHITECTURE/LAYOUT/C_API/TODO/AGENTS/CHANGELOG updated;
-      CLI reference/diagnostic catalog remain P6-09.
-- [~] Q-08 Release process, changelog, SemVer.
+      README/ARCHITECTURE/LAYOUT/C_API/DIAGNOSTICS/TODO/AGENTS/CHANGELOG
+      updated; P6-09 owns the remaining troubleshooting/migration text.
+- [x] Q-08 Release process, changelog, SemVer.
       Changelog (Unreleased/0.1.0) and SemVer scheme documented;
-      tag/release process open.
+      `.github/workflows/release.yml` runs the tests on a `v*` tag, builds
+      `--locked`, packages/checksums/smoke-tests the Linux x64 JIT/AOT artifact and
+      publishes it with the automatic `GITHUB_TOKEN` (no repository secrets).
+      Artifacts for other platforms remain Q-09.
 - [ ] Q-09 Cross-platform (macOS, Windows, aarch64) — after Linux stability.
-- [~] Q-10 Telemetry-free defaults; build reproducibility.
-      No telemetry; reproducible builds (P3-05) open.
+- [ ] Q-10 Telemetry-free defaults; build reproducibility.
+      No telemetry is emitted. Reproducible builds are owned by P3-05; this
+      item closes with that acceptance plus a check that no network/telemetry
+      call exists in the runtime/CLI.
 
 ## P6 — Polishing & developer experience (cargo-like)
 
 Goal: `pyx` should feel like a single, complete tool — not like
 a collection of scripts. Errors are first-class products, not an afterthought.
 
-- [~] P6-01 First-class diagnostics: stable codes (`PYXnnnn`), spans,
+- [x] P6-01 First-class diagnostics: stable codes (`PYXnnnn`), spans,
   source snippets with carets, help/hints (did-you-mean), multiple errors,
   summary and consistent exit codes.
-      Codes/spans/snippets/help/summary/exit codes implemented;
-      sema carets are partly 1 character, ICE path not yet tested.
+      Codes/spans/snippets/help/summary/exit codes are implemented; semantic
+      diagnostics now carry multi-character expression spans
+      (`sema::simple_expr_end` + `check_spans_multichar_expression`), and the
+      ICE path is covered by unit/E2E tests (P6-05/P6-08).
 - [x] P6-02 Machine-readable diagnostics: `--json`/message format with a stable
   schema (file/line/col/end_col/code/message/help) — implemented & tested.
-- [~] P6-03 Unified CLI UX: `new`, `init`, `check`, `run`, `build`, `test`,
+- [x] P6-03 Unified CLI UX: `new`, `init`, `check`, `run`, `build`, `test`,
   `fmt`, `lint`, `clean`, `doctor`, `add`, `remove`, `sync`, `lock` from one
   binary; clear help, `--verbose`/`--quiet`, `--color`.
-      All named subcommands, help, `--color`/`--json` and defined
-      exit codes are implemented. **Open:** `--verbose`/`--quiet`.
-- [~] P6-04 Build cache & incremental builds (`.pyx/cache`), reproducible,
-  cache invalidation via source + flags + runtime version.
-      Cache incl. module tree fingerprint, `--no-cache`, `pyx clean` and
-      hit/invalidation tests implemented. Reproducible binaries
-      (deterministic objects/path stripping) remain P3-05.
-- [~] P6-05 ICE handling: internal panics as `internal compiler error` with
+      All named subcommands, help, `--color`/`--json`, global/per-command
+      `--verbose`/`--quiet` (conflict → exit 2) and defined exit codes are
+      implemented and covered in `crates/pyx-cli/tests/e2e.rs`.
+- [x] P6-04 Build cache & incremental builds (`.pyx/cache`), cache
+  invalidation via source + flags + runtime version.
+      Owned by P3-04: cache incl. module tree fingerprint, compiler
+      fingerprint, `--no-cache`, `pyx clean` and hit/invalidation tests.
+      Reproducible binaries are P3-05.
+- [x] P6-05 ICE handling: internal panics as `internal compiler error` with
   version/target/hint, exit code 2, `RUST_BACKTRACE` hint; no panics
-  on user input (fuzzing P6-08).
-      `catch_unwind` + ICE banner; regression test open.
+  on user input (fuzzing tracked in Q-03/Q-04).
+      `catch_unwind` + ICE banner are covered by
+      `main.rs::panic_maps_to_an_ice_without_the_payload`; the payload is
+      never printed.
 - [x] P6-06 Project scaffolding/templates (`pyx new`, `pyx init`) so that a
   project is ready to go without third-party tools; `pyproject.toml` compatibility.
       Scaffold (`main.py`, `pyproject.toml`, `.gitignore`) with `--force`
@@ -612,15 +695,27 @@ a collection of scripts. Errors are first-class products, not an afterthought.
       `docs/pyx.1` is the roff manpage; `pyx --version --verbose` prints
       version, target, backend and runtime version. Tests in
       `crates/pyx-cli/tests/completions.rs`.
-- [~] P6-08 Diagnostic regression tests: codes, spans, JSON schema, colors/
+- [x] P6-08 Diagnostic regression tests: codes, spans, JSON schema, colors/
   TTY behavior, exit codes, ICE path.
-      E2E covers human/JSON/color/doctor/caret/syntax code; ICE and
-      detail-span tests open.
-- [~] P6-09 Documentation: CLI reference, diagnostic catalog, troubleshooting guide,
+      E2E covers human/JSON/color/doctor/caret/syntax code, the multi-character
+      expression span (`check_spans_multichar_expression`) and the ICE
+      classification unit test.
+- [ ] P6-09 Documentation: CLI reference, diagnostic catalog, troubleshooting guide,
   migration from CPython.
-      README/ARCHITECTURE/LAYOUT/C_API/TODO updated; a dedicated
-      CLI reference/diagnostic catalog open.
+      Delivered: `docs/DIAGNOSTICS.md` (codes, spans, JSON schema, CLI flags,
+      exit codes) and the `docs/pyx.1` CLI reference. Program: a troubleshooting
+      section (common failures → checks) and a CPython migration scope
+      (supported subset, known deviations, where each is tracked). Acceptance:
+      every documented command/flag matches `pyx --help`; every emitted
+      `PYXnnnn` code appears in the catalog; a reader can migrate a small
+      CPython script without consulting source.
 - [ ] P6-10 Build feedback: timing, `--verbose`, progress, exit-code summary.
+      Delivered: `--verbose` phase timings and cache decisions for `run` and
+      `build`; `--quiet` suppresses status output. Program: progress reporting
+      for long operations and a final exit-code summary for multi-file
+      commands (`test`/`lint`). Acceptance: long builds/tests show progress
+      without `--verbose`; the summary reports counts and the exit code
+      matches the process status.
 
 **Acceptance P6:** a user can initialize, build, run and diagnose a project with
 `pyx` without knowing other tools; every error class has a
@@ -632,7 +727,7 @@ Goal: the CPython 3.14.9 standard library works on the PyX runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
 from it). Status 2026-10-25: **60/297 modules importable**, **237 missing**
-(39 builtin/frozen, 133 pure Python, 59 extension, 8 unknown/platform),
+(39 builtin/frozen, 131 pure Python, 59 extension, 8 unknown/platform),
 with 9 modules where CPython 3.14.9 itself fails on this host.
 
 The package/site-packages loader (P7-01) is in place: packages with
@@ -661,17 +756,19 @@ goal P4-09; P4-09 keeps the policy and the dependency on P4-03/P4-04.
 
 ### Workstreams
 
-- [~] P7-01 Import and package foundation: packages with `__init__.py`,
+- [ ] P7-01 Import and package foundation: packages with `__init__.py`,
       dotted and relative imports, `sys.path`/`sys.modules` handling,
-      namespace packages, frozen modules, circular imports, and top-level
-      module execution (import side effects). Depends on P4-03.
+      namespace packages, frozen modules and circular imports. Depends on P4-03.
       **Delivered:** packages (dotted names, submodules, relative imports),
       the search path (sibling files, package-chain root, `PYX_SITE_PACKAGES`,
       `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages, `PYTHONPATH`), load-once per
       canonical path, cycle diagnostics for module-level import cycles, and
-      imported module bodies as one-time initializers. **Open:** namespace
-      packages, frozen modules, a general `sys.path`/`sys.modules` runtime
-      model and multiple-module `from x import *`.
+      imported module bodies as one-time initializers.
+      **Program:** namespace packages, frozen modules, a general
+      `sys.path`/`sys.modules` runtime model and multiple-module
+      `from x import *`. Acceptance: namespace/zip/frozen fixtures import as
+      on CPython 3.14.9; `sys.modules` reflects loaded units and can be
+      inspected; `from pkg import *` honors `__all__`.
 - [ ] P7-02 Pure-Python stdlib source and shim pipeline: consume the CPython
       3.14 stdlib tree unmodified (PSF license, optional sysroot), resolve
       imports through PyX shims, never fork sources; per-module provenance
@@ -681,26 +778,51 @@ goal P4-09; P4-09 keeps the policy and the dependency on P4-03/P4-04.
       `itertools`, `marshal`, `_io`, `_abc`, `gc`, `atexit`, `faulthandler`,
       `site`, `_codecs`, `_sre`, `_thread`-adjacent gaps — the baseline every
       other batch imports.
+      Delivered: `sys`, `itertools`, `abc`, `typing`, `types`, `enum`,
+      `__future__`, `_io`, `_operator`, `_functools`, `_stat`, `_bisect`,
+      `_heapq` are importable; `sys` lacks `path`/`modules`. Program: the
+      remaining import/lib shims above, enough to import the pure-Python
+      batches.
 - [ ] P7-04 Extension modules in Rust: implement or back with Rust where
       semantics/performance matter (`_socket`, `_ssl`, `_hashlib`, `zlib`,
       `_json`, `_csv`, `_struct`, `_datetime`, `_decimal`, `_sqlite3`,
       `select`, `array`, `binascii`, `unicodedata`); pure-Python fallbacks
       only where the semantics allow; explicit unsupported list otherwise.
+      Delivered in Rust: `_bisect`, `_heapq`, `_stat`, `_operator`,
+      `_functools`, `_io`, `binascii`, plus the native `math`/`json`/`csv`/
+      `re`/`socket` surfaces. Program: the remaining extension modules and
+      their CPython test subsets.
 - [ ] P7-05 Per-module CPython test integration: map every module to its
       `Lib/test/test_*.py` subset, run it through the P4-01 differential
       harness, record `pyx_pass`/`expected_fail` only from real runs, and
       fail the gate on regressions.
+      Delivered: the differential harness, manifest and `--check-manifest`
+      gate exist, and `scripts/stdlib_compat.py --tests` is the hook.
+      Program: the per-module mapping and a regression gate at batch
+      granularity. Acceptance: each importable module has a mapped subset and
+      a recorded status; a previously green subset that regresses fails the
+      gate.
 - [ ] P7-06 Dependency batches and reporting: keep the batch order below
       current, regenerate the matrix after every batch, and report per
       module (importable, tests green, unsupported reason) in
       `docs/COMPATIBILITY.md` and `docs/CPYTHON_TESTS.md`.
+      Delivered: dependency-ordered batches and the generated import matrix.
+      Program: add the tests-green column per module and regenerate both
+      reports after each batch. Acceptance: the two generated reports agree
+      on every module's status and the batch list stays dependency-ordered.
 
 ### Batches (dependency-ordered)
 
-Each module below is assigned to exactly one batch; 33 ledger entries are
-importable now, 231 remain open and 8 are platform-blocked. Later
+Each module below is assigned to exactly one batch; 35 ledger entries are
+importable now, 229 remain open and 8 are platform-blocked. Later
 batches may start only when their prerequisites are importable; the module
 ledger below is the per-layer checklist that tracks the actual work.
+The benchmark-critical batch (P7-22) owns `tempfile`, `shutil` and `textwrap`;
+its `subprocess` and `timeit` members are counted in Batches D/F.
+Batch acceptance (applies to every `[ ]` batch): each listed module imports
+through `pyx`, its representative API matches CPython 3.14.9, and its mapped
+`Lib/test/test_*.py` subset (P7-05) is green — or the module is explicitly
+listed as unsupported with a reason.
 
 - [x] P7-10 Batch A — 11 modules: simple native primitives. No dependencies;
       establishes the native-module pattern for later batches.
@@ -731,19 +853,20 @@ ledger below is the per-layer checklist that tracks the actual work.
       `_bisect`, `bisect`, `_heapq`, `heapq`, `colorsys`, `keyword`,
       `_stat`, `stat`, `_operator`, `_functools`, `_io`
 
-- [~] P7-11 Batch B — 25 modules: text, string and shell utilities. The
+- [ ] P7-11 Batch B — 23 modules: text, string and shell utilities. The
       self-contained native codec/text core is done; the rest needs the
       pure-Python source pipeline (P7-02) and the `_string` shim (P7-03).
-      Native core done: `binascii`, `base64`, `quopri`, `fnmatch`,
-      `getopt`, `mimetypes`.
-      Remaining (ledger entries are checked for the native core):
+      Importable now (7/23): `binascii`, `base64`, `quopri`, `fnmatch`,
+      `getopt`, `mimetypes`, `html`.
+      Remaining (ledger entries are checked for importable + API):
       `string`, `_string`, `stringprep`, `glob`, `filecmp`, `fileinput`,
-      `shlex`, `reprlib`, `pprint`, `difflib`, `linecache`, `html`,
+      `shlex`, `reprlib`, `pprint`, `difflib`, `linecache`,
       `_markupbase`, `cmd`, `mailbox`, `email`, `wave`
 
-- [~] P7-12 Batch C — 45 modules: import, builtins and object model. Needs P7-01;
-      unblocks every remaining batch. Importable now (7/45): `abc`,
-      `itertools`, `types`, `typing`, `enum`, `importlib`, `__future__`.
+- [ ] P7-12 Batch C — 45 modules: import, builtins and object model. Needs P7-01;
+      unblocks every remaining batch. Importable now (8/45): `abc`,
+      `itertools`, `types`, `typing`, `enum`, `importlib`, `__future__`,
+      `contextlib`.
       Remaining (ledger entries start unchecked):
       `_abc`, `_codecs`, `_collections`, `_collections_abc`,
       `_frozen_importlib`, `_frozen_importlib_external`, `_imp`, `_sre`,
@@ -751,11 +874,11 @@ ledger below is the per-layer checklist that tracks the actual work.
       `_py_warnings`, `_weakref`, `_weakrefset`, `_py_abc`, `atexit`,
       `builtins`, `codecs`, `encodings`, `faulthandler`, `gc`,
       `runpy`, `site`, `_sitebuiltins`, `zipimport`,
-      `warnings`, `weakref`, `copy`, `contextlib`,
+      `warnings`, `weakref`, `copy`,
       `pkgutil`, `modulefinder`, `_suggestions`, `_colorize`,
       `sre_compile`, `sre_constants`, `sre_parse`
 
-- [~] P7-13 Batch D — 24 modules: filesystem and process. Needs P7-01/P7-03
+- [ ] P7-13 Batch D — 24 modules: filesystem and process. Needs P7-01/P7-03
       (`posix`, `genericpath`). `subprocess` is done as part of the
       benchmark-critical batch; the remaining modules need the import
       foundation.
@@ -765,7 +888,7 @@ ledger below is the per-layer checklist that tracks the actual work.
       `_pyio`, `fcntl`, `grp`, `resource`, `pty`, `tty`, `termios`,
       `select`, `selectors`, `syslog`, `mmap`, `sched`, `webbrowser`
 
-- [~] P7-14 Batch E — 42 modules: data formats, datetime, serialization and
+- [ ] P7-14 Batch E — 42 modules: data formats, datetime, serialization and
       numerics. Uses the implemented BigInt type and P7-04 for
       `_json`/`_struct`/`_pickle`/`_csv`. Importable now (3/42):
       `dataclasses` and `datetime` (native module specs, with frontend
@@ -780,7 +903,7 @@ ledger below is the per-layer checklist that tracks the actual work.
       `_csv`, `_pickle`, `array`, `cmath`, `graphlib`, `xml`,
       `_elementtree`, `pyexpat`, `_random`
 
-- [~] P7-15 Batch F — 39 modules: introspection, REPL and developer tooling.
+- [ ] P7-15 Batch F — 39 modules: introspection, REPL and developer tooling.
       Needs C (import) and code-object metadata. `timeit` is done as part
       of the benchmark-critical batch; `ast` is importable now (2/39).
       Remaining (ledger entries start unchecked):
@@ -806,7 +929,7 @@ ledger below is the per-layer checklist that tracks the actual work.
       `imaplib`, `poplib`, `smtplib`, `socketserver`, `wsgiref`, `xmlrpc`,
       `_socket`, `_ssl`, `ssl`
 
-- [ ] P7-18 Batch I — 11 modules: compression and archives. Needs P7-04 (`zlib`,
+- [ ] P7-18 Batch I — 10 modules: compression and archives. Needs P7-04 (`zlib`,
       `_bz2`, `_lzma`, `_zstd`). `binascii` is implemented in Batch B and is
       not repeated here.
       Modules (remaining; all `[ ]` in the ledger):
@@ -829,20 +952,19 @@ ledger below is the per-layer checklist that tracks the actual work.
       `_codecs_kr`, `_codecs_tw`, `_multibytecodec`, `_tkinter`, `tkinter`,
       `turtle`, `turtledemo`, `unicodedata`
 
-- [x] P7-22 Benchmark-critical batch — 5 modules used by
+- [ ] P7-22 Benchmark-critical batch — 5 modules used by
       `benchmarks/bench_all.py` and the bench scripts: `subprocess`,
-      `tempfile`, `shutil`, `textwrap`, `timeit`. Gate (under CPython): all
-      five import and their benchmark-used APIs pass; the full
-      `bench_all.py` completes. Running `bench_all.py` itself under PyX now
-      also completes when `PYX_GC_THRESHOLD` is raised: the official pure-Python
-      `rich` package renders console/table/panel/rule, a native
-      `rich.status.Status` shim provides the progress context manager, and
-      the AOT report is written. The default conservative GC still needs
-      precise roots for heavier rich rendering.
-      `bench_pyx.py` runs under CPython and drives `pyx run`/`pyx build`
-      over embedded workloads; the harness scripts themselves are not PyX
-      targets in this gate. The remaining `rich` work is P4-02/P7-01.
-      Modules: `subprocess`, `tempfile`, `shutil`, `textwrap`, `timeit`.
+      `tempfile`, `shutil`, `textwrap`, `timeit`.
+      Delivered: all five import and their benchmark-used APIs pass under
+      CPython; `bench_all.py` completes under PyX when `PYX_GC_THRESHOLD` is
+      raised (official pure-Python `rich` renders console/table/panel/rule, a
+      native `rich.status.Status` shim provides the progress context manager,
+      and the AOT report is written). `bench_pyx.py` runs under CPython and
+      drives `pyx run`/`pyx build` over embedded workloads.
+      Program: the full `bench_all.py` completes under PyX at the **default**
+      GC threshold. Acceptance: `pyx run benchmarks/bench_all.py` without
+      `PYX_GC_THRESHOLD` writes the complete report; the fix belongs to
+      P2-06/P2-07 precise roots, not to a threshold workaround.
 
 - [ ] P7-21 Batch L — 13 modules: platform-specific modules. The 8
       Windows/Apple-only modules are `[!]` unsupported on Linux; the 5
@@ -854,17 +976,22 @@ ledger below is the per-layer checklist that tracks the actual work.
 
 ### Module ledger (272 originally missing)
 
-Derived from the 272-module baseline in `benchmarks/compat/latest.json`.
-33 entries are checked; `[x]` means importable (plus representative-API
-testing where the batch notes say so), not CPython test-subset parity
-(P7-05). The 11 newly checked entries (`abc`, `itertools`, `types`,
-`typing`, `enum`, `importlib`, `__future__`, `ast`, `dataclasses`,
-`datetime`, `fractions`) are checked from real `latest.json` imports. `[!]`
+Derived from the 272-module baseline in `benchmarks/compat/latest.json`
+(the modules already importable at the baseline are not listed). 35 entries
+are checked; `[x]` means importable plus representative-API testing where the
+batch notes say so, not CPython test-subset parity (P7-05). The checked
+entries are the import/API slices delivered by Batches A/B/benchmark, the
+native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
+`importlib`/`__future__` modules, and `html`/`contextlib`. `[!]`
 marks a module CPython ships only for a
 platform PyX does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
-#### Builtin / frozen (46)
+Current matrix: 60/297 importable, 237 missing (39 builtin/frozen, 131 pure,
+59 extension, 8 platform). The ledger is the work list for the 237 missing;
+checked entries count as delivered slices, not as complete parity.
+
+#### Builtin / frozen (46: 7 importable, 39 open)
 
 - [ ] `_abc`
 - [ ] `_ast`
@@ -913,7 +1040,7 @@ platform-unsupported rather than implemented.
 - [x] `stat`
 - [ ] `zipimport`
 
-#### Pure Python (156)
+#### Pure Python (156: 25 importable, 131 open)
 
 - [x] `__future__`
 - [ ] `_aix_support`
@@ -953,7 +1080,7 @@ platform-unsupported rather than implemented.
 - [ ] `compression`
 - [ ] `concurrent`
 - [ ] `configparser`
-- [ ] `contextlib`
+- [x] `contextlib`
 - [ ] `contextvars`
 - [ ] `copy`
 - [ ] `copyreg`
@@ -984,7 +1111,7 @@ platform-unsupported rather than implemented.
 - [ ] `hashlib`
 - [x] `heapq`
 - [ ] `hmac`
-- [ ] `html`
+- [x] `html`
 - [ ] `http`
 - [ ] `idlelib`
 - [ ] `imaplib`
@@ -1072,7 +1199,7 @@ platform-unsupported rather than implemented.
 - [ ] `zipfile`
 - [ ] `zoneinfo`
 
-#### Extension (62)
+#### Extension (62: 3 importable, 59 open)
 
 - [ ] `_asyncio`
 - [x] `_bisect`
@@ -1148,10 +1275,12 @@ platform-unsupported rather than implemented.
 - [!] `winreg`
 - [!] `winsound`
 
-**Acceptance P7:** all 272 ledger entries are either checked with green
-per-module CPython test runs, or explicitly documented as
-platform-unsupported; the generated compatibility matrix shows the same
-numbers; no module is declared done on import alone.
+**Acceptance P7:** all 272 ledger entries are accounted for, and every
+297/297 module is either parity — importable, representative API matching
+CPython 3.14.9, and its mapped `Lib/test/test_*.py` subset green — or
+documented platform-unsupported. `[x]` in the ledger marks the import/API
+slice only; parity is decided by P7-05, never by an import alone. The
+generated compatibility matrix must show the same status and counts.
 
 ## Risks / open decisions
 
@@ -1163,17 +1292,16 @@ numbers; no module is declared done on import alone.
 - R2: tagged-int fast path plus BigInt promotion is implemented; remaining native i64 boundaries are documented.
 - R3: Cranelift instead of LLVM: faster startup, less optimization; LLVM optional.
 - R4: GC with native frames needs precise roots; conservative scanning is the
-  interim (P2-06/P2-07). Fiber stack and the two context register frames
-  have been lifetime-registered conservative roots since Phase 2.32 (with
-  stack-bounds override); precise stack maps remain open.
+  interim (P2-06/P2-07). The fiber stack and the two context register frames
+  are lifetime-registered conservative roots (with stack-bounds override);
+  precise stack maps remain open.
 - R5: `uv` interpreter coupling may force a fork; currently passthrough,
   decision documented (no fork without a blocker).
 - R6: Dynamic features (monkey-patching, `eval`, metaclasses) vs. AOT — tiering
   or an explicit support scope needed.
-- R7: Generator/coroutine remainder: async generators/comprehensions.
-  Generator expressions are eagerly materialized into an iterator (not
-  lazy); `async for`/`async with`
-  use the synchronous protocol.
+- R7: Generator/coroutine remainder: async generators/comprehensions and
+  mutable closure captures. Generator expressions are lazy (synthetic
+  generator function); `async for`/`async with` use the synchronous protocol.
 - R8: Performance weak spots: string concatenation remains O(n²)
   (`string_concat` ~1.3–1.5x faster than CPython only because of lower
   constant factors) and CPython-extension boundaries will add conversion

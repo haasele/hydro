@@ -31,11 +31,11 @@ pub enum Type {
     None,
     Any,
     Never,
-    /// Untyped list (elements are `Any` in Phase 2.0).
+    /// Untyped list (`Any` elements).
     List,
     /// Untyped dict (keys must be hashable at runtime).
     Dict,
-    /// Untyped tuple (elements are `Any` in Phase 2.5).
+    /// Untyped tuple (`Any` elements).
     Tuple,
     /// Insertion-ordered set (elements must be hashable).
     Set,
@@ -277,8 +277,8 @@ pub enum BoolOp {
     Or,
 }
 
-/// Builtins known to Phase 1. `range` is special-cased by `for` lowering and
-/// therefore not listed here.
+/// Builtins known to the compiler. `range` is special-cased by `for` lowering
+/// and therefore not listed here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Builtin {
     Print,
@@ -490,7 +490,8 @@ impl Builtin {
     }
 }
 
-/// Exception kinds supported in Phase 1. Tags are the stable runtime encoding.
+/// Exception kinds supported by the compiler. Tags are the stable runtime
+/// encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExcKind {
     ValueError,

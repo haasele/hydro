@@ -1,4 +1,4 @@
-//! Dynamic method dispatch for built-in types (ARCHITECTURE §3.2, Phase 2.4).
+//! Dynamic method dispatch for built-in types (ARCHITECTURE §3.2).
 //!
 //! `pyx_method` resolves a method by receiver kind and name;
 //! [`call_kw`] handles the keyword variant used by `pyx_method_kw`. Every
@@ -8,8 +8,8 @@
 //!
 //! Details that differ from CPython are documented here: `dict.keys()`,
 //! `dict.values()` and `dict.items()` materialise plain lists (insertion
-//! order) because Phase 2 has no views; only the method subset in
-//! ARCHITECTURE §3.2 is provided. `dict.items()` yields `(key, value)` tuples.
+//! order) rather than views; only the method subset in ARCHITECTURE §3.2 is
+//! provided. `dict.items()` yields `(key, value)` tuples.
 //!
 //! Generator objects expose `send`, `throw` and `close`. `throw` accepts an
 //! exception *instance* only (PyX has no exception class objects) and supports
@@ -157,16 +157,6 @@ pub(crate) fn call(
     attribute_error(obj, &method)
 }
 
-/// Calls a class method with the instance bound as `self`.
-///
-/// The arguments are copied once into `[self, args...]`; the method is looked
-/// up along the class and base chain. A missing name is an `AttributeError` on
-/// the instance. The function itself validates its arity (the bound `self`
-/// counts as the first parameter).
-///
-/// `@classmethod` binds the class instead of the instance and
-/// `@staticmethod` binds no receiver; a property getter is called with the
-/// instance and no extra arguments.
 /// Implements the lowered `super().__init__(...)` form. Python resolves the
 /// initializer on the class after the one that defines the current method;
 /// with PyX's single-base approximation the direct base of the instance class
@@ -246,8 +236,7 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
     let mut call_args = Vec::with_capacity(argc + 1);
     call_args.extend(receiver);
     if argc > 0 {
-        // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-        // tagged values; the length checks above keep the slice in range.
+        // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
         let args = unsafe { std::slice::from_raw_parts(argv, argc) };
         call_args.extend_from_slice(args);
     }
@@ -300,8 +289,7 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
     let mut call_args = Vec::with_capacity(argc + 1);
     call_args.extend(receiver);
     if argc > 0 {
-        // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-        // tagged values; the length checks above keep the slice in range.
+        // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
         let args = unsafe { std::slice::from_raw_parts(argv, argc) };
         call_args.extend_from_slice(args);
     }
@@ -325,9 +313,8 @@ fn native_instance_params(obj: i64, method: &str) -> Option<(&'static [&'static 
     None
 }
 
-/// Keyword arguments decoded from the `[name, value, ...]` buffer passed by
-/// generated code. Names are tagged strings.
-/// Runtime keyword binding for a generated user method.
+/// Runtime keyword binding for a generated user method, also used by class
+/// instantiation to bind constructor arguments through the same path.
 ///
 /// The source signature is stored on the function value (all slots including
 /// the receiver). Positional arguments fill positional slots, a `*args` slot
@@ -335,8 +322,6 @@ fn native_instance_params(obj: i64, method: &str) -> Option<(&'static [&'static 
 /// slots by name, and unknown names go to `**kwargs`. Missing slots use the
 /// literal default or raise `TypeError`. The resulting full slot vector is
 /// forwarded through the generated uniform full-argv trampoline.
-/// Public wrapper used by class instantiation to bind constructor arguments
-/// through the same metadata path as method calls.
 pub(crate) fn call_user_method(
     instance: i64,
     class: i64,
@@ -483,6 +468,8 @@ fn call_user_method_kw(
     crate::core::builtins::call_full_entry(entry, &full)
 }
 
+/// Keyword arguments decoded from the `[name, value, ...]` buffer passed by
+/// generated code. Names are tagged strings.
 pub(crate) struct KeywordArgs {
     pub(crate) items: Vec<(String, i64)>,
 }
@@ -497,9 +484,7 @@ impl KeywordArgs {
                 "keyword arguments were passed without an argument buffer".to_string(),
             ));
         }
-        // SAFETY: the ABI contract requires `kw_argv` to point at
-        // `2 * kwargc` readable tagged values; the length check keeps the
-        // slice in range.
+        // SAFETY: ABI contract: `kw_argv` points at `2 * kwargc` readable values; length checked.
         let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
         let mut items = Vec::with_capacity(kwargc);
         for pair in pairs.as_chunks::<2>().0 {
@@ -1086,8 +1071,7 @@ fn decode_name(ptr: *const u8, len: usize) -> Option<String> {
     if ptr.is_null() || len == 0 || len > isize::MAX as usize {
         return None;
     }
-    // SAFETY: the ABI contract requires `ptr..ptr+len` to be readable; the
-    // length check above keeps the slice representable.
+    // SAFETY: ABI contract: `ptr..ptr+len` is readable; length checked above.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     std::str::from_utf8(bytes).ok().map(str::to_owned)
 }
@@ -1180,9 +1164,7 @@ fn int_arg(v: i64) -> Result<i64, i64> {
     })
 }
 
-// -------------------------------------------------------------------------
 // str
-// -------------------------------------------------------------------------
 
 fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
     match method {
@@ -1617,9 +1599,7 @@ fn str_list(parts: Vec<String>) -> i64 {
     result
 }
 
-// -------------------------------------------------------------------------
 // bytes
-// -------------------------------------------------------------------------
 
 /// Copies a `bytes` argument, reporting a `TypeError` naming the 1-based
 /// argument position otherwise.
@@ -2040,9 +2020,7 @@ fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // list
-// -------------------------------------------------------------------------
 
 fn list_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     match method {
@@ -2234,9 +2212,7 @@ fn list_find(items: &[i64], target: i64) -> Option<usize> {
         .position(|&item| container::equals(item, target))
 }
 
-// -------------------------------------------------------------------------
 // tuple
-// -------------------------------------------------------------------------
 
 fn tuple_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     match method {
@@ -2266,9 +2242,7 @@ fn tuple_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // set
-// -------------------------------------------------------------------------
 
 /// `s.issuperset(other)` / `s.issubset(other)` for iterable operands.
 fn set_relation(obj: i64, other: i64, superset: bool) -> i64 {
@@ -2486,9 +2460,7 @@ fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // dict
-// -------------------------------------------------------------------------
 
 fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     match method {
@@ -2672,9 +2644,7 @@ fn check_hashable_items(items: &[i64]) -> Option<i64> {
     items.iter().find_map(|&item| check_hashable(item))
 }
 
-// -------------------------------------------------------------------------
 // lock (`_thread.allocate_lock()`)
-// -------------------------------------------------------------------------
 
 /// Methods of a `_thread` lock. The object owns a `Mutex<bool>`/`Condvar`
 /// pair, so a blocking `acquire()` waits on the condition variable and never
@@ -2737,9 +2707,7 @@ fn lock_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // threading.Thread / Event, queue.Queue, multiprocessing.Process / Queue
-// -------------------------------------------------------------------------
 
 /// Parses an optional timeout: `None` stays `None`, numbers become a
 /// non-negative duration.
@@ -3624,9 +3592,7 @@ fn file_byte_lines(v: i64) -> Result<Vec<Vec<u8>>, i64> {
     Ok(lines)
 }
 
-// -------------------------------------------------------------------------
 // pathlib.Path
-// -------------------------------------------------------------------------
 
 /// Dynamic `pathlib.Path` method dispatch.
 ///
@@ -4428,7 +4394,7 @@ mod tests {
         assert_eq!(message(), "'z'");
 
         crate::exc::clear();
-        // keys()/values() return fresh lists (Phase-2 deviation: no views).
+        // keys()/values() return fresh lists, not views.
         let ks = invoke(d, "keys", &[]);
         invoke(ks, "append", &[string("c")]);
         assert_eq!(rendered_list(invoke(d, "keys", &[])), "['b']");

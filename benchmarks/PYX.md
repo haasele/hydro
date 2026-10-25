@@ -143,10 +143,61 @@ python3 scripts/check_benchmarks.py --update   # rewrite baseline
 
 The factors are deliberately generous (default 1.75; threads, pool, and processes
 3.0; process startup 4.0) and are additionally backed by `floor_ms`. The
-gate does **not** run in CI, because timing fluctuates too much on shared
+gate does **not** enforce in CI, because timing fluctuates too much on shared
 runners; it is intended as a local/release gate. CPython measurements are
-not gated.
+not gated. `--check` is the explicit form of the default mode and
+`scripts/test_check_benchmarks.py` covers threshold, skip, failure and
+`--update` behavior.
 
+**Q-06 policy.** Threshold enforcement stays local/release-only. CI runs the
+gate as a **non-blocking** report (`continue-on-error`) over the checked-in
+`results/latest.json` and runs the harness self-tests; it never fails a build
+on runner timing. Re-baselining is an explicit, reviewed `--update` on a quiet
+machine, not an automatic CI step.
+
+## Hyperfine adapter (P0-09)
+
+`scripts/bench_hyperfine.sh` wraps the unchanged `benchmarks/bench_*.py`
+harnesses in hyperfine. Each timed run goes through `uv run --script` and also
+validates the benchmark's JSON (sections, rows, positive metrics), so an empty
+result cannot pass as a fast one.
+
+```bash
+scripts/bench_hyperfine.sh                  # quick profile, all harnesses
+scripts/bench_hyperfine.sh loops startup    # subset
+scripts/bench_hyperfine.sh --full --runs 5  # larger workloads
+scripts/bench_hyperfine.sh --list
+```
+
+The `quick` profile uses small work amounts (`loops` only the sum group,
+`csv --no-pandas`, startup with two modules, `request --skip-live`, FastAPI
+ASGI only). Missing `hyperfine` or `uv` prints `SKIP` and exits 0; `--strict`
+turns that into exit 1. Reports are written to
+`bench_results/hyperfine-<timestamp>/` (`hyperfine-<bench>.json`,
+`raw/<bench>.json`, `summary.md`). `bench_all.py` and `bench_pyx.py` are not
+wrapped: the former is the orchestrator, the latter already measures
+CPython/JIT/AOT itself.
+
+## Engine comparison (CPython/PyX/PyPy/Go)
+
+`benchmarks/compare_engines.py` benchmarks a while-loop sum and interpreter
+startup under CPython, PyX JIT, PyPy (if installed) and Go (equivalent
+compiled program, native reference). Each engine runs a fresh process; a
+warmup run validates the exact output before `--runs` measured runs. Missing
+engines are reported as `skipped` with the reason and have no timings.
+A detected engine that fails or prints the wrong result is an `error` and
+exits 1.
+
+```bash
+python3 benchmarks/compare_engines.py
+python3 benchmarks/compare_engines.py --n 2000000 --runs 7 --warmup 2
+python3 benchmarks/compare_engines.py --json /tmp/engines.json \
+    --markdown /tmp/engines.md
+```
+
+The markdown table shows median/min and `CPython/engine` (>1 means the engine
+is faster); `--json` contains the same rows plus versions, per-run times and
+skip notes. `--strict` fails when any engine is skipped.
 
 ## Next expansion stages for the full harnesses
 

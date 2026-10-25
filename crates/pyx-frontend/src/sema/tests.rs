@@ -16,6 +16,7 @@ fn checker<'a>(prog: &'a LHir, inf: &'a mut Infer) -> Checker<'a> {
         diags: Vec::new(),
         ops: Vec::new(),
         checks: Vec::new(),
+        spans: HashMap::new(),
     }
 }
 

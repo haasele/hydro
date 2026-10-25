@@ -55,9 +55,30 @@ python3 scripts/check_benchmarks.py
 
 If a threshold trips, check the cause first. Only for an intentional
 change, rewrite the baseline with `python3 scripts/check_benchmarks.py --update`
-and justify the change in the commit. The harnesses under
+and justify the change in the commit. Threshold enforcement is local/release
+only; CI runs the gate as a non-blocking report and runs
+`python3 scripts/test_check_benchmarks.py`. The harnesses under
 `benchmarks/bench_*.py` are reference measurements against CPython and are not
 adapted to PyX.
+
+Additional harnesses:
+
+```bash
+scripts/bench_hyperfine.sh --quick     # hyperfine wrapper (skips if unavailable)
+python3 benchmarks/compare_engines.py  # CPython/PyX/PyPy/Go loop + startup
+```
+
+Both validate outputs and report missing tools/engines as skipped rather than
+fabricating numbers; see `benchmarks/PYX.md`.
+
+## Releases
+
+Tagging `vX.Y.Z` triggers `.github/workflows/release.yml`: it runs the tests,
+builds `pyx` from the tagged workspace with `Cargo.lock` (`--locked`), packages
+a Linux x64 tarball with the AOT runtime archive, licenses and manpage,
+smoke-tests JIT and AOT, and uploads it to the GitHub release. No repository
+secrets are needed (only the automatic `GITHUB_TOKEN`); other platforms
+remain Q-09.
 
 ## License
 

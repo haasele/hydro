@@ -61,9 +61,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
-// -------------------------------------------------------------------------
 // CPython limited-API mirror structures
-// -------------------------------------------------------------------------
 
 /// `METH_*` bits from CPython's `methodobject.h` (limited-API subset).
 const METH_VARARGS: c_int = 0x0001;
@@ -184,9 +182,7 @@ const _: () = {
 /// `PyBUF_WRITABLE`: the only request bit this read-only shim rejects.
 const PYBUF_WRITABLE: c_int = 0x0001;
 
-// -------------------------------------------------------------------------
 // Shim values and objects
-// -------------------------------------------------------------------------
 
 /// The crate-internal value contract shared with the extension loader.
 ///
@@ -298,9 +294,7 @@ pub(crate) struct ShimObject {
 /// Shape of the `PyInit_<name>` entry point in a limited-API extension.
 type ExtensionInit = unsafe extern "C" fn() -> *mut ShimObject;
 
-// -------------------------------------------------------------------------
 // Process-lifetime object arena
-// -------------------------------------------------------------------------
 
 #[allow(clippy::vec_box)] // the box keeps every PyObject address stable
 fn arena_lock() -> MutexGuard<'static, Vec<Box<ShimObject>>> {
@@ -309,11 +303,8 @@ fn arena_lock() -> MutexGuard<'static, Vec<Box<ShimObject>>> {
     ARENA.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Allocates a shim object in the process-lifetime arena.
-///
-/// Objects are never freed: `Py_DecRef` only decrements the count. That is the
-/// documented slice limitation which makes it impossible for an extension to
-/// observe a dangling `PyObject *`.
+/// Allocates a shim object in the process-lifetime arena; see the
+/// "No finalization" limitation above.
 fn new_object(kind: ShimKind) -> *mut ShimObject {
     let pointer = Box::into_raw(Box::new(ShimObject {
         refcnt: AtomicIsize::new(1),
@@ -573,9 +564,7 @@ fn begin_container(
     Ok(())
 }
 
-// -------------------------------------------------------------------------
 // Thread-local error state
-// -------------------------------------------------------------------------
 
 std::thread_local! {
     /// Pending error set by an extension or by a failing conversion. This is
@@ -620,17 +609,14 @@ fn take_error() -> Option<String> {
     CALL_ERROR.with(|slot| slot.borrow_mut().take())
 }
 
-// -------------------------------------------------------------------------
 // Conversion helpers for the C entry points
-// -------------------------------------------------------------------------
 
 /// Reads a NUL-terminated C string, replacing invalid UTF-8 lossily.
 fn read_c_string(pointer: *const c_char) -> String {
     if pointer.is_null() {
         return String::new();
     }
-    // SAFETY: callers only pass pointers to NUL-terminated strings (module
-    // names, attribute names and values from the CPython C API contract).
+    // SAFETY: callers only pass NUL-terminated strings (CPython C API contract).
     unsafe { CStr::from_ptr(pointer) }
         .to_string_lossy()
         .into_owned()
@@ -866,9 +852,7 @@ fn store_argument<T>(out: *mut T, value: T, format_character: &str) -> c_int {
     1
 }
 
-// -------------------------------------------------------------------------
 // Module registry
-// -------------------------------------------------------------------------
 
 /// Parsed, owned copy of one `PyMethodDef` entry.
 #[derive(Clone, Debug)]
@@ -1140,9 +1124,7 @@ fn add_attribute(object: *mut ShimObject, name: String, attribute: ShimAttr) -> 
     Ok(())
 }
 
-// -------------------------------------------------------------------------
 // Loader contract
-// -------------------------------------------------------------------------
 
 /// Loads an extension shared object and runs its `PyInit_<init_name>`.
 ///
@@ -1385,9 +1367,7 @@ fn convert_result(result: *mut ShimObject) -> Result<ShimValue, String> {
     object_to_value(result)
 }
 
-// -------------------------------------------------------------------------
 // Exported CPython limited-API surface
-// -------------------------------------------------------------------------
 
 /// `PyModule_Create2`: registers a module parsed from a `PyModuleDef`.
 #[no_mangle]
@@ -2150,22 +2130,18 @@ pub extern "C" fn Py_IncRef(object: *mut ShimObject) {
     if object.is_null() {
         return;
     }
-    // SAFETY: every non-NULL shim object lives in the arena for the process
-    // lifetime, so the reference count is always accessible.
+    // SAFETY: shim objects live in the arena for the process lifetime; the refcount is accessible.
     unsafe { (*object).refcnt.fetch_add(1, Ordering::Relaxed) };
 }
 
-/// `Py_DecRef`: decrements a shim object's reference count.
-///
-/// Documented slice limitation: the object is never freed even when the count
-/// reaches zero, which makes stale pointers harmless but retains memory.
+/// `Py_DecRef`: decrements a shim object's reference count. The object is
+/// never freed (see "No finalization" above), so stale pointers are harmless.
 #[no_mangle]
 pub extern "C" fn Py_DecRef(object: *mut ShimObject) {
     if object.is_null() {
         return;
     }
-    // SAFETY: every non-NULL shim object lives in the arena for the process
-    // lifetime, so the reference count is always accessible.
+    // SAFETY: shim objects live in the arena for the process lifetime; the refcount is accessible.
     let _ = unsafe { (*object).refcnt.fetch_sub(1, Ordering::Relaxed) };
 }
 
@@ -2180,8 +2156,7 @@ pub extern "C" fn _Py_IncRef(object: *mut ShimObject) {
     if object.is_null() {
         return;
     }
-    // SAFETY: every non-NULL shim object lives in the arena for the process
-    // lifetime, so the reference count is always accessible.
+    // SAFETY: shim objects live in the arena for the process lifetime; the refcount is accessible.
     unsafe { (*object).refcnt.fetch_add(1, Ordering::Relaxed) };
 }
 
@@ -2194,8 +2169,7 @@ pub extern "C" fn _Py_DecRef(object: *mut ShimObject) {
     if object.is_null() {
         return;
     }
-    // SAFETY: every non-NULL shim object lives in the arena for the process
-    // lifetime, so the reference count is always accessible.
+    // SAFETY: shim objects live in the arena for the process lifetime; the refcount is accessible.
     let _ = unsafe { (*object).refcnt.fetch_sub(1, Ordering::Relaxed) };
 }
 
@@ -2231,9 +2205,7 @@ pub extern "C" fn PyErr_Clear() {
     clear_error();
 }
 
-// -------------------------------------------------------------------------
 // Accessors used by `parse.c`
-// -------------------------------------------------------------------------
 
 /// Number of positional arguments in a tuple object (0 for non-tuples).
 #[no_mangle]
@@ -2362,9 +2334,7 @@ pub extern "C" fn pyx_capi_parse_p(object: *mut ShimObject, out: *mut c_int) -> 
     }
 }
 
-// -------------------------------------------------------------------------
 // Link anchor
-// -------------------------------------------------------------------------
 
 extern "C" {
     /// Defined in `parse.c`; declared here so [`anchor`] can reference it and

@@ -9,11 +9,11 @@ use std::fs;
 use std::process::ExitCode;
 
 use super::scan::{collect_files, is_python_file};
-use crate::cli::args::parse_scan;
+use crate::cli::args::{parse_scan, Verbosity};
 use crate::cli::{CliError, CliResult};
 
-pub(crate) fn cmd_fmt(args: &[OsString]) -> CliResult {
-    let options = parse_scan(args, "fmt", true)?;
+pub(crate) fn cmd_fmt(args: &[OsString], verbosity: Verbosity) -> CliResult {
+    let options = parse_scan(args, "fmt", true, verbosity)?;
     let files = collect_files(&options.paths, is_python_file)?;
 
     let mut changed = 0usize;
@@ -41,7 +41,9 @@ pub(crate) fn cmd_fmt(args: &[OsString]) -> CliResult {
             failures += 1;
             continue;
         }
-        println!("formatted {}", file.display());
+        if !options.diagnostics.verbosity.is_quiet() {
+            println!("formatted {}", file.display());
+        }
     }
 
     if options.check && changed > 0 {

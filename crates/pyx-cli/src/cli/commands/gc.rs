@@ -13,13 +13,13 @@ use std::process::ExitCode;
 use pyx_runtime::GcStats;
 
 use super::{exit_code, read_source, unwrap_or_report};
-use crate::cli::args::parse_single_source;
+use crate::cli::args::{parse_single_source, Verbosity};
 use crate::cli::diag;
 use crate::cli::{CliError, CliResult};
 
-pub(crate) fn cmd_gc(args: &[OsString]) -> CliResult {
+pub(crate) fn cmd_gc(args: &[OsString], verbosity: Verbosity) -> CliResult {
     let (json, rest) = split_json(args);
-    let (file, mut options) = parse_single_source(&rest, "gc")?;
+    let (file, mut options) = parse_single_source(&rest, "gc", verbosity)?;
     if json {
         // `--json` also selects the machine-readable diagnostics rendering,
         // matching the other compiler commands.

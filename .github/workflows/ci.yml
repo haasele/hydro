@@ -54,5 +54,15 @@ jobs:
       - name: CPython gate manifest
         run: python3 scripts/cpython_compat.py --check-manifest
 
+      - name: Harness self-tests
+        run: python3 scripts/test_check_benchmarks.py
+
+      # Timing on shared runners is too noisy for enforcement (Q-06). The
+      # checked-in baseline is only validated and reported non-blockingly;
+      # the real gate is `scripts/check_benchmarks.py` on a local/release host.
+      - name: Benchmark threshold report (non-blocking)
+        continue-on-error: true
+        run: python3 scripts/check_benchmarks.py --check -v
+
       - name: Full gate (E2E, AOT, GC)
         run: ./scripts/verify.sh

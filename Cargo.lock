@@ -637,7 +637,6 @@ dependencies = [
  "cranelift-object",
  "pyx-ir",
  "pyx-runtime",
- "target-lexicon",
 ]
 
 [[package]]

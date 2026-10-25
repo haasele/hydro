@@ -11,7 +11,9 @@ unusable input.
 
 Usage:
     python3 benchmarks/pyx/run_micro.py       # fresh results/latest.json
-    python3 scripts/check_benchmarks.py       # check JIT + AOT medians
+    python3 scripts/check_benchmarks.py       # same as --check
+    python3 scripts/check_benchmarks.py --check
+    python3 scripts/check_benchmarks.py -v    # also list skipped workloads
 
     # Re-baseline after an intentional performance change:
     python3 scripts/check_benchmarks.py --update
@@ -246,7 +248,13 @@ def main() -> int:
             f"specific factor (default: {DEFAULT_FACTOR})"
         ),
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help="compare the results against the thresholds (the default mode)",
+    )
+    mode.add_argument(
         "--update",
         action="store_true",
         help="re-baseline thresholds from --results instead of checking",

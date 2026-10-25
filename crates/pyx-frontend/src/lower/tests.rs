@@ -2646,8 +2646,9 @@ fn comprehension_result_types_are_static_containers() {
         .collect();
     assert_eq!(
         types,
-        vec![Type::List, Type::Set, Type::Dict, Type::List],
-        "generator expressions are materialised as lists"
+        vec![Type::List, Type::Set, Type::Dict, Type::Any],
+        "list/set/dict comprehensions stay eager containers; a generator \
+         expression is a lazily called generator function"
     );
     assert!(
         matches!(&module[0].kind, pyx_ir::StmtKind::Assign { value, .. }
@@ -2661,9 +2662,53 @@ fn comprehension_result_types_are_static_containers() {
         matches!(&module[2].kind, pyx_ir::StmtKind::Assign { value, .. }
             if matches!(&value.kind, ExprKind::DictComp { .. }))
     );
+    let pyx_ir::StmtKind::Assign { value, .. } = &module[3].kind else {
+        panic!("expected a generator expression assignment");
+    };
+    let ExprKind::Call { callee, args } = &value.kind else {
+        panic!("expected a generator call, got {:?}", value.kind);
+    };
     assert!(
-        matches!(&module[3].kind, pyx_ir::StmtKind::Assign { value, .. }
-            if matches!(&value.kind, ExprKind::GeneratorExp { .. }))
+        matches!(callee, pyx_ir::Callee::Function(id)
+            if program.functions[*id as usize].is_generator),
+        "a generator expression calls a synthetic generator function"
+    );
+    assert_eq!(
+        args.len(),
+        1,
+        "only the outermost iterable is evaluated eagerly"
+    );
+}
+
+#[test]
+fn generator_expression_captures_and_laziness_are_structural() {
+    let source = "def f(xs, n):\n    return sum(x + n for x in xs if x)\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    let genexpr = program
+        .functions
+        .iter()
+        .find(|function| function.name.ends_with("<genexpr>"))
+        .expect("synthetic generator function");
+    assert!(genexpr.is_generator);
+    assert_eq!(
+        genexpr.params.len(),
+        2,
+        "the hidden iterable plus the captured `n` (the eagerly evaluated \
+         outermost iterable needs no capture)"
+    );
+    let pyx_ir::StmtKind::ForEach { body, .. } = &genexpr.body[0].kind else {
+        panic!(
+            "expected the outermost clause to be a for loop: {:?}",
+            genexpr.body
+        );
+    };
+    let pyx_ir::StmtKind::If { then_body, .. } = &body[0].kind else {
+        panic!("expected the `if` filter inside the loop");
+    };
+    assert!(
+        matches!(&then_body[0].kind, pyx_ir::StmtKind::Yield { .. }),
+        "the element is yielded, not stored in a list: {:?}",
+        then_body
     );
 }
 

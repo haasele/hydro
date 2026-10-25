@@ -136,8 +136,9 @@ CPython 3.14 `sys.stdlib_module_names` contains **297** modules:
 | Layer | Count | Consequence for PyX |
 |---|---:|---|
 | pure-Python modules | 174 | must run **unmodified** on the PyX language/runtime |
-| extension modules | 71 | native Rust implementation, `abi3`/full-ABI wheel, or documented replacement |
+| extension modules | 63 | native Rust implementation, `abi3`/full-ABI wheel, or documented replacement |
 | builtin/frozen modules | 52 | runtime internals (`sys`, `_io`, `_imp`, `_thread`, `itertools`, …) |
+| platform-specific / unknown | 8 | Windows/Apple-only modules on this Linux host; documented as unsupported |
 
 The stdlib program is tracked in `docs/TODO.md` (P4-01…P4-11) and gated by a
 machine-readable compatibility report, not by prose claims.

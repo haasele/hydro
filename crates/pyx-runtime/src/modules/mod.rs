@@ -1,5 +1,5 @@
 //! Native implementations for the builtin modules declared in
-//! `pyx_ir::stdlib` (Phase 2.10).
+//! `pyx_ir::stdlib`.
 //!
 //! The central spec is the single source of truth for names, arities and
 //! result types. `pyx_module_call` dispatches a direct `module.function(...)`
@@ -19,6 +19,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use num_bigint::{BigInt, Sign};
+use num_traits::Signed;
 use pyx_ir::stdlib;
 use pyx_ir::{PYTHON_VERSION, PYTHON_VERSION_STRING};
 
@@ -85,8 +87,7 @@ fn name_str<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
     if ptr.is_null() || len == 0 || len > MAX_NAME_LEN {
         return None;
     }
-    // SAFETY: the ABI contract requires `ptr..ptr+len` to be readable; the
-    // length check above keeps the slice representable.
+    // SAFETY: ABI contract: `ptr..ptr+len` is readable; length checked above.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     std::str::from_utf8(bytes).ok()
 }
@@ -98,8 +99,7 @@ fn decode_name(ptr: *const u8, len: usize) -> String {
     if ptr.is_null() || len == 0 || len > MAX_NAME_LEN {
         return String::new();
     }
-    // SAFETY: the ABI contract requires `ptr..ptr+len` to be readable; the
-    // length check above keeps the slice representable.
+    // SAFETY: ABI contract: `ptr..ptr+len` is readable; length checked above.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -252,9 +252,7 @@ fn encode_int(n: i64) -> i64 {
         .unwrap_or_else(|| exc::raise_with_message(OVERFLOW_ERROR, "integer overflow"))
 }
 
-// -------------------------------------------------------------------------
 // ABI entry helpers
-// -------------------------------------------------------------------------
 
 /// `pyx_module_call`: direct `module.function(args...)` call.
 pub(crate) fn module_call(
@@ -455,8 +453,7 @@ fn call_native_at(
             &format!("function call received {argc} argument(s) without an argument buffer"),
         );
     } else {
-        // SAFETY: the ABI requires `argv..argv+argc` to be readable and the
-        // length check above keeps the slice representable.
+        // SAFETY: ABI contract: `argv..argv+argc` is readable; length checked above.
         unsafe { std::slice::from_raw_parts(argv, argc) }
     };
     dispatch(module_name, function_name, args)
@@ -503,8 +500,7 @@ fn call_native_kw_at(
             "function call received arguments without an argument buffer",
         );
     }
-    // SAFETY: the length checks above keep both slices representable; the ABI
-    // requires the caller to pass readable buffers.
+    // SAFETY: ABI contract: caller passes readable buffers; length checked above.
     let mut args: Vec<i64> = if argc == 0 {
         Vec::new()
     } else {
@@ -624,9 +620,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // Constants
-// -------------------------------------------------------------------------
 
 fn constant_value(module: &str, name: &str) -> i64 {
     match (module, name) {
@@ -851,9 +845,7 @@ fn platform() -> &'static str {
     }
 }
 
-// -------------------------------------------------------------------------
 // random
-// -------------------------------------------------------------------------
 
 /// Global generator behind the module-level `random` functions. Seeded from
 /// the environment on first use.
@@ -1018,6 +1010,10 @@ fn random_uniform(rng: &value::RandomState, args: &[i64]) -> i64 {
     value::float_new(low + (high - low) * rng.next_f64())
 }
 
+/// Mirrors `ops::MAX_BIGINT_BITS` (8 Mibit, ~1 MiB of magnitude) so a random
+/// draw cannot allocate integers the rest of the runtime refuses to produce.
+const MAX_GETRANDBITS: i64 = 1 << 23;
+
 fn random_getrandbits(rng: &value::RandomState, arg: i64) -> i64 {
     let bits = match random_int_arg(arg) {
         Ok(v) => v,
@@ -1029,18 +1025,31 @@ fn random_getrandbits(rng: &value::RandomState, arg: i64) -> i64 {
     if bits == 0 {
         return encode_int(0);
     }
-    // PyX integers are 61-bit tagged immediates (`value::MAX_INT` is 2^60-1),
-    // so a wider request cannot be represented. Documented limitation:
-    // `getrandbits(k)` with `k > 60` raises OverflowError instead of returning
-    // a big integer.
-    if bits > 60 {
+    if bits > MAX_GETRANDBITS {
         return exc::raise_with_message(
             OVERFLOW_ERROR,
-            "getrandbits() result does not fit in a PyX int",
+            "getrandbits() result exceeds the maximum integer size",
         );
     }
-    let draw = rng.next_u64() >> (64 - bits as u32);
-    encode_int(draw as i64)
+    // Draw independent 64-bit SplitMix64 words and assemble little-endian
+    // 32-bit limbs; the final limb is masked to the exact requested width.
+    let mut digits = Vec::with_capacity((bits as usize).div_ceil(32));
+    let mut remaining = bits as usize;
+    while remaining > 0 {
+        let draw = rng.next_u64();
+        let take = remaining.min(64);
+        let chunk = if take == 64 {
+            draw
+        } else {
+            draw & ((1u64 << take) - 1)
+        };
+        digits.push(chunk as u32);
+        if take > 32 {
+            digits.push((chunk >> 32) as u32);
+        }
+        remaining -= take;
+    }
+    value::bigint_new(BigInt::from_slice(Sign::Plus, &digits))
 }
 
 /// Shared implementation of the module-level functions and `Random` methods.
@@ -1129,9 +1138,7 @@ pub(crate) fn random_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     random_operation(rng, method, args)
 }
 
-// -------------------------------------------------------------------------
 // pathlib
-// -------------------------------------------------------------------------
 
 /// `pathlib.Path(path=None)`, `pathlib.cwd()` and `pathlib.home()`.
 ///
@@ -1172,9 +1179,7 @@ fn pathlib_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // platform
-// -------------------------------------------------------------------------
 
 /// Reads a kernel pseudo-file, trimming the trailing newline. Missing files
 /// yield the empty string (portable fallback).
@@ -1248,9 +1253,7 @@ fn platform_call(function: &str) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // statistics
-// -------------------------------------------------------------------------
 
 fn statistics_error(message: &str) -> i64 {
     exc::raise_with_message(VALUE_ERROR, message)
@@ -1358,9 +1361,7 @@ fn statistics_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // math
-// -------------------------------------------------------------------------
 
 fn domain_error() -> i64 {
     exc::raise_with_message(VALUE_ERROR, "math domain error")
@@ -1463,16 +1464,25 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
             Ok(x) => value::float_new(x.abs()),
             Err(err) => err,
         },
-        "floor" | "ceil" | "trunc" => match number(args[0]) {
-            Ok(x) => float_to_int(function, x),
-            Err(err) => err,
-        },
+        "floor" | "ceil" | "trunc" => {
+            // Integers are already integral: return the same exact value.
+            if value::is_bigint(args[0]) {
+                return args[0];
+            }
+            if let Some(n) = value::as_integer(args[0]) {
+                return ops::int_result(n);
+            }
+            match number(args[0]) {
+                Ok(x) => float_to_int(function, x),
+                Err(err) => err,
+            }
+        }
         // `gcd(*integers)`: CPython accepts any number of integers and
         // returns 0 for none. Floats are rejected even when integral.
         "gcd" => {
-            let mut result: u64 = 0;
+            let mut result = BigInt::from(0);
             for arg in args {
-                let Some(n) = value::as_integer(*arg) else {
+                let Some(n) = value::to_bigint(*arg) else {
                     return exc::raise_with_message(
                         TYPE_ERROR,
                         &format!(
@@ -1481,18 +1491,21 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
                         ),
                     );
                 };
-                result = gcd_u64(result, n.unsigned_abs());
+                result = gcd_bigint(result, n);
             }
-            ops::int_result(result as i64)
+            value::bigint_new(result)
         }
         _ => missing_attribute("math", function),
     }
 }
 
-/// Euclid's algorithm over magnitudes.
-fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        let remainder = a % b;
+/// Greatest common divisor over exact magnitudes (`math.gcd` accepts
+/// negatives and integers beyond the tagged range).
+fn gcd_bigint(a: BigInt, b: BigInt) -> BigInt {
+    let mut a = a.abs();
+    let mut b = b.abs();
+    while b.sign() != Sign::NoSign {
+        let remainder = a % &b;
         a = b;
         b = remainder;
     }
@@ -1519,9 +1532,7 @@ fn float_to_int(function: &str, x: f64) -> i64 {
     ops::int_result(rounded as i64)
 }
 
-// -------------------------------------------------------------------------
 // functools
-// -------------------------------------------------------------------------
 
 /// Dispatches a native `functools` function.
 ///
@@ -1605,9 +1616,7 @@ fn reduce(args: &[i64]) -> i64 {
     accumulator
 }
 
-// -------------------------------------------------------------------------
 // operator
-// -------------------------------------------------------------------------
 
 fn operator_call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -1657,9 +1666,7 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // time
-// -------------------------------------------------------------------------
 
 /// Epoch for `perf_counter`/`monotonic` (and their `_ns` variants), relative
 /// to the first time-module call in this process.
@@ -1689,23 +1696,14 @@ fn wall_clock_nanos() -> i64 {
     match since_epoch {
         Ok(duration) => nanos_value(duration.as_nanos()),
         // A pre-1970 clock: represent as a negative nanosecond count.
-        Err(err) => {
-            let nanos = err.duration().as_nanos().min(value::MAX_INT as u128);
-            -value::encode_int(nanos as i64).unwrap_or(value::MAX_INT << 3)
-        }
+        Err(err) => value::bigint_new(-BigInt::from(err.duration().as_nanos())),
     }
 }
 
-/// Encodes a nanosecond count as a tagged int.
-///
-/// The tagged representation only holds `2^60 - 1` (`value::MAX_INT`). The
-/// current UNIX epoch in nanoseconds (~1.8e18) already exceeds that limit, so
-/// `time_ns` saturates instead of raising: the documented Phase-1 limit
-/// applies, and the ABI still returns a positive int.
+/// Encodes an exact nanosecond count, promoting past `MAX_INT` instead of
+/// clamping.
 fn nanos_value(nanos: u128) -> i64 {
-    let clamped = nanos.min(value::MAX_INT as u128);
-    // `clamped` is representable by construction.
-    value::encode_int(clamped as i64).unwrap_or(value::MAX_INT << 3)
+    value::bigint_new(BigInt::from(nanos))
 }
 
 fn time_call(function: &str, args: &[i64]) -> i64 {
@@ -1735,9 +1733,7 @@ fn time_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // _thread (no GIL)
-// -------------------------------------------------------------------------
 //
 // `start_new_thread` switches the process to the shared heap (see
 // `crate::heap`) before the new thread exists. Threads then run in parallel:
@@ -1887,10 +1883,8 @@ pub(crate) fn spawn_thread(
             let _ = registered_tx.send(());
             heap::safepoint();
             let _exit = ThreadExit { finished };
-            // SAFETY: `argv` is alive in this closure for the whole call and
-            // `argc` matches its length; the wrapper contract lets the callee
-            // read `argc` tagged values from the pointer (NULL is passed for
-            // zero arguments by `builtins::call`).
+            // SAFETY: `argv` outlives the call and `argc` matches its length; the callee
+            // reads `argc` values (NULL for zero arguments, which it never dereferences).
             let _ = builtins::call(function, argc, argv.as_ptr());
             // An exception cannot cross the thread boundary: report it like
             // an uncaught exception, as CPython's `_thread` does.
@@ -1986,9 +1980,7 @@ fn join_thread(handle_value: i64) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // threading / queue / multiprocessing / pickle
-// -------------------------------------------------------------------------
 
 /// Fallback for constructor slots the frontend omitted (`None` means default).
 fn optional(args: &[i64], index: usize) -> i64 {
@@ -2385,9 +2377,7 @@ fn pickle_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // csv
-// -------------------------------------------------------------------------
 
 fn csv_call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -2399,7 +2389,6 @@ fn csv_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // html
 fn html_call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -2438,7 +2427,6 @@ fn html_call(function: &str, args: &[i64]) -> i64 {
 }
 
 // json
-// -------------------------------------------------------------------------
 
 /// Maximum container nesting accepted by both the serializer and the parser.
 /// Bounds recursion on the native stack; cycles and over-deep documents are
@@ -3198,9 +3186,7 @@ fn push_scalar(out: &mut Vec<u8>, scalar: u32) {
     out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
 }
 
-// -------------------------------------------------------------------------
 // os.path
-// -------------------------------------------------------------------------
 
 /// Borrows a `str` or `Path` argument for an `os.path` function.
 ///
@@ -3371,9 +3357,7 @@ fn os_path_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // os
-// -------------------------------------------------------------------------
 
 fn os_call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -3747,9 +3731,7 @@ fn os_access(args: &[i64]) -> i64 {
     }
 }
 
-// -------------------------------------------------------------------------
 // sys
-// -------------------------------------------------------------------------
 
 fn sys_call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -3777,9 +3759,7 @@ fn sys_exit(args: &[i64]) -> i64 {
     process::exit_now(1)
 }
 
-// -------------------------------------------------------------------------
 // io
-// -------------------------------------------------------------------------
 
 /// `io.open(file, mode="r", encoding=None, newline=None, errors=None)`.
 ///
@@ -4036,6 +4016,10 @@ mod tests {
         value::as_integer(v).expect("int result")
     }
 
+    fn as_big(v: i64) -> BigInt {
+        value::to_bigint(v).expect("integer result")
+    }
+
     fn message() -> String {
         value::to_string(exc::pending_value())
     }
@@ -4080,6 +4064,14 @@ mod tests {
         assert_eq!(as_int(call("math", "floor", &[value::float_new(2.7)])), 2);
         assert_eq!(as_int(call("math", "ceil", &[value::float_new(2.1)])), 3);
         assert_eq!(as_int(call("math", "trunc", &[value::float_new(-2.7)])), -2);
+        // Integer inputs pass through unchanged, exactly.
+        assert_eq!(as_int(call("math", "floor", &[int(7)])), 7);
+        assert_eq!(as_int(call("math", "ceil", &[TRUE])), 1);
+        assert_eq!(as_int(call("math", "trunc", &[int(-7)])), -7);
+        let huge = big("1267650600228229401496703205376");
+        assert_eq!(call("math", "floor", &[huge]), huge);
+        assert_eq!(call("math", "ceil", &[huge]), huge);
+        assert_eq!(call("math", "trunc", &[huge]), huge);
         assert_eq!(
             as_float(call("math", "fabs", &[value::float_new(-3.5)])),
             3.5
@@ -4140,6 +4132,18 @@ mod tests {
         assert_eq!(as_int(call("math", "gcd", &[int(12), int(8), int(6)])), 2);
         assert_eq!(as_int(call("math", "gcd", &[int(-12), int(8)])), 4);
         assert_eq!(as_int(call("math", "gcd", &[TRUE, int(4)])), 1);
+        assert!(!exc::pending());
+
+        // Exact gcd over BigInt operands (2^100 and 3 * 2^50 => 2^50).
+        let pow100 = big("1267650600228229401496703205376");
+        let three_pow50 = big("3377699720527872");
+        let pow50 = big("1125899906842624");
+        let result = call("math", "gcd", &[pow100, three_pow50]);
+        assert_eq!(result, pow50);
+        assert_eq!(as_int(result), 1 << 50);
+        let negative_pow100 = value::bigint_new(-as_big(pow100));
+        assert_eq!(call("math", "gcd", &[negative_pow100, three_pow50]), pow50);
+        assert_eq!(call("math", "gcd", &[pow100, int(3)]), int(1));
         assert!(!exc::pending());
 
         // A function value resolved from the module (`from math import gcd`)
@@ -4383,9 +4387,14 @@ mod tests {
         assert!(end >= start);
         assert!(as_float(call("time", "monotonic", &[])) >= 0.0);
         assert!(as_float(call("time", "time", &[])) > 0.0);
-        assert!(as_int(call("time", "time_ns", &[])) > 0);
-        assert!(as_int(call("time", "perf_counter_ns", &[])) >= 0);
-        assert!(as_int(call("time", "monotonic_ns", &[])) >= 0);
+        // Nanosecond clocks are exact: past the tagged range the result is a
+        // BigInt with the same decimal text.
+        let wall = call("time", "time_ns", &[]);
+        let wall_ns = as_big(wall);
+        assert!(wall_ns > BigInt::from(value::MAX_INT));
+        assert_eq!(value::to_string(wall), wall_ns.to_string());
+        assert!(as_big(call("time", "perf_counter_ns", &[])) >= BigInt::from(0));
+        assert!(as_big(call("time", "monotonic_ns", &[])) >= BigInt::from(0));
         exc::init();
         assert_eq!(call("time", "sleep", &[int(-1)]), NONE);
         assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
@@ -4492,16 +4501,45 @@ mod tests {
             let value = as_int(call("random", "getrandbits", &[int(24)]));
             assert!((0..(1 << 24)).contains(&value), "24-bit draw out of range");
         }
-        let wide = as_int(call("random", "getrandbits", &[int(60)]));
-        assert!((0..=value::MAX_INT).contains(&wide));
+        // Wide requests promote instead of raising OverflowError.
+        for bits in [60i64, 61, 64, 65, 100, 129, 512] {
+            let drawn = call("random", "getrandbits", &[int(bits)]);
+            assert!(!exc::pending(), "getrandbits({bits}) raised");
+            let n = as_big(drawn);
+            assert!(n.sign() != Sign::Minus);
+            assert!(
+                n.bits() <= bits as u64,
+                "draw of {} bits exceeds {bits}",
+                n.bits()
+            );
+            assert_eq!(value::to_string(drawn), n.to_string());
+            let dump = call("json", "dumps", &[drawn]);
+            assert!(!exc::pending(), "json.dumps raised");
+            assert_eq!(
+                value::as_str(dump).expect("json str result"),
+                n.to_string().as_str()
+            );
+        }
+
+        // The bit stream is deterministic for a given seed.
+        let seed = int(12345);
+        let first = call("random", "Random", &[seed]);
+        let second = call("random", "Random", &[seed]);
+        let draw =
+            |rng| crate::methods::call(rng, b"getrandbits".as_ptr(), 11, 1, [int(200)].as_ptr());
+        assert_eq!(as_big(draw(first)), as_big(draw(second)));
 
         exc::init();
         assert_eq!(call("random", "getrandbits", &[int(-1)]), NONE);
         assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
         assert_eq!(message(), "number of bits must be non-negative");
 
+        // Memory is capped at the runtime-wide BigInt limit.
         exc::init();
-        assert_eq!(call("random", "getrandbits", &[int(61)]), NONE);
+        assert_eq!(
+            call("random", "getrandbits", &[int(MAX_GETRANDBITS + 1)]),
+            NONE
+        );
         assert_eq!(exc::pending_tag(), crate::exc::OVERFLOW_ERROR as i64);
 
         // The same operation is a `Random` method.
@@ -4899,9 +4937,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
     // json
-    // ---------------------------------------------------------------------
 
     fn dumps(v: i64) -> String {
         let out = call("json", "dumps", &[v]);
@@ -5269,9 +5305,7 @@ mod tests {
         assert_eq!(value::to_string(dumped), source);
     }
 
-    // ---------------------------------------------------------------------
     // os
-    // ---------------------------------------------------------------------
 
     #[test]
     fn os_functions_and_constants() {

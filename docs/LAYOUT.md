@@ -7,21 +7,24 @@ repository root.
 
 ```text
 .
-├── AGENTS.md                  work status, phases, known limits
-├── PLAN.md                    strategy/guiding decisions
+├── AGENTS.md                  resume status, commands, architecture invariants
+├── PLAN.md                    strategy and current-status pointer
 ├── README.md                  overview, quickstart, CLI, language scope
 ├── CHANGELOG.md               Keep-a-Changelog format
 ├── CONTRIBUTING.md            setup, gate, commit rules
 ├── Cargo.toml                 workspace + shared dependency versions
 ├── scripts/
 │   ├── verify.sh              full gate (fmt/clippy/build/tests/E2E/AOT/GC)
-│   ├── check_benchmarks.py    local benchmark regression gate
+│   ├── check_benchmarks.py    local benchmark regression gate (--check/--update)
+│   ├── test_check_benchmarks.py  deterministic tests for the threshold gate
+│   ├── bench_hyperfine.sh     hyperfine adapter for benchmark harnesses
 │   ├── stdlib_compat.py       stdlib import matrix (pinned CPython 3.14.9)
 │   └── cpython_compat.py      official Lib/test differential gate
 ├── benchmarks/
 │   ├── PYX.md                 readiness matrix of the external harnesses
 │   ├── bench_pyx.py           CPython/JIT/AOT comparison, 11 workloads
 │   ├── bench_all.py           orchestrator (e.g. `--only pyx`)
+│   ├── compare_engines.py     CPython/PyX/PyPy/Go loop + startup comparison
 │   └── pyx/                   micro-benchmarks, run_micro.py, results/, thresholds.json
 ├── spikes/p4_04/              embedded-CPython/abi3 probes + measurements
 ├── tests/compat/              pinned CPython test manifests (3.14.9)
@@ -31,6 +34,7 @@ repository root.
 │   ├── C_API.md               P4-04 decision, probes, milestones
 │   ├── COMPATIBILITY.md       generated stdlib import matrix
 │   ├── CPYTHON_TESTS.md       official-test gate policy + baseline
+│   ├── DIAGNOSTICS.md         diagnostic codes/spans/JSON, CLI flags, exit codes
 │   ├── pyx.1                  roff manpage
 │   ├── TODO.md                single work list
 │   └── LAYOUT.md              this file
@@ -85,7 +89,8 @@ repository root.
         │       ├── diag.rs    snippet/JSON/color rendering
         │       ├── dispatch.rs subcommand table
         │       └── commands/  new, init, check, run, build, test, fmt,
-        │                      lint, clean, doctor, help, uv, spawn, scan,
+        │                      lint, clean, doctor, help, uv (passthrough),
+        │                      spawn (internal), scan (file discovery),
         │                      completions; `gc.rs` = `pyx gc`
         └── tests/             E2E, fibers, closures, user modules, extensions
                                (paths, dotted, multi-phase), completions,

@@ -2,9 +2,7 @@ use std::os::raw::c_uchar;
 
 use crate::{builtins, container, exc, fiber, format, heap, iter, methods, modules, ops, value};
 
-// ---------------------------------------------------------------------
 // Constants (tagged representation, see ARCHITECTURE §3.1)
-// ---------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn pyx_none() -> i64 {
@@ -21,9 +19,7 @@ pub extern "C" fn pyx_false() -> i64 {
     value::FALSE
 }
 
-// ---------------------------------------------------------------------
 // Constructors
-// ---------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn pyx_bool(b: i64) -> i64 {
@@ -171,9 +167,7 @@ pub extern "C" fn pyx_zip(argc: usize, argv: *const i64) -> i64 {
     builtins::zip(argc, argv)
 }
 
-// ---------------------------------------------------------------------
-// First-class functions (Phase 2.9)
-// ---------------------------------------------------------------------
+// First-class functions
 
 /// Copies the function name passed by generated code. A missing or empty
 /// buffer yields the fallback `"<function>"`.
@@ -181,8 +175,7 @@ fn function_name(ptr: *const c_uchar, len: usize) -> String {
     if ptr.is_null() || len == 0 || len > isize::MAX as usize {
         return "<function>".to_string();
     }
-    // SAFETY: the ABI contract requires `ptr..ptr+len` to be readable;
-    // the length check above keeps the slice representable.
+    // SAFETY: ABI contract: `ptr..ptr+len` is readable; length checked above.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     let text = String::from_utf8_lossy(bytes).into_owned();
     if text.is_empty() {
@@ -198,8 +191,7 @@ fn required_name(ptr: *const c_uchar, len: usize) -> Option<String> {
     if ptr.is_null() || len == 0 || len > isize::MAX as usize {
         return None;
     }
-    // SAFETY: the ABI contract requires `ptr..ptr+len` to be readable; the
-    // length check above keeps the slice representable.
+    // SAFETY: ABI contract: `ptr..ptr+len` is readable; length checked above.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     let text = String::from_utf8_lossy(bytes).into_owned();
     if text.is_empty() {
@@ -276,9 +268,7 @@ pub extern "C" fn pyx_class_new(
             );
         }
         methods.reserve(method_count);
-        // SAFETY: the ABI contract requires all three buffers to hold
-        // `method_count` readable entries; the length check above keeps the
-        // slices representable.
+        // SAFETY: ABI contract: three buffers hold `method_count` readable entries; checked above.
         let names = unsafe { std::slice::from_raw_parts(names_ptr, method_count) };
         let funcs = unsafe { std::slice::from_raw_parts(funcs_ptr, method_count) };
         let kinds = unsafe { std::slice::from_raw_parts(kinds_ptr, method_count) };
@@ -333,9 +323,7 @@ pub extern "C" fn pyx_class_new(
             );
         }
         attrs.reserve(attr_count);
-        // SAFETY: the ABI contract requires both buffers to hold `attr_count`
-        // readable tagged values; the length check above keeps the slices
-        // representable.
+        // SAFETY: ABI contract: both buffers hold `attr_count` readable values; checked above.
         let attr_names = unsafe { std::slice::from_raw_parts(attr_names_ptr, attr_count) };
         let attr_values = unsafe { std::slice::from_raw_parts(attr_values_ptr, attr_count) };
         for (name_value, attr_value) in attr_names.iter().zip(attr_values) {
@@ -420,8 +408,7 @@ pub extern "C" fn pyx_bind_class_kwargs(
         };
         let mut matched = None;
         for index in 0..name_count {
-            // SAFETY: the ABI contract requires `2 * name_count` readable
-            // words; NULL and zero-length names are skipped.
+            // SAFETY: ABI contract: `2 * name_count` readable words; NULL and empty names skipped.
             let ptr = unsafe { *names_ptr.add(index * 2) } as *const c_uchar;
             let len = unsafe { *names_ptr.add(index * 2 + 1) } as usize;
             if len == 0 {
@@ -530,19 +517,13 @@ pub extern "C" fn pyx_closure_new(
     let captures = if capture_count == 0 {
         Vec::new()
     } else {
-        // SAFETY: the ABI contract requires `captures_ptr..+capture_count`
-        // to be readable tagged values; the length check above keeps the
-        // slice representable.
+        // SAFETY: ABI contract: `captures_ptr..+capture_count` holds readable values; checked.
         unsafe { std::slice::from_raw_parts(captures_ptr, capture_count) }.to_vec()
     };
     let name = function_name(name_ptr, name_len);
     value::closure_new_with_flags(wrapper as usize, arity, name, captures, flags)
 }
 
-/// Attaches the user-visible positional parameter names of a generated wrapper
-/// to its function value. `names` points at `2 * count` words in
-/// `[name_ptr, name_len, ...]` order, mirroring the keyword buffers of
-/// `pyx_method_kw`. Returns the function value; a malformed buffer is ignored
 /// Stores full parameter metadata and the uniform full-argv trampoline on a
 /// generated function value.
 ///
@@ -616,15 +597,18 @@ pub extern "C" fn pyx_function_meta(
     value::NONE
 }
 
-/// (the names are only used to bind `functools.partial` keywords).
+/// Attaches the user-visible positional parameter names of a generated wrapper
+/// to its function value. `names` points at `2 * count` words in
+/// `[name_ptr, name_len, ...]` order, mirroring the keyword buffers of
+/// `pyx_method_kw`; the names are only used to bind `functools.partial`
+/// keywords. Returns the function value; a malformed buffer is ignored.
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn pyx_function_params(function: i64, count: usize, names: *const i64) -> i64 {
     if count == 0 || names.is_null() || count > isize::MAX as usize / 16 {
         return function;
     }
-    // SAFETY: the caller passes `2 * count` readable words (codegen stack
-    // array); the length check above keeps the slice representable.
+    // SAFETY: caller passes `2 * count` readable words (codegen stack array); checked.
     let words = unsafe { std::slice::from_raw_parts(names, count * 2) };
     let params = words
         .chunks(2)
@@ -634,8 +618,7 @@ pub extern "C" fn pyx_function_params(function: i64, count: usize, names: *const
             if ptr.is_null() || len == 0 || len > isize::MAX as usize {
                 return String::new();
             }
-            // SAFETY: the caller passes a readable `name_ptr..name_ptr+len`
-            // range for every pair; the length check keeps it representable.
+            // SAFETY: caller passes a readable `name_ptr..name_ptr+len` range per pair; checked.
             String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).into_owned()
         })
         .collect();
@@ -652,8 +635,7 @@ fn copy_fiber_args(argc: usize, argv: *const i64) -> Option<Vec<i64>> {
     if argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return None;
     }
-    // SAFETY: the ABI contract requires `argv..argv+argc` to be readable; the
-    // length check keeps the slice representable.
+    // SAFETY: ABI contract: `argv..argv+argc` is readable; length checked above.
     Some(unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec())
 }
 
@@ -805,9 +787,7 @@ pub extern "C" fn pyx_filter(function: i64, iterable: i64) -> i64 {
     builtins::filter(function, iterable)
 }
 
-// ---------------------------------------------------------------------
-// Builtin modules (Phase 2.10)
-// ---------------------------------------------------------------------
+// Builtin modules
 
 /// `module.function(args...)` for a name from `pyx_ir::stdlib`.
 ///
@@ -975,9 +955,7 @@ pub extern "C" fn pyx_deferred_import(
     builtins::deferred_import(&module, member.as_deref())
 }
 
-// ---------------------------------------------------------------------
-// CPython limited-API extensions (P4-04)
-// ---------------------------------------------------------------------
+// CPython limited-API extensions
 
 /// `extension.function(args...)` for a loaded `abi3` extension module.
 ///
@@ -1012,9 +990,7 @@ pub extern "C" fn pyx_extension_get(
     modules::extension::get(path, path_len, member, member_len)
 }
 
-// ---------------------------------------------------------------------
 // Comprehension builders
-// ---------------------------------------------------------------------
 
 /// Appends a list-comprehension element. Non-lists raise `TypeError`;
 /// always returns `None` otherwise.
@@ -1046,9 +1022,7 @@ pub extern "C" fn pyx_dict_merge(left: i64, right: i64) -> i64 {
     builtins::dict_merge(left, right)
 }
 
-// ---------------------------------------------------------------------
 // Indexing and iteration
-// ---------------------------------------------------------------------
 
 /// `object[index]` for lists, strings, dicts and tuples.
 #[no_mangle]
@@ -1228,9 +1202,7 @@ pub extern "C" fn pyx_next(obj: i64, default: i64, has_default: i64) -> i64 {
     iter::next_value(obj, default, has_default != 0)
 }
 
-// ---------------------------------------------------------------------
 // Operators
-// ---------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn pyx_binop(op: u32, a: i64, b: i64) -> i64 {
@@ -1253,9 +1225,7 @@ pub extern "C" fn pyx_truthy(v: i64) -> i64 {
     }
 }
 
-// ---------------------------------------------------------------------
 // Builtins
-// ---------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn pyx_print(argc: usize, argv: *const i64) -> i64 {
@@ -1329,8 +1299,7 @@ fn format_spec(ptr: *const c_uchar, len: usize) -> String {
     if ptr.is_null() || len == 0 || len > isize::MAX as usize {
         return String::new();
     }
-    // SAFETY: the ABI contract requires `ptr..ptr+len` to be readable; the
-    // length check above keeps the slice representable.
+    // SAFETY: ABI contract: `ptr..ptr+len` is readable; length checked above.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -1353,9 +1322,7 @@ pub extern "C" fn pyx_format_value(
     }
 }
 
-// ---------------------------------------------------------------------
 // Source location and frames
-// ---------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn pyx_set_file(ptr: *const c_uchar, len: usize) {
@@ -1377,9 +1344,7 @@ pub extern "C" fn pyx_frame_leave() {
     exc::frame_leave();
 }
 
-// ---------------------------------------------------------------------
 // Exceptions
-// ---------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn pyx_exc_pending() -> i64 {
@@ -1403,6 +1368,31 @@ pub extern "C" fn pyx_exc_value() -> i64 {
 #[no_mangle]
 pub extern "C" fn pyx_exc_clear() -> i64 {
     exc::clear()
+}
+
+/// Pushes an exception (or `None` for a `finally` entered without one) as the
+/// active handler context used for implicit chaining.
+#[no_mangle]
+pub extern "C" fn pyx_exc_handler_push(value: i64) -> i64 {
+    exc::handler_push(value)
+}
+
+/// Pops the innermost handler context.
+#[no_mangle]
+pub extern "C" fn pyx_exc_handler_pop() -> i64 {
+    exc::handler_pop()
+}
+
+/// Number of active handler contexts, captured at function entry.
+#[no_mangle]
+pub extern "C" fn pyx_exc_handler_depth() -> i64 {
+    exc::handler_depth()
+}
+
+/// Pops handler contexts down to an absolute depth.
+#[no_mangle]
+pub extern "C" fn pyx_exc_handler_truncate(depth: i64) -> i64 {
+    exc::handler_truncate(depth)
 }
 
 #[no_mangle]
@@ -1451,9 +1441,7 @@ pub extern "C" fn pyx_uncaught() -> i64 {
     exc::uncaught()
 }
 
-// ---------------------------------------------------------------------
 // Garbage collector (ARCHITECTURE §7)
-// ---------------------------------------------------------------------
 
 /// Forces a conservative collection and returns the number of objects
 /// freed by this call. In shared-heap mode this stops the other threads
@@ -1464,7 +1452,7 @@ pub extern "C" fn pyx_gc_collect() -> i64 {
     heap::collect()
 }
 
-/// Cooperative GC safepoint (Phase 2.13).
+/// Cooperative GC safepoint.
 ///
 /// Generated code calls this at every function entry and loop backedge.
 /// The fast path is a single atomic load; if a collection is requested,
@@ -1506,9 +1494,7 @@ pub extern "C" fn pyx_runtime_init() {
     crate::capi::anchor();
 }
 
-// ---------------------------------------------------------------------
 // Spawn start method
-// ---------------------------------------------------------------------
 
 /// Registers a generated wrapper for the `spawn` start method.
 ///
@@ -2397,7 +2383,7 @@ mod tests {
         assert_eq!(pyx_exc_pending(), 0);
     }
 
-    // ---- first-class functions (Phase 2.9) -------------------------
+    // First-class functions
 
     extern "C" fn add_wrapper(argv: *const i64) -> i64 {
         // SAFETY: the caller guarantees two readable arguments.

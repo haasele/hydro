@@ -38,8 +38,7 @@ pub(crate) fn print(argc: usize, argv: *const i64) -> i64 {
     let args: &[i64] = if argc == 0 || argv.is_null() {
         &[]
     } else {
-        // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-        // tagged values.
+        // SAFETY: ABI contract: `argv` points at `argc` readable tagged values.
         unsafe { std::slice::from_raw_parts(argv, argc) }
     };
     let mut text = render_args(args);
@@ -555,8 +554,7 @@ pub(crate) fn bytes_build(argc: usize, argv: *const i64) -> i64 {
             "bytes() received arguments without an argument buffer",
         );
     }
-    // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-    // tagged values; the length check above keeps the slice in range.
+    // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
     let args = unsafe { std::slice::from_raw_parts(argv, argc) };
     if argc == 2 {
         let Some(text) = value::as_str(args[0]) else {
@@ -807,8 +805,7 @@ fn list_buffer(argc: usize, argv: *const i64) -> &'static [i64] {
     if argc == 0 || argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return &[];
     }
-    // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-    // tagged values; the length check above keeps the slice in range.
+    // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
     unsafe { std::slice::from_raw_parts(argv, argc) }
 }
 
@@ -887,9 +884,7 @@ pub(crate) fn zip(argc: usize, argv: *const i64) -> i64 {
     result
 }
 
-// -------------------------------------------------------------------------
-// First-class functions (Phase 2.9)
-// -------------------------------------------------------------------------
+// First-class functions
 
 /// `fn(args...)`: calls a function value.
 ///
@@ -1020,23 +1015,18 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
                 }
                 buffer.extend_from_slice(captures);
                 if argc > 0 {
-                    // SAFETY: the caller passed a valid buffer for `argc`
-                    // tagged values; checked above for NULL.
+                    // SAFETY: caller passed a valid buffer of `argc` values; NULL checked above.
                     let args = unsafe { std::slice::from_raw_parts(argv, argc) };
                     buffer.extend_from_slice(args);
                 }
                 buffer.as_ptr()
             };
-            // SAFETY: `entry` was installed by `pyx_function_new` or
-            // `pyx_closure_new` from a generated entry point with exactly this
-            // signature (ARCHITECTURE §3/§5). The argument buffer is only
-            // dereferenced by the callee when it has parameters, which were
-            // checked against the wrapper's capture+user arity.
+            // SAFETY: `entry` is a generated entry point with this exact signature
+            // (ARCHITECTURE §3/§5); the callee only reads the buffer up to the checked arity.
             let entry: unsafe extern "C" fn(*const i64) -> i64 =
                 unsafe { std::mem::transmute(*entry) };
-            // SAFETY: the generated wrapper is called in-process with the
-            // calling convention it was emitted for. Root the copied buffer
-            // while callee code may allocate and trigger a collection.
+            // SAFETY: the generated wrapper is called in-process with its emitted
+            // calling convention; the copied buffer is rooted while the callee may allocate.
             let roots = crate::heap::root_values(&buffer);
             let result = unsafe { entry(argv) };
             crate::heap::release_roots(roots);
@@ -1063,8 +1053,7 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             let mut call_args = Vec::with_capacity(bound.len() + argc);
             call_args.extend_from_slice(bound);
             if argc > 0 {
-                // SAFETY: checked above for NULL; the caller's ABI contract
-                // makes `argv..argv+argc` readable.
+                // SAFETY: NULL checked above; the ABI contract makes `argv..argv+argc` readable.
                 let supplied = unsafe { std::slice::from_raw_parts(argv, argc) };
                 call_args.extend_from_slice(supplied);
             }
@@ -1258,8 +1247,7 @@ pub(crate) fn call_star(function: i64, argc: usize, argv: *const i64, star: i64)
     let Some(total) = argc.checked_add(items.len()) else {
         return exc::raise_with_message(TYPE_ERROR, "function call has too many arguments");
     };
-    // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-    // tagged values; the length checks above keep the slice in range.
+    // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
     let mut args: Vec<i64> = Vec::with_capacity(total);
     if argc > 0 {
         unsafe {
@@ -1573,8 +1561,7 @@ pub(crate) fn call_kw(
 /// visible to the conservative collector. Small vectors are copied to a stack
 /// array; unusually large signatures fall back to permanent thread roots.
 pub(crate) fn call_full_entry(entry: usize, args: &[i64]) -> i64 {
-    // SAFETY: `entry` is the generated `extern "C" fn(*const i64) -> i64`
-    // trampoline for this exact argument count.
+    // SAFETY: `entry` is the generated trampoline for this exact argument count.
     let trampoline: extern "C" fn(*const i64) -> i64 =
         unsafe { std::mem::transmute::<usize, extern "C" fn(*const i64) -> i64>(entry) };
     const STACK_ARGS: usize = 32;
@@ -1728,8 +1715,7 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
         MethodKind::Staticmethod => {}
     }
     if argc > 0 {
-        // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-        // tagged values; `argv` is non-NULL because `argc > 0`.
+        // SAFETY: ABI contract: `argv` points at `argc` readable values; non-NULL since `argc > 0`.
         let rest = unsafe { std::slice::from_raw_parts(argv, argc) };
         args.extend_from_slice(rest);
     }
@@ -1742,8 +1728,6 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     instance
 }
 
-/// Reports a builtin arity mismatch as `TypeError`, mirroring the message
-/// generated code produces for direct builtin calls.
 /// Shared `getattr(obj, name)` lookup used by the 2- and 3-argument forms.
 fn getattr_builtin(object: i64, name: i64) -> i64 {
     let Some(name) = value::as_str(name) else {
@@ -1795,8 +1779,7 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
     if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return builtin_arity_error(builtin.name(), "a supported number of", argc);
     }
-    // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-    // tagged values; the length checks above keep the slice in range.
+    // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
     let args: &[i64] = if argc == 0 {
         &[]
     } else {
@@ -2141,14 +2124,10 @@ pub(crate) fn filter(function: i64, iterable: i64) -> i64 {
     result
 }
 
-// -------------------------------------------------------------------------
 // `all` and dict unpacking
-// -------------------------------------------------------------------------
 
-/// `all(iterable)`: `True` when every element is truthy, `False` otherwise.
-/// An empty iterable is `True`, like CPython. A pending exception from the
-/// iteration or a falsy element short-circuits the result.
 /// `any(iterable)`: `True` when at least one element is truthy.
+/// An empty iterable is `False`; iteration errors propagate.
 pub(crate) fn any(iterable: i64) -> i64 {
     let iterator = iter::iter_new(iterable);
     if exc::pending() {
@@ -2169,6 +2148,8 @@ pub(crate) fn any(iterable: i64) -> i64 {
     }
 }
 
+/// `all(iterable)`: `True` when every element is truthy, `False` otherwise.
+/// An empty iterable is `True`, like CPython.
 pub(crate) fn all(iterable: i64) -> i64 {
     let iterator = iter::iter_new(iterable);
     if exc::pending() {
@@ -2231,9 +2212,7 @@ pub(crate) fn dict_merge(left: i64, right: i64) -> i64 {
     result
 }
 
-// -------------------------------------------------------------------------
 // `max` / `min` / `round` / `format` / `isinstance`
-// -------------------------------------------------------------------------
 
 /// `max(*args)`: the largest candidate, or the largest element of a single
 /// iterable. The final argument is always the key slot: `None` or a callable.
@@ -2263,8 +2242,7 @@ fn extremum(name: &str, argc: usize, argv: *const i64, want_max: bool) -> i64 {
     if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return builtin_arity_error(name, "a supported number of", argc);
     }
-    // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-    // tagged values; the checks above keep the slice in range.
+    // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
     let args: &[i64] = if argc == 0 {
         &[]
     } else {
@@ -2358,17 +2336,8 @@ fn extremum(name: &str, argc: usize, argv: *const i64, want_max: bool) -> i64 {
     best
 }
 
-/// `sorted(iterable, key=None, reverse=None)`: a new list with the elements
-/// in ascending order, or descending when `reverse` is truthy.
-///
-/// Direct lowering always supplies the `key` and `reverse` slots (`None`
-/// when omitted); a first-class `sorted` value forwards the user arguments,
-/// so one to three arguments are accepted. Ordering uses Python's `<` and the
-/// sort is stable, so equal keys keep their source order in either direction.
-/// Keys are evaluated once per element before any comparison, and both the
-/// elements and the keys stay reachable from rooted lists throughout.
 /// `reversed(iterable)`: materialise and reverse a sequence (the rich/stdlib
-/// surface only needs a list result).
+/// surface only needs a list result). Non-sequences are iterated to a list.
 fn reversed(value: i64) -> i64 {
     let mut items: Vec<i64> = if let Some(items) = value::as_list(value) {
         items.to_vec()
@@ -2426,6 +2395,14 @@ fn reversed(value: i64) -> i64 {
     value::list_new(items)
 }
 
+/// `sorted(iterable, key=None, reverse=None)`: a new list with the elements
+/// in ascending order, or descending when `reverse` is truthy.
+///
+/// Direct lowering always supplies the `key` and `reverse` slots (`None`
+/// when omitted); a first-class `sorted` value forwards the user arguments,
+/// so one to three arguments are accepted. Ordering uses Python's `<` and the
+/// sort is stable, so equal keys keep their source order in either direction.
+/// Keys are evaluated once per element before any comparison.
 pub(crate) fn sorted(argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -2436,8 +2413,7 @@ pub(crate) fn sorted(argc: usize, argv: *const i64) -> i64 {
     if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return builtin_arity_error("sorted", "a supported number of", argc);
     }
-    // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-    // tagged values; the length checks above keep the slice in range.
+    // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
     let args: &[i64] = if argc == 0 {
         &[]
     } else {

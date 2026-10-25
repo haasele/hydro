@@ -7,6 +7,8 @@
 //! side of `*`. Variables that never resolve become [`Type::Any`], which makes
 //! the codegen use the dynamic runtime operators.
 
+use std::collections::HashMap;
+
 use pyx_ir::stdlib;
 use pyx_ir::{
     BinOp, Builtin, Callee, ClassAttr, ClassMethod, CompClause, CompTarget, Const, DeleteTarget,
@@ -667,6 +669,33 @@ enum Check {
     },
 }
 
+/// End column of expressions whose source spelling has a known width.
+fn simple_expr_end(expr: &HExpr, f: &HFunction) -> Option<u32> {
+    let width = match &expr.kind {
+        HExprKind::Local(id) => {
+            let name = &f.locals.get(*id as usize)?.name;
+            if name.starts_with('$') {
+                return None;
+            }
+            name.len()
+        }
+        HExprKind::BuiltinRef(builtin) => builtin.name().len(),
+        HExprKind::Call {
+            callee: Callee::Builtin(builtin),
+            ..
+        } => builtin.name().len(),
+        HExprKind::ExceptionClass(kind) => kind.name().len(),
+        HExprKind::GlobalGet { name, .. } => name.len(),
+        HExprKind::Const(Const::None) => 4,
+        HExprKind::Const(Const::Bool(true)) => 4,
+        HExprKind::Const(Const::Bool(false)) => 5,
+        HExprKind::Const(Const::NotImplemented) => 14,
+        HExprKind::Const(Const::Ellipsis) => 3,
+        _ => return None,
+    };
+    Some(expr.col.saturating_add(u32::try_from(width).ok()?))
+}
+
 struct Checker<'a> {
     prog: &'a LHir,
     inf: &'a mut Infer,
@@ -674,6 +703,8 @@ struct Checker<'a> {
     diags: Vec<Diagnostic>,
     ops: Vec<Op>,
     checks: Vec<Check>,
+    /// Known end columns keyed by expression start.
+    spans: HashMap<(u32, u32), u32>,
 }
 
 impl<'a> Checker<'a> {
@@ -1019,7 +1050,7 @@ impl<'a> Checker<'a> {
                 }
                 let var_ty = f.locals[*var as usize].ty;
                 // `bytes` yields integer byte values; every other iterable
-                // keeps its elements dynamically typed in this phase.
+                // keeps its elements dynamically typed.
                 let element = if iterable_ty == Ty::Concrete(Type::Bytes) {
                     Type::Int
                 } else {
@@ -1369,6 +1400,9 @@ impl<'a> Checker<'a> {
     }
 
     fn check_expr(&mut self, expr: &HExpr, f: &HFunction) {
+        if let Some(end_col) = simple_expr_end(expr, f) {
+            self.spans.entry((expr.line, expr.col)).or_insert(end_col);
+        }
         match &expr.kind {
             HExprKind::Const(_) => {}
             HExprKind::Local(id) => {
@@ -1497,12 +1531,6 @@ impl<'a> Checker<'a> {
                 self.check_expr(value, f);
                 self.check_hashable(key);
                 let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Dict));
-            }
-            HExprKind::GeneratorExp { element, clauses } => {
-                // Generator expressions are materialised as lists.
-                self.check_comp_clauses(clauses, f);
-                self.check_expr(element, f);
-                let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::List));
             }
             HExprKind::Subscript { object, index } => {
                 self.check_expr(object, f);
@@ -1851,7 +1879,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Resolve `object.method(args)` against the Phase 2.4 method matrix.
+    /// Resolve `object.method(args)` against the known method matrix.
     ///
     /// Receivers whose type is not statically known (or `Any`) are executed
     /// dynamically: every method name and arity is accepted and the result is
@@ -3370,6 +3398,7 @@ pub fn check(prog: &LHir, inf: &mut Infer, filename: &str) -> Result<(), Vec<Dia
         diags: Vec::new(),
         ops: Vec::new(),
         checks: Vec::new(),
+        spans: HashMap::new(),
     };
 
     let functions = prog.functions.clone();
@@ -3380,6 +3409,18 @@ pub fn check(prog: &LHir, inf: &mut Infer, filename: &str) -> Result<(), Vec<Dia
     checker.apply_builtin_checks();
     checker.solve_ops();
     checker.apply_raise_checks();
+
+    // Most semantic errors carry only a start column; widen them to the
+    // identifier or literal they point at.
+    for diagnostic in &mut checker.diags {
+        if diagnostic.end_col <= diagnostic.col.saturating_add(1) {
+            if let Some(&end_col) = checker.spans.get(&(diagnostic.line, diagnostic.col)) {
+                if end_col > diagnostic.col {
+                    diagnostic.end_col = end_col;
+                }
+            }
+        }
+    }
 
     if checker.diags.is_empty() {
         Ok(())
@@ -3750,10 +3791,6 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
         } => ExprKind::DictComp {
             key: Box::new(emit_expr(key, inf)),
             value: Box::new(emit_expr(value, inf)),
-            clauses: emit_comp_clauses(clauses, inf),
-        },
-        HExprKind::GeneratorExp { element, clauses } => ExprKind::GeneratorExp {
-            element: Box::new(emit_expr(element, inf)),
             clauses: emit_comp_clauses(clauses, inf),
         },
         HExprKind::Subscript { object, index } => ExprKind::Subscript {

@@ -10,14 +10,14 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::cli::args::{parse_project, ProjectOptions};
+use crate::cli::args::{parse_project, ProjectOptions, Verbosity};
 use crate::cli::{CliError, CliResult};
 
 const MAIN_PY: &str = "print(\"Hello, PyX!\")\n";
 const GITIGNORE: &str = ".pyx/\n__pycache__/\n";
 
-pub(crate) fn cmd_new(args: &[OsString]) -> CliResult {
-    let options = parse_project(args, "new", true)?;
+pub(crate) fn cmd_new(args: &[OsString], verbosity: Verbosity) -> CliResult {
+    let options = parse_project(args, "new", true, verbosity)?;
     if options.path.exists() {
         if !options.path.is_dir() {
             return Err(CliError::new(
@@ -48,11 +48,11 @@ pub(crate) fn cmd_new(args: &[OsString]) -> CliResult {
             ),
         )
     })?;
-    scaffold(&options.path, options.force)
+    scaffold(&options.path, options.force, options.verbosity)
 }
 
-pub(crate) fn cmd_init(args: &[OsString]) -> CliResult {
-    let options: ProjectOptions = parse_project(args, "init", false)?;
+pub(crate) fn cmd_init(args: &[OsString], verbosity: Verbosity) -> CliResult {
+    let options: ProjectOptions = parse_project(args, "init", false, verbosity)?;
     if !options.path.is_dir() {
         return Err(CliError::new(
             1,
@@ -62,10 +62,10 @@ pub(crate) fn cmd_init(args: &[OsString]) -> CliResult {
             ),
         ));
     }
-    scaffold(&options.path, options.force)
+    scaffold(&options.path, options.force, options.verbosity)
 }
 
-fn scaffold(directory: &Path, force: bool) -> CliResult {
+fn scaffold(directory: &Path, force: bool, verbosity: Verbosity) -> CliResult {
     let name = project_name(directory);
     let files = [
         ("main.py", MAIN_PY.to_string()),
@@ -108,7 +108,9 @@ fn scaffold(directory: &Path, force: bool) -> CliResult {
                 format!("pyx: cannot write '{}': {error}", path.display()),
             )
         })?;
-        println!("created {}", path.display());
+        if !verbosity.is_quiet() {
+            println!("created {}", path.display());
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

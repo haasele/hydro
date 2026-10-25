@@ -14,6 +14,10 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// CPython's separator between an explicit cause and the exception it causes.
 const DIRECT_CAUSE: &str = "The above exception was the direct cause of the following exception:";
 
+/// CPython's separator between an implicitly handled exception and the
+/// exception raised while handling it.
+const DURING_HANDLING: &str = "During handling of the above exception, another exception occurred:";
+
 fn write_source(test_name: &str, source: &str) -> PathBuf {
     let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
@@ -246,6 +250,161 @@ outer()
     assert!(!stderr.contains(DIRECT_CAUSE), "stderr:\n{stderr}");
     assert!(
         stderr.contains("RuntimeError: outer boom"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn division_error_in_handler_chains_to_the_new_exception() {
+    let source = "\
+try:
+    1 / 0
+except ZeroDivisionError:
+    raise ValueError('x')
+";
+    let (code, _, stderr) = run_source("division_context", source);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    let division = assert_after(&stderr, "ZeroDivisionError", 0);
+    let marker = assert_after(&stderr, DURING_HANDLING, division);
+    assert_after(&stderr, "ValueError: x", marker);
+}
+
+#[test]
+fn nested_handlers_chain_implicit_context_deepest_first() {
+    let source = "\
+def inner():
+    raise ValueError('inner boom')
+
+def outer():
+    try:
+        inner()
+    except ValueError:
+        try:
+            raise TypeError('middle boom')
+        except TypeError:
+            raise RuntimeError('outer boom')
+
+outer()
+";
+    let (code, _, stderr) = run_source("implicit_nested", source);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    let inner = assert_after(&stderr, "ValueError: inner boom", 0);
+    let middle = assert_after(&stderr, DURING_HANDLING, inner);
+    let middle_frame = assert_after(&stderr, "TypeError: middle boom", middle);
+    let outer_frame = assert_after(&stderr, DURING_HANDLING, middle_frame);
+    assert_after(&stderr, "RuntimeError: outer boom", outer_frame);
+    assert_eq!(
+        stderr.matches(DURING_HANDLING).count(),
+        2,
+        "both implicit links must be rendered:\n{stderr}"
+    );
+    assert!(!stderr.contains(DIRECT_CAUSE), "stderr:\n{stderr}");
+}
+
+#[test]
+fn explicit_cause_wins_over_implicit_context_in_a_handler() {
+    let source = "\
+def inner():
+    raise ValueError('inner boom')
+
+def outer():
+    try:
+        inner()
+    except ValueError as e:
+        raise RuntimeError('outer boom') from e
+
+outer()
+";
+    let (code, _, stderr) = run_source("explicit_over_context", source);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    let inner = assert_after(&stderr, "ValueError: inner boom", 0);
+    let marker = assert_after(&stderr, DIRECT_CAUSE, inner);
+    assert_after(&stderr, "RuntimeError: outer boom", marker);
+    assert!(
+        !stderr.contains(DURING_HANDLING),
+        "explicit cause must suppress implicit context:\n{stderr}"
+    );
+}
+
+#[test]
+fn raise_from_none_suppresses_implicit_context_in_a_handler() {
+    let source = "\
+try:
+    raise ValueError('inner boom')
+except ValueError:
+    raise RuntimeError('outer boom') from None
+";
+    let (code, _, stderr) = run_source("from_none_context", source);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(!stderr.contains("inner boom"), "stderr:\n{stderr}");
+    assert!(!stderr.contains(DURING_HANDLING), "stderr:\n{stderr}");
+    assert!(!stderr.contains(DIRECT_CAUSE), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("RuntimeError: outer boom"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn bare_re_raise_in_a_handler_does_not_chain_to_itself() {
+    let source = "\
+def fail():
+    try:
+        raise ValueError('once')
+    except ValueError:
+        raise
+
+fail()
+";
+    let (code, _, stderr) = run_source("handler_reraise", source);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert_eq!(
+        stderr.matches("ValueError: once").count(),
+        1,
+        "a bare re-raise must print the exception once:\n{stderr}"
+    );
+    assert!(!stderr.contains(DURING_HANDLING), "stderr:\n{stderr}");
+}
+
+#[test]
+fn handler_context_does_not_leak_after_normal_break_or_return() {
+    let source = "\
+def normal():
+    try:
+        raise ValueError('first')
+    except ValueError:
+        pass
+
+def via_break():
+    while True:
+        try:
+            raise ValueError('second')
+        except ValueError:
+            break
+
+def via_return():
+    try:
+        raise ValueError('third')
+    except ValueError:
+        return
+
+def raised_after_return():
+    via_return()
+    raise TypeError('after return')
+
+normal()
+via_break()
+raised_after_return()
+";
+    let (code, _, stderr) = run_source("no_context_leak", source);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(
+        !stderr.contains("ValueError"),
+        "handled exceptions must not leak into later raises:\n{stderr}"
+    );
+    assert!(!stderr.contains(DURING_HANDLING), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("TypeError: after return"),
         "stderr:\n{stderr}"
     );
 }

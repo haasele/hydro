@@ -1,8 +1,10 @@
 //! Exception state and tracebacks (ARCHITECTURE §3.3).
 //!
-//! Phase 1 keeps a single pending exception per thread in a `thread_local`.
-//! Raising overwrites any previous pending exception; the codegen polls
-//! `pyx_exc_pending()` after every fallible runtime call.
+//! A single pending exception per thread lives in a `thread_local`. Raising
+//! overwrites any previous pending exception; the codegen polls
+//! `pyx_exc_pending()` after every fallible runtime call. A separate stack of
+//! exceptions whose handlers are active supplies implicit `__context__`
+//! chaining, and the codegen keeps it balanced on every handler exit path.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -26,9 +28,13 @@ pub(crate) struct ExcData {
     pub(crate) line: u32,
     /// Function name at raise time (`""` if unknown).
     pub(crate) frame: String,
-    /// Tagged exception value that caused this one, or `None` for no explicit
-    /// cause (including `raise ... from None`).
+    /// Tagged exception value passed to `raise ... from`, if any.
     pub(crate) cause: Option<i64>,
+    /// Exception being handled when this one was raised (implicit chaining).
+    pub(crate) context: Option<i64>,
+    /// `raise ... from ...` (including `from None`): hide `context` in the
+    /// rendered traceback even though it is stored.
+    pub(crate) suppress_context: bool,
 }
 
 // Exception tags, fixed by ARCHITECTURE §3.2.
@@ -168,6 +174,10 @@ struct State {
     frames: Vec<String>,
     /// Tagged heap pointer to the pending exception object, if any.
     pending: Option<i64>,
+    /// Exceptions whose handlers are active (and in-flight exceptions while a
+    /// `finally` body runs), innermost last. Implicit chaining reads the top;
+    /// the heap mirror keeps these values alive.
+    handled: Vec<i64>,
 }
 
 thread_local! {
@@ -179,9 +189,7 @@ thread_local! {
     static CLASS_CACHE: RefCell<HashMap<u32, i64>> = RefCell::new(HashMap::new());
 }
 
-// -------------------------------------------------------------------------
 // Source location tracking
-// -------------------------------------------------------------------------
 
 pub(crate) fn set_file_ptr(ptr: *const u8, len: usize) {
     let file = decode_bytes(ptr, len);
@@ -204,11 +212,6 @@ pub(crate) fn frame_leave() {
     });
 }
 
-/// Name of the innermost active frame (`""` when no frame is active).
-fn current_frame() -> String {
-    STATE.with(|s| s.borrow().frames.last().cloned().unwrap_or_default())
-}
-
 fn decode_bytes(ptr: *const u8, len: usize) -> String {
     if ptr.is_null() || len == 0 || len > isize::MAX as usize {
         return String::new();
@@ -218,9 +221,7 @@ fn decode_bytes(ptr: *const u8, len: usize) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-// -------------------------------------------------------------------------
 // Pending exception state
-// -------------------------------------------------------------------------
 
 pub(crate) fn pending() -> bool {
     STATE.with(|s| s.borrow().pending.is_some())
@@ -256,22 +257,94 @@ pub(crate) fn init() {
     CLASS_CACHE.with(|cache| cache.borrow_mut().clear());
     value::clear_type_class_cache();
     crate::heap::set_pending_mirror(value::NONE);
+    crate::heap::set_handled_mirror(&[]);
+}
+
+/// Pushes `value` (a tagged exception or `None`) as the active handler
+/// context. `None` marks a `finally` body entered without an in-flight
+/// exception, so outer handlers are not shadowed by a stale value.
+pub(crate) fn handler_push(value: i64) -> i64 {
+    let handled = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        state.handled.push(value);
+        state.handled.clone()
+    });
+    crate::heap::set_handled_mirror(&handled);
+    NONE
+}
+
+/// Pops the innermost handler context (`pyx_exc_handler_pop`).
+pub(crate) fn handler_pop() -> i64 {
+    let handled = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        state.handled.pop();
+        state.handled.clone()
+    });
+    crate::heap::set_handled_mirror(&handled);
+    NONE
+}
+
+/// Number of active handler contexts (`pyx_exc_handler_depth`).
+pub(crate) fn handler_depth() -> i64 {
+    STATE.with(|s| s.borrow().handled.len() as i64)
+}
+
+/// Pops handler contexts until the stack is back at `depth`
+/// (`pyx_exc_handler_truncate`). A depth at or beyond the current length is a
+/// no-op, so a path that already unwound cannot pop a caller's context.
+pub(crate) fn handler_truncate(depth: i64) -> i64 {
+    let handled = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        if depth >= 0 {
+            state.handled.truncate(depth as usize);
+        }
+        state.handled.clone()
+    });
+    crate::heap::set_handled_mirror(&handled);
+    NONE
+}
+
+/// Exception whose handler is active, if any. `None` entries above it are
+/// `finally` markers and are skipped.
+fn handled() -> Option<i64> {
+    STATE.with(|s| {
+        s.borrow()
+            .handled
+            .iter()
+            .rev()
+            .copied()
+            .find(|&value| value != NONE)
+    })
+}
+
+/// Tagged values of the active handler stack, for the collector's root scan.
+pub(crate) fn handled_values() -> Vec<i64> {
+    STATE.with(|s| s.borrow().handled.clone())
 }
 
 /// Raises `tag` with `message`, capturing the current file/line/frame.
 /// Returns the ABI dummy value (`None`).
 pub(crate) fn raise_with_message(tag: u32, message: &str) -> i64 {
-    raise_with_message_cause(tag, message, None)
+    raise_with_message_cause(tag, message, None, false)
 }
 
-/// [`raise_with_message`] with an explicit cause (already filtered: `None`
-/// means "no cause").
-fn raise_with_message_cause(tag: u32, message: &str, cause: Option<i64>) -> i64 {
-    let (file, line) = STATE.with(|s| {
+/// [`raise_with_message`] with an explicit cause (`None` means "no cause")
+/// and the `from` suppression flag. A new exception records the exception
+/// whose handler is active as its implicit `context`.
+fn raise_with_message_cause(
+    tag: u32,
+    message: &str,
+    cause: Option<i64>,
+    suppress_context: bool,
+) -> i64 {
+    let (file, line, frame) = STATE.with(|s| {
         let st = s.borrow();
-        (st.file.clone(), st.line)
+        (
+            st.file.clone(),
+            st.line,
+            st.frames.last().cloned().unwrap_or_default(),
+        )
     });
-    let frame = current_frame();
     let data = ExcData {
         tag,
         name: tag_name(tag),
@@ -280,6 +353,8 @@ fn raise_with_message_cause(tag: u32, message: &str, cause: Option<i64>) -> i64 
         line,
         frame,
         cause,
+        context: handled(),
+        suppress_context,
     };
     publish(value::exception_new(data))
 }
@@ -335,24 +410,35 @@ pub(crate) fn raise_msg_ptr(tag: u32, ptr: *const u8, len: usize) -> i64 {
 /// `pyx_raise_value`: re-raises an existing exception object (bare `raise`).
 ///
 /// The object is stored as-is, so type, message and source location of the
-/// original raise are preserved. Non-exception values raise `RuntimeError`,
-/// matching CPython.
+/// original raise are preserved. If another exception's handler is active and
+/// the object has no implicit context yet, a copy carrying that context is
+/// published instead; re-raising the handled object itself never creates a
+/// self-cycle. Non-exception values raise `RuntimeError`, matching CPython.
 pub(crate) fn raise_value(v: i64) -> i64 {
-    if value::exception_data(v).is_some() {
-        publish(v)
-    } else {
-        raise_with_message(RUNTIME_ERROR, "exceptions must derive from BaseException")
+    match value::exception_data(v) {
+        Some(data) => {
+            let context = handled().filter(|&h| h != v);
+            match context {
+                Some(context) if data.context.is_none() => {
+                    let mut data = data.clone();
+                    data.context = Some(context);
+                    publish(value::exception_new(data))
+                }
+                _ => publish(v),
+            }
+        }
+        None => raise_with_message(RUNTIME_ERROR, "exceptions must derive from BaseException"),
     }
 }
 
 /// `pyx_raise_from`: `raise X(msg) from cause`.
 ///
-/// A `cause` of `None` (`from None`) suppresses the cause entirely; any other
-/// tagged value is stored as the explicit cause so the chained traceback and
-/// the collector can follow it.
+/// A `cause` of `None` (`from None`) stores no cause; any other tagged value
+/// is stored as the explicit cause. Either way the implicit `context` is
+/// recorded but no longer rendered, so explicit chaining wins.
 pub(crate) fn raise_from(tag: u32, msg: i64, cause: i64) -> i64 {
     let text = rendered_message(tag, msg);
-    raise_with_message_cause(tag, &text, cause_of(cause))
+    raise_with_message_cause(tag, &text, cause_of(cause), true)
 }
 
 /// `pyx_raise_value_from`: `raise value from cause` for an existing exception
@@ -366,6 +452,10 @@ pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
         Some(data) => {
             let mut data = data.clone();
             data.cause = cause_of(cause);
+            data.suppress_context = true;
+            if let Some(context) = handled().filter(|&h| h != v) {
+                data.context = Some(context);
+            }
             publish(value::exception_new(data))
         }
         None => raise_with_message(RUNTIME_ERROR, "exceptions must derive from BaseException"),
@@ -397,13 +487,18 @@ pub(crate) fn matches_handler(handler_tag: u32) -> i32 {
     i32::from(matched)
 }
 
-// -------------------------------------------------------------------------
 // Uncaught traceback
-// -------------------------------------------------------------------------
 
-/// Maximum number of exceptions rendered for one cause chain. Deeper chains
-/// stop at the outermost exception (the chain is rendered deepest first).
+/// Maximum number of exceptions rendered for one chain. Deeper chains stop
+/// at the outermost exception (the chain is rendered deepest first).
 const MAX_CAUSE_CHAIN: usize = 8;
+
+/// CPython's separator between an implicit context and the exception it
+/// caused.
+const DURING_HANDLING: &str = "During handling of the above exception, another exception occurred:";
+
+/// CPython's separator between an explicit cause and the exception it caused.
+const DIRECT_CAUSE: &str = "The above exception was the direct cause of the following exception:";
 
 /// Prints the traceback for the pending exception to stderr, clears it and
 /// returns the process exit code `1`. Returns `0` if nothing is pending.
@@ -420,6 +515,8 @@ pub(crate) fn uncaught() -> i64 {
         line: 0,
         frame: String::new(),
         cause: None,
+        context: None,
+        suppress_context: false,
     });
 
     let text = render_chain(root, &data);
@@ -432,38 +529,56 @@ pub(crate) fn uncaught() -> i64 {
     1
 }
 
-/// Renders `data` after the tracebacks of its explicit causes.
+/// Renders `data` after the tracebacks of its chained predecessors.
 ///
-/// The chain is followed through `ExcData::cause` only (implicit context is
-/// not tracked), deepest cause first, separated by the CPython marker line.
-/// At most [`MAX_CAUSE_CHAIN`] exceptions are rendered and cycles are cut off,
-/// so a self-referential chain cannot loop.
+/// An explicit cause wins over implicit context; without one, the context is
+/// followed unless `raise ... from` suppressed it. Predecessors are rendered
+/// deepest first, separated by the matching CPython marker line. At most
+/// [`MAX_CAUSE_CHAIN`] exceptions are rendered and cycles are cut off, so a
+/// self-referential chain cannot loop.
 fn render_chain(root: i64, data: &ExcData) -> String {
     let mut chain = vec![data.clone()];
+    // `edges[i]` is true when chain[i] was reached through an explicit cause.
+    let mut edges: Vec<bool> = Vec::new();
     let mut seen = vec![root];
-    let mut cause = data.cause;
-    while let Some(handle) = cause {
-        if chain.len() >= MAX_CAUSE_CHAIN || seen.contains(&handle) {
+    let mut current = data.clone();
+    loop {
+        if chain.len() >= MAX_CAUSE_CHAIN {
             break;
         }
-        seen.push(handle);
-        let Some(next) = value::exception_data(handle) else {
+        let (next, direct) = match current.cause {
+            Some(cause) => (cause, true),
+            None if !current.suppress_context => match current.context {
+                Some(context) => (context, false),
+                None => break,
+            },
+            None => break,
+        };
+        if seen.contains(&next) {
+            break;
+        }
+        seen.push(next);
+        let Some(next) = value::exception_data(next) else {
             break;
         };
-        cause = next.cause;
-        chain.push(next.clone());
+        current = next.clone();
+        chain.push(current.clone());
+        edges.push(direct);
     }
 
     let mut text = String::new();
-    for (index, data) in chain.iter().rev().enumerate() {
-        if index > 0 {
+    for index in (0..chain.len()).rev() {
+        if index + 1 < chain.len() {
             let _ = writeln!(text);
-            let _ = writeln!(
-                text,
-                "The above exception was the direct cause of the following exception:"
-            );
+            let separator = if edges[index] {
+                DIRECT_CAUSE
+            } else {
+                DURING_HANDLING
+            };
+            let _ = writeln!(text, "{separator}");
             let _ = writeln!(text);
         }
+        let data = &chain[index];
         let _ = writeln!(text, "Traceback (most recent call last):");
         let _ = writeln!(
             text,
@@ -661,6 +776,8 @@ mod tests {
             line,
             frame: frame.to_string(),
             cause,
+            context: None,
+            suppress_context: false,
         }
     }
 
@@ -898,6 +1015,165 @@ mod tests {
         let cause = data.cause.expect("cause edge");
         assert_eq!(
             value::exception_data(cause).expect("cause object").msg,
+            "inner"
+        );
+        init();
+    }
+
+    #[test]
+    fn handler_stack_push_pop_and_truncate() {
+        init();
+        let first = value::exception_new(test_data(VALUE_ERROR, "first", 1, "f", None));
+        let second = value::exception_new(test_data(TYPE_ERROR, "second", 2, "f", None));
+        handler_push(first);
+        handler_push(second);
+        assert_eq!(handler_depth(), 2);
+        assert_eq!(handled(), Some(second));
+
+        handler_truncate(1);
+        assert_eq!(handler_depth(), 1);
+        assert_eq!(handled(), Some(first));
+
+        // A depth beyond the stack is a no-op, so a path that already
+        // unwound cannot pop a caller's context.
+        handler_truncate(5);
+        assert_eq!(handler_depth(), 1);
+
+        handler_pop();
+        assert_eq!(handler_depth(), 0);
+        assert_eq!(handled(), None);
+        handler_pop();
+        assert_eq!(handler_depth(), 0);
+        init();
+    }
+
+    #[test]
+    fn handler_context_is_recorded_and_rendered() {
+        init();
+        let inner = value::exception_new(test_data(VALUE_ERROR, "inner", 3, "inner_fn", None));
+        handler_push(inner);
+        raise_with_message(RUNTIME_ERROR, "outer");
+        let outer = pending_value();
+        let data = value::exception_data(outer).expect("exception object");
+        assert_eq!(data.context, Some(inner));
+        assert_eq!(data.cause, None);
+        assert!(!data.suppress_context);
+        assert_eq!(
+            render_chain(outer, data),
+            concat!(
+                "Traceback (most recent call last):\n",
+                "  File \"test.py\", line 3, in inner_fn\n",
+                "ValueError: inner\n",
+                "\n",
+                "During handling of the above exception, another exception occurred:\n",
+                "\n",
+                "Traceback (most recent call last):\n",
+                "  File \"\", line 0, in \n",
+                "RuntimeError: outer\n",
+            )
+        );
+
+        // Popping the handler stops implicit chaining.
+        clear();
+        handler_pop();
+        raise_with_message(RUNTIME_ERROR, "plain");
+        assert_eq!(
+            value::exception_data(pending_value())
+                .expect("exception object")
+                .context,
+            None
+        );
+        init();
+    }
+
+    #[test]
+    fn explicit_cause_wins_over_context() {
+        init();
+        let inner = value::exception_new(test_data(VALUE_ERROR, "inner", 3, "inner_fn", None));
+        handler_push(inner);
+        raise_from(RUNTIME_ERROR, value::str_from_bytes(b"outer"), inner);
+        let outer = pending_value();
+        let data = value::exception_data(outer).expect("exception object");
+        assert_eq!(data.cause, Some(inner));
+        assert_eq!(data.context, Some(inner));
+        assert!(data.suppress_context);
+        let text = render_chain(outer, data);
+        assert!(!text.contains("During handling"), "{text}");
+        assert!(text.contains("direct cause"), "{text}");
+        init();
+    }
+
+    #[test]
+    fn raise_from_none_hides_the_context() {
+        init();
+        let inner = value::exception_new(test_data(VALUE_ERROR, "inner", 3, "inner_fn", None));
+        handler_push(inner);
+        raise_from(RUNTIME_ERROR, value::str_from_bytes(b"outer"), NONE);
+        let outer = pending_value();
+        let data = value::exception_data(outer).expect("exception object");
+        assert_eq!(data.cause, None);
+        assert_eq!(data.context, Some(inner));
+        assert!(data.suppress_context);
+        let text = render_chain(outer, data);
+        assert!(!text.contains("inner"), "{text}");
+        assert!(!text.contains("During handling"), "{text}");
+        assert!(text.contains("RuntimeError: outer"), "{text}");
+        init();
+    }
+
+    #[test]
+    fn re_raising_the_handled_exception_does_not_cycle() {
+        init();
+        let inner = value::exception_new(test_data(VALUE_ERROR, "inner", 3, "inner_fn", None));
+        handler_push(inner);
+        raise_value(inner);
+        assert_eq!(pending_value(), inner);
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert_eq!(data.context, None);
+        let text = render_chain(pending_value(), data);
+        assert_eq!(
+            text,
+            concat!(
+                "Traceback (most recent call last):\n",
+                "  File \"test.py\", line 3, in inner_fn\n",
+                "ValueError: inner\n",
+            )
+        );
+        handler_pop();
+        init();
+    }
+
+    /// Raises an outer exception while `inner` is handled, then pops the
+    /// handler; only the `context` edge keeps `inner` alive.
+    #[inline(never)]
+    fn raise_chain_with_context() -> i64 {
+        let inner = value::exception_new(test_data(VALUE_ERROR, "inner", 1, "inner", None));
+        handler_push(inner);
+        raise_with_message(RUNTIME_ERROR, "outer");
+        handler_pop();
+        pending_value()
+    }
+
+    #[test]
+    fn collection_keeps_the_context_of_the_pending_exception() {
+        init();
+        crate::heap::reset();
+        let outer = raise_chain_with_context();
+        assert!(pending());
+        assert_eq!(crate::heap::objects(), 2, "inner and outer were allocated");
+
+        scrub_stack();
+        let freed = crate::heap::collect();
+        assert_eq!(
+            freed, 0,
+            "the pending exception and its context must stay reachable"
+        );
+        assert_eq!(crate::heap::objects(), 2);
+
+        let data = value::exception_data(outer).expect("exception object");
+        let context = data.context.expect("context edge");
+        assert_eq!(
+            value::exception_data(context).expect("context object").msg,
             "inner"
         );
         init();

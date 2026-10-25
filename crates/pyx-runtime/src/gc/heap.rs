@@ -1,118 +1,43 @@
-//! Interim conservative mark-&-sweep collector (ARCHITECTURE §7).
+//! Conservative mark-&-sweep collector; the algorithm is specified in
+//! ARCHITECTURE §7. Contract summary:
 //!
-//! Every heap object created by [`crate::value`] is registered here. The scan
-//! is conservative: a word is treated as a tagged heap pointer only when its
-//! low three bits are `010` *and* the decoded address is present in the
-//! registry, so a false positive can only keep an object alive, never
-//! dereference an unknown address.
+//! * Every heap object is registered here. A word is treated as a tagged heap
+//!   pointer only when its low three bits are `010` *and* the decoded address
+//!   is in the registry, so a stale word can keep an object alive but never
+//!   dereference an unknown address.
+//! * Threads start with a thread-local registry; after
+//!   `_thread.start_new_thread` the heap is process-wide ([`enable_shared`])
+//!   and mutex-protected. Collections are incremental: a root snapshot and a
+//!   final rescan stop the world, marking and sweeping run concurrently with
+//!   mutators. Insertion barriers ([`write_barrier_edge`]) publish every new
+//!   edge; objects allocated while marking are born grey.
+//! * [`safepoint`] runs at function entry, loop backedges and before every
+//!   allocation; blocking operations park via [`blocking_enter`]/
+//!   [`blocking_leave`]. There is no GIL: shared containers still need user
+//!   locks.
+//! * Lock order: `GLOBAL` (registry) before the heap mutex, never after.
+//!   `GLOBAL` is only held after all threads are parked or briefly during the
+//!   sweep partition, never across a payload drop. `GRAPH_LOCK` serialises
+//!   container mutation against marking; `WORKLIST` is never held while
+//!   acquiring `GRAPH_LOCK`, a queue mutex or `GLOBAL`. `GC_LOCK` is only
+//!   taken with `try_lock`, so a second collector skips. No guard is held
+//!   across a safepoint or an allocation.
 //!
-//! # Single-threaded and shared heaps
+//! Documented limits:
 //!
-//! By default every thread owns a thread-local registry, so independent
-//! runtime unit tests stay isolated and the collector can scan the current
-//! stack without coordination. Once `_thread.start_new_thread` is used the
-//! process switches permanently to a process-wide *shared heap*
-//! ([`enable_shared`]): all objects are migrated into one mutex-protected
-//! registry and every later allocation is registered there, so objects
-//! created by the main thread are visible to child threads and vice versa.
+//! * Container mutation is serialised against the marker by `GRAPH_LOCK`; a
+//!   long mutation delays marking but cannot block the collector forever.
+//! * An iterator's `index` is not traced, only its immutable `target`, so a
+//!   partially consumed iterator keeps its whole target alive.
+//! * A registered thread whose saved context cannot be bounded abandons the
+//!   collection (objects are leaked) rather than scanning unsafely.
 //!
-//! # Incremental concurrent collection
-//!
-//! Shared-mode collections are incremental mark-&-sweep with only two short
-//! stop-the-world windows:
-//!
-//! 1. **Root snapshot.** `MARKING` is published, the collector requests a
-//!    stop-the-world, waits until every other registered thread is parked or
-//!    exited, snapshots their saved contexts, pending mirrors and explicit
-//!    roots (plus its own live stack/registers), copies the registry's address
-//!    index, marks the roots grey and releases the world.
-//! 2. **Concurrent marking.** Mutators keep running while the collector drains
-//!    the worklist. Every mutation that stores a new child value publishes an
-//!    insertion barrier for that edge ([`write_barrier_edge`]): if the
-//!    container is already black, the *child* is marked grey and queued, so
-//!    the new edge is traced without re-tracing the (possibly huge) parent.
-//!    Allocations made while `MARKING` is set are born grey (floating garbage
-//!    is acceptable).
-//! 3. **Final rescan.** The collector stops the world again and holds the
-//!    thread registry across the rescan and the final drain, so no
-//!    registration, allocation or barrier can slip in. Afterwards it releases
-//!    the world while `MARKING` stays set, so allocations made during the
-//!    sweep are still born grey and can never be collected.
-//! 4. **Concurrent sweep.** Under the heap lock only, the collector partitions
-//!    the registry: white objects leave it, every survivor turns white again
-//!    and the address index is rebuilt. The payloads are then dropped
-//!    *outside* the heap lock while the mutators run; no live PyX object can
-//!    reference them (the final rescan and the insertion barriers published
-//!    every live edge before the world was released). The cells themselves go
-//!    back to the pool's free list under the brief final heap lock, which
-//!    also clears `MARKING` and whitens every registered object again.
-//!
-//! Threads park at [`safepoint`]s, which generated code executes at function
-//! entry and loop backedges and which every allocation runs before touching
-//! the heap. A thread that blocks (lock acquisition, `_thread.join`,
-//! `time.sleep`) parks itself for the duration of the block via
-//! [`blocking_enter`]/[`blocking_leave`]; while blocked its saved context is
-//! scanned as usual, and it does not resume user code until a running
-//! collection has finished. This is *not* a GIL: between safepoints threads
-//! execute in parallel, and shared mutable containers still need user locks.
-//!
-//! # Locking and deadlock avoidance
-//!
-//! * `GLOBAL` (heap registry) is only held by the collector after every
-//!   other thread is parked, except during the registry partition and final
-//!   colour reset of the concurrent sweep, where it is held briefly and
-//!   never across a payload drop (`ptr::drop_in_place`). A thread never waits
-//!   for another thread while holding it.
-//! * `GRAPH_LOCK` serialises container payload mutation (via the guards in
-//!   [`crate::value`]) against the marker's [`trace`]. The marker takes it per
-//!   object and holds it across the black transition; a guard holds it across
-//!   the mutation *and* its edge barriers, so a barrier cannot race with the
-//!   marker.
-//! * `WORKLIST` is never held while acquiring `GRAPH_LOCK`, a queue's item
-//!   mutex or `GLOBAL`; a mutator's barrier may therefore take `GRAPH_LOCK`
-//!   (or the queue mutex) and then `WORKLIST`.
-//! * The marker takes a queue's item mutex across the traversal *and* the
-//!   black transition; a queue push publishes its edge barrier under the same
-//!   mutex, so a push can never be lost to a completed trace.
-//! * `GC_LOCK` is only ever taken with `try_lock`, so a second collector
-//!   skips instead of blocking.
-//! * [`blocking_enter`] must never run while the heap, registry, graph or
-//!   collector lock is held, and no guard is held across a safepoint or a PyX
-//!   allocation (a collection could otherwise wait for a lock the thread
-//!   itself holds).
-//! * A thread counted as parked only *waits*: it never inserts into or removes
-//!   from a container between [`blocking_enter`] and [`blocking_leave`]
-//!   (blocking queue operations park around their condvar wait and mutate
-//!   after unparking), so a root snapshot cannot miss an edge created by a
-//!   thread the collector believes is stopped.
-//! * The registry mutex is taken before the heap mutex, never after.
-//!
-//! # Documented limits
-//!
-//! * The stack/register scan is conservative: a stale word keeps an object
-//!   alive but can never free a reachable one.
-//! * `GRAPH_LOCK` serialises every list/dict/set mutation against the marker.
-//!   A mutation that takes long delays marking but never blocks the collector
-//!   forever (mutators hold the lock only for the payload update and barrier).
-//! * An iterator's `index` is not part of the traced graph; only its immutable
-//!   `target` is. The owner advances the index, and a partially consumed
-//!   iterator keeps its whole target alive.
-//! * If a registered thread's saved context cannot be bounded, the collection
-//!   is abandoned (objects are leaked) rather than scanned unsafely.
-//!
-//! # Allocation
-//!
-//! `PyxObj` has a single fixed layout, so the registry's storage is the slab
-//! pool in [`alloc`]: cells are allocated in fixed-size slabs, released into a
-//! free list and reused without touching the system allocator. That covers
-//! the one object size class; variable *payload* size classes (and precise
-//! shadow-stack roots) remain future work (P2-05/P2-06).
-//!
+//! `PyxObj` has a single fixed layout, so storage is the slab pool in
+//! [`alloc`]: cells are allocated in fixed-size slabs, released into a free
+//! list and reused without touching the system allocator. Variable payload
+//! size classes and precise shadow-stack roots are future work.
 //! Stack words are read with inline assembly because they may be
-//! uninitialized; the relevant invariants are documented where they occur.
-//!
-//! This is deliberately an interim solution: P2-05/P2-06 (size-class
-//! allocator, precise shadow-stack roots) replace it later.
+//! uninitialized; those invariants are documented where they occur.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -395,9 +320,7 @@ unsafe impl Send for HeapState {}
 
 static GLOBAL: LazyLock<Mutex<HeapState>> = LazyLock::new(|| Mutex::new(HeapState::new()));
 
-// -------------------------------------------------------------------------
 // Colours, graph lock and write barriers
-// -------------------------------------------------------------------------
 
 /// Not yet reached by the marker: swept when a collection ends.
 pub(crate) const WHITE: u8 = 0;
@@ -580,9 +503,7 @@ fn drain_worklist() {
     }
 }
 
-// -------------------------------------------------------------------------
 // Thread registry and stop-the-world coordination
-// -------------------------------------------------------------------------
 
 /// Number of machine words captured per parked thread.
 ///
@@ -608,6 +529,8 @@ const REG_WORDS: usize = 16;
 ///   removed from the registry; it is never scanned afterwards.
 /// * `pending` mirrors the thread's pending tagged exception so the collector
 ///   can mark exception objects owned by parked threads.
+/// * `handled` mirrors the thread's active exception-handler stack so
+///   exceptions reachable only through implicit chaining stay alive.
 /// * `roots` holds tagged values that are only reachable from a Rust heap
 ///   closure (e.g. the arguments of `_thread.start_new_thread`). It is set
 ///   before the thread is inserted into the registry and is therefore visible
@@ -631,6 +554,7 @@ pub(crate) struct ThreadGc {
     saved_sp: AtomicUsize,
     saved_regs: Mutex<[usize; REG_WORDS]>,
     pending: AtomicI64,
+    handled: Mutex<Vec<i64>>,
     roots: Mutex<Vec<i64>>,
 }
 
@@ -849,6 +773,19 @@ pub(crate) fn blocking_leave() {
 pub(crate) fn set_pending_mirror(value: i64) {
     if let Some(gc) = current_gc() {
         gc.pending.store(value, Ordering::Release);
+    }
+}
+
+/// Mirrors the calling thread's handled-exception stack into its registration
+/// so a collector keeps exceptions that only implicit chaining references.
+pub(crate) fn set_handled_mirror(values: &[i64]) {
+    if let Some(gc) = current_gc() {
+        let mut handled = gc
+            .handled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        handled.clear();
+        handled.extend_from_slice(values);
     }
 }
 
@@ -1107,6 +1044,7 @@ struct RootSnapshot {
     high: usize,
     regs: [usize; REG_WORDS],
     pending: i64,
+    handled: Vec<i64>,
     roots: Vec<i64>,
     /// Conservative root ranges of suspended fibers owned by this thread.
     suspended: Vec<(usize, usize)>,
@@ -1156,6 +1094,11 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let handled = gc
+            .handled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let mut suspended: Vec<(usize, usize)> = all_suspended
             .iter()
             .filter(|&&(owner, _, _)| owner == gc.token)
@@ -1185,6 +1128,7 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
                 high: 0,
                 regs: [0; REG_WORDS],
                 pending,
+                handled,
                 roots,
                 suspended,
             });
@@ -1208,6 +1152,7 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
             high,
             regs,
             pending,
+            handled,
             roots,
             suspended,
         });
@@ -1227,15 +1172,22 @@ fn mark_roots(
     if let Some(root) = extra_root {
         mark_word(root as usize, addresses);
     }
-    // The caller's own pending exception and live context.
+    // The caller's own pending exception, handler stack and live context.
     mark_word(exc::pending_value() as usize, addresses);
+    for value in exc::handled_values() {
+        mark_word(value as usize, addresses);
+    }
     scan_stack(self_sp, self_high, addresses);
     mark_captured_registers(addresses);
 
-    // Parked threads' saved stacks/registers, pending mirrors and
-    // out-of-stack roots (spawn arguments held only by Rust closures).
+    // Parked threads' saved stacks/registers, pending mirrors, handler
+    // stacks and out-of-stack roots (spawn arguments held only by Rust
+    // closures).
     for thread in snapshots {
         mark_word(thread.pending as usize, addresses);
+        for &value in &thread.handled {
+            mark_word(value as usize, addresses);
+        }
         for &root in &thread.roots {
             mark_word(root as usize, addresses);
         }
@@ -1317,7 +1269,7 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     // the worklist drains.
     MARKING.store(true, Ordering::SeqCst);
 
-    // ---- Phase A: root snapshot (stop the world) ----
+    // ---- Stage A: root snapshot (stop the world) ----
     let mut registry = lock_thread_registry();
     GC_REQUESTED.store(true, Ordering::SeqCst);
     GC_CONDVAR.notify_all();
@@ -1347,12 +1299,12 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     drop(registry);
     let pause_a = started.elapsed();
 
-    // ---- Phase B: concurrent marking ----
+    // ---- Stage B: concurrent marking ----
     let mark_start = Instant::now();
     drain_worklist();
     let mark_time = mark_start.elapsed();
 
-    // ---- Phase C: final rescan (stop the world) ----
+    // ---- Stage C: final rescan (stop the world) ----
     let pause_start = Instant::now();
     let mut registry = lock_thread_registry();
     GC_REQUESTED.store(true, Ordering::SeqCst);
@@ -1406,7 +1358,7 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     drop(registry);
     let pause = pause_a + pause_start.elapsed();
 
-    // ---- Phase D: concurrent sweep ----
+    // ---- Stage D: concurrent sweep ----
     let sweep_start = Instant::now();
     // The only heap-lock section of the sweep: partition the registry. The
     // white objects leave it, survivors are reset to white and the address
@@ -1422,7 +1374,7 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     // object can reference these addresses any more (the final rescan and
     // insertion barriers published every live edge before the world was
     // released), so the payloads can be dropped concurrently with allocation
-    // and mutation. The cells themselves are returned to the pool in Phase E,
+    // and mutation. The cells themselves are returned to the pool in stage E,
     // which already takes the heap lock briefly for the colour reset.
     for &obj in &whites {
         // SAFETY: every pointer came from `ObjectPool::allocate` in
@@ -1432,7 +1384,7 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
         unsafe { ObjectPool::drop_object(obj) };
     }
 
-    // ---- Phase E: reset colours and finish ----
+    // ---- Stage E: reset colours and finish ----
     let pool_stats = {
         // A mutator that acquires the heap lock after this must observe
         // `MARKING == false`, so no grey object can be created for a finished
@@ -1531,6 +1483,7 @@ fn register_current_thread(id: i64, roots: Vec<i64>) {
         saved_sp: AtomicUsize::new(0),
         saved_regs: Mutex::new([0; REG_WORDS]),
         pending: AtomicI64::new(crate::value::NONE),
+        handled: Mutex::new(Vec::new()),
         roots: Mutex::new(roots),
     });
     GC_SELF.with(|cell| *cell.borrow_mut() = Some(gc.clone()));
@@ -1687,6 +1640,13 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for &root in roots.iter() {
                 mark_word(root as usize, addresses);
+            }
+            let handled = gc
+                .handled
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for &value in handled.iter() {
+                mark_word(value as usize, addresses);
             }
         }
 
@@ -2045,11 +2005,15 @@ unsafe fn trace(addr: usize) {
                         | FunctionBody::Builtin(_) => {}
                     }
                 }
-                // The explicit cause (`raise X from Y`) is a GC edge; `from
-                // None` stores no cause.
+                // The explicit cause (`raise X from Y`) and the implicit
+                // context are GC edges; `from None` stores no cause but may
+                // keep the handled exception as a context.
                 ObjData::Exception(exception) => {
                     if let Some(cause) = exception.cause {
                         mark_value(cause);
+                    }
+                    if let Some(context) = exception.context {
+                        mark_value(context);
                     }
                 }
                 // Scalars, ranges, locks, events, cross-process
@@ -2189,18 +2153,15 @@ unsafe fn load_stack_word(addr: usize) -> usize {
 ///
 /// # Safety
 ///
-/// Same contract as the x86_64 variant. The interim collector accepts the
-/// theoretical uninitialized-memory caveat on these targets; they are not
-/// supported run targets.
+/// Same contract as the x86_64 variant. These targets are unsupported run
+/// targets and accept the theoretical uninitialized-memory caveat.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline]
 unsafe fn load_stack_word(addr: usize) -> usize {
     unsafe { std::ptr::read_unaligned(addr as *const usize) }
 }
 
-// -------------------------------------------------------------------------
 // Stack bounds
-// -------------------------------------------------------------------------
 
 /// Redirects the collector's stack bounds to `low..high` while a fiber runs.
 ///
@@ -2362,9 +2323,7 @@ fn native_stack_bounds() -> Option<(usize, usize)> {
     None
 }
 
-// -------------------------------------------------------------------------
 // Register dump
-// -------------------------------------------------------------------------
 
 /// Marks every word of the register dump returned by [`spill_registers`].
 fn mark_captured_registers(addresses: &AddressSet) {

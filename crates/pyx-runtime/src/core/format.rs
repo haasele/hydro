@@ -61,9 +61,7 @@ const CONVERSION_STR: u8 = 1;
 const CONVERSION_REPR: u8 = 2;
 const CONVERSION_ASCII: u8 = 3;
 
-// -------------------------------------------------------------------------
 // Spec parsing
-// -------------------------------------------------------------------------
 
 /// Parsed `format_spec` mini-language.
 #[derive(Clone, Debug, Default)]
@@ -167,9 +165,7 @@ fn unknown_code(ty: char, type_name: &str) -> FormatError {
     ))
 }
 
-// -------------------------------------------------------------------------
 // Public entry points
-// -------------------------------------------------------------------------
 
 /// Formats one value for an f-string field.
 ///
@@ -467,9 +463,7 @@ pub(crate) fn percent_format(template: &str, rhs: i64) -> Result<String, FormatE
     Ok(out)
 }
 
-// -------------------------------------------------------------------------
 // Native value formatting
-// -------------------------------------------------------------------------
 
 fn format_native(value: i64, spec: &Spec) -> Result<String, FormatError> {
     if value::is_special(value) {
@@ -827,9 +821,7 @@ fn general(magnitude: f64, precision: usize, upper: bool, alternate: bool) -> St
     out
 }
 
-// -------------------------------------------------------------------------
 // Padding and grouping
-// -------------------------------------------------------------------------
 
 /// Applies fill, alignment and width.
 ///
@@ -934,9 +926,7 @@ fn ascii_repr(repr: &str) -> String {
     out
 }
 
-// -------------------------------------------------------------------------
 // Percent formatting
-// -------------------------------------------------------------------------
 
 /// One rendered `%` conversion, split so width/sign padding can be applied.
 struct Piece {

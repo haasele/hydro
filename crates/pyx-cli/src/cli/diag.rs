@@ -13,6 +13,8 @@ use std::path::Path;
 
 use pyx_frontend::Diagnostic;
 
+use super::args::Verbosity;
+
 /// When to emit ANSI escape sequences.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorMode {
@@ -39,6 +41,8 @@ pub struct Options {
     /// Emit a JSON array on stderr instead of human-readable snippets.
     pub json: bool,
     pub color: ColorMode,
+    /// Non-error status detail for the surrounding command.
+    pub verbosity: Verbosity,
 }
 
 impl Default for Options {
@@ -46,6 +50,7 @@ impl Default for Options {
         Options {
             json: false,
             color: ColorMode::Auto,
+            verbosity: Verbosity::Normal,
         }
     }
 }

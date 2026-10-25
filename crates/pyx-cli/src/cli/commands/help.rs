@@ -4,6 +4,7 @@ use std::env;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
+use crate::cli::args::{apply_verbosity, Verbosity};
 use crate::cli::{usage_text, CliError, CliResult};
 
 pub(crate) fn cmd_help(args: &[OsString]) -> CliResult {
@@ -17,23 +18,22 @@ pub(crate) fn cmd_help(args: &[OsString]) -> CliResult {
     Ok(ExitCode::SUCCESS)
 }
 
-pub(crate) fn cmd_version(args: &[OsString]) -> CliResult {
-    let mut verbose = false;
+pub(crate) fn cmd_version(args: &[OsString], verbosity: Verbosity) -> CliResult {
+    let mut verbosity = verbosity;
     for extra in args {
-        match extra.to_str() {
-            Some("--verbose") => verbose = true,
-            _ => {
-                return Err(CliError::usage(format!(
-                    "pyx: version: unexpected argument '{}'",
-                    extra.to_string_lossy()
-                )))
-            }
+        let text = extra.to_string_lossy();
+        if let Some(result) = apply_verbosity(text.as_ref(), &mut verbosity, "version") {
+            result?;
+            continue;
         }
+        return Err(CliError::usage(format!(
+            "pyx: version: unexpected argument '{text}'"
+        )));
     }
 
     let version = env!("CARGO_PKG_VERSION");
     println!("pyx {version}");
-    if !verbose {
+    if !verbosity.is_verbose() {
         return Ok(ExitCode::SUCCESS);
     }
 

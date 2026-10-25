@@ -9,14 +9,15 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::cli::args::parse_clean;
+use crate::cli::args::{parse_clean, Verbosity};
 use crate::cli::{CliError, CliResult};
 
 /// Paths relative to the working directory that `clean` owns.
 const TARGETS: [&str; 2] = [".pyx/cache", "target/pyx-tmp"];
 
-pub(crate) fn cmd_clean(args: &[OsString]) -> CliResult {
-    let dry_run = parse_clean(args)?;
+pub(crate) fn cmd_clean(args: &[OsString], verbosity: Verbosity) -> CliResult {
+    let (dry_run, verbosity) = parse_clean(args, verbosity)?;
+    let quiet = verbosity.is_quiet();
     let mut found = 0usize;
 
     for target in TARGETS {
@@ -26,16 +27,20 @@ pub(crate) fn cmd_clean(args: &[OsString]) -> CliResult {
         }
         found += 1;
         if dry_run {
-            println!("would remove {target}");
+            if !quiet {
+                println!("would remove {target}");
+            }
             continue;
         }
         fs::remove_dir_all(path).map_err(|error| {
             CliError::new(1, format!("pyx: clean: cannot remove '{target}': {error}"))
         })?;
-        println!("removed {target}");
+        if !quiet {
+            println!("removed {target}");
+        }
     }
 
-    if found == 0 {
+    if found == 0 && !quiet {
         println!("pyx clean: nothing to remove");
     }
     Ok(ExitCode::SUCCESS)

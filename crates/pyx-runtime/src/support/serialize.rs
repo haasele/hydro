@@ -7,9 +7,9 @@
 //! "PYX1" <version: u8> <value>
 //! ```
 //!
-//! Supported values: `None`, `True`/`False`, tagged integers, floats,
-//! strings, bytes, lists, tuples, dicts, sets, ranges and generated function
-//! values.
+//! Supported values: `None`, `True`/`False`, tagged integers and
+//! arbitrary-precision heap integers (`BigInt`), floats, strings, bytes,
+//! lists, tuples, dicts, sets, ranges and generated function values.
 //! Function values are restored from their wrapper address, so they are only
 //! meaningful in the same process (or an address-space copy created by
 //! `fork`).
@@ -24,6 +24,8 @@
 //! types; decoding never panics on malformed input and reports
 //! [`PickleError::Corrupt`] instead. Containers are built incrementally so
 //! partially decoded values stay reachable for the conservative collector.
+
+use num_bigint::Sign;
 
 use crate::value::{self, FunctionBody, NONE};
 
@@ -55,6 +57,9 @@ const TAG_FUNCTION_NAME: u8 = 12;
 const TAG_MP_QUEUE: u8 = 13;
 /// Immutable bytes payload (`u32` length + raw bytes).
 const TAG_BYTES: u8 = 14;
+/// Arbitrary-precision `int` (heap `BigInt`): sign byte (`0` non-negative,
+/// `1` negative), `u32` magnitude byte count, big-endian magnitude bytes.
+const TAG_BIGINT: u8 = 15;
 
 /// Reason a value could not be serialized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,9 +93,7 @@ impl PickleError {
     }
 }
 
-// -------------------------------------------------------------------------
 // Encoding
-// -------------------------------------------------------------------------
 
 /// Encodes `value` (the body only, with magic and version prefix).
 ///
@@ -134,6 +137,23 @@ fn encode_value(
     if let Some(number) = value::as_integer(value) {
         out.push(TAG_INT);
         out.extend_from_slice(&number.to_le_bytes());
+        return Ok(());
+    }
+    if let Some(number) = value::as_bigint(value) {
+        let (sign, magnitude) = number.to_bytes_be();
+        if sign == Sign::NoSign {
+            // Zero is always a tagged int; `as_integer` above normally wins.
+            out.push(TAG_INT);
+            out.extend_from_slice(&0i64.to_le_bytes());
+            return Ok(());
+        }
+        out.push(TAG_BIGINT);
+        out.push(u8::from(sign == Sign::Minus));
+        let Ok(len) = u32::try_from(magnitude.len()) else {
+            return Err(PickleError::Unsupported("int"));
+        };
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&magnitude);
         return Ok(());
     }
     if let Some(number) = value::as_float(value) {
@@ -255,9 +275,7 @@ fn encode_value(
     Err(PickleError::Unsupported(value::type_name(value)))
 }
 
-// -------------------------------------------------------------------------
 // Decoding
-// -------------------------------------------------------------------------
 
 /// Bounds-checked little-endian reader.
 struct Reader<'a> {
@@ -345,6 +363,25 @@ fn decode_value(reader: &mut Reader<'_>, depth: usize, spawn: bool) -> Result<i6
         TAG_INT => {
             let number = reader.i64()?;
             value::encode_int(number).ok_or(PickleError::Corrupt)
+        }
+        TAG_BIGINT => {
+            let sign = match reader.u8()? {
+                0 => Sign::Plus,
+                1 => Sign::Minus,
+                _ => return Err(PickleError::Corrupt),
+            };
+            let len = reader.u32()? as usize;
+            if len == 0 || len > reader.remaining() {
+                return Err(PickleError::Corrupt);
+            }
+            let magnitude = reader.take(len)?;
+            // Reject non-canonical magnitudes (leading zero), including zero,
+            // which is always transported as a tagged int.
+            if magnitude[0] == 0 {
+                return Err(PickleError::Corrupt);
+            }
+            let number = num_bigint::BigInt::from_bytes_be(sign, magnitude);
+            Ok(value::bigint_new(number))
         }
         TAG_FLOAT => Ok(value::float_new(reader.f64()?)),
         TAG_STR => {
@@ -474,9 +511,7 @@ fn read_into_list(reader: &mut Reader<'_>, depth: usize, spawn: bool) -> Result<
     Ok(list)
 }
 
-// -------------------------------------------------------------------------
 // Hex transport (`pickle.dumps` returns a hex string)
-// -------------------------------------------------------------------------
 
 /// Lowercase hex encoding.
 pub(crate) fn to_hex(bytes: &[u8]) -> String {
@@ -540,6 +575,84 @@ mod tests {
             (value::encode_int(1).unwrap(), value::tuple_new(Vec::new())),
         ]);
         roundtrip(nested);
+    }
+
+    fn bigint(text: &str) -> i64 {
+        value::bigint_new(value::parse_decimal_int(text).expect("valid integer literal"))
+    }
+
+    #[test]
+    fn bigints_roundtrip_exactly() {
+        crate::exc::init();
+        // 2**100 and its negation exercise values far beyond `i64`.
+        let positive = bigint("1267650600228229401496703205376");
+        let negative = bigint("-1267650600228229401496703205376");
+        for original in [positive, negative] {
+            let bytes = encode(original, false).expect("encodable");
+            let decoded = decode(&bytes, false).expect("valid payload");
+            assert_eq!(value::repr(decoded), value::repr(original));
+            assert!(value::as_bigint(decoded).is_some());
+        }
+        assert_eq!(value::repr(positive), "1267650600228229401496703205376");
+        assert_eq!(value::repr(negative), "-1267650600228229401496703205376");
+    }
+
+    #[test]
+    fn bigints_roundtrip_inside_containers() {
+        crate::exc::init();
+        let big = bigint("1267650600228229401496703205376");
+        let negative = bigint("-18446744073709551617"); // -(2**64 + 1)
+        let inner = value::tuple_new(vec![value::encode_int(3).unwrap(), big, negative]);
+        let mapping = value::dict_new(vec![
+            (value::str_alloc("big".into()), big),
+            (negative, inner),
+        ]);
+        let list = value::list_new(vec![mapping, value::set_new(vec![big, negative])]);
+        for spawn in [false, true] {
+            let bytes = encode(list, spawn).expect("encodable");
+            let decoded = decode(&bytes, spawn).expect("valid payload");
+            assert_eq!(value::repr(decoded), value::repr(list));
+        }
+    }
+
+    #[test]
+    fn bigints_that_fit_stay_tagged_ints() {
+        crate::exc::init();
+        let tagged = value::encode_int(7).unwrap();
+        let bytes = encode(tagged, false).expect("encodable");
+        assert_eq!(bytes[5], TAG_INT);
+        let decoded = decode(&bytes, false).expect("valid payload");
+        assert_eq!(decoded, tagged);
+        assert!(value::as_bigint(decoded).is_none());
+
+        // A canonical small BigInt payload normalizes back to the tagged form.
+        let payload = b"PYX1\x01\x0f\x01\x01\x00\x00\x00\x2a";
+        let decoded = decode(payload, false).expect("valid payload");
+        assert_eq!(decoded, value::encode_int(-42).unwrap());
+        assert!(value::as_bigint(decoded).is_none());
+    }
+
+    #[test]
+    fn malformed_bigints_are_rejected() {
+        crate::exc::init();
+        for payload in [
+            // Declared magnitude larger than the remaining bytes.
+            b"PYX1\x01\x0f\x00\x02\x00\x00\x00\x01".as_slice(),
+            // Empty magnitude.
+            b"PYX1\x01\x0f\x00\x00\x00\x00\x00".as_slice(),
+            // Oversized magnitude length.
+            b"PYX1\x01\x0f\x00\xff\xff\xff\xff".as_slice(),
+            // Unknown sign byte.
+            b"PYX1\x01\x0f\x02\x01\x00\x00\x00\x01".as_slice(),
+            // Leading zero (non-canonical magnitude).
+            b"PYX1\x01\x0f\x00\x02\x00\x00\x00\x00\x05".as_slice(),
+            // Zero magnitude is always transported as a tagged int.
+            b"PYX1\x01\x0f\x00\x01\x00\x00\x00\x00".as_slice(),
+            // Trailing bytes after a valid value.
+            b"PYX1\x01\x0f\x00\x01\x00\x00\x00\x01\x00".as_slice(),
+        ] {
+            assert_eq!(decode(payload, false), Err(PickleError::Corrupt));
+        }
     }
 
     #[test]

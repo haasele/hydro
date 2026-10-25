@@ -13,4 +13,3 @@ cranelift-module.workspace = true
 cranelift-jit.workspace = true
 cranelift-object.workspace = true
 cranelift-native.workspace = true
-target-lexicon.workspace = true

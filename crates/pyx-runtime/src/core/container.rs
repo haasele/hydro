@@ -1,5 +1,5 @@
 //! List/dict/tuple construction, indexing, unpacking and structural equality
-//! (ARCHITECTURE §3.2, Phase 2.0).
+//! (ARCHITECTURE §3.2).
 //!
 //! Every entry point is total: malformed pointers or values yield a pending
 //! exception (or an empty container for a `NULL` literal buffer), never a
@@ -15,9 +15,7 @@ use std::collections::HashMap;
 use crate::exc::{self, INDEX_ERROR, KEY_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value::{self, Num, NONE};
 
-// -------------------------------------------------------------------------
 // Literals
-// -------------------------------------------------------------------------
 
 /// Copies `argc` tagged values from `argv`. A `NULL` buffer with `argc == 0`
 /// is the empty list; a `NULL` buffer with items present yields an empty list
@@ -36,8 +34,7 @@ fn copy_values(argc: usize, argv: *const i64) -> Vec<i64> {
     if argc == 0 || argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return Vec::new();
     }
-    // SAFETY: the ABI contract requires `argv` to point at `argc` readable
-    // tagged values; the length check above keeps the slice in range.
+    // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
     let items = unsafe { std::slice::from_raw_parts(argv, argc) };
     items.to_vec()
 }
@@ -52,8 +49,7 @@ pub(crate) fn dict_new(argc: usize, keys: *const i64, values: *const i64) -> i64
     if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return value::dict_new(Vec::new());
     }
-    // SAFETY: the ABI contract requires both buffers to hold `argc` readable
-    // tagged values; the length check above keeps the slices in range.
+    // SAFETY: ABI contract: both buffers hold `argc` readable values; length checked above.
     let (keys, values) = unsafe {
         (
             std::slice::from_raw_parts(keys, argc),
@@ -393,9 +389,7 @@ pub(crate) fn unpack_star(value: i64, before: usize, after: usize) -> i64 {
     result
 }
 
-// -------------------------------------------------------------------------
 // Dict payload: insertion-ordered entries plus a hash index
-// -------------------------------------------------------------------------
 
 /// Insertion-ordered `(key, value)` entries with an index over the key hashes.
 ///
@@ -571,9 +565,7 @@ impl<T: PairMut + 'static> PairMut for value::ContainerGuard<T> {
     }
 }
 
-// -------------------------------------------------------------------------
 // Key hashing
-// -------------------------------------------------------------------------
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -683,9 +675,7 @@ pub(crate) fn unhashable_message(name: &str) -> String {
     format!("unhashable type: '{}'", name)
 }
 
-// -------------------------------------------------------------------------
 // Dict operations over a pair table
-// -------------------------------------------------------------------------
 
 /// Position of `key` in a pair table (`O(1)` for [`DictData`], a scan for the
 /// plain vectors used by `defaultdict`).
@@ -722,9 +712,7 @@ pub(crate) fn dict_insert_barrier<P: PairMut + ?Sized>(
     }
 }
 
-// -------------------------------------------------------------------------
-// Comprehension builders (Phase 2.8)
-// -------------------------------------------------------------------------
+// Comprehension builders
 
 /// Appends `item` to a list comprehension result. Non-lists raise `TypeError`
 /// and return `None`.
@@ -778,9 +766,7 @@ pub(crate) fn dict_set(dict: i64, key: i64, new_value: i64) -> i64 {
     NONE
 }
 
-// -------------------------------------------------------------------------
 // Indexing
-// -------------------------------------------------------------------------
 
 /// `object[index]` for lists, strings, tuples and dicts.
 pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
@@ -987,9 +973,7 @@ fn type_error(message: String) -> i64 {
     exc::raise_with_message(TYPE_ERROR, &message)
 }
 
-// -------------------------------------------------------------------------
 // Slicing
-// -------------------------------------------------------------------------
 
 enum SliceError {
     /// A bound was neither an integer nor `None`.
@@ -1382,9 +1366,7 @@ fn slice_positions(start: i64, stop: i64, step: i64) -> Vec<usize> {
     positions
 }
 
-// -------------------------------------------------------------------------
 // Structural equality
-// -------------------------------------------------------------------------
 
 /// Python `==` for the value subset (numeric cross-type equality, string
 /// contents, deep list equality and order-insensitive dict equality).

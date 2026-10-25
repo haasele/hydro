@@ -273,7 +273,8 @@ complete -c pyx -n "not __fish_seen_subcommand_from $pyx_commands" -a help -d 's
 
 complete -c pyx -s h -l help -d 'show help'
 complete -c pyx -s V -l version -d 'show the version'
-complete -c pyx -l verbose -d 'verbose version output (with --version)'
+complete -c pyx -l verbose -d 'print phase timings, cache decisions and version details'
+complete -c pyx -l quiet -d 'suppress non-error status output'
 
 complete -c pyx -n "__fish_seen_subcommand_from completions" -a 'bash zsh fish' -d 'shell'
 complete -c pyx -n "__fish_seen_subcommand_from help" -a "$pyx_commands"

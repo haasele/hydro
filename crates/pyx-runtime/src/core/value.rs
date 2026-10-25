@@ -8,16 +8,14 @@
 //! | `001` | immediate special: `None = 1`, `False = 9`, `True = 17` |
 //! | `010` | heap pointer: `ptr = v & !7`, points at [`PyxObj`]      |
 //!
-//! Heap objects carry a `kind: u32` header and are allocated with
-//! `Box::into_raw`. They are owned by the interim conservative mark-&-sweep
-//! collector in [`crate::heap`] (ARCHITECTURE §7): a reference returned by
-//! this module stays valid as long as the object is reachable from the
-//! runtime roots. Scalars are immutable; lists and dicts are mutated in place
-//! by item assignment, iterators advance in place and tuples are immutable.
+//! Heap objects carry a `kind: u32` header and live in a slab cell owned by
+//! the collector ([`crate::heap::allocate`], ARCHITECTURE §7); a reference
+//! stays valid while the object is reachable from runtime roots. Scalars and
+//! tuples are immutable; lists and dicts are mutated in place by item
+//! assignment and iterators advance in place.
 //! After `_thread.start_new_thread` the heap is process-wide and values are
 //! visible to every thread; there is no GIL, so concurrent mutation of the
-//! same list/dict requires a user lock. The registry and collector access is
-//! mutex-protected (see [`crate::heap`]).
+//! same list/dict requires a user lock.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -1663,9 +1661,7 @@ pub(crate) enum ObjData {
     BigInt(BigInt),
 }
 
-// -------------------------------------------------------------------------
 // Tag helpers
-// -------------------------------------------------------------------------
 
 #[inline]
 pub(crate) fn is_int(v: i64) -> bool {
@@ -1706,8 +1702,7 @@ pub(crate) fn is_bigint(v: i64) -> bool {
     if !is_heap(v) {
         return false;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     matches!(unsafe { as_obj(v) }, Some(obj) if obj.kind == KIND_BIGINT)
 }
 
@@ -1717,8 +1712,7 @@ pub(crate) fn as_bigint(v: i64) -> Option<&'static BigInt> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_BIGINT {
         return None;
@@ -1837,9 +1831,7 @@ pub(crate) fn num_of(v: i64) -> Option<Num> {
     as_float(v).map(Num::Float)
 }
 
-// -------------------------------------------------------------------------
 // Heap access
-// -------------------------------------------------------------------------
 
 /// Reinterprets a tagged heap value as an object.
 ///
@@ -1867,8 +1859,7 @@ pub(crate) fn as_float(v: i64) -> Option<f64> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_FLOAT {
         return None;
@@ -1883,8 +1874,7 @@ pub(crate) fn as_str(v: i64) -> Option<&'static str> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_STR {
         return None;
@@ -1900,8 +1890,7 @@ pub(crate) fn as_bytes(v: i64) -> Option<&'static [u8]> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_BYTES {
         return None;
@@ -1917,8 +1906,7 @@ pub(crate) fn as_random(v: i64) -> Option<&'static RandomState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration
-    // of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_RANDOM {
         return None;
@@ -1934,8 +1922,7 @@ pub(crate) fn as_path(v: i64) -> Option<&'static PathState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration
-    // of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_PATH {
         return None;
@@ -1959,8 +1946,7 @@ pub(crate) fn as_arg_parser(v: i64) -> Option<&'static crate::modules::argparse:
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration
-    // of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_ARG_PARSER {
         return None;
@@ -1976,8 +1962,7 @@ pub(crate) fn as_namespace(v: i64) -> Option<&'static [(String, i64)]> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration
-    // of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_NAMESPACE {
         return None;
@@ -1993,8 +1978,7 @@ pub(crate) fn as_defaultdict(v: i64) -> Option<(&'static [(i64, i64)], i64)> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_DEFAULTDICT {
         return None;
@@ -2010,8 +1994,7 @@ pub(crate) fn as_pattern(v: i64) -> Option<&'static crate::modules::re::PatternS
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_PATTERN {
         return None;
@@ -2027,8 +2010,7 @@ pub(crate) fn as_match(v: i64) -> Option<&'static crate::modules::re::MatchState
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_MATCH {
         return None;
@@ -2044,8 +2026,7 @@ pub(crate) fn as_socket(v: i64) -> Option<&'static crate::modules::socket::Socke
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration
-    // of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_SOCKET {
         return None;
@@ -2060,8 +2041,7 @@ pub(crate) fn exception_data(v: i64) -> Option<&'static ExcData> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_EXCEPTION {
         return None;
@@ -2077,8 +2057,7 @@ pub(crate) fn as_class(v: i64) -> Option<&'static ClassState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_CLASS {
         return None;
@@ -2094,8 +2073,7 @@ pub(crate) fn as_module(v: i64) -> Option<&'static ModuleState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_MODULE {
         return None;
@@ -2112,8 +2090,7 @@ pub(crate) fn as_std_stream(v: i64) -> Option<&'static StdStreamState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted/immutable for the
-    // duration of this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_STD_STREAM {
         return None;
@@ -2133,7 +2110,6 @@ pub(crate) fn std_stream_new(fd: i32) -> i64 {
     alloc(KIND_STD_STREAM, ObjData::StdStream(StdStreamState { fd }))
 }
 
-/// Borrows the state of a class instance.
 /// Field values of a `typing.NamedTuple` instance in attribute insertion
 /// order. NamedTuple classes are empty native classes whose base is the
 /// `NamedTuple` placeholder; only that class form is recognised.
@@ -2158,8 +2134,7 @@ pub(crate) fn as_instance(v: i64) -> Option<&'static InstanceState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_INSTANCE {
         return None;
@@ -2233,9 +2208,8 @@ pub(crate) fn class_method(class: i64, name: &str) -> Option<i64> {
     class_member(class, name).map(|(_, function)| function)
 }
 
-/// Reads an instance data attribute. Method attributes are resolved by
-/// [`crate::methods::call`] instead.
-/// Snapshot of `instance.__dict__` in insertion order.
+/// Snapshot of `instance.__dict__` in insertion order. Method attributes are
+/// resolved by [`crate::methods::call`] instead.
 pub(crate) fn instance_dict(instance: i64) -> Option<Vec<(i64, i64)>> {
     let state = as_instance(instance)?;
     Some(
@@ -2318,8 +2292,7 @@ pub(crate) fn as_list(v: i64) -> Option<&'static [i64]> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_LIST {
         return None;
@@ -2335,8 +2308,7 @@ pub(crate) fn as_dict_data(v: i64) -> Option<&'static DictData> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_DICT {
         return None;
@@ -2355,8 +2327,7 @@ pub(crate) fn as_tuple(v: i64) -> Option<&'static [i64]> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_TUPLE {
         return None;
@@ -2371,8 +2342,7 @@ pub(crate) fn as_set(v: i64) -> Option<&'static [i64]> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_SET {
         return None;
@@ -2388,8 +2358,7 @@ pub(crate) fn as_range(v: i64) -> Option<(i64, i64, i64)> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_RANGE {
         return None;
@@ -2404,8 +2373,7 @@ pub(crate) fn as_function(v: i64) -> Option<&'static FunctionObj> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_FUNCTION {
         return None;
@@ -2421,8 +2389,7 @@ pub(crate) fn as_ext_function(v: i64) -> Option<&'static ExtFunctionState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_EXT_FUNCTION {
         return None;
@@ -2446,8 +2413,7 @@ pub(crate) fn as_capsule(v: i64) -> Option<(usize, Option<&'static str>)> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_CAPSULE {
         return None;
@@ -2465,9 +2431,7 @@ pub(crate) fn as_lock(v: i64) -> Option<&'static LockState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects). The payload is
-    // independent of the heap registry and shared through `Mutex`.
+    // SAFETY: heap tag checked; object rooted, payload shared through a `Mutex`.
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_LOCK {
         return None;
@@ -2483,8 +2447,7 @@ pub(crate) fn as_thread(v: i64) -> Option<&'static ThreadState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration
-    // of this call and is shared through atomics/mutexes.
+    // SAFETY: heap tag checked; object rooted and shared through atomics/mutexes.
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_THREAD {
         return None;
@@ -2627,8 +2590,7 @@ pub(crate) fn as_iter(v: i64) -> Option<&'static IterState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_ITER {
         return None;
@@ -2644,8 +2606,7 @@ pub(crate) fn as_fiber(v: i64) -> Option<&'static crate::fiber::FiberState> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked above; the object is rooted for the duration of
-    // this call (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_FIBER {
         return None;
@@ -2742,8 +2703,7 @@ fn lock_container(v: i64, kind: u32) -> Option<GraphGuard> {
     } else {
         GraphGuard::Local
     };
-    // SAFETY: heap tag checked above; the object is rooted for the duration
-    // of the borrow (the collector only frees unreachable objects).
+    // SAFETY: heap tag checked; object rooted for the borrow (collector frees only unreachable).
     let obj = unsafe { &*((v & !TAG_MASK) as *const PyxObj) };
     if obj.kind != kind {
         return None;
@@ -2767,8 +2727,7 @@ fn lock_container(v: i64, kind: u32) -> Option<GraphGuard> {
 /// graph lock, so a concurrent marking pass never reads a payload mid-update.
 pub(crate) fn list_items_mut(v: i64) -> Option<ContainerGuard<Vec<i64>>> {
     let graph = lock_container(v, KIND_LIST)?;
-    // SAFETY: heap tag and kind were checked; the value is owned by the
-    // executing program, see the function contract.
+    // SAFETY: heap tag/kind checked; value owned by the executing program (see contract).
     let obj: &'static mut PyxObj = unsafe { &mut *((v & !TAG_MASK) as *mut PyxObj) };
     match &mut obj.data {
         ObjData::List(items) => Some(ContainerGuard::new(items, graph)),
@@ -2829,8 +2788,7 @@ pub(crate) fn iter_state_mut(v: i64) -> Option<&'static mut IterState> {
     if !is_heap(v) || (v & !TAG_MASK) == 0 {
         return None;
     }
-    // SAFETY: see `list_items_mut`; iterators are created per loop and are
-    // only advanced by the runtime.
+    // SAFETY: see `list_items_mut`; iterators are per loop and advanced only by the runtime.
     let obj = unsafe { &mut *((v & !TAG_MASK) as *mut PyxObj) };
     if obj.kind != KIND_ITER {
         return None;
@@ -2847,9 +2805,7 @@ pub(crate) fn exception_clone(v: i64) -> Option<ExcData> {
     exception_data(v).cloned()
 }
 
-// -------------------------------------------------------------------------
-// Allocation (interim conservative GC, ARCHITECTURE §7)
-// -------------------------------------------------------------------------
+// Heap allocation (collector contract, ARCHITECTURE §7)
 
 /// Allocates a heap object owned by the collector.
 ///
@@ -3334,8 +3290,7 @@ pub(crate) fn function_set_params(function: i64, params: Vec<String>) {
     if !is_heap(function) || (function & !TAG_MASK) == 0 {
         return;
     }
-    // SAFETY: heap tag checked above; the function value is live for the
-    // duration of the call and the parameter names own no PyX values.
+    // SAFETY: heap tag checked; function live for the call, parameter names own no PyX values.
     let obj = unsafe { &mut *((function & !TAG_MASK) as *mut PyxObj) };
     if obj.kind != KIND_FUNCTION {
         return;
@@ -3590,9 +3545,7 @@ pub(crate) fn csv_writer_new(file: i64, fieldnames: Option<Vec<String>>) -> i64 
     )
 }
 
-// -------------------------------------------------------------------------
 // Python-visible semantics
-// -------------------------------------------------------------------------
 
 /// Number of values in `range(start, stop, step)`, saturating at `i64::MAX`.
 ///
@@ -3660,8 +3613,7 @@ pub(crate) fn type_name(v: i64) -> &'static str {
         };
     }
     if is_heap(v) {
-        // SAFETY: heap tag checked above; the object is rooted for the duration of
-        // this call (the collector only frees unreachable objects).
+        // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
         return match unsafe { as_obj(v) }.map(|o| &o.data) {
             Some(ObjData::Str(_)) => "str",
             Some(ObjData::Float(_)) => "float",
@@ -3764,8 +3716,7 @@ pub(crate) fn truthy(v: i64) -> bool {
         return v == TRUE || v == NOT_IMPLEMENTED;
     }
     if is_heap(v) {
-        // SAFETY: heap tag checked above; the object is rooted for the duration of
-        // this call (the collector only frees unreachable objects).
+        // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
         return match unsafe { as_obj(v) }.map(|o| &o.data) {
             Some(ObjData::Str(s)) => !s.is_empty(),
             Some(ObjData::Float(f)) => *f != 0.0,
@@ -3860,8 +3811,7 @@ pub(crate) fn to_string(v: i64) -> String {
         };
     }
     if is_heap(v) {
-        // SAFETY: heap tag checked above; the object is rooted for the duration of
-        // this call (the collector only frees unreachable objects).
+        // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
         if let Some(obj) = unsafe { as_obj(v) } {
             return match &obj.data {
                 ObjData::Str(s) => s.clone(),

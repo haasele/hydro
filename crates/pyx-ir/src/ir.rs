@@ -218,12 +218,6 @@ pub enum ExprKind {
         value: Box<Expr>,
         clauses: Vec<CompClause>,
     },
-    /// `(element for ...)`. Phase 2.8 materialises this eagerly as a list
-    /// (documented deviation until real generator objects exist).
-    GeneratorExp {
-        element: Box<Expr>,
-        clauses: Vec<CompClause>,
-    },
     /// `object.method(args...)`. A bare `object.method` without a call is a
     /// [`ExprKind::GetAttr`] and raises `AttributeError` at runtime.
     MethodCall {

@@ -382,11 +382,6 @@ pub enum HExprKind {
         value: Box<HExpr>,
         clauses: Vec<HCompClause>,
     },
-    /// `(element for ...)`, materialised as a list in Phase 2.8.
-    GeneratorExp {
-        element: Box<HExpr>,
-        clauses: Vec<HCompClause>,
-    },
     Subscript {
         object: Box<HExpr>,
         index: Box<HExpr>,
@@ -687,6 +682,10 @@ struct FuncState {
     is_async: bool,
     /// Generator body being lowered: `yield` is allowed.
     is_generator: bool,
+    /// Synthetic generator-expression frame. Its locals are private to the
+    /// suspended fiber, so an assignment expression cannot write back to the
+    /// enclosing function.
+    genexp_frame: bool,
 }
 
 impl FuncState {
@@ -1525,6 +1524,7 @@ impl<'a> Lowerer<'a> {
             in_lambda: false,
             is_async: false,
             is_generator: false,
+            genexp_frame: false,
         };
         let mut body = Vec::new();
         for (idx, stmt) in module.body.iter().enumerate() {
@@ -3317,6 +3317,7 @@ impl<'a> Lowerer<'a> {
             in_lambda: false,
             is_async: false,
             is_generator: false,
+            genexp_frame: false,
         };
 
         let self_expr = HExpr {
@@ -3446,20 +3447,9 @@ impl<'a> Lowerer<'a> {
         locals.push(HLocal { name, ty });
     }
 
-    /// Default value of a parameter (`def f(x=1)`).
-    ///
-    /// Python evaluates defaults at definition time. Literal defaults are
-    /// recorded exactly, so direct calls fill the omitted argument with the
-    /// source value. A non-literal default (a class attribute/enum member such
-    /// as rich's `color_system=ColorSystem.TRUECOLOR`, or a name) is accepted
-    /// rather than rejected, but parameter metadata can only hold a literal:
-    /// it is recorded as `None`. Documented limitation: a direct call that
-    /// omits such an argument receives `None` instead of evaluating the
-    /// source default.
-    /// Lowers a non-literal default expression in a module-like scope. The
-    /// expression is evaluated when the function/method value is created;
-    /// diagnostics from unsupported shapes are rolled back to preserve the
-    /// previous "default is None" behavior.
+    /// Lowers a non-literal parameter default in a module-like scope: it is
+    /// evaluated when the function value is created. Diagnostics from
+    /// unsupported shapes are rolled back, leaving the default `None`.
     fn lowered_default(&mut self, default: Option<&ast::Expr>) -> Option<HExpr> {
         let default = default?;
         let diagnostics = self.diags.len();
@@ -3473,6 +3463,7 @@ impl<'a> Lowerer<'a> {
             in_lambda: false,
             is_async: false,
             is_generator: false,
+            genexp_frame: false,
         };
         let previous = self.in_default_expr;
         self.in_default_expr = true;
@@ -3620,6 +3611,7 @@ impl<'a> Lowerer<'a> {
             in_lambda: false,
             is_async: function.is_async,
             is_generator: function.is_generator,
+            genexp_frame: false,
         };
         let saved_method = self.current_class_method.clone();
         self.current_class_method = self.class_methods.get(&fid).cloned();
@@ -4971,25 +4963,274 @@ impl<'a> Lowerer<'a> {
         let mut clauses = Vec::with_capacity(generators.len());
         let mut saved = Vec::new();
         for generator in generators {
-            if generator.is_async {
-                self.error_at(
-                    generator.target.range(),
-                    "async comprehensions are not supported yet",
-                );
-            }
-            let iterable = self.expr(&generator.iter, fs);
-            let target = self.lower_comp_target(&generator.target, fs, &mut saved);
-            let mut conditions = Vec::with_capacity(generator.ifs.len());
-            for condition in &generator.ifs {
-                conditions.push(self.expr(condition, fs));
-            }
-            clauses.push(HCompClause {
-                target,
-                iterable,
-                conditions,
-            });
+            let clause = self.lower_comp_clause(generator, fs, &mut saved);
+            clauses.push(clause);
         }
         (clauses, saved)
+    }
+
+    /// Lower one `for target in iterable if ...` clause, evaluating the
+    /// iterable before its target binds.
+    fn lower_comp_clause(
+        &mut self,
+        generator: &ast::Comprehension,
+        fs: &mut FuncState,
+        saved: &mut Vec<(String, Option<LocalId>)>,
+    ) -> HCompClause {
+        let iterable = self.expr(&generator.iter, fs);
+        self.lower_comp_clause_from(generator, fs, saved, iterable)
+    }
+
+    /// Lower a clause whose iterable was already evaluated (`iterable`).
+    fn lower_comp_clause_from(
+        &mut self,
+        generator: &ast::Comprehension,
+        fs: &mut FuncState,
+        saved: &mut Vec<(String, Option<LocalId>)>,
+        iterable: HExpr,
+    ) -> HCompClause {
+        if generator.is_async {
+            self.error_at(
+                generator.target.range(),
+                "async comprehensions are not supported yet",
+            );
+        }
+        let target = self.lower_comp_target(&generator.target, fs, saved);
+        let mut conditions = Vec::with_capacity(generator.ifs.len());
+        for condition in &generator.ifs {
+            conditions.push(self.expr(condition, fs));
+        }
+        HCompClause {
+            target,
+            iterable,
+            conditions,
+        }
+    }
+
+    /// Lower `(element for ...)` to a lazy generator.
+    ///
+    /// The comprehension becomes a synthetic generator function: one hidden
+    /// parameter receives the outermost iterable (Python evaluates it when the
+    /// generator is created) and one parameter per captured enclosing value.
+    /// Calling it creates a suspended fiber, so the clauses and the element run
+    /// only as items are requested and never build a result list.
+    fn lower_generator_exp(
+        &mut self,
+        c: &ast::ExprGeneratorExp,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let Some(first) = c.generators.first() else {
+            return self.error_expr(c.range);
+        };
+
+        // Free names read by the generator frame in first-use order. The
+        // outermost iterable is evaluated in the enclosing frame, so names it
+        // reads nowhere else are not captures. Everything the frame does read
+        // from the enclosing scope becomes a parameter.
+        let mut free = Vec::new();
+        let mut seen = HashSet::new();
+        let mut bound = HashSet::new();
+        for (index, generator) in c.generators.iter().enumerate() {
+            if index > 0 {
+                walk_free_expr(&generator.iter, &bound, &mut free, &mut seen);
+            }
+            // Attribute/subscript receivers of a target are evaluated per item,
+            // inside the generator frame.
+            walk_free_target(&generator.target, &bound, &mut free, &mut seen);
+            collect_comp_target_names(&generator.target, &mut bound);
+            for condition in &generator.ifs {
+                walk_free_expr(condition, &bound, &mut free, &mut seen);
+            }
+        }
+        walk_free_expr(&c.elt, &bound, &mut free, &mut seen);
+        let mut capture_names = Vec::new();
+        let mut captures = Vec::new();
+        let mut globals = HashSet::new();
+        for name in free {
+            if fs.is_global(&name) {
+                globals.insert(name);
+            } else if let Some(local) = fs.lookup(&name) {
+                capture_names.push(name);
+                captures.push(HExpr {
+                    kind: HExprKind::Local(local),
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                });
+            } else if let Some(value) = self
+                .class_attr_scopes
+                .last()
+                .and_then(|scope| scope.get(&name))
+                .cloned()
+            {
+                // A class body has no frame of its own: the attribute value is
+                // evaluated where the generator is created.
+                capture_names.push(name);
+                captures.push(value);
+            }
+        }
+
+        // The outermost iterable belongs to the enclosing frame.
+        let outer_iterable = self.expr(&first.iter, fs);
+
+        let fid = self.functions.len() as FunctionId;
+        let mut params = Vec::with_capacity(capture_names.len() + 1);
+        let mut locals = Vec::with_capacity(capture_names.len() + 1);
+        let push_param = |name: &str, params: &mut Vec<HParam>, locals: &mut Vec<HLocal>| {
+            let local = locals.len() as LocalId;
+            locals.push(HLocal {
+                name: name.to_string(),
+                ty: Ty::Concrete(Type::Any),
+            });
+            params.push(HParam {
+                local,
+                name: name.to_string(),
+                ty: Ty::Concrete(Type::Any),
+                default: None,
+                default_expr: None,
+                kind: ParamKind::Positional,
+            });
+            local
+        };
+        let iter_local = push_param("$geniter", &mut params, &mut locals);
+        for name in &capture_names {
+            push_param(name, &mut params, &mut locals);
+        }
+        let (fid_line, fid_col) = self.span(c.range);
+        self.functions.push(HFunction {
+            name: "<genexpr>".to_string(),
+            params,
+            capture_count: 0,
+            ret_ty: Ty::Concrete(Type::Any),
+            locals: locals.clone(),
+            body: Vec::new(),
+            is_async: false,
+            is_generator: true,
+            is_module: false,
+            line: fid_line,
+            col: fid_col,
+        });
+
+        let mut gfs = FuncState {
+            fid,
+            is_module: false,
+            locals: locals
+                .iter()
+                .enumerate()
+                .map(|(index, local)| (local.name.clone(), index as LocalId))
+                .collect(),
+            comp_shadowed: HashMap::new(),
+            globals,
+            loop_depth: 0,
+            in_lambda: fs.in_lambda,
+            is_async: false,
+            is_generator: true,
+            genexp_frame: true,
+        };
+
+        let mut saved = Vec::new();
+        let mut clauses = Vec::with_capacity(c.generators.len());
+        let first_iterable = HExpr {
+            kind: HExprKind::Local(iter_local),
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        };
+        clauses.push(self.lower_comp_clause_from(first, &mut gfs, &mut saved, first_iterable));
+        for generator in &c.generators[1..] {
+            let clause = self.lower_comp_clause(generator, &mut gfs, &mut saved);
+            clauses.push(clause);
+        }
+        let element = self.expr(&c.elt, &mut gfs);
+        self.restore_comp_bindings(&mut gfs, saved);
+
+        let body = self.gen_body(clauses, element, &mut gfs);
+        self.functions[fid as usize].body = body;
+
+        let mut args = Vec::with_capacity(captures.len() + 1);
+        args.push(outer_iterable);
+        args.extend(captures);
+        HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Function(self.fid_base + fid),
+                args,
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
+    /// Build the synthetic generator body: one `for` per clause (outermost
+    /// first), its filters in source order, and the element as the `yield`
+    /// executed by the innermost level.
+    fn gen_body(
+        &mut self,
+        clauses: Vec<HCompClause>,
+        element: HExpr,
+        fs: &mut FuncState,
+    ) -> Vec<HStmt> {
+        let (line, col) = (element.line, element.col);
+        let mut body = vec![HStmt {
+            kind: HStmtKind::Yield {
+                value: Some(element),
+            },
+            line,
+            col,
+        }];
+        for clause in clauses.into_iter().rev() {
+            for condition in clause.conditions.into_iter().rev() {
+                let (line, col) = (condition.line, condition.col);
+                body = vec![HStmt {
+                    kind: HStmtKind::If {
+                        cond: condition,
+                        then_body: body,
+                        else_body: Vec::new(),
+                    },
+                    line,
+                    col,
+                }];
+            }
+            let (var, bound) = match clause.target {
+                HCompTarget::Name(local) => (local, body),
+                HCompTarget::Unpack(targets) => {
+                    // The loop variable receives the whole item and the target
+                    // unpacks it, as `for a, b in ...` does.
+                    let temp = self.comp_local(fs);
+                    let (line, col) = (clause.iterable.line, clause.iterable.col);
+                    let mut bound = Vec::with_capacity(body.len() + 1);
+                    bound.push(HStmt {
+                        kind: HStmtKind::Unpack {
+                            targets,
+                            value: HExpr {
+                                kind: HExprKind::Local(temp),
+                                ty: Ty::Concrete(Type::Any),
+                                line,
+                                col,
+                            },
+                        },
+                        line,
+                        col,
+                    });
+                    bound.extend(body);
+                    (temp, bound)
+                }
+            };
+            let (line, col) = (clause.iterable.line, clause.iterable.col);
+            body = vec![HStmt {
+                kind: HStmtKind::ForEach {
+                    var,
+                    iterable: clause.iterable,
+                    body: bound,
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            }];
+        }
+        body
     }
 
     /// Restore the bindings shadowed by a comprehension. Reversed so that a
@@ -5244,23 +5485,18 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Lowers `raise`, `raise X(...)`, `raise ... from cause`.
-    ///
-    /// Built-in exception kinds keep their tag-based lowering. A call to a
-    /// class this unit declares (`class ReprError(Exception)`) has no runtime
-    /// tag, because PyX exception objects are native values: it lowers to
-    /// `RuntimeError` whose message is `"<ClassName>: <message>"`. Imported
-    /// classes (`raise errors.StyleSyntaxError(...)`) use the same fallback
-    /// with their dotted source name. This is a documented limitation: the
-    /// original class identity is not preserved and every user class shares
-    /// the `RuntimeError` tag, so handlers are approximate. The explicit
-    /// `from` cause is kept in both paths, and a raise is never dropped.
     /// Whether a name denotes a user-defined or imported exception class
     /// (handled through the documented RuntimeError fallback).
     fn is_user_exception_name(&self, name: &str) -> bool {
         self.class_names.contains(name) || self.imported_user_globals.contains_key(name)
     }
 
+    /// Lowers `raise`, `raise X(...)`, `raise ... from cause`.
+    ///
+    /// Built-in exception kinds keep their tag-based lowering. A user or
+    /// imported exception class has no runtime tag, so it lowers to
+    /// `RuntimeError` with message `"<Name>: <message>"`; class identity is
+    /// lost, so handlers are approximate. The `from` cause is kept.
     fn lower_raise(
         &mut self,
         s: &ast::StmtRaise,
@@ -5443,19 +5679,10 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Resolves the tags an `except` handler matches.
-    ///
-    /// Builtin exception names keep their exact tag. Any other exception
-    /// expression — a user class declared in this unit (`except ReprError:`),
-    /// an imported class (`except ColorParseError:`) or a dotted class
-    /// (`except errors.StyleSyntaxError:`) — has no runtime tag, so it is
-    /// approximated with [`ExcKind::RuntimeError`], the tag `raise` uses for
-    /// user classes. Documented limitation: such a handler also catches any
-    /// other user-class raise, and an unknown builtin-looking name is accepted
-    /// rather than diagnosed.
-    ///
-    /// Returns `None` after reporting when the handler expression is not a
-    /// name, a dotted name or a non-empty tuple of those.
+    /// Resolves the tags an `except` handler matches. Builtin names keep
+    /// their tag; user/imported classes fall back to [`ExcKind::RuntimeError`]
+    /// (like `raise`), so their handlers also catch other user-class raises.
+    /// Returns `None` after reporting an unsupported handler expression.
     fn handler_exception_kinds(&mut self, type_expr: &ast::Expr) -> Option<Vec<ExcKind>> {
         match type_expr {
             ast::Expr::Name(n) => Some(vec![Self::approximate_exception_kind(n.id.as_str())]),
@@ -5611,16 +5838,11 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Lower `with a as x, b as y:` into nested `try/finally` blocks.
-    ///
-    /// Each context expression is evaluated exactly once into a hidden
-    /// `$withN` local. Its `__enter__()` result is bound to the `as` target
-    /// (the call still runs without a target). The body is then wrapped in
-    /// one `try` per item (innermost for the last item) whose `finally` calls
-    /// `__exit__(None, None, None)` on the hidden local, so `return`,
-    /// `break`, `continue` and exceptions still exit every entered object in
-    /// reverse order. The return value of `__exit__` is ignored: exceptions
-    /// are never suppressed.
+    /// Lowers `with a as x, b as y:` into nested `try/finally` blocks: each
+    /// context expression is evaluated once into a hidden `$withN` local, its
+    /// `__enter__()` is bound to the `as` target, and the innermost `finally`
+    /// calls `__exit__(None, None, None)`. `__exit__` results are ignored:
+    /// exceptions are never suppressed.
     fn lower_with(
         &mut self,
         s: &ast::StmtWith,
@@ -6371,20 +6593,7 @@ impl<'a> Lowerer<'a> {
                     col,
                 }
             }
-            ast::Expr::GeneratorExp(c) => {
-                let (clauses, saved) = self.lower_comp_clauses(&c.generators, fs);
-                let element = self.expr(&c.elt, fs);
-                self.restore_comp_bindings(fs, saved);
-                HExpr {
-                    kind: HExprKind::GeneratorExp {
-                        element: Box::new(element),
-                        clauses,
-                    },
-                    ty: self.infer.fresh(),
-                    line,
-                    col,
-                }
-            }
+            ast::Expr::GeneratorExp(c) => self.lower_generator_exp(c, fs, line, col),
             ast::Expr::Lambda(l) => self.lower_lambda(l, line, col),
             ast::Expr::IfExp(i) => {
                 // `i.orelse` is only evaluated when the test is falsy; the IR
@@ -6428,6 +6637,17 @@ impl<'a> Lowerer<'a> {
                         n.range,
                         codes::UNSUPPORTED,
                         "assignment expression to a name declared global is not supported",
+                    );
+                    return self.error_expr(e.range());
+                }
+                if fs.genexp_frame {
+                    // CPython binds the target in the enclosing function; a
+                    // generator frame cannot write there, so binding locally
+                    // would silently hide the assignment.
+                    self.error_at_code(
+                        n.range,
+                        codes::UNSUPPORTED,
+                        "assignment expressions inside a generator expression are not supported",
                     );
                     return self.error_expr(e.range());
                 }
@@ -6610,6 +6830,7 @@ impl<'a> Lowerer<'a> {
             in_lambda: true,
             is_async: false,
             is_generator: false,
+            genexp_frame: false,
         };
         let value = self.expr(&l.body, &mut fs);
         let (body_line, body_col) = self.span(l.body.range());
@@ -6745,15 +6966,10 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Lower a list display containing `*` unpacking, e.g.
-    /// `["a", *xs, "b"]`.
-    ///
-    /// The display becomes a chain of list concatenations: each run of plain
-    /// elements is a list literal and each starred operand is the right-hand
-    /// side of a `+`. The runtime list-concat operator rejects non-list
-    /// operands with `TypeError`, and the left-to-right evaluation order of
-    /// `+` matches the source order. A leading starred operand starts from an
-    /// empty list, which also copies the operand like Python's display does.
+    /// Lowers `["a", *xs, "b"]` into left-to-right list concatenations: each
+    /// plain run is a list literal and each starred operand a `+` operand
+    /// (the runtime concat rejects non-lists with `TypeError`). A leading
+    /// `*` starts from an empty list, copying the operand.
     fn list_with_star(
         &mut self,
         elts: &[ast::Expr],
@@ -6828,13 +7044,10 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Lower a dict display containing `**` unpacking, e.g.
-    /// `{**h, "k": v}`.
-    ///
-    /// Literal pairs keep their own `Dict` node and every unpacked mapping is
-    /// merged left to right with the internal `DictMerge` builtin, which
-    /// preserves insertion order and last-wins semantics. A display that
-    /// starts with `**` is merged onto an empty dict so the result is a copy.
+    /// Lowers `{**h, "k": v}` into left-to-right merges: literal pairs keep
+    /// their `Dict` node and each unpacked mapping is merged with the internal
+    /// `DictMerge` builtin (insertion order, last-wins). A leading `**` is
+    /// merged onto an empty dict, copying the operand.
     fn dict_with_unpack(
         &mut self,
         d: &ast::ExprDict,
@@ -8577,9 +8790,6 @@ impl<'a> Lowerer<'a> {
         Some(args)
     }
 
-    /// Signature of a same-unit class's `__init__`, or `None` when the class
-    /// has no `__init__` or its signature needs the runtime binder
-    /// (`*args`, keyword-only parameters or `**kwargs`).
     /// Whether `name` denotes a class of this unit at a call site: the module
     /// body holds it in a local slot, while functions/methods read the
     /// mirrored module global. A function-local parameter of the same name
@@ -8654,13 +8864,11 @@ impl<'a> Lowerer<'a> {
             .cloned()
     }
 
-    /// Bind `Class(args..., name=value...)` against its `__init__` signature.
-    ///
-    /// The runtime fills `self` when it instantiates the class, so only the
-    /// remaining parameters take call arguments. Keywords move into their
-    /// parameter slots; omitted parameters use the parameter's literal default
-    /// (a `field(...)` default is recorded as `None` and resolved by the
-    /// generated body). The caller always passes the full positional arity.
+    /// Binds `Class(args..., name=value...)` against its `__init__` signature.
+    /// The runtime supplies `self`, so only remaining parameters take
+    /// arguments; keywords fill their slots and omitted ones use the literal
+    /// default (a `field(...)` default is `None`, filled by the body). The
+    /// caller always passes the full positional arity.
     fn class_constructor_arguments(
         &mut self,
         class: &str,
@@ -9380,10 +9588,8 @@ enum FoldNum {
     Float(f64),
 }
 
-/// Bounds of the integers the runtime can encode as tagged immediates.
-///
-/// Arithmetic whose result leaves this range raises `OverflowError` at
-/// runtime, so such expressions must not be folded.
+/// Bounds of the integers the runtime encodes as tagged immediates. Folds
+/// leaving this range are declined; runtime arithmetic promotes to `BigInt`.
 const MIN_TAGGED_INT: i64 = i64::MIN >> 3;
 const MAX_TAGGED_INT: i64 = i64::MAX >> 3;
 
@@ -9854,14 +10060,6 @@ fn module_docstring(stmts: &[ast::Stmt]) -> Option<String> {
     Some(text.clone())
 }
 
-/// Names that become locals of the enclosing function.
-///
-/// `include_defs` controls whether nested function definitions bind their
-/// name in this scope. It is `true` for function bodies (a nested `def`
-/// stores its closure in a local) and `false` for the module body, where
-/// functions live in the function table instead of module locals. Nested
-/// function bodies and lambdas are never descended into: they have their own
-/// scopes.
 /// Collects the module-level simple-name assignment targets and class
 /// definitions that are mirrored into the runtime global table. Function and
 /// class bodies are not entered; assignments and class definitions inside
@@ -10186,6 +10384,11 @@ fn collect_import_bindings(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// Names that become locals of the enclosing function.
+///
+/// `include_defs` binds nested `def` names here (true for function bodies,
+/// false for the module body, where functions live in the function table).
+/// Nested function bodies and lambdas are never descended into.
 fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool) {
     for stmt in stmts {
         match stmt {

@@ -2,111 +2,124 @@
 
 ## Strategy
 
-PyX is a standalone Python runtime with its own compiler and toolchain — conceptually comparable to Bun in the JavaScript ecosystem, but for Python. Developers write ordinary Python and invoke a single command such as `pyx run main.py`; the toolchain handles type checking, compilation, execution and dependency management. CPython is not the default runtime, but Python compatibility remains a first-class goal.
+PyX is a standalone Python runtime with its own compiler and toolchain —
+conceptually Bun for Python: one command (`pyx run main.py`) handles
+compilation, execution and dependency management. CPython is not the default
+runtime, but Python compatibility is a first-class, permanent goal.
 
-A runtime, a garbage collector and a native compiler are three separate components. They must be designed together, but they do not all have to be built from scratch. The compiler backend and package management should be reused wherever possible; the runtime and object model are where the project's own work concentrates.
+A runtime, a garbage collector and a native compiler must be designed together,
+but not everything is built from scratch: reuse the compiler backend and uv for
+package management; concentrate the project's own work on the runtime and
+object model.
 
 ## Scope
 
-- **Runtime in Rust** — object model, exceptions, modules, built-ins, memory management and runtime support functions.
-- **Native compiler** — parse Python syntax, check types, optimize code and emit machine code.
-- **Go-like garbage collector** — concurrent mark-and-sweep, efficient allocation, short pauses and profiling.
-- **Toolchain on top of uv** — reuse package installation, virtual environments, lockfiles and project management, but invoke the PyX interpreter/compiler.
-
-uv is integrated first, not forked immediately. A fork or a dedicated wrapper is only justified if uv's architecture cannot accommodate the runtime choice.
+- **Runtime in Rust** — object model, exceptions, modules, builtins, memory
+  management, C-ABI shim.
+- **Native compiler** — parse Python, check types, optimize, emit machine code
+  (Cranelift; AOT primary, JIT behind measurement).
+- **Go-like garbage collector** — concurrent mark-and-sweep, short pauses,
+  shared heap, no GIL.
+- **Toolchain on top of uv** — reuse project management, dependency resolution
+  and lockfiles; integrate uv first, fork only on an architectural blocker.
 
 ## AOT vs JIT
 
-AOT is the primary compiler; JIT is a later optimization, gated on measurement.
+AOT is the primary compiler; a JIT is a later optimization gated on
+measurement. AOT gives predictable startup and simple deployment. A JIT only
+pays off for dynamic Python paths that AOT cannot specialize; LLVM ORC would
+provide the infrastructure, so no JIT is built from scratch.
 
-**AOT (primary).** Code is translated to native machine code before startup. Benefits: fast and predictable startup after the build, no JIT warm-up, simple deployment and native optimization.
+Backend today: **Cranelift 0.120**. LLVM remains a future option behind a
+feature flag, evaluated only if its optimization depth justifies the cost.
 
-**JIT (later).** Hot functions are compiled or re-optimized at runtime. Benefits: the compiler can observe real types and runtime behavior. Costs: added complexity, warm-up time and memory footprint. LLVM's ORC provides JIT infrastructure, including lazy and parallel compilation, so no JIT has to be built from scratch.
+## Workstreams
 
-Roadmap for a system that should run normal Python projects with minimal friction:
+Beyond compiler, runtime, GC and package manager, the project owns:
 
-1. AOT compiler with cache.
-2. Optional interpreter or bytecode mode for development and the REPL.
-3. Profiling and benchmarks.
-4. Only then a JIT for functions where measurements show a real benefit.
-
-A JIT is not an automatic performance win. For statically typed code, AOT already produces efficient machine code; a JIT becomes interesting mainly for optimizing dynamic Python code at runtime.
-
-**Backend:** Cranelift 0.120 is the current backend. LLVM is a future option behind a feature flag, evaluated only if its optimization potential justifies its cost; it is not the backend today.
-
-## Missing Components
-
-Beyond compiler, runtime, GC and package manager, the project needs at least:
-
-- **Python frontend and language semantics** — parser, AST, scopes, imports, exceptions, classes, decorators, generators, async/await and dynamic features. A parser alone is not enough; the language's behavior must be reproduced.
-- **Standard library and Python interop** — `os`, `pathlib`, `json`, `re`, `socket`, `asyncio`, `subprocess`, `threading` and further modules. Each module must be either reimplemented or routed through a compatibility layer.
-- **Module and ABI compatibility** — native Python extensions commonly use the CPython C API. Loading NumPy or PyTorch unchanged requires a compatible ABI layer, CPython as an embedded runtime, or explicitly limited compatibility. This is one of the largest parts of the project.
-- **CLI and build system** — `run`, `build`, `test`, `fmt`, `lint`, `check`, `add`, `remove`, `sync` and `lock`, plus reproducible builds, incremental compilation and a local build cache.
-- **Debugger, diagnostics and profiling** — Python-like tracebacks, source maps or debug metadata, native debugger integration, CPU and heap profilers, and GC metrics. Without these tools the language is hard to use day to day.
+- Python frontend and semantics (parser alone is insufficient).
+- Standard library and Python interop.
+- Module and C-ABI compatibility — the largest cost driver.
+- CLI/build system: cache, reproducible builds, diagnostics.
+- Debugger, profiling and GC metrics.
 
 ## Phase Ordering
 
-1. **Phase 1 — Minimal compiler.** Python-like syntax, variables, functions, control flow, type inference, exceptions and native output. Not yet full Python compatibility.
-2. **Phase 2 — Runtime.** Object model, strings, lists, dictionaries, modules, memory allocator and a GC that is correct first. Performance work follows measurement.
-3. **Phase 3 — Toolchain.** Project files, dependency resolution, lockfiles, build cache and a `run` command. Integrate uv rather than forking it prematurely.
-4. **Phase 4 — Python compatibility.** Tests against the CPython test suite, standard library, exceptions, dynamic features, then C extensions and ABI compatibility.
-5. **Phase 5 — Performance.** AOT optimization, profile-guided optimization, GC tuning and only then a possible JIT. Benchmarks against CPython, PyPy, Go and comparable implementations.
-6. **Phase 6 — Polish and developer experience.** First-class diagnostics, machine-readable error output, a coherent CLI and documentation.
-
-Full Python compatibility is large enough to be a permanent, independent goal. It means the 297 modules of the CPython 3.14 standard library (174 pure Python, 71 extension, 52 builtin/frozen), plus the common ecosystem (NumPy, pandas, pydantic, FastAPI, Django, …) with reproducible tests and benchmarks, not only a familiar syntax subset. Projects such as Nuitka and PyPy show how much effort already goes into compiler, runtime and compatibility.
+1. **Minimal compiler** — syntax, functions, control flow, inference,
+   exceptions, native output.
+2. **Runtime** — object model, containers, modules, allocator, correct GC
+   first; performance follows measurement.
+3. **Toolchain** — project files, uv integration, lockfiles, build cache, run.
+4. **Python compatibility** — CPython test suite, stdlib, language features,
+   C extensions/ABI.
+5. **Performance** — AOT optimization, PGO, GC tuning, then a possible JIT;
+   benchmarks against CPython, PyPy and Go.
+6. **Polish** — first-class diagnostics, machine-readable output, coherent CLI,
+   documentation.
 
 ## Current Status
 
-Phases 1–6 are tracked item by item in `docs/TODO.md`. The gate is `scripts/verify.sh` on a fresh checkout; the suite currently holds 877 tests. The main compatibility target is **CPython 3.14.9** (see “Compatibility targets and LTS”).
+Phases and acceptance criteria are tracked item by item in
+[`docs/TODO.md`](docs/TODO.md); the resume status, commands and current test
+counts are in [`AGENTS.md`](AGENTS.md#current-state). The gate is
+`scripts/verify.sh` on a fresh checkout.
 
-- **Phase 1 — done.** Compiler, JIT and AOT paths, CLI and verification are complete.
-- **Phase 2 — largely done.** Includes real lazy generators and coroutines on a cooperative event loop, and a concurrent GC with a shared heap and no GIL. Open: async generators/comprehensions, and precise GC roots and stack maps.
-- **Phase 3 — core done.** `new`/`init`/`add`/`remove`/`sync`/`lock`, the build cache and `run` work. Open: uv interpreter injection, own lockfile/venv semantics, reproducible builds and packaging.
-- **Phase 4 — unblocked; decision B.** CPython 3.14.9 is the pinned compatibility target; development headers/oracle for 3.14 are available. The project implements the CPython C API/ABI on PyX objects (no `libpython` in production; CPython only as build-time header source and differential test oracle). The stdlib/ecosystem program covers 297 stdlib modules, ecosystem suites and benchmarks (P4-01…P4-12); see `docs/C_API.md` and `docs/CPYTHON_TESTS.md`.
-- **Phase 5 — baseline in place.** Micro-benchmark harness, baseline artifacts and local regression thresholds exist; PyPy/Go comparisons, PGO and a JIT decision remain open.
-- **Phase 6 — diagnostics mostly done.** Stable codes, spans, snippets, `--json` output and exit codes are implemented; ICE regression tests, completions, manpage and the CLI/diagnostic reference are open.
+- **Phase 1 — done.**
+- **Phase 2 — largely done.** Lazy generators and generator expressions,
+  coroutines/event loop, shared heap with concurrent GC and no GIL. Open:
+  precise GC roots/stack maps, async generators/comprehensions, mutable
+  closures.
+- **Phase 3 — core present.** `new`/`init`/`test`/`fmt`/`lint`/`clean`, build
+  cache, uv passthrough. Open: uv interpreter injection, reproducible builds,
+  packaging.
+- **Phase 4 — unblocked; option B.** CPython 3.14.9 is the pinned oracle; the
+  CPython C API/ABI is implemented on PyX objects without `libpython` in
+  production (first abi3 slice works). The stdlib/ecosystem program is P4-01…
+  P4-12 and the executable module batches P7; see [`docs/C_API.md`](docs/C_API.md)
+  and [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md).
+- **Phase 5 — baseline in place.** Micro harness, tracked baseline, local
+  threshold gate and CPython/PyX/PyPy/Go engine comparison. Open: inlining/
+  escape analysis, PGO, GC tuning after precise roots.
+- **Phase 6 — diagnostics largely done.** Stable codes, spans, snippets,
+  `--json`, `--verbose`/`--quiet`, CLI/diagnostic references. Open:
+  troubleshooting/migration docs, progress feedback.
 
 ## Compatibility Targets and LTS
 
-PyX pins its behavioural conformance to a single CPython patch release at a
-time. The current target is **CPython 3.14.9**:
+PyX pins conformance to one CPython patch release at a time; the current
+target is **CPython 3.14.9**. 3.13 is security-only and 3.15 is newer than the
+oracle. The target is defined once in `pyx_ir::compat` and surfaces through
+`sys.version`/`sys.version_info`, `platform.python_version()`,
+`--version --verbose`, wheel tags and the test harnesses.
 
-- 3.15 is too new to be the conformance oracle;
-- 3.13 is already in security-only maintenance;
-- every compatibility claim, extension ABI tag (`cpython-314-*`) and CPython
-  test-suite run is evaluated against 3.14.9 (differential oracle).
+The 3.14 standard library has 297 modules (174 pure Python, 63 extension,
+52 builtin/frozen, 8 platform-specific); module-by-module status is generated
+in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
-The target lives in one place (`pyx_ir::compat`) and is surfaced through
-`sys.version`/`sys.version_info`, `platform.python_version()`, the CLI's
-`--version --verbose`, the wheel-tag policy and the test harnesses. Changing
-the patch target means a new baseline/manifest and a wheel-tag review, not an
-edit in place.
-
-**LTS policy (future, not before production):** PyX LTS lines are keyed to
-CPython *minor* versions — 3.13, 3.14, 3.15, … — rather than to PyX release
-numbers alone. An LTS line freezes:
-
-- the CPython minor and the exact patch baseline used as conformance oracle;
-- the supported C-ABI tag(s) and extension-wheel policy;
-- the frozen standard-library and language surface with its compatibility
-  matrix;
-- security-patch intake and a documented support window.
-
-No LTS line is declared or promised now; pre-production releases track the
-moving 3.14.x patch target. The full policy and its gates are tracked as P4-12
-in `docs/TODO.md`.
+**LTS policy (future, not before production):** LTS lines are keyed to CPython
+minors and freeze the patch baseline, C-ABI/wheel tags, stdlib/language surface
+with its matrix, and security-patch intake/support window. No LTS line is
+declared now; pre-production releases track the moving 3.14.x target (P4-12).
 
 ## Risks and Open Decisions
 
-- **C-API/ABI compatibility** is the largest cost driver. The decision is a PyX-native shim (option B) so that the PyX startup/GC/performance advantages survive; the remaining risk is the full CPython 3.14 `PyTypeObject`/refcount/GC/GIL surface required by NumPy and `pydantic-core`.
-- **i64 instead of BigInt** is a documented boundary; BigInt is a later feature.
-- **Cranelift vs LLVM** trades faster startup against optimization depth. LLVM remains optional.
-- **Precise GC roots** are still open: conservative scanning of fiber stacks and context register frames is an interim measure, not the target design.
-- **uv coupling** may force a fork; the current decision is passthrough with no fork without an architectural blocker.
-- **Dynamic features** (monkey-patching, `eval`, metaclasses) conflict with AOT; they need tiering or an explicitly defined support scope.
-- **Generator/coroutine remainder** — async generators; generator expressions are still materialized eagerly.
-- **Native module dispatch** is a known performance weakness. No optimization is claimed without measurement.
+- **C-API/ABI compatibility** is the largest cost driver; option B preserves
+  the PyX startup/GC advantages, but the full `PyTypeObject`/refcount/GC/GIL
+  surface for NumPy and `pydantic-core` remains (P4-04c/d).
+- **Precise GC roots/stack maps** are still open; conservative scanning is an
+  interim measure, not the target design (P2-06/P2-07).
+- **uv coupling** may force a fork; current decision is passthrough with no
+  fork without an architectural blocker.
+- **Dynamic features** (monkey-patching, `eval`, metaclasses) conflict with
+  AOT; they need tiering or an explicitly defined support scope.
+- **Generator/coroutine remainder** — async generators; generator expressions
+  are lazy (synthetic generator function over the fiber ABI).
+- **Performance claims** are made only from tracked measurements.
 
 ## Recommendation
 
-AOT first, JIT later. Target a Go-like GC but prioritize correctness and measurability. Integrate uv where possible. Prototype Python C-API compatibility early, before committing to a fully new object and runtime design: ABI compatibility may decide whether the system can absorb the Python ecosystem or remains a new language with familiar syntax.
+AOT first, JIT later. Target a Go-like GC but prioritize correctness and
+measurability. Integrate uv where possible. Continue the CPython C-API
+prototype before committing further to a new object/runtime design: ABI
+compatibility decides whether the system can absorb the Python ecosystem or
+remains a new language with familiar syntax.

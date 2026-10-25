@@ -1,7 +1,8 @@
 # PyX — Architecture
 
 As of: **2026-10-25**. Phase 1 is complete; Phase 2 is largely
-implemented (1403 tests, `scripts/verify.sh` ALL GREEN). This document is
+implemented (current test counts and breakdown: [`AGENTS.md`](../AGENTS.md#current-state);
+`scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
 option B: PyX-native ABI layer without `libpython`) and its gates are
@@ -24,8 +25,8 @@ concurrent mark-&-sweep GC.
 **Deliberately not (as of now):** async generators/comprehensions, the
 complete CPython stdlib,
 C extensions/C API, decorators, pattern matching, metaclasses,
-`bytearray`/`memoryview`, precise GC roots and a dedicated
-size-class allocator. Details in §10 and `docs/TODO.md`.
+`bytearray`/`memoryview`, precise GC roots and variable payload
+size classes. Details in §10 and `docs/TODO.md`.
 
 ## 2. Components & Data Flow
 
@@ -370,10 +371,13 @@ built-in kinds), so the fallback never matches a user handler.
   `enumerate`/`zip` materialize lists of tuples.
 - Comprehensions (Phase 2.8): `[e for ...]`, `{e for ...}`, `{k: v for ...}`
   and generator expressions; multiple `for` clauses and `if` filters are
-  evaluated nested, tuple targets unpacked. Generator expressions are
-  still **materialized eagerly as a list** (documented deviation;
-  function generators are lazy since Phase 2.32); comprehension variables
-  are synthetic locals and do not leak.
+  evaluated nested, tuple targets unpacked. List/set/dict comprehensions
+  build their container eagerly, while a generator expression is lazy: the
+  frontend synthesizes a generator function whose outermost iterable is
+  evaluated when the generator is created and whose remaining clauses,
+  filters and element run on each resume (enclosing locals are passed as
+  capture parameters). Comprehension variables are synthetic locals and do
+  not leak.
 - Dicts store their insertion order in an entry list plus a
   hash index over the key hashes (`DictData`). Buckets are verified with
   Python equality (first position, last value); numeric
@@ -416,7 +420,9 @@ built-in kinds), so the fallback never matches a user handler.
   their frozen attributes and `__name__`. Zero-argument
   `super().__init__(...)` calls the direct base initializer; not supported:
   other class decorators, metaclasses, `class` keywords, multiple inheritance,
-  other `super()` forms, `__repr__`/descriptor protocols. Instances render
+  other `super()` forms and the general descriptor protocol. Common user
+  dunders (`__repr__`/`__str__`/`__len__`/`__contains__`/operators/`__call__`)
+  are dispatched; otherwise instances render
   deterministically as `<ClassName object>` (no heap address), classes as
   `<class 'Name'>`.
 - **Attributes** (`pyx_getattr`): `pathlib.Path` (`name`, `stem`, `suffix`,
@@ -471,9 +477,8 @@ built-in kinds), so the fallback never matches a user handler.
   run. The expression evaluates to the delegate's return value (`None` for a
   plain iterator). Delegating to a running generator raises `RuntimeError`.
   Not supported: async generators (`async def` + `yield` is a diagnostic) and
-  async comprehensions. Generator expressions are eagerly materialized into
-  an iterator (still not lazy)
-  lists (documented deviation). Deviations: `send` into a plain-iterator
+  async comprehensions. Generator expressions are lazy (a synthetic generator
+  function; the outermost iterable is evaluated at creation). Deviations: `send` into a plain-iterator
   delegate raises `AttributeError` naming the iterator as `'iterator'` (not
   e.g. `'list_iterator'`), and PEP 479 (converting a body-raised
   `StopIteration` into `RuntimeError`) is not implemented.
@@ -737,7 +742,7 @@ it. The cache is not a shared artifact store.
   `IfExp` (`a if c else b`,
   only the selected branch evaluates), `List`, `Dict`, `Tuple`, `Set`,
   `Subscript`, `Slice`,
-  `ListComp`, `SetComp`, `DictComp`, `GeneratorExp` (eager), `Await`,
+  `ListComp`, `SetComp`, `DictComp`, `GeneratorExp` (lazy), `Await`,
   `Yield` (expression form; evaluates to the sent value), `YieldFrom`
   (delegation; evaluates to the delegate's result), `FunctionRef`,
   `BuiltinRef` (`f = int`), `IndirectCall { callee, args, star }`
@@ -760,8 +765,10 @@ it. The cache is not a shared artifact store.
   (return/break/continue suppress a pending exception; a new exception
   in finally replaces the old one). Tuple handlers are expanded by the
   frontend into ordered handlers. `raise ... from ...` stores an explicit
-  cause, rendered deepest-first; `from None` suppresses it. Implicit context
-  chaining ("During handling ...") and `except*` are not implemented.
+  cause, rendered deepest-first; `from None` suppresses it. A raise inside an
+  active handler stores the caught exception as `__context__` and renders
+  "During handling of the above exception ...", suppressed by
+  `__suppress_context__`; `except*` is not implemented.
 - `ForEach` iterates lists/strings/dicts via the runtime iterators;
   `ForRange` remains the syntactically specialized `range(...)` form (since
   Phase 2.7, `range` is additionally a value). Negative step is
@@ -843,8 +850,9 @@ Set, Range, Function`.
   `Is`/`IsNot` → Bool for every operand pair and does not narrow either
   operand (`x is None` leaves `x` dynamic). `IfExp` joins the branch types;
   incompatible branches become `Any`.
-- Comprehensions: ListComp → List, SetComp → Set, DictComp → Dict,
-  GeneratorExp → List (eager). Targets bind synthetic locals.
+- Comprehensions: ListComp → List, SetComp → Set, DictComp → Dict.
+  Generator expressions are lowered to a synthetic generator function and
+  typed dynamically. Targets bind synthetic locals.
 - Name/Lambda → Function; indirect call: callee Function/Any, result Any;
   `f = int` is a function (`BuiltinRef`). Closures capture exclusively
   existing locals; `capture_count` is derived from the first use in the
@@ -941,7 +949,7 @@ collector as an interim**:
 
 This is deliberately an **interim**: conservative scanning can preserve false
 positives; the final root rescan is STW, the white partition runs briefly
-under the heap lock. P2-05 (dedicated size-class allocator), P2-06/P2-07
+under the heap lock. P2-05 (variable payload size classes), P2-06/P2-07
 (precise shadow-stack roots, finer safepoint polling) remain open. The
 `unsafe` policy: The GC scan/free paths are encapsulated in `pyx-runtime/src/gc/`
 and justify their invariants there.
@@ -1038,7 +1046,8 @@ Evidence: embedded CPython costs ~6.7 ms `Py_Initialize` + ~7.5 ms
 AOT process; a stable-ABI probe imports with four undefined CPython symbols
 (the initial shim surface). Full rationale, milestones and acceptance gates:
 [`C_API.md`](C_API.md). The 297-module stdlib program (174 pure Python,
-71 extension, 52 builtin/frozen modules), the ecosystem suites and their
+63 extension, 52 builtin/frozen, 8 platform-specific modules), the ecosystem
+suites and their
 benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 
 ## 10. Verification and Documented Limits
@@ -1046,8 +1055,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
   `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
   (diagnostics/tracebacks), GC threshold/stress.
-- As of 2026-10-25: **1403 tests** (424 frontend, 51 codegen, 18 IR, 509
-  runtime unit, 179 runtime integration, 222 CLI/E2E). E2E coverage
+- Test counts and the per-crate breakdown are canonical in
+  [`AGENTS.md`](../AGENTS.md#current-state). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
@@ -1073,8 +1082,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   `property`/`classmethod`/`staticmethod` on methods and the ignored
   `lru_cache`/`cache`/`wraps`/`abstractmethod`/`overload`/
   `runtime_checkable`), pattern matching,
-  metaclasses, descriptor/`__dunder__` protocols, `except*`,
-  implicit exception context, `bytearray`/`memoryview`; other `super()` forms; class namespace immutable. Multiple inheritance is approximated
+  metaclasses, the general descriptor protocol, `except*`,
+  `bytearray`/`memoryview`; other `super()` forms; class namespace immutable. Multiple inheritance is approximated
   by the first base (additional bases are ignored). General dynamic calls
   combine at most one `*` operand; `*args` plus `**kwargs` together still
   need a deferred call, while class constructors can bind `**mapping`.
@@ -1084,7 +1093,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 - **Generators/async:** real lazy generators (stackful fibers) and
   coroutines with a cooperative event loop. Open: async generators, async
   comprehensions and `asyncio` beyond `run`/`sleep`/`gather`; generator
-  expressions are eagerly materialized into an iterator (not lazy),
+  expressions are lazy (synthetic generator function),
   `async for`/`async with` use the
   synchronous protocol. `throw` accepts exception instances only (no
   exception class objects) and has no three-argument form.
@@ -1115,8 +1124,9 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   `regex` syntax, `socket` only blocking TCP, `argparse` with a fixed help
   renderer (and no `SystemExit` for an explicit argv), `random` not
   CPython-reproducible.
-- **GC:** conservative, no precise roots/stack maps, no
-  size-class allocator; STW root window. P2-05/06/07 open.
+- **GC:** conservative root scanning (no precise roots/stack maps); fixed
+  slab/free-list allocator with variable payload size classes still open;
+  STW root window. P2-05/06/07 open.
 - **Concurrency:** no GIL; unprotected mutations of shared containers are
   data races. Function registry for spawn/Pool only by name/arity
   (duplicates/lambdas/native targets rejected); queue `maxsize` is lost in the

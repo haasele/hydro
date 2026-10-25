@@ -20,11 +20,12 @@ defined subset (see [Language Scope](#language-and-stdlib-scope) and
 | Phase 2 — Runtime, GC, modules, classes, concurrency | largely done; lazy generators/coroutines + event loop, exception hierarchy/chaining, module values/globals; precise GC roots and async generators open |
 | Phase 3 — Toolchain (`new`/`init`/`test`/`fmt`/`lint`/`clean`, build cache, uv passthrough) | core available; uv interpreter injection/packaging open |
 | Phase 4 — Python compatibility, C API/ABI | **decision B; first abi3 slice works** (limited-API `.so` imports/calls under JIT+AOT, no `libpython`); full ABI/stdlib/ecosystem open (P4-04a…P4-11), see [`docs/C_API.md`](docs/C_API.md) |
-| Phase 5 — Performance | baseline + local regression gate available |
-| Phase 6 — Diagnostics/Developer Experience | largely done; completions/manpage and ICE regression test open |
+| Phase 5 — Performance | baseline + local regression gate + CPython/PyX/PyPy/Go engine comparison |
+| Phase 6 — Diagnostics/Developer Experience | largely done; CLI/diagnostic references, `--verbose`/`--quiet`, ICE and span tests; troubleshooting/migration open |
 
-Current state of work (Cargo version 0.1.0, no public release yet):
-**1403 tests** (unit, integration, E2E). Compatibility target: **CPython
+Current state of work (Cargo version 0.1.0, no public release yet): the suite
+covers unit, integration and E2E tests (current count and breakdown:
+[`AGENTS.md`](AGENTS.md#current-state)). Compatibility target: **CPython
 3.14.9**; the official `Lib/test` baseline is 1/398 (`test_errno.py`), tracked in [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md). JIT (`pyx run`) and AOT
 (`pyx build`) share the same runtime and IR. Details:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
@@ -33,7 +34,7 @@ Current state of work (Cargo version 0.1.0, no public release yet):
 
 ## Performance
 
-Medians over 5 runs, fresh process per run; AOT excludes build time. Measured on Linux x86_64 (Intel Core Ultra 7 255H, 16 cores, 24 GB), CPython 3.13.13, `n = 200000`, `pyx` release build. Command: `uv run benchmarks/bench_all.py --only pyx`; full report under `bench_results/`.
+Medians over 5 runs, fresh process per run; AOT excludes build time. **Historical snapshot** measured on Linux x86_64 (Intel Core Ultra 7 255H, 16 cores, 24 GB) with CPython 3.13.13; the project oracle is now CPython 3.14.9, and current engine numbers come from `python3 benchmarks/compare_engines.py` or `benchmarks/pyx/run_micro.py`. Snapshot command: `uv run benchmarks/bench_all.py --only pyx`; full report under the untracked `bench_results/`.
 
 | Workload | CPython | PyX JIT | PyX AOT | CPython/JIT | CPython/AOT |
 |---|---:|---:|---:|---:|---:|
@@ -49,7 +50,7 @@ Medians over 5 runs, fresh process per run; AOT excludes build time. Measured on
 | generator_sum | 10.19 ms | 7.68 ms | 6.78 ms | 1.33× | 1.50× |
 | async_gather | 57.93 ms | 23.17 ms | 21.44 ms | 2.50× | 2.70× |
 
-PyX AOT is faster than CPython on 10/11 workloads; `math_loop` is at parity (1.01× AOT, 0.94× JIT) after native-module dispatch moved to a thread-local spec cache (no per-call name allocations or table scans), up from 0.81×. In the 50k-iteration micro harness the same loop is 2.2× faster end-to-end (6.2 ms vs 13.6 ms). `async_gather` runs four coroutines with `asyncio.sleep(0.02)`; wall time is ≈ one sleep, confirming the cooperative event loop runs them concurrently. The 100k-element lazy generator (`sum(gen(100000))`) takes ~10.2 ms under CPython, ~7.7 ms under PyX JIT and ~6.8 ms under PyX AOT (register-switch fibers, no syscalls per yield).
+PyX AOT is faster than CPython on 10/11 workloads; `math_loop` is at parity (1.01× AOT, 0.94× JIT) after native-module dispatch moved to a thread-local spec cache (no per-call name allocations or table scans). In the 50k-iteration micro harness the same loop is 2.2× faster end-to-end (6.2 ms vs 13.6 ms). `async_gather` runs four coroutines with `asyncio.sleep(0.02)`; wall time is ≈ one sleep, confirming the cooperative event loop runs them concurrently. The 100k-element lazy generator (`sum(gen(100000))`) takes ~10.2 ms under CPython, ~7.7 ms under PyX JIT and ~6.8 ms under PyX AOT (register-switch fibers, no syscalls per yield).
 
 ## Requirements
 
@@ -93,8 +94,8 @@ examples and expected outputs are located in `examples/` and
 ```
 pyx new <path> [--force]           create project directory with scaffold
 pyx init [path] [--force]          create project in current/given directory
-pyx check <file.py> [options]      parse and type-check only
-pyx run <file.py> [options]        compile and run with the JIT
+pyx check [options] <file.py>      parse and type-check only
+pyx run [options] <file.py> [args...]  compile and run with the JIT (args → sys.argv[1:])
 pyx build <file.py> [options]      compile and link a native binary
 pyx test [paths...] [options]      run test_*.py / *_test.py with `pyx run`
 pyx fmt [paths...] [--check]       normalize trailing whitespace + final newline
@@ -106,10 +107,15 @@ pyx remove <spec...> [uv options]  remove dependencies with uv
 pyx sync [uv options]              synchronize environment with uv
 pyx lock [uv options]              update lockfile with uv
 pyx doctor [--json]                report toolchain/environment status
+pyx completions <shell>            print bash/zsh/fish completion script
 pyx help | --help | -h             this help
 pyx --version | -V                 version
 ```
 
+- Global `--verbose`/`--quiet` (cannot be combined) are accepted before the
+  command and, for compiler/project commands, before the first path.
+  `--version --verbose` adds target, backend, runtime and Python compatibility;
+  `docs/DIAGNOSTICS.md` is the diagnostic/CLI reference.
 - Diagnostic options (`check`, `run`, `build`, `test`, `lint`): `--json`,
   `--color=<auto|always|never>`, `--no-color`.
 - `build`: `-o/--output <OUT>` (default: file stem in the current directory),
@@ -131,16 +137,18 @@ pyx --version | -V                 version
   `NO_COLOR`; additionally at runtime `PYX_GC_THRESHOLD`, `PYX_GC_STRESS=1`
   and `PYX_GC_STATS=1`.
 
-`--` ends option parsing; additional program arguments are currently not yet
-supported by `run`.
+`--` ends option parsing. Everything after the source file is forwarded to the
+program as `sys.argv[1:]` (`sys.argv[0]` is the source path), so diagnostic
+options must precede the file.
 
 ## Language and Stdlib Scope
 
 **Values and operators**
 
-- `int` (i64, overflow → `OverflowError`), `float`, `bool`, `None`, `str`
-  (UTF-8, Unicode scalar values), `bytes`; `list`, `tuple`, `dict`
-  (insertion order, O(1) lookup via hash index), `set`, `range`,
+- `int` (arbitrary precision: tagged i64 fast path with automatic `BigInt`
+  promotion; native i64 boundaries remain documented), `float`, `bool`,
+  `None`, `str` (UTF-8, Unicode scalar values), `bytes`; `list`, `tuple`,
+  `dict` (insertion order, O(1) lookup via hash index), `set`, `range`,
   iterators, generator/coroutine objects, function/class values.
   `iter(x)` and `next(it[, default])` are builtins.
 - Arithmetic incl. `//`/`%`/`**`, comparisons, `and`/`or` (short-circuit),
@@ -163,8 +171,8 @@ supported by `run`.
 - **Integers:** arbitrary-precision `int` with a tagged i64 fast path and
   automatic `BigInt` promotion; exact arithmetic, comparisons, formatting
   and JSON beyond 64 bits.
-- Comprehensions: lists/sets/dicts and generator expressions (the latter
-  **eagerly as an iterator**), multiple `for` clauses, `if` filters.
+- Comprehensions: lists/sets/dicts (eager containers) and **lazy** generator
+  expressions, multiple `for` clauses, `if` filters.
 
 **Formatting and attributes**
 
@@ -178,9 +186,9 @@ supported by `run`.
 **Control flow, exceptions, context**
 
 - `raise` (incl. `raise ... from ...`), `try`/`except [as]`/`else`/`finally`,
-  re-raise, `except Exception`/`BaseException`, tuple handlers and simplified
-  Python-style tracebacks (explicit chains are deepest-first); unhandled
-  exceptions exit with exit code 1.
+  re-raise, `except Exception`/`BaseException`, tuple handlers and Python-style
+  tracebacks with explicit and implicit (`__context__`/`During handling ...`)
+  chaining; unhandled exceptions exit with exit code 1.
 - `with a as x, b as y:` via the `__enter__`/`__exit__` protocol (files,
   `Pool`, user classes); return values of `__exit__` do not suppress
   exceptions. `with` items are exited in reverse order.
@@ -205,17 +213,19 @@ supported by `run`.
   Generators support `send`/`throw`/`close`, `yield` expressions and
   `yield from` (`throw` accepts exception instances only).
   Not supported: async generators, async comprehensions; `async for`/
-  `async with` use the synchronous protocol. Generator expressions are
-  still materialized eagerly as a list.
+  `async with` use the synchronous protocol. Generator expressions are lazy
+  (synthetic generator function; the outermost iterable is evaluated at
+  creation, the remaining clauses run per resume).
 
 **Modules and imports**
 
 - Native modules (see below) and **user modules**: `import foo` /
-  `from foo import f` resolve a sibling file `foo.py`; functions
-  are exported, the loader caches per canonical path and detects
-  cycles. Imported modules must not have top-level side effects
-  (only imports, function definitions, docstring, `pass`). Packages,
-  dotted/relative imports and `import *` are missing.
+  `from foo import f` resolve a sibling file, a package (`foo/__init__.py`),
+  dotted and relative submodules, `PYX_SITE_PACKAGES`, venv/conda
+  site-packages or `PYTHONPATH`. Each unit loads once per canonical path,
+  imported module bodies run once as initializers, and import cycles are
+  diagnosed. `from x import *` and a general `sys.modules`/`sys.path` model
+  are missing.
 - Standard-library modules are first-class values (`m = errno`,
   `getattr(errno, name)`) and expose their constants through `pyx_module_get`.
   Module-level assignments are visible inside functions and methods.
@@ -233,7 +243,9 @@ supported by `run`.
 `Pattern`/`Match`), `socket` (blocking TCP), `random`, `platform`,
 `statistics`, `pathlib`, `_thread`, `threading`, `queue`, `multiprocessing`,
 `pickle`, `asyncio` (only `run`/`sleep`/`gather`), `errno` (full Linux
-constant table, `errorcode`, module `__dict__`), a minimal `unittest`
+constant table, `errorcode`, module `__dict__`), `typing`, `abc`, `enum`,
+`types`, `itertools`, `ast`, `fractions`, `importlib`, `__future__`,
+`dataclasses`, `datetime`, `contextlib`, `html`, a minimal `unittest`
 (`TestCase` + runner via `main`, native assertions), and Batch A of the
 standard-library program (`bisect`, `heapq`, `colorsys`, `keyword`, `stat`,
 plus the `_bisect`/`_heapq`/`_stat`/`_operator`/`_functools`/`_io` aliases
@@ -255,17 +267,17 @@ plus the benchmark-critical `subprocess`, `tempfile`, `shutil`, `textwrap`,
 **Not supported (selection)**
 
 Async generators and async comprehensions (`asyncio` only
-`run`/`sleep`/`gather`), decorators,
-pattern matching, metaclasses, descriptor/`__dunder__` protocols, multiple
-inheritance, `bytearray`/`memoryview`,
-implicit exception context, `except*`; arbitrary
-C extensions or the C API/ABI and the complete CPython stdlib (60/297
-modules importable; see [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
-Precise GC roots and a dedicated size-class allocator
-are missing. Package management is only a uv passthrough (no
-interpreter injection/packaging). Packages, dotted/relative imports and
-`site-packages` resolution work through the module loader; imports inside
-functions are deferred until the enclosing code runs.
+`run`/`sleep`/`gather`), user decorators, pattern matching, metaclasses,
+multiple inheritance, the general descriptor protocol, `bytearray`/
+`memoryview`, `except*`; arbitrary C extensions or the C API/ABI and the
+complete CPython stdlib (60/297 modules importable; see
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). Precise GC roots/stack maps
+and variable payload size classes are missing. A general `sys.path`/
+`sys.modules` model, namespace/zip/frozen imports and `from x import *` are
+open; packages, dotted/relative imports and `site-packages` resolution work
+through the module loader, and imports inside functions are deferred until
+the enclosing code runs. Package management is only a uv passthrough (no
+interpreter injection/packaging).
 
 ## Architecture
 
@@ -297,7 +309,7 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests and Benchmarks
 
 - `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), build,
-  `cargo test --workspace` (1403 tests), E2E comparison JIT vs. AOT,
+  `cargo test --workspace`, E2E comparison JIT vs. AOT,
   negative tests (diagnostics/tracebacks) and GC stress tests.
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Ubuntu, stable
   Rust, fmt/clippy/test/verify, no secrets).
@@ -307,8 +319,9 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   writes `benchmarks/pyx/results/latest.json`. `benchmarks/bench_pyx.py`
   compares 11 pure Python workloads (incl. lazy generator and async
   `gather`) under CPython/JIT/AOT and is registered as `pyx` in `bench_all.py`
-  (`uv run benchmarks/bench_all.py --only pyx`). The measured
-  weak spot remains native module dispatch (`math_loop` ~0.8x); the
+  (`uv run benchmarks/bench_all.py --only pyx`). Remaining weak spots are
+  string concatenation (O(n²)) and float boxing; native module dispatch is
+  no longer a bottleneck, and the
   register-only fiber switch makes the lazy generator sum over 100k
   elements faster than CPython (release: CPython 11.0 ms, JIT 7.7 ms,
   AOT 6.8 ms; 94 syscalls total instead of 200,097).
@@ -317,13 +330,22 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
   ```bash
   python3 benchmarks/pyx/run_micro.py
-  python3 scripts/check_benchmarks.py            # exit 1 when exceeded
+  python3 scripts/check_benchmarks.py            # --check, exit 1 when exceeded
   python3 scripts/check_benchmarks.py --update   # rewrite baseline
   ```
 
   The gate compares only workloads that are present in both the result and
-  threshold file. It is deliberately not part of CI: timing on shared
-  runners is subject to strong variance.
+  threshold file. Enforcement stays local/release-only: timing on shared
+  runners is too noisy for a blocking CI gate. CI runs the check as a
+  non-blocking report and runs `scripts/test_check_benchmarks.py`.
+- Harnesses: `scripts/bench_hyperfine.sh` wraps the `bench_*.py` scripts in
+  hyperfine with output validation (skips cleanly when hyperfine/uv is
+  missing); `benchmarks/compare_engines.py` compares loop/startup under
+  CPython, PyX, PyPy and Go and reports missing engines as skipped.
+- Releases: tag-driven `.github/workflows/release.yml` builds and packages the
+  Linux x64 `pyx` binary plus AOT runtime archive with tests, checksums
+  and a smoke test, without
+  repository secrets (other platforms: Q-09).
 
 ## Contributing
 

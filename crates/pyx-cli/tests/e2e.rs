@@ -1443,6 +1443,33 @@ fn check_json_diagnostics() {
 }
 
 #[test]
+fn check_spans_multichar_expression() {
+    let dir = TestDir::new("span-expression");
+    let program = dir.path().join("span.py");
+    std::fs::write(&program, "value = 5\nprint(value[0])\n").expect("failed to write program");
+    let program = program.to_string_lossy().into_owned();
+
+    let (code, stdout, stderr) = run(&["check", &program]);
+    assert_eq!(code, 1, "subscript error must exit with status 1");
+    assert!(stdout.is_empty(), "pyx check must not write to stdout");
+    assert!(
+        stderr.contains("'int' object is not subscriptable"),
+        "missing subscript diagnostic, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("^^^^^"),
+        "expected the offending identifier span, got:\n{stderr}"
+    );
+
+    let (code, _, stderr) = run(&["check", "--json", &program]);
+    assert_eq!(code, 1, "JSON diagnostics must exit with status 1");
+    assert!(
+        stderr.contains("\"col\":7") && stderr.contains("\"end_col\":12"),
+        "expected a five-byte expression span at line 2, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn check_json_syntax_code() {
     let program = example("errors/syntax_error.py");
     let (code, stdout, stderr) = run(&["check", "--json", &program]);
@@ -2290,6 +2317,75 @@ fn read_text(path: &Path) -> String {
 }
 
 #[test]
+fn global_verbose_reports_run_timing() {
+    let hello = example("hello.py");
+    let (code, stdout, stderr) = run(&["--verbose", "run", &hello]);
+
+    assert_eq!(code, 0, "pyx run failed: {stderr}");
+    assert_eq!(stdout, "Hello, PyX!\n");
+    assert!(
+        stderr.contains("pyx: run: frontend"),
+        "missing frontend timing, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("pyx: run: jit"),
+        "missing JIT timing, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(" ms"),
+        "missing timing unit, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn global_quiet_suppresses_scaffold_status() {
+    let dir = TestDir::new("quiet-scaffold");
+    let project = dir.path().join("project");
+    let project_arg = project.to_string_lossy().into_owned();
+
+    let (code, stdout, stderr) = run(&["--quiet", "new", &project_arg]);
+
+    assert_eq!(code, 0, "pyx new failed: {stderr}");
+    assert!(
+        stdout.is_empty(),
+        "quiet new must not print status:\n{stdout}"
+    );
+    assert!(project.join("main.py").is_file());
+}
+
+#[test]
+fn global_quiet_suppresses_clean_status() {
+    let dir = TestDir::new("quiet-clean");
+    std::fs::create_dir_all(dir.path().join(".pyx/cache")).expect("failed to create cache");
+
+    let (code, stdout, stderr) = run_in(dir.path(), &["--quiet", "clean"]);
+
+    assert_eq!(code, 0, "pyx clean failed: {stderr}");
+    assert!(
+        stdout.is_empty(),
+        "quiet clean must not print status:\n{stdout}"
+    );
+    assert!(!dir.path().join(".pyx/cache").exists());
+}
+
+#[test]
+fn verbose_and_quiet_conflict() {
+    let hello = example("hello.py");
+    for args in [
+        vec!["--verbose", "--quiet", "run", hello.as_str()],
+        vec!["run", "--verbose", "--quiet", hello.as_str()],
+    ] {
+        let (code, stdout, stderr) = run(&args);
+        assert_eq!(code, 2, "conflicting flags must be a usage error");
+        assert!(stdout.is_empty(), "usage errors go to stderr");
+        assert!(
+            stderr.contains("'--verbose' and '--quiet' cannot be used together"),
+            "missing conflict message, got:\n{stderr}"
+        );
+    }
+}
+
+#[test]
 fn help_lists_project_commands() {
     let (code, stdout, stderr) = run(&["help"]);
 
@@ -2565,6 +2661,40 @@ fn clean_removes_generated_dirs() {
     let (code, stdout, stderr) = run_in(dir.path(), &["clean"]);
     assert_eq!(code, 0, "clean must be idempotent: {stderr}");
     assert!(stdout.contains("nothing to remove"), "{stdout}");
+}
+
+#[test]
+fn build_verbose_reports_timing_and_cache_decisions() {
+    if !runtime_lib_present() {
+        eprintln!(
+            "skipping build_verbose_reports_timing_and_cache_decisions: \
+             libpyx_runtime.a not found next to the test profile"
+        );
+        return;
+    }
+
+    let dir = TestDir::new("build-verbose");
+    std::fs::write(dir.path().join("hello.py"), "print(\"Hello, PyX!\")\n")
+        .expect("failed to write hello.py");
+
+    let (code, stdout, stderr) = run_in(dir.path(), &["--verbose", "build", "hello.py"]);
+    assert_eq!(code, 0, "verbose pyx build failed:\n{stdout}\n{stderr}");
+    for needle in [
+        "pyx: build: frontend",
+        "pyx: build: cache key",
+        "pyx: build: cache miss",
+        "pyx: build: codegen",
+        "pyx: build: link",
+    ] {
+        assert!(stderr.contains(needle), "missing '{needle}' in:\n{stderr}");
+    }
+
+    let (code, _, stderr) = run_in(dir.path(), &["build", "--verbose", "hello.py"]);
+    assert_eq!(code, 0, "cached verbose build failed: {stderr}");
+    assert!(
+        stderr.contains("pyx: build: cache hit"),
+        "second verbose build must report the cache hit, got:\n{stderr}"
+    );
 }
 
 #[test]

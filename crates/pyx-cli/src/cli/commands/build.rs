@@ -6,10 +6,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::{read_source, unwrap_or_report};
-use crate::cli::args::parse_build;
+use crate::cli::args::{parse_build, Verbosity};
 use crate::cli::{CliError, CliResult};
 
 const RUNTIME_LIB_NAME: &str = "libpyx_runtime.a";
@@ -17,9 +17,11 @@ const RUNTIME_LIB_NAME: &str = "libpyx_runtime.a";
 /// Build cache location, relative to the working directory.
 const CACHE_DIR: &str = ".pyx/cache";
 
-pub(crate) fn cmd_build(args: &[OsString]) -> CliResult {
-    let options = parse_build(args)?;
+pub(crate) fn cmd_build(args: &[OsString], verbosity: Verbosity) -> CliResult {
+    let options = parse_build(args, verbosity)?;
+    let verbose = options.diagnostics.verbosity.is_verbose();
     let source = read_source(&options.file)?;
+    let frontend_start = Instant::now();
     let program = unwrap_or_report(
         pyx_frontend::check_file(&options.file),
         &source,
@@ -27,6 +29,12 @@ pub(crate) fn cmd_build(args: &[OsString]) -> CliResult {
         "compile",
         &options.diagnostics,
     )?;
+    if verbose {
+        eprintln!(
+            "pyx: build: frontend {:.1} ms",
+            millis(frontend_start.elapsed())
+        );
+    }
 
     let output = options
         .output
@@ -43,14 +51,34 @@ pub(crate) fn cmd_build(args: &[OsString]) -> CliResult {
     let key = cache
         .as_ref()
         .map(|_| cache_key(&source, &options.file, &runtime));
+    if verbose {
+        match (&cache, &key, options.no_cache) {
+            (_, _, true) => eprintln!("pyx: build: cache disabled"),
+            (Some(_), Some(key), _) => eprintln!("pyx: build: cache key {key}"),
+            _ => eprintln!("pyx: build: cache unavailable"),
+        }
+    }
     if let (Some(cache), Some(key)) = (&cache, &key) {
         if cache.restore(key, &output) {
+            if verbose {
+                eprintln!("pyx: build: cache hit");
+            }
             return Ok(ExitCode::SUCCESS);
+        }
+        if verbose {
+            eprintln!("pyx: build: cache miss");
         }
     }
 
+    let codegen_start = Instant::now();
     let object = pyx_codegen::compile_object(&program)
         .map_err(|error| CliError::new(2, format!("pyx: internal codegen error: {error}")))?;
+    if verbose {
+        eprintln!(
+            "pyx: build: codegen {:.1} ms",
+            millis(codegen_start.elapsed())
+        );
+    }
 
     // The guard removes the temporary object on every exit path, including
     // compiler/linker failures and write errors.
@@ -64,7 +92,14 @@ pub(crate) fn cmd_build(args: &[OsString]) -> CliResult {
         // read-only cache) the plain build below still produces the output and
         // reports the linker diagnostics. A genuine link error therefore only
         // fails the command through the direct attempt.
+        let link_start = Instant::now();
         if run_linker(&temporary.path, &runtime, &staging).is_ok() {
+            if verbose {
+                eprintln!(
+                    "pyx: build: link {:.1} ms (cache)",
+                    millis(link_start.elapsed())
+                );
+            }
             if fs::rename(&staging, &cached_binary).is_ok() {
                 if fs::copy(&cached_binary, &output).is_ok() {
                     make_executable(&output)?;
@@ -79,10 +114,18 @@ pub(crate) fn cmd_build(args: &[OsString]) -> CliResult {
         // Cache publication failed; fall through to the direct link.
     }
 
+    let link_start = Instant::now();
     run_linker(&temporary.path, &runtime, &output)
         .map_err(|failure| report_link_failure(failure, &output))?;
+    if verbose {
+        eprintln!("pyx: build: link {:.1} ms", millis(link_start.elapsed()));
+    }
     make_executable(&output)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn millis(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 /// Read/write access to `.pyx/cache`.

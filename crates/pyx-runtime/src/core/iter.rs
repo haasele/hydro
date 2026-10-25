@@ -1,6 +1,5 @@
 //! Runtime iterators for `for ... in` over lists, strings, dicts, tuples,
-//! sets, ranges, text files and `csv.reader` snapshots (ARCHITECTURE §3.2,
-//! Phase 2.0/2.7).
+//! sets, ranges, text files and `csv.reader` snapshots (ARCHITECTURE §3.2).
 //!
 //! Iterators are index-based: the target is not copied, so mutations made
 //! during the loop are observed. Iterating a string yields one-character

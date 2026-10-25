@@ -67,6 +67,10 @@ pub(crate) fn usage_text() -> String {
          pyx completions <shell>            print a completion script (bash, zsh or fish)\n  \
          pyx help | --help | -h             show this help\n  \
          pyx --version | -V                 show the version (--verbose adds details)\n\n\
+         global options (before the command or its first path):\n  \
+         --verbose                print build/run phase timings and build cache decisions\n  \
+         --quiet                  suppress non-error status output\n  \
+         --verbose and --quiet cannot be combined\n\n\
          new/init:\n  \
          a scaffold contains main.py, pyproject.toml and .gitignore; without --force\n  \
          existing non-empty files are never overwritten\n\n\

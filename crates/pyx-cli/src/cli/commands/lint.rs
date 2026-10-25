@@ -8,11 +8,11 @@ use std::fs;
 use std::process::ExitCode;
 
 use super::scan::{collect_files, is_python_file};
-use crate::cli::args::parse_scan;
+use crate::cli::args::{parse_scan, Verbosity};
 use crate::cli::{diag, CliError, CliResult};
 
-pub(crate) fn cmd_lint(args: &[OsString]) -> CliResult {
-    let options = parse_scan(args, "lint", false)?;
+pub(crate) fn cmd_lint(args: &[OsString], verbosity: Verbosity) -> CliResult {
+    let options = parse_scan(args, "lint", false, verbosity)?;
     let files = collect_files(&options.paths, is_python_file)?;
 
     let mut collected: Vec<pyx_frontend::Diagnostic> = Vec::new();
@@ -50,7 +50,9 @@ pub(crate) fn cmd_lint(args: &[OsString]) -> CliResult {
     if options.diagnostics.json {
         eprintln!("{}", diag::render_json(&collected));
     } else if failed_files == 0 && read_failures == 0 {
-        println!("pyx lint: {} file(s) checked, no errors", files.len());
+        if !options.diagnostics.verbosity.is_quiet() {
+            println!("pyx lint: {} file(s) checked, no errors", files.len());
+        }
     } else {
         eprintln!(
             "pyx lint: {} file(s) checked, {} file(s) with errors",

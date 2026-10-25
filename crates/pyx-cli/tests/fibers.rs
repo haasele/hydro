@@ -611,3 +611,211 @@ except RuntimeError as e:
     assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
     assert_eq!(stdout, "1\ngenerator ignored GeneratorExit\n");
 }
+
+// -------------------------------------------------------------------------
+// Lazy generator expressions
+// -------------------------------------------------------------------------
+
+/// True when the AOT runtime archive was built next to the test binary.
+fn runtime_lib_present() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    exe.ancestors()
+        .any(|dir| dir.join("libpyx_runtime.a").is_file())
+}
+
+/// `(exit code, stdout, stderr)` of a finished child process.
+fn output_parts(output: Output) -> (i32, String, String) {
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn run_executable(path: &Path) -> (i32, String, String) {
+    let output = Command::new(path)
+        .output()
+        .expect("failed to spawn built executable");
+    output_parts(output)
+}
+
+#[test]
+fn generator_expression_runs_only_as_items_are_requested() {
+    let source = "\
+class Counter:
+    def __init__(self):
+        self.calls = 0
+    def tick(self, value):
+        self.calls += 1
+        return value * 2
+
+counter = Counter()
+gen = (counter.tick(v) for v in [1, 2, 3])
+print(counter.calls)
+print(next(gen))
+print(counter.calls)
+print(next(gen))
+print(counter.calls)
+print(list(gen))
+print(counter.calls)
+";
+    let (code, stdout, stderr) = run_source("genexp_lazy", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+    assert_eq!(stdout, "0\n2\n1\n4\n2\n[6]\n3\n");
+}
+
+#[test]
+fn generator_expression_is_single_pass_and_exhausts() {
+    let source = "\
+gen = (v for v in [1, 2])
+print(list(gen))
+print(list(gen))
+total = 0
+for v in gen:
+    total += v
+print(total)
+for v in gen:
+    total += v
+print(total)
+try:
+    next(gen)
+except StopIteration:
+    print('stop')
+";
+    let (code, stdout, stderr) = run_source("genexp_single_pass", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(stdout, "[1, 2]\n[]\n0\n0\nstop\n");
+}
+
+#[test]
+fn generator_expression_binds_tuple_targets_and_sees_later_mutations() {
+    let source = "\
+def rows(data, offset):
+    gen = ((i + offset, j * offset) for i, j in data if i < j if j > 2)
+    return list(gen)
+
+def pairs():
+    return list((i, j) for i in range(3) for j in range(i) if j % 2 == 0)
+
+def total():
+    return sum(x for x in range(4))
+
+data = [(1, 3), (2, 2), (1, 5)]
+print(rows(data, 10))
+print(pairs())
+print(total())
+
+values = [1, 2]
+grow = (v for v in values)
+values.append(3)
+print(list(grow))
+";
+    let (code, stdout, stderr) = run_source("genexp_clauses", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(
+        stdout,
+        "[(11, 30), (11, 50)]\n[(1, 0), (2, 0)]\n6\n[1, 2, 3]\n"
+    );
+}
+
+#[test]
+fn generator_expression_resumes_after_partial_consumption() {
+    let source = "\
+def scan():
+    gen = (v * v for v in range(10))
+    head = next(gen)
+    total = 0
+    for v in gen:
+        if v > 20:
+            break
+        total += v
+    return head, total
+
+print(scan())
+print(sum(v for v in range(5)))
+print(list(v for v in range(3)))
+
+rest = (v for v in range(5))
+for v in rest:
+    if v == 1:
+        break
+print(next(rest))
+";
+    let (code, stdout, stderr) = run_source("genexp_partial", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(stdout, "(0, 30)\n10\n[0, 1, 2]\n2\n");
+}
+
+#[test]
+fn generator_expression_propagates_exceptions_on_resume() {
+    let source = "\
+def bad(v):
+    if v == 2:
+        raise ValueError('boom from genexp')
+    return v
+
+gen = (bad(v) for v in [1, 2, 3])
+print(next(gen))
+try:
+    for v in gen:
+        print(v)
+except ValueError:
+    print('caught ValueError')
+";
+    let (code, stdout, stderr) = run_source("genexp_exceptions", source);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(stdout, "1\ncaught ValueError\n");
+}
+
+#[test]
+fn generator_expression_rejects_a_foreign_walrus_target() {
+    let source = "gen = ((y := v) for v in [1, 2])\n";
+    let (code, _, stderr) = run_source("genexp_walrus", source);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("assignment expressions inside a generator expression"),
+        "missing walrus diagnostic, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn generator_expressions_run_under_aot() {
+    if !runtime_lib_present() {
+        eprintln!(
+            "skipping generator_expressions_run_under_aot: libpyx_runtime.a not found next \
+             to the test profile (AOT is covered by scripts/verify.sh)"
+        );
+        return;
+    }
+    let source = "\
+class Counter:
+    def __init__(self):
+        self.calls = 0
+    def tick(self, value):
+        self.calls += 1
+        return value
+
+counter = Counter()
+gen = (counter.tick(v) * 10 for v in [1, 2, 3] if v != 2)
+print(next(gen))
+print(list(gen))
+print(counter.calls)
+print(sum(v for v in range(4)))
+";
+    let program = write_source("genexp_aot", source);
+    let binary = program.with_file_name("genexp_bin");
+    let program_arg = program.to_string_lossy().into_owned();
+    let binary_arg = binary.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = output_parts(run(&["build", &program_arg, "-o", &binary_arg]));
+    assert_eq!(
+        code, 0,
+        "pyx build failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let (code, stdout, stderr) = run_executable(&binary);
+    cleanup(&program);
+    assert_eq!(code, 0, "AOT binary failed: {stderr}");
+    assert_eq!(stdout, "10\n[30]\n2\n6\n");
+}

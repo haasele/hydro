@@ -225,6 +225,10 @@ struct Runtime {
     exc_tag: FuncId,
     exc_value: FuncId,
     exc_clear: FuncId,
+    exc_handler_push: FuncId,
+    exc_handler_pop: FuncId,
+    exc_handler_depth: FuncId,
+    exc_handler_truncate: FuncId,
     raise: FuncId,
     raise_value: FuncId,
     raise_from: FuncId,
@@ -563,6 +567,15 @@ impl Runtime {
             exc_tag: declare_runtime(module, "pyx_exc_tag", &[], Some(i64t))?,
             exc_value: declare_runtime(module, "pyx_exc_value", &[], Some(i64t))?,
             exc_clear: declare_runtime(module, "pyx_exc_clear", &[], Some(i64t))?,
+            exc_handler_push: declare_runtime(module, "pyx_exc_handler_push", &[i64t], Some(i64t))?,
+            exc_handler_pop: declare_runtime(module, "pyx_exc_handler_pop", &[], Some(i64t))?,
+            exc_handler_depth: declare_runtime(module, "pyx_exc_handler_depth", &[], Some(i64t))?,
+            exc_handler_truncate: declare_runtime(
+                module,
+                "pyx_exc_handler_truncate",
+                &[i64t],
+                Some(i64t),
+            )?,
             raise: declare_runtime(module, "pyx_raise", &[i32t, i64t], Some(i64t))?,
             raise_value: declare_runtime(module, "pyx_raise_value", &[i64t], Some(i64t))?,
             // Explicit chaining. Both arguments are tagged values; a `None`
@@ -922,8 +935,7 @@ fn wrapper_const<M: Module>(
         Const::Bool(false) => builder.ins().iconst(types::I64, FALSE_TAG),
         Const::None => builder.ins().iconst(types::I64, NONE_TAG),
         Const::NotImplemented => builder.ins().iconst(types::I64, NOT_IMPLEMENTED_TAG),
-        // Documented limitation: PyX has no distinct `Ellipsis` sentinel, so
-        // `...` materialises as `None`.
+        // `...` materialises as `None` (see `Const::Ellipsis`).
         Const::Ellipsis => builder.ins().iconst(types::I64, NONE_TAG),
         Const::Float(value) => {
             let float = builder.ins().f64const(*value);
@@ -1113,6 +1125,9 @@ fn bind_dynamic_arguments<M: Module>(
 struct LoopTargets {
     break_block: Block,
     continue_block: Block,
+    /// Runtime handler depth at the loop's entry; `break`/`continue` unwind
+    /// to it.
+    handler_depth: Variable,
 }
 
 /// The payload a comprehension emits once all clauses have matched.
@@ -1129,8 +1144,9 @@ type CleanupId = usize;
 /// Where an in-flight exception is routed.
 #[derive(Clone, Copy)]
 enum ExcTarget {
-    /// Jump into the handler dispatch block of an enclosing `try`.
-    Handler(Block),
+    /// Jump into the handler dispatch block of an enclosing `try`; the
+    /// variable holds the runtime handler depth outside that `try`.
+    Handler(Block, Variable),
     /// Run the `finally` block of the cleanup, which then re-propagates.
     Cleanup(CleanupId),
     /// Leave the function through the epilogue.
@@ -1152,6 +1168,8 @@ struct CleanupInfo {
     /// Slot holding the exception object in flight when the cleanup is
     /// entered with action `4`.
     pending_slot: StackSlot,
+    /// Runtime handler depth outside the `try`.
+    handler_depth: Variable,
 }
 
 struct Lower<'a, 'b, M: Module> {
@@ -1175,6 +1193,9 @@ struct Lower<'a, 'b, M: Module> {
     exc_target: ExcTarget,
     /// Exception object handled by the enclosing `except` arm, for bare `raise`.
     current_exc: Option<Variable>,
+    /// Runtime handler depth at function entry; leaving the function unwinds
+    /// to it so caller contexts stay intact.
+    handler_base: Variable,
     loops: Vec<LoopTargets>,
     /// Active `finally` blocks, innermost last.
     cleanups: Vec<CleanupId>,
@@ -1207,6 +1228,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     ) -> Lower<'a, 'b, M> {
         let ret_var = Variable::from_u32(function.locals.len() as u32);
         let safepoint_counter = Variable::from_u32(function.locals.len() as u32 + 1);
+        let handler_base = Variable::from_u32(function.locals.len() as u32 + 2);
         Lower {
             module,
             program,
@@ -1225,12 +1247,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             safepoint_counter,
             exc_target: ExcTarget::Function,
             current_exc: None,
+            handler_base,
             loops: Vec::new(),
             cleanups: Vec::new(),
             cleanup_infos: Vec::new(),
             finally_slots: Vec::new(),
             suppress_pending: 0,
-            next_temp: function.locals.len() as u32 + 2,
+            next_temp: function.locals.len() as u32 + 3,
             terminated: false,
             func_refs: HashMap::new(),
         }
@@ -1258,6 +1281,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.builder.def_var(self.ret_var, none);
         let zero = self.builder.ins().iconst(types::I64, 0);
         self.builder.def_var(self.safepoint_counter, zero);
+        // Handler contexts of enclosing callers stay on the runtime stack;
+        // leaving this function unwinds only to this baseline.
+        self.builder.declare_var(self.handler_base, types::I64);
+        let handler_base = self.call_rt(self.runtime.exc_handler_depth, &[])?;
+        self.builder.def_var(self.handler_base, handler_base);
 
         let entry_params = self.builder.block_params(entry).to_vec();
         for (position, param) in self.params.iter().enumerate() {
@@ -1418,8 +1446,38 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             .ok_or_else(|| CodegenError::new(format!("internal error: unknown cleanup id {id}")))
     }
 
+    /// Capture the current runtime handler depth in a fresh variable.
+    fn capture_handler_depth(&mut self) -> Result<Variable, CodegenError> {
+        let var = self.temp_var();
+        let depth = self.call_rt(self.runtime.exc_handler_depth, &[])?;
+        self.builder.def_var(var, depth);
+        Ok(var)
+    }
+
+    /// Pop handler contexts down to the absolute `depth` variable.
+    fn emit_handler_unwind(&mut self, depth: Variable) -> Result<(), CodegenError> {
+        let depth = self.builder.use_var(depth);
+        let id = self.runtime.exc_handler_truncate;
+        self.call_rt(id, &[depth])?;
+        Ok(())
+    }
+
+    /// Enter a `finally` body, recording `value` (or `None` when the body was
+    /// entered without an in-flight exception) as the active handler context.
+    fn enter_finally(&mut self, entry: Block, value: Option<Value>) -> Result<(), CodegenError> {
+        let value = match value {
+            Some(value) => value,
+            None => self.none(),
+        };
+        let id = self.runtime.exc_handler_push;
+        self.call_rt(id, &[value])?;
+        self.jump(entry);
+        Ok(())
+    }
+
     /// Leave the current block for `target`.
     ///
+    /// Handler contexts entered inside the construct are popped first.
     /// Cleanup targets park the pending exception in the cleanup's slot,
     /// clear it, select action `4` and enter the `finally` body; the action
     /// dispatch re-raises it afterwards. Clearing it first keeps runtime
@@ -1428,6 +1486,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     fn emit_jump_exc_target(&mut self, target: ExcTarget) -> Result<(), CodegenError> {
         match target {
             ExcTarget::Function => {
+                self.emit_handler_unwind(self.handler_base)?;
                 let epilogue = self.epilogue.ok_or_else(|| {
                     CodegenError::new(
                         "internal error: exception target before epilogue was created",
@@ -1435,9 +1494,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 })?;
                 self.jump(epilogue);
             }
-            ExcTarget::Handler(block) => self.jump(block),
+            ExcTarget::Handler(block, depth) => {
+                self.emit_handler_unwind(depth)?;
+                self.jump(block);
+            }
             ExcTarget::Cleanup(id) => {
                 let info = self.cleanup_info(id)?;
+                self.emit_handler_unwind(info.handler_depth)?;
                 let value_id = self.runtime.exc_value;
                 let value = self.call_rt(value_id, &[])?;
                 self.builder.ins().stack_store(value, info.pending_slot, 0);
@@ -1445,7 +1508,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.call_rt(clear_id, &[])?;
                 let action = self.tagged_int(4);
                 self.builder.def_var(info.action_var, action);
-                self.jump(info.finally_entry);
+                self.enter_finally(info.finally_entry, Some(value))?;
             }
         }
         Ok(())
@@ -1500,13 +1563,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         if self.suppress_pending > 0 {
             self.clear_pending()?;
         }
+        self.emit_handler_unwind(self.handler_base)?;
         if let Some(id) = self.cleanups.last().copied() {
             let info = self.cleanup_info(id)?;
             // Entering for `return` without an in-flight exception.
             self.reset_finally_slot(info.pending_slot);
             let action = self.tagged_int(1);
             self.builder.def_var(info.action_var, action);
-            self.jump(info.finally_entry);
+            self.enter_finally(info.finally_entry, None)?;
         } else {
             let epilogue = self.epilogue.ok_or_else(|| {
                 CodegenError::new("internal error: return before epilogue was created")
@@ -1528,13 +1592,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         if self.suppress_pending > 0 {
             self.clear_pending()?;
         }
+        self.emit_handler_unwind(target.handler_depth)?;
         if let Some(id) = self.cleanups.last().copied() {
             let info = self.cleanup_info(id)?;
             if info.break_loop == Some(index) {
                 self.reset_finally_slot(info.pending_slot);
                 let action = self.tagged_int(2);
                 self.builder.def_var(info.action_var, action);
-                self.jump(info.finally_entry);
+                self.enter_finally(info.finally_entry, None)?;
                 return Ok(());
             }
         }
@@ -1554,13 +1619,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         if self.suppress_pending > 0 {
             self.clear_pending()?;
         }
+        self.emit_handler_unwind(target.handler_depth)?;
         if let Some(id) = self.cleanups.last().copied() {
             let info = self.cleanup_info(id)?;
             if info.break_loop == Some(index) {
                 self.reset_finally_slot(info.pending_slot);
                 let action = self.tagged_int(3);
                 self.builder.def_var(info.action_var, action);
-                self.jump(info.finally_entry);
+                self.enter_finally(info.finally_entry, None)?;
                 return Ok(());
             }
         }
@@ -1583,7 +1649,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.reset_finally_slot(info.pending_slot);
                 let action = self.tagged_int(0);
                 self.builder.def_var(info.action_var, action);
-                self.jump(info.finally_entry);
+                self.enter_finally(info.finally_entry, None)?;
             }
             None => self.jump(after),
         }
@@ -1644,7 +1710,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             self.reset_finally_slot(outer.pending_slot);
             let action = self.tagged_int(1);
             self.builder.def_var(outer.action_var, action);
-            self.jump(outer.finally_entry);
+            self.enter_finally(outer.finally_entry, None)?;
         } else {
             let epilogue = self.epilogue.ok_or_else(|| {
                 CodegenError::new("internal error: return before epilogue was created")
@@ -1700,7 +1766,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.reset_finally_slot(outer.pending_slot);
                 let action = self.tagged_int(code);
                 self.builder.def_var(outer.action_var, action);
-                self.jump(outer.finally_entry);
+                self.enter_finally(outer.finally_entry, None)?;
                 return Ok(());
             }
         }
@@ -1861,6 +1927,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 } else {
                     after
                 };
+                let handler_depth = self.capture_handler_depth()?;
                 self.jump(condition_block);
                 self.switch_to(condition_block);
                 // Backedge landing pad: poll every 64th iteration before
@@ -1874,6 +1941,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.loops.push(LoopTargets {
                     break_block: after,
                     continue_block: condition_block,
+                    handler_depth,
                 });
                 self.switch_to(body_block);
                 self.lower_stmts(body.as_slice())?;
@@ -2376,6 +2444,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             after
         };
 
+        let handler_depth = self.capture_handler_depth()?;
         self.jump(condition);
         self.switch_to(condition);
 
@@ -2436,6 +2505,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             break_block: after,
             // `continue` must still advance the loop variable.
             continue_block: increment,
+            handler_depth,
         });
         self.switch_to(body_block);
         self.lower_stmts(body)?;
@@ -2511,6 +2581,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             after
         };
 
+        let handler_depth = self.capture_handler_depth()?;
         self.jump(next_block);
         self.switch_to(next_block);
         // Loop head / backedge (also the `continue` target).
@@ -2528,6 +2599,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.loops.push(LoopTargets {
             break_block: after,
             continue_block: next_block,
+            handler_depth,
         });
         self.switch_to(body_block);
         let value = self
@@ -2554,12 +2626,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(())
     }
 
-    /// Lower a comprehension (including eager generator expressions).
+    /// Lower an eager list/set/dict comprehension.
     ///
     /// The result container is created in the current block and kept in a
     /// temporary variable so the generated appends always see a live tagged
     /// root. The clauses are lowered recursively; each level runs its own
     /// iterator loop and jumps back to its head after the nested clauses.
+    /// Generator expressions are lazy instead: the frontend lowers them to a
+    /// synthetic generator function that codegen calls through the fiber ABI.
     fn lower_comprehension(
         &mut self,
         clauses: &'a [CompClause],
@@ -2833,6 +2907,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         finally_body: &'a [Stmt],
     ) -> Result<(), CodegenError> {
         let outer_exc = self.exc_target;
+        let outer_handler_depth = self.capture_handler_depth()?;
         let after = self.builder.create_block();
         let has_finally = !finally_body.is_empty();
         let has_handlers = !handlers.is_empty();
@@ -2860,6 +2935,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 break_loop,
                 outer_exc,
                 pending_slot,
+                handler_depth: outer_handler_depth,
             });
             self.cleanups.push(id);
             Some(id)
@@ -2873,7 +2949,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             None
         };
         let inner_exc = match (dispatch, cleanup) {
-            (Some(handler), _) => ExcTarget::Handler(handler),
+            (Some(handler), _) => ExcTarget::Handler(handler, outer_handler_depth),
             (None, Some(id)) => ExcTarget::Cleanup(id),
             (None, None) => outer_exc,
         };
@@ -2973,11 +3049,17 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 }
                 let clear_id = self.runtime.exc_clear;
                 self.call_rt(clear_id, &[])?;
+                // Implicit chaining: exceptions raised in this arm record the
+                // handled exception as their `context`.
+                let push_id = self.runtime.exc_handler_push;
+                self.call_rt(push_id, &[value])?;
                 self.exc_target = handler_exc;
                 let previous_exc = self.current_exc.replace(exc_var);
                 self.lower_stmts(handler.body.as_slice())?;
                 self.current_exc = previous_exc;
                 if !self.terminated {
+                    let pop_id = self.runtime.exc_handler_pop;
+                    self.call_rt(pop_id, &[])?;
                     self.emit_finally_normal(cleanup, after)?;
                 }
 
@@ -3008,6 +3090,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             // this cleanup's slot (or falls back to RuntimeError when the
             // body was entered normally and the slot is `None`).
             self.finally_slots.push(info.pending_slot);
+            // Every entry into the body pushed a handler context (the
+            // in-flight exception or a `None` marker); the body-completion
+            // pop below balances it.
             self.lower_stmts(finally_body)?;
             if self.finally_slots.pop() != Some(info.pending_slot) {
                 return Err(CodegenError::new(
@@ -3018,6 +3103,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             self.current_exc = saved_current;
 
             if !self.terminated {
+                let pop_id = self.runtime.exc_handler_pop;
+                self.call_rt(pop_id, &[])?;
                 let dispatch_block = self.builder.create_block();
                 self.jump(dispatch_block);
                 self.switch_to(dispatch_block);
@@ -3257,15 +3344,6 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 value,
                 clauses,
             } => self.lower_comprehension(clauses.as_slice(), CompEmit::Dict(key, value)),
-            ExprKind::GeneratorExp { element, clauses } => {
-                // Materialised eagerly until lazy generator expressions exist,
-                // but wrapped in an iterator so `next()` and single-pass use
-                // match the Python protocol.
-                let list = self.lower_comprehension(clauses.as_slice(), CompEmit::List(element))?;
-                let iterator = self.call_rt(self.runtime.iter_new, &[list])?;
-                self.emit_exc_check()?;
-                Ok(iterator)
-            }
             ExprKind::Subscript { object, index } => {
                 let object = self.lower_expr(object)?;
                 let index = self.lower_expr(index)?;
@@ -3412,24 +3490,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
 
     /// Condition: `true` when neither operand needs the dynamic operator.
     ///
-    /// A promoted arbitrary-precision `int` lives on the heap (`TAG_HEAP`), so
-    /// the tagged-int fast paths must branch around the untagging instead of
-    /// interpreting its pointer as a payload.
+    /// Shared guard for the tagged-int fast paths: a promoted `BigInt` lives
+    /// at `TAG_HEAP`, so its pointer must never be shifted as a payload.
     fn int_operands_tagged(&mut self, lhs: Value, rhs: Value) -> Value {
         let lhs_tagged = self.is_tagged_immediate(lhs);
         let rhs_tagged = self.is_tagged_immediate(rhs);
         self.builder.ins().band(lhs_tagged, rhs_tagged)
     }
 
-    /// `int op int` for `+`, `-` and `*`.
-    ///
-    /// Both operands are statically `int` and the result is `int`, so the
-    /// operation cannot dispatch on types. The fast path untags, computes
-    /// with the checked machine operation, verifies the payload still fits
-    /// the 61-bit tagged immediate and retags. A heap operand (a promoted
-    /// `BigInt` bound to a statically-`int` local), i64 overflow or an
-    /// out-of-range result branches to `pyx_binop`, whose runtime
-    /// `value::int_result` promotes the result to a heap `BigInt`.
+    /// `int op int` for `+`, `-` and `*` with statically `int` operands and
+    /// result. Untags, checks overflow and the tagged-immediate range, then
+    /// retags; a heap operand or out-of-range result branches to `pyx_binop`,
+    /// whose `value::int_result` promotes to a heap `BigInt`.
     fn lower_int_arith(
         &mut self,
         op: BinOp,
@@ -3441,8 +3513,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 "internal error: non-arithmetic operator on the int fast path",
             ));
         }
-        // Guard before untagging: a heap `BigInt` pointer must never be
-        // shifted as if it were a payload.
+        // Guard before untagging.
         let operands_tagged = self.int_operands_tagged(lhs, rhs);
 
         let fast_block = self.builder.create_block();
@@ -4181,8 +4252,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             Const::Bool(false) => Ok(self.tagged_int(FALSE_TAG)),
             Const::None => Ok(self.none()),
             Const::NotImplemented => Ok(self.tagged_int(NOT_IMPLEMENTED_TAG)),
-            // Documented limitation: PyX has no distinct `Ellipsis` sentinel,
-            // so `...` materialises as `None`.
+            // `...` materialises as `None` (see `Const::Ellipsis`).
             Const::Ellipsis => Ok(self.none()),
             Const::Float(value) => {
                 let float = self.builder.ins().f64const(*value);
@@ -4246,14 +4316,6 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(result)
     }
 
-    /// Attach the user-visible positional parameter names of a generated
-    /// wrapper to its function value through `pyx_function_params`.
-    ///
-    /// The runtime needs them to bind `functools.partial` keyword arguments by
-    /// name. Captured values, `*args`, keyword-only parameters and `**kwargs`
-    /// have no positional slot and are therefore not listed; a dynamic
-    /// signature is skipped entirely because its calls take the count-prefixed
-    /// buffer the runtime cannot bind by name.
     /// Attaches full parameter metadata and the full-argv trampoline to a
     /// generated function value for runtime keyword binding.
     fn attach_function_signature(

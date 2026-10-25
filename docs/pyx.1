@@ -1,4 +1,4 @@
-.TH PYX 1 "2026-10-24" "pyx 0.1.0" "User Commands"
+.TH PYX 1 "2026-10-25" "pyx 0.1.0" "User Commands"
 .SH NAME
 pyx \- compile, check and run a subset of Python 3
 .SH SYNOPSIS
@@ -43,11 +43,20 @@ Parse and type\-check
 .I file.py
 without running it.
 .TP
-.B run \fIfile.py\fR [\fIdiagnostic options\fR]
+.B run \fR[\fIdiagnostic options\fR] \fIfile.py\fR [\fIprogram arguments\fR]
 Compile
 .I file.py
 with the JIT and run it.
-Program arguments are not supported yet.
+Everything after
+.I file.py
+is passed to the program verbatim as
+.BR sys.argv [1:]
+onwards;
+.B sys.argv[0]
+is the source path.
+Diagnostic options must therefore precede the source file, and
+.B \-\-
+ends option parsing.
 .TP
 .B gc \fR[\fB\-\-json\fR] \fIfile.py\fR [\fIdiagnostic options\fR]
 Compile and run exactly like
@@ -150,6 +159,30 @@ the runtime version
 and the implemented Python compatibility mode.
 .SH OPTIONS
 Options are positional: each command accepts only those listed for it.
+.SS Global options
+Accepted before the command name and, for compiler and project commands, also
+before the command's first path.
+.TP
+.B \-\-verbose
+Print phase timings for
+.B run
+and
+.B build
+(frontend, JIT, codegen and link) and the build cache key/hit/miss decisions
+on stderr.
+With
+.B \-\-version
+it adds the target, backend, runtime and Python compatibility lines.
+.TP
+.B \-\-quiet
+Suppress non\-error status output such as scaffold, formatting and removal
+messages, and passing test lines.
+Errors and diagnostics are always printed.
+.PP
+.B \-\-verbose
+and
+.B \-\-quiet
+cannot be combined; doing so is a usage error with exit status 2.
 .SS Diagnostic options
 Accepted by
 .BR check ,
@@ -307,5 +340,7 @@ See the "Language and Stdlib Scope" section of the README and
 .I docs/COMPATIBILITY.md
 for the supported syntax, bundled modules and the stdlib import matrix.
 .SH SEE ALSO
+.I docs/DIAGNOSTICS.md
+(diagnostic codes, spans, JSON schema and exit codes),
 .BR uv (1),
 .BR cc (1)

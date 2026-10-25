@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use super::scan::{collect_files, is_test_file};
-use crate::cli::args::{parse_scan, ScanOptions};
+use crate::cli::args::{parse_scan, ScanOptions, Verbosity};
 use crate::cli::diag;
 use crate::cli::{CliError, CliResult};
 
@@ -23,14 +23,15 @@ struct TestResult {
     stderr: String,
 }
 
-pub(crate) fn cmd_test(args: &[OsString]) -> CliResult {
-    let options = parse_scan(args, "test", false)?;
+pub(crate) fn cmd_test(args: &[OsString], verbosity: Verbosity) -> CliResult {
+    let options = parse_scan(args, "test", false, verbosity)?;
     let files = collect_files(&options.paths, is_test_file)?;
+    let quiet = options.diagnostics.verbosity.is_quiet();
 
     if files.is_empty() {
         if options.diagnostics.json {
             println!("[]");
-        } else {
+        } else if !quiet {
             println!("pyx test: no test files found");
         }
         return Ok(ExitCode::SUCCESS);
@@ -52,19 +53,24 @@ pub(crate) fn cmd_test(args: &[OsString]) -> CliResult {
     } else {
         for result in &results {
             if result.passed {
+                if quiet {
+                    continue;
+                }
                 println!("PASS {}", result.file.display());
             } else {
                 println!("FAIL {} (exit code {})", result.file.display(), result.code);
             }
             write_child_output(result);
         }
-        let passed = results.iter().filter(|result| result.passed).count();
-        println!(
-            "\n{} passed, {} failed, {} total",
-            passed,
-            results.len() - passed,
-            results.len()
-        );
+        if !quiet {
+            let passed = results.iter().filter(|result| result.passed).count();
+            println!(
+                "\n{} passed, {} failed, {} total",
+                passed,
+                results.len() - passed,
+                results.len()
+            );
+        }
     }
 
     if results.iter().all(|result| result.passed) {

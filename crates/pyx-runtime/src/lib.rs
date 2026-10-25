@@ -4,9 +4,8 @@
 //! frozen by `docs/ARCHITECTURE.md` §3 and must not change without updating
 //! that document, the codegen and all tests.
 //!
-//! Phase 1 allocation policy was to leak heap objects. Since Phase 2.1 an
-//! interim conservative mark-&-sweep collector (see [`gc::heap`] and
-//! ARCHITECTURE §7) owns them.
+//! Heap objects are owned by the incremental conservative mark-&-sweep
+//! collector ([`gc::heap`], ARCHITECTURE §7).
 //!
 //! Implementation notes:
 //! - Values are tagged `i64`s: `000` int (`v >> 3`), `001` special

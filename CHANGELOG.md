@@ -8,7 +8,8 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
-As of 2026-10-25: **1403 tests**, `scripts/verify.sh` ALL GREEN. The official
+As of 2026-10-25 the full suite is green (`scripts/verify.sh` ALL GREEN; current
+test count and breakdown in [`AGENTS.md`](AGENTS.md#current-state)). The official
 CPython suite has its first real pass (`test_errno.py`), recorded in the
 manifest. The first abi3
 extension slice runs under JIT and AOT without `libpython`; the full C
@@ -22,6 +23,49 @@ heavier rich rendering. See the package-loader entry below.
 
 ### Added
 
+- **Lazy generator expressions:** `(e for ...)` no longer builds an eager
+  list. The frontend synthesizes a generator function whose hidden first
+  parameter is the outermost iterable (evaluated when the generator is
+  created) plus one parameter per captured enclosing local, and codegen calls
+  it through the existing fiber ABI. Every later clause, filter and the
+  element run only on resume, so `next`/`for`/`sum`/`list` consume a single
+  pass, exhaustion raises `StopIteration`, and body exceptions propagate on
+  resume. List/set/dict comprehensions stay eager. Assignment expressions
+  inside a generator expression are rejected (their target would have to bind
+  in the enclosing frame). Tests cover laziness/partial consumption, captures,
+  tuple targets, multiple clauses/filters, exceptions, and JIT+AOT.
+- **Implicit exception context:** a `raise` inside an active handler now
+  records `__context__` and renders "During handling of the above exception,
+  another exception occurred:" with deepest-first tracebacks; `__cause__`
+  still wins, and `__suppress_context__`/`raise ... from None` suppress the
+  implicit chain. Unit tests cover chain rendering and suppression.
+- **CLI feedback and diagnostic spans:** global/per-command
+  `--verbose`/`--quiet` (conflict exits 2), phase timings and cache decisions
+  for `run`/`build`, multi-character semantic spans
+  (`sema::simple_expr_end`), and ICE classification tests; the diagnostic
+  catalog is `docs/DIAGNOSTICS.md`.
+- **Native `html` and `contextlib` shims:** `html.escape`/`unescape` and
+  `contextlib.suppress` (+ the internal suppress enter/exit) are importable,
+  advancing the import matrix to 60/297.
+- **BigInt serialization:** PYX1 stores a sign byte plus big-endian magnitude
+  and normalizes a canonical small payload back to the tagged integer;
+  containers, pickle and process queues round-trip arbitrary-precision ints.
+- **Deterministic container/GC property tests:** `pyx-runtime/tests/container_properties.rs`
+  and `gc_properties.rs` drive list/dict/set/tuple and allocation/collection
+  sequences with a dependency-free SplitMix64 generator and compare against
+  Rust models. The GC tests cover randomized churn, nested reachable graphs,
+  collection invariants and cycle reclamation without exact-count assertions.
+- **Benchmark tooling:** `scripts/bench_hyperfine.sh` wraps the existing
+  `bench_*.py` harnesses in hyperfine with JSON output validation and clean
+  skip/error behavior; `benchmarks/compare_engines.py` compares loop/startup
+  under CPython/PyX/PyPy/Go and reports missing engines as skipped. The
+  threshold gate gained an explicit `--check` mode, deterministic
+  `scripts/test_check_benchmarks.py` tests, and a non-blocking CI report;
+  enforcement stays local/release-only (P5-01c/Q-06).
+- **Tag-driven releases:** `.github/workflows/release.yml` tests the tagged
+  workspace, builds with `--locked`, packages/checksums/smoke-tests the Linux
+  x64 JIT and AOT artifact (binary plus runtime archive) and publishes it
+  without repository secrets.
 - **Arbitrary-precision integers:** Python `int` now uses a tagged i64 fast
   path with automatic exact promotion to a heap `BigInt` (`num-bigint`).
   New IR/type `Type::BigInt`, `Const::BigInt`, ABI
@@ -386,11 +430,11 @@ heavier rich rendering. See the package-loader entry below.
   `textwrap` and `timeit` are native and API-tested; `pyx run` now forwards
   program arguments into `sys.argv`, with `sys.executable`, `sys.exit`,
   `os.environ`/`os.access` and argparse default-argv/help support.
-  `bench_all.py --only pyx` completes under CPython; import baseline at that
-  point 47/297 (now 58/297).
+  `bench_all.py --only pyx` completes under CPython; the import baseline at
+  that point was 47/297.
 - **Batch B native codec/text core:** `binascii`, `base64`, `quopri`,
   `fnmatch`, `getopt` and `mimetypes` are native and API-tested, bringing the
-  import baseline to 42/297 (now 58/297). The remaining Batch B modules still
+  import baseline to 42/297 at that point. The remaining Batch B modules still
   need the pure-Python pipeline.
 - **Standard-library program (P7) and Batch A:** added a complete
   module-by-module plan for all 272 missing stdlib modules with dependency
@@ -423,7 +467,7 @@ heavier rich rendering. See the package-loader entry below.
   a stable-ABI fixture imports with four undefined CPython symbols
   (`spikes/p4_04/`).
 - **Full-compatibility program:** P4-09 (297 stdlib modules: 174 pure Python,
-  71 extension, 52 builtin/frozen), P4-10 (ecosystem suites: NumPy, pandas,
+  63 extension, 52 builtin/frozen, 8 platform-specific), P4-10 (ecosystem suites: NumPy, pandas,
   pydantic, FastAPI, Django, …) and P4-11 (ecosystem benchmarks) added to
   `docs/TODO.md`.
 

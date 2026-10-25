@@ -1,11 +1,11 @@
-//! Fixed-size slab allocator for collector cells (P2-05, first stage).
+//! Fixed-size slab allocator for collector cells.
 //!
 //! Every object the collector owns is a [`PyxObj`]. Although its payload enum
 //! has many variants, the *object* itself has one fixed Rust layout and one
 //! fixed alignment: growing payloads (`String`, `Vec`) keep their buffers on
 //! the system allocator. One size class is therefore enough, and the pool
 //! documents that explicitly — variable object size classes remain future
-//! work (P2-05/P2-06).
+//! work.
 //!
 //! Cells are grouped into slabs that are allocated with
 //! `Layout::array::<PyxObj>(SLAB_OBJECTS)` and released with exactly the same
