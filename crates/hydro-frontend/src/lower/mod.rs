@@ -3727,6 +3727,18 @@ impl<'a> Lowerer<'a> {
                     col,
                 }
             } else if let Some((module, name)) = self.imported_user_globals.get(&binding).cloned() {
+                // A member of a module that is still initializing (an
+                // ancestor package, or a module reached through an import
+                // cycle) cannot be read yet: its initializer runs after this
+                // unit's. The compile-time binding still resolves the name at
+                // use time from the source module's global table, and that
+                // module mirrors its own definitions in its initializer. An
+                // eager store here would read the name before the definition
+                // ran (for example `from . import greeting` in a package
+                // submodule imported before the package body).
+                if self.is_initializing_ancestor(&module) || self.late_modules.contains(&module) {
+                    continue;
+                }
                 HExpr {
                     kind: HExprKind::GlobalGet { module, name },
                     ty: Ty::Concrete(Type::Any),

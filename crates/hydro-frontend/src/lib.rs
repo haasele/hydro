@@ -3292,6 +3292,78 @@ mod tests {
     }
 
     #[test]
+    fn initializing_package_function_is_not_read_before_the_package_body() {
+        // Package cycle: `pkg` imports `pkg.child` before defining
+        // `greeting`, and `pkg.child` imports `greeting` back from `pkg`.
+        // The child initializer runs first, so it must not eagerly read
+        // `pkg.greeting`; the compile-time binding resolves the name when
+        // `run()` executes, after the package body mirrored the function.
+        let dir = TestDir::new("initializing-parent-order");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "from .child import run\n\ndef greeting():\n    return 'hi'\n",
+        )
+        .expect("write package init");
+        fs::write(
+            pkg.join("child.py"),
+            "from . import greeting\n\ndef run():\n    return greeting()\n",
+        )
+        .expect("write child");
+        let main = dir.write("main.py", "from pkg.child import run\nprint(run())\n");
+        let program = program(&main);
+
+        use hydro_ir::{ExprKind, StmtKind};
+        let initializer = |name: &str| {
+            program
+                .initializers
+                .iter()
+                .copied()
+                .find(|id| program.functions[*id as usize].name == name)
+                .unwrap_or_else(|| panic!("missing initializer {name}"))
+        };
+        let child = initializer("pkg.child.<module>");
+        let package = initializer("pkg.<module>");
+        assert!(
+            child < package,
+            "the package dependency initializes before the package body"
+        );
+
+        let eager_read =
+            program.functions[child as usize]
+                .body
+                .iter()
+                .any(|stmt| match &stmt.kind {
+                    StmtKind::GlobalSet { value, .. } => matches!(
+                        &value.kind,
+                        ExprKind::GlobalGet { module, name }
+                            if module == "pkg" && name == "greeting"
+                    ),
+                    _ => false,
+                });
+        assert!(
+            !eager_read,
+            "the child initializer must not read pkg.greeting before the package body runs"
+        );
+
+        let mirrored =
+            program.functions[package as usize]
+                .body
+                .iter()
+                .any(|stmt| match &stmt.kind {
+                    StmtKind::GlobalSet { name, value, .. } if name == "greeting" => {
+                        matches!(&value.kind, ExprKind::FunctionRef(_))
+                    }
+                    _ => false,
+                });
+        assert!(
+            mirrored,
+            "the package body must mirror the function value for the late read"
+        );
+    }
+
+    #[test]
     fn type_checking_guarded_imports_are_not_resolved() {
         let dir = TestDir::new("type-checking");
         let main = dir.write(
