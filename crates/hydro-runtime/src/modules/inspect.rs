@@ -2617,9 +2617,19 @@ fn function_static_attribute(obj: i64, name: &str) -> Option<i64> {
         }
     }
     match name {
-        "__name__" | "__qualname__" => Some(text(&function.name)),
-        "__doc__" => Some(NONE),
-        _ => None,
+        "__name__" => Some(value::str_alloc(value::function_name(obj))),
+        "__qualname__" => Some(value::str_alloc(value::function_qualname(obj))),
+        "__doc__" => Some(value::function_doc(obj)),
+        "__module__" => value::function_module(obj),
+        "__annotations__" => value::function_annotations(obj),
+        "__dict__" => {
+            if value::function_has_attributes(obj) {
+                value::function_dict(obj)
+            } else {
+                None
+            }
+        }
+        _ => value::function_attribute(obj, name),
     }
 }
 
@@ -2949,6 +2959,16 @@ fn getmembers_impl(obj: i64, predicate: i64) -> i64 {
         }
     } else if value::as_function(obj).is_some() {
         names.extend(["__name__", "__qualname__", "__doc__"].map(str::to_string));
+        if value::function_has_attributes(obj) {
+            names.push("__dict__".to_string());
+            names.extend(value::function_attribute_names(obj));
+        }
+        if value::function_module(obj).is_some() {
+            names.push("__module__".to_string());
+        }
+        if value::function_annotations(obj).is_some() {
+            names.push("__annotations__".to_string());
+        }
         if matches!(function_body(obj), Some(FunctionBody::Partial { .. })) {
             names.extend(["func", "args", "keywords"].map(str::to_string));
         }

@@ -1392,7 +1392,9 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     }
     // Function metadata: the generated code stores the bare definition name,
     // so `f.__name__`/`f.__qualname__` report it and `__doc__` stays `None`
-    // (Hydro keeps no docstring payload on function values).
+    // until a program assigns one. `__module__`/`__annotations__` are absent
+    // because Hydro keeps no module provenance or annotation payload; every
+    // other name falls back to the function's live `__dict__`.
     if let Some(function) = value::as_function(obj) {
         // The `int` builtin type value exposes its class-level methods as
         // callable attributes, like CPython's type objects.
@@ -1428,9 +1430,28 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             }
         }
         return match attr.as_str() {
-            "__name__" | "__qualname__" => value::str_alloc(function.name.clone()),
-            "__doc__" => NONE,
-            _ => attribute_error(obj, &attr),
+            "__name__" => value::str_alloc(value::function_name(obj)),
+            "__qualname__" => value::str_alloc(value::function_qualname(obj)),
+            "__doc__" => value::function_doc(obj),
+            "__module__" => match value::function_module(obj) {
+                Some(module) => module,
+                None => attribute_error(obj, &attr),
+            },
+            "__annotations__" => match value::function_annotations(obj) {
+                Some(annotations) => annotations,
+                None => attribute_error(obj, &attr),
+            },
+            "__dict__" => {
+                if value::function_has_attributes(obj) {
+                    value::function_dict(obj).unwrap_or(NONE)
+                } else {
+                    attribute_error(obj, &attr)
+                }
+            }
+            _ => match value::function_attribute(obj, &attr) {
+                Some(attribute) => attribute,
+                None => attribute_error(obj, &attr),
+            },
         };
     }
     // Built-in exception objects expose `args`, `__class__`, `__cause__`,
@@ -1757,6 +1778,36 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    // Python-level functions and partial objects have CPython's writable
+    // attribute surface: the `__name__`/`__qualname__`/`__doc__`/`__module__`/
+    // `__annotations__` slots plus a `__dict__` of arbitrary attributes.
+    // Native module functions and builtins are C-level callables and reject
+    // assignment, exactly like CPython's `builtin_function_or_method`.
+    if let Some(function) = value::as_function(obj) {
+        // `functools.partial`'s `func`/`args`/`keywords` are read-only slots,
+        // like CPython; every other name uses the function attribute surface.
+        if matches!(&function.body, value::FunctionBody::Partial { .. })
+            && matches!(attr.as_str(), "func" | "args" | "keywords")
+        {
+            return attribute_error(obj, &attr);
+        }
+        match attr.as_str() {
+            "__name__" | "__qualname__" if value::as_str(new_value).is_none() => {
+                return type_error(format!("{attr} must be set to a string object"));
+            }
+            "__dict__" if value::as_dict(new_value).is_none() => {
+                return type_error(format!(
+                    "__dict__ must be set to a dictionary, not a '{}'",
+                    value::type_name(new_value)
+                ));
+            }
+            _ => {}
+        }
+        if value::function_setattr(obj, &attr, new_value) {
+            return NONE;
+        }
+        return attribute_error(obj, &attr);
+    }
     if let Some(class) = value::instance_class_value(obj) {
         if attr == "__dict__" {
             if value::instance_set_dict(obj, new_value) {

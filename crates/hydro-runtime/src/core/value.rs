@@ -259,9 +259,9 @@ pub(crate) enum FunctionBody {
     /// Native bound method (`obj.method` without a call). The receiver is a
     /// traced GC edge; keyword arguments are not supported by this value form.
     BoundMethod { receiver: i64, method: String },
-    /// Identity callable used by `functools.cache`/`wraps` and by the
-    /// decorator values returned from `lru_cache`/`wraps`: returns its single
-    /// argument. Holds no Hydro values.
+    /// Identity callable used by `functools.cache` and by the decorator value
+    /// returned from `lru_cache`: returns its single argument. Holds no Hydro
+    /// values.
     Identity,
     /// Interpreter-owned function body. `token` identifies the IR function in
     /// the interpreter's program registry and `captures` are the closure
@@ -282,7 +282,8 @@ pub(crate) enum FunctionBody {
 /// Python-visible name (`<lambda>` for anonymous functions). Wrapper functions
 /// own their captured values, item getters own their keys and partials own the
 /// target callable plus the bound arguments; the collector traces those edges
-/// (see `gc::heap`).
+/// (see `gc::heap`). `metadata` holds the writable attribute slots and the
+/// function's own `__dict__`, whose values are traced as well.
 pub(crate) struct ParamMeta {
     pub(crate) name: String,
     pub(crate) kind: ParamKind,
@@ -291,10 +292,83 @@ pub(crate) struct ParamMeta {
     pub(crate) default: Option<i64>,
 }
 
+/// Metadata a function value exposes through attribute access.
+///
+/// CPython's function objects have writable `__name__`/`__qualname__`/
+/// `__doc__`/`__module__`/`__annotations__` slots plus a `__dict__` holding
+/// every other attribute; `functools.wraps` copies those. Hydro only retains
+/// the definition name, so the remaining slots stay absent (`None`) until a
+/// program assigns them: reading an absent slot is an `AttributeError`, never
+/// a fabricated value.
+///
+/// The mutable state sits behind a mutex: `update_wrapper` can assign slots
+/// while the collector marks the object, so the trace takes its snapshot under
+/// the same lock the assignment path uses (the [`Attributes`] pattern).
+pub(crate) struct FunctionMetadata {
+    state: Mutex<FunctionMetadataState>,
+}
+
+pub(crate) struct FunctionMetadataState {
+    /// Assigned `__name__`; `None` reports the definition name.
+    pub(crate) name: Option<String>,
+    /// Assigned `__qualname__`; `None` reports the plain definition name.
+    pub(crate) qualname: Option<String>,
+    /// Assigned `__doc__`; `None` reports `None` like an undocumented
+    /// function.
+    pub(crate) doc: Option<i64>,
+    /// Assigned `__module__`; absent because Hydro keeps no module
+    /// provenance on function values.
+    pub(crate) module: Option<i64>,
+    /// Assigned `__annotations__`; absent because Hydro keeps no annotation
+    /// payload on function values.
+    pub(crate) annotations: Option<i64>,
+    /// The function's `__dict__`, [`NONE`] until the first attribute is
+    /// stored. The dictionary is a live object, so `f.__dict__[...] = value`
+    /// and `f.__dict__.update(...)` behave like CPython's function dictionary.
+    pub(crate) dict: i64,
+}
+
+impl FunctionMetadata {
+    pub(crate) fn new() -> FunctionMetadata {
+        FunctionMetadata {
+            state: Mutex::new(FunctionMetadataState {
+                name: None,
+                qualname: None,
+                doc: None,
+                module: None,
+                annotations: None,
+                dict: NONE,
+            }),
+        }
+    }
+
+    /// Locks the metadata, ignoring poisoning: a panic in user code must not
+    /// make the function unusable.
+    fn lock(&self) -> MutexGuard<'_, FunctionMetadataState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Copies the collector's GC edges: the values are read under the metadata
+    /// lock, so a concurrent assignment cannot tear them.
+    pub(crate) fn trace_edges(&self) -> (Option<i64>, Option<i64>, Option<i64>, i64) {
+        let state = self.lock();
+        (state.doc, state.module, state.annotations, state.dict)
+    }
+}
+
+impl Default for FunctionMetadata {
+    fn default() -> FunctionMetadata {
+        FunctionMetadata::new()
+    }
+}
+
 pub(crate) struct FunctionObj {
     pub(crate) body: FunctionBody,
     pub(crate) arity: usize,
     pub(crate) name: String,
+    pub(crate) metadata: FunctionMetadata,
     /// Uniform `(argv) -> i64` trampoline that forwards every declared
     /// parameter slot, used by runtime keyword binding.
     pub(crate) full_entry: usize,
@@ -5405,6 +5479,7 @@ pub(crate) fn function_new_with_flags(
             flags,
             full_entry: 0,
             signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
             params: Vec::new(),
         }),
     )
@@ -5430,6 +5505,7 @@ pub(crate) fn closure_new_with_flags(
             flags,
             full_entry: 0,
             signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
             params: Vec::new(),
         }),
     )
@@ -5448,6 +5524,7 @@ pub(crate) fn native_function_new(module: &'static str, name: &'static str, arit
             flags: 0,
             full_entry: 0,
             signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
             params: Vec::new(),
         }),
     )
@@ -5465,6 +5542,7 @@ pub(crate) fn builtin_function_new(builtin: hydro_ir::Builtin) -> i64 {
             flags: 0,
             full_entry: 0,
             signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
             params: Vec::new(),
         }),
     )
@@ -5509,6 +5587,7 @@ pub(crate) fn host_function_new(
             // through the runtime binder for interpreter functions too.
             full_entry: 1,
             signature,
+            metadata: FunctionMetadata::default(),
             params: positional,
         }),
     )
@@ -5526,6 +5605,7 @@ pub(crate) fn attribute_getter_new(names: Vec<String>) -> i64 {
             flags: 0,
             full_entry: 0,
             signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
             params: Vec::new(),
         }),
     )
@@ -5543,6 +5623,7 @@ pub(crate) fn item_getter_new(keys: Vec<i64>) -> i64 {
             flags: 0,
             full_entry: 0,
             signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
             params: Vec::new(),
         }),
     )
@@ -5606,6 +5687,7 @@ pub(crate) fn partial_new_with_keywords(
             flags: 0,
             full_entry: 0,
             signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
             params: Vec::new(),
         }),
     )
@@ -5701,6 +5783,177 @@ pub(crate) fn function_params(function: i64) -> &'static [String] {
     }
 }
 
+/// Whether a function value carries CPython's writable attribute surface.
+///
+/// Generated wrappers, interpreter functions and `functools.partial` objects
+/// are Python-level callables with a `__dict__`; native module functions,
+/// builtins and native bound methods are C-level callables that reject
+/// attribute assignment.
+pub(crate) fn function_has_attributes(function: i64) -> bool {
+    match as_function(function) {
+        Some(func) => matches!(
+            &func.body,
+            FunctionBody::Wrapper { .. }
+                | FunctionBody::Host { .. }
+                | FunctionBody::Partial { .. }
+                | FunctionBody::Identity
+        ),
+        None => false,
+    }
+}
+
+/// The Python-visible name of a function value: the definition name unless the
+/// program assigned `__name__`.
+pub(crate) fn function_name(function: i64) -> String {
+    match as_function(function) {
+        Some(func) => func
+            .metadata
+            .lock()
+            .name
+            .clone()
+            .unwrap_or_else(|| func.name.clone()),
+        None => String::new(),
+    }
+}
+
+/// The Python-visible qualified name of a function value. Hydro stores one
+/// definition name, so an unassigned `__qualname__` reports it.
+pub(crate) fn function_qualname(function: i64) -> String {
+    match as_function(function) {
+        Some(func) => func
+            .metadata
+            .lock()
+            .qualname
+            .clone()
+            .unwrap_or_else(|| func.name.clone()),
+        None => String::new(),
+    }
+}
+
+/// The `__doc__` slot: `None` when the program has not assigned a docstring.
+pub(crate) fn function_doc(function: i64) -> i64 {
+    let Some(func) = as_function(function) else {
+        return NONE;
+    };
+    func.metadata.lock().doc.unwrap_or(NONE)
+}
+
+/// The assigned `__module__`, or `None` when the slot is absent.
+pub(crate) fn function_module(function: i64) -> Option<i64> {
+    as_function(function).and_then(|func| func.metadata.lock().module)
+}
+
+/// The assigned `__annotations__`, or `None` when the slot is absent.
+pub(crate) fn function_annotations(function: i64) -> Option<i64> {
+    as_function(function).and_then(|func| func.metadata.lock().annotations)
+}
+
+/// Reads `name` from a function's attribute dictionary.
+pub(crate) fn function_attribute(function: i64, name: &str) -> Option<i64> {
+    let dictionary = as_function(function)?.metadata.lock().dict;
+    if dictionary == NONE {
+        return None;
+    }
+    as_dict(dictionary)?
+        .iter()
+        .find_map(|(key, item)| (as_str(*key) == Some(name)).then_some(*item))
+}
+
+/// Snapshot of the attribute names stored in a function's `__dict__`.
+pub(crate) fn function_attribute_names(function: i64) -> Vec<String> {
+    let Some(func) = as_function(function) else {
+        return Vec::new();
+    };
+    let dictionary = func.metadata.lock().dict;
+    if dictionary == NONE {
+        return Vec::new();
+    }
+    as_dict(dictionary)
+        .map(|pairs| {
+            pairs
+                .iter()
+                .filter_map(|(key, _)| as_str(*key).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The live function attribute dictionary (`__dict__`), created on first
+/// access so `f.__dict__[...] = value` and `f.__dict__.update(...)` persist.
+pub(crate) fn function_dict(function: i64) -> Option<i64> {
+    let func = as_function(function)?;
+    let existing = func.metadata.lock().dict;
+    if existing != NONE {
+        return Some(existing);
+    }
+    let dictionary = dict_new(Vec::new());
+    let roots = crate::heap::root_values(&[dictionary]);
+    func.metadata.lock().dict = dictionary;
+    crate::heap::write_barrier_edge(function, dictionary);
+    crate::heap::release_roots(roots);
+    Some(dictionary)
+}
+
+/// Stores `name = value` on a function value.
+///
+/// Returns `false` when the value has no writable attribute surface (a native
+/// function, a builtin or a bound method) or when a string slot received a
+/// non-string value; the caller raises the matching error.
+pub(crate) fn function_setattr(function: i64, name: &str, new_value: i64) -> bool {
+    if !function_has_attributes(function) {
+        return false;
+    }
+    let Some(func) = as_function(function) else {
+        return false;
+    };
+    match name {
+        "__name__" | "__qualname__" => {
+            let Some(text) = as_str(new_value).map(str::to_string) else {
+                return false;
+            };
+            if name == "__name__" {
+                func.metadata.lock().name = Some(text);
+            } else {
+                func.metadata.lock().qualname = Some(text);
+            }
+            true
+        }
+        "__doc__" => {
+            func.metadata.lock().doc = Some(new_value);
+            crate::heap::write_barrier_edge(function, new_value);
+            true
+        }
+        "__module__" => {
+            func.metadata.lock().module = Some(new_value);
+            crate::heap::write_barrier_edge(function, new_value);
+            true
+        }
+        "__annotations__" => {
+            func.metadata.lock().annotations = Some(new_value);
+            crate::heap::write_barrier_edge(function, new_value);
+            true
+        }
+        "__dict__" => {
+            if as_dict(new_value).is_none() {
+                return false;
+            }
+            func.metadata.lock().dict = new_value;
+            crate::heap::write_barrier_edge(function, new_value);
+            true
+        }
+        _ => {
+            let Some(dictionary) = function_dict(function) else {
+                return false;
+            };
+            let key = str_alloc(name.to_string());
+            let roots = crate::heap::root_values(&[key, new_value]);
+            crate::container::dict_set(dictionary, key, new_value);
+            crate::heap::release_roots(roots);
+            !crate::exc::pending()
+        }
+    }
+}
+
 /// Allocates a native bound method value (`receiver.method`).
 pub(crate) fn bound_method_new(receiver: i64, method: String) -> i64 {
     alloc(
@@ -5715,13 +5968,14 @@ pub(crate) fn bound_method_new(receiver: i64, method: String) -> i64 {
             flags: 0,
             full_entry: 0,
             signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
             params: Vec::new(),
         }),
     )
 }
 
-/// Allocates the identity callable returned by `functools.lru_cache` and
-/// `functools.wraps` (the decorator) and used by `functools.cache`.
+/// Allocates the identity callable returned by `functools.lru_cache` (the
+/// decorator) and used by `functools.cache`.
 pub(crate) fn identity_function_new(name: &str) -> i64 {
     alloc(
         KIND_FUNCTION,
@@ -5732,6 +5986,7 @@ pub(crate) fn identity_function_new(name: &str) -> i64 {
             flags: 0,
             full_entry: 0,
             signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
             params: Vec::new(),
         }),
     )

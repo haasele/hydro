@@ -334,9 +334,9 @@ fn collect_class_names(class: i64, names: &mut Vec<String>) {
     }
 }
 
-/// `vars([object])`: a read-only snapshot of an instance/class attribute
-/// table. Module and builtin namespaces have no real mapping, so they raise
-/// `TypeError` like CPython's "argument must have `__dict__`" path.
+/// `vars([object])`: the instance/class attribute table, or a function value's
+/// live `__dict__`. Module and builtin namespaces have no real mapping, so they
+/// raise `TypeError` like CPython's "argument must have `__dict__`" path.
 fn vars(args: &[i64]) -> i64 {
     if args.is_empty() {
         return exc::raise_with_message(
@@ -361,6 +361,10 @@ fn vars(args: &[i64]) -> i64 {
         );
         pairs.extend(state.attrs.iter().cloned());
         pairs
+    } else if value::function_has_attributes(object) {
+        // Function values have a real `__dict__`; `vars(f)` is that live
+        // mapping, like CPython, not a snapshot.
+        return value::function_dict(object).unwrap_or_else(|| value::dict_new(Vec::new()));
     } else {
         return type_error(&format!(
             "vars() argument must have __dict__ attribute, not '{}'",

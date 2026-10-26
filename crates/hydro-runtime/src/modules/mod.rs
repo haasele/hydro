@@ -2424,8 +2424,13 @@ fn constant_value(module: &str, name: &str) -> i64 {
     }
 }
 
-/// `contextlib.suppress`: returns a native context manager. The subset does
-/// not suppress exceptions; `__exit__` returns `None` and the normal block
+/// `contextlib.nullcontext(enter_result=None)`: CPython's no-op context
+/// manager as a native class instance. `__enter__` returns `enter_result`
+/// (read back from the instance, so the same manager can be reused) and
+/// `__exit__` returns `False`, which keeps exceptions propagating.
+///
+/// `contextlib.suppress` returns a native context manager too. The subset does
+/// not suppress exceptions; its `__exit__` returns `None` and the normal block
 /// path is supported.
 fn contextlib_call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -2445,6 +2450,26 @@ fn contextlib_call(function: &str, args: &[i64]) -> i64 {
             value::instance_new(class)
         }
         "_suppress_enter" | "_suppress_exit" => NONE,
+        "nullcontext" => {
+            let methods = vec![
+                (
+                    "__enter__".to_string(),
+                    value::native_function_new("contextlib", "_nullcontext_enter", 1),
+                ),
+                (
+                    "__exit__".to_string(),
+                    value::native_function_new("contextlib", "_nullcontext_exit", 4),
+                ),
+            ];
+            let class = value::class_new("nullcontext".to_string(), NONE, methods);
+            let instance = value::instance_new(class);
+            let enter_result = args.first().copied().unwrap_or(NONE);
+            value::instance_setattr(instance, "enter_result".to_string(), enter_result);
+            instance
+        }
+        "_nullcontext_enter" => value::instance_attr(args[0], "enter_result").unwrap_or(NONE),
+        // Returning false keeps the exception raised by the block.
+        "_nullcontext_exit" => value::bool_value(false),
         _ => missing_attribute("contextlib", function),
     }
 }
@@ -3248,11 +3273,11 @@ pub(crate) fn floor_sqrt_int(v: i64) -> i64 {
 
 /// Dispatches a native `functools` function.
 ///
-/// `lru_cache` and `wraps` are accepted as decorator factories: they return an
-/// identity callable, so applying the result to the decorated function leaves
-/// it unchanged. Caching and metadata copying are not implemented; the
-/// decorator syntax is handled by the frontend and the runtime values stay
-/// inert, which is enough for rich's module import and ordinary calls.
+/// `lru_cache` is accepted as a decorator factory returning an identity
+/// callable; caching is not implemented, so the decorated function stays
+/// inert. `wraps(wrapped)` is real: it returns the decorator that applies
+/// `update_wrapper` (see [`functools::wraps_decorator`]), so the wrapper gets
+/// the wrapped function's metadata and its `__wrapped__` back-reference.
 ///
 /// `partial(f, *args, **kwargs)` stores the keyword values by name; applying
 /// them happens when the partial is called (see
@@ -3266,7 +3291,7 @@ fn functools_call(function: &str, args: &[i64]) -> i64 {
         // `@cache` is an identity decorator: the function itself is returned.
         "cache" => args[0],
         "lru_cache" => value::identity_function_new("lru_cache.<locals>.decorator"),
-        "wraps" => value::identity_function_new("wraps.<locals>.decorator"),
+        "wraps" => functools::wraps_decorator(args[0], args.get(1).copied(), args.get(2).copied()),
         "partial" => value::partial_new(args[0], args[1..].to_vec()),
         _ => missing_attribute("functools", function),
     }
@@ -4066,12 +4091,83 @@ fn pickle_error(error: serialize::PickleError, loading: bool) -> i64 {
     exc::raise_with_message(tag, &message)
 }
 
+/// Highest protocol version CPython defines. HYD1 output is the same for
+/// every version, but an out-of-range request is rejected instead of being
+/// silently accepted.
+const PICKLE_HIGHEST_PROTOCOL: i64 = 5;
+
+/// Validates `pickle`'s `protocol` argument. `None` selects the default and
+/// negative integers select the highest protocol, like CPython; anything above
+/// [`PICKLE_HIGHEST_PROTOCOL`] is a `ValueError` and non-integers are a
+/// `TypeError`.
+fn pickle_check_protocol(argument: i64) -> Result<(), i64> {
+    if argument == NONE {
+        return Ok(());
+    }
+    let Some(protocol) = value::to_bigint(argument) else {
+        let ty = value::type_name_of(argument);
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("protocol must be an integer or None, not {ty}"),
+        ));
+    };
+    if protocol > BigInt::from(PICKLE_HIGHEST_PROTOCOL) {
+        return Err(exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("pickle protocol must be <= {}", PICKLE_HIGHEST_PROTOCOL),
+        ));
+    }
+    Ok(())
+}
+
+/// `pickle.dumps(obj, protocol=None)` / `pickle.dump(obj, file, protocol=None,
+/// *, fix_imports=True, buffer_callback=None)`.
+///
+/// `dumps` returns the HYD1 payload as one hexadecimal string and `dump`
+/// writes that same text to a file object: UTF-8 bytes into binary files, the
+/// `str` into text files. `fix_imports` and `buffer_callback` are accepted and
+/// ignored because HYD1 stores class references inline and has no out-of-band
+/// buffers.
 fn pickle_call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "dumps" => match serialize::encode(args[0], false) {
-            Ok(bytes) => value::str_alloc(serialize::to_hex(&bytes)),
-            Err(error) => pickle_error(error, false),
-        },
+        "dumps" => {
+            if let Err(raised) = pickle_check_protocol(args.get(1).copied().unwrap_or(NONE)) {
+                return raised;
+            }
+            match serialize::encode(args[0], false) {
+                Ok(bytes) => value::str_alloc(serialize::to_hex(&bytes)),
+                Err(error) => pickle_error(error, false),
+            }
+        }
+        "dump" => {
+            if let Err(raised) = pickle_check_protocol(args.get(2).copied().unwrap_or(NONE)) {
+                return raised;
+            }
+            let file_value = args[1];
+            let Some(file) = value::as_file(file_value) else {
+                let ty = value::type_name_of(file_value);
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("file must be a writable file object, not {ty}"),
+                );
+            };
+            let bytes = match serialize::encode(args[0], false) {
+                Ok(bytes) => bytes,
+                Err(error) => return pickle_error(error, false),
+            };
+            // HYD1 is one hexadecimal string: binary files receive its UTF-8
+            // bytes, text files receive the `str` itself.
+            let payload = serialize::to_hex(&bytes);
+            let written = if file.binary() {
+                file.write_bytes(payload.as_bytes())
+            } else {
+                file.write(&payload)
+            };
+            match written {
+                Ok(_) => NONE,
+                Err(error) => value::raise_file_error(error),
+            }
+        }
         "loads" => {
             let Some(text) = value::as_str(args[0]) else {
                 return exc::raise_with_message(
@@ -5543,6 +5639,7 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
             }
         }
         "access" => os_access(args),
+        "fspath" => os_fspath(args[0]),
         "stat" => os_stat(args),
         "sysconf" => os_sysconf(args),
         "getloadavg" => os_getloadavg(),
@@ -5924,6 +6021,51 @@ fn os_access(args: &[i64]) -> i64 {
     } else {
         FALSE
     }
+}
+
+/// `os.fspath(path)`: `str` and `bytes` pass through unchanged; any other
+/// value must be path-like, and its `__fspath__()` result (str or bytes) is
+/// returned. `pathlib.Path` carries its text in a native payload rather than a
+/// `__fspath__` method value, so it is answered directly.
+fn os_fspath(path: i64) -> i64 {
+    if value::as_str(path).is_some() || value::as_bytes(path).is_some() {
+        return path;
+    }
+    if let Some(state) = value::as_path(path) {
+        return value::str_alloc(state.path().to_string());
+    }
+    if let Some(instance) = value::as_instance(path) {
+        if let Some(value::ClassEntry::Method(kind, function)) =
+            value::class_lookup(instance.class, "__fspath__")
+        {
+            // Special methods go through the normal descriptor protocol: an
+            // ordinary or `@property` method binds the instance, a
+            // `@classmethod` binds the class, and a `@staticmethod` binds
+            // nothing.
+            let argv: Vec<i64> = match kind {
+                hydro_ir::MethodKind::Normal | hydro_ir::MethodKind::Property => vec![path],
+                hydro_ir::MethodKind::Classmethod => vec![instance.class],
+                hydro_ir::MethodKind::Staticmethod => Vec::new(),
+            };
+            let result = crate::core::builtins::call(function, argv.len(), argv.as_ptr());
+            if exc::pending() {
+                return NONE;
+            }
+            if value::as_str(result).is_some() || value::as_bytes(result).is_some() {
+                return result;
+            }
+            let ty = value::type_name_of(result);
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("expected __fspath__() to return str or bytes, not {ty}"),
+            );
+        }
+    }
+    let ty = value::type_name_of(path);
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!("expected str, bytes or os.PathLike object, not {ty}"),
+    )
 }
 
 // sys
@@ -9766,9 +9908,18 @@ mod tests {
         let decorated = string("function");
         assert_eq!(call("functools", "cache", &[decorated]), decorated);
 
-        // `lru_cache`/`wraps` return an identity decorator value.
-        let decorator = call("functools", "wraps", &[decorated]);
-        assert_eq!(call_value(decorator, &[decorated]), decorated);
+        // `wraps` copies the wrapped function's metadata and records the
+        // `__wrapped__` back-reference; `lru_cache` stays an identity value.
+        let wrapped = value::identity_function_new("wrapped");
+        let wrapper = value::identity_function_new("wrapper");
+        let decorator = call("functools", "wraps", &[wrapped]);
+        assert!(!exc::pending());
+        assert_eq!(call_value(decorator, &[wrapper]), wrapper);
+        assert_eq!(value::function_qualname(wrapper), "wrapped");
+        assert_eq!(
+            value::function_attribute(wrapper, "__wrapped__"),
+            Some(wrapped)
+        );
         let cached = call("functools", "lru_cache", &[int(16), FALSE]);
         assert_eq!(call_value(cached, &[decorated]), decorated);
         assert!(!exc::pending());
@@ -10606,6 +10757,203 @@ mod tests {
         method(wrapper, "flush", &[]);
         method(wrapper, "close", &[]);
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "a\nb");
+    }
+
+    #[test]
+    fn contextlib_nullcontext_enters_with_its_result_and_does_not_suppress() {
+        exc::init();
+        let manager = call("contextlib", "nullcontext", &[string("resource")]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            value::class_display_name(value::instance_class_value(manager).expect("instance")),
+            Some("nullcontext")
+        );
+        assert_eq!(
+            value::as_str(attribute(manager, "enter_result")),
+            Some("resource")
+        );
+        assert_eq!(
+            value::as_str(method(manager, "__enter__", &[])),
+            Some("resource")
+        );
+        // CPython's nullcontext is reusable: `__enter__` re-reads the stored
+        // result instead of consuming it.
+        assert_eq!(
+            value::as_str(method(manager, "__enter__", &[])),
+            Some("resource")
+        );
+        // `False` keeps the exception raised by the block.
+        assert_eq!(method(manager, "__exit__", &[NONE, NONE, NONE]), FALSE);
+
+        // The default `enter_result` is `None`.
+        let bare = call("contextlib", "nullcontext", &[]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(attribute(bare, "enter_result"), NONE);
+        assert_eq!(method(bare, "__enter__", &[]), NONE);
+        assert_eq!(method(bare, "__exit__", &[NONE, NONE, NONE]), FALSE);
+
+        // `suppress` shares the same native-method dispatch, so its internal
+        // methods must be registered in the module table as well.
+        let suppress = call("contextlib", "suppress", &[]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(method(suppress, "__enter__", &[]), NONE);
+        // `None` is falsy: the manager never suppresses the block exception.
+        assert_eq!(method(suppress, "__exit__", &[NONE, NONE, NONE]), NONE);
+    }
+
+    #[test]
+    fn os_fspath_passes_through_and_asks_path_like_objects() {
+        exc::init();
+        let text_path = string("data.txt");
+        assert_eq!(call("os", "fspath", &[text_path]), text_path);
+        let raw = value::bytes_new(b"data.bin".to_vec());
+        assert_eq!(call("os", "fspath", &[raw]), raw);
+
+        let path = call("pathlib", "Path", &[string("/tmp/data.txt")]);
+        assert_eq!(
+            value::as_str(call("os", "fspath", &[path])),
+            Some("/tmp/data.txt")
+        );
+
+        // A class implementing `__fspath__` is asked for its result; the
+        // native function stands in for the user method and returns a str.
+        let methods = vec![(
+            "__fspath__".to_string(),
+            value::native_function_new("builtins", "repr", 1),
+        )];
+        let class = value::class_new("PathLikeFixture".to_string(), NONE, methods);
+        let fixture = value::instance_new(class);
+        let resolved = call("os", "fspath", &[fixture]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::as_str(resolved).is_some_and(|text| !text.is_empty()));
+    }
+
+    #[test]
+    fn os_fspath_rejects_other_values_and_bad_fspath_results() {
+        exc::init();
+        assert_eq!(call("os", "fspath", &[int(7)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "expected str, bytes or os.PathLike object, not int"
+        );
+
+        exc::init();
+        let methods = vec![(
+            "__fspath__".to_string(),
+            value::native_function_new("builtins", "id", 1),
+        )];
+        let class = value::class_new("BadPath".to_string(), NONE, methods);
+        let bad = value::instance_new(class);
+        assert_eq!(call("os", "fspath", &[bad]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "expected __fspath__() to return str or bytes, not int"
+        );
+    }
+
+    #[test]
+    fn pickle_dumps_accepts_protocol_and_rejects_out_of_range_versions() {
+        exc::init();
+        let payload = value::list_new(vec![int(1), string("two")]);
+        let default = call("pickle", "dumps", &[payload]);
+        let text = value::as_str(default).expect("dumps returns the HYD1 text");
+        // "HYD1" is the format magic.
+        assert!(text.starts_with("48594431"), "{text}");
+        // The frontend binds `protocol=` into the second positional slot, so
+        // every supported version yields the same version-independent payload.
+        for protocol in [0, 5, -1] {
+            let encoded = call("pickle", "dumps", &[payload, int(protocol)]);
+            assert_eq!(value::as_str(encoded), Some(text));
+        }
+
+        exc::init();
+        assert_eq!(call("pickle", "dumps", &[payload, int(6)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "pickle protocol must be <= 5");
+
+        // A protocol that only exists as a heap integer is out of range too.
+        exc::init();
+        let huge = big("1180591620717411303424");
+        assert_eq!(call("pickle", "dumps", &[payload, huge]), NONE);
+        assert_eq!(message(), "pickle protocol must be <= 5");
+
+        exc::init();
+        assert_eq!(call("pickle", "dumps", &[payload, string("four")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "protocol must be an integer or None, not str");
+
+        // `protocol` is a declared keyword parameter of both functions.
+        let dumps = hydro_ir::stdlib::function("pickle", "dumps").expect("dumps spec");
+        assert_eq!(dumps.params, &["obj", "protocol"][..]);
+        assert_eq!(dumps.max_args, 2);
+        let dump = hydro_ir::stdlib::function("pickle", "dump").expect("dump spec");
+        assert_eq!(dump.params.len(), 5);
+        assert_eq!(dump.params[0], "obj");
+        assert_eq!(dump.params[1], "file");
+        assert_eq!(dump.params[2], "protocol");
+        assert_eq!(dump.params[3], "fix_imports");
+        assert_eq!(dump.params[4], "buffer_callback");
+        assert_eq!((dump.min_args, dump.max_args), (2, 5));
+    }
+
+    #[test]
+    fn pickle_dump_writes_the_hyd1_text_to_binary_and_text_files() {
+        exc::init();
+        let dir = temp_root("pickle");
+        let payload = value::list_new(vec![int(3), string("four")]);
+        let text = value::as_str(call("pickle", "dumps", &[payload]))
+            .expect("HYD1 text")
+            .to_string();
+        assert!(!exc::pending(), "{}", message());
+
+        // Binary files receive the payload's UTF-8 bytes; the keyword-only
+        // `fix_imports`/`buffer_callback` slots are accepted and ignored.
+        let binary_path = dir.join("payload.bin");
+        let binary_name = binary_path.to_string_lossy().into_owned();
+        let file = call("io", "open", &[string(&binary_name), string("wb")]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            call("pickle", "dump", &[payload, file, NONE, TRUE, NONE]),
+            NONE
+        );
+        assert!(!exc::pending(), "{}", message());
+        method(file, "close", &[]);
+        assert_eq!(
+            std::fs::read(&binary_path).unwrap().as_slice(),
+            text.as_bytes()
+        );
+
+        // Text files receive the `str` itself.
+        let text_path = dir.join("payload.txt");
+        let text_name = text_path.to_string_lossy().into_owned();
+        let file = call("io", "open", &[string(&text_name), string("w")]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(call("pickle", "dump", &[payload, file]), NONE);
+        assert!(!exc::pending(), "{}", message());
+        method(file, "close", &[]);
+        assert_eq!(std::fs::read_to_string(&text_path).unwrap(), text);
+
+        // A non-file second argument is rejected instead of being dropped.
+        exc::init();
+        assert_eq!(
+            call("pickle", "dump", &[payload, string("not a file")]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "file must be a writable file object, not str");
+
+        // The protocol is validated before anything is written.
+        exc::init();
+        let empty_path = dir.join("empty.bin");
+        let empty_name = empty_path.to_string_lossy().into_owned();
+        let file = call("io", "open", &[string(&empty_name), string("wb")]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(call("pickle", "dump", &[payload, file, int(9)]), NONE);
+        assert_eq!(message(), "pickle protocol must be <= 5");
+        method(file, "close", &[]);
+        assert!(std::fs::read(&empty_path).unwrap().is_empty());
     }
 
     fn tuple_ints(list: i64) -> Vec<Vec<i64>> {

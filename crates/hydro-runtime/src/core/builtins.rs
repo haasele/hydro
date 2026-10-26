@@ -3036,6 +3036,10 @@ fn vars_value(object: i64) -> i64 {
         crate::heap::release_roots(roots);
         return namespace;
     }
+    if value::function_has_attributes(object) {
+        // `vars(f)` is the function's live `__dict__`, like CPython.
+        return value::function_dict(object).unwrap_or_else(|| value::dict_new(Vec::new()));
+    }
     exc::raise_with_message(
         TYPE_ERROR,
         &format!(
@@ -3100,6 +3104,21 @@ fn dir_value(object: i64) -> i64 {
                 names.extend(globals::names(&module_name));
                 names.extend(globals::view_names(&module_name));
             }
+        }
+    } else if let Some(function) = value::as_function(object) {
+        names.extend(["__name__", "__qualname__", "__doc__"].map(str::to_string));
+        if value::function_has_attributes(object) {
+            names.push("__dict__".to_string());
+            names.extend(value::function_attribute_names(object));
+        }
+        if value::function_module(object).is_some() {
+            names.push("__module__".to_string());
+        }
+        if value::function_annotations(object).is_some() {
+            names.push("__annotations__".to_string());
+        }
+        if matches!(&function.body, FunctionBody::Partial { .. }) {
+            names.extend(["func", "args", "keywords"].map(str::to_string));
         }
     } else {
         return exc::raise_with_message(

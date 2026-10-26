@@ -1,6 +1,15 @@
 //! Pure-Python `functools` internals used by `inspect`, plus the real
 //! `partialmethod` descriptor and `Placeholder` singleton.
 //!
+//! `update_wrapper`/`wraps` are implemented over the runtime's function
+//! values: `update_wrapper(wrapper, wrapped)` copies the metadata slots
+//! `wrapped` actually exposes (skipping absent ones, exactly like CPython),
+//! updates the requested mapping attributes, and records
+//! `wrapper.__wrapped__`. `wraps(wrapped)` returns the decorator that applies
+//! it. Function values therefore carry the writable attribute surface CPython
+//! gives them: `__name__`, `__qualname__`, `__doc__`, an assigned
+//! `__module__`/`__annotations__` and a live `__dict__`.
+//!
 //! `inspect._has_code_flag` unwraps wrapper descriptors before reading
 //! `__code__.co_flags`:
 //!
@@ -34,6 +43,232 @@ use crate::core::value::{self, ClassEntry, FunctionBody, NONE};
 use crate::exc::{self, ATTRIBUTE_ERROR, TYPE_ERROR};
 use crate::heap;
 use hydro_ir::MethodKind;
+
+/// CPython's `functools.WRAPPER_ASSIGNMENTS`.
+const WRAPPER_ASSIGNMENTS: [&str; 5] = [
+    "__module__",
+    "__name__",
+    "__qualname__",
+    "__doc__",
+    "__annotations__",
+];
+
+/// CPython's `functools.WRAPPER_UPDATES`.
+const WRAPPER_UPDATES: [&str; 1] = ["__dict__"];
+
+/// A `(name, ...)` tuple of freshly allocated strings, kept rooted while the
+/// tuple allocation may trigger a collection.
+fn string_tuple(names: &[&str]) -> i64 {
+    let items: Vec<i64> = names
+        .iter()
+        .map(|name| value::str_alloc((*name).to_string()))
+        .collect();
+    let roots = heap::root_values(&items);
+    let tuple = value::tuple_new(items);
+    heap::release_roots(roots);
+    tuple
+}
+
+/// `functools.WRAPPER_ASSIGNMENTS` as a value tuple.
+pub(crate) fn default_assigned() -> i64 {
+    string_tuple(&WRAPPER_ASSIGNMENTS)
+}
+
+/// `functools.WRAPPER_UPDATES` as a value tuple.
+pub(crate) fn default_updated() -> i64 {
+    string_tuple(&WRAPPER_UPDATES)
+}
+
+/// Resolves an optional `assigned`/`updated` argument.
+///
+/// Codegen pads an omitted keyword slot with `None` (`wraps(f, updated=())`
+/// lowers to `wraps(f, None, ())`), so `None` stands for "use the default
+/// list". An explicit `None` from source cannot be distinguished from the
+/// padding and takes the same path, which is the convention every native
+/// module function with optional parameters follows.
+fn wrapper_argument(argument: Option<i64>, default: fn() -> i64) -> i64 {
+    match argument {
+        Some(item) if item != NONE => item,
+        _ => default(),
+    }
+}
+
+/// Outcome of reading one attribute for `update_wrapper`: a missing attribute
+/// leaves the pending `AttributeError` in place so the caller can decide
+/// whether CPython skips it (`assigned`) or propagates it (`updated`).
+enum AttributeRead {
+    Found(i64),
+    Missing,
+    Failed,
+}
+
+fn read_attribute(obj: i64, name: &str) -> AttributeRead {
+    let result = crate::core::methods::getattr(obj, name.as_ptr(), name.len());
+    if !exc::pending() {
+        return AttributeRead::Found(result);
+    }
+    if exc::pending_tag() == ATTRIBUTE_ERROR as i64 {
+        return AttributeRead::Missing;
+    }
+    AttributeRead::Failed
+}
+
+fn write_attribute(obj: i64, name: &str, item: i64) -> bool {
+    crate::core::methods::setattr(obj, name.as_ptr(), name.len(), item);
+    !exc::pending()
+}
+
+/// Materialises an `assigned`/`updated` argument as attribute names.
+///
+/// CPython iterates the argument; Hydro accepts the tuple/list forms the
+/// standard library and ordinary call sites produce and reports a `TypeError`
+/// for anything else instead of guessing.
+fn attribute_names(items: i64, parameter: &str) -> Result<Vec<String>, ()> {
+    let Some(entries) = value::as_tuple(items).or_else(|| value::as_list(items)) else {
+        exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "update_wrapper() argument '{parameter}' must be a sequence of attribute names, not '{}'",
+                value::type_name(items)
+            ),
+        );
+        return Err(());
+    };
+    let mut names = Vec::with_capacity(entries.len());
+    for &entry in entries {
+        match value::as_str(entry) {
+            Some(name) => names.push(name.to_string()),
+            None => {
+                exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "attribute name must be string, not '{}'",
+                        value::type_name(entry)
+                    ),
+                );
+                return Err(());
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// `functools.update_wrapper(wrapper, wrapped, assigned=WRAPPER_ASSIGNMENTS,
+/// updated=WRAPPER_UPDATES)`.
+///
+/// Follows CPython's algorithm exactly: assigned attributes that `wrapped`
+/// exposes are copied onto `wrapper`, missing ones are skipped (an absent
+/// `__dict__`/`__annotations__` therefore never fabricates a value), the
+/// `updated` attributes are updated from `wrapped` (defaulting to an empty
+/// mapping when absent), and `wrapper.__wrapped__` is set to `wrapped`.
+fn update_wrapper(wrapper: i64, wrapped: i64, assigned: Option<i64>, updated: Option<i64>) -> i64 {
+    let roots = heap::root_values(&[wrapper, wrapped]);
+    let assigned = wrapper_argument(assigned, default_assigned);
+    // The assigned default may allocate, and the updated default allocates
+    // again; keep the first list rooted while the second is materialised.
+    let assigned_roots = heap::root_values(&[assigned]);
+    let updated = wrapper_argument(updated, default_updated);
+    let inner = heap::root_values(&[assigned, updated]);
+    heap::release_roots(assigned_roots);
+    let result = apply_wrapper_metadata(wrapper, wrapped, assigned, updated);
+    heap::release_roots(inner);
+    heap::release_roots(roots);
+    result
+}
+
+fn apply_wrapper_metadata(wrapper: i64, wrapped: i64, assigned: i64, updated: i64) -> i64 {
+    let Ok(assigned_names) = attribute_names(assigned, "assigned") else {
+        return NONE;
+    };
+    let Ok(updated_names) = attribute_names(updated, "updated") else {
+        return NONE;
+    };
+    for name in assigned_names {
+        match read_attribute(wrapped, &name) {
+            AttributeRead::Found(item) => {
+                // `getattr` may have allocated the value just read, so keep it
+                // rooted while `setattr` allocates the wrapper's storage.
+                let roots = heap::root_values(&[item]);
+                let written = write_attribute(wrapper, &name, item);
+                heap::release_roots(roots);
+                if !written {
+                    return NONE;
+                }
+            }
+            // CPython ignores an assigned attribute `wrapped` does not have.
+            AttributeRead::Missing => {
+                exc::clear();
+            }
+            AttributeRead::Failed => return NONE,
+        }
+    }
+    for name in updated_names {
+        // `getattr(wrapper, attr)` is unguarded in CPython, so a wrapper
+        // without the mapping propagates the AttributeError.
+        let target = match read_attribute(wrapper, &name) {
+            AttributeRead::Found(item) => item,
+            AttributeRead::Missing | AttributeRead::Failed => return NONE,
+        };
+        let roots = heap::root_values(&[target]);
+        let source = match read_attribute(wrapped, &name) {
+            AttributeRead::Found(item) => item,
+            AttributeRead::Missing => {
+                exc::clear();
+                value::dict_new(Vec::new())
+            }
+            AttributeRead::Failed => {
+                heap::release_roots(roots);
+                return NONE;
+            }
+        };
+        let argv = [source];
+        let edges = heap::root_values(&[source]);
+        crate::core::methods::call(
+            target,
+            b"update".as_ptr(),
+            "update".len(),
+            argv.len(),
+            argv.as_ptr(),
+        );
+        heap::release_roots(edges);
+        heap::release_roots(roots);
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    if !write_attribute(wrapper, "__wrapped__", wrapped) {
+        return NONE;
+    }
+    wrapper
+}
+
+/// `functools.wraps(wrapped, assigned=WRAPPER_ASSIGNMENTS,
+/// updated=WRAPPER_UPDATES)`: the decorator that applies `update_wrapper`
+/// with the given (or default) assignment lists.
+///
+/// The decorator is a `functools.partial` of the internal `_wraps_apply`
+/// helper. `functools.partial` prepends its bound arguments, so the helper
+/// takes the decorator's single argument — the wrapper — last:
+/// `_wraps_apply(wrapped, assigned, updated, wrapper)`. The partial therefore
+/// binds `wrapped`, `assigned` and `updated` (the defaults when they were
+/// omitted) and keeps every bound value as a traced GC edge.
+pub(crate) fn wraps_decorator(wrapped: i64, assigned: Option<i64>, updated: Option<i64>) -> i64 {
+    let apply = value::native_function_new("functools", "_wraps_apply", 4);
+    let roots = heap::root_values(&[wrapped, apply]);
+    let assigned = wrapper_argument(assigned, default_assigned);
+    // Both lists must survive the allocations that follow; root each one as it
+    // is produced so a collection cannot drop the first while the second is
+    // being materialised.
+    let assigned_roots = heap::root_values(&[assigned]);
+    let updated = wrapper_argument(updated, default_updated);
+    let bound = [wrapped, assigned, updated];
+    let edges = heap::root_values(&bound);
+    heap::release_roots(assigned_roots);
+    let decorator = value::partial_new(apply, bound.to_vec());
+    heap::release_roots(edges);
+    heap::release_roots(roots);
+    decorator
+}
 
 /// `functools._unwrap_partial(func)`: repeatedly replaces a
 /// `functools.partial` with its `.func` target.
@@ -212,6 +447,10 @@ pub(crate) fn constant(name: &str) -> i64 {
     match name {
         "Placeholder" => placeholder(),
         "_PlaceholderType" => placeholder_type_class(),
+        // The default assignment lists `functools.update_wrapper` uses; both
+        // are value tuples, so a caller can pass them back explicitly.
+        "WRAPPER_ASSIGNMENTS" => default_assigned(),
+        "WRAPPER_UPDATES" => default_updated(),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'functools' has no attribute '{name}'"),
@@ -862,6 +1101,25 @@ pub(crate) fn call(function: &str, args: &[i64]) -> Option<i64> {
         });
     }
     Some(match function {
+        "update_wrapper" => match args {
+            [wrapper, wrapped] => update_wrapper(*wrapper, *wrapped, None, None),
+            [wrapper, wrapped, assigned] => {
+                update_wrapper(*wrapper, *wrapped, Some(*assigned), None)
+            }
+            [wrapper, wrapped, assigned, updated] => {
+                update_wrapper(*wrapper, *wrapped, Some(*assigned), Some(*updated))
+            }
+            _ => exc::raise_with_message(TYPE_ERROR, "update_wrapper() takes 2 to 4 arguments"),
+        },
+        // `functools.wraps(...)` returns a partial of this helper that binds
+        // `wrapped`, `assigned` and `updated`; the decorator's own argument —
+        // the wrapper — is appended by the partial call, so it arrives last.
+        "_wraps_apply" => match args {
+            [wrapped, assigned, updated, wrapper] => {
+                update_wrapper(*wrapper, *wrapped, Some(*assigned), Some(*updated))
+            }
+            _ => exc::raise_with_message(TYPE_ERROR, "_wraps_apply() takes 4 arguments"),
+        },
         "_unwrap_partial" => unwrap_partial(args[0]),
         "_unwrap_partialmethod" => unwrap_partialmethod(args[0]),
         "_singledispatchmethod_get" => match args {
@@ -1173,5 +1431,305 @@ mod tests {
         assert!(exc::pending());
         assert!(value::to_string(exc::pending_value()).contains("callable or a descriptor"));
         exc::clear();
+    }
+
+    fn text(content: &str) -> i64 {
+        value::str_alloc(content.to_string())
+    }
+
+    fn attribute(obj: i64, name: &str) -> i64 {
+        let result = crate::core::methods::getattr(obj, name.as_ptr(), name.len());
+        assert!(!exc::pending(), "reading {name} raised");
+        result
+    }
+
+    fn set_attribute(obj: i64, name: &str, item: i64) {
+        crate::core::methods::setattr(obj, name.as_ptr(), name.len(), item);
+        assert!(!exc::pending(), "setting {name} raised");
+    }
+
+    fn name_tuple(names: &[&str]) -> i64 {
+        let items: Vec<i64> = names.iter().map(|name| text(name)).collect();
+        let roots = heap::root_values(&items);
+        let tuple = value::tuple_new(items);
+        heap::release_roots(roots);
+        tuple
+    }
+
+    #[test]
+    fn update_wrapper_copies_metadata_and_records_wrapped() {
+        exc::init();
+        let wrapped = value::identity_function_new("wrapped");
+        let wrapper = value::identity_function_new("wrapper");
+        set_attribute(wrapped, "__doc__", text("wrapped docs"));
+        set_attribute(wrapped, "__module__", text("pkg.mod"));
+        set_attribute(wrapped, "__annotations__", value::dict_new(Vec::new()));
+        set_attribute(wrapped, "custom", int(7));
+
+        assert_eq!(call("update_wrapper", &[wrapper, wrapped]), Some(wrapper));
+        assert!(!exc::pending());
+
+        assert_eq!(
+            value::as_str(attribute(wrapper, "__name__")),
+            Some("wrapped")
+        );
+        assert_eq!(
+            value::as_str(attribute(wrapper, "__qualname__")),
+            Some("wrapped")
+        );
+        assert_eq!(
+            value::as_str(attribute(wrapper, "__doc__")),
+            Some("wrapped docs")
+        );
+        assert_eq!(
+            value::as_str(attribute(wrapper, "__module__")),
+            Some("pkg.mod")
+        );
+        assert!(value::as_dict(attribute(wrapper, "__annotations__")).is_some());
+        // The wrapped function's `__dict__` entries move to the wrapper; the
+        // `__wrapped__` back-reference lives there too.
+        assert_eq!(attribute(wrapper, "custom"), int(7));
+        let dictionary = value::as_dict(attribute(wrapper, "__dict__"))
+            .expect("wrapper __dict__")
+            .to_vec();
+        assert_eq!(dictionary.len(), 2);
+        assert!(dictionary
+            .iter()
+            .any(|(key, _)| value::as_str(*key) == Some("custom")));
+        assert!(dictionary
+            .iter()
+            .any(|(key, _)| value::as_str(*key) == Some("__wrapped__")));
+        // `__wrapped__` is the back-reference `inspect.unwrap` follows.
+        assert_eq!(attribute(wrapper, "__wrapped__"), wrapped);
+        // The wrapped function itself is untouched.
+        assert_eq!(
+            value::as_str(attribute(wrapped, "__name__")),
+            Some("wrapped")
+        );
+    }
+
+    #[test]
+    fn update_wrapper_skips_metadata_the_wrapped_callable_lacks() {
+        exc::init();
+        let wrapped = value::identity_function_new("bare");
+        let wrapper = value::identity_function_new("wrapper");
+        // Hydro retains no module or annotation payload on function values, so
+        // those slots are absent and `update_wrapper` must skip them instead of
+        // fabricating a value; the wrapper keeps its own assignment.
+        set_attribute(wrapper, "__module__", text("own.module"));
+
+        call("update_wrapper", &[wrapper, wrapped]).expect("update_wrapper");
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(attribute(wrapper, "__module__")),
+            Some("own.module")
+        );
+
+        // A slot the wrapped function never exposes stays absent.
+        crate::core::methods::getattr(
+            wrapper,
+            b"__annotations__".as_ptr(),
+            "__annotations__".len(),
+        );
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        exc::clear();
+        // `__doc__` exists on every function and is `None` for the bare one.
+        assert_eq!(attribute(wrapper, "__doc__"), NONE);
+        assert_eq!(attribute(wrapper, "__wrapped__"), wrapped);
+    }
+
+    #[test]
+    fn wraps_decorator_applies_update_wrapper_and_wraps_partials() {
+        exc::init();
+        let wrapped = value::identity_function_new("wrapped");
+        set_attribute(wrapped, "__doc__", text("docs"));
+
+        let decorator = wraps_decorator(wrapped, None, None);
+        // The decorator is a partial of the internal apply helper, so the
+        // wrapped callable is a traced edge of the decorator value.
+        let apply = unwrap_partial(decorator);
+        assert_eq!(
+            value::as_function(apply).map(|function| function.name.as_str()),
+            Some("_wraps_apply")
+        );
+
+        let wrapper = value::identity_function_new("wrapper");
+        let argv = [wrapper];
+        let applied = crate::core::builtins::call(decorator, 1, argv.as_ptr());
+        assert!(!exc::pending());
+        assert_eq!(applied, wrapper);
+        assert_eq!(
+            value::as_str(attribute(wrapper, "__name__")),
+            Some("wrapped")
+        );
+        assert_eq!(value::as_str(attribute(wrapper, "__doc__")), Some("docs"));
+        assert_eq!(attribute(wrapper, "__wrapped__"), wrapped);
+
+        // A `functools.partial` is a valid wrapper: its own attributes stay
+        // readable and the metadata is attached to it.
+        let function = target();
+        let partial = value::partial_new(function, vec![int(1)]);
+        let argv = [partial];
+        assert_eq!(
+            crate::core::builtins::call(decorator, 1, argv.as_ptr()),
+            partial
+        );
+        assert!(!exc::pending());
+        assert_eq!(attribute(partial, "__wrapped__"), wrapped);
+        assert_eq!(attribute(partial, "func"), function);
+        assert_eq!(
+            value::as_tuple(attribute(partial, "args")).map(|items| items.to_vec()),
+            Some(vec![int(1)])
+        );
+    }
+
+    #[test]
+    fn update_wrapper_honours_custom_assigned_and_updated() {
+        exc::init();
+        let wrapped = value::identity_function_new("wrapped");
+        let wrapper = value::identity_function_new("wrapper");
+        set_attribute(wrapped, "__doc__", text("wrapped docs"));
+        set_attribute(wrapper, "__doc__", text("wrapper docs"));
+        let wrapped_extra = value::dict_new(vec![(text("a"), int(1))]);
+        let wrapper_extra = value::dict_new(vec![(text("b"), int(2))]);
+        set_attribute(wrapped, "extra", wrapped_extra);
+        set_attribute(wrapper, "extra", wrapper_extra);
+
+        let assigned = name_tuple(&["__name__"]);
+        let updated = name_tuple(&["extra"]);
+        call("update_wrapper", &[wrapper, wrapped, assigned, updated]).expect("update_wrapper");
+        assert!(!exc::pending());
+
+        // Only the listed assigned slot is copied.
+        assert_eq!(
+            value::as_str(attribute(wrapper, "__name__")),
+            Some("wrapped")
+        );
+        assert_eq!(
+            value::as_str(attribute(wrapper, "__doc__")),
+            Some("wrapper docs")
+        );
+        // The listed updated mapping merges the wrapped entries into the
+        // wrapper's own mapping.
+        let extra = attribute(wrapper, "extra");
+        assert_eq!(extra, wrapper_extra);
+        let pairs = value::as_dict(extra).expect("dict");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(
+            pairs
+                .iter()
+                .find_map(|(key, item)| (value::as_str(*key) == Some("a")).then_some(*item)),
+            Some(int(1))
+        );
+        assert_eq!(attribute(wrapper, "__wrapped__"), wrapped);
+        // The `__dict__` update is skipped when it is not requested.
+        assert!(value::function_attribute(wrapper, "__wrapped__").is_some());
+        assert_eq!(value::function_attribute(wrapper, "unrelated"), None);
+
+        // An empty `updated` skips the dictionary update entirely.
+        let second = value::identity_function_new("second");
+        let source = value::identity_function_new("source");
+        set_attribute(source, "custom", int(3));
+        call(
+            "update_wrapper",
+            &[second, source, name_tuple(&["__name__"]), name_tuple(&[])],
+        )
+        .expect("update_wrapper");
+        assert!(!exc::pending());
+        assert_eq!(value::as_str(attribute(second, "__name__")), Some("source"));
+        assert_eq!(value::function_attribute(second, "custom"), None);
+
+        // `wraps` forwards the same custom lists through its decorator.
+        let via_wraps = value::identity_function_new("via wraps");
+        let own_extra = value::dict_new(vec![(text("own"), int(4))]);
+        set_attribute(via_wraps, "extra", own_extra);
+        let argv = [wrapped, name_tuple(&["__name__"]), name_tuple(&[])];
+        let decorator =
+            crate::modules::call_native("functools", "wraps", argv.len(), argv.as_ptr());
+        assert!(!exc::pending());
+        // The decorator binds `wrapped`/`assigned`/`updated` on a partial of
+        // the apply helper, so applying it only supplies the wrapper.
+        assert_eq!(
+            value::as_function(unwrap_partial(decorator)).map(|function| function.name.as_str()),
+            Some("_wraps_apply")
+        );
+        let argv = [via_wraps];
+        assert_eq!(
+            crate::core::builtins::call(decorator, 1, argv.as_ptr()),
+            via_wraps
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(attribute(via_wraps, "__name__")),
+            Some("wrapped")
+        );
+        assert_eq!(value::as_str(attribute(via_wraps, "__doc__")), None);
+        // The empty `updated` list leaves the wrapper's own mapping alone.
+        assert_eq!(attribute(via_wraps, "extra"), own_extra);
+        assert_eq!(
+            value::as_dict(attribute(via_wraps, "extra")).map(|pairs| pairs.len()),
+            Some(1)
+        );
+        assert_eq!(attribute(via_wraps, "__wrapped__"), wrapped);
+
+        // Codegen pads an omitted keyword slot with `None`, the compiled form
+        // of `wraps(f, updated=("extra",))`; the default `assigned` list still
+        // applies while the custom update list is forwarded.
+        let merged = value::identity_function_new("merged");
+        let merged_extra = value::dict_new(vec![(text("own"), int(5))]);
+        set_attribute(merged, "extra", merged_extra);
+        let argv = [wrapped, NONE, name_tuple(&["extra"])];
+        let decorator =
+            crate::modules::call_native("functools", "wraps", argv.len(), argv.as_ptr());
+        assert!(!exc::pending());
+        let argv = [merged];
+        assert_eq!(
+            crate::core::builtins::call(decorator, 1, argv.as_ptr()),
+            merged
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(attribute(merged, "__doc__")),
+            Some("wrapped docs")
+        );
+        assert_eq!(
+            value::as_str(attribute(merged, "__name__")),
+            Some("wrapped")
+        );
+        // The custom update runs in place on the wrapper's own mapping.
+        assert_eq!(attribute(merged, "extra"), merged_extra);
+        assert_eq!(
+            value::as_dict(merged_extra).map(|pairs| pairs.len()),
+            Some(2)
+        );
+        assert_eq!(attribute(merged, "__wrapped__"), wrapped);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn wrapper_constants_match_cpython_defaults() {
+        exc::init();
+        let assigned: Vec<String> = tuple_items(constant("WRAPPER_ASSIGNMENTS"))
+            .into_iter()
+            .map(|item| value::as_str(item).expect("string").to_string())
+            .collect();
+        assert_eq!(
+            assigned,
+            vec![
+                "__module__",
+                "__name__",
+                "__qualname__",
+                "__doc__",
+                "__annotations__"
+            ]
+        );
+        assert_eq!(
+            tuple_items(constant("WRAPPER_UPDATES"))
+                .into_iter()
+                .map(|item| value::as_str(item).expect("string").to_string())
+                .collect::<Vec<String>>(),
+            vec!["__dict__"]
+        );
+        assert!(!exc::pending());
     }
 }

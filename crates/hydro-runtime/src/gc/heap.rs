@@ -3178,6 +3178,23 @@ unsafe fn trace(addr: usize) {
                             mark_value(default);
                         }
                     }
+                    // Assigned metadata slots and the attribute dictionary are
+                    // GC edges, like CPython's function slots and `__dict__`.
+                    // The snapshot is taken under the metadata lock, so a
+                    // concurrent assignment cannot tear a value.
+                    let (doc, module, annotations, dictionary) = function.metadata.trace_edges();
+                    if let Some(doc) = doc {
+                        mark_value(doc);
+                    }
+                    if let Some(module) = module {
+                        mark_value(module);
+                    }
+                    if let Some(annotations) = annotations {
+                        mark_value(annotations);
+                    }
+                    if dictionary != crate::value::NONE {
+                        mark_value(dictionary);
+                    }
                     match &function.body {
                         FunctionBody::Wrapper { captures, .. } => {
                             for &capture in captures {

@@ -36,13 +36,35 @@ pub static MATH: ModuleSpec = ModuleSpec {
 };
 
 /// `functools` and `_functools` share the same function table: the C
-/// accelerator exposes `reduce` and `partial`, while the no-op decorator
-/// helpers live in the pure-Python module.
+/// accelerator exposes `reduce` and `partial`, while `wraps`/`update_wrapper`
+/// and the pure-Python internals live in the `functools` module.
 const FUNCTOOLS_FUNCTIONS: &[FunctionSpec] = &[
     f("reduce", 2, 3, Type::Any),
     f("cache", 1, 1, Type::Any),
     kw("lru_cache", 0, 2, Type::Any, &["maxsize", "typed"]),
-    f("wraps", 1, 1, Type::Any),
+    // `wraps(wrapped, assigned=..., updated=...)`: the decorator factory
+    // binds `wrapped`/`assigned`/`updated` on a `functools.partial` of the
+    // internal `_wraps_apply` helper, whose call form is therefore
+    // `_wraps_apply(wrapped, assigned, updated, wrapper)`.
+    kw(
+        "wraps",
+        1,
+        3,
+        Type::Any,
+        &["wrapped", "assigned", "updated"],
+    ),
+    // `update_wrapper(wrapper, wrapped, assigned=..., updated=...)`: copies
+    // the wrapped callable's metadata onto the wrapper and records
+    // `wrapper.__wrapped__`. `wraps` applies it through the internal
+    // `_wraps_apply` helper, which receives the wrapper last.
+    kw(
+        "update_wrapper",
+        2,
+        4,
+        Type::Any,
+        &["wrapper", "wrapped", "assigned", "updated"],
+    ),
+    f("_wraps_apply", 4, 4, Type::Any),
     // `partial(func, *args, **kwargs)`: the extra keyword names are forwarded
     // to the wrapped callee and therefore kept by name.
     kw_dynamic("partial", 1, usize::MAX, Type::Any, &["func"]),
@@ -68,6 +90,9 @@ pub static FUNCTOOLS: ModuleSpec = ModuleSpec {
         // instance that marks an argument slot in `partial`/`partialmethod`.
         c("Placeholder", Type::Any),
         c("_PlaceholderType", Type::Any),
+        // Default assignment lists used by `update_wrapper`/`wraps`.
+        c("WRAPPER_ASSIGNMENTS", Type::Any),
+        c("WRAPPER_UPDATES", Type::Any),
     ],
 };
 
@@ -279,6 +304,10 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("cpu_count", 0, 0, Type::Int),
         f("getcwd", 0, 0, Type::Str),
         f("getenv", 1, 2, Type::Any),
+        // `os.fspath(path)`: str/bytes pass through, other objects are asked
+        // for `__fspath__`. The result is str or bytes, which the runtime
+        // reports as the dynamic type.
+        kw("fspath", 1, 1, Type::Any, &["path"]),
         f("fork", 0, 0, Type::Int),
         f("waitpid", 2, 2, Type::Tuple),
         f("_exit", 1, 1, Type::None),
@@ -407,9 +436,26 @@ pub static MULTIPROCESSING: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
+/// `pickle`: the HYD1 textual format. `dumps`/`dump` accept CPython's
+/// `protocol` keyword (the format itself is version-independent, so the value
+/// is validated but never changes the output), and `dump` writes the payload
+/// to a file object.
 pub static PICKLE: ModuleSpec = ModuleSpec {
     name: "pickle",
-    functions: &[f("dumps", 1, 1, Type::Str), f("loads", 1, 1, Type::Any)],
+    functions: &[
+        kw("dumps", 1, 2, Type::Str, &["obj", "protocol"]),
+        // `dump(obj, file, protocol=None, *, fix_imports=True,
+        // buffer_callback=None)`: the two keyword-only parameters are accepted
+        // and ignored because HYD1 has no import table or out-of-band buffers.
+        kw(
+            "dump",
+            2,
+            5,
+            Type::None,
+            &["obj", "file", "protocol", "fix_imports", "buffer_callback"],
+        ),
+        f("loads", 1, 1, Type::Any),
+    ],
     constants: &[],
 };
 
@@ -2160,12 +2206,24 @@ pub static IMPORTLIB_RESOURCES: ModuleSpec = ModuleSpec {
     constants: &[c("Traversable", Type::Any)],
 };
 
-/// `contextlib`: the `suppress` context manager used by rich/ansi and other
-/// libraries. Its `__exit__` never suppresses exceptions in this subset; the
-/// common no-error path is supported.
+/// `contextlib`: the `suppress` and `nullcontext` context managers used by
+/// rich/ansi, numpy and other libraries. `suppress`'s `__exit__` never
+/// suppresses exceptions in this subset; the common no-error path is
+/// supported. `nullcontext` is CPython's no-op manager: `__enter__` returns
+/// its `enter_result` and `__exit__` returns `False`, so exceptions propagate.
 pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
     name: "contextlib",
-    functions: &[f("suppress", 0, usize::MAX, Type::Any)],
+    functions: &[
+        f("suppress", 0, usize::MAX, Type::Any),
+        kw("nullcontext", 0, 1, Type::Any, &["enter_result"]),
+        // The native methods of the two context-manager classes; the runtime
+        // values carry these names, so the central table must know their
+        // arities.
+        f("_suppress_enter", 1, 1, Type::Any),
+        f("_suppress_exit", 4, 4, Type::None),
+        f("_nullcontext_enter", 1, 1, Type::Any),
+        f("_nullcontext_exit", 4, 4, Type::Bool),
+    ],
     constants: &[],
 };
 
@@ -3707,7 +3765,17 @@ mod tests {
         assert_eq!(function("functools", "cache").unwrap().min_args, 1);
         let lru_cache = function("functools", "lru_cache").unwrap();
         assert_eq!(lru_cache.params, &["maxsize", "typed"][..]);
-        assert_eq!(function("functools", "wraps").unwrap().max_args, 1);
+        let wraps = function("functools", "wraps").expect("wraps");
+        assert_eq!((wraps.min_args, wraps.max_args), (1, 3));
+        assert_eq!(wraps.params, &["wrapped", "assigned", "updated"][..]);
+        let update_wrapper = function("functools", "update_wrapper").expect("update_wrapper");
+        assert_eq!((update_wrapper.min_args, update_wrapper.max_args), (2, 4));
+        assert_eq!(
+            update_wrapper.params,
+            &["wrapper", "wrapped", "assigned", "updated"][..]
+        );
+        let wraps_apply = function("functools", "_wraps_apply").expect("_wraps_apply");
+        assert_eq!((wraps_apply.min_args, wraps_apply.max_args), (4, 4));
         let partial = function("functools", "partial").unwrap();
         assert_eq!(partial.max_args, usize::MAX);
         assert_eq!(partial.params, &["func"][..]);
@@ -3746,6 +3814,9 @@ mod tests {
             Type::Any
         );
         assert_eq!(constant("_functools", "Placeholder").unwrap().ty, Type::Any);
+        for name in ["WRAPPER_ASSIGNMENTS", "WRAPPER_UPDATES"] {
+            assert_eq!(constant("functools", name).unwrap().ty, Type::Any);
+        }
     }
 
     #[test]
