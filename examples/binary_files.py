@@ -1,7 +1,7 @@
 import os
 
 
-path = "/tmp/pyx-binary-" + str(os.getpid()) + ".bin"
+path = "/tmp/hydro-binary-" + str(os.getpid()) + ".bin"
 with open(path, "wb") as handle:
     handle.write(b"\x00A\nB\n")
 

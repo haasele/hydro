@@ -1,12 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/pyx-ir",
-    "crates/pyx-frontend",
-    "crates/pyx-runtime",
-    "crates/pyx-interp",
-    "crates/pyx-codegen",
-    "crates/pyx-cli",
+    "crates/hydro-ir",
+    "crates/hydro-frontend",
+    "crates/hydro-runtime",
+    "crates/hydro-interp",
+    "crates/hydro-codegen",
 ]
 
 [workspace.package]
@@ -16,11 +15,11 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
 [workspace.dependencies]
-pyx-ir = { path = "crates/pyx-ir" }
-pyx-frontend = { path = "crates/pyx-frontend" }
-pyx-runtime = { path = "crates/pyx-runtime" }
-pyx-interp = { path = "crates/pyx-interp" }
-pyx-codegen = { path = "crates/pyx-codegen" }
+hydro-ir = { path = "crates/hydro-ir" }
+hydro-frontend = { path = "crates/hydro-frontend" }
+hydro-runtime = { path = "crates/hydro-runtime" }
+hydro-interp = { path = "crates/hydro-interp" }
+hydro-codegen = { path = "crates/hydro-codegen" }
 rustpython-parser = "0.4"
 cranelift-codegen = "0.120"
 cranelift-frontend = "0.120"

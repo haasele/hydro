@@ -1,4 +1,4 @@
-# AGENTS.md — PyX Work Status
+# AGENTS.md — Hydro Work Status
 
 > **Resume rule:** read this file + `docs/TODO.md` before continuing.
 > A step counts as done only when the command/scenario was actually executed;
@@ -7,11 +7,12 @@
 
 ## Project
 
-PyX: standalone Python runtime (Rust) with AOT compiler and toolchain,
-conceptually Bun for Python. Sources of truth: `PLAN.md` (strategy),
-`docs/ARCHITECTURE.md` (contracts), `docs/TODO.md` (single work list),
-`docs/C_API.md` (P4-04), `docs/DIAGNOSTICS.md` (diagnostics/CLI) and
-`docs/LAYOUT.md` (source tree).
+Hydro: the standalone Python runtime/compiler monorepo in Rust. The
+user-facing toolchain **Tea** is a separate repository (`../tea`) and owns
+CLI/project/pytest/REPL/AOT packaging/PGO flavors. Sources of truth:
+`PLAN.md` (strategy), `docs/ARCHITECTURE.md` (contracts), `docs/TODO.md`
+(work list), `docs/C_API.md` (P4-04), `docs/DIAGNOSTICS.md` (diagnostics)
+and `docs/LAYOUT.md` (source tree).
 
 ## Current State
 
@@ -20,32 +21,31 @@ conceptually Bun for Python. Sources of truth: `PLAN.md` (strategy),
 | P0 Foundation | done | CI, README, licenses, changelog, hyperfine adapter, release workflow |
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
 | P2 Runtime | **done & verified**: containers/classes/closures, lazy generators + async generators/TaskGroup, exception hierarchy/chaining, precise shadow-stack GC + size-classed payload allocator, threads/processes/pool with shutdown cleanup, TLS/UDP/select networking, argparse/pytest, IR interpreter/REPL, fuzz gate | `scripts/verify.sh` ALL GREEN |
-| P3 Toolchain | core present (`new`/`init`/`test`/`fmt`/`lint`/`clean`, build cache, uv passthrough) | E2E/cache tests |
-| P4 Compatibility | **CPython 3.14.9 target; option B (PyX-native ABI, no `libpython`); abi3 slice + import matrix + official-test gate**; full ABI/stdlib/ecosystem open | `docs/C_API.md`, `docs/COMPATIBILITY.md`, `docs/CPYTHON_TESTS.md` |
-| P5 Performance | baseline + local threshold gate + CPython/PyX/PyPy/Go engine comparison | `benchmarks/pyx/results/latest.md`, `thresholds.json`, `compare_engines.py` |
-| P6 Polish | largely done; diagnostics/JSON/doctor/CLI flags/ICE/CLI reference | `docs/DIAGNOSTICS.md`, `docs/pyx.1`, E2E |
+| P3 Toolchain | moved to the separate **Tea** repository (`../tea`) | Tea gate |
+| P4 Compatibility | **CPython 3.14.9 target; option B (Hydro-native ABI, no `libpython`); abi3 slice + import matrix + official-test gate**; full ABI/stdlib/ecosystem open | `docs/C_API.md`, `docs/COMPATIBILITY.md`, `docs/CPYTHON_TESTS.md` |
+| P5 Performance | baseline + local threshold gate + CPython/Hydro/PyPy/Go engine comparison | `benchmarks/hydro/results/latest.md`, `thresholds.json`, `compare_engines.py` |
+| P6 Polish | diagnostics/JSON/doctor/ICE in Hydro; CLI/manpage/completions in Tea | `docs/DIAGNOSTICS.md`, Tea repo docs |
 
 **Compatibility target:** **CPython 3.14.9** (single definition in
-`pyx_ir::compat`; 3.13 is security-only, 3.15 is newer than the oracle).
+`hydro_ir::compat`; 3.13 is security-only, 3.15 is newer than the oracle).
 Official `Lib/test` runs are a release gate; the offline manifest check runs
 in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
 ### Test counts (canonical — update only here)
 
-`cargo test --workspace` on 2026-10-26: **1679 tests**:
+`cargo test --workspace` on 2026-10-26: **1375 Hydro tests**:
 
 | Suite | Tests |
 |---|---:|
-| runtime unit | 531 |
-| runtime integration | 275 |
+| runtime unit | 532 |
+| runtime integration | 278 |
 | frontend | 476 (incl. 4 fuzz smoke) |
-| codegen | 57 |
+| codegen | 60 |
 | IR | 18 |
 | interpreter unit | 11 |
-| CLI/E2E | 311 |
 
-Other docs must link here instead of repeating the total; future agents add
-tests, so this block is the only exact count.
+Tea (separate repository) carries **325** CLI/E2E/AOT/pytest/REPL/PGO tests.
+Other docs must link here instead of repeating the total.
 
 ### Compatibility checkpoint (2026-10-25)
 
@@ -53,30 +53,30 @@ tests, so this block is the only exact count.
   5 extension; 39/129/58 + 8 platform missing; 9 modules fail under CPython
   3.14.9 itself). Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **Official suite:** **1/398 passing** (`test_errno.py`), 334 `pyx_fail`,
+- **Official suite:** **1/398 passing** (`test_errno.py`), 334 `hydro_fail`,
   63 `expected_fail` (CPython also fails), 0 timeouts. Manifest
-  `tests/compat/cpython-3.14.9.json` grows only from real `pyx_pass` runs.
-- **C-API:** the limited-API fixture `pyx_capi_probe` (scalars, strings, bytes,
+  `tests/compat/cpython-3.14.9.json` grows only from real `hydro_pass` runs.
+- **C-API:** the limited-API fixture `hydro_capi_probe` (scalars, strings, bytes,
   floats, lists, tuples, dicts, capsules, read-only buffers) builds against
   CPython 3.14 headers, loads from a sibling `.so` and runs under JIT and AOT;
-  neither the CLI nor the AOT binary links `libpython`. Multi-phase init and
+  neither Tea nor the AOT binary links `libpython`. Multi-phase init and
   wheel-tag validation work; wheels/venvs and the full ABI are open.
-- **`bench_all.py` under PyX:** the PyX group completes at the **default GC
+- **`bench_all.py` under Hydro:** the Hydro group completes at the **default GC
   threshold** (official pure-Python `rich` renders; AOT report written). The
-  full suite was previously green with `PYX_GC_THRESHOLD` raised; the default
+  full suite was previously green with `HYDRO_GC_THRESHOLD` raised; the default
   gate is now the normal path. Precise roots are active by default, with
-  `PYX_GC_PRECISE=1` strict and `PYX_GC_PRECISE=0` conservative fallback.
+  `HYDRO_GC_PRECISE=1` strict and `HYDRO_GC_PRECISE=0` conservative fallback.
 - **Benchmarks:** micro harness + tracked baselines; default-GC n=200000
-  PyX group: hello JIT/AOT 1.88/1.19 ms, while_sum 3.94/2.96 ms,
+  Hydro group: hello JIT/AOT 1.88/1.19 ms, while_sum 3.94/2.96 ms,
   math_loop 4.52/2.62 ms, async_gather 24.04/22.11 ms. Root-frame emission
   made generator resume the current weak spot (JIT/AOT 16.07/14.61 ms vs
   CPython 11.23 ms); P5 performance work owns that regression.
-  `compare_engines.py` covers CPython/PyX/PyPy/Go and skips missing engines.
+  `compare_engines.py` covers CPython/Hydro/PyPy/Go and skips missing engines.
 
 ### Known limits (details in `docs/TODO.md` / `ARCHITECTURE.md` §10)
 
 - GC is precise for generated frames/arrays, with a conservative fallback for
-  Rust-side frames/tests; strict mode (`PYX_GC_PRECISE=1`) removes it.
+  Rust-side frames/tests; strict mode (`HYDRO_GC_PRECISE=1`) removes it.
   Native Rust owners must still root tagged locals explicitly.
 - Async generators/comprehensions, `async for`/`async with`, cancellation and
   `TaskGroup` are implemented; `ExceptionGroup`, `wait_for` and the wider
@@ -92,11 +92,11 @@ tests, so this block is the only exact count.
 - Stdlib is a curated subset; `re` is Rust syntax, `socket` supports TCP/UDP/
   IPv6, TLS client, non-blocking I/O and selectors; argparse covers the
   documented CPython surface, pytest is the native runner, and pickle uses
-  PYX1. Full P7 parity is open.
+  HYD1. Full P7 parity is open.
 - C-API is a defined limited subset; no real wheels, NumPy/pydantic-core, GIL
   emulation or `ctypes`/`cffi` yet.
-- `uv` is a passthrough: no interpreter injection/lockfile interpretation;
-  reproducible builds and packaging are open.
+- Tea owns uv interoperability/injection and packaging; Hydro does not embed
+  `uv` or a package manager.
 - Linux x86_64 is the verified target; aarch64 is untested; macOS/Windows and
   cross-compilation are open.
 
@@ -120,39 +120,29 @@ tests, so this block is the only exact count.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
-cargo build                            # whole workspace
-cargo test                             # unit/integration tests
-cargo clippy --workspace -- -D warnings
+cargo build                            # Hydro workspace
+cargo test --workspace                 # Hydro unit/integration tests
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-./scripts/verify.sh                    # full phase gate
-scripts/repro_check.sh                 # same-host AOT determinism (docs/REPRODUCIBLE.md)
-cargo run -q -p pyx-cli -- new /tmp/demo
-cargo run -q -p pyx-cli -- run examples/fib.py
-cargo run -q -p pyx-cli -- build examples/fib.py -o /tmp/fib && /tmp/fib
-cargo run -q -p pyx-cli -- test examples
-cargo run -q -p pyx-cli -- fmt --check examples
-cargo run -q -p pyx-cli -- lint examples
-cargo run -q -p pyx-cli -- gc --json examples/fib.py
-python3 benchmarks/pyx/run_micro.py       # CPython vs. JIT vs. AOT
-uv run benchmarks/bench_pyx.py            # 11 workloads, three runners
-uv run benchmarks/bench_all.py --only pyx
-python3 scripts/check_benchmarks.py       # local threshold gate (--check/--update)
-python3 scripts/test_check_benchmarks.py
-scripts/bench_hyperfine.sh                # hyperfine adapter (skips when missing)
-python3 benchmarks/compare_engines.py     # CPython/PyX/PyPy/Go loop + startup
-python3 scripts/stdlib_compat.py          # regenerate import matrix
-python3 scripts/cpython_compat.py --check-manifest
+./scripts/verify.sh                    # Hydro gate (tests, fuzz smoke, manifest)
+cargo build --release -p hydro-runtime # staticlib for Tea/AOT
+../tea/scripts/verify.sh               # Tea CLI/E2E/AOT/PGO gate
+../tea/target/release/tea infuse examples/fib.py
+../tea/target/release/tea build examples/fib.py -o /tmp/fib
+python3 benchmarks/hydro/run_micro.py
+python3 scripts/check_benchmarks.py
 ```
+
 
 ## Architecture invariants (short version)
 
 - IR is the only frontend↔codegen contract; signatures in
-  `crates/pyx-ir/src/ir.rs`/`model.rs`.
+  `crates/hydro-ir/src/ir.rs`/`model.rs`.
 - ABI is fixed in `docs/ARCHITECTURE.md` §3; runtime functions live in
-  `pyx_runtime::abi`, `extern "C"`, `#[no_mangle]`, **without panics**.
+  `hydro_runtime::abi`, `extern "C"`, `#[no_mangle]`, **without panics**.
 - Values: tagged `i64`; ints/bools/None immediate (BigInt promoted on
   overflow); heap objects 8-byte aligned with a kind header.
-- Errors go through the pending exception + `pyx_exc_pending()` checks in
+- Errors go through the pending exception + `hydro_exc_pending()` checks in
   codegen; explicit and implicit chaining are rendered deepest-first.
 - Heap objects are managed by the conservative concurrent mark-&-sweep GC
   (shared heap, insertion barriers, safepoints); precise roots are open.
@@ -174,7 +164,7 @@ python3 scripts/cpython_compat.py --check-manifest
 See `CHANGELOG.md` for details; this is only the resume pointer.
 
 - BigInt exact integers (tagged i64 fast path + heap promotion) across IR,
-  ABI, arithmetic, formatting, JSON, keys and PYX1 serialization.
+  ABI, arithmetic, formatting, JSON, keys and HYD1 serialization.
 - Implicit `__context__` exception chaining with `__suppress_context__`;
   tracebacks render "During handling ..." deepest-first.
 - CLI `--verbose`/`--quiet` (conflicts exit 2), phase timings/cache decisions,
@@ -182,11 +172,10 @@ See `CHANGELOG.md` for details; this is only the resume pointer.
   catalog (`docs/DIAGNOSTICS.md`) and manpage refreshed.
 - Deterministic container/GC property tests (SplitMix64 models, no new deps)
   and dependency-free fuzz smoke tests for the frontend and runtime ABI.
-- Same-host AOT reproducibility: contract/evidence in
-  `docs/REPRODUCIBLE.md`, checked by `scripts/repro_check.sh` and before
-  release packaging.
+- Same-host AOT reproducibility lives in the Tea repository
+  (`docs/REPRODUCIBLE.md`, `scripts/repro_check.sh`).
 - Hyperfine adapter, engine comparison, explicit threshold `--check` +
   deterministic gate tests, non-blocking CI threshold report, tag-driven
   `release.yml` for Linux x64.
 - Stdlib import matrix advanced to 60/297 (html/contextlib included); full
-  `bench_all.py` runs under PyX with a raised GC threshold.
+  `bench_all.py` runs under Hydro with a raised GC threshold.

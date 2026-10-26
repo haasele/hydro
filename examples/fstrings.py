@@ -1,4 +1,4 @@
-name = "PyX"
+name = "Hydro"
 n = 7
 pi = 3.5
 print(f"Hello, {name}!")

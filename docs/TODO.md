@@ -1,4 +1,4 @@
-# PyX — Work Plan & ToDos
+# Hydro — Work Plan & ToDos
 
 Source: [PLAN.md](../PLAN.md). This document is the **only** work list.
 Status: `[ ]` open, scoped program · `[x]` done & verified · `[!]` blocked (reason follows).
@@ -10,11 +10,11 @@ a fresh checkout with `./scripts/verify.sh`.
 **As of 2026-10-25 (latest):** CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN. The current test count and per-crate breakdown live in [`AGENTS.md`](../AGENTS.md#current-state).
 Phase 1 is complete; Phase 2 is complete. It includes lazy/async generators,
 coroutines and task groups, precise shadow-stack roots (strict mode
-`PYX_GC_PRECISE=1`), the size-classed payload allocator, argparse/pytest,
+`HYDRO_GC_PRECISE=1`), the size-classed payload allocator, argparse/pytest,
 TLS/UDP/select networking, and the IR interpreter/REPL. Remaining work is P7
 stdlib/ecosystem parity and P5 performance (generator-resume root overhead). **P4-04 is unblocked and decided:** CPython
 3.14 development files are available, and the project follows **option B** —
-a PyX-native CPython C-API/ABI layer without embedded `libpython`; evidence and
+a Hydro-native CPython C-API/ABI layer without embedded `libpython`; evidence and
 gates in [`docs/C_API.md`](C_API.md). The **first abi3 slice is implemented**:
 a limited-API extension (`.so`) next to the source can be imported and called
 under JIT and AOT without `libpython` (limited ABI slice; P4-04a/b). The
@@ -27,9 +27,9 @@ generated stdlib compatibility baseline (`docs/COMPATIBILITY.md`,
 core, the benchmark-critical batch, the package/site-packages loader and the
 new native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
 `importlib`/`__future__` modules) and the first official CPython test pass
-(`test_errno.py`). `benchmarks/bench_all.py --only pyx` now renders the rich
+(`test_errno.py`). `benchmarks/bench_all.py --only hydro` now renders the rich
 report at the default GC threshold; the full-suite report is written under
-PyX. Full P7 stdlib/ecosystem parity remains open.
+Hydro. Full P7 stdlib/ecosystem parity remains open.
 
 ## Guiding decisions (derived from PLAN.md)
 
@@ -44,8 +44,8 @@ PyX. Full P7 stdlib/ecosystem parity remains open.
 
 ## P0 — Foundation (now)
 
-- [x] P0-01 Repository structure: Cargo workspace with `pyx-ir`, `pyx-frontend`,
-      `pyx-runtime`, `pyx-codegen`, `pyx-cli`.
+- [x] P0-01 Repository structure: Cargo workspace with `hydro-ir`, `hydro-frontend`,
+      `hydro-runtime`, `hydro-codegen`, `tea`.
 - [x] P0-02 Document architecture decisions (`docs/ARCHITECTURE.md`).
 - [x] P0-03 Define the IR as a stable contract between frontend and codegen.
 - [x] P0-04 Fix the runtime C ABI (value representation, symbols, error protocol).
@@ -56,12 +56,12 @@ PyX. Full P7 stdlib/ecosystem parity remains open.
       `.github/workflows/ci.yml`: stable Rust, Cargo cache, read-only
       permissions, concurrency cancel, `scripts/verify.sh` as the full gate.
 - [x] P0-09 Set up benchmark harness (hyperfine script, CPython baseline).
-      `benchmarks/pyx/run_micro.py` (CPython/JIT/AOT, RSS, build time) + the
+      `benchmarks/hydro/run_micro.py` (CPython/JIT/AOT, RSS, build time) + the
       tracked baseline/thresholds; `scripts/bench_hyperfine.sh` wraps the
       existing `bench_*.py` harnesses with output validation and clean
       skip/error behavior when hyperfine or uv is missing.
 - [x] P0-10 Error/diagnostic conventions (span, exit codes, stderr format).
-      Stable codes (`PYXnnnn`), spans (`end_col`), help/hints, snippets,
+      Stable codes (`HYDnnnn`), spans (`end_col`), help/hints, snippets,
       `--json` schema and exit codes 0/1/2 are implemented and tested.
 - [x] P0-11 Backend decision: Cranelift now, evaluate LLVM behind `--features llvm`
       (see ARCHITECTURE.md §4).
@@ -107,16 +107,16 @@ exceptions and native output. No full Python compatibility yet.
 
 ### Codegen
 - [x] P1-19 Cranelift IR generation for all IR statements/expressions.
-- [x] P1-20 JIT path (`pyx run`), runtime symbols registered.
-- [x] P1-21 AOT path (`pyx build`): object file + link against `libpyx_runtime.a`.
+- [x] P1-20 JIT path (`tea infuse`), runtime symbols registered.
+- [x] P1-21 AOT path (`tea build`): object file + link against `libhydro_runtime.a`.
 - [x] P1-22 Exception checks after every fallible operation; handler routing.
 - [x] P1-23 Line table/frames for tracebacks; generator main as entry point.
 - [x] P1-24 Deterministic error output on codegen errors.
 
 ### CLI & toolchain base
-- [x] P1-25 `pyx check <file>`, `pyx run <file>`, `pyx build <file> -o <out>`.
+- [x] P1-25 `tea check <file>`, `tea infuse <file>`, `tea build <file> -o <out>`.
 - [x] P1-26 Exit codes: 0 ok, 1 user/program error, 2 internal error.
-- [x] P1-27 `pyx run` passes through the program exit code.
+- [x] P1-27 `tea infuse` passes through the program exit code.
 
 ### Verification P1
 - [x] P1-28 E2E tests: hello, fib, loops, strings, exceptions, recursion.
@@ -124,7 +124,7 @@ exceptions and native output. No full Python compatibility yet.
 - [x] P1-30 AOT binary executable independently of the source text (smoke in tmpdir).
 - [x] P1-31 `cargo test` + `scripts/verify.sh` green.
 
-**Acceptance P1:** `pyx run examples/fib.py` and `pyx build examples/fib.py -o /tmp/fib`
+**Acceptance P1:** `tea infuse examples/fib.py` and `tea build examples/fib.py -o /tmp/fib`
 produce identical, correct output; error cases produce Python-like messages;
 no CPython is needed at runtime.
 
@@ -138,7 +138,7 @@ no CPython is needed at runtime.
       f-strings, `%` formatting.
       Format specs (`:04d`, `:.2f`, `:#x`, alignment/fill characters), `!s`/`!r`/
       `!a`, `str.format` and `%` formatting are implemented and tested via
-      `pyx_format_value` and `core/format.rs`.
+      `hydro_format_value` and `core/format.rs`.
 - [x] P2-03 Iterators/iteration protocol; `for` over containers; `enumerate`, `zip`.
       File/CSV reader, bytes and real generator iteration are present;
       `iter(x)`/`next(it[, default])` are builtins. `dict` views are
@@ -154,7 +154,7 @@ no CPython is needed at runtime.
       rejected; no general runtime module object/`sys.modules` or
       multiple-module `from x import *` (P4-03/P7-01).
 - [x] P2-05 Allocator: size classes, arena/chunk allocation, alignment, statistics.
-      Delivered: split 16-byte `PyxObj` header and typed payload blocks;
+      Delivered: split 16-byte `HydroObj` header and typed payload blocks;
       18 size classes (8..4096 bytes) with per-class slabs/free lists, a large
       exact-allocation fallback, 16-byte alignment, `absorb`/`clear` across
       classes, and per-class/peak-byte statistics. `ObjData` remains the
@@ -176,7 +176,7 @@ no CPython is needed at runtime.
       `bench_all.py` runs at the default GC threshold; a stress program with
       known dead temporaries does not retain them across collections.
       Delivered: `gc/roots.rs` shadow frames/ranges published at safepoints,
-      persistent root slots, `PYX_GC_PRECISE=1` strict mode, and
+      persistent root slots, `HYDRO_GC_PRECISE=1` strict mode, and
       `tests/precise_gc.rs` (frame/scope/stale-stack/persistent/shared).
 - [x] P2-07 Anchor GC safepoints + stack maps or shadow stack in codegen.
       Delivered: safepoints at entry/backedges (every 64 iterations) and
@@ -185,15 +185,15 @@ no CPython is needed at runtime.
       Acceptance: the collector reads only precise roots at safepoints;
       P2-06's stress gate and the GC tests pass with conservative scanning
       disabled; codegen has no unsafepoint call into allocating runtime code.
-- [x] P2-08 GC metrics (`pyx gc [--json]`), heap profiling foundation.
-      `pyx gc [--json] <file.py>` runs the program like `pyx run` and
+- [x] P2-08 GC metrics (`tea gc [--json]`), heap profiling foundation.
+      `tea gc [--json] <file.py>` runs the program like `tea infuse` and
       reports collections/live_objects/threshold/pause_total_us/pause_max_us/
       mark_total_us/sweep_total_us/freed_total/stress; plus
-      `gc_stats()`/`reset_gc_stats()`/`GcStats`, `PYX_GC_STATS=1`,
-      `pyx_gc_collect`, `pyx_gc_objects`. Deep heap profiling remains P5-05.
+      `gc_stats()`/`reset_gc_stats()`/`GcStats`, `HYDRO_GC_STATS=1`,
+      `hydro_gc_collect`, `hydro_gc_objects`. Deep heap profiling remains P5-05.
 - [x] P2-09 Classes/objects, methods, inheritance, `__init__`, attributes.
       Single-base classes with methods, `__init__`, inheritance/overrides,
-      `pyx_getattr`/`pyx_setattr`, dynamic dispatch, frozen class attributes,
+      `hydro_getattr`/`hydro_setattr`, dynamic dispatch, frozen class attributes,
       `@property`/`@classmethod`/`@staticmethod`, and deterministic
       representation. Limits: user decorators, metaclasses, multiple
       inheritance and the general descriptor protocol are absent (P4-02).
@@ -217,7 +217,7 @@ no CPython is needed at runtime.
       above exception ...") are implemented with deepest-first
       tracebacks. `except*` remains a language-completeness item under P4-02.
 - [x] P2-12 `async`/`await`, event loop foundation.
-      Delivered: `async def` creates coroutine objects; `await`/`pyx_await`
+      Delivered: `async def` creates coroutine objects; `await`/`hydro_await`
       drives them, `asyncio.run` drives a cooperative single-thread loop on a
       persistent thread-local driver whose scheduled-task list is a heap
       persistent root, `sleep` suspends only the current fiber (blocking
@@ -249,16 +249,16 @@ no CPython is needed at runtime.
       `regex`), `asyncio`, and native `socket` with TCP/UDP/IPv6, TLS,
       non-blocking I/O, `select`/`poll`/`selectors`. The final P2-13 slice adds
       catchable `SystemExit`/`sys.exit`, the complete argparse surface and a
-      pytest-compatible runner. `crates/pyx-cli/tests/stdlib_core.rs` exercises
+      pytest-compatible runner. `tea/tests/stdlib_core.rs` exercises
       representative math/time/random/json/re/os/pathlib/io behavior plus error
       paths, so no module is counted from import alone. Full 297-module/P7
       parity remains the separate P7 program; it is not claimed here.
 - [x] P2-14 Interpreter/bytecode mode for REPL and fast dev loops (optional).
-      Delivered the IR tree-walk interpreter (`crates/pyx-interp`) used by
-      `pyx run --interpret`; it covers every IR node, shares the runtime ABI,
+      Delivered the IR tree-walk interpreter (`crates/hydro-interp`) used by
+      `tea infuse --interpret`; it covers every IR node, shares the runtime ABI,
       registers precise roots for frames/temporaries, and materialises IR
-      functions as host callables for native callbacks. `pyx repl`, `pyx -c`
-      and `pyx -i` provide a persistent session with multi-line buffering,
+      functions as host callables for native callbacks. `tea repl`, `tea -c`
+      and `tea -i` provide a persistent session with multi-line buffering,
       expression echo, `_`, import-once and global flush. A separate bytecode
       VM was deliberately not added: the IR interpreter is the second execution
       path and avoids duplicating semantics; `dis`/code objects remain P7.
@@ -272,14 +272,14 @@ no CPython is needed at runtime.
         Shared heap + concurrent mark & sweep (STW root snapshot and
         rescan, concurrent marking with insertion barriers,
         white partition under heap lock, free outside, growth-based
-        threshold, PYX_GC_STATS). No GIL; shared containers need
+        threshold, HYDRO_GC_STATS). No GIL; shared containers need
         user locks. Precise roots and the size-classed allocator are now
         implemented (P2-05/06); optional finer safepoint polling and codegen
         stack maps remain future work.
       - [x] P2-20b `threading` subset: Thread, Lock, RLock, Event, Queue;
         thread-local exception/frame states, thread spawn/join.
         Thread/Lock/RLock/Event/queue.Queue implemented; `_thread.join` remains
-        a PyX extension; blocking waits park GC-safely.
+        a Hydro extension; blocking waits park GC-safely.
       - [x] P2-20c Process API: `multiprocessing` (Process, Queue, Pool),
         `os.fork`/spawn, waitpid, exit codes; real parallel processes.
         Process/Queue/fork/waitpid/_exit, real spawn (exec,
@@ -288,7 +288,7 @@ no CPython is needed at runtime.
         Process/Pool.terminate.
       - [x] P2-20d Serialization for process boundaries (pickle-compatible or
         own format), incl. function references.
-        Own PYX1 format (`pickle` = hex, mp.Queue = binary;
+        Own HYD1 format (`pickle` = hex, mp.Queue = binary;
         spawn = function by name, queue FDs). Not CPython-compatible.
       - [x] P2-20e Parallel benchmarks: thread scaling, process scaling,
         memory/startup cost vs. CPython; CI thresholds.
@@ -335,41 +335,41 @@ cover cycles; container semantics tested against CPython behavior.
 
 ## P3 — Toolchain (uv)
 
-- [x] P3-01 `pyx new`/`init`, `pyx add`, `pyx remove`, `pyx sync`, `pyx lock`.
+- [x] P3-01 `tea new`/`init`, `tea add`, `tea remove`, `tea sync`, `tea lock`.
       `new`/`init` create `main.py`, `pyproject.toml`, `.gitignore`;
       add/remove/sync/lock are an unchanged passthrough to `uv`
-      (`PYX_UV`), including the exit status.
+      (`HYDRO_UV`), including the exit status.
 - [ ] P3-02 Keep `pyproject.toml`/lockfile behavior compatible with `uv`.
       Delivered: scaffold and an unchanged uv passthrough (`add`/`remove`/
-      `sync`/`lock`); PyX does not interpret the files. Program: read
+      `sync`/`lock`); Hydro does not interpret the files. Program: read
       `pyproject.toml` for the entry point and dependency intent, honor
       `uv.lock`/`pyproject.toml` without forking uv semantics, and document
-      which fields PyX interprets. Acceptance: a foreign project with
-      `pyproject.toml` + `uv.lock` runs via `pyx sync && pyx run`; a fixture
-      asserts that PyX and `uv` agree on the environment, with no silent
+      which fields Hydro interprets. Acceptance: a foreign project with
+      `pyproject.toml` + `uv.lock` runs via `tea sync && tea infuse`; a fixture
+      asserts that Hydro and `uv` agree on the environment, with no silent
       rewrite of project files.
 - [ ] P3-03 Integrate uv as a library/process; redirect interpreter selection to
-      `pyx` (`.python-version`, venv marker, `sys.executable`).
+      `tea` (`.python-version`, venv marker, `sys.executable`).
       Delivered: process passthrough and a real `sys.executable`
       (`current_exe`). Program: write a venv marker/`.python-version` that
-      makes uv select PyX instead of CPython, and inject the PyX interpreter
-      into uv-driven environments. Acceptance: after `pyx sync`, `pyx run`
-      and `uv run` in the same project use PyX (no CPython interpreter
+      makes uv select Hydro instead of CPython, and inject the Hydro interpreter
+      into uv-driven environments. Acceptance: after `tea sync`, `tea infuse`
+      and `uv run` in the same project use Hydro (no CPython interpreter
       needed), with the marker/version content covered by a test.
 - [x] P3-04 Build cache: hash over source + flags + runtime version, incremental.
-      `.pyx/cache`, deterministic key over source, reachable
-      modules, target, version and runtime archive; `--no-cache`, `pyx clean`,
+      `.tea/cache`, deterministic key over source, reachable
+      modules, target, version and runtime archive; `--no-cache`, `tea clean`,
       hit/invalidation tests.
 - [ ] P3-05 Reproducible builds (deterministic objects, path stripping).
-      Delivered: `scripts/repro_check.sh` compares two `--no-cache` builds,
-      cache/fresh links, hashes and program output; `docs/REPRODUCIBLE.md`
-      records the current contract. Same spelling/path is deterministic;
+      Moved to the Tea repository: `scripts/repro_check.sh` compares two
+      `--no-cache` builds, cache/fresh links, hashes and program output;
+      `docs/REPRODUCIBLE.md` records the current contract. Same spelling/path is deterministic;
       relative vs absolute source paths still change embedded path immediates.
       Program: path-independent output, `SOURCE_DATE_EPOCH`, stripped
       absolute paths (Q-10 relies on this). Acceptance: two builds from
       different checkout paths/times are byte-identical and the gate compares
       checksums.
-- [x] P3-06 `pyx test`, `pyx fmt`, `pyx lint`, `pyx check`.
+- [x] P3-06 `tea test`, `tea fmt`, `tea lint`, `tea check`.
       Implemented; `test` is **not** pytest-compatible (success = exit 0,
       `--json`), `fmt` only normalizes whitespace/final newline.
 - [x] P3-07 uv fork only if the architecture forces it (decision doc).
@@ -377,15 +377,15 @@ cover cycles; container semantics tested against CPython behavior.
 - [ ] P3-08 Packaging: native binaries, cross-compilation, installers.
 
 **Acceptance P3:** a foreign Python project with `pyproject.toml` can be started with
-`pyx sync && pyx run` (defined support scope). *Not yet
+`tea sync && tea infuse` (defined support scope). *Not yet
 met*: without uv interpreter injection/packaging this remains a goal.
 
 ## P4 — Python compatibility & ecosystem
 
 Goal: run unmodified Python code — the CPython standard library and the common
-ecosystem — on the PyX runtime while keeping the PyX advantages (single VM,
+ecosystem — on the Hydro runtime while keeping the Hydro advantages (single VM,
 concurrent GC, fast startup). The decision for the C-API path is recorded in
-[`docs/C_API.md`](C_API.md): **option B, a PyX-native CPython ABI layer; no
+[`docs/C_API.md`](C_API.md): **option B, a Hydro-native CPython ABI layer; no
 `libpython` in the production runtime.**
 
 - [x] P4-01 CPython test-suite harness and official gate.
@@ -395,7 +395,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       **3.14.9** oracle, JSON + `docs/CPYTHON_TESTS.md`, release gate
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
       Manifest `tests/compat/cpython-3.14.9.json` records **1** pass
-      (`test_errno.py`); it grows only from real `pyx_pass` results.
+      (`test_errno.py`); it grows only from real `hydro_pass` results.
       Stdlib import baseline 2026-10-26: **63/297 importable** (13
       builtin/frozen, 45 pure, 5 extension; 9 `cpython_failed`). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
@@ -408,19 +408,19 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
       `__future__` modules are importable and API-tested.
       Official-suite
-      baseline 2026-10-25: **1/398 passing** (334 `pyx_fail`, 63
+      baseline 2026-10-25: **1/398 passing** (334 `hydro_fail`, 63
       `expected_fail` where CPython also fails; 0 timeouts). No test is marked
-      passing unless CPython 3.14.9 and PyX both exit 0.
+      passing unless CPython 3.14.9 and Hydro both exit 0.
       The harness runs a defined subset of CPython 3.14 `Lib/test` against
-      `pyx` and emits a machine-readable report (per test: pass/skip/fail,
+      `tea` and emits a machine-readable report (per test: pass/skip/fail,
       plus the reason).
       Acceptance: `scripts/stdlib_compat.py` generates
       `docs/COMPATIBILITY.md` + `benchmarks/compat/latest.json`, and
       `scripts/cpython_compat.py` generates `docs/CPYTHON_TESTS.md` +
       `benchmarks/compat/cpython-3.14.9.json` and updates the manifest only
-      from real `pyx_pass` runs. Both are deterministic and offline-checkable
+      from real `hydro_pass` runs. Both are deterministic and offline-checkable
       (`--check-manifest`); no hand-written pass claims. Gating: a test counts
-      as passed only if CPython 3.14.9 and PyX both exit 0. Growing the
+      as passed only if CPython 3.14.9 and Hydro both exit 0. Growing the
       manifest is P7-05/P7-06.
 - [ ] P4-02 Language completeness required by the stdlib and ecosystem.
       Delivered: arbitrary-precision `int` (tagged i64 fast path + `BigInt`),
@@ -440,7 +440,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       remaining deviation is listed in `docs/COMPATIBILITY.md`.
 - [ ] P4-03 Import system and module model for real packages.
       Delivered: packages (`__init__.py`), dotted and relative imports,
-      `PYX_SITE_PACKAGES`/`VIRTUAL_ENV`/`CONDA_PREFIX`/`PYTHONPATH` search,
+      `HYDRO_SITE_PACKAGES`/`VIRTUAL_ENV`/`CONDA_PREFIX`/`PYTHONPATH` search,
       one-time module initializers, cycle diagnostics and `importlib` core
       modules. Program: a general runtime `sys.path`/`sys.modules` model,
       `site`/`.pth`, namespace packages, zip and frozen imports, module
@@ -449,10 +449,10 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       package/relative-import fixtures pass; `sys.modules` and namespace/zip
       fixtures behave like CPython 3.14.9.
 - [x] P4-04 C-API/ABI strategy: decision recorded (2026-10-24).
-      **Option B** (PyX-native ABI shim, no `libpython` in production; CPython
+      **Option B** (Hydro-native ABI shim, no `libpython` in production; CPython
       3.14 headers at build time and the CPython interpreter as differential
       test oracle only). Evidence: embedded CPython costs ~6.7 ms init +
-      ~7.5 ms finalize and ~41.6 ms for `import numpy`; PyX AOT startup is
+      ~7.5 ms finalize and ~41.6 ms for `import numpy`; Hydro AOT startup is
       ~0.8–1.0 ms. A stable-ABI probe module builds and imports with just four
       undefined CPython symbols, confirming the loader/shim model. Details in
       [`docs/C_API.md`](C_API.md).
@@ -466,19 +466,19 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
         ReleaseBuffer`), variadic `PyArg_ParseTuple` (`i/l/n/d/s/O/p`, `|`,
         `:`/`;`), refcount entry points, `PyErr_*` + `PyExc_*` singletons,
         symbol anchor and C-variadic glue. Gate proven for the fixture:
-        `pyx_capi_probe.abi3.so` imports/calls under JIT and AOT, and neither
+        `hydro_capi_probe.abi3.so` imports/calls under JIT and AOT, and neither
         the CLI nor the AOT binary links `libpython`
-        (`crates/pyx-cli/tests/extensions.rs`). This is the defined limited-API
+        (`tea/tests/extensions.rs`). This is the defined limited-API
         subset; additional `abi3` symbols required by real extensions are
         driven by P4-10.
       - [x] P4-04b Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags,
         package submodules, multi-phase init, clear init-failure errors.
         **Implemented:** compile-time discovery of `<name>.so`/`<name>.abi3.so`/
         `<name>.*.so` next to the source, lazy per-path load/caching,
-        `PyInit_<name>` resolution, symbol resolution from the `pyx` process,
-        callable values via `pyx_getattr`/`pyx_call`, and clear
+        `PyInit_<name>` resolution, symbol resolution from the `tea` process,
+        callable values via `hydro_getattr`/`hydro_call`, and clear
         init/attribute/argument errors. Discovery also searches
-        `PYX_EXTENSION_PATH`, `PYTHONPATH`, `PYX_SITE_PACKAGES` and
+        `HYDRO_EXTENSION_PATH`, `PYTHONPATH`, `HYDRO_SITE_PACKAGES` and
         `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages, and resolves dotted
         package submodules (`pkg/sub_ext.abi3.so` without package Python
         source). Wheel tags are validated at compile time: only `.so`,
@@ -488,18 +488,18 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
         module core and their `Py_mod_exec` slots run once per path; invalid
         slots and exec failures are load errors.
       - [ ] P4-04c Full CPython 3.14 ABI: `PyTypeObject` layout, refcounted
-        `PyObject` handles over PyX objects, vectorcall, full buffer protocol,
+        `PyObject` handles over Hydro objects, vectorcall, full buffer protocol,
         `PyType_FromSpec`, GC traverse/clear integration.
         Gate: NumPy 2.5 array smoke and `pydantic-core` model validation.
       - [ ] P4-04d GIL emulation at extension boundaries and callback safety.
         Gate: threaded extension callbacks under GC stress without
         deadlock/data race.
 - [ ] P4-05 Native extension loading (`.so`) + wheel support.
-      Delivered: `.so` loading, sibling/`PYX_EXTENSION_PATH`/`PYTHONPATH`/
+      Delivered: `.so` loading, sibling/`HYDRO_EXTENSION_PATH`/`PYTHONPATH`/
       venv `site-packages` discovery, package submodules
       (`pkg/sub_ext.abi3.so`), wheel ABI-tag validation (`.so`, `.abi3.so`,
       `.cpython-314-<platform>.so`; other tags are compile-time errors),
-      symbol resolution from the PyX shim, explicit init/ABI errors, and
+      symbol resolution from the Hydro shim, explicit init/ABI errors, and
       multi-phase (`PyModuleDef_Init`) initialisation. Program: unpack and
       install `.whl` archives into a venv-like prefix, resolve
       `*.dist-info`/RECORD paths, and import extensions from the installed
@@ -510,13 +510,13 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `ctypes.CDLL` on libc and `cffi` ABI-mode smoke; pointer/struct/array
       conversion rules documented. Depends on P4-04a.
 - [ ] P4-07 Pickle/serialization, encoding details, numeric limits.
-      PYX1 is deliberately not CPython-compatible; `bytes`/UTF-8/string escapes
+      HYD1 is deliberately not CPython-compatible; `bytes`/UTF-8/string escapes
       are tested; BigInt promotion is documented.
       Program: CPython pickle protocols 2–5, a `marshal` subset and
       `datetime`/`decimal` encodings. Acceptance: CPython-written pickles
       round-trip for the supported types and the protocol matrix is tested;
       every unsupported opcode/protocol is an explicit error.
-      - [x] P4-07a BigInt in PYX1: the serializer stores sign + big-endian
+      - [x] P4-07a BigInt in HYD1: the serializer stores sign + big-endian
         magnitude and normalizes a canonical small BigInt back to the tagged
         form (`support/serialize.rs`; covered by the serialization tests).
 - [ ] P4-08 Compatibility matrix and support policy.
@@ -563,12 +563,12 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
 - [ ] P4-11 Ecosystem benchmarks and budgets.
       For each Tier-1 library/app: startup, import time, request/throughput,
       dataframe/array operation, RSS versus CPython 3.14.9; thresholds in
-      `benchmarks/ecosystem/` and a report comparable to `bench_pyx.py`.
+      `benchmarks/ecosystem/` and a report comparable to `bench_hydro.py`.
       Acceptance: reproducible report + documented budgets; regressions fail
-      the local gate. This is the evidence that keeps the PyX advantages
+      the local gate. This is the evidence that keeps the Hydro advantages
       rather than trading them for CPython overhead.
 - [ ] P4-12 LTS compatibility lines (future; no LTS before production).
-      Define PyX LTS lines keyed to CPython minor versions (3.13/3.14/3.15…):
+      Define Hydro LTS lines keyed to CPython minor versions (3.13/3.14/3.15…):
       frozen CPython patch baseline, supported C-ABI/wheel tags, frozen
       stdlib/language surface + compatibility matrix, security-patch intake and
       a documented support window. Acceptance: one manifest/baseline per LTS
@@ -577,50 +577,50 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
 
 **Acceptance P4:** defined, tested language/stdlib/ecosystem scope; a generated
 compatibility matrix; C-API limits documented; no silent semantic deviations;
-ecosystem benchmarks show where PyX is faster, equal or slower than CPython
+ecosystem benchmarks show where Hydro is faster, equal or slower than CPython
 (the latter documented, not hidden).
 
 ## P5 — Performance & JIT
 
 - [x] P5-01 Benchmarks vs. CPython/PyPy/Go (startup time, throughput, memory).
-      Readiness matrix `benchmarks/PYX.md`; PyX micro harness and baseline
-      (`benchmarks/pyx/results/latest.{json,md}`) cover throughput, RSS and
+      Readiness matrix `benchmarks/HYD.md`; Hydro micro harness and baseline
+      (`benchmarks/hydro/results/latest.{json,md}`) cover throughput, RSS and
       build/startup time, incl. comprehensions, map/filter, lambda calls,
       reduce, math loop, JSON dumps/loads and thread/process/pool scaling.
-      `benchmarks/bench_pyx.py` runs 11 workloads (incl. lazy generator sum
-      and async `gather`) under CPython/JIT/AOT and is registered as `pyx` in
+      `benchmarks/bench_hydro.py` runs 11 workloads (incl. lazy generator sum
+      and async `gather`) under CPython/JIT/AOT and is registered as `hydro` in
       `bench_all.py`. `benchmarks/compare_engines.py` compares loop and
-      startup under CPython/PyX/PyPy/Go (Go = equivalent compiled native
+      startup under CPython/Hydro/PyPy/Go (Go = equivalent compiled native
       reference) with output validation; missing engines are reported as
       skipped, so PyPy numbers require an installed PyPy. Memory/RSS is
-      measured by the PyX micro harness; cross-engine RSS is not claimed.
-- [ ] P5-01a PyX adapter: run the existing `bench_*.py` with PyX as the implementation
-      (subprocess/`PYX_BIN`), without modifying the user harnesses.
-      Delivered: micro harness `benchmarks/pyx/run_micro.py` (CPython/JIT/AOT),
-      `benchmarks/bench_pyx.py` (same pure Python workloads under three
+      measured by the Hydro micro harness; cross-engine RSS is not claimed.
+- [ ] P5-01a Hydro adapter: run the existing `bench_*.py` with Hydro as the implementation
+      (subprocess/`HYDRO_BIN`), without modifying the user harnesses.
+      Delivered: micro harness `benchmarks/hydro/run_micro.py` (CPython/JIT/AOT),
+      `benchmarks/bench_hydro.py` (same pure Python workloads under three
       runners) and `compare_engines.py` (equivalent loop/startup scripts).
-      Program: a `PYX_BIN` adapter that runs `bench_loops.py`, `bench_csv.py`,
-      `bench_startup.py` and `bench_request_handling.py` unchanged with PyX.
+      Program: a `HYDRO_BIN` adapter that runs `bench_loops.py`, `bench_csv.py`,
+      `bench_startup.py` and `bench_request_handling.py` unchanged with Hydro.
       Acceptance: each harness produces validated output through the adapter;
-      missing `PYX_BIN` is a skip, not a fabricated number.
+      missing `HYDRO_BIN` is a skip, not a fabricated number.
 - [ ] P5-01b Benchmark readiness per benchmark: loops (comprehensions/lambdas/
       builtins), csv (modules/IO/with), startup (AOT/JIT subprocess),
       request (async/socket/json), fastapi (framework/C API).
-      Delivered: matrix in `benchmarks/PYX.md`; loops and startup (JIT/AOT)
+      Delivered: matrix in `benchmarks/HYD.md`; loops and startup (JIT/AOT)
       measurable; csv rows documented. Program: request needs non-blocking I/O
       (P7-17/P2-13); fastapi needs decorators + C API (P4-02/P4-04c) and the
       adapter from P5-01a. Acceptance: every matrix row has a measured,
-      output-validated CPython/PyX result or an explicit blocker with the
+      output-validated CPython/Hydro result or an explicit blocker with the
       blocking item.
-- [x] P5-01c CI regression thresholds + baseline artifacts for PyX.
-      Baseline artifacts + `benchmarks/pyx/thresholds.json` +
+- [x] P5-01c CI regression thresholds + baseline artifacts for Hydro.
+      Baseline artifacts + `benchmarks/hydro/thresholds.json` +
       `scripts/check_benchmarks.py` (`--check`/`--update`) as a local/release
       gate; `bench_all.py` resolves its output directory absolutely, AOT
       builds are excluded from the measured runs and deviating outputs result
       in exit code 1. Q-06 is resolved as local enforcement plus a
       non-blocking CI report and deterministic harness self-tests.
 - [x] P5-01e Parallel benchmarks (after P2-20): threads/processes, scaling,
-      startup cost, memory; CPython/PyX comparison.
+      startup cost, memory; CPython/Hydro comparison.
       `threads_serial`, `threads_parallel`, `pool_serial`, `pool_parallel`,
       `pool_map`, `process_queue` (JIT/AOT/CPython, RSS/startup time).
 - [ ] P5-02 PGO + LTO for AOT. (`lto = "thin"` is set in the profile;
@@ -629,7 +629,7 @@ ecosystem benchmarks show where PyX is faster, equal or slower than CPython
       Delivered: constant folding (int/float/str/binops/comparisons/unary,
       overflow- and zero-division-protected), dead `if`/`while False`, typed
       int fast paths (`+`/`-`/`*`, comparisons, AugAssign, fully int-typed
-      `for range` counters; checked overflow → `pyx_binop` slow path), native
+      `for range` counters; checked overflow → `hydro_binop` slow path), native
       module dispatch through a thread-local spec cache, and the
       register-only x86_64 fiber switch. Measured (release, n=200000):
       `math_loop` parity (AOT 1.01x, JIT 0.94x), while_sum 7.7x/12.4x,
@@ -640,8 +640,8 @@ ecosystem benchmarks show where PyX is faster, equal or slower than CPython
       claim without a tracked result.
 - [ ] P5-04 GC tuning based on measurements (pauses, allocation rate).
       Delivered: growth-based threshold, relaxed-safepoint fast path,
-      edge barriers, concurrent sweep, `PYX_GC_STATS`, `gc_stats()`/
-      `GcStats` and `pyx gc [--json]` pause/mark/sweep times; dict hash
+      edge barriers, concurrent sweep, `HYDRO_GC_STATS`, `gc_stats()`/
+      `GcStats` and `tea gc [--json]` pause/mark/sweep times; dict hash
       index; fiber `ctx`/`caller_ctx` lifetime roots; a fast non-cryptographic
       address hasher and in-place sweep rebuild (300k-short-lived-list AOT:
       44.95 → 40.91 ms median, ≈9%). Program: pause/allocation-rate targets
@@ -670,7 +670,7 @@ ecosystem benchmarks show where PyX is faster, equal or slower than CPython
       remain open.
 - [ ] Q-04 Fuzzing: runtime/GC (allocation/object operations).
       Delivered: deterministic ABI operation-sequence fuzz smoke in
-      `crates/pyx-runtime/tests/fuzz_smoke.rs`; cargo-fuzz targets remain
+      `crates/hydro-runtime/tests/fuzz_smoke.rs`; cargo-fuzz targets remain
       open.
 - [ ] Q-05 Security review of `unsafe` code; policy in ARCHITECTURE.md.
       `unsafe` is encapsulated and justified in GC/ABI; formal review open.
@@ -696,10 +696,10 @@ ecosystem benchmarks show where PyX is faster, equal or slower than CPython
 
 ## P6 — Polishing & developer experience (cargo-like)
 
-Goal: `pyx` should feel like a single, complete tool — not like
+Goal: `tea` should feel like a single, complete tool — not like
 a collection of scripts. Errors are first-class products, not an afterthought.
 
-- [x] P6-01 First-class diagnostics: stable codes (`PYXnnnn`), spans,
+- [x] P6-01 First-class diagnostics: stable codes (`HYDnnnn`), spans,
   source snippets with carets, help/hints (did-you-mean), multiple errors,
   summary and consistent exit codes.
       Codes/spans/snippets/help/summary/exit codes are implemented; semantic
@@ -713,11 +713,11 @@ a collection of scripts. Errors are first-class products, not an afterthought.
   binary; clear help, `--verbose`/`--quiet`, `--color`.
       All named subcommands, help, `--color`/`--json`, global/per-command
       `--verbose`/`--quiet` (conflict → exit 2) and defined exit codes are
-      implemented and covered in `crates/pyx-cli/tests/e2e.rs`.
-- [x] P6-04 Build cache & incremental builds (`.pyx/cache`), cache
+      implemented and covered in `tea/tests/e2e.rs`.
+- [x] P6-04 Build cache & incremental builds (`.hydro/cache`), cache
   invalidation via source + flags + runtime version.
       Owned by P3-04: cache incl. module tree fingerprint, compiler
-      fingerprint, `--no-cache`, `pyx clean` and hit/invalidation tests.
+      fingerprint, `--no-cache`, `tea clean` and hit/invalidation tests.
       Reproducible binaries are P3-05.
 - [x] P6-05 ICE handling: internal panics as `internal compiler error` with
   version/target/hint, exit code 2, `RUST_BACKTRACE` hint; no panics
@@ -725,16 +725,16 @@ a collection of scripts. Errors are first-class products, not an afterthought.
       `catch_unwind` + ICE banner are covered by
       `main.rs::panic_maps_to_an_ice_without_the_payload`; the payload is
       never printed.
-- [x] P6-06 Project scaffolding/templates (`pyx new`, `pyx init`) so that a
+- [x] P6-06 Project scaffolding/templates (`tea new`, `tea init`) so that a
   project is ready to go without third-party tools; `pyproject.toml` compatibility.
       Scaffold (`main.py`, `pyproject.toml`, `.gitignore`) with `--force`
       policy; `pyproject.toml` remains uv-compatible.
 - [x] P6-07 Shell completions, manpage, `--version --verbose` (target,
   Cranelift, runtime version).
-      `pyx completions <bash|zsh|fish>` emits complete scripts;
-      `docs/pyx.1` is the roff manpage; `pyx --version --verbose` prints
+      `tea completions <bash|zsh|fish>` emits complete scripts;
+      Tea's `docs/tea.1` is the roff manpage; `tea --version --verbose` prints
       version, target, backend and runtime version. Tests in
-      `crates/pyx-cli/tests/completions.rs`.
+      `tea/tests/completions.rs`.
 - [x] P6-08 Diagnostic regression tests: codes, spans, JSON schema, colors/
   TTY behavior, exit codes, ICE path.
       E2E covers human/JSON/color/doctor/caret/syntax code, the multi-character
@@ -742,12 +742,12 @@ a collection of scripts. Errors are first-class products, not an afterthought.
       classification unit test.
 - [ ] P6-09 Documentation: CLI reference, diagnostic catalog, troubleshooting guide,
   migration from CPython.
-      Delivered: `docs/DIAGNOSTICS.md` (codes, spans, JSON schema, CLI flags,
-      exit codes) and the `docs/pyx.1` CLI reference. Program: a troubleshooting
+      Delivered: `docs/DIAGNOSTICS.md` (codes, spans, JSON schema) and the
+      Tea `docs/tea.1` CLI reference. Program: a troubleshooting
       section (common failures → checks) and a CPython migration scope
       (supported subset, known deviations, where each is tracked). Acceptance:
-      every documented command/flag matches `pyx --help`; every emitted
-      `PYXnnnn` code appears in the catalog; a reader can migrate a small
+      every documented command/flag matches `tea --help`; every emitted
+      `HYDnnnn` code appears in the catalog; a reader can migrate a small
       CPython script without consulting source.
 - [ ] P6-10 Build feedback: timing, `--verbose`, progress, exit-code summary.
       Delivered: `--verbose` phase timings and cache decisions for `run` and
@@ -758,12 +758,12 @@ a collection of scripts. Errors are first-class products, not an afterthought.
       matches the process status.
 
 **Acceptance P6:** a user can initialize, build, run and diagnose a project with
-`pyx` without knowing other tools; every error class has a
+`tea` without knowing other tools; every error class has a
 code, span, help and stable exit code; `--json` is documented and tested.
 
 ## P7 — Standard library
 
-Goal: the CPython 3.14.9 standard library works on the PyX runtime —
+Goal: the CPython 3.14.9 standard library works on the Hydro runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
 from it). Status 2026-10-26: **63/297 modules importable**, **234 failed**
@@ -772,17 +772,17 @@ including 9 modules where CPython 3.14.9 itself fails on this host.
 
 The package/site-packages loader (P7-01) is in place: packages with
 `__init__.py`, dotted names, submodules and relative imports resolve through
-sibling files, the package-chain root, `PYX_SITE_PACKAGES`, the
+sibling files, the package-chain root, `HYDRO_SITE_PACKAGES`, the
 `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages trees and `PYTHONPATH`.
 Imported module bodies run once as initializers, and nested imports stay
 deferred. No native `rich` is shipped: the official pure-Python `rich`
 distribution is resolved through this loader.
 
-**`bench_all.py` under PyX: green at the default GC threshold.** Rich
+**`bench_all.py` under Hydro: green at the default GC threshold.** Rich
 `console`/`table`/`panel`/`rule` rendering works, native Thread subclassing
 and zero-argument `super().__init__` are supported, and a native
 `rich.status.Status` shim covers `Console.status`. The report renders without
-raising `PYX_GC_THRESHOLD`; precise roots fixed the former live-value loss.
+raising `HYDRO_GC_THRESHOLD`; precise roots fixed the former live-value loss.
 
 Acceptance: 297/297 modules accounted for on CPython 3.14.9 — every module
 is either importable **and** green in its CPython `Lib/test/test_*.py`
@@ -799,7 +799,7 @@ goal P4-09; P4-09 keeps the policy and the dependency on P4-03/P4-04.
       dotted and relative imports, `sys.path`/`sys.modules` handling,
       namespace packages, frozen modules and circular imports. Depends on P4-03.
       **Delivered:** packages (dotted names, submodules, relative imports),
-      the search path (sibling files, package-chain root, `PYX_SITE_PACKAGES`,
+      the search path (sibling files, package-chain root, `HYDRO_SITE_PACKAGES`,
       `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages, `PYTHONPATH`), load-once per
       canonical path, cycle diagnostics for module-level import cycles, and
       imported module bodies as one-time initializers.
@@ -810,7 +810,7 @@ goal P4-09; P4-09 keeps the policy and the dependency on P4-03/P4-04.
       inspected; `from pkg import *` honors `__all__`.
 - [ ] P7-02 Pure-Python stdlib source and shim pipeline: consume the CPython
       3.14 stdlib tree unmodified (PSF license, optional sysroot), resolve
-      imports through PyX shims, never fork sources; per-module provenance
+      imports through Hydro shims, never fork sources; per-module provenance
       and drift checks against the pinned 3.14.9 tree.
 - [ ] P7-03 Builtin/frozen native shims: `builtins`, `sys`, `_imp`,
       `_frozen_importlib*`, `_warnings`, `_weakref`, `_collections`,
@@ -833,7 +833,7 @@ goal P4-09; P4-09 keeps the policy and the dependency on P4-03/P4-04.
       their CPython test subsets.
 - [ ] P7-05 Per-module CPython test integration: map every module to its
       `Lib/test/test_*.py` subset, run it through the P4-01 differential
-      harness, record `pyx_pass`/`expected_fail` only from real runs, and
+      harness, record `hydro_pass`/`expected_fail` only from real runs, and
       fail the gate on regressions.
       Delivered: the differential harness, manifest and `--check-manifest`
       gate exist, and `scripts/stdlib_compat.py --tests` is the hook.
@@ -859,7 +859,7 @@ ledger below is the per-layer checklist that tracks the actual work.
 The benchmark-critical batch (P7-22) owns `tempfile`, `shutil` and `textwrap`;
 its `subprocess` and `timeit` members are counted in Batches D/F.
 Batch acceptance (applies to every `[ ]` batch): each listed module imports
-through `pyx`, its representative API matches CPython 3.14.9, and its mapped
+through `tea`, its representative API matches CPython 3.14.9, and its mapped
 `Lib/test/test_*.py` subset (P7-05) is green — or the module is explicitly
 listed as unsupported with a reason.
 
@@ -877,11 +877,11 @@ listed as unsupported with a reason.
       `S_IS*`, `filemode`; `_operator`, `_functools`, `_io` re-export
       the `operator` surface, `reduce` and `open`.
       **Delivered:** stdlib specs
-      (`crates/pyx-ir/src/stdlib/`), runtime dispatch and submodule
-      declarations (`crates/pyx-runtime/src/modules/`), native
+      (`crates/hydro-ir/src/stdlib/`), runtime dispatch and submodule
+      declarations (`crates/hydro-runtime/src/modules/`), native
       implementations, and the CLI regression
-      `crates/pyx-cli/tests/stdlib_batch_a.rs`.
-      Acceptance: all 11 modules import through `pyx`; a
+      `tea/tests/stdlib_batch_a.rs`.
+      Acceptance: all 11 modules import through `tea`; a
       representative API call matches CPython 3.14.9 (bisect
       insertion points, heap pop ordering, HLS/HSV round-trips,
       `filemode` strings, `operator.add`/`functools.reduce`/
@@ -995,14 +995,14 @@ listed as unsupported with a reason.
       `benchmarks/bench_all.py` and the bench scripts: `subprocess`,
       `tempfile`, `shutil`, `textwrap`, `timeit`.
       Delivered: all five import and their benchmark-used APIs pass under
-      CPython; `bench_all.py` completes under PyX when `PYX_GC_THRESHOLD` is
+      CPython; `bench_all.py` completes under Hydro when `HYDRO_GC_THRESHOLD` is
       raised (official pure-Python `rich` renders console/table/panel/rule, a
       native `rich.status.Status` shim provides the progress context manager,
-      and the AOT report is written). `bench_pyx.py` runs under CPython and
-      drives `pyx run`/`pyx build` over embedded workloads.
-      Program: the full `bench_all.py` completes under PyX at the **default**
-      GC threshold. Acceptance: `pyx run benchmarks/bench_all.py` without
-      `PYX_GC_THRESHOLD` writes the complete report; the fix belongs to
+      and the AOT report is written). `bench_hydro.py` runs under CPython and
+      drives `tea infuse`/`tea build` over embedded workloads.
+      Program: the full `bench_all.py` completes under Hydro at the **default**
+      GC threshold. Acceptance: `tea infuse benchmarks/bench_all.py` without
+      `HYDRO_GC_THRESHOLD` writes the complete report; the fix belongs to
       P2-06/P2-07 precise roots, not to a threshold workaround.
 
 - [ ] P7-21 Batch L — 13 modules: platform-specific modules. The 8
@@ -1023,7 +1023,7 @@ entries are the import/API slices delivered by Batches A/B/benchmark, the
 native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
 `importlib`/`__future__` modules, and `html`/`contextlib`. `[!]`
 marks a module CPython ships only for a
-platform PyX does not target on this host (Windows/Apple), tracked as
+platform Hydro does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
 Current matrix: 63/297 importable, 234 failed (39 builtin/frozen, 129 pure,
@@ -1325,7 +1325,7 @@ generated compatibility matrix must show the same status and counts.
 
 - R1: C-API/ABI compatibility is the biggest cost driver (PLAN.md §3).
   The environment is unblocked (CPython 3.14 dev files) and the decision is
-  option B (PyX-native ABI layer, no `libpython`); the remaining risk is the
+  option B (Hydro-native ABI layer, no `libpython`); the remaining risk is the
   full 3.14 `PyTypeObject`/refcount/GC/GIL surface required by NumPy and
   `pydantic-core`.
 - R2: tagged-int fast path plus BigInt promotion is implemented; remaining native i64 boundaries are documented.

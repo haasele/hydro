@@ -1,9 +1,9 @@
-# PyX — Strategy and Plan
+# Hydro — Strategy and Plan
 
 ## Strategy
 
-PyX is a standalone Python runtime with its own compiler and toolchain —
-conceptually Bun for Python: one command (`pyx run main.py`) handles
+Hydro is a standalone Python runtime with its own compiler and toolchain —
+conceptually Bun for Python: one command (`tea infuse main.py`) handles
 compilation, execution and dependency management. CPython is not the default
 runtime, but Python compatibility is a first-class, permanent goal.
 
@@ -73,12 +73,12 @@ counts are in [`AGENTS.md`](AGENTS.md#current-state). The gate is
   cache, uv passthrough. Open: uv interpreter injection, reproducible builds,
   packaging.
 - **Phase 4 — unblocked; option B.** CPython 3.14.9 is the pinned oracle; the
-  CPython C API/ABI is implemented on PyX objects without `libpython` in
+  CPython C API/ABI is implemented on Hydro objects without `libpython` in
   production (first abi3 slice works). The stdlib/ecosystem program is P4-01…
   P4-12 and the executable module batches P7; see [`docs/C_API.md`](docs/C_API.md)
   and [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md).
 - **Phase 5 — baseline in place.** Micro harness, tracked baseline, local
-  threshold gate and CPython/PyX/PyPy/Go engine comparison. Open: inlining/
+  threshold gate and CPython/Hydro/PyPy/Go engine comparison. Open: inlining/
   escape analysis, PGO, GC tuning after precise roots.
 - **Phase 6 — diagnostics largely done.** Stable codes, spans, snippets,
   `--json`, `--verbose`/`--quiet`, CLI/diagnostic references. Open:
@@ -86,9 +86,9 @@ counts are in [`AGENTS.md`](AGENTS.md#current-state). The gate is
 
 ## Compatibility Targets and LTS
 
-PyX pins conformance to one CPython patch release at a time; the current
+Hydro pins conformance to one CPython patch release at a time; the current
 target is **CPython 3.14.9**. 3.13 is security-only and 3.15 is newer than the
-oracle. The target is defined once in `pyx_ir::compat` and surfaces through
+oracle. The target is defined once in `hydro_ir::compat` and surfaces through
 `sys.version`/`sys.version_info`, `platform.python_version()`,
 `--version --verbose`, wheel tags and the test harnesses.
 
@@ -104,7 +104,7 @@ declared now; pre-production releases track the moving 3.14.x target (P4-12).
 ## Risks and Open Decisions
 
 - **C-API/ABI compatibility** is the largest cost driver; option B preserves
-  the PyX startup/GC advantages, but the full `PyTypeObject`/refcount/GC/GIL
+  the Hydro startup/GC advantages, but the full `PyTypeObject`/refcount/GC/GIL
   surface for NumPy and `pydantic-core` remains (P4-04c/d).
 - **Precise GC roots** cover generated frames/arrays and strict mode; the
   remaining risk is native Rust owners that hold tagged locals across

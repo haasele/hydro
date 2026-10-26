@@ -1,4 +1,4 @@
-s = "Py" + "X"
+s = "Hy" + "dro"
 print(s)
 print(len(s))
 print("n=" + str(42))

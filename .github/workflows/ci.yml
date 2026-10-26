@@ -19,7 +19,7 @@ env:
 
 jobs:
   verify:
-    name: fmt, clippy, test, e2e
+    name: fmt, clippy, tests, fuzz, manifest
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -48,11 +48,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Tests
-        run: cargo test --workspace
-
-      - name: CPython gate manifest
-        run: python3 scripts/cpython_compat.py --check-manifest
+      - name: Hydro gate (tests, fuzz smoke, manifest)
+        run: ./scripts/verify.sh
 
       - name: Harness self-tests
         run: python3 scripts/test_check_benchmarks.py
@@ -63,9 +60,6 @@ jobs:
       - name: Benchmark threshold report (non-blocking)
         continue-on-error: true
         run: python3 scripts/check_benchmarks.py --check -v
-
-      - name: Full gate (E2E, AOT, GC)
-        run: ./scripts/verify.sh
 
   # Bounded fuzz smoke (P2-20f): every target runs for a small fixed budget and
   # a crash fails the job. The 24 h campaign is a manual/local run; see the

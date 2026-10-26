@@ -1,17 +1,17 @@
-# PyX — Architecture
+# Hydro — Architecture
 
 As of: **2026-10-25**. Phase 1 is complete; Phase 2 is largely
 implemented (current test counts and breakdown: [`AGENTS.md`](../AGENTS.md#current-state);
 `scripts/verify.sh` ALL GREEN). This document is
 the **normative contract** between the crates. Changes to ABI/IR only with an
 update of this document and of all consumers. The C API decision (P4-04,
-option B: PyX-native ABI layer without `libpython`) and its gates are
+option B: Hydro-native ABI layer without `libpython`) and its gates are
 documented in [`C_API.md`](C_API.md).
 
 ## 1. Vision
 
-PyX is a standalone Python runtime with an AOT compiler and toolchain
-(`pyx`), conceptually Bun for Python. CPython is not the standard runtime.
+Hydro is a standalone Python runtime with an AOT compiler and toolchain
+(`tea`), conceptually Bun for Python. CPython is not the standard runtime.
 One goal is broad Python compatibility, initially via a clearly
 defined subset (see `docs/TODO.md`).
 
@@ -34,21 +34,21 @@ and `docs/TODO.md`.
 Source .py (+ imported modules and packages)
   │  rustpython-parser (Python grammar, AST)
   ▼
-pyx-frontend ── Lowering ──► typed IR (pyx-ir) ──► pyx-codegen
+hydro-frontend ── Lowering ──► typed IR (hydro-ir) ──► hydro-codegen
   │ Type checking/inference                      │
-  ▼                                              ├─ JIT (pyx run)
-Diagnostics (file:line:col)                      └─ Object + cc link (pyx build)
+  ▼                                              ├─ JIT (tea infuse)
+Diagnostics (file:line:col)                      └─ Object + cc link (tea build)
                                                         │
-                                                  pyx-runtime (libpyx_runtime.a, C ABI)
+                                                  hydro-runtime (libhydro_runtime.a, C ABI)
 ```
 
 | Crate | Responsibility | Dependencies |
 |---|---|---|
-| `pyx-ir` | Typed HIR; the only frontend↔codegen contract; central stdlib specification | – |
-| `pyx-frontend` | Parsing, module loader/imports, lowering, type inference, diagnostics | `pyx-ir`, `rustpython-parser` |
-| `pyx-runtime` | Value model, operators, builtins, exceptions, GC, file I/O, modules, concurrency; `rlib` + `staticlib` | `regex` et al. |
-| `pyx-codegen` | Cranelift codegen, JIT and AOT path | `pyx-ir`, `pyx-runtime`, Cranelift |
-| `pyx-cli` | `pyx` binary (project, compiler, tests, formatter, lint, uv passthrough) | `pyx-frontend`, `pyx-codegen` |
+| `hydro-ir` | Typed HIR; the only frontend↔codegen contract; central stdlib specification | – |
+| `hydro-frontend` | Parsing, module loader/imports, lowering, type inference, diagnostics | `hydro-ir`, `rustpython-parser` |
+| `hydro-runtime` | Value model, operators, builtins, exceptions, GC, file I/O, modules, concurrency; `rlib` + `staticlib` | `regex` et al. |
+| `hydro-codegen` | Cranelift codegen, JIT and AOT path | `hydro-ir`, `hydro-runtime`, Cranelift |
+| **Tea** (external) | CLI/toolchain repository: project commands, pytest, REPL, AOT packaging, uv passthrough | `hydro-frontend`, `hydro-codegen`, `hydro-runtime`, `hydro-interp` |
 
 ### 2.1 Directory Layout
 
@@ -56,21 +56,21 @@ Since the completion slice the crates are internally split into thematic directo
 (full tree in [`LAYOUT.md`](LAYOUT.md)):
 
 ```
-crates/pyx-ir/src/{model.rs, ir.rs, stdlib/}
-crates/pyx-frontend/src/{lib.rs, diag.rs, lower/, sema/}
-crates/pyx-codegen/src/{lib.rs, backend/, lower/}
-crates/pyx-runtime/src/{abi.rs, core/, gc/, modules/, concurrency/, support/, csv.rs}
-crates/pyx-cli/src/{main.rs, cli/, cli/commands/}
+crates/hydro-ir/src/{model.rs, ir.rs, stdlib/}
+crates/hydro-frontend/src/{lib.rs, diag.rs, lower/, sema/}
+crates/hydro-codegen/src/{lib.rs, backend/, lower/}
+crates/hydro-runtime/src/{abi.rs, core/, gc/, modules/, concurrency/, support/, csv.rs}
+../tea/src/{main.rs, cli/, cli/commands/}   (external toolchain)
 ```
 
-`pyx-ir` remains logic-free (contract structures + type tables). Runtime code
-lives exclusively in `pyx-runtime`; `pyx-codegen` only calls
-`pyx_runtime::abi` symbols.
+`hydro-ir` remains logic-free (contract structures + type tables). Runtime code
+lives exclusively in `hydro-runtime`; `hydro-codegen` only calls
+`hydro_runtime::abi` symbols.
 
 ## 3. Runtime ABI (Normative)
 
-All values are `i64` (`PyxValue`). All functions are `extern "C"`,
-`#[no_mangle]`, in the `pyx_runtime::abi` module, and **must not** panic
+All values are `i64` (`HydroValue`). All functions are `extern "C"`,
+`#[no_mangle]`, in the `hydro_runtime::abi` module, and **must not** panic
 (user error → pending exception; internal error → `process::abort`).
 
 ### 3.1 Tagging
@@ -79,7 +79,7 @@ All values are `i64` (`PyxValue`). All functions are `extern "C"`,
 |---|---|
 | `000` | `int`: value = `v >> 3` (arithmetic, i64) |
 | `001` | Special: `None = 1`, `False = 9`, `True = 17` (payload `0/1/2`) |
-| `010` | Heap pointer: `ptr = v & !7`, points to `PyxObj` |
+| `010` | Heap pointer: `ptr = v & !7`, points to `HydroObj` |
 | Rest | reserved |
 
 Ints, bools and None are immediates; floats/strings/containers/native objects
@@ -109,8 +109,8 @@ Object kinds (stable `kind` values):
 
 Kinds 32–37 (`ExtFunction`, `Capsule`, `Module`, `StdStream`, `BigInt`,
 `Cell`) were added after this table. Kind 38 is `StrBuilder`, the internal
-mutable string accumulator created by `pyx_str_builder_new`: it appends in
-place for a proved `s += ...` loop and `pyx_str_builder_finish` returns a
+mutable string accumulator created by `hydro_str_builder_new`: it appends in
+place for a proved `s += ...` loop and `hydro_str_builder_finish` returns a
 normal `str`, so it never reaches user code.
 
 Lists/dicts/sets are insertion-ordered (sets deterministically; Python
@@ -124,177 +124,177 @@ context is a callee-saved register frame, otherwise a `ucontext_t`.
 ### 3.2 Symbols
 
 ```c
-i64  pyx_none(void);                  // constant 1
-i64  pyx_true(void);                  // 17
-i64  pyx_false(void);                 // 9
-i64  pyx_bool(i64 b);                 // Truthiness -> True/False
-i64  pyx_int(i64 v);                  // identity (range check)
-i64  pyx_str_new(const uint8_t* ptr, size_t len);   // copies UTF-8
-i64  pyx_str_builder_new(i64 init);   // mutable accumulator, seeded with init
-i64  pyx_str_builder_append(i64 builder, i64 value);
+i64  hydro_none(void);                  // constant 1
+i64  hydro_true(void);                  // 17
+i64  hydro_false(void);                 // 9
+i64  hydro_bool(i64 b);                 // Truthiness -> True/False
+i64  hydro_int(i64 v);                  // identity (range check)
+i64  hydro_str_new(const uint8_t* ptr, size_t len);   // copies UTF-8
+i64  hydro_str_builder_new(i64 init);   // mutable accumulator, seeded with init
+i64  hydro_str_builder_append(i64 builder, i64 value);
                                       // builder + value, appends a str in place
-i64  pyx_str_builder_finish(i64 builder);  // accumulated text as a str
-i64  pyx_bytes_new(const uint8_t* ptr, size_t len);
-i64  pyx_bytes_build(uint64_t argc, const i64* argv); // bytes(...)
-i64  pyx_float_new(double f);
-i64  pyx_math_floor_sqrt_int(i64 value); // floor(sqrt(int)) fast/error path
-i64  pyx_bigint_from_str(const uint8_t* ptr, size_t len); // decimal literal
-i64  pyx_binop(uint32_t op, i64 a, i64 b);          // incl. comparisons
-i64  pyx_unop(uint32_t op, i64 a);
-i64  pyx_truthy(i64 v);               // 1 if truthy, 0 if falsy (C style)
-i64  pyx_print(uint64_t argc, const i64* argv);     // space-separated + '\n'
-i64  pyx_len(i64 v);
-i64  pyx_to_str(i64 v);
-i64  pyx_to_repr(i64 v);                            // repr(v)
-i64  pyx_hash(i64 v);                              // hash(v)
-i64  pyx_to_int(i64 v);
-i64  pyx_to_float(i64 v);
-i64  pyx_abs(i64 v);
-i64  pyx_all(i64 iterable);                         // all(): True/False
-i64  pyx_format_value(i64 value, const uint8_t* spec, size_t spec_len,
+i64  hydro_str_builder_finish(i64 builder);  // accumulated text as a str
+i64  hydro_bytes_new(const uint8_t* ptr, size_t len);
+i64  hydro_bytes_build(uint64_t argc, const i64* argv); // bytes(...)
+i64  hydro_float_new(double f);
+i64  hydro_math_floor_sqrt_int(i64 value); // floor(sqrt(int)) fast/error path
+i64  hydro_bigint_from_str(const uint8_t* ptr, size_t len); // decimal literal
+i64  hydro_binop(uint32_t op, i64 a, i64 b);          // incl. comparisons
+i64  hydro_unop(uint32_t op, i64 a);
+i64  hydro_truthy(i64 v);               // 1 if truthy, 0 if falsy (C style)
+i64  hydro_print(uint64_t argc, const i64* argv);     // space-separated + '\n'
+i64  hydro_len(i64 v);
+i64  hydro_to_str(i64 v);
+i64  hydro_to_repr(i64 v);                            // repr(v)
+i64  hydro_hash(i64 v);                              // hash(v)
+i64  hydro_to_int(i64 v);
+i64  hydro_to_float(i64 v);
+i64  hydro_abs(i64 v);
+i64  hydro_all(i64 iterable);                         // all(): True/False
+i64  hydro_format_value(i64 value, const uint8_t* spec, size_t spec_len,
                       uint8_t conversion);          // f-string field
-i64  pyx_list_new(uint64_t argc, const i64* items);
-i64  pyx_dict_new(uint64_t argc, const i64* keys, const i64* values);
-i64  pyx_tuple_new(uint64_t argc, const i64* items);
-i64  pyx_unpack(i64 value, uint64_t expected);      // None or ValueError
-i64  pyx_set_new(uint64_t argc, const i64* items);
-i64  pyx_set_from(i64 iterable);
-i64  pyx_range_new(i64 start, i64 stop, i64 step);  // step != 0
-i64  pyx_unpack_seq(i64 value, uint64_t expected);
+i64  hydro_list_new(uint64_t argc, const i64* items);
+i64  hydro_dict_new(uint64_t argc, const i64* keys, const i64* values);
+i64  hydro_tuple_new(uint64_t argc, const i64* items);
+i64  hydro_unpack(i64 value, uint64_t expected);      // None or ValueError
+i64  hydro_set_new(uint64_t argc, const i64* items);
+i64  hydro_set_from(i64 iterable);
+i64  hydro_range_new(i64 start, i64 stop, i64 step);  // step != 0
+i64  hydro_unpack_seq(i64 value, uint64_t expected);
                                     // sequence to bind (fresh list if needed)
-i64  pyx_unpack_star(i64 value, uint64_t before, uint64_t after);
+i64  hydro_unpack_star(i64 value, uint64_t before, uint64_t after);
                                     // a, *rest, b = value: fresh list with
                                     // slot `before` holding the middle list
-i64  pyx_list_from(i64 iterable);
-i64  pyx_tuple_from(i64 iterable);  // tuple(iterable)
-i64  pyx_dict_from(i64 iterable);
-i64  pyx_sum(i64 iterable, i64 start);
-i64  pyx_enumerate(i64 iterable, i64 start);
-i64  pyx_zip(uint64_t argc, const i64* iterables);
-i64  pyx_list_append(i64 list, i64 value);          // None or error
-i64  pyx_set_add(i64 set, i64 value);
-i64  pyx_dict_set(i64 dict, i64 key, i64 value);
-i64  pyx_dict_merge(i64 left, i64 right);           // {**left, **right} copy
-i64  pyx_function_new(const uint8_t* wrapper, uint64_t arity,
+i64  hydro_list_from(i64 iterable);
+i64  hydro_tuple_from(i64 iterable);  // tuple(iterable)
+i64  hydro_dict_from(i64 iterable);
+i64  hydro_sum(i64 iterable, i64 start);
+i64  hydro_enumerate(i64 iterable, i64 start);
+i64  hydro_zip(uint64_t argc, const i64* iterables);
+i64  hydro_list_append(i64 list, i64 value);          // None or error
+i64  hydro_set_add(i64 set, i64 value);
+i64  hydro_dict_set(i64 dict, i64 key, i64 value);
+i64  hydro_dict_merge(i64 left, i64 right);           // {**left, **right} copy
+i64  hydro_function_new(const uint8_t* wrapper, uint64_t arity,
                       const uint8_t* name, size_t name_len, uint32_t flags);
-i64  pyx_function_params(i64 fn, uint64_t count, const i64* names);
+i64  hydro_function_params(i64 fn, uint64_t count, const i64* names);
                                     // 2*count words [ptr, len, ...]:
                                     // user-visible positional parameter names
-i64  pyx_function_meta(i64 fn, i64 full_entry, uintptr_t count,
+i64  hydro_function_meta(i64 fn, i64 full_entry, uintptr_t count,
                        const i64* names, const i64* kinds,
                        const i64* defaults, const i64* default_flags);
                                     // names: [ptr,len] pairs; kinds
                                     // 0..3; definition-time defaults
-i64  pyx_call_kw(i64 fn, uintptr_t argc, const i64* argv,
+i64  hydro_call_kw(i64 fn, uintptr_t argc, const i64* argv,
                  uintptr_t kwargc, const i64* kw_argv);
-i64  pyx_builtin_function(const uint8_t* name, size_t name_len); // f = int
-i64  pyx_closure_new(const uint8_t* wrapper, uint64_t arity,
+i64  hydro_builtin_function(const uint8_t* name, size_t name_len); // f = int
+i64  hydro_closure_new(const uint8_t* wrapper, uint64_t arity,
                      const uint8_t* name, size_t name_len,
                      uint64_t capture_count, const i64* captures,
                      uint32_t flags);
-i64  pyx_cell_new(i64 value);      // mutable closure binding
-i64  pyx_cell_get(i64 cell);       // current value
-void pyx_cell_set(i64 cell, i64 value);  // publishes the GC edge
-i64  pyx_class_new(const uint8_t* name, size_t name_len, i64 base,
+i64  hydro_cell_new(i64 value);      // mutable closure binding
+i64  hydro_cell_get(i64 cell);       // current value
+void hydro_cell_set(i64 cell, i64 value);  // publishes the GC edge
+i64  hydro_class_new(const uint8_t* name, size_t name_len, i64 base,
                    uint64_t method_count, const i64* names, const i64* funcs,
                    const i64* kinds,
                    uint64_t attr_count, const i64* attr_names,
                    const i64* attr_values);
-i64  pyx_instance_new(i64 class);   // allocate without __init__
-i64  pyx_bind_class_kwargs(i64 mapping, const i64* names, uintptr_t count,
+i64  hydro_instance_new(i64 class);   // allocate without __init__
+i64  hydro_bind_class_kwargs(i64 mapping, const i64* names, uintptr_t count,
                            i64* slots, i64 kwarg_index,
                            const uint8_t* class_name, size_t class_len);
                                     // route **mapping into constructor slots
-i64  pyx_exception_class(uint32_t tag);  // cached native class, e.g. ValueError
-i64  pyx_call(i64 fn, uint64_t argc, const i64* argv);
-i64  pyx_call_star(i64 fn, uint64_t argc, const i64* argv, i64 star);
+i64  hydro_exception_class(uint32_t tag);  // cached native class, e.g. ValueError
+i64  hydro_call(i64 fn, uint64_t argc, const i64* argv);
+i64  hydro_call_star(i64 fn, uint64_t argc, const i64* argv, i64 star);
                             // fn(args..., *star); star is a list/tuple
-i64  pyx_map(i64 fn, i64 iterable);                 // materialized list
-i64  pyx_filter(i64 fn_or_none, i64 iterable);
-i64  pyx_module_call(const uint8_t* module, size_t module_len,
+i64  hydro_map(i64 fn, i64 iterable);                 // materialized list
+i64  hydro_filter(i64 fn_or_none, i64 iterable);
+i64  hydro_module_call(const uint8_t* module, size_t module_len,
                      const uint8_t* function, size_t function_len,
                      uint64_t argc, const i64* argv);
-i64  pyx_module_call_kw(const uint8_t* module, size_t module_len,
+i64  hydro_module_call_kw(const uint8_t* module, size_t module_len,
                         const uint8_t* function, size_t function_len,
                         uint64_t argc, const i64* argv,
                         uint64_t kwargc, const i64* kw_argv);
                                     // [name, value, ...]; only specs with
                                     // dynamic keywords (functools.partial)
-i64  pyx_module_get(const uint8_t* module, size_t module_len,
+i64  hydro_module_get(const uint8_t* module, size_t module_len,
                     const uint8_t* name, size_t name_len);
-i64  pyx_module_value(const uint8_t* module, size_t module_len);
-i64  pyx_deferred_import(const uint8_t* module, size_t module_len,
+i64  hydro_module_value(const uint8_t* module, size_t module_len);
+i64  hydro_deferred_import(const uint8_t* module, size_t module_len,
                          const uint8_t* member, size_t member_len);
                      // resolves an already-initialized module global when
                      // possible; otherwise raises RuntimeError
                      // (empty member = module alias)
-i64  pyx_global_get(const uint8_t* module, size_t module_len,
+i64  hydro_global_get(const uint8_t* module, size_t module_len,
                     const uint8_t* name, size_t name_len);
-i64  pyx_global_set(const uint8_t* module, size_t module_len,
+i64  hydro_global_set(const uint8_t* module, size_t module_len,
                     const uint8_t* name, size_t name_len, i64 value);
-i64  pyx_subscript(i64 obj, i64 index);
-i64  pyx_subscript_set(i64 obj, i64 index, i64 value);
-i64  pyx_slice(i64 obj, i64 start, i64 stop, i64 step);
-i64  pyx_slice_set(i64 obj, i64 start, i64 stop, i64 step, i64 value);
+i64  hydro_subscript(i64 obj, i64 index);
+i64  hydro_subscript_set(i64 obj, i64 index, i64 value);
+i64  hydro_slice(i64 obj, i64 start, i64 stop, i64 step);
+i64  hydro_slice_set(i64 obj, i64 start, i64 stop, i64 step, i64 value);
                      // list slice assignment; returns None, errors via pending
                      // exception
-i64  pyx_getattr(i64 obj, const uint8_t* name, size_t name_len); // data attribute
-i64  pyx_hasattr(i64 obj, const uint8_t* name, size_t name_len); // True/False
-i64  pyx_setattr(i64 obj, const uint8_t* name, size_t name_len, i64 value);
-i64  pyx_method(i64 obj, const uint8_t* name, size_t name_len,
+i64  hydro_getattr(i64 obj, const uint8_t* name, size_t name_len); // data attribute
+i64  hydro_hasattr(i64 obj, const uint8_t* name, size_t name_len); // True/False
+i64  hydro_setattr(i64 obj, const uint8_t* name, size_t name_len, i64 value);
+i64  hydro_method(i64 obj, const uint8_t* name, size_t name_len,
                 uint64_t argc, const i64* argv);
-i64  pyx_method_kw(i64 obj, const uint8_t* name, size_t name_len,
+i64  hydro_method_kw(i64 obj, const uint8_t* name, size_t name_len,
                    uint64_t argc, const i64* argv,
                    uint64_t kwargc, const i64* kw_argv); // [name, value, ...]
-i64  pyx_method_star(i64 obj, const uint8_t* name, size_t name_len,
+i64  hydro_method_star(i64 obj, const uint8_t* name, size_t name_len,
                      i64 star, uint64_t kwargc,
                      const i64* kw_argv);  // obj.m(*list_or_tuple, k=v)
-i64  pyx_iter_new(i64 obj);
-i64  pyx_iter_next(i64 iter, i64* out);             // 1=value, 0=end
-i64  pyx_iter(i64 obj);                             // iter(obj)
-i64  pyx_next(i64 obj, i64 default, i64 has_default); // next(obj[, default])
-i64  pyx_generator_new(const uint8_t* entry, uint64_t argc, const i64* argv);
-i64  pyx_coroutine_new(const uint8_t* entry, uint64_t argc, const i64* argv);
-i64  pyx_async_generator_new(const uint8_t* entry, uint64_t argc,
+i64  hydro_iter_new(i64 obj);
+i64  hydro_iter_next(i64 iter, i64* out);             // 1=value, 0=end
+i64  hydro_iter(i64 obj);                             // iter(obj)
+i64  hydro_next(i64 obj, i64 default, i64 has_default); // next(obj[, default])
+i64  hydro_generator_new(const uint8_t* entry, uint64_t argc, const i64* argv);
+i64  hydro_coroutine_new(const uint8_t* entry, uint64_t argc, const i64* argv);
+i64  hydro_async_generator_new(const uint8_t* entry, uint64_t argc,
                              const i64* argv);      // lazy async generator
-i64  pyx_yield(i64 value);                          // suspends the fiber
-i64  pyx_yield_from(i64 iterable);                  // delegates iteration
-i64  pyx_await(i64 value);                          // drives a coroutine
-i64  pyx_gc_collect(void);
-i64  pyx_gc_objects(void);
-void pyx_safepoint(void);
-void pyx_set_file(const uint8_t* ptr, size_t len);
-void pyx_set_line(uint32_t line);
-void pyx_frame_enter(const uint8_t* name, size_t len);
-void pyx_frame_leave(void);
-i64  pyx_exc_pending(void);
-i64  pyx_exc_tag(void);
-i64  pyx_exc_value(void);
-i64  pyx_exc_clear(void);
-i64  pyx_raise(uint32_t tag, i64 msg);
-i64  pyx_raise_msg(uint32_t tag, const uint8_t* p, size_t n);
-i64  pyx_raise_value(i64 exc);
-i64  pyx_raise_from(uint32_t tag, i64 msg, i64 cause);
-i64  pyx_raise_value_from(i64 exc, i64 cause);
-int  pyx_exc_matches(uint32_t handler_tag);
-i64  pyx_uncaught(void);
-void pyx_runtime_init(void);
-void pyx_register_function(const uint8_t* name, size_t name_len,
+i64  hydro_yield(i64 value);                          // suspends the fiber
+i64  hydro_yield_from(i64 iterable);                  // delegates iteration
+i64  hydro_await(i64 value);                          // drives a coroutine
+i64  hydro_gc_collect(void);
+i64  hydro_gc_objects(void);
+void hydro_safepoint(void);
+void hydro_set_file(const uint8_t* ptr, size_t len);
+void hydro_set_line(uint32_t line);
+void hydro_frame_enter(const uint8_t* name, size_t len);
+void hydro_frame_leave(void);
+i64  hydro_exc_pending(void);
+i64  hydro_exc_tag(void);
+i64  hydro_exc_value(void);
+i64  hydro_exc_clear(void);
+i64  hydro_raise(uint32_t tag, i64 msg);
+i64  hydro_raise_msg(uint32_t tag, const uint8_t* p, size_t n);
+i64  hydro_raise_value(i64 exc);
+i64  hydro_raise_from(uint32_t tag, i64 msg, i64 cause);
+i64  hydro_raise_value_from(i64 exc, i64 cause);
+int  hydro_exc_matches(uint32_t handler_tag);
+i64  hydro_uncaught(void);
+void hydro_runtime_init(void);
+void hydro_register_function(const uint8_t* name, size_t name_len,
                            const uint8_t* wrapper, size_t arity); // spawn/Pool
-int32_t pyx_spawn_child(void);        // child mode after exec (-1 = normal)
+int32_t hydro_spawn_child(void);        // child mode after exec (-1 = normal)
 ```
 
-`op` codes (`pyx_binop`): `0 Add, 1 Sub, 2 Mul, 3 Div, 4 FloorDiv, 5 Mod,
+`op` codes (`hydro_binop`): `0 Add, 1 Sub, 2 Mul, 3 Div, 4 FloorDiv, 5 Mod,
 6 Pow, 7 Eq, 8 Ne, 9 Lt, 10 Le, 11 Gt, 12 Ge, 13 In, 14 NotIn, 15 Is,
 16 IsNot, 17 BitAnd, 18 BitOr, 19 BitXor, 20 Shl, 21 Shr`.
-`pyx_unop`: `0 Neg, 1 Pos, 2 Not, 3 Invert` (`~` is int/bool only).
+`hydro_unop`: `0 Neg, 1 Pos, 2 Not, 3 Invert` (`~` is int/bool only).
 
-`flags` in `pyx_function_new`/`pyx_closure_new`: Bit 0 = `async`, Bit 1 =
+`flags` in `hydro_function_new`/`hydro_closure_new`: Bit 0 = `async`, Bit 1 =
 generator. If either of the bits is set, the generated wrapper calls
-`pyx_async_generator_new` (both bits), `pyx_coroutine_new` (async only) or
-`pyx_generator_new` (generator only); `argv` contains the captures followed
-by the call arguments. The fiber starts only on the first `pyx_iter_next`
-(generator), `pyx_await`/`asyncio.run` (coroutine) or
+`hydro_async_generator_new` (both bits), `hydro_coroutine_new` (async only) or
+`hydro_generator_new` (generator only); `argv` contains the captures followed
+by the call arguments. The fiber starts only on the first `hydro_iter_next`
+(generator), `hydro_await`/`asyncio.run` (coroutine) or
 `__anext__`/`asend` (async generator).
 
 Exception tags: `0 ValueError, 1 TypeError, 2 ZeroDivisionError,
@@ -306,7 +306,7 @@ Names are 1:1 as in Python; `IOError` is an alias for `OSError`.
 `except Exception` matches every tag except 5/11/19; `except BaseException`
 matches every tag. `raise`/`except` resolve tags from names directly, while
 an unqualified exception name used as a value lowers to
-`pyx_exception_class(tag)`, which returns one cached empty class object per
+`hydro_exception_class(tag)`, which returns one cached empty class object per
 tag. Explicit causes are stored on the exception and traced by the GC.
 
 **User exception classes are a documented limitation.** `class ReprError(
@@ -345,11 +345,11 @@ built-in kinds), so the fallback never matches a user handler.
   (`%s`, `%d`, `%f`, `%x`, flags/width/precision, `%%`, tuple arguments).
 - f-strings: `{expr}`, `{expr!s}`, `{expr!r}`, `{expr!a}` and format specs
   (`:.2f`, `:04d`, `:#x`, alignment/fill/sign/grouping).
-  Codegen calls `pyx_format_value`; conversion and spec are applied before
+  Codegen calls `hydro_format_value`; conversion and spec are applied before
   formatting. Invalid specs → `ValueError`, wrong types → `TypeError`.
 - `str.format(...)` supports positional/named fields, index/attribute
   paths and format specs. The spec logic lives centrally in
-  `pyx-runtime/src/core/format.rs` and is shared by f-strings, `str.format` and
+  `hydro-runtime/src/core/format.rs` and is shared by f-strings, `str.format` and
   `%`.
 - `bytes` (Phase 2.19): literals `b"..."`, `bytes()` constructor, indexing
   (int 0..255), slicing, iteration, `+`/`*`, comparisons/equality/hash,
@@ -407,13 +407,13 @@ built-in kinds), so the fallback never matches a user handler.
 #### Functions, Closures, Classes
 
 - Named functions and lambdas are values (`FunctionRef`); indirect calls
-  go through `pyx_call` (wrapper with argv). Lambdas are parameter-only; an
+  go through `hydro_call` (wrapper with argv). Lambdas are parameter-only; an
   access to outer names inside a lambda is a diagnostic.
 - Builtins are values as well: `f = int`, `map(f, xs)` etc. materialize
-  a `FunctionBody::Builtin` object via `pyx_builtin_function`.
+  a `FunctionBody::Builtin` object via `hydro_builtin_function`.
 - **Closures capture cells for mutable bindings** (Phase 2.39): a local
   that a nested function reads and that is assigned here (or through
-  `nonlocal`) lives in a heap `Cell` (`pyx_cell_new/get/set`). The outer
+  `nonlocal`) lives in a heap `Cell` (`hydro_cell_new/get/set`). The outer
   function reads and writes through the cell and the closure captures the
   cell value, so mutations are shared in both directions. Read-only
   captures keep by-value semantics, and a loop creates a fresh cell per
@@ -440,8 +440,8 @@ built-in kinds), so the fallback never matches a user handler.
   in order unless the class defines its own. `Name(...)` creates
   an instance and calls `__init__` (via the class/base chain) with the
   receiver selected by the method kind. Methods are resolved dynamically via
-  `pyx_method` by receiver type and class chain; attributes via
-  `pyx_getattr`/`pyx_setattr`. Instances expose `__class__`; classes expose
+  `hydro_method` by receiver type and class chain; attributes via
+  `hydro_getattr`/`hydro_setattr`. Instances expose `__class__`; classes expose
   their frozen attributes and `__name__`. Zero-argument
   `super().__init__(...)` calls the direct base initializer; not supported:
   other class decorators, metaclasses, `class` keywords, multiple inheritance,
@@ -450,14 +450,14 @@ built-in kinds), so the fallback never matches a user handler.
   are dispatched; otherwise instances render
   deterministically as `<ClassName object>` (no heap address), classes as
   `<class 'Name'>`.
-- **Attributes** (`pyx_getattr`): `pathlib.Path` (`name`, `stem`, `suffix`,
+- **Attributes** (`hydro_getattr`): `pathlib.Path` (`name`, `stem`, `suffix`,
   `parent`, `path`), files (`name`, `mode`, `closed`, `encoding`),
   `threading.Thread` (`name`, `ident`, `daemon`) and
   `multiprocessing.Process` (`name`, `pid`, `exitcode`, `daemon`) provide
   data attributes. For native objects, names without a call are data
   attributes; methods must be called. Unknown names → `AttributeError`.
-  `pyx_setattr` allows only instance attributes; classes are immutable.
-- **Method keywords** (`pyx_method_kw`): native methods with named
+  `hydro_setattr` allows only instance attributes; classes are immutable.
+- **Method keywords** (`hydro_method_kw`): native methods with named
   parameters accept keywords. Implemented are `str.split`/
   `replace`/`startswith`/`endswith`, `pathlib.Path.mkdir`/`open`/
   `read_text`/`write_text`/`read_bytes`/`write_bytes`/`glob` and
@@ -473,7 +473,7 @@ built-in kinds), so the fallback never matches a user handler.
   compile; parameter metadata records `None`, so a direct call that omits it
   receives `None` instead of the source default (documented limitation).
   `max`/`min` pass `key=` as the runtime's
-  trailing key slot. `pyx_method_star` flattens one list/tuple operand
+  trailing key slot. `hydro_method_star` flattens one list/tuple operand
   (`t.add_row(*cells, style=style)`). Other native methods reject keywords
   (runtime/frontend diagnostic).
 
@@ -482,21 +482,21 @@ built-in kinds), so the fallback never matches a user handler.
 - **Generators** (Phase 2.32): A function with `yield` is compiled as a
   fiber (`core/fiber.rs`). The call creates a `Fiber` object with its
   own 128-KiB stack; on x86_64 the context switch is
-  `global_asm!`-`pyx_context_switch` over the callee-saved registers `rsp`,
+  `global_asm!`-`hydro_context_switch` over the callee-saved registers `rsp`,
   `rbx`, `rbp`, `r12`–`r15` (`ret`-based, no syscalls); on other
   targets libc `ucontext` remains the fallback. The wrapper runs only on the
-  first `pyx_iter_next`. `yield value`/bare `yield` suspend the fiber,
+  first `hydro_iter_next`. `yield value`/bare `yield` suspend the fiber,
   `return` ends the iteration, exceptions are propagated on the next resume.
   Every object is independent; `for`, `list`, `sum`, `iter(x)` and
   `next(it[, default])` work on it. `send(v)` resumes the generator and
   returns the next yielded value; `x = yield v` evaluates to the sent value
   (`None` for `next`). `throw(exc)` raises an exception *instance* at the
-  suspension point (PyX has no exception class objects yet, so only the
+  suspension point (Hydro has no exception class objects yet, so only the
   one-argument, instance form is supported). `close()` injects
   `GeneratorExit`, so `finally` blocks run; a generator that yields during
   `close()` raises `RuntimeError("generator ignored GeneratorExit")`.
   Exhausted generators raise `StopIteration` from `send`/`throw`.
-  `yield from iterable` delegates iteration (`pyx_yield_from`): each
+  `yield from iterable` delegates iteration (`hydro_yield_from`): each
   delegated item is yielded, `send`/`throw` are forwarded to a delegated
   generator, and `close()` closes the delegate first so its `finally` blocks
   run. The expression evaluates to the delegate's return value (`None` for a
@@ -508,7 +508,7 @@ built-in kinds), so the fallback never matches a user handler.
   delegate raises `AttributeError` naming the iterator as `'iterator'` (not
   e.g. `'list_iterator'`).
 - **Async generators** (Phase 2.12): `async def` with `yield` compiles to a
-  `FiberKind::AsyncGenerator` (`pyx_async_generator_new`). `__aiter__`
+  `FiberKind::AsyncGenerator` (`hydro_async_generator_new`). `__aiter__`
   returns the object, `__anext__` resumes it and returns the item directly
   (or raises `StopAsyncIteration`, tag 18), and `asend`/`athrow`/`aclose`
   mirror `send`/`throw`/`close` with async completion semantics. Awaits
@@ -517,7 +517,7 @@ built-in kinds), so the fallback never matches a user handler.
   running task. `async for`/`async with` and asynchronous comprehensions are
   real await loops (`__aiter__`/`__anext__`/`__aenter__`/`__aexit__`).
 - **async** (Phase 2.12): `async def` creates a coroutine object;
-  `await`/`pyx_await` drives it to completion (non-fiber values are
+  `await`/`hydro_await` drives it to completion (non-fiber values are
   returned unchanged) and rejects generators/async generators. Suspensions
   carry runtime-internal wait requests (sleep/join) outwards; an awaiting
   chain is bounded to 512 frames. A thread-local persistent loop
@@ -584,18 +584,18 @@ exception replaces the in-flight one — the `$wexc` guard then keeps the
 `return`, `break` and `continue` leaving the body also run it. Managers are
 evaluated left to right and exited in reverse order, and a manager that
 suppresses the exception leaves the outer managers with no exception to see.
-PyX has no traceback objects, so `__exit__` always receives `None` as its
+Hydro has no traceback objects, so `__exit__` always receives `None` as its
 third argument.
 
 #### Imports, User Modules, `__name__`
 
-- Native modules are specified via `pyx_ir::stdlib` (see below).
+- Native modules are specified via `hydro_ir::stdlib` (see below).
   `import X [as Y]` and `from X import a [as b]` bind eagerly at module
   level; imported names are visible inside functions. Imports nested in a
   function, class or compound body are **deferred**: the loader records them
   without loading the module, names that can still be linked to an
   already-visible dependency bind normally, and every other binding lowers to
-  `DeferredImport`, which calls `pyx_deferred_import` and raises
+  `DeferredImport`, which calls `hydro_deferred_import` and raises
   `RuntimeError` (`dynamic import ... is not supported`) when evaluated.
   `X.f(...)` →
   ModuleCall, `X.const`/`X.f` as a value → ModuleAttr. Native functions are
@@ -606,7 +606,7 @@ third argument.
   diagnostics; unknown members are compile-time diagnostics.
   Module-level simple-name assignments that are read by a function are
   mirrored into a keyed global store (`GlobalSet`/`GlobalGet`,
-  `pyx_global_set`/`pyx_global_get`); other module locals remain invisible
+  `hydro_global_set`/`hydro_global_get`); other module locals remain invisible
   inside functions. Imported units mirror every export because an importer may
   read any name; the entry module mirrors only names its own functions read
   (precomputed before lowering), so top-level loops do not emit a global store
@@ -615,7 +615,7 @@ third argument.
   P7 checkpoint): `import foo` / `from foo import f` resolve `foo.py` and
   packages (`foo/__init__.py`), including dotted names, submodules and
   relative imports. Search order: sibling files, the package-chain root,
-  `PYX_SITE_PACKAGES`, the `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages trees,
+  `HYDRO_SITE_PACKAGES`, the `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages trees,
   then `PYTHONPATH`. The loader loads every unit **once per canonical path**
   (module cache at compile time), loads dependencies first and diagnoses
   cycles made only of module-level imports. Imported module bodies are
@@ -640,7 +640,7 @@ third argument.
 
 #### Stdlib Modules
 
-Central specification in `pyx_ir::stdlib` (`MODULES` in
+Central specification in `hydro_ir::stdlib` (`MODULES` in
 `stdlib/mod.rs`): `math`, `io`, `functools`, `operator`, `time`, `sys`,
 `random`, `platform`, `pathlib`, `statistics`, `json`, `csv`, `os`,
 `os.path`, `_thread`, `threading`, `queue`, `multiprocessing`, `pickle`,
@@ -675,7 +675,7 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
   the usage block to stderr and raise `SystemExit(2)`; `-h`/`--help` and
   `--version` print to stdout and raise `SystemExit(0)`. `parse_args` reads
   `sys.argv[1:]` by default. The legacy non-exiting explicit-argv behaviour
-  is confined to the internal `_pyx_test_mode` used by the runtime tests.
+  is confined to the internal `_hydro_test_mode` used by the runtime tests.
 - `collections.defaultdict`: insertion-ordered `(key, value)` pairs plus
   `default_factory`; a missing key calls the factory, inserts and returns;
   `None` factory → `KeyError`.
@@ -701,10 +701,10 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
   Deterministic per seed, but **not CPython-reproducible**.
 - `sys.stdout`/`sys.stderr`: small native text streams over fd 1/2 with
   `write(str)` (returns the character count, flushes), `flush()` and
-  `isatty()`. They are fresh GC-safe objects per resolution (no PyX
+  `isatty()`. They are fresh GC-safe objects per resolution (no Hydro
   children) and expose no other attributes.
 - `platform`: `system`/`machine`/`release`/`version`/`node`/`platform`/
-  `python_version`, `python_implementation() == "PyX"`.
+  `python_version`, `python_implementation() == "Hydro"`.
 - `statistics`: `mean`/`fmean`/`median`/`pstdev`/`stdev` including error paths.
 - `pathlib`: native `Path` (`Path()`, `cwd()`, `home()`) with
   `exists`/`is_file`/`is_dir`, `read_text`/`write_text`, `read_bytes`/
@@ -718,7 +718,7 @@ Central specification in `pyx_ir::stdlib` (`MODULES` in
 
 #### Methods
 
-`pyx_method`/`pyx_method_kw` dispatch dynamically by receiver type.
+`hydro_method`/`hydro_method_kw` dispatch dynamically by receiver type.
 `str`: `upper`, `lower`, `strip`, `lstrip`, `rstrip`, `split` (0/1 arg),
 `join`, `replace` (2/3 args), `startswith`, `endswith`, `find`, `count`,
 `isdigit`, `isalpha`, `isalnum`, `isspace`, `format`, `encode` (bytes).
@@ -737,18 +737,18 @@ a data attribute (see above) or `AttributeError`. For `str`, `list`,
 - Files: see `io`; `with` uses the `__enter__`/`__exit__` protocol.
 - **No GIL.** On the first `_thread.start_new_thread` the heap switches to
   a global shared heap (existing objects are migrated). Threads
-  receive IDs; `_thread.join` is a PyX extension. Locks
+  receive IDs; `_thread.join` is a Hydro extension. Locks
   (`_thread.allocate_lock`) are native `Lock` objects; `threading` provides
   `Thread`, `Lock`, `RLock` (owner/depth), `Event` and `queue.Queue`.
 - `multiprocessing` provides fork-based `Process` objects, `os.fork`/
-  `waitpid`/`_exit` and `multiprocessing.Queue` (socketpair, PYX1
+  `waitpid`/`_exit` and `multiprocessing.Queue` (socketpair, HYD1
   serialization). `spawn` starts a fresh process via `exec`
-  (`pyx __spawn` resp. AOT binary); `pyx_main` registers all functions before
+  (`tea __spawn` resp. AOT binary); `hydro_main` registers all functions before
   the module body, a payload names the target name + args, and only that function
   runs in the child (queue FDs are inherited; no module body in the child).
   `Pool` uses per-worker private task/result queues for fork and spawn and
   implements `__enter__`/`__exit__` (terminate).
-- `pickle.dumps/loads` uses its own PYX1 hex format that is not CPython-compatible
+- `pickle.dumps/loads` uses its own HYD1 hex format that is not CPython-compatible
   (None/Bool/Int/Float/Str/List/Tuple/Dict/Set/Range/Bytes/
   function wrapper); cycle-free, depth 128. Functions are reconstructed by
   wrapper address/name only in the same, forked or spawn-
@@ -761,7 +761,7 @@ a data attribute (see above) or `AttributeError`. For `str`, `list`,
 
 Error-capable runtime calls set a **pending exception** on failure and
 return a dummy value. After *every* error-capable operation, codegen checks
-`pyx_exc_pending()` and jumps to the next handler (or to the uncaught path).
+`hydro_exc_pending()` and jumps to the next handler (or to the uncaught path).
 An exception carries tag, message, function name and line at the time of the
 `raise`. User exception classes have no runtime tag: `raise UserClass(msg)`
 and `raise module.UserClass(msg)` lower to `RuntimeError` with a
@@ -769,7 +769,7 @@ and `raise module.UserClass(msg)` lower to `RuntimeError` with a
 or dotted name, including imported classes) match `RuntimeError`. This
 handler matching is documented as approximate: every user class shares the
 `RuntimeError` tag, so unrelated user-class raises are caught too.
-`pyx_uncaught()` prints:
+`hydro_uncaught()` prints:
 
 ```
 Traceback (most recent call last):
@@ -789,7 +789,7 @@ a feature flag.
 Rationale: no system LLVM/`llvm-config`/headers needed, fast builds,
 JIT and object emission from one codebase, solid baseline optimization.
 Costs: weaker optimization than LLVM (PGO/inlining, P5) and no
-ORC-JIT tiering. Codegen remains encapsulated in `pyx-codegen`, so an
+ORC-JIT tiering. Codegen remains encapsulated in `hydro-codegen`, so an
 LLVM backend can later consume the same IR. The decision is documented in P0-11.
 
 The shared `build_isa` enables `opt_level=speed` and `enable_alias_analysis`;
@@ -802,26 +802,26 @@ non-PIE AOT mode and Cranelift PGO/LLVM remain measurement-driven P5 work.
 
 ### 4.1 AOT Linking
 
-`pyx build` produces an object file (`.o`) and links it with `cc` against
-`libpyx_runtime.a` (staticlib of the workspace). The generated binary exports
-`main(argc, argv) -> int`, which calls `pyx_main() -> int`. `pyx_main`
+`tea build` produces an object file (`.o`) and links it with `cc` against
+`libhydro_runtime.a` (staticlib of the workspace). The generated binary exports
+`main(argc, argv) -> int`, which calls `hydro_main() -> int`. `hydro_main`
 executes the module body (incl. embedded user modules) and returns the
-`pyx_uncaught()` exit code on a pending exception, otherwise `0`. The binary
-needs neither CPython nor `pyx`.
+`hydro_uncaught()` exit code on a pending exception, otherwise `0`. The binary
+needs neither CPython nor `tea`.
 
-Runtime library resolution: `--runtime-lib <path>`, otherwise `PYX_RUNTIME_LIB`,
-otherwise relative to the CLI executable (`target/<profile>/libpyx_runtime.a`).
+Runtime library resolution: `--runtime-lib <path>`, otherwise `HYDRO_RUNTIME_LIB`,
+otherwise relative to the CLI executable (`target/<profile>/libhydro_runtime.a`).
 If it is missing, a clear error message with a build hint.
 
-The build cache lives under `.pyx/cache` and is a purely local
+The build cache lives under `.hydro/cache` and is a purely local
 optimization. The key covers CLI/runtime version, target architecture/OS,
 source text, all reachable `.py` modules (relative path + content) and the
-identity of the runtime archives. `--no-cache` bypasses it; `pyx clean` removes
+identity of the runtime archives. `--no-cache` bypasses it; `tea clean` removes
 it. The cache is not a shared artifact store.
 
 ## 5. IR Contract
 
-`pyx-ir` is deliberately small and fully typed:
+`hydro-ir` is deliberately small and fully typed:
 
 - `Program { functions, main }`; `functions[0]` is the module body `<module>`
   of the entry file. User modules occupy contiguous `FunctionId`
@@ -868,7 +868,7 @@ it. The cache is not a shared artifact store.
   Phase 2.7, `range` is additionally a value). Negative step is
   allowed, step `0` is a runtime `ValueError`.
 - `Delete { targets }` evaluates targets left to right and deletes each one
-  immediately: locals (slot cleared to `None`; PyX does not track unbound
+  immediately: locals (slot cleared to `None`; Hydro does not track unbound
   locals), module globals (`NameError` when missing), instance attributes,
   list/dict subscripts and list slices. Receivers/bounds are evaluated in
   Python order, immutable receivers and class namespaces raise `TypeError`,
@@ -885,25 +885,25 @@ it. The cache is not a shared artifact store.
   `cause` is the optional explicit chaining expression. A raise of a class
   declared in the unit lowers to `RuntimeError` with a
   `"<ClassName>: <message>"` message (see the exception-tag notes above).
-- `tuple()`/`tuple(iterable)` materialise a tuple (`pyx_tuple_from`), and
+- `tuple()`/`tuple(iterable)` materialise a tuple (`hydro_tuple_from`), and
   `hasattr(obj, name)` runs the attribute lookup, swallowing only
   `AttributeError`. Starred unpack targets (`a, *rest, b = value`) bind a
-  fresh list of the middle elements through `pyx_unpack_star`; one star is
+  fresh list of the middle elements through `hydro_unpack_star`; one star is
   allowed and it may not nest inside another container target.
 - `functools.partial(func, *args, **kwargs)` keeps keyword names: the
-  frontend forwards them through `pyx_module_call_kw`, the runtime stores
+  frontend forwards them through `hydro_module_call_kw`, the runtime stores
   `(name, value)` pairs in the partial and applies them at call time using
   the parameter names codegen attaches to every generated function value
-  (`pyx_function_params`). A callable without parameter names rejects
+  (`hydro_function_params`). A callable without parameter names rejects
   keywords with `TypeError`; a hole before a named parameter is reported
   instead of silently passing `None`.
 - Functions carry `is_generator` and `is_async`; codegen derives the
-  flags in `pyx_function_new`/`pyx_closure_new` from them (bit 0 async, bit 1
-  generator) and generates a wrapper that calls `pyx_async_generator_new`
-  when both are set, else `pyx_coroutine_new` resp. `pyx_generator_new`.
-  `Yield` statements become `pyx_yield` (result
+  flags in `hydro_function_new`/`hydro_closure_new` from them (bit 0 async, bit 1
+  generator) and generates a wrapper that calls `hydro_async_generator_new`
+  when both are set, else `hydro_coroutine_new` resp. `hydro_generator_new`.
+  `Yield` statements become `hydro_yield` (result
   discarded); `Yield` expressions keep the returned sent value; `YieldFrom`
-  becomes `pyx_yield_from`. `Await` becomes `pyx_await`.
+  becomes `hydro_yield_from`. `Await` becomes `hydro_await`.
 - **Lowering:** `with`/`async with` become nested `try/finally` with
   `__enter__`/`__exit__`; async managers bind `__aenter__`/`__aexit__`
   through awaited method calls. Augmented subscript assignment
@@ -955,7 +955,7 @@ Set, Range, Function`.
   existing locals; `capture_count` is derived from the first use in the
   nested body.
 - Modules/imports: native module attributes/calls are typed via
-  `pyx_ir::stdlib`; user module imports bind exported function signatures.
+  `hydro_ir::stdlib`; user module imports bind exported function signatures.
   Module-level imports are globally visible. A name bound by a nested import
   is visible too, but has the dynamic `DeferredImport` type: using it raises
   at runtime instead of failing the type check.
@@ -965,7 +965,7 @@ Set, Range, Function`.
 - Statically `Int`-typed operands use checked int fast paths in codegen:
   `+`/`-`/`*` (untag, `sadd_overflow`/`ssub_overflow`/
   `smul_overflow`, range check, retag) and comparisons; on overflow or a
-  non-`Int` result it goes through `pyx_binop`. The same applies to `AugAssign`
+  non-`Int` result it goes through `hydro_binop`. The same applies to `AugAssign`
   and to fully `Int`-typed `for range` counters. Constant folding and
   dead-`if`/`while False` already run in the frontend (only with guaranteed
   identical semantics).
@@ -982,9 +982,9 @@ collector as an interim**:
   runtime-owned aligned heap addresses, never adversarial bytes, so SipHash
   seeding is unnecessary while equality still compares the full address.
 - Roots: **precise shadow frames** plus a conservative fallback. Generated
-  code registers every frame with `pyx_gc_frame_push` (all slots `None`-filled,
-  scanned prefix narrowed with `pyx_gc_frame_used`) and every caller-owned
-  value array with `pyx_gc_scope_push`; the collector marks those slots
+  code registers every frame with `hydro_gc_frame_push` (all slots `None`-filled,
+  scanned prefix narrowed with `hydro_gc_frame_used`) and every caller-owned
+  value array with `hydro_gc_scope_push`; the collector marks those slots
   exactly. A mutator publishes its thread-local frame/range set at each
   safepoint slow path and before `blocking_enter` parks, so a shared
   collection snapshots every stopped thread's roots (`snapshot_all`); the
@@ -996,7 +996,7 @@ collector as an interim**:
 - **Root modes:** by default the collector is *mixed*: precise slots are
   marked exactly and their byte extents are excluded from the conservative
   native-stack/register scan (merged ranges are skipped), while unregistered
-  Rust frames and suspended fiber stacks are still scanned. `PYX_GC_PRECISE=1`
+  Rust frames and suspended fiber stacks are still scanned. `HYDRO_GC_PRECISE=1`
   selects *strict* mode: every conservative stack and register scan is
   disabled, so only precise frames/ranges, pending/handled/thread roots,
   suspended fibers' `SavedRoots`, C-API shim roots and persistent roots keep
@@ -1009,8 +1009,8 @@ collector as an interim**:
   `remove_persistent_root` maintain a per-thread slot vector in `ThreadGc`
   that is marked by every collection. They are for long-lived Rust-side owners
   (asyncio loop tasks) and are cleared on thread exit and by
-  `pyx_runtime_init` (which also resets the asyncio loop state before the heap
-  is freed). The hidden `pyx_runtime::precise_roots` module re-exports them for
+  `hydro_runtime_init` (which also resets the asyncio loop state before the heap
+  is freed). The hidden `hydro_runtime::precise_roots` module re-exports them for
   the integration tests.
 - Conservative fallback (mixed mode): native stack scan (bounds via
   `pthread_getattr_np`), a register dump (x86_64/aarch64) and the pending
@@ -1027,7 +1027,7 @@ collector as an interim**:
   via `set_aux_stack`; in shared mode both are mirrored into the `ThreadGc`,
   in local mode it stays with thread-local ranges without atomics
   per switch. Nested resumes publish nothing because the caller is a fiber
-  with already registered lifetime ranges. `PYX_GC_STRESS=1` covers
+  with already registered lifetime ranges. `HYDRO_GC_STRESS=1` covers
   interleaved generators.
 - The register dump happens in **one** `asm!` block that writes all
   general-purpose registers (x86_64: incl. `rsp`; aarch64: `x0..x30` + `sp`)
@@ -1057,35 +1057,35 @@ collector as an interim**:
   mark the new child if the parent is already BLACK;
   container mutation and marker are serialized by a graph lock per payload. In
   local mode the lock is omitted.
-- Trigger on growth since the last collection: `live + PYX_GC_THRESHOLD`
-  (default 10000), not on absolute object count. `PYX_GC_STRESS=1` collects
-  before every allocation. `PYX_GC_STATS=1` reports pause, mark and sweep time
+- Trigger on growth since the last collection: `live + HYDRO_GC_THRESHOLD`
+  (default 10000), not on absolute object count. `HYDRO_GC_STRESS=1` collects
+  before every allocation. `HYDRO_GC_STATS=1` reports pause, mark and sweep time
   as well as frees per collection on stderr.
-- `pyx_runtime::gc_stats()` returns a `GcStats` snapshot
+- `hydro_runtime::gc_stats()` returns a `GcStats` snapshot
   (`collections`, `pause_total_us`, `pause_max_us`, `mark_total_us`,
   `sweep_total_us`, `freed_total`, `live_objects`, `threshold`, `stress`,
   `precise`, `precise_frames`); `precise` reports strict mode and
   `precise_frames` the frames marked by the latest collection. The
-  `PYX_GC_STATS=1` line carries the same `precise=mixed|strict` and
+  `HYDRO_GC_STATS=1` line carries the same `precise=mixed|strict` and
   `precise_frames=` fields. `reset_gc_stats()` resets the counters.
-  `pyx gc [--json] <file.py>`
-  runs the program like `pyx run` and prints the statistics afterwards;
+  `tea gc [--json] <file.py>`
+  runs the program like `tea infuse` and prints the statistics afterwards;
   with `--json` the last stdout line is an object with snake_case keys.
-- `gc/alloc.rs` keeps a fixed 16-byte `PyxObj` header separate from a typed
+- `gc/alloc.rs` keeps a fixed 16-byte `HydroObj` header separate from a typed
   payload block. Payloads use 18 size classes (8..4096 bytes) with per-class
   slabs/free lists and an exact large-object fallback; the header has its own
   slab class. Stats cover per-class slabs/live/reused/bytes, large blocks and
   peak live bytes. `ObjData` remains the construction descriptor and
   `ObjDataRef`/`ObjDataMut` provide typed access.
-- `pyx_gc_collect()` forces a collection; `pyx_gc_objects()` returns the
-  live object count. `pyx_runtime_init()` resets heap and exception state.
+- `hydro_gc_collect()` forces a collection; `hydro_gc_objects()` returns the
+  live object count. `hydro_runtime_init()` resets heap and exception state.
 
 This is deliberately an **interim**: in mixed mode conservative scanning can
 preserve false positives; the final root rescan is STW and the white partition
 runs briefly under the heap lock. Strict precise mode removes the conservative
 fallback entirely but requires every native stack to root its tagged locals.
 The
-`unsafe` policy: The GC scan/free paths are encapsulated in `pyx-runtime/src/gc/`
+`unsafe` policy: The GC scan/free paths are encapsulated in `hydro-runtime/src/gc/`
 and justify their invariants there.
 
 ### 7.1 Concurrency (P2-20)
@@ -1094,7 +1094,7 @@ and justify their invariants there.
 (heap migration on the first thread), a thread registry and native
 `_thread` primitives. Since Phase 2.13/2.15 a **concurrent
 mark-&-sweep collector** collects even while threads run: Codegen calls
-`pyx_safepoint()` at function entries and (since Phase 2.15 only every 64th
+`hydro_safepoint()` at function entries and (since Phase 2.15 only every 64th
 loop iteration) at loop backedges; every thread registers stack bounds,
 saved SP/registers, thread roots and a pending-exception mirror.
 The collector sets `GC_REQUESTED` only for the root snapshot and final
@@ -1110,45 +1110,45 @@ throughput (baseline `threads_serial` AOT approx. 40–45 ms).
 ## 8. Toolchain / CLI / uv (Phase 3)
 
 The CLI is a single binary. Subcommands (full help via
-`pyx help`):
+`tea help`):
 
 `new`, `init`, `check`, `run`, `build`, `test`, `fmt`, `lint`, `clean`,
 `gc`, `add`, `remove`, `sync`, `lock`, `doctor`, `help`, `--version`.
 
 - `new`/`init` create `main.py`, `pyproject.toml` and `.gitignore`;
   existing non-empty files are not overwritten without `--force`.
-- `test` runs `test_*.py`/`*_test.py` with `pyx run`; success = exit 0
+- `test` runs `test_*.py`/`*_test.py` with `tea infuse`; success = exit 0
   (no pytest assertions). `--json` returns a result list.
 - `fmt` normalizes trailing whitespace and exactly one final newline
   (no AST formatter); `--check` does not write. `lint` type-checks all
   `.py` files; `--json` aggregates diagnostics.
-- `clean` removes `.pyx/cache` and `target/pyx-tmp` (`--dry-run`).
+- `clean` removes `.hydro/cache` and `target/hydro-tmp` (`--dry-run`).
 - `gc` compiles and starts a program like `run` and prints the
   GC statistics afterwards (`--json` for a machine-readable last line).
 - `add`/`remove`/`sync`/`lock` are a **passthrough** to `uv`
-  (`PYX_UV` overrides the executable). PyX interprets neither specs nor
+  (`HYDRO_UV` overrides the executable). Hydro interprets neither specs nor
   `pyproject.toml`; the uv exit status is returned.
 - The build cache (§4.1) is implemented; `--no-cache` bypasses it.
 
-`uv` remains an external dependency for now: PyX uses uv for resolution,
-lockfiles and venvs, but does **not yet** inject the PyX interpreter
+`uv` remains an external dependency for now: Hydro uses uv for resolution,
+lockfiles and venvs, but does **not yet** inject the Hydro interpreter
 (`.python-version`, venv markers, `sys.executable` equivalent). A dedicated
 fork is intended only in case of an architectural blocker. Own files:
-`pyproject.toml` (compatible), `pyx.lock` (optionally additional), build cache
-under `.pyx/cache/`.
+`pyproject.toml` (compatible), `tea.lock` (optionally additional), build cache
+under `.hydro/cache/`.
 
 ## 9. C API/ABI Strategy (Phase 4)
 
-**Decision (2026-10-24): option B — a PyX-native CPython C-API/ABI layer.
+**Decision (2026-10-24): option B — a Hydro-native CPython C-API/ABI layer.
 No `libpython` in the production runtime.**
 
 CPython 3.14 development files are used at build time to compile extensions
 and test fixtures; the CPython interpreter serves as a differential test
-oracle only. `ldd pyx` must not contain `libpython`. One process keeps the
-PyX tagged-value model, the concurrent GC and the fast startup path; foreign
+oracle only. `ldd tea` must not contain `libpython`. One process keeps the
+Hydro tagged-value model, the concurrent GC and the fast startup path; foreign
 code sees refcounted `PyObject` handles whose lifetime is integrated with the
 collector (refcount as an additional root, `tp_traverse`/`tp_clear` mirroring
-GC edges). The GIL is emulated only while foreign code runs; PyX code remains
+GC edges). The GIL is emulated only while foreign code runs; Hydro code remains
 GIL-free.
 
 Two tiers: (1) `abi3`/limited API (module init, `PyArg_Parse*`, scalar and
@@ -1158,25 +1158,25 @@ layout, vectorcall, full buffer protocol, GC integration, package/wheel
 loading).
 
 **Implemented (2026-10-24, first abi3 slice):** the shim in
-`pyx-runtime/src/capi/` exports the limited-API module/scalar/error surface
+`hydro-runtime/src/capi/` exports the limited-API module/scalar/error surface
 with a C-variadic `PyArg_ParseTuple`; the frontend resolves sibling
 `.so`/`.abi3.so` files at compile time and lowers `ext.member(...)`/
 `from ext import member` to `Callee::Extension`/`ExprKind::ExtensionAttr`;
-`pyx_extension_call`/`pyx_extension_get` load and cache modules lazily
+`hydro_extension_call`/`hydro_extension_get` load and cache modules lazily
 (`modules/extension.rs`). Scalars, strings, bytes, floats, lists, tuples and
 dicts convert recursively in both directions (bounded copies); capsules and
 read-only contiguous bytes buffers are supported. Extension discovery includes
-sibling files, `PYX_EXTENSION_PATH`, `PYTHONPATH`, `PYX_SITE_PACKAGES` and
+sibling files, `HYDRO_EXTENSION_PATH`, `PYTHONPATH`, `HYDRO_SITE_PACKAGES` and
 venv/conda `site-packages`; dotted submodules (`pkg.sub_ext`) resolve through
 a directory path without package Python source. Wheel tags are validated
 (`.so`, `.abi3.so`, `.cpython-314-*`; others are compile-time diagnostics), and
 both single- and multi-phase init (`PyModuleDef_Init`/`Py_mod_exec`) are
-supported. `pyx` and AOT binaries export the shim symbols with
+supported. `tea` and AOT binaries export the shim symbols with
 `--export-dynamic`; fixtures import and call under both with no `libpython`.
 The full 3.14 ABI (NumPy/pydantic-core) remains open.
 
 Evidence: embedded CPython costs ~6.7 ms `Py_Initialize` + ~7.5 ms
-`Py_Finalize` and ~41.6 ms for `import numpy`, versus ~0.8–1.0 ms for a PyX
+`Py_Finalize` and ~41.6 ms for `import numpy`, versus ~0.8–1.0 ms for a Hydro
 AOT process; a stable-ABI probe imports with four undefined CPython symbols
 (the initial shim surface). Full rationale, milestones and acceptance gates:
 [`C_API.md`](C_API.md). The 297-module stdlib program (174 pure Python,
@@ -1194,10 +1194,10 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
-  socket echo, pathlib, build cache, `pyx gc` and uv passthrough.
+  socket echo, pathlib, build cache, `tea gc` and uv passthrough.
 - Generated stdlib import matrix (2026-10-26): **63/297 importable** (13
   builtin/frozen, 45 pure, 5 extension; report in
-  [`COMPATIBILITY.md`](COMPATIBILITY.md)). `benchmarks/bench_all.py --only pyx`
+  [`COMPATIBILITY.md`](COMPATIBILITY.md)). `benchmarks/bench_all.py --only hydro`
   runs at the default GC threshold; rich console/table/panel/rule rendering
   works and a native `rich.status.Status` shim covers `Console.status`.
   Precise roots removed the former live-value loss.
@@ -1205,7 +1205,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   iteration, async generators, task cancellation and TaskGroup;
   `examples/generators_async.py` and `examples/async_generators.py` run
   under JIT and AOT.
-- E2E compares stdout/exit code of `pyx run` and the AOT binary; negative tests
+- E2E compares stdout/exit code of `tea infuse` and the AOT binary; negative tests
   check diagnostics and tracebacks (stderr, exit code).
 - No silent miscompilation: unsupported syntax → diagnostic.
 
@@ -1232,7 +1232,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   `ExceptionGroup`, `wait_for` and the wider `asyncio` API; `throw` accepts
   exception instances only (no three-argument form).
 - **GC:** generated frames and call buffers are precise shadow-stack roots;
-  `PYX_GC_PRECISE=1` runs the collector without conservative scanning. The
+  `HYDRO_GC_PRECISE=1` runs the collector without conservative scanning. The
   default mixed mode keeps the conservative fallback for Rust-side frames.
 - **Performance:** native module dispatch is fixed (thread-local spec cache).
   The precise root-frame bookkeeping currently makes generator resume the
@@ -1258,7 +1258,7 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   documented surface, and `random` is SplitMix64 (not CPython-reproducible).
   Full P7 module parity remains open.
 - **GC:** precise shadow frames for generated code plus a conservative
-  fallback in the default mixed mode (`PYX_GC_PRECISE=1` = strict, no
+  fallback in the default mixed mode (`HYDRO_GC_PRECISE=1` = strict, no
   conservative scan); size-classed slab/free-list allocator; STW root
   window.
 - **Concurrency:** no GIL; unprotected mutations of shared containers are

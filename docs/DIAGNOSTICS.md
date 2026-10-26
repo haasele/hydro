@@ -1,6 +1,6 @@
 # Diagnostics and CLI Reference
 
-`pyx` reports every user error as a located diagnostic and reserves exit
+`tea` reports every user error as a located diagnostic and reserves exit
 status 2 for toolchain and internal failures. This page is the compact
 reference for the rendering, the machine-readable form and the CLI flags that
 control them.
@@ -22,7 +22,7 @@ exits with status 2.
 `sys.argv[1:]`, so diagnostic options must precede the file:
 
 ```sh
-pyx run --color=never main.py --program-flag value
+tea infuse --color=never main.py --program-flag value
 ```
 
 `sys.argv[0]` is the source path. A `--` before the source file also ends
@@ -43,7 +43,7 @@ Accepted by `check`, `run`, `gc`, `build`, `test`, `lint` and `fmt`:
 A human diagnostic is a cargo-style snippet on stderr:
 
 ```text
-error[PYX0202]: 'int' object is not subscriptable
+error[HYD0202]: 'int' object is not subscriptable
   --> main.py:2:7
    |
  2 | print(value[0])
@@ -60,16 +60,16 @@ actionable hint exists.
 
 | Code | Area |
 | --- | --- |
-| `PYX0001` | Syntax / parse error |
-| `PYX0002` | Unsupported language construct |
-| `PYX0100` | Generic semantic error |
-| `PYX0101` | Unknown name (with did-you-mean) |
-| `PYX0102` | Operand or type mismatch |
-| `PYX0103` | Call arity / argument error |
-| `PYX0104` | Invalid `return` / `break` / `continue` placement |
-| `PYX0201` | Unknown method or attribute |
-| `PYX0202` | Indexing, slicing or subscript assignment |
-| `PYX0301` | Annotation or declaration validation |
+| `HYD0001` | Syntax / parse error |
+| `HYD0002` | Unsupported language construct |
+| `HYD0100` | Generic semantic error |
+| `HYD0101` | Unknown name (with did-you-mean) |
+| `HYD0102` | Operand or type mismatch |
+| `HYD0103` | Call arity / argument error |
+| `HYD0104` | Invalid `return` / `break` / `continue` placement |
+| `HYD0201` | Unknown method or attribute |
+| `HYD0202` | Indexing, slicing or subscript assignment |
+| `HYD0301` | Annotation or declaration validation |
 
 Codes are stable: tests and tooling may match them.
 
@@ -78,7 +78,7 @@ Codes are stable: tests and tooling may match them.
 `--json` prints exactly one array on stderr (no summary line):
 
 ```json
-[{"file":"main.py","line":2,"col":7,"end_col":12,"code":"PYX0202","message":"'int' object is not subscriptable","help":null}]
+[{"file":"main.py","line":2,"col":7,"end_col":12,"code":"HYD0202","message":"'int' object is not subscriptable","help":null}]
 ```
 
 `file`, `line`, `col`, `end_col` and `code` are always present. `help` is
@@ -100,7 +100,7 @@ A panic inside the compiler is caught at the CLI boundary. The process prints a
 short banner to stderr and exits with status 2:
 
 ```text
-pyx: internal compiler error (ICE)
+tea: internal compiler error (ICE)
 version 0.1.0 target x86_64-linux
 please report this with the command you ran and RUST_BACKTRACE=1 output
 ```
@@ -111,4 +111,4 @@ full backtrace from the standard panic hook.
 ## See also
 
 - `docs/ARCHITECTURE.md` for the frontend diagnostic contract.
-- `docs/pyx.1` for the command-line manual page.
+- `docs/tea.1` for the command-line manual page.

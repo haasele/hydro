@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Regression gate for the PyX micro-benchmarks.
+"""Regression gate for the Hydro micro-benchmarks.
 
-Reads the medians written by ``benchmarks/pyx/run_micro.py`` and compares them
-against ``benchmarks/pyx/thresholds.json``. Only workloads/implementations that
+Reads the medians written by ``benchmarks/hydro/run_micro.py`` and compares them
+against ``benchmarks/hydro/thresholds.json``. Only workloads/implementations that
 are present in *both* files are compared, so the gate keeps working when the
 harness gains or loses a workload; missing entries are reported as skipped.
 
@@ -10,7 +10,7 @@ Exit codes: 0 = within thresholds (or nothing to compare), 1 = regression or
 unusable input.
 
 Usage:
-    python3 benchmarks/pyx/run_micro.py       # fresh results/latest.json
+    python3 benchmarks/hydro/run_micro.py       # fresh results/latest.json
     python3 scripts/check_benchmarks.py       # same as --check
     python3 scripts/check_benchmarks.py --check
     python3 scripts/check_benchmarks.py -v    # also list skipped workloads
@@ -32,12 +32,12 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULTS = ROOT / "benchmarks" / "pyx" / "results" / "latest.json"
-DEFAULT_THRESHOLDS = ROOT / "benchmarks" / "pyx" / "thresholds.json"
+DEFAULT_RESULTS = ROOT / "benchmarks" / "tea" / "results" / "latest.json"
+DEFAULT_THRESHOLDS = ROOT / "benchmarks" / "tea" / "thresholds.json"
 
 # Implementations that the gate enforces. CPython is measured for context in
 # the baseline but intentionally not gated: it is not part of this repository.
-GATED_IMPLS = ("pyx-jit", "pyx-aot")
+GATED_IMPLS = ("hydro-jit", "hydro-aot")
 
 DEFAULT_FACTOR = 1.75
 # Concurrency and process-startup numbers are dominated by scheduling noise.
@@ -65,7 +65,7 @@ def load_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        die(f"{path} not found (run benchmarks/pyx/run_micro.py first)")
+        die(f"{path} not found (run benchmarks/hydro/run_micro.py first)")
     except (OSError, json.JSONDecodeError) as exc:
         die(f"cannot read {path}: {exc}")
 
@@ -205,7 +205,7 @@ def cmd_update(results_path: Path, thresholds_path: Path, default_factor: float)
         "factors": FACTORS,
         "floor_ms": FLOOR_MS,
         "note": (
-            "Generated from the PyX micro-benchmark baseline. max_ms is the "
+            "Generated from the Hydro micro-benchmark baseline. max_ms is the "
             "allowed median for a failing run; regenerate with "
             "`python3 scripts/check_benchmarks.py --update`."
         ),
@@ -225,7 +225,7 @@ def cmd_update(results_path: Path, thresholds_path: Path, default_factor: float)
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Check PyX micro-benchmarks against recorded thresholds."
+        description="Check Hydro micro-benchmarks against recorded thresholds."
     )
     parser.add_argument(
         "--results",

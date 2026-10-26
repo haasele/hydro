@@ -1,7 +1,7 @@
 import json
 import os
 
-data = {"name": "PyX", "n": 3, "ok": True, "items": [1, 2.5, None], "nested": {"x": "y"}}
+data = {"name": "Hydro", "n": 3, "ok": True, "items": [1, 2.5, None], "nested": {"x": "y"}}
 text = json.dumps(data)
 print(text)
 back = json.loads(text)
@@ -16,8 +16,8 @@ print(json.dumps("é€"))
 
 print(os.getpid() > 0, os.cpu_count() > 0, len(os.name) > 0, os.sep == "/")
 print(len(os.getcwd()) > 0)
-print(os.getenv("DEFINITELY_NOT_SET_PYX", "fallback"))
-print(os.getenv("DEFINITELY_NOT_SET_PYX"))
+print(os.getenv("DEFINITELY_NOT_SET_HYD", "fallback"))
+print(os.getenv("DEFINITELY_NOT_SET_HYD"))
 
 try:
     json.loads("{")

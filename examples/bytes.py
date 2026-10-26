@@ -1,4 +1,4 @@
-data = b"Hello, PyX!\n"
+data = b"Hello, Hydro!\n"
 print(len(data))
 print(data[0], data[-1])
 print(data[0:5])

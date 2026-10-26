@@ -2,7 +2,7 @@ import os
 import pathlib
 
 
-base = pathlib.Path("/tmp/pyx-pathlib-example")
+base = pathlib.Path("/tmp/hydro-pathlib-example")
 base.mkdir(False, True)
 text_file = base / "a.txt"
 binary_file = base / "b.bin"

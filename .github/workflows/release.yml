@@ -1,8 +1,7 @@
 name: Release
 
-# Tag-driven Linux x64 artifacts. The workspace builds self-contained from the
-# tag (Cargo.lock + --locked, no CPython download, no repository secrets); the
-# automatic GITHUB_TOKEN only publishes the GitHub release.
+# Tag-driven Hydro runtime artifacts. Tea releases its CLI/AOT binaries in the
+# separate Tea repository; this workflow only packages the runtime staticlib.
 on:
   push:
     tags: ["v*"]
@@ -19,10 +18,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  linux-x64:
-    name: build, test and package (x86_64)
+  runtime:
+    name: build, test and package runtime (x86_64)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,55 +29,39 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-
+          key: ${{ runner.os }}-hydro-release-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Tests
         run: cargo test --workspace --locked
 
-      - name: Build release
-        run: cargo build --release --locked -p pyx-cli -p pyx-runtime
-
-      # Same source, four builds into different paths: fails the release if the
-      # host is not deterministic (docs/REPRODUCIBLE.md). No cargo invocation.
-      - name: Reproducibility check
-        run: ./scripts/repro_check.sh examples/modules.py
+      - name: Build runtime
+        run: cargo build --release --locked -p hydro-runtime
 
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME:-dev}"
-          name="pyx-${tag}-x86_64-unknown-linux-gnu"
+          name="hydro-${tag}-x86_64-unknown-linux-gnu"
           mkdir -p "dist/$name"
-          install -m 0755 target/release/pyx "dist/$name/pyx"
-          install -m 0644 target/release/libpyx_runtime.a "dist/$name/libpyx_runtime.a"
-          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE docs/pyx.1 "dist/$name/"
+          install -m 0644 target/release/libhydro_runtime.a "dist/$name/libhydro_runtime.a"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          mkdir -p "dist/$name/docs"
+          cp docs/ARCHITECTURE.md docs/C_API.md docs/COMPATIBILITY.md docs/LAYOUT.md "dist/$name/docs/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
-
-      - name: Smoke-test artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          tmp="$(mktemp -d)"
-          tar -C "$tmp" -xzf dist/*.tar.gz
-          "$tmp"/*/pyx run examples/hello.py | grep -qx "Hello, PyX!"
-          "$tmp"/*/pyx build examples/hello.py -o "$tmp/hello"
-          "$tmp/hello" | grep -qx "Hello, PyX!"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pyx-linux-x64
+          name: hydro-runtime-linux-x64
           path: dist/*.tar.gz
           if-no-files-found: error
 
@@ -87,8 +70,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" \
-            dist/*.tar.gz dist/*.sha256 \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
+            --title "$GITHUB_REF_NAME" --generate-notes

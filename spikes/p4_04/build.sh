@@ -16,26 +16,26 @@ read -r -a EMBED_LDFLAGS <<< "$("$PYTHON_CONFIG" --embed --ldflags)"
     -o embed_probe "${EMBED_LDFLAGS[@]}"
 
 "$CC" -O2 -Wall -Wextra -shared -fPIC "${INCLUDES[@]}" abi3_probe.c \
-    -o pyx_capi_probe.so
+    -o hydro_capi_probe.so
 
 printf '%s\n' '=== embedded CPython probe ==='
 ./embed_probe
 
 printf '%s\n' '=== stable-ABI extension probe ==='
 PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -c '
-import pyx_capi_probe
+import hydro_capi_probe
 
-result = pyx_capi_probe.add(2, 3)
-print(f"abi3_tag={pyx_capi_probe.tag}")
+result = hydro_capi_probe.add(2, 3)
+print(f"abi3_tag={hydro_capi_probe.tag}")
 print(f"abi3_add_2_3={result}")
-if pyx_capi_probe.tag != "abi3" or result != 5:
+if hydro_capi_probe.tag != "abi3" or result != 5:
     raise SystemExit("unexpected abi3 probe result")
 '
 
-printf '%s\n' '=== undefined CPython symbols in pyx_capi_probe.so ==='
+printf '%s\n' '=== undefined CPython symbols in hydro_capi_probe.so ==='
 if command -v "$NM" >/dev/null 2>&1; then
     UNDEFINED=$(
-        "$NM" -D --undefined-only pyx_capi_probe.so \
+        "$NM" -D --undefined-only hydro_capi_probe.so \
             | awk '{print $NF}' \
             | grep '^Py' \
             | LC_ALL=C sort -u \

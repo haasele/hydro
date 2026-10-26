@@ -46,7 +46,7 @@ def row(workload: str, impl: str, median: float, status: str = "ok") -> dict:
 def thresholds(max_ms: float) -> dict:
     return {
         "schema": 1,
-        "workloads": {"w": {"pyx-jit": {"baseline_ms": 8.0, "max_ms": max_ms}}},
+        "workloads": {"w": {"hydro-jit": {"baseline_ms": 8.0, "max_ms": max_ms}}},
     }
 
 
@@ -80,7 +80,7 @@ class CheckBenchmarksTests(unittest.TestCase):
         )
 
     def test_within_threshold_passes(self) -> None:
-        self.write(self.results_path, results(row("w", "pyx-jit", 10.0)))
+        self.write(self.results_path, results(row("w", "hydro-jit", 10.0)))
         self.write(self.thresholds_path, thresholds(20.0))
         proc = self.run_check()
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -90,7 +90,7 @@ class CheckBenchmarksTests(unittest.TestCase):
         self.assertEqual(explicit.returncode, 0, explicit.stderr)
 
     def test_over_threshold_fails(self) -> None:
-        self.write(self.results_path, results(row("w", "pyx-jit", 25.0)))
+        self.write(self.results_path, results(row("w", "hydro-jit", 25.0)))
         self.write(self.thresholds_path, thresholds(20.0))
         proc = self.run_check()
         self.assertEqual(proc.returncode, 1, proc.stdout)
@@ -98,7 +98,7 @@ class CheckBenchmarksTests(unittest.TestCase):
         self.assertIn("regression", proc.stderr)
 
     def test_check_flag_reports_the_same_failure(self) -> None:
-        self.write(self.results_path, results(row("w", "pyx-jit", 25.0)))
+        self.write(self.results_path, results(row("w", "hydro-jit", 25.0)))
         self.write(self.thresholds_path, thresholds(20.0))
         default = self.run_check()
         explicit = self.run_check("--check")
@@ -114,7 +114,7 @@ class CheckBenchmarksTests(unittest.TestCase):
         self.assertIn("not found", proc.stderr)
 
     def test_unmatched_workloads_are_skipped(self) -> None:
-        self.write(self.results_path, results(row("other", "pyx-jit", 10.0)))
+        self.write(self.results_path, results(row("other", "hydro-jit", 10.0)))
         self.write(self.thresholds_path, thresholds(20.0))
         proc = self.run_check("--check", "-v")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -124,16 +124,16 @@ class CheckBenchmarksTests(unittest.TestCase):
         self.write(
             self.results_path,
             results(
-                row("w", "pyx-jit", 10.0),
-                row("x", "pyx-jit", 1.0, status="error"),
+                row("w", "hydro-jit", 10.0),
+                row("x", "hydro-jit", 1.0, status="error"),
             ),
         )
         self.write(
             self.thresholds_path,
             {
                 "workloads": {
-                    "w": {"pyx-jit": {"baseline_ms": 8.0, "max_ms": 20.0}},
-                    "x": {"pyx-jit": {"baseline_ms": 1.0, "max_ms": 2.0}},
+                    "w": {"hydro-jit": {"baseline_ms": 8.0, "max_ms": 20.0}},
+                    "x": {"hydro-jit": {"baseline_ms": 1.0, "max_ms": 2.0}},
                 }
             },
         )
@@ -150,17 +150,17 @@ class CheckBenchmarksTests(unittest.TestCase):
         self.write(
             self.results_path,
             results(
-                row("w", "pyx-jit", 10.0),
-                row("w", "pyx-aot", 20.0),
-                row("w", "pyx-jit", 999.0, status="error"),
+                row("w", "hydro-jit", 10.0),
+                row("w", "hydro-aot", 20.0),
+                row("w", "hydro-jit", 999.0, status="error"),
                 row("ignored", "cpython", 1.0),
             ),
         )
         proc = self.run_check("--update", "--factor", "2.0", "-v")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(self.thresholds_path.read_text(encoding="utf-8"))
-        jit = payload["workloads"]["w"]["pyx-jit"]
-        aot = payload["workloads"]["w"]["pyx-aot"]
+        jit = payload["workloads"]["w"]["hydro-jit"]
+        aot = payload["workloads"]["w"]["hydro-aot"]
         self.assertEqual(jit["baseline_ms"], 10.0)
         self.assertEqual(jit["max_ms"], 20.0)
         self.assertEqual(aot["baseline_ms"], 20.0)
@@ -168,10 +168,10 @@ class CheckBenchmarksTests(unittest.TestCase):
         self.assertNotIn("cpython", payload["workloads"].get("ignored", {}))
 
     def test_invalid_threshold_entry_fails(self) -> None:
-        self.write(self.results_path, results(row("w", "pyx-jit", 10.0)))
+        self.write(self.results_path, results(row("w", "hydro-jit", 10.0)))
         self.write(
             self.thresholds_path,
-            {"workloads": {"w": {"pyx-jit": {"baseline_ms": 8.0, "max_ms": 0}}}},
+            {"workloads": {"w": {"hydro-jit": {"baseline_ms": 8.0, "max_ms": 0}}}},
         )
         proc = self.run_check()
         self.assertEqual(proc.returncode, 1)

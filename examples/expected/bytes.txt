@@ -2,7 +2,7 @@
 72 10
 b'Hello'
 [72, 101, 108]
-Hello, PyX!
+Hello, Hydro!
 b'h\xc3\xa9'
 [b'a', b'b', b'c']
 b'a-b'

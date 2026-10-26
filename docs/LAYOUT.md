@@ -1,4 +1,4 @@
-# PyX — Source Layout
+# Hydro — Source Layout
 
 As of 2026-10-26 (after the P2 completion slice). The crates remain the
 only Frontend↔Codegen contract; inside the crates, the formerly flat
@@ -18,17 +18,16 @@ repository root.
 │   ├── check_benchmarks.py    local benchmark regression gate (--check/--update)
 │   ├── test_check_benchmarks.py  deterministic tests for the threshold gate
 │   ├── bench_hyperfine.sh     hyperfine adapter for benchmark harnesses
-│   ├── repro_check.sh         same-host AOT reproducibility check (docs/REPRODUCIBLE.md)
 │   ├── fuzz-smoke.sh          bounded libFuzzer/stable fuzz smoke
 │   ├── fuzz-parallel.sh       multi-core stable fuzz soak (independent seeds)
 │   ├── stdlib_compat.py       stdlib import matrix (pinned CPython 3.14.9)
 │   └── cpython_compat.py      official Lib/test differential gate
 ├── benchmarks/
-│   ├── PYX.md                 readiness matrix of the external harnesses
-│   ├── bench_pyx.py           CPython/JIT/AOT comparison, 11 workloads
-│   ├── bench_all.py           orchestrator (e.g. `--only pyx`)
-│   ├── compare_engines.py     CPython/PyX/PyPy/Go loop + startup comparison
-│   └── pyx/                   micro-benchmarks, run_micro.py, results/, thresholds.json
+│   ├── HYD.md                 readiness matrix of the external harnesses
+│   ├── bench_hydro.py           CPython/JIT/AOT comparison, 11 workloads
+│   ├── bench_all.py           orchestrator (e.g. `--only hydro`)
+│   ├── compare_engines.py     CPython/Hydro/PyPy/Go loop + startup comparison
+│   └── hydro/                 micro-benchmarks, run_micro.py, results/, thresholds.json
 ├── spikes/p4_04/              embedded-CPython/abi3 probes + measurements
 ├── fuzz/                      libFuzzer targets + stable fallback harness
 ├── tests/compat/              pinned CPython test manifests (3.14.9)
@@ -39,12 +38,10 @@ repository root.
 │   ├── COMPATIBILITY.md       generated stdlib import matrix
 │   ├── CPYTHON_TESTS.md       official-test gate policy + baseline
 │   ├── DIAGNOSTICS.md         diagnostic codes/spans/JSON, CLI flags, exit codes
-│   ├── REPRODUCIBLE.md        AOT build reproducibility contract + evidence
-│   ├── pyx.1                  roff manpage
 │   ├── TODO.md                single work list
 │   └── LAYOUT.md              this file
 └── crates/
-    ├── pyx-ir/                typed IR, only Frontend↔Codegen contract
+    ├── hydro-ir/                typed IR, only Frontend↔Codegen contract
     │   └── src/
     │       ├── lib.rs         re-exports + contract signatures
     │       ├── model.rs       Type, Const, Builtin, BinOp, exception tags
@@ -54,7 +51,7 @@ repository root.
     │       │   ├── mod.rs
     │       │   └── specs.rs
     │       └── tests.rs
-    ├── pyx-frontend/          parsing, lowering, type checking, user modules
+    ├── hydro-frontend/          parsing, lowering, type checking, user modules
     │   ├── src/
     │   │   ├── lib.rs         check_file, module loader/import resolution
     │   │   │                  (siblings, packages, site-packages, PYTHONPATH)
@@ -62,12 +59,12 @@ repository root.
     │   │   ├── lower/         AST → HIR/lowering
     │   │   └── sema/          type inference, constraints, IR emission
     │   └── tests/             fuzz-smoke parse/lower/check coverage
-    ├── pyx-codegen/           Cranelift backend
+    ├── hydro-codegen/           Cranelift backend
     │   └── src/
     │       ├── lib.rs
     │       ├── backend/       JIT and AOT drivers
     │       └── lower/         IR → Cranelift (frames, cleanup stack, safepoints)
-    ├── pyx-runtime/           value model, ABI, GC, modules, C-API shim
+    ├── hydro-runtime/           value model, ABI, GC, modules, C-API shim
     │   ├── build.rs           compiles the C-variadic PyArg_ParseTuple glue
     │   ├── src/
     │   │   ├── lib.rs
@@ -84,12 +81,12 @@ repository root.
     │   │   │                  itertools, ast, fractions, importlib,
     │   │   │                  __future__; extension.rs (abi3 loader)
     │   │   ├── concurrency/   threads/locks/queue/processes/pool/spawn
-    │   │   ├── support/       PYX1 serialization (pickle/spawn/mp.Queue)
+    │   │   ├── support/       HYD1 serialization (pickle/spawn/mp.Queue)
     │   │   └── csv.rs         CSV reader/writer
     │   └── tests/             integration tests per feature (ABI level)
-    ├── pyx-interp/            IR tree-walk interpreter + REPL session
+    ├── hydro-interp/            IR tree-walk interpreter + REPL session
     │   └── src/               frame roots, eval, stmt, host callbacks
-    └── pyx-cli/               `pyx` binary
+    └── (Tea is a separate repository: ../tea/)
         ├── src/
         │   ├── main.rs        ICE catching, exit codes
         │   └── cli/
@@ -101,7 +98,7 @@ repository root.
         │                      build, test, pytest, repl, fmt, lint, clean,
         │                      doctor, help, uv (passthrough), spawn
         │                      (internal), scan (file discovery), completions;
-        │                      `gc.rs` = `pyx gc`
+        │                      `gc.rs` = `tea gc` (external)
         └── tests/             E2E, fibers, closures, user modules, extensions
                                (paths, dotted, multi-phase), completions,
                                exceptions, unittest_runner, stdlib_batch_a,
@@ -113,14 +110,14 @@ repository root.
 
 ## Mapping rules
 
-- `pyx-ir` contains **no** logic beyond type tables and contract structures.
+- `hydro-ir` contains **no** logic beyond type tables and contract structures.
   Changes to `ir.rs`/`model.rs` are contract changes.
-- `pyx-frontend::stdlib` (re-export from `pyx-ir`) is the only place where
+- `hydro-frontend::stdlib` (re-export from `hydro-ir`) is the only place where
   native module signatures for type checking and runtime validation live.
-- Runtime code lives exclusively in `pyx-runtime`; `pyx-codegen` only calls
-  `pyx_runtime::abi` symbols.
+- Runtime code lives exclusively in `hydro-runtime`; `hydro-codegen` only calls
+  `hydro_runtime::abi` symbols.
 - Tests live with their respective responsibility: unit tests inline, ABI
-  integration tests under `crates/pyx-runtime/tests/`, process/CLI E2E under
-  `crates/pyx-cli/tests/`.
-- New CLI subcommands get a file under `pyx-cli/src/cli/commands/`
+  integration tests under `crates/hydro-runtime/tests/`, process/CLI E2E under
+  the Tea repository's `tests/`.
+- New CLI subcommands live in the Tea repository (`../tea/src/cli/commands/`).
   and an entry in `dispatch.rs`, `args.rs`, and `usage_text()`.

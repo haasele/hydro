@@ -7,7 +7,7 @@
 # fails instead of producing an empty timing.
 #
 # Missing `hyperfine`/`uv` is a skip by default (exit 0); `--strict` turns it
-# into an error (exit 1). `bench_all.py` (orchestrator) and `bench_pyx.py`
+# into an error (exit 1). `bench_all.py` (orchestrator) and `bench_hydro.py`
 # (already measures CPython/JIT/AOT itself) are intentionally not wrapped.
 #
 # Usage:

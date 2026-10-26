@@ -1,0 +1,610 @@
+{
+  "meta": {
+    "timestamp": "2026-10-24 20:29:58",
+    "python": "3.14.8",
+    "platform": "Linux-7.2.11-1-cachyos-x86_64-with-glibc2.44",
+    "cpu": "x86_64",
+    "repeats": 5,
+    "tea": "/mnt/Vault/GitHub/tea/target/release/tea"
+  },
+  "results": [
+    {
+      "workload": "while_sum",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 22.862310001073638,
+      "median_ms": 23.485933998017572,
+      "max_ms": 24.54581499841879,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "while_sum",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 2.6891369998338632,
+      "median_ms": 3.1596070002706256,
+      "max_ms": 3.3475259988335893,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "while_sum",
+      "impl": "hydro-aot",
+      "build_ms": 89.48041500116233,
+      "min_ms": 1.667033000558149,
+      "median_ms": 1.7317550009465776,
+      "max_ms": 1.75236799987033,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "for_sum",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 18.740167000942165,
+      "median_ms": 19.25029199992423,
+      "max_ms": 20.887184000457637,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "for_sum",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 2.399354001681786,
+      "median_ms": 2.4496029982401524,
+      "max_ms": 2.7680130006046966,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "for_sum",
+      "impl": "hydro-aot",
+      "build_ms": 86.9341590005206,
+      "min_ms": 1.2155170006735716,
+      "median_ms": 1.3957299997855444,
+      "max_ms": 1.92262199925608,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "range_sum",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 9.674624998297077,
+      "median_ms": 10.095038000144996,
+      "max_ms": 13.6842229985632,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "range_sum",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 3.093128998443717,
+      "median_ms": 3.2237060004263185,
+      "max_ms": 3.509850001137238,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "range_sum",
+      "impl": "hydro-aot",
+      "build_ms": 84.89783099867054,
+      "min_ms": 2.65989699983038,
+      "median_ms": 2.973977996589383,
+      "max_ms": 3.2679409996489994,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "list_append",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 16.179116999410326,
+      "median_ms": 16.705949998140568,
+      "max_ms": 20.393707000039285,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "list_append",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 4.068447000463493,
+      "median_ms": 4.488663998927223,
+      "max_ms": 5.301659999531694,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "list_append",
+      "impl": "hydro-aot",
+      "build_ms": 82.09450399954221,
+      "min_ms": 3.846499999781372,
+      "median_ms": 4.000320997874951,
+      "max_ms": 4.264628001692472,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "dict_insert",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 8.296881002024747,
+      "median_ms": 8.967057001427747,
+      "max_ms": 9.89513199965586,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "dict_insert",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 2.307578000909416,
+      "median_ms": 2.680992998648435,
+      "max_ms": 3.227653996873414,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "dict_insert",
+      "impl": "hydro-aot",
+      "build_ms": 87.58571599901188,
+      "min_ms": 1.3498100015567616,
+      "median_ms": 1.5076290001161397,
+      "max_ms": 1.7056020005838946,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "string_concat",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 8.533737000107067,
+      "median_ms": 9.510461997706443,
+      "max_ms": 10.919188000116264,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "string_concat",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 7.125054002244724,
+      "median_ms": 7.515957000578055,
+      "max_ms": 8.082082000328228,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "string_concat",
+      "impl": "hydro-aot",
+      "build_ms": 87.02710699799354,
+      "min_ms": 5.12613700266229,
+      "median_ms": 6.245838998438558,
+      "max_ms": 6.851353002275573,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "list_comp",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 12.900444999104366,
+      "median_ms": 14.051900998310884,
+      "max_ms": 15.026223998575006,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "list_comp",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 3.4442910000507254,
+      "median_ms": 3.7057029985589907,
+      "max_ms": 4.616120000719093,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "list_comp",
+      "impl": "hydro-aot",
+      "build_ms": 80.3784710005857,
+      "min_ms": 2.4458949992549606,
+      "median_ms": 2.5282579990744125,
+      "max_ms": 3.118976001132978,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_comp",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 10.827188001712784,
+      "median_ms": 12.213134999910835,
+      "max_ms": 13.551388001360465,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_comp",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 3.6247890020604245,
+      "median_ms": 3.7757829995825887,
+      "max_ms": 4.218607002258068,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_comp",
+      "impl": "hydro-aot",
+      "build_ms": 90.69130999705521,
+      "min_ms": 2.614560002257349,
+      "median_ms": 3.0402619995584246,
+      "max_ms": 3.42364300013287,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "sum_genexp",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 11.87006200052565,
+      "median_ms": 12.020705002214527,
+      "max_ms": 12.618418997590197,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "sum_genexp",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 3.7488269990717527,
+      "median_ms": 3.944336000131443,
+      "max_ms": 4.497278998314869,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "sum_genexp",
+      "impl": "hydro-aot",
+      "build_ms": 88.19372500147438,
+      "min_ms": 3.0248249968281016,
+      "median_ms": 3.2301950013788883,
+      "max_ms": 3.5783040002570488,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "map_lambda",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 14.662178000435233,
+      "median_ms": 15.902113998890854,
+      "max_ms": 16.68434300154331,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "map_lambda",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 6.510266000987031,
+      "median_ms": 7.359068000369007,
+      "max_ms": 7.469494998076698,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "map_lambda",
+      "impl": "hydro-aot",
+      "build_ms": 85.10099200066179,
+      "min_ms": 5.162560999451671,
+      "median_ms": 5.912065000302391,
+      "max_ms": 6.6054439994331915,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_lambda",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 11.831742998765549,
+      "median_ms": 13.181255002564285,
+      "max_ms": 13.700348998099798,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_lambda",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 5.616493999696104,
+      "median_ms": 6.018241998390295,
+      "max_ms": 6.790100997022819,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "filter_lambda",
+      "impl": "hydro-aot",
+      "build_ms": 90.40943700165371,
+      "min_ms": 4.7938140014593955,
+      "median_ms": 4.883440997218713,
+      "max_ms": 5.462850000185426,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "lambda_call",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 14.56723199953558,
+      "median_ms": 15.206638003292028,
+      "max_ms": 18.17808600026183,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "lambda_call",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 4.416858999320539,
+      "median_ms": 4.629432998626726,
+      "max_ms": 4.845987001317553,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "lambda_call",
+      "impl": "hydro-aot",
+      "build_ms": 92.23930299776839,
+      "min_ms": 3.580277996661607,
+      "median_ms": 3.8508979996549897,
+      "max_ms": 4.0391149996139575,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "reduce_add",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 11.820343999715988,
+      "median_ms": 12.720622999040643,
+      "max_ms": 14.333973998873262,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "reduce_add",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 3.326820002257591,
+      "median_ms": 4.014775000541704,
+      "max_ms": 4.831958998693153,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "reduce_add",
+      "impl": "hydro-aot",
+      "build_ms": 81.02743400013424,
+      "min_ms": 2.909124999860069,
+      "median_ms": 3.1380729997181334,
+      "max_ms": 3.290946999186417,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "math_loop",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 12.515655002061976,
+      "median_ms": 13.634891998663079,
+      "max_ms": 16.51697399938712,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "math_loop",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 6.791037001676159,
+      "median_ms": 7.409547997667687,
+      "max_ms": 7.608495001477422,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "math_loop",
+      "impl": "hydro-aot",
+      "build_ms": 95.10215900081675,
+      "min_ms": 5.822306000482058,
+      "median_ms": 6.15704200026812,
+      "max_ms": 6.908774998009903,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "json_dumps",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 14.360351000505034,
+      "median_ms": 14.968096002121456,
+      "max_ms": 16.691952998371562,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "json_dumps",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 3.0203080023056827,
+      "median_ms": 3.297973998996895,
+      "max_ms": 3.9854310016380623,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "json_dumps",
+      "impl": "hydro-aot",
+      "build_ms": 88.12192800178309,
+      "min_ms": 1.8493899988243356,
+      "median_ms": 1.8861370008380618,
+      "max_ms": 2.910111998062348,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "json_loads",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 14.735649001522688,
+      "median_ms": 15.378331001556944,
+      "max_ms": 17.40117599911173,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "json_loads",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 2.682739999727346,
+      "median_ms": 2.699777000088943,
+      "max_ms": 3.253237002354581,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "json_loads",
+      "impl": "hydro-aot",
+      "build_ms": 89.10006999940379,
+      "min_ms": 1.5867619986238424,
+      "median_ms": 1.9073530020250473,
+      "max_ms": 2.591952998045599,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_serial",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 55.94438399930368,
+      "median_ms": 58.42442200082587,
+      "max_ms": 63.08852200163528,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_serial",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 4.206035999231972,
+      "median_ms": 4.5818889993825,
+      "max_ms": 5.305472001055023,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_serial",
+      "impl": "hydro-aot",
+      "build_ms": 79.71991899830755,
+      "min_ms": 3.6786320015380625,
+      "median_ms": 3.8759080016461667,
+      "max_ms": 4.581173001497518,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_parallel",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 35.46726800050237,
+      "median_ms": 36.57730399936554,
+      "max_ms": 39.60000699953525,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_parallel",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 5.631510997773148,
+      "median_ms": 6.070552000892349,
+      "max_ms": 7.816833000106271,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "threads_parallel",
+      "impl": "hydro-aot",
+      "build_ms": 85.36915800141287,
+      "min_ms": 2.4539459991501644,
+      "median_ms": 2.8330239983915817,
+      "max_ms": 3.685024999867892,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "pool_map",
+      "impl": "cpython",
+      "build_ms": null,
+      "status": "error",
+      "error": "CPython reference failed"
+    },
+    {
+      "workload": "pool_serial",
+      "impl": "cpython",
+      "build_ms": null,
+      "status": "error",
+      "error": "CPython reference failed"
+    },
+    {
+      "workload": "pool_parallel",
+      "impl": "cpython",
+      "build_ms": null,
+      "status": "error",
+      "error": "CPython reference failed"
+    },
+    {
+      "workload": "process_queue",
+      "impl": "cpython",
+      "build_ms": null,
+      "status": "error",
+      "error": "CPython reference failed"
+    },
+    {
+      "workload": "startup_hello",
+      "impl": "cpython",
+      "build_ms": null,
+      "min_ms": 8.667456000694074,
+      "median_ms": 9.331017001386499,
+      "max_ms": 10.666682999726618,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "startup_hello",
+      "impl": "hydro-jit",
+      "build_ms": null,
+      "min_ms": 1.323559001320973,
+      "median_ms": 1.7251569988729898,
+      "max_ms": 2.51515499985544,
+      "rss_kb": null,
+      "status": "ok"
+    },
+    {
+      "workload": "startup_hello",
+      "impl": "hydro-aot",
+      "build_ms": 89.13639700040221,
+      "min_ms": 0.8432970025751274,
+      "median_ms": 0.9214739984599873,
+      "max_ms": 1.1368529994797427,
+      "rss_kb": null,
+      "status": "ok"
+    }
+  ]
+}

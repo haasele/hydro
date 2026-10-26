@@ -56,7 +56,7 @@ BENCHES = [
           ["--duration", "2", "--warmup", "0.5", "--repeat", "3"]),
     Bench("fastapi", "bench_fastapi_throughput.py", "FastAPI-Durchsatz",
           ["--duration", "2", "--warmup", "0.5"]),
-    Bench("pyx", "bench_pyx.py", "PyX vs CPython (JIT/AOT)",
+    Bench("hydro", "bench_hydro.py", "Hydro vs CPython (JIT/AOT)",
           ["--n", "50000", "--repeat", "2"]),
 ]
 

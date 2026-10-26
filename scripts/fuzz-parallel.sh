@@ -20,7 +20,7 @@ WORKERS="${FUZZ_WORKERS:-$(nproc)}"
 ITERATIONS="${FUZZ_ITERATIONS:-100000}"
 BASE_SEED="${FUZZ_SEED:-242424}"
 LOG_DIR="${FUZZ_LOG_DIR:-fuzz/logs}"
-RUNNER="fuzz/stable/target/release/pyx-fuzz-stable"
+RUNNER="fuzz/stable/target/release/hydro-fuzz-stable"
 
 mkdir -p "$LOG_DIR"
 cargo build --release --manifest-path fuzz/stable/Cargo.toml

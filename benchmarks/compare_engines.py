@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Compare CPython, PyX, PyPy and Go on representative loop/startup workloads.
+"""Compare CPython, Hydro, PyPy and Go on representative loop/startup workloads.
 
-The Python workloads are plain scripts run in fresh processes. PyX runs them
-through `pyx run`; Go measures an equivalent compiled Go program and is a
+The Python workloads are plain scripts run in fresh processes. Hydro runs them
+through `tea infuse`; Go measures an equivalent compiled Go program and is a
 native reference, not a Python runtime. Missing engines (no `pypy3`, no built
-`pyx`, no Go toolchain) are reported as skipped with the reason; timings are
+`tea`, no Go toolchain) are reported as skipped with the reason; timings are
 never invented. A detected engine that fails or prints the wrong result is an
 error and makes the command exit 1.
 
@@ -13,7 +13,7 @@ Usage:
     python3 benchmarks/compare_engines.py --n 2000000 --runs 7 --warmup 2
     python3 benchmarks/compare_engines.py --json /tmp/engines.json \
         --markdown /tmp/engines.md
-    python3 benchmarks/compare_engines.py --pyx target/release/pyx
+    python3 benchmarks/compare_engines.py --tea ../tea/target/release/tea
 
 Exit codes: 0 = at least one successful measurement and no engine error,
 1 = an engine failed, nothing could be measured, or --strict found a skip.
@@ -55,7 +55,7 @@ class Engine:
     note: str
     version: str = "-"
     path: str = "-"
-    kind: str = ""  # python | pyx | go
+    kind: str = ""  # python | tea | go
 
 
 @dataclass
@@ -140,51 +140,51 @@ def detect_pypy() -> Engine:
     return Engine("pypy", "PyPy", "skipped", "pypy3/pypy not found on PATH")
 
 
-def detect_pyx(explicit: str | None) -> Engine:
+def detect_hydro(explicit: str | None) -> Engine:
     if explicit:
         candidate = Path(explicit).expanduser()
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return Engine(
-                "pyx",
-                "PyX (JIT)",
+                "tea",
+                "Hydro (JIT)",
                 "ok",
                 "",
                 version=version_of([str(candidate), "--version"]),
                 path=str(candidate),
-                kind="pyx",
+                kind="tea",
             )
         return Engine(
-            "pyx",
-            "PyX (JIT)",
+            "tea",
+            "Hydro (JIT)",
             "skipped",
-            f"requested --pyx is not executable: {candidate}",
+            f"requested --tea is not executable: {candidate}",
         )
 
     candidates = []
-    env = os.environ.get("PYX_BIN")
+    env = os.environ.get("HYDRO_BIN")
     if env:
         candidates.append(Path(env).expanduser())
-    which = shutil.which("pyx")
+    which = shutil.which("tea")
     if which:
         candidates.append(Path(which))
-    candidates.extend((ROOT / "target/release/pyx", ROOT / "target/debug/pyx"))
+    candidates.extend((ROOT.parent / "tea" / "../tea/target/release/tea", ROOT.parent / "tea" / "target/debug/tea"))
 
     for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return Engine(
-                "pyx",
-                "PyX (JIT)",
+                "tea",
+                "Hydro (JIT)",
                 "ok",
                 "",
                 version=version_of([str(candidate), "--version"]),
                 path=str(candidate),
-                kind="pyx",
+                kind="tea",
             )
     return Engine(
-        "pyx",
-        "PyX (JIT)",
+        "tea",
+        "Hydro (JIT)",
         "skipped",
-        "pyx binary not found (build it or pass --pyx/$PYX_BIN)",
+        "tea binary not found (build it or pass --tea/$HYDRO_BIN)",
     )
 
 
@@ -271,8 +271,8 @@ def command_for(
     if engine.kind == "go":
         return [str(go_binaries[workload])]
     script = str(scripts[workload])
-    if engine.kind == "pyx":
-        return [engine.path, "run", script]
+    if engine.kind == "tea":
+        return [engine.path, "infuse", script]
     return [engine.path, script]
 
 
@@ -306,7 +306,7 @@ def markdown_report(payload: dict) -> str:
     meta = payload["meta"]
     labels = {engine["key"]: engine["label"] for engine in payload["engines"]}
     lines = [
-        "# PyX engine comparison",
+        "# Hydro engine comparison",
         "",
         f"- Generated: {payload['generated']}",
         f"- Host: {meta['platform']} / {meta['machine']} / {meta['cpus']} CPUs",
@@ -343,13 +343,13 @@ def markdown_report(payload: dict) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Compare CPython, PyX, PyPy and Go on loop/startup workloads."
+        description="Compare CPython, Hydro, PyPy and Go on loop/startup workloads."
     )
     parser.add_argument("--n", type=int, default=DEFAULT_N, help=f"loop iterations (default {DEFAULT_N})")
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS, help=f"measured runs (default {DEFAULT_RUNS})")
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP, help=f"warmup runs (default {DEFAULT_WARMUP})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="per-run timeout in seconds")
-    parser.add_argument("--pyx", help="PyX binary (default: $PYX_BIN, PATH, target/{release,debug}/pyx)")
+    parser.add_argument("--tea", help="Hydro binary (default: $HYDRO_BIN, PATH, target/{release,debug}/tea)")
     parser.add_argument("--json", type=Path, help="write the machine-readable result here")
     parser.add_argument("--markdown", type=Path, help="write the markdown report here")
     parser.add_argument("--strict", action="store_true", help="fail when any engine is skipped")
@@ -362,7 +362,7 @@ def main() -> int:
     if args.warmup < 0:
         parser.error("--warmup must not be negative")
 
-    engines = [detect_python(), detect_pyx(args.pyx), detect_pypy(), detect_go()]
+    engines = [detect_python(), detect_hydro(args.hydro), detect_pypy(), detect_go()]
     by_key = {engine.key: engine for engine in engines}
     for engine in engines:
         if engine.status == "ok":
@@ -371,7 +371,7 @@ def main() -> int:
             log(f"{engine.key}: skipped - {engine.note}")
 
     results: list[Result] = []
-    with tempfile.TemporaryDirectory(prefix="pyx-compare-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="hydro-compare-") as tmp:
         workdir = Path(tmp)
         scripts: dict[str, Path] = {}
         for workload, _ in WORKLOADS:

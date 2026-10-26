@@ -1,8 +1,8 @@
-# PyX — C API/ABI Strategy (P4-04)
+# Hydro — C API/ABI Strategy (P4-04)
 
-Status: **decided 2026-10-24** — Option B (PyX-native CPython C-API/ABI
+Status: **decided 2026-10-24** — Option B (Hydro-native CPython C-API/ABI
 layer). The **first abi3 slice is implemented and verified**: a limited-API
-extension (`.so`) next to a PyX source file imports and calls under JIT and
+extension (`.so`) next to a Hydro source file imports and calls under JIT and
 AOT with no `libpython` (see §3.1). The full surface, wheels/venvs and the
 ecosystem program remain open.
 
@@ -12,20 +12,20 @@ list of what is *not* yet implemented.
 
 ## 1. Question
 
-Should CPython C extensions (NumPy, `pydantic-core`, …) run under PyX, and if
-so, via which path? The answer determines whether PyX objects need a
+Should CPython C extensions (NumPy, `pydantic-core`, …) run under Hydro, and if
+so, via which path? The answer determines whether Hydro objects need a
 CPython-compatible layout in the long term or whether a translation layer
 suffices. It affects the object model, GC, refcounting and ABI stability.
 
 ## 2. Decision
 
-**Option B: implement the CPython C API/ABI layer on PyX's own runtime; do not
+**Option B: implement the CPython C API/ABI layer on Hydro's own runtime; do not
 embed `libpython` in the production runtime.**
 
 - CPython 3.14 development files are used at build time (headers, `python3-config`)
   to compile extensions and test fixtures, and the CPython interpreter is used
   as a **differential test oracle** — never as a shipped runtime dependency.
-- `ldd pyx` must not list `libpython`. One process, one GC, one object graph.
+- `ldd tea` must not list `libpython`. One process, one GC, one object graph.
 - Two compatibility tiers, delivered in order:
   1. **`abi3`/limited API** for new and simple extensions (module init,
      `PyArg_Parse*`, scalar/container constructors, errors, capsules,
@@ -37,7 +37,7 @@ embed `libpython` in the production runtime.**
 
 Option A (embedding `libpython`) is rejected as the production path because it
 imposes CPython's startup, refcount model and a second VM on exactly those
-applications that are supposed to benefit from PyX. Option C (no extensions)
+applications that are supposed to benefit from Hydro. Option C (no extensions)
 is rejected as the long-term plan because NumPy/pandas/pydantic/FastAPI are
 required for ecosystem compatibility; it remains only as an explicitly
 documented fallback if the shim proves unfundable.
@@ -60,15 +60,15 @@ Reproducible probe: `spikes/p4_04/build.sh` (sources and full output there).
 | 100k `PyObject_Call` boundary calls | 1.65 ms |
 | peak RSS after probes (`VmHWM`) | 31.5 MB |
 
-For comparison, a PyX AOT `hello` starts in **0.80–1.04 ms** (bench_pyx). Any
+For comparison, a Hydro AOT `hello` starts in **0.80–1.04 ms** (bench_hydro). Any
 process that imports a C-extension package through Option A therefore pays
-CPython initialization plus module import before PyX code can run, and the
+CPython initialization plus module import before Hydro code can run, and the
 application graph is split across two object models and two collectors —
 exactly the opposite of the startup/efficiency goals.
 
 ### Option B — feasibility artifact
 
-A `Py_LIMITED_API = 0x030C0000` extension (`pyx_capi_probe`) builds without
+A `Py_LIMITED_API = 0x030C0000` extension (`hydro_capi_probe`) builds without
 linking `libpython`, imports in CPython and returns `add(2,3) = 5` with
 `tag = "abi3"`. Its undefined CPython symbols are the first concrete shim
 surface of an `abi3` extension:
@@ -81,16 +81,16 @@ PyModule_Create2
 ```
 
 This confirms the loader model: extensions are ordinary `.so` files with
-undefined CPython symbols that the host runtime resolves. PyX will export
+undefined CPython symbols that the host runtime resolves. Hydro will export
 those symbols from its shim (option B) instead of resolving them from
 `libpython` (option A).
 
 ### 3.1 Implemented slice (2026-10-24)
 
-The first vertical slice of option B is in `pyx-runtime` and verified by
-`crates/pyx-cli/tests/extensions.rs`:
+The first vertical slice of option B is in `hydro-runtime` and verified by
+`tea/tests/extensions.rs`:
 
-- **Shim** (`crates/pyx-runtime/src/capi/`): `PyModule_Create2`,
+- **Shim** (`crates/hydro-runtime/src/capi/`): `PyModule_Create2`,
   `PyModuleDef_Init` (multi-phase results, `Py_mod_exec` slots),
   `PyModule_AddStringConstant`, `PyModule_AddObject`, `PyLong_FromLong`,
   `PyLong_AsLong`, `PyUnicode_FromString`/`AsUTF8`, `PyFloat_FromDouble`/
@@ -106,20 +106,20 @@ The first vertical slice of option B is in `pyx-runtime` and verified by
   `PyArg_ParseTuple` (C shim in `parse.c`, formats `i/l/n/s/O/p/d`, `|`,
   `:`/`;`). Objects live in a process-lifetime arena; `Py_DecRef` never frees
   in this slice (no use-after-free, but no reclamation either).
-- **Loader** (`crates/pyx-runtime/src/modules/extension.rs`): discovery of
+- **Loader** (`crates/hydro-runtime/src/modules/extension.rs`): discovery of
   `<name>.so`, `<name>.abi3.so` or `<name>.*.so` at compile time in the
-  frontend (sibling directory, `PYX_EXTENSION_PATH`, `PYTHONPATH`,
-  `PYX_SITE_PACKAGES`, venv/conda `site-packages`); lazy `dlopen(RTLD_NOW)` +
+  frontend (sibling directory, `HYDRO_EXTENSION_PATH`, `PYTHONPATH`,
+  `HYDRO_SITE_PACKAGES`, venv/conda `site-packages`); lazy `dlopen(RTLD_NOW)` +
   `PyInit_<name>` resolution, cached by path; single-phase modules use the
   returned module object, multi-phase ones are created from their
   `PyModuleDef` and their `Py_mod_exec` slots run once before the load is
-  cached; callable values participate in `pyx_call`; errors map to the
-  matching PyX exception.
-- **Linking:** `pyx` and AOT binaries are linked with `--export-dynamic` and
-  pin the shim symbols via `capi::anchor()` in `pyx_runtime_init`; extension
+  cached; callable values participate in `hydro_call`; errors map to the
+  matching Hydro exception.
+- **Linking:** `tea` and AOT binaries are linked with `--export-dynamic` and
+  pin the shim symbols via `capi::anchor()` in `hydro_runtime_init`; extension
   symbols resolve from the process, not from `libpython`.
-- **Verified fixture:** `pyx_capi_probe.abi3.so` (`Py_LIMITED_API 0x030C0000`)
-  prints `5`, `abi3`, `42`, `abi3` under `pyx run` and an AOT binary; a second
+- **Verified fixture:** `hydro_capi_probe.abi3.so` (`Py_LIMITED_API 0x030C0000`)
+  prints `5`, `abi3`, `42`, `abi3` under `tea infuse` and an AOT binary; a second
   fixture (`abi3_multiphase.c`) returns a `PyModuleDef` from `PyInit_*`, adds
   `tag` from a `Py_mod_exec` slot and prints `multiphase`/`42` under both;
   `ldd` shows no `libpython`; arity errors are `TypeError`, missing members
@@ -133,9 +133,9 @@ The first vertical slice of option B is in `pyx-runtime` and verified by
 
 CPython 3.14 `sys.stdlib_module_names` contains **297** modules:
 
-| Layer | Count | Consequence for PyX |
+| Layer | Count | Consequence for Hydro |
 |---|---:|---|
-| pure-Python modules | 174 | must run **unmodified** on the PyX language/runtime |
+| pure-Python modules | 174 | must run **unmodified** on the Hydro language/runtime |
 | extension modules | 63 | native Rust implementation, `abi3`/full-ABI wheel, or documented replacement |
 | builtin/frozen modules | 52 | runtime internals (`sys`, `_io`, `_imp`, `_thread`, `itertools`, …) |
 | platform-specific / unknown | 8 | Windows/Apple-only modules on this Linux host; documented as unsupported |
@@ -145,28 +145,28 @@ machine-readable compatibility report, not by prose claims.
 
 ## 4. Object-model consequences
 
-- PyX values remain tagged `i64`; heap objects keep the kind header and the
+- Hydro values remain tagged `i64`; heap objects keep the kind header and the
   conservative/concurrent GC.
 - A CPython-visible object is a **refcounted handle** allocated by the shim:
   - For immutable scalars (`int`, `float`, `str`, `bytes`, `None`, `bool`) the
     handle may cache/convert the tagged value.
-  - For containers and user objects the handle points at the PyX object and
+  - For containers and user objects the handle points at the Hydro object and
     raises its refcount; the collector treats the refcount as an additional
     root, and the shim's `tp_traverse`/`tp_clear` mirror GC edges.
   - Extensions that require real `PyObject` structs (NumPy) see the full
-    struct; PyX-native code never does.
+    struct; Hydro-native code never does.
 - The GIL is **emulated only around extension entry points** (one global lock
-  held while foreign code runs). PyX code remains GIL-free; extension
+  held while foreign code runs). Hydro code remains GIL-free; extension
   callbacks acquire the same lock.
 - Identity (`is`) and refcount semantics are preserved within the CPython
-  handle graph; mixing raw PyX values into extension APIs requires an explicit
+  handle graph; mixing raw Hydro values into extension APIs requires an explicit
   conversion function and is rejected with a clear error where not supported.
 
 ## 5. Milestones and acceptance gates
 
 | Milestone | Content | Acceptance |
 |---|---|---|
-| P4-04a | `abi3` shim: module init, `PyArg_Parse*`, scalar/container constructors, error API, capsuled types, buffer basics | **Done for the defined subset:** module/scalar/container APIs, capsules, read-only bytes buffers, `PyExc_*`; fixture imports/runs under PyX with no `libpython`. Further symbols are driven by P4-10 |
+| P4-04a | `abi3` shim: module init, `PyArg_Parse*`, scalar/container constructors, error API, capsuled types, buffer basics | **Done for the defined subset:** module/scalar/container APIs, capsules, read-only bytes buffers, `PyExc_*`; fixture imports/runs under Hydro with no `libpython`. Further symbols are driven by P4-10 |
 | P4-04b | Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags, package submodules, multi-phase init | **Done:** sibling/env/venv discovery, wheel tags validated at compile time, dotted package submodules, single- and multi-phase init (exec slots, clear slot errors), caching and error paths green |
 | P4-04c | Full 3.14 ABI: `PyTypeObject`, refcounts/GC integration, vectorcall, full buffer protocol | NumPy 2.5 smoke (array create/ops/dtype) and `pydantic-core` model validation |
 | P4-04d | GIL emulation and callback safety | threaded extension callbacks + GC stress; no deadlock/data race |
@@ -184,7 +184,7 @@ machine-readable compatibility report, not by prose claims.
   refcount/GC coordination are multi-month work; the milestones above are
   ordered so each one is independently testable.
 - **Performance claims:** boundary conversion costs must be measured per
-  library; no promise that extension-heavy code matches native PyX speed.
+  library; no promise that extension-heavy code matches native Hydro speed.
 - **Licensing/distribution:** CPython headers are used at build time only;
   extensions keep their own licenses.
 

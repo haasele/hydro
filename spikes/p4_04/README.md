@@ -2,7 +2,7 @@
 
 Two small probes for the CPython-embedding option (option A) and the
 stable-C-ABI option (option B). They are measurement/feasibility scaffolding,
-not PyX components.
+not Hydro components.
 
 ## What is measured
 
@@ -21,7 +21,7 @@ If a Python import or call step fails, its line is printed as
 `...=unavailable` and the remaining steps continue. Import timing includes
 CPython's module lookup and initialization, not compilation of a user module.
 
-`abi3_probe.c` builds the module `pyx_capi_probe` with
+`abi3_probe.c` builds the module `hydro_capi_probe` with
 `Py_LIMITED_API=0x030C0000`, without linking `libpython`. It exports:
 
 - `add(a, b)` using `PyArg_ParseTuple` and `PyLong_FromLong`.
@@ -72,12 +72,12 @@ decision, not a benchmark suite.
 | 100k one-argument calls | `call100k_ms` | Monotonic-clock interval around 100,000 `PyObject_CallOneArg` calls | 1.645 ms |
 | CPython finalization | `finalize_ms` | Monotonic-clock interval around `Py_FinalizeEx()` | 7.461 ms |
 | Peak RSS | `rss_kb` | `VmHWM` in `/proc/self/status`, read after finalization | 31,460 KB |
-| ABI3 extension smoke test | `abi3_tag`, `abi3_add_2_3` | CPython imports `pyx_capi_probe.so` and calls the exported members | `abi3`, `5` |
-| Undefined CPython symbols | `undefined_py_symbols` | Count of unique `Py*` names from `nm -D --undefined-only pyx_capi_probe.so` | 4 (`PyArg_ParseTuple`, `PyLong_FromLong`, `PyModule_AddStringConstant`, `PyModule_Create2`) |
+| ABI3 extension smoke test | `abi3_tag`, `abi3_add_2_3` | CPython imports `hydro_capi_probe.so` and calls the exported members | `abi3`, `5` |
+| Undefined CPython symbols | `undefined_py_symbols` | Count of unique `Py*` names from `nm -D --undefined-only hydro_capi_probe.so` | 4 (`PyArg_ParseTuple`, `PyLong_FromLong`, `PyModule_AddStringConstant`, `PyModule_Create2`) |
 
 Interpretation for the P4-04 decision: embedded CPython costs ~14.1 ms for
-init+finalize and ~41.6 ms for a NumPy import before any PyX code runs, while a
-PyX AOT process starts in ~0.8–1.0 ms. The ABI3 extension needs four shim
+init+finalize and ~41.6 ms for a NumPy import before any Hydro code runs, while a
+Hydro AOT process starts in ~0.8–1.0 ms. The ABI3 extension needs four shim
 symbols, confirming that extensions are ordinary shared objects whose CPython
 symbols the host can provide. See `../../docs/C_API.md` for the decision and
 gates.

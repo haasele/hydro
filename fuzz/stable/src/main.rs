@@ -1,4 +1,4 @@
-//! Stable-toolchain fallback runner for the PyX fuzz targets.
+//! Stable-toolchain fallback runner for the Hydro fuzz targets.
 //!
 //! `libfuzzer-sys` needs nightly (`cargo-fuzz`). Where that is unavailable,
 //! this runner executes the *same* harness functions on deterministic
@@ -6,15 +6,15 @@
 //!
 //! ```text
 //! cargo build --release --manifest-path fuzz/stable/Cargo.toml
-//! fuzz/stable/target/release/pyx-fuzz-stable frontend_pipeline --iterations 50
-//! fuzz/stable/target/release/pyx-fuzz-stable runtime_gc --iterations 2000
+//! fuzz/stable/target/release/hydro-fuzz-stable frontend_pipeline --iterations 50
+//! fuzz/stable/target/release/hydro-fuzz-stable runtime_gc --iterations 2000
 //! ```
 //!
 //! A panic (or an abnormal exit) fails with a non-zero status and prints the
 //! offending input as hex, so it can be replayed with `--input`:
 //!
 //! ```text
-//! pyx-fuzz-stable runtime_gc --input crash.bin
+//! hydro-fuzz-stable runtime_gc --input crash.bin
 //! ```
 //!
 //! The long campaign is the real fuzzer's job; see `fuzz/Cargo.toml`.
@@ -28,7 +28,7 @@ use std::time::Instant;
 use harness::{SplitMix64, generate_frontend_input, generate_runtime_input};
 
 const USAGE: &str = "\
-usage: pyx-fuzz-stable <target> [options]
+usage: hydro-fuzz-stable <target> [options]
 
 targets:
   frontend_pipeline   parse + lower + type-check + native codegen
@@ -132,7 +132,7 @@ fn main() {
     }
 
     println!(
-        "pyx-fuzz-stable: {target}: {executed} inputs in {:.2?}",
+        "hydro-fuzz-stable: {target}: {executed} inputs in {:.2?}",
         start.elapsed()
     );
 }
@@ -142,7 +142,7 @@ fn run_one(run: fn(&[u8]), data: &[u8]) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(data)));
     if outcome.is_err() {
         eprintln!(
-            "pyx-fuzz: {} byte input crashed the target\nhex: {}",
+            "hydro-fuzz: {} byte input crashed the target\nhex: {}",
             data.len(),
             hex(data)
         );
@@ -182,6 +182,6 @@ fn hex(data: &[u8]) -> String {
 }
 
 fn usage(message: &str) -> ! {
-    eprintln!("pyx-fuzz-stable: {message}\n\n{USAGE}");
+    eprintln!("hydro-fuzz-stable: {message}\n\n{USAGE}");
     std::process::exit(2);
 }

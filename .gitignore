@@ -5,10 +5,10 @@
 /fuzz/target
 /fuzz/stable/target
 
-# PyX build cache / project state (also test-created caches under crates/)
-.pyx/
+# Hydro build cache / project state (also test-created caches under crates/)
+.hydro/
 
-# Native artifacts from `pyx build` (ad-hoc, in-tree output)
+# Native artifacts from `tea build` (ad-hoc, in-tree output)
 *.o
 *.a
 

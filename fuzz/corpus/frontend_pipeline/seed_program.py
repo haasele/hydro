@@ -13,4 +13,4 @@ def describe(value: str) -> str:
 
 items = [add(i, i * 2) for i in range(6)]
 total = sum(items)
-print(describe("pyx"), total)
+print(describe("tea"), total)

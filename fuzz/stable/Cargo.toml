@@ -1,17 +1,17 @@
 [package]
-name = "pyx-fuzz-stable"
+name = "hydro-fuzz-stable"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "pyx-fuzz-stable"
+name = "hydro-fuzz-stable"
 path = "src/main.rs"
 
 [dependencies]
-pyx-frontend = { path = "../../crates/pyx-frontend" }
-pyx-codegen = { path = "../../crates/pyx-codegen" }
-pyx-runtime = { path = "../../crates/pyx-runtime" }
+hydro-frontend = { path = "../../crates/hydro-frontend" }
+hydro-codegen = { path = "../../crates/hydro-codegen" }
+hydro-runtime = { path = "../../crates/hydro-runtime" }
 
 # Standalone workspace: the stable fallback is built with the ordinary stable
 # toolchain and must not pull `libfuzzer-sys` (which needs `cargo-fuzz` and

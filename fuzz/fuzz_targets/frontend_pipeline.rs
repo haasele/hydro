@@ -13,7 +13,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pyx_fuzz::frontend_pipeline;
+use hydro_fuzz::frontend_pipeline;
 
 fuzz_target!(|data: &[u8]| {
     frontend_pipeline(data);

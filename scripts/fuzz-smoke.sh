@@ -15,14 +15,14 @@
 # 2. Stable fallback (`fuzz/stable`, no nightly, no libfuzzer-sys), used
 #    automatically when cargo-fuzz/nightly is missing:
 #      cargo build --release --manifest-path fuzz/stable/Cargo.toml
-#      fuzz/stable/target/release/pyx-fuzz-stable frontend_pipeline --iterations 50
-#      fuzz/stable/target/release/pyx-fuzz-stable runtime_gc --iterations 2000
+#      fuzz/stable/target/release/hydro-fuzz-stable frontend_pipeline --iterations 50
+#      fuzz/stable/target/release/hydro-fuzz-stable runtime_gc --iterations 2000
 #
 # Long campaign (resumable: the corpus lives in fuzz/corpus/<target>):
 #      cargo +nightly fuzz run frontend_pipeline -- -max_total_time=86400 -timeout=10
 #      cargo +nightly fuzz run runtime_gc        -- -max_total_time=86400 -timeout=10
 #   or, without nightly, a long stable soak:
-#      fuzz/stable/target/release/pyx-fuzz-stable runtime_gc --iterations 500000
+#      fuzz/stable/target/release/hydro-fuzz-stable runtime_gc --iterations 500000
 #
 # Environment:
 #   FUZZ_SECONDS     per-target libFuzzer wall clock (default 15)
@@ -56,7 +56,7 @@ if have_libfuzzer; then
     for target in "${TARGETS[@]}"; do
         sanitizer=()
         if [[ "$target" == "runtime_gc" && "${FUZZ_ALLOW_NONE:-0}" == "1" ]]; then
-            # PyX switches fiber stacks without ASan annotations.
+            # Hydro switches fiber stacks without ASan annotations.
             sanitizer=(-s none)
         fi
         echo "-- $target"
@@ -69,7 +69,7 @@ fi
 
 echo "== fuzz smoke (stable fallback): ${STABLE_ITERATIONS} inputs for runtime_gc =="
 cargo build --release --manifest-path fuzz/stable/Cargo.toml
-runner="fuzz/stable/target/release/pyx-fuzz-stable"
+runner="fuzz/stable/target/release/hydro-fuzz-stable"
 
 # Codegen runs per input, so the frontend budget is an order of magnitude
 # smaller than the runtime budget; both stay well under a second per target.

@@ -2,7 +2,7 @@ import io
 import os
 
 
-path = "/tmp/pyx-files-" + str(os.getpid()) + ".txt"
+path = "/tmp/hydro-files-" + str(os.getpid()) + ".txt"
 with open(path, "w", encoding="utf-8") as handle:
     handle.write("alpha\n")
     handle.write("beta\n")

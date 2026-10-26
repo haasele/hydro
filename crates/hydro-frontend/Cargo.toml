@@ -1,0 +1,9 @@
+[package]
+name = "hydro-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hydro-ir.workspace = true
+rustpython-parser.workspace = true

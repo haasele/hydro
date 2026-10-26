@@ -380,6 +380,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hydro-codegen"
+version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-jit",
+ "cranelift-module",
+ "cranelift-native",
+ "cranelift-object",
+ "hydro-ir",
+ "hydro-runtime",
+]
+
+[[package]]
+name = "hydro-frontend"
+version = "0.1.0"
+dependencies = [
+ "hydro-ir",
+ "rustpython-parser",
+]
+
+[[package]]
+name = "hydro-fuzz-stable"
+version = "0.1.0"
+dependencies = [
+ "hydro-codegen",
+ "hydro-frontend",
+ "hydro-runtime",
+]
+
+[[package]]
+name = "hydro-ir"
+version = "0.1.0"
+
+[[package]]
+name = "hydro-runtime"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "hydro-ir",
+ "libc",
+ "num-bigint",
+ "num-traits",
+ "regex",
+ "rustls",
+ "rustls-pki-types",
+ "webpki-roots",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -613,56 +663,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "pyx-codegen"
-version = "0.1.0"
-dependencies = [
- "cranelift-codegen",
- "cranelift-frontend",
- "cranelift-jit",
- "cranelift-module",
- "cranelift-native",
- "cranelift-object",
- "pyx-ir",
- "pyx-runtime",
-]
-
-[[package]]
-name = "pyx-frontend"
-version = "0.1.0"
-dependencies = [
- "pyx-ir",
- "rustpython-parser",
-]
-
-[[package]]
-name = "pyx-fuzz-stable"
-version = "0.1.0"
-dependencies = [
- "pyx-codegen",
- "pyx-frontend",
- "pyx-runtime",
-]
-
-[[package]]
-name = "pyx-ir"
-version = "0.1.0"
-
-[[package]]
-name = "pyx-runtime"
-version = "0.1.0"
-dependencies = [
- "cc",
- "libc",
- "num-bigint",
- "num-traits",
- "pyx-ir",
- "regex",
- "rustls",
- "rustls-pki-types",
- "webpki-roots",
 ]
 
 [[package]]

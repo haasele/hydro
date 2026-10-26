@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run CPython's official test suite against PyX and a pinned CPython oracle.
+"""Run CPython's official test suite against Hydro and a pinned CPython oracle.
 
 Every top-level ``Lib/test/test_*.py`` file is executed twice from a CPython
 3.14.9 source tree: once by a CPython 3.14.9 interpreter (the differential
-oracle) and once by PyX (``pyx run``).  A test is reported as passing
-(``pyx_pass``) only when both interpreters exit 0.  The result is written as
+oracle) and once by Hydro (``tea infuse``).  A test is reported as passing
+(``hydro_pass``) only when both interpreters exit 0.  The result is written as
 JSON plus a Markdown report, and the passing set can seed a release-gate
 manifest.
 
@@ -20,15 +20,15 @@ silent fallback to another CPython.
     python3 scripts/cpython_compat.py --update-manifest    # record passing set
 
 Source resolution: ``--source PATH``, else the auto-downloaded cache in
-``.pyx/cpython/Python-3.14.9`` (downloaded once from python.org and hashed).
+``.hydro/cpython/Python-3.14.9`` (downloaded once from python.org and hashed).
 ``--gate`` and ``--check-manifest`` never touch the network.
 
-Oracle resolution: ``--cpython PATH``, else ``$PYX_CPYTHON``, else
+Oracle resolution: ``--cpython PATH``, else ``$HYDRO_CPYTHON``, else
 ``uv python find 3.14.9``.  If none is found the script fails with the
 ``uv python install 3.14.9`` remedy.
 
 Exit codes: 0 = report/gate/manifest succeeded, 1 = gate or manifest failure
-(or invalid usage), 2 = missing/unusable PyX, CPython oracle, or source tree.
+(or invalid usage), 2 = missing/unusable Hydro, CPython oracle, or source tree.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ ROOT = HERE.parent  # repository root (parent of scripts/)
 
 TARGET_PYTHON = "3.14.9"
 DOWNLOAD_URL = f"https://www.python.org/ftp/python/{TARGET_PYTHON}/Python-{TARGET_PYTHON}.tgz"
-CACHE_ROOT = ROOT / ".pyx" / "cpython"
+CACHE_ROOT = ROOT / ".hydro" / "cpython"
 DEFAULT_SOURCE = CACHE_ROOT / f"Python-{TARGET_PYTHON}"
 DEFAULT_ARCHIVE = CACHE_ROOT / f"Python-{TARGET_PYTHON}.tgz"
 
@@ -74,12 +74,12 @@ MANIFEST_NOTES = (
     "Import-only baseline is separate in docs/COMPATIBILITY.md."
 )
 
-PASS_STATUS = "pyx_pass"
-FAIL_STATUSES = ("pyx_fail", "cpython_fail", "expected_fail", "timeout")
+PASS_STATUS = "hydro_pass"
+FAIL_STATUSES = ("hydro_fail", "cpython_fail", "expected_fail", "timeout")
 STATUSES = (PASS_STATUS, *FAIL_STATUSES)
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-PYX_CODE_RE = re.compile(r"error\[(PYX\d+)\]")
+HYDRO_CODE_RE = re.compile(r"error\[(HYD\d+)\]")
 EXCEPTION_RE = re.compile(
     r"^(?:[A-Za-z_][\w.]*)(?:Error|Exception|Warning|Exit|Interrupt)\b"
 )
@@ -104,25 +104,25 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def resolve_pyx(cli_value: str | None) -> tuple[Path | None, str | None]:
-    """Resolve the PyX binary; an explicit --pyx path must be usable."""
+def resolve_hydro(cli_value: str | None) -> tuple[Path | None, str | None]:
+    """Resolve the Hydro binary; an explicit --tea path must be usable."""
     if cli_value:
         candidate = Path(cli_value).expanduser()
         if not (candidate.is_file() and os.access(candidate, os.X_OK)):
-            return None, f"PyX binary not found or not executable: {candidate}"
+            return None, f"Hydro binary not found or not executable: {candidate}"
         return candidate.resolve(), None
-    env = os.environ.get("PYX_BIN")
+    env = os.environ.get("HYDRO_BIN")
     if env:
         candidate = Path(env).expanduser()
         if not (candidate.is_file() and os.access(candidate, os.X_OK)):
-            return None, f"$PYX_BIN is not an executable file: {candidate}"
+            return None, f"$HYDRO_BIN is not an executable file: {candidate}"
         return candidate.resolve(), None
-    for candidate in (ROOT / "target" / "release" / "pyx", ROOT / "target" / "debug" / "pyx"):
+    for candidate in (ROOT.parent / "tea" / "target" / "release" / "tea", ROOT.parent / "tea" / "target" / "debug" / "tea"):
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate.resolve(), None
     return None, (
-        "PyX binary not found (tried --pyx, $PYX_BIN, "
-        f"{ROOT / 'target' / 'release' / 'pyx'}, {ROOT / 'target' / 'debug' / 'pyx'})"
+        "Hydro binary not found (tried --tea, $HYDRO_BIN, "
+        f"{ROOT / 'target' / 'release' / 'tea'}, {ROOT / 'target' / 'debug' / 'tea'})"
     )
 
 
@@ -230,19 +230,19 @@ def resolve_cpython(cli_value: str | None) -> tuple[Path | None, str | None, str
         if not (candidate.is_file() and os.access(candidate, os.X_OK)):
             return None, None, f"--cpython is not an executable file: {candidate}"
     else:
-        env = os.environ.get("PYX_CPYTHON")
+        env = os.environ.get("HYDRO_CPYTHON")
         if env:
             candidate = Path(env).expanduser()
-            origin = "$PYX_CPYTHON"
+            origin = "$HYDRO_CPYTHON"
             if not (candidate.is_file() and os.access(candidate, os.X_OK)):
-                return None, None, f"$PYX_CPYTHON is not an executable file: {candidate}"
+                return None, None, f"$HYDRO_CPYTHON is not an executable file: {candidate}"
         else:
             candidate, origin = uv_python_find()
             if candidate is None:
                 return None, None, (
                     f"CPython {TARGET_PYTHON} oracle not found ({origin}). "
                     f"Install it with `uv python install {TARGET_PYTHON}`, or pass "
-                    "--cpython PATH / set $PYX_CPYTHON."
+                    "--cpython PATH / set $HYDRO_CPYTHON."
                 )
             if not (candidate.is_file() and os.access(candidate, os.X_OK)):
                 return None, None, (
@@ -411,10 +411,10 @@ def last_non_empty_line(text: str) -> str:
 
 
 def first_error(stderr: str, stdout: str) -> str | None:
-    """First ``error[PYXnnnn]`` line, else the first exception line."""
+    """First ``error[HYDnnnn]`` line, else the first exception line."""
     text = ANSI_RE.sub("", stderr or "")
     for line in text.splitlines():
-        if PYX_CODE_RE.search(line):
+        if HYDRO_CODE_RE.search(line):
             return line.strip()[:MAX_ERROR_CHARS]
     for line in text.splitlines():
         stripped = line.strip()
@@ -424,25 +424,25 @@ def first_error(stderr: str, stdout: str) -> str | None:
     return tail[:MAX_ERROR_CHARS] or None
 
 
-def classify(cpython: dict, pyx: dict) -> str:
-    """Differential status; a PyX timeout is never a pass."""
-    if pyx["timed_out"]:
+def classify(cpython: dict, tea: dict) -> str:
+    """Differential status; a Hydro timeout is never a pass."""
+    if tea["timed_out"]:
         return "timeout"
     if cpython["timed_out"]:
-        return "expected_fail" if pyx["exit"] != 0 else "cpython_fail"
+        return "expected_fail" if tea["exit"] != 0 else "cpython_fail"
     if cpython["exit"] == 0:
-        return PASS_STATUS if pyx["exit"] == 0 else "pyx_fail"
-    return "expected_fail" if pyx["exit"] != 0 else "cpython_fail"
+        return PASS_STATUS if tea["exit"] == 0 else "hydro_fail"
+    return "expected_fail" if tea["exit"] != 0 else "cpython_fail"
 
 
 def check_test(
     path: Path,
     source: Path,
     cpython: Path,
-    pyx: Path,
+    tea: Path,
     timeout: float,
     cpython_env: dict[str, str],
-    pyx_env: dict[str, str],
+    hydro_env: dict[str, str],
 ) -> dict:
     lib_dir = source / "Lib"
     cpython_run = run_capture(
@@ -451,20 +451,20 @@ def check_test(
         timeout=timeout,
         env=cpython_env,
     )
-    pyx_run = run_capture(
-        [str(pyx), "run", "--color=never", str(path)],
+    hydro_run = run_capture(
+        [str(tea), "infuse", "--color=never", str(path)],
         cwd=ROOT,
         timeout=timeout,
-        env=pyx_env,
+        env=hydro_env,
     )
-    status = classify(cpython_run, pyx_run)
+    status = classify(cpython_run, hydro_run)
 
     error: str | None = None
     if status != PASS_STATUS:
-        if pyx_run["timed_out"]:
-            error = f"PyX timed out after {timeout:g}s"
+        if hydro_run["timed_out"]:
+            error = f"Hydro timed out after {timeout:g}s"
         else:
-            error = first_error(pyx_run["stderr"], pyx_run["stdout"])
+            error = first_error(hydro_run["stderr"], hydro_run["stdout"])
             if not error:
                 error = first_error(cpython_run["stderr"], cpython_run["stdout"])
 
@@ -476,10 +476,10 @@ def check_test(
             "timed_out": cpython_run["timed_out"],
             "duration_ms": cpython_run["duration_ms"],
         },
-        "pyx": {
-            "exit": pyx_run["exit"],
-            "timed_out": pyx_run["timed_out"],
-            "duration_ms": pyx_run["duration_ms"],
+        "tea": {
+            "exit": hydro_run["exit"],
+            "timed_out": hydro_run["timed_out"],
+            "duration_ms": hydro_run["duration_ms"],
         },
         "error": error,
     }
@@ -517,11 +517,11 @@ def run_cell(run: dict) -> str:
 
 def render_body(meta: dict, tests: list[dict], counts: dict) -> str:
     cpython = meta["cpython"]
-    pyx = meta["pyx"]
+    tea = meta["tea"]
     out: list[str] = []
     out.append(
         f"Environment: CPython `{cpython['version']}` (`{cpython['path']}`) · "
-        f"PyX `{pyx['version']}` (`{pyx['path']}`)"
+        f"Hydro `{tea['version']}` (`{tea['path']}`)"
     )
     out.append("")
     out.append(f"Source: `{meta['source']}` · generated {meta['date']}")
@@ -536,7 +536,7 @@ def render_body(meta: dict, tests: list[dict], counts: dict) -> str:
     out.append("")
     out.append(
         f"Passing: **{counts['passed']} / {counts['total']}** "
-        "(a pass requires PyX and CPython 3.14.9 to both exit 0)."
+        "(a pass requires Hydro and CPython 3.14.9 to both exit 0)."
     )
     out.append("")
 
@@ -571,12 +571,12 @@ def render_body(meta: dict, tests: list[dict], counts: dict) -> str:
 
     out.append("## Test results")
     out.append("")
-    out.append("| Test | CPython 3.14.9 | PyX | Status | First error |")
+    out.append("| Test | CPython 3.14.9 | Hydro | Status | First error |")
     out.append("| --- | --- | --- | --- | --- |")
     for test in tests:
         out.append(
             f"| `{md_cell(test['name'])}` | {run_cell(test['cpython'])} | "
-            f"{run_cell(test['pyx'])} | {md_cell(test['status'])} | "
+            f"{run_cell(test['tea'])} | {md_cell(test['status'])} | "
             f"{md_cell(test['error'] or '-', MAX_MD_ERROR_CHARS)} |"
         )
     out.append("")
@@ -727,11 +727,11 @@ def evaluate_gate(manifest: dict, tests: list[dict]) -> list[str]:
 # ------------------------------------------------------------------------ main
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Run CPython 3.14.9's Lib/test suite against PyX (differential oracle).",
+        description="Run CPython 3.14.9's Lib/test suite against Hydro (differential oracle).",
     )
-    ap.add_argument("--source", metavar="PATH", help="CPython 3.14.9 source tree (default: .pyx/cpython cache)")
-    ap.add_argument("--cpython", metavar="PATH", help="CPython 3.14.9 executable (default: $PYX_CPYTHON, uv python find 3.14.9)")
-    ap.add_argument("--pyx", help="path to the PyX binary (default: $PYX_BIN, release, debug)")
+    ap.add_argument("--source", metavar="PATH", help="CPython 3.14.9 source tree (default: .hydro/cpython cache)")
+    ap.add_argument("--cpython", metavar="PATH", help="CPython 3.14.9 executable (default: $HYDRO_CPYTHON, uv python find 3.14.9)")
+    ap.add_argument("--tea", help="path to the Hydro binary (default: $HYDRO_BIN, release, debug)")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="per-run timeout in seconds")
     ap.add_argument("--only", help="comma-separated test names (with or without .py)")
     ap.add_argument("--limit", type=int, help="run at most N tests (smoke runs)")
@@ -795,9 +795,9 @@ def main(argv: list[str] | None = None) -> int:
         log("error: --gate and --update-manifest require a full run; drop --only/--limit")
         return 1
 
-    pyx, pyx_error = resolve_pyx(args.pyx)
-    if pyx is None:
-        log(f"error: {pyx_error}")
+    tea, hydro_error = resolve_hydro(args.hydro)
+    if tea is None:
+        log(f"error: {hydro_error}")
         return 2
 
     cpython, cpython_version, cpython_error = resolve_cpython(args.cpython)
@@ -816,8 +816,8 @@ def main(argv: list[str] | None = None) -> int:
     env.setdefault("NO_COLOR", "1")
     cpython_env = dict(env)
     cpython_env["PYTHONPATH"] = str(source / "Lib")
-    pyx_env = dict(env)
-    pyx_env.pop("PYTHONPATH", None)  # the oracle's path must not leak into PyX
+    hydro_env = dict(env)
+    hydro_env.pop("PYTHONPATH", None)  # the oracle's path must not leak into Hydro
 
     test_dir = source / "Lib" / "test"
     paths, unknown = discover_tests(test_dir, args.only, args.limit)
@@ -834,7 +834,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     for index, path in enumerate(paths, 1):
         log(f"[{index}/{len(paths)}] {path.name}")
-        tests.append(check_test(path, source, cpython, pyx, args.timeout, cpython_env, pyx_env))
+        tests.append(check_test(path, source, cpython, tea, args.timeout, cpython_env, hydro_env))
 
     counts = summarize(tests)
     elapsed = round(time.perf_counter() - started, 1)
@@ -845,7 +845,7 @@ def main(argv: list[str] | None = None) -> int:
         "date": date,
         "python_target": TARGET_PYTHON,
         "cpython": {"path": str(cpython), "version": cpython_version},
-        "pyx": {"path": str(pyx), "version": pyx_version(pyx)},
+        "tea": {"path": str(tea), "version": hydro_version(tea)},
         "source": str(source),
         "options": {"timeout": args.timeout, "limit": args.limit, "only": only},
         "cwd": str(ROOT),
@@ -918,8 +918,8 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def pyx_version(pyx: Path) -> str:
-    result = run_capture([str(pyx), "--version"], cwd=ROOT, timeout=VERSION_TIMEOUT)
+def hydro_version(tea: Path) -> str:
+    result = run_capture([str(tea), "--version"], cwd=ROOT, timeout=VERSION_TIMEOUT)
     text = (result["stdout"] or "").strip() or (result["stderr"] or "").strip()
     first = text.splitlines()[0].strip() if text else ""
     return first or "unknown"

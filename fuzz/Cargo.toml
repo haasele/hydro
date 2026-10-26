@@ -14,9 +14,9 @@
 #   cargo +nightly fuzz run runtime_gc        -- -max_total_time=86400 -timeout=10
 # Without nightly, soak the stable harness instead:
 #   cargo build --release --manifest-path fuzz/stable/Cargo.toml
-#   fuzz/stable/target/release/pyx-fuzz-stable runtime_gc --iterations 500000
+#   fuzz/stable/target/release/hydro-fuzz-stable runtime_gc --iterations 500000
 [package]
-name = "pyx-fuzz"
+name = "hydro-fuzz"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -29,9 +29,9 @@ path = "src/lib.rs"
 
 [dependencies]
 libfuzzer-sys = "0.4"
-pyx-frontend = { path = "../crates/pyx-frontend" }
-pyx-codegen = { path = "../crates/pyx-codegen" }
-pyx-runtime = { path = "../crates/pyx-runtime" }
+hydro-frontend = { path = "../crates/hydro-frontend" }
+hydro-codegen = { path = "../crates/hydro-codegen" }
+hydro-runtime = { path = "../crates/hydro-runtime" }
 
 # `cargo-fuzz` targets. Bounded local smoke run: `scripts/fuzz-smoke.sh`.
 # Long campaign (24 h per target, resumable through the corpus directory):

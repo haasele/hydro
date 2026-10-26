@@ -1,4 +1,4 @@
-//! Shared fuzz harness bodies for PyX.
+//! Shared fuzz harness bodies for Hydro.
 //!
 //! The same functions are used by the `cargo-fuzz` targets
 //! (`../fuzz_targets/*.rs`) and by the stable fallback runner
@@ -15,7 +15,7 @@
 //!   drives the C ABI with values the runtime produced itself (never raw
 //!   integers that could alias a heap pointer). It never spawns a thread,
 //!   process or pool: those need a program shell to be meaningful and are
-//!   covered by `crates/pyx-runtime/tests/shutdown.rs`.
+//!   covered by `crates/hydro-runtime/tests/shutdown.rs`.
 //!
 //! Invariants checked by every step:
 //!
@@ -25,15 +25,15 @@
 //! * a collection always succeeds and never leaves a negative object count.
 //!
 //! The operation mix mirrors the dependency-free smoke tests in
-//! `crates/pyx-frontend/tests/fuzz_smoke.rs` and
-//! `crates/pyx-runtime/tests/fuzz_smoke.rs`, extended with cycles, fibers and
+//! `crates/hydro-frontend/tests/fuzz_smoke.rs` and
+//! `crates/hydro-runtime/tests/fuzz_smoke.rs`, extended with cycles, fibers and
 //! forced collections.
 
 use std::hint::black_box;
 
-use pyx_codegen::compile_object;
-use pyx_frontend::check_source;
-use pyx_runtime::abi::*;
+use hydro_codegen::compile_object;
+use hydro_frontend::check_source;
+use hydro_runtime::abi::*;
 
 /// Largest input the harnesses look at, in bytes.
 ///
@@ -88,16 +88,16 @@ pub fn frontend_pipeline(data: &[u8]) {
 /// A fiber body with the generated-wrapper signature. It allocates once so
 /// the collector runs with a live fiber stack, then returns.
 extern "C" fn fiber_body(_argv: *const i64) -> i64 {
-    let _ = pyx_str_new(b"fiber".as_ptr(), 5);
-    pyx_none()
+    let _ = hydro_str_new(b"fiber".as_ptr(), 5);
+    hydro_none()
 }
 
 /// Drives allocation, containers, cycles, fibers and collection from `data`.
 pub fn runtime_gc(data: &[u8]) {
     let data = &data[..data.len().min(MAX_INPUT)];
     // Each candidate starts from a clean heap: the target is single-threaded
-    // and `pyx_runtime_init` frees everything the previous iteration left.
-    pyx_runtime_init();
+    // and `hydro_runtime_init` frees everything the previous iteration left.
+    hydro_runtime_init();
 
     let mut rng = SplitMix64::new(seed(data));
     let mut slots = initial_slots(&mut rng);
@@ -124,59 +124,59 @@ pub fn runtime_gc(data: &[u8]) {
         match op {
             0 => {
                 let items = [a, b, slots[(operand >> 1) % SLOTS]];
-                slots[slot] = pyx_list_new(1 + operand % 3, items.as_ptr());
+                slots[slot] = hydro_list_new(1 + operand % 3, items.as_ptr());
             }
             1 => {
                 black_box(&slots);
-                pyx_list_append(a, b);
+                hydro_list_append(a, b);
             }
             2 => {
-                pyx_subscript(a, tagged(operand as i64 % 5));
+                hydro_subscript(a, tagged(operand as i64 % 5));
             }
             3 => {
                 // `x[i] = x` builds a cycle that only the collector can break.
-                pyx_subscript_set(a, tagged(0), slots[(operand >> 2) % SLOTS]);
+                hydro_subscript_set(a, tagged(0), slots[(operand >> 2) % SLOTS]);
             }
             4 => {
-                pyx_delete_subscript(a, tagged(0));
+                hydro_delete_subscript(a, tagged(0));
             }
             5 => {
                 let stop = tagged(operand as i64 % 4);
-                pyx_slice(a, pyx_none(), stop, pyx_none());
-                pyx_slice_set(a, pyx_none(), stop, pyx_none(), b);
-                pyx_delete_slice(a, pyx_none(), stop, pyx_none());
+                hydro_slice(a, hydro_none(), stop, hydro_none());
+                hydro_slice_set(a, hydro_none(), stop, hydro_none(), b);
+                hydro_delete_slice(a, hydro_none(), stop, hydro_none());
             }
             6 => {
                 let keys = [a, b];
                 let values = [b, a];
-                slots[slot] = pyx_dict_new(2, keys.as_ptr(), values.as_ptr());
-                pyx_dict_set(slots[slot], a, b);
-                pyx_dict_merge(slots[slot], a);
+                slots[slot] = hydro_dict_new(2, keys.as_ptr(), values.as_ptr());
+                hydro_dict_set(slots[slot], a, b);
+                hydro_dict_merge(slots[slot], a);
             }
             7 => {
                 let items = [a, b];
-                slots[slot] = pyx_set_new(2, items.as_ptr());
-                pyx_set_add(slots[slot], slots[(operand >> 4) % SLOTS]);
+                slots[slot] = hydro_set_new(2, items.as_ptr());
+                hydro_set_add(slots[slot], slots[(operand >> 4) % SLOTS]);
             }
             8 => {
                 let items = [a, b];
-                slots[slot] = pyx_tuple_new(2, items.as_ptr());
+                slots[slot] = hydro_tuple_new(2, items.as_ptr());
             }
             9 => {
-                pyx_len(a);
-                pyx_truthy(b);
-                pyx_hash(a);
+                hydro_len(a);
+                hydro_truthy(b);
+                hydro_hash(a);
             }
             10 => {
-                pyx_binop((operand % 22) as u32, a, b);
-                pyx_unop((operand % 9) as u32, b);
+                hydro_binop((operand % 22) as u32, a, b);
+                hydro_unop((operand % 9) as u32, b);
             }
             11 => {
-                pyx_to_str(a);
-                pyx_to_repr(b);
-                pyx_to_int(a);
-                pyx_to_float(b);
-                pyx_abs(a);
+                hydro_to_str(a);
+                hydro_to_repr(b);
+                hydro_to_int(a);
+                hydro_to_float(b);
+                hydro_abs(a);
             }
             12 => {
                 let names = [
@@ -201,90 +201,90 @@ pub fn runtime_gc(data: &[u8]) {
                 let name = names[operand % names.len()];
                 let args = [a, b];
                 let argc = operand % 3;
-                pyx_method(a, name.as_ptr(), name.len(), argc, args.as_ptr());
+                hydro_method(a, name.as_ptr(), name.len(), argc, args.as_ptr());
             }
             13 => {
-                pyx_getattr(a, b"missing".as_ptr(), 7);
-                pyx_setattr(a, b"missing".as_ptr(), 7, b);
-                pyx_delete_attr(a, b"missing".as_ptr(), 7);
+                hydro_getattr(a, b"missing".as_ptr(), 7);
+                hydro_setattr(a, b"missing".as_ptr(), 7, b);
+                hydro_delete_attr(a, b"missing".as_ptr(), 7);
             }
             14 => {
-                let iterator = pyx_iter_new(a);
+                let iterator = hydro_iter_new(a);
                 for _ in 0..3 {
-                    let mut out = pyx_none();
-                    pyx_iter_next(iterator, &mut out);
+                    let mut out = hydro_none();
+                    hydro_iter_next(iterator, &mut out);
                 }
-                pyx_next(iterator, b, (operand % 2) as i64);
-                pyx_iter(a);
+                hydro_next(iterator, b, (operand % 2) as i64);
+                hydro_iter(a);
             }
             15 => {
-                pyx_unpack(a, operand % 4);
-                pyx_unpack_seq(b, operand % 3);
-                pyx_unpack_star(a, operand % 3, (operand >> 2) % 3);
+                hydro_unpack(a, operand % 4);
+                hydro_unpack_seq(b, operand % 3);
+                hydro_unpack_star(a, operand % 3, (operand >> 2) % 3);
             }
             16 => {
-                pyx_raise((operand % 24) as u32, a);
+                hydro_raise((operand % 24) as u32, a);
                 drain();
-                pyx_raise_value(b);
+                hydro_raise_value(b);
                 drain();
             }
             17 => {
                 let text = "fuzz \u{e9}\u{1f600}";
-                pyx_raise_msg((operand % 24) as u32, text.as_ptr(), text.len());
+                hydro_raise_msg((operand % 24) as u32, text.as_ptr(), text.len());
                 drain();
-                pyx_raise_from((operand % 24) as u32, a, b);
+                hydro_raise_from((operand % 24) as u32, a, b);
                 drain();
             }
             18 => {
-                pyx_exception_class((operand % 24) as u32);
-                pyx_exc_matches((operand % 16) as u32);
-                pyx_exc_matches((operand % 8) as u32);
+                hydro_exception_class((operand % 24) as u32);
+                hydro_exc_matches((operand % 16) as u32);
+                hydro_exc_matches((operand % 8) as u32);
             }
             19 => {
-                pyx_list_from(a);
-                pyx_tuple_from(b);
-                pyx_dict_from(a);
-                pyx_set_from(b);
-                pyx_all(a);
-                pyx_sum(a, tagged(0));
+                hydro_list_from(a);
+                hydro_tuple_from(b);
+                hydro_dict_from(a);
+                hydro_set_from(b);
+                hydro_all(a);
+                hydro_sum(a, tagged(0));
             }
             20 => {
-                pyx_enumerate(a, tagged(operand as i64 % 3));
+                hydro_enumerate(a, tagged(operand as i64 % 3));
                 let zip_args = [a, b];
-                pyx_zip(2, zip_args.as_ptr());
-                pyx_map(a, b);
-                pyx_filter(a, b);
+                hydro_zip(2, zip_args.as_ptr());
+                hydro_map(a, b);
+                hydro_filter(a, b);
             }
             21 => {
-                pyx_format_value(a, std::ptr::null(), 0, 0);
-                pyx_format_value(a, b"08.2f".as_ptr(), 5, 0);
+                hydro_format_value(a, std::ptr::null(), 0, 0);
+                hydro_format_value(a, b"08.2f".as_ptr(), 5, 0);
             }
             22 => {
-                let cell = pyx_cell_new(a);
-                pyx_cell_get(cell);
-                pyx_cell_set(cell, b);
+                let cell = hydro_cell_new(a);
+                hydro_cell_get(cell);
+                hydro_cell_set(cell, b);
                 slots[slot] = cell;
             }
             23 => {
-                assert!(pyx_gc_collect() >= 0, "collection failed at step {step}");
+                assert!(hydro_gc_collect() >= 0, "collection failed at step {step}");
                 assert!(
-                    pyx_gc_objects() >= 0,
+                    hydro_gc_objects() >= 0,
                     "negative object count at step {step}"
                 );
             }
             24 => {
-                pyx_set_file(b"fuzz.py".as_ptr(), 7);
-                pyx_set_line((operand % 10_000) as u32);
-                pyx_frame_enter(b"fuzz".as_ptr(), 5);
-                pyx_frame_leave();
-                pyx_safepoint();
+                hydro_set_file(b"fuzz.py".as_ptr(), 7);
+                hydro_set_line((operand % 10_000) as u32);
+                hydro_frame_enter(b"fuzz".as_ptr(), 5);
+                hydro_frame_leave();
+                hydro_safepoint();
             }
             25 => {
                 let name = ["len", "abs", "str", "repr", "hash", "missing-builtin"][operand % 6];
-                let function = pyx_builtin_function(name.as_ptr(), name.len());
+                let function = hydro_builtin_function(name.as_ptr(), name.len());
                 drain();
                 let args = [a];
-                pyx_call(function, 1, args.as_ptr());
+                hydro_call(function, 1, args.as_ptr());
             }
             26 => {
                 // A fresh fiber every time: the generator/coroutine stack is
@@ -302,28 +302,28 @@ pub fn runtime_gc(data: &[u8]) {
                 let body: extern "C" fn(*const i64) -> i64 = fiber_body;
                 let entry = body as *const u8;
                 if operand % 2 == 0 {
-                    slots[slot] = pyx_generator_new(entry, argc, argv);
+                    slots[slot] = hydro_generator_new(entry, argc, argv);
                 } else {
-                    slots[slot] = pyx_coroutine_new(entry, argc, argv);
+                    slots[slot] = hydro_coroutine_new(entry, argc, argv);
                 }
             }
             27 => {
                 // Driving a fiber and misusing the yield protocol both have to
                 // raise instead of corrupting the caller's stack.
-                pyx_await(a);
-                pyx_yield(b);
-                pyx_yield_from(a);
+                hydro_await(a);
+                hydro_yield(b);
+                hydro_yield_from(a);
             }
             _ => unreachable!(),
         }
         drain();
     }
 
-    assert!(pyx_gc_collect() >= 0, "final collection failed");
-    assert!(pyx_gc_objects() >= 0, "negative final object count");
+    assert!(hydro_gc_collect() >= 0, "final collection failed");
+    assert!(hydro_gc_objects() >= 0, "negative final object count");
 }
 
-/// Tagged small integer (`pyx_int` is the identity on tagged immediates).
+/// Tagged small integer (`hydro_int` is the identity on tagged immediates).
 fn tagged(n: i64) -> i64 {
     n << 3
 }
@@ -333,38 +333,38 @@ fn initial_slots(rng: &mut SplitMix64) -> [i64; SLOTS] {
     let text = "h\u{e9}llo \u{1f600}\u{200b}";
     let raw = [0u8, 0xff, b'a'];
     let bigint = "123456789012345678901234567890";
-    let mut slots = [pyx_none(); SLOTS];
-    slots[0] = pyx_none();
-    slots[1] = pyx_true();
-    slots[2] = pyx_false();
+    let mut slots = [hydro_none(); SLOTS];
+    slots[0] = hydro_none();
+    slots[1] = hydro_true();
+    slots[2] = hydro_false();
     slots[3] = tagged(7);
     slots[4] = tagged(-3);
-    slots[5] = pyx_float_new(2.5);
-    slots[6] = pyx_float_new(f64::from_bits(rng.next_u64()));
-    slots[7] = pyx_str_new(text.as_ptr(), text.len());
-    slots[8] = pyx_bytes_new(raw.as_ptr(), raw.len());
-    slots[9] = pyx_bigint_from_str(bigint.as_ptr(), bigint.len());
-    slots[10] = pyx_range_new(tagged(0), tagged(9), pyx_none());
-    slots[11] = pyx_str_new(b"".as_ptr(), 0);
-    slots[12] = pyx_list_new(0, std::ptr::null());
-    slots[13] = pyx_dict_new(0, std::ptr::null(), std::ptr::null());
-    slots[14] = pyx_set_new(0, std::ptr::null());
-    slots[15] = pyx_cell_new(pyx_none());
-    slots[16] = pyx_str_new(b"fuzz".as_ptr(), 4);
+    slots[5] = hydro_float_new(2.5);
+    slots[6] = hydro_float_new(f64::from_bits(rng.next_u64()));
+    slots[7] = hydro_str_new(text.as_ptr(), text.len());
+    slots[8] = hydro_bytes_new(raw.as_ptr(), raw.len());
+    slots[9] = hydro_bigint_from_str(bigint.as_ptr(), bigint.len());
+    slots[10] = hydro_range_new(tagged(0), tagged(9), hydro_none());
+    slots[11] = hydro_str_new(b"".as_ptr(), 0);
+    slots[12] = hydro_list_new(0, std::ptr::null());
+    slots[13] = hydro_dict_new(0, std::ptr::null(), std::ptr::null());
+    slots[14] = hydro_set_new(0, std::ptr::null());
+    slots[15] = hydro_cell_new(hydro_none());
+    slots[16] = hydro_str_new(b"fuzz".as_ptr(), 4);
     let one = [tagged(1)];
-    slots[17] = pyx_list_new(1, one.as_ptr());
+    slots[17] = hydro_list_new(1, one.as_ptr());
     slots
 }
 
 /// Validates and clears a pending exception, if any.
 fn drain() {
-    if pyx_exc_pending() == 0 {
+    if hydro_exc_pending() == 0 {
         return;
     }
-    assert!(pyx_exc_tag() >= 0, "pending exception without a tag");
-    assert_ne!(pyx_exc_value(), 0, "pending exception without a value");
-    assert_eq!(pyx_exc_clear(), 0, "pyx_exc_clear must return 0");
-    assert_eq!(pyx_exc_pending(), 0, "exception still pending after clear");
+    assert!(hydro_exc_tag() >= 0, "pending exception without a tag");
+    assert_ne!(hydro_exc_value(), 0, "pending exception without a value");
+    assert_eq!(hydro_exc_clear(), 0, "hydro_exc_clear must return 0");
+    assert_eq!(hydro_exc_pending(), 0, "exception still pending after clear");
 }
 
 // -------------------------------------------------------------------------
