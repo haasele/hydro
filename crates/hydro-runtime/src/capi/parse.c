@@ -66,6 +66,8 @@ extern int hydro_capi_parse_p(PyObject *object, int *out);
 extern void hydro_capi_set_error(const char *message);
 extern void hydro_capi_set_type_error(const char *message);
 extern void hydro_capi_set_exception_message(PyObject *exception, const char *message);
+extern void *hydro_capi_vectorcall(void *callable, void *const *args,
+                                   size_t nargs);
 
 static int hydro_capi_is_space(char code)
 {
@@ -625,4 +627,74 @@ PyObject *PyErr_Format(PyObject *exception, const char *format, ...)
         free(message);
     }
     return NULL;
+}
+
+/*
+ * The variadic convenience form of a positional call. `NULL` terminates the
+ * argument list, exactly as CPython documents. The arguments are borrowed for
+ * the duration of the call; the Rust helper builds the PEP 590 vector and
+ * returns a new reference (or NULL with a pending error).
+ *
+ * Two passes over the `va_list` are used: the first counts, the second fills
+ * either a stack buffer or an exact heap allocation. This keeps the common
+ * small call allocation-free.
+ */
+PyObject *PyObject_CallFunctionObjArgs(PyObject *callable, ...)
+{
+    va_list arguments;
+    size_t count = 0;
+    size_t index;
+    PyObject *stack_items[16];
+    PyObject **items = stack_items;
+    PyObject *result;
+
+    if (callable == NULL) {
+        hydro_capi_set_type_error(
+            "PyObject_CallFunctionObjArgs: callable is NULL");
+        return NULL;
+    }
+
+    va_start(arguments, callable);
+    for (;;) {
+        PyObject *item = va_arg(arguments, PyObject *);
+        if (item == NULL) {
+            break;
+        }
+        if (count == (size_t)-1) {
+            va_end(arguments);
+            hydro_capi_set_type_error(
+                "PyObject_CallFunctionObjArgs: too many arguments");
+            return NULL;
+        }
+        count += 1;
+    }
+    va_end(arguments);
+
+    if (count > sizeof stack_items / sizeof stack_items[0]) {
+        if (count > ((size_t)-1) / sizeof(PyObject *)) {
+            hydro_capi_set_type_error(
+                "PyObject_CallFunctionObjArgs: too many arguments");
+            return NULL;
+        }
+        items = malloc(count * sizeof(PyObject *));
+        if (items == NULL) {
+            hydro_capi_set_type_error(
+                "MemoryError: cannot allocate the argument vector");
+            return NULL;
+        }
+    }
+
+    va_start(arguments, callable);
+    for (index = 0; index < count; index++) {
+        items[index] = va_arg(arguments, PyObject *);
+    }
+    /* Consume the terminator so both passes walk the same list. */
+    (void)va_arg(arguments, PyObject *);
+    va_end(arguments);
+
+    result = hydro_capi_vectorcall(callable, (void *const *)items, count);
+    if (items != stack_items) {
+        free(items);
+    }
+    return result;
 }

@@ -52,6 +52,15 @@
 //! ordered before the `GLOBAL` heap mutex and never held across user code or a
 //! payload drop.
 //!
+//! Armed callbacks are strong edges of the reference object (traced by the
+//! instance trace and mirrored in `__callback__`). When a target is cleared,
+//! the callback is taken out of the entry exactly once, its reference is
+//! pinned and, if the reference would otherwise die, marked grey, and the pair
+//! is queued. [`run_pending_weakref_callbacks`] invokes queued callbacks with
+//! no lock held, from a generated-code safepoint, `gc.collect()`, or thread
+//! exit; a raising callback is reported to stderr and its pending exception is
+//! cleared. References stay pinned until their callback has run.
+//!
 //! `getweakrefs` pins the references it materialises into a list: the Rust
 //! vector holding them is invisible to the conservative stack scan, so every
 //! collection also marks the pinned references until the module releases the
@@ -441,8 +450,23 @@ static MARKING: AtomicBool = AtomicBool::new(false);
 struct WeakEntry {
     /// Raw target cell address, or `0` after the target was collected.
     target: usize,
+    /// Tagged callback value, or `NONE`. The callback is a strong edge held by
+    /// the reference object (stored both here and in its `__callback__`
+    /// attribute) and is taken out exactly once when the target is cleared.
+    callback: i64,
     /// Whether the owning reference belongs to the process-wide (shared) heap.
     shared: bool,
+}
+
+/// One weakref callback waiting to run outside every GC lock.
+struct PendingWeakCallback {
+    /// Tagged reference object passed to the callback.
+    reference: i64,
+    /// Tagged callable.
+    callback: i64,
+    /// Token of the thread that queued it. Callbacks run on that thread, which
+    /// owns any private heap the reference belongs to.
+    owner: u64,
 }
 
 #[derive(Default)]
@@ -450,12 +474,28 @@ struct WeakState {
     /// Weak references by their own cell address.
     refs: HashMap<usize, WeakEntry>,
     /// Conservative "keep this reference object alive" pins, installed by
-    /// `getweakrefs` while it materialises its result list. Pins are marked as
-    /// roots by every collection and released by [`weakrefs_unpin`].
+    /// `getweakrefs` while it materialises its result list and by queued
+    /// callbacks until they have run. Pins are marked as roots by every
+    /// collection and released by [`weakrefs_unpin`]/the callback runner.
     pins: HashMap<usize, usize>,
+    /// Callbacks whose targets were cleared and that have not run yet.
+    pending: Vec<PendingWeakCallback>,
 }
 
 static WEAK: LazyLock<Mutex<WeakState>> = LazyLock::new(|| Mutex::new(WeakState::default()));
+
+/// Number of queued weakref callbacks, readable on the safepoint fast path.
+static PENDING_WEAK_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Set once any weak reference with a callback exists. Instance tracing only
+/// consults the weak table for the callback edge while this is set.
+static WEAK_CALLBACKS_EXIST: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Re-entrancy guard: a callback may allocate and reach a safepoint, which
+    /// must not start a nested callback drain.
+    static RUNNING_WEAK_CALLBACKS: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Set once the shared collector's final rescan has frozen the weak table for
 /// the current cycle. Cleared when the cycle completes.
@@ -627,6 +667,16 @@ fn mark_weak_pins(addresses: &AddressSet) {
             mark_grey(addr);
         }
     }
+    // A queued callback keeps its callable alive until it has run, even if the
+    // reference object was dropped from the table in the same clear pass.
+    for item in &weak.pending {
+        if item.callback & crate::value::TAG_MASK == crate::value::TAG_HEAP {
+            let callback_addr = (item.callback & !crate::value::TAG_MASK) as usize;
+            if addresses.contains(&callback_addr) {
+                mark_grey(callback_addr);
+            }
+        }
+    }
 }
 
 /// Whether `target` supports weak references.
@@ -713,15 +763,23 @@ fn registered_object(addr: usize) -> bool {
     }
 }
 
-/// Records `reference` as a weak reference to `target`.
+/// Records `reference` as a weak reference to `target` with no callback.
+#[allow(dead_code)] // Convenience wrapper retained for tests/embedding.
+pub(crate) fn weakref_register(reference: i64, target: i64) -> bool {
+    weakref_register_with_callback(reference, target, crate::value::NONE)
+}
+
+/// Records `reference` as a weak reference to `target` with `callback`.
 ///
 /// Both values must be tagged heap pointers; the caller (the `_weakref`
 /// module) validates that `target` is weak-referenceable and reports the
-/// Python-level `TypeError`. Returns `false` for a malformed pair or a
+/// Python-level `TypeError`. The callback is a strong edge owned by the
+/// reference object; it is invoked exactly once if the target is collected.
+/// `NONE` means no callback. Returns `false` for a malformed pair or a
 /// reference that already died. During the sweep phase of a collection, a
 /// target that lost the final rescan is recorded as already dead instead of
 /// leaving a dangling address in the table.
-pub(crate) fn weakref_register(reference: i64, target: i64) -> bool {
+pub(crate) fn weakref_register_with_callback(reference: i64, target: i64, callback: i64) -> bool {
     if reference & crate::value::TAG_MASK != crate::value::TAG_HEAP
         || target & crate::value::TAG_MASK != crate::value::TAG_HEAP
     {
@@ -745,10 +803,68 @@ pub(crate) fn weakref_register(reference: i64, target: i64) -> bool {
         ref_addr,
         WeakEntry {
             target: target_addr,
+            callback,
             shared: shared(),
         },
     );
+    if callback != crate::value::NONE {
+        WEAK_CALLBACKS_EXIST.store(true, Ordering::Release);
+        // Publication barrier for the strong callback edge: when the
+        // reference is already black, a collection in progress has traced it
+        // and would otherwise miss the newly armed callback. Marking is
+        // idempotent; the final rescan/partition keeps the grey callback.
+        if MARKING.load(Ordering::Acquire) {
+            mark_value(callback);
+        }
+    }
     true
+}
+
+/// Takes the callback out of an entry, if one is still armed.
+fn take_callback(entry: &mut WeakEntry) -> i64 {
+    if entry.callback == crate::value::NONE {
+        crate::value::NONE
+    } else {
+        std::mem::replace(&mut entry.callback, crate::value::NONE)
+    }
+}
+
+/// Queues a cleared reference's callback and pins the reference until it runs.
+///
+/// The caller holds `WEAK`. The reference object may itself be otherwise
+/// unreachable in this cycle (its target died), so the pin and the caller's
+/// explicit `mark_grey` keep it (and the callback edge) alive.
+fn queue_weakref_callback(weak: &mut WeakState, ref_addr: usize, callback: i64) {
+    *weak.pins.entry(ref_addr).or_insert(0) += 1;
+    weak.pending.push(PendingWeakCallback {
+        reference: (ref_addr as i64) | crate::value::TAG_HEAP,
+        callback,
+        owner: current_gc_token(),
+    });
+    PENDING_WEAK_CALLBACKS.fetch_add(1, Ordering::AcqRel);
+    WEAK_CALLBACKS_EXIST.store(true, Ordering::Release);
+    // The callback is also a root through the pending queue (in addition to
+    // the reference's side edge): this keeps it alive for a collection that
+    // runs before the callback is drained.
+    mark_value(callback);
+}
+
+/// Marks the callback stored for a weak-reference instance, if any.
+///
+/// The callback is a strong edge of the reference object. It is normally also
+/// present in `__callback__`, but keeping the side table authoritative means a
+/// user overwriting that attribute cannot make the collector free a callback
+/// that is still armed.
+fn mark_weakref_callback(addr: usize) {
+    if !WEAK_CALLBACKS_EXIST.load(Ordering::Acquire) {
+        return;
+    }
+    let weak = lock_weak();
+    if let Some(entry) = weak.refs.get(&addr) {
+        if entry.callback != crate::value::NONE {
+            mark_value(entry.callback);
+        }
+    }
 }
 
 /// The target recorded for `reference`, without resolving it.
@@ -885,7 +1001,7 @@ pub(crate) fn weakrefs_for(target: i64) -> Vec<i64> {
     refs
 }
 
-/// Releases the pins installed by [`weakrefs_for`].
+/// Releases the pins installed by [`weakrefs_for`] or queued callbacks.
 pub(crate) fn weakrefs_unpin(refs: &[i64]) {
     if refs.is_empty() {
         return;
@@ -910,60 +1026,150 @@ pub(crate) fn weakrefs_unpin(refs: &[i64]) {
     }
 }
 
+/// Whether any weakref callback is queued.
+pub(crate) fn weakref_callbacks_pending() -> bool {
+    PENDING_WEAK_CALLBACKS.load(Ordering::Acquire) != 0
+}
+
+/// Runs queued weakref callbacks for the calling thread.
+///
+/// Called from safepoints and after an explicit collection: both are points
+/// where no GC lock is held and the caller's live values are describable by
+/// the collector. Each callback is popped under the weak lock, then invoked
+/// with no lock held. The reference object stays pinned (and, for references
+/// that would otherwise be collected in this cycle, grey) until the callback
+/// returns. A raising callback is reported like CPython's unraisable output
+/// and cleared, leaving no pending exception for the mutator.
+pub(crate) fn run_pending_weakref_callbacks() {
+    if !weakref_callbacks_pending() {
+        return;
+    }
+    if RUNNING_WEAK_CALLBACKS.with(Cell::get) {
+        // A callback allocated and reached a safepoint: the outer drain will
+        // keep going once it returns.
+        return;
+    }
+    RUNNING_WEAK_CALLBACKS.with(|running| running.set(true));
+    struct ResetGuard;
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            RUNNING_WEAK_CALLBACKS.with(|running| running.set(false));
+        }
+    }
+    let _guard = ResetGuard;
+
+    let owner = current_gc_token();
+    loop {
+        let item = {
+            let mut weak = lock_weak();
+            let Some(position) = weak.pending.iter().position(|item| item.owner == owner) else {
+                break;
+            };
+            let item = weak.pending.remove(position);
+            PENDING_WEAK_CALLBACKS.fetch_sub(1, Ordering::AcqRel);
+            item
+        };
+        let argument = [item.reference];
+        crate::builtins::call(item.callback, 1, argument.as_ptr());
+        if exc::pending() {
+            let text = crate::value::to_string(exc::pending_value());
+            {
+                use std::io::Write as _;
+                let stderr = std::io::stderr();
+                let mut stderr = stderr.lock();
+                let _ = writeln!(stderr, "Exception ignored in weakref callback: {text}");
+                let _ = stderr.flush();
+            }
+            exc::clear();
+        }
+        weakrefs_unpin(&[item.reference]);
+    }
+}
+
 /// Clears weak references whose targets are white and drops entries whose
 /// reference object is white, before a local sweep releases any cell.
 ///
 /// Only entries of this thread's private heap are touched: a parallel test
 /// thread owns a different address set, so its entries must be left alone.
-fn clear_weakrefs_local(heap: &HeapState) {
+/// References whose target died with an armed callback are returned so the
+/// caller can resurrect them (mark them grey) before the sweep; the callback
+/// itself is pinned and queued in the weak table.
+fn clear_weakrefs_local(heap: &HeapState) -> Vec<usize> {
     let mut weak = lock_weak();
+    let mut actions: Vec<(usize, i64)> = Vec::new();
     weak.refs.retain(|&ref_addr, entry| {
-        if entry.shared {
+        if entry.shared || !heap.addresses.contains(&ref_addr) {
             return true;
         }
-        let ref_known = heap.addresses.contains(&ref_addr);
-        if ref_known {
-            // SAFETY: the address came from this heap's registry and the
-            // sweep has not released it yet.
-            let color = unsafe { object_at(ref_addr).marked.load(Ordering::Acquire) };
-            if color == WHITE {
-                return false;
-            }
-        }
-        if entry.target != 0 && heap.addresses.contains(&entry.target) {
+        // SAFETY: the address came from this heap's registry and the sweep has
+        // not released it yet.
+        let ref_live = unsafe { object_at(ref_addr).marked.load(Ordering::Acquire) != WHITE };
+        let target_dead = entry.target != 0
+            && heap.addresses.contains(&entry.target)
             // SAFETY: as above; white targets are still live cells here.
-            let color = unsafe { object_at(entry.target).marked.load(Ordering::Acquire) };
-            if color == WHITE {
-                entry.target = 0;
+            && unsafe { object_at(entry.target).marked.load(Ordering::Acquire) == WHITE };
+        if target_dead {
+            entry.target = 0;
+            let callback = take_callback(entry);
+            if callback != crate::value::NONE {
+                actions.push((ref_addr, callback));
             }
         }
-        true
+        // A dead reference is dropped unless it still has a callback to run;
+        // the callback keeps the object reachable through its queue pin.
+        ref_live
     });
+    let mut resurrect = Vec::with_capacity(actions.len());
+    for (ref_addr, callback) in actions {
+        queue_weakref_callback(&mut weak, ref_addr, callback);
+        resurrect.push(ref_addr);
+    }
+    resurrect
 }
 
 /// Freezes the shared weak table at the end of the final rescan.
 ///
 /// Runs with every other thread parked, before the sweep releases the white
 /// cells. References whose object did not survive are removed; targets that
-/// did not survive are cleared. From here until the end of the cycle every
-/// recorded target is live, so `weakref.__call__` can return it without a
-/// registry lookup.
+/// did not survive are cleared. Armed callbacks are queued and their reference
+/// objects are marked grey (and pinned) so they survive the sweep until the
+/// callback runs; the marking is drained after releasing the weak/heap locks.
+/// From here until the end of the cycle every recorded target is live, so
+/// `weakref.__call__` can return it without a registry lookup.
 fn clear_weakrefs_shared() {
-    let mut weak = lock_weak();
-    let heap = lock_global();
-    weak.refs.retain(|&ref_addr, entry| {
-        if !entry.shared {
-            return true;
+    let mut resurrect: Vec<usize> = Vec::new();
+    {
+        let mut weak = lock_weak();
+        let heap = lock_global();
+        let mut actions: Vec<(usize, i64)> = Vec::new();
+        weak.refs.retain(|&ref_addr, entry| {
+            if !entry.shared {
+                return true;
+            }
+            let ref_live = shared_object_live_locked(&heap, ref_addr);
+            let target_dead = entry.target != 0 && !shared_object_live_locked(&heap, entry.target);
+            if target_dead {
+                entry.target = 0;
+                let callback = take_callback(entry);
+                if callback != crate::value::NONE {
+                    actions.push((ref_addr, callback));
+                }
+            }
+            ref_live
+        });
+        for (ref_addr, callback) in actions {
+            queue_weakref_callback(&mut weak, ref_addr, callback);
+            resurrect.push(ref_addr);
         }
-        if !shared_object_live_locked(&heap, ref_addr) {
-            return false;
-        }
-        if entry.target != 0 && !shared_object_live_locked(&heap, entry.target) {
-            entry.target = 0;
-        }
-        true
-    });
-    WEAK_FROZEN.store(true, Ordering::SeqCst);
+        WEAK_FROZEN.store(true, Ordering::SeqCst);
+    }
+    // The world is stopped, so no mutator can observe the pins or the queue
+    // yet. Trace the resurrected references (and, through them, the callback
+    // edges) without holding the weak or heap lock.
+    for addr in resurrect {
+        mark_grey(addr);
+    }
+    drain_worklist();
 }
 
 /// Liveness test for a caller already holding the heap lock.
@@ -995,16 +1201,23 @@ fn weakrefs_reset() {
     let mut weak = lock_weak();
     weak.refs.clear();
     weak.pins.clear();
+    weak.pending.clear();
+    PENDING_WEAK_CALLBACKS.store(0, Ordering::Release);
+    WEAK_CALLBACKS_EXIST.store(false, Ordering::Release);
     WEAK_FROZEN.store(false, Ordering::SeqCst);
     WEAK_PARTITIONED.store(false, Ordering::SeqCst);
 }
 
-/// Test-only: forget every weak entry and pin.
+/// Test-only: forget every weak entry, pin and queued callback.
 #[cfg(test)]
 pub(crate) fn weakref_tests_clear() {
     let mut weak = lock_weak();
     weak.refs.clear();
     weak.pins.clear();
+    weak.pending.clear();
+    PENDING_WEAK_CALLBACKS.store(0, Ordering::Release);
+    // `WEAK_CALLBACKS_EXIST` is deliberately left set: clearing it could
+    // disable callback tracing for a concurrent non-weak test.
     WEAK_FROZEN.store(false, Ordering::SeqCst);
     WEAK_PARTITIONED.store(false, Ordering::SeqCst);
 }
@@ -1015,8 +1228,19 @@ pub(crate) fn weakref_tests_clear() {
 #[allow(dead_code)] // Used by the module's own test suite when it is declared.
 pub(crate) fn weakref_test_kill(reference: i64) {
     let addr = (reference & !crate::value::TAG_MASK) as usize;
-    if let Some(entry) = lock_weak().refs.get_mut(&addr) {
+    let mut weak = lock_weak();
+    let callback = {
+        let Some(entry) = weak.refs.get_mut(&addr) else {
+            return;
+        };
+        if entry.target == 0 {
+            return;
+        }
         entry.target = 0;
+        take_callback(entry)
+    };
+    if callback != crate::value::NONE {
+        queue_weakref_callback(&mut weak, addr, callback);
     }
 }
 
@@ -1222,6 +1446,13 @@ fn save_context(gc: &ThreadGc) {
 /// calls it too.
 #[inline]
 pub(crate) fn safepoint() {
+    // Callbacks queued by an earlier collection run here: a safepoint is
+    // outside every GC lock and generated code's live values are described by
+    // the precise shadow stack. Never run them while a collection is trying
+    // to stop this thread.
+    if !GC_REQUESTED.load(Ordering::Relaxed) && weakref_callbacks_pending() {
+        run_pending_weakref_callbacks();
+    }
     if !GC_REQUESTED.load(Ordering::Relaxed) {
         return;
     }
@@ -1684,11 +1915,16 @@ pub(crate) fn reset() {
 /// Forces a collection (ABI `hydro_gc_collect`). Returns the number of freed
 /// objects; returns `0` when another collector is already running.
 pub(crate) fn collect() -> i64 {
-    if shared() {
+    let freed = if shared() {
         collect_shared(None)
     } else {
         collect_with_root(None) as i64
-    }
+    };
+    // `gc.collect()` is a safe point: no GC lock is held and no unrooted
+    // allocation is in flight. Run callbacks queued by this (or an earlier)
+    // collection here, the same way CPython runs them from the collector.
+    run_pending_weakref_callbacks();
+    freed
 }
 
 /// Root set of one registered thread, captured while it is parked.
@@ -2281,6 +2517,12 @@ pub(crate) fn leave_unstarted_thread() {
 /// Records that a spawned thread has exited: marks it exited, removes it from
 /// the collector registry and wakes a waiting collector.
 pub(crate) fn leave_thread() {
+    // Run callbacks queued for this thread while its registration and stack
+    // are still intact. Skip while a collector is stopping the world: the
+    // pins keep the references alive until the next drain or reset.
+    if !GC_REQUESTED.load(Ordering::SeqCst) && !MARKING.load(Ordering::Acquire) {
+        run_pending_weakref_callbacks();
+    }
     if let Some(gc) = GC_SELF.with(|cell| cell.borrow_mut().take()) {
         gc.exited.store(true, Ordering::SeqCst);
         let mut registry = lock_thread_registry();
@@ -2495,12 +2737,17 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
     // their (native-only) children while the result list is being built.
     mark_weak_pins(&heap.addresses);
     drain_worklist();
-    let mark_time = mark_start.elapsed();
 
     // ---- sweep -----------------------------------------------------
     // Clear weak targets that did not survive and drop entries whose
     // reference object did not survive, before any white cell is released.
-    clear_weakrefs_local(heap);
+    // References with an armed callback are resurrected so the callback can
+    // receive them after the collection.
+    for addr in clear_weakrefs_local(heap) {
+        mark_grey(addr);
+    }
+    drain_worklist();
+    let mark_time = mark_start.elapsed();
     let sweep_start = Instant::now();
     let freed = sweep(heap);
     let sweep_time = sweep_start.elapsed();
@@ -2758,10 +3005,19 @@ unsafe fn trace(addr: usize) {
                 mark_black(addr);
                 return;
             };
-            // The class namespace is immutable, so no lock is needed: the
-            // base and every method are stable GC edges.
-            if state.base != crate::value::NONE {
-                mark_value(state.base);
+            // The frozen namespace is immutable, so only the overlay needs the
+            // lock: `class_set_attr` publishes its insertion barrier under the
+            // same mutex, so an edge added during marking cannot be lost.
+            let overlay = state.lock_overlay();
+            mark_value(state.base);
+            for &base in &state.bases {
+                mark_value(base);
+            }
+            for &ancestor in &state.mro {
+                mark_value(ancestor);
+            }
+            if state.metaclass != crate::value::NONE {
+                mark_value(state.metaclass);
             }
             for &(_, function, _) in &state.methods {
                 mark_value(function);
@@ -2769,6 +3025,10 @@ unsafe fn trace(addr: usize) {
             for &(_, value) in &state.attrs {
                 mark_value(value);
             }
+            for &(_, value) in overlay.iter() {
+                mark_value(value);
+            }
+            drop(overlay);
             mark_black(addr);
         }
         crate::value::KIND_INSTANCE => {
@@ -2788,6 +3048,9 @@ unsafe fn trace(addr: usize) {
             for &(_, value) in attrs.iter() {
                 mark_value(value);
             }
+            // A weak reference holds its callback as a strong edge even if a
+            // user overwrote `__callback__`; the side table is authoritative.
+            mark_weakref_callback(addr);
             mark_black(addr);
         }
         _ => {
@@ -2803,6 +3066,50 @@ unsafe fn trace(addr: usize) {
                         mark_value(item);
                     }
                 }
+                // Template payloads are immutable after construction, so their
+                // literal strings and interpolations are stable GC edges; an
+                // interpolation traces its value and format-spec string.
+                ObjDataRef::Template(state) => {
+                    for &string in &state.strings {
+                        mark_value(string);
+                    }
+                    for &interpolation in &state.interpolations {
+                        mark_value(interpolation);
+                    }
+                }
+                ObjDataRef::Interpolation(state) => {
+                    mark_value(state.value);
+                    mark_value(state.format_spec);
+                }
+                // A view observes its exporter live, so the exporter is a
+                // stable edge: `release()` only drops it.
+                ObjDataRef::MemoryView(state) => mark_value(state.buffer),
+                // A dict view is live over its dict.
+                ObjDataRef::DictView(state) => mark_value(state.dict),
+                ObjDataRef::Super(state) => {
+                    mark_value(state.class);
+                    mark_value(state.object);
+                }
+                // A user-defined exception traces its class identity, the
+                // exception chaining edges of its native payload and its
+                // instance attribute table (held under the mutex until black,
+                // like a normal instance).
+                ObjDataRef::ExcInstance(state) => {
+                    let attrs = state.lock_attrs();
+                    mark_value(state.class);
+                    if let Some(cause) = state.data.cause {
+                        mark_value(cause);
+                    }
+                    if let Some(context) = state.data.context {
+                        mark_value(context);
+                    }
+                    for &(_, value) in attrs.iter() {
+                        mark_value(value);
+                    }
+                    drop(attrs);
+                }
+                // A bytearray holds native bytes only.
+                ObjDataRef::ByteArray(_) => {}
                 ObjDataRef::Thread(thread) => {
                     mark_value(thread.target);
                     for &arg in &thread.args {
@@ -3432,7 +3739,26 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         weakref_tests_clear();
+        CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        CALLBACK_LAST.store(0, Ordering::SeqCst);
         guard
+    }
+
+    static CALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CALLBACK_LAST: AtomicI64 = AtomicI64::new(0);
+
+    unsafe extern "C" fn counting_callback(argv: *const i64) -> i64 {
+        CALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+        if !argv.is_null() {
+            // SAFETY: the caller passes one readable tagged argument.
+            CALLBACK_LAST.store(unsafe { *argv }, Ordering::SeqCst);
+        }
+        crate::value::NONE
+    }
+
+    fn counting_callback_value() -> i64 {
+        let entry: unsafe extern "C" fn(*const i64) -> i64 = counting_callback;
+        crate::value::function_new_with_flags(entry as usize, 1, "weakref_callback".to_string(), 0)
     }
 
     /// The colour of a registered cell.
@@ -3458,6 +3784,7 @@ mod tests {
             ref_addr,
             WeakEntry {
                 target: target_addr,
+                callback: crate::value::NONE,
                 shared: false,
             },
         );
@@ -3512,7 +3839,7 @@ mod tests {
         mark_cell(target, WHITE);
         mark_survivor(reference);
 
-        clear_weakrefs_local(&heap);
+        let _ = clear_weakrefs_local(&heap);
         assert_eq!(weakref_target_raw(reference), Some(crate::value::NONE));
         assert_eq!(sweep(&mut heap), 1);
         // The reference object itself is still alive and resolves to None.
@@ -3539,7 +3866,7 @@ mod tests {
         mark_survivor(reference);
         mark_survivor(target);
 
-        clear_weakrefs_local(&heap);
+        let _ = clear_weakrefs_local(&heap);
         assert_eq!(sweep(&mut heap), 0);
         assert_eq!(weakref_target_raw(reference), Some(target));
         assert_eq!(weakref_count(target), 1);
@@ -3564,7 +3891,7 @@ mod tests {
         mark_cell(reference, WHITE);
         mark_survivor(target);
 
-        clear_weakrefs_local(&heap);
+        let _ = clear_weakrefs_local(&heap);
         assert_eq!(weakref_target_raw(reference), None);
         assert_eq!(sweep(&mut heap), 1);
         assert_eq!(weakref_count(target), 0);
@@ -3598,10 +3925,80 @@ mod tests {
         mark_cell(second, WHITE);
         mark_survivor(reference);
 
-        clear_weakrefs_local(&heap);
+        let _ = clear_weakrefs_local(&heap);
         assert_eq!(weakref_target_raw(reference), Some(crate::value::NONE));
         // Both members of the cycle are collected; the weak reference and its
         // non-owning edge do not retain either of them.
+        assert_eq!(sweep(&mut heap), 2);
+    }
+
+    #[test]
+    fn weakref_callback_runs_once_when_the_target_dies() {
+        let _guard = weak_guard();
+        let mut heap = HeapState::new();
+        let target = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        let reference = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        let callback = counting_callback_value();
+        assert!(weakref_register_with_callback(reference, target, callback));
+        assert!(!weakref_callbacks_pending());
+
+        // The target dies; the reference survives this cycle.
+        mark_cell(target, WHITE);
+        mark_survivor(reference);
+        let resurrect = clear_weakrefs_local(&heap);
+        assert_eq!(resurrect, vec![cell_address(reference)]);
+        assert!(weakref_callbacks_pending());
+        assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+
+        run_pending_weakref_callbacks();
+        assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(CALLBACK_LAST.load(Ordering::SeqCst), reference);
+
+        // Nothing is armed any more: clearing and draining again is a no-op.
+        let _ = clear_weakrefs_local(&heap);
+        run_pending_weakref_callbacks();
+        assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        assert!(!weakref_callbacks_pending());
+
+        assert_eq!(sweep(&mut heap), 1);
+        assert!(heap.addresses.contains(&cell_address(reference)));
+    }
+
+    #[test]
+    fn weakref_callback_receives_an_unreachable_reference() {
+        let _guard = weak_guard();
+        let mut heap = HeapState::new();
+        let target = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        let reference = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        let callback = counting_callback_value();
+        assert!(weakref_register_with_callback(reference, target, callback));
+
+        // Both the target and the reference are white this cycle. The callback
+        // still runs (with the reference) before either cell is released.
+        mark_cell(target, WHITE);
+        mark_cell(reference, WHITE);
+        let resurrect = clear_weakrefs_local(&heap);
+        assert_eq!(resurrect, vec![cell_address(reference)]);
+        assert_eq!(weakref_target_raw(reference), None);
+        run_pending_weakref_callbacks();
+        assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(CALLBACK_LAST.load(Ordering::SeqCst), reference);
         assert_eq!(sweep(&mut heap), 2);
     }
 

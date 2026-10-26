@@ -16,8 +16,9 @@
 //!   [`Program::source_name`].
 //! - Nested functions are closures: [`StmtKind::Closure`] captures the
 //!   current values of enclosing locals, or the cell for bindings mutated
-//!   through `nonlocal`. Classes are limited to a single
-//!   optional base and plain methods.
+//!   through `nonlocal`. A class carries its base expressions in source order
+//!   (the runtime resolves the MRO) and an optional `metaclass` value; its
+//!   methods are plain, property, classmethod or staticmethod entries.
 
 pub mod compat;
 mod ir;
@@ -30,7 +31,8 @@ mod tests;
 pub use crate::compat::{PYTHON_ABI_TAG, PYTHON_VERSION, PYTHON_VERSION_STRING};
 pub use crate::ir::{
     ClassAttr, ClassMethod, CompClause, CompTarget, DeleteTarget, Expr, ExprKind, Function,
-    Handler, LocalInfo, MethodKind, Param, ParamKind, Program, Stmt, StmtKind, UnpackTarget,
+    Handler, LocalInfo, MethodKind, Param, ParamKind, Program, Stmt, StmtKind,
+    TemplateInterpolation, UnpackTarget,
 };
 pub use crate::model::{
     BinOp, BoolOp, Builtin, Callee, Const, ExcKind, FunctionId, LocalId, Type, UnOp,

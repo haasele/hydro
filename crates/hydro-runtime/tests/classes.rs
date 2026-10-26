@@ -434,9 +434,10 @@ fn setattr_rejects_non_instances() {
     hydro_runtime_init();
     let cls = class("C", hydro_none(), &[]);
 
-    // Classes have no writable namespace in this runtime.
+    // Classes have a writable namespace; the attribute is visible.
     setattr(cls, "x", int(1));
-    assert_error_tag(TYPE_ERROR);
+    assert_no_error();
+    assert_int(getattr(cls, "x"), 1);
 
     // Native values are read-only.
     setattr(int(1), "x", int(1));

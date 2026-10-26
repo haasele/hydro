@@ -11,7 +11,9 @@
 //! table: they record a target address without a traced edge, so they never
 //! keep the target alive, and the collector clears them when the target is
 //! swept. `getweakrefs` pins the references it materialises until the result
-//! list is reachable.
+//! list is reachable. Armed callbacks are queued when their target dies and
+//! run outside every GC lock from a safepoint or `gc.collect()`; raising
+//! callbacks are reported and cleared.
 
 pub mod heap;
 pub mod roots;

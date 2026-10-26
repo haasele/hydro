@@ -209,6 +209,8 @@ fn sequence_len(value: i64) -> Option<usize> {
         Some(items.len())
     } else if let Some(bytes) = value::as_bytes(value) {
         Some(bytes.len())
+    } else if let Some(view) = value::as_memoryview(value) {
+        Some(view.len())
     } else {
         value::as_str(value).map(|text| text.chars().count())
     }
@@ -653,8 +655,9 @@ fn numeric_hash(v: i64) -> Option<u64> {
     Some(fnv_mix(HASH_NUMERIC, bits))
 }
 
-/// Type name of an unhashable object (`list`, `dict`, `iterator`, or a tuple
-/// containing one), if any. Tuples are hashable exactly when every element is.
+/// Type name of an unhashable object (`list`, `dict`, `iterator`, a bytes-like
+/// mutable/view value, or a tuple containing one), if any. Tuples are hashable
+/// exactly when every element is.
 pub(crate) fn unhashable_name(v: i64) -> Option<&'static str> {
     if value::as_list(v).is_some() {
         Some("list")
@@ -664,6 +667,12 @@ pub(crate) fn unhashable_name(v: i64) -> Option<&'static str> {
         Some("set")
     } else if value::as_iter(v).is_some() {
         Some("iterator")
+    } else if value::as_bytearray(v).is_some() {
+        Some("bytearray")
+    } else if value::as_memoryview(v).is_some() {
+        Some("memoryview")
+    } else if let Some(view) = value::as_dict_view(v) {
+        Some(view.kind.type_name())
     } else if let Some(items) = value::as_tuple(v) {
         items.iter().find_map(|item| unhashable_name(*item))
     } else {
@@ -673,6 +682,133 @@ pub(crate) fn unhashable_name(v: i64) -> Option<&'static str> {
 
 pub(crate) fn unhashable_message(name: &str) -> String {
     format!("unhashable type: '{}'", name)
+}
+
+/// Number of entries a live `dict` view observes.
+pub(crate) fn dict_view_len(view: &value::DictViewState) -> usize {
+    value::as_dict(view.dict).map_or(0, |pairs| pairs.len())
+}
+
+/// Whether `item` is present in a live `dict` view.
+///
+/// Keys compare by key equality, values by value equality and items by a
+/// `(key, value)` pair with both halves equal.
+pub(crate) fn dict_view_contains(view: &value::DictViewState, item: i64) -> bool {
+    let Some(pairs) = value::as_dict(view.dict) else {
+        return false;
+    };
+    match view.kind {
+        value::DictViewKind::Keys => pairs.iter().any(|(key, _)| equals(*key, item)),
+        value::DictViewKind::Values => pairs.iter().any(|(_, value)| equals(*value, item)),
+        value::DictViewKind::Items => {
+            let pair = value::as_tuple(item)
+                .or_else(|| value::as_list(item))
+                .filter(|pair| pair.len() == 2);
+            let Some(pair) = pair else {
+                return false;
+            };
+            pairs
+                .iter()
+                .any(|(key, val)| equals(*key, pair[0]) && equals(*val, pair[1]))
+        }
+    }
+}
+
+/// Elements a `dict` view contributes to set equality and set operators.
+///
+/// `dict_values` has no set-like element view, so it returns `None`. The
+/// `dict_items` tuples are accumulated in a heap list so they stay reachable
+/// while later tuples are allocated.
+pub(crate) fn dict_view_elements(view: &value::DictViewState) -> Option<Vec<i64>> {
+    let pairs: Vec<(i64, i64)> = value::as_dict(view.dict)?.to_vec();
+    match view.kind {
+        value::DictViewKind::Keys => Some(pairs.into_iter().map(|(key, _)| key).collect()),
+        value::DictViewKind::Values => None,
+        value::DictViewKind::Items => {
+            let accumulator = value::list_new(Vec::new());
+            for (key, val) in pairs {
+                let item = value::tuple_new(vec![key, val]);
+                list_append(accumulator, item);
+            }
+            Some(
+                value::as_list(accumulator)
+                    .map(|items| items.to_vec())
+                    .unwrap_or_default(),
+            )
+        }
+    }
+}
+
+/// Set-like equality: same size and every element of `left` in `right`.
+pub(crate) fn set_like_equal(left: &[i64], right: &[i64]) -> bool {
+    left.len() == right.len() && left.iter().all(|item| set_contains(right, *item))
+}
+
+/// Set operators supported on sets and `dict_keys`/`dict_items` views.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SetOp {
+    And,
+    Or,
+    Sub,
+    Xor,
+}
+
+/// Elements of a value that participates in set operations.
+fn set_like_elements(v: i64) -> Option<Vec<i64>> {
+    if let Some(items) = value::as_set(v) {
+        return Some(items.to_vec());
+    }
+    value::as_dict_view(v).and_then(dict_view_elements)
+}
+
+/// Whether `v` participates in set operations (`set` or a keys/items view).
+pub(crate) fn is_set_like(v: i64) -> bool {
+    value::as_set(v).is_some()
+        || value::as_dict_view(v).is_some_and(|view| view.kind != value::DictViewKind::Values)
+}
+
+/// `a & b`, `a | b`, `a - b` and `a ^ b` over sets and `dict` views.
+///
+/// Returns `None` when either operand is not set-like, so the caller keeps its
+/// existing numeric/type-error behaviour. The result is always a fresh `set`.
+pub(crate) fn set_operation(op: SetOp, a: i64, b: i64) -> Option<i64> {
+    let left = set_like_elements(a)?;
+    let right = set_like_elements(b)?;
+    let result = value::set_new(Vec::new());
+    match op {
+        SetOp::And => {
+            for &item in &left {
+                if set_contains(&right, item) {
+                    insert_set_item(result, item);
+                }
+            }
+        }
+        SetOp::Or => {
+            for &item in left.iter().chain(right.iter()) {
+                insert_set_item(result, item);
+            }
+        }
+        SetOp::Sub => {
+            for &item in &left {
+                if !set_contains(&right, item) {
+                    insert_set_item(result, item);
+                }
+            }
+        }
+        SetOp::Xor => {
+            for &item in &left {
+                if !set_contains(&right, item) {
+                    insert_set_item(result, item);
+                }
+            }
+            for &item in &right {
+                if !set_contains(&left, item) {
+                    insert_set_item(result, item);
+                }
+            }
+        }
+    }
+    Some(result)
 }
 
 // Dict operations over a pair table
@@ -768,8 +904,37 @@ pub(crate) fn dict_set(dict: i64, key: i64, new_value: i64) -> i64 {
 
 // Indexing
 
-/// `object[index]` for lists, strings, tuples and dicts.
+/// `object[index]` for lists, strings, tuples, dicts, bytes-likes and views.
 pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
+    // Checked before `as_bytes`, which also accepts a `bytearray`.
+    if let Some(bytes) = value::as_bytearray(obj) {
+        let Some(raw) = value::as_integer(index) else {
+            return type_error(format!(
+                "bytearray indices must be integers or slices, not {}",
+                value::type_name(index)
+            ));
+        };
+        let len = bytes.len();
+        return match normalize_index(raw, len) {
+            Some(pos) => crate::ops::int_result(bytes[pos] as i64),
+            None => exc::raise_with_message(INDEX_ERROR, "bytearray index out of range"),
+        };
+    }
+    if let Some(view) = value::as_memoryview(obj) {
+        if view.released {
+            return exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED);
+        }
+        let Some(raw) = value::as_integer(index) else {
+            return type_error("memoryview: invalid indices for memoryview".to_string());
+        };
+        let Some(pos) = normalize_index(raw, view.len()) else {
+            return exc::raise_with_message(INDEX_ERROR, value::MEMORYVIEW_OUT_OF_RANGE);
+        };
+        return match value::memoryview_get(view, pos) {
+            Ok(item) => item,
+            Err(message) => memoryview_error(message),
+        };
+    }
     if let Some(items) = value::as_list(obj) {
         let Some(raw) = value::as_integer(index) else {
             return type_error(format!(
@@ -864,9 +1029,55 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
     ))
 }
 
-/// `object[index] = value` for lists and dicts. Always returns `None`; errors
-/// are reported through the pending exception.
+/// `object[index] = value` for lists, dicts, bytearrays and writable views.
+/// Always returns `None`; errors are reported through the pending exception.
 pub(crate) fn subscript_set(obj: i64, index: i64, new_value: i64) -> i64 {
+    // Checked before `as_bytes`, which also accepts a `bytearray`.
+    if let Some(bytes) = value::as_bytearray(obj) {
+        let Some(raw) = value::as_integer(index) else {
+            return type_error(format!(
+                "bytearray indices must be integers or slices, not {}",
+                value::type_name(index)
+            ));
+        };
+        let Some(byte) = byte_value(new_value) else {
+            return if value::as_integer(new_value).is_some() {
+                exc::raise_with_message(VALUE_ERROR, "byte must be in range(0, 256)")
+            } else {
+                type_error(format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    value::type_name(new_value)
+                ))
+            };
+        };
+        let position = match normalize_index(raw, bytes.len()) {
+            Some(position) => position,
+            None => return exc::raise_with_message(INDEX_ERROR, "bytearray index out of range"),
+        };
+        // Re-borrow after the allocation-free validation above.
+        return match value::bytearray_bytes_mut(obj) {
+            Some(bytes) => {
+                bytes[position] = byte;
+                NONE
+            }
+            None => type_error("bytearray assignment on a non-bytearray".to_string()),
+        };
+    }
+    if let Some(view) = value::as_memoryview(obj) {
+        if view.released {
+            return exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED);
+        }
+        let Some(raw) = value::as_integer(index) else {
+            return type_error("memoryview: invalid indices for memoryview".to_string());
+        };
+        let Some(position) = normalize_index(raw, view.len()) else {
+            return exc::raise_with_message(INDEX_ERROR, value::MEMORYVIEW_OUT_OF_RANGE);
+        };
+        return match value::memoryview_set(view, position, new_value) {
+            Ok(()) => NONE,
+            Err(message) => memoryview_error(message),
+        };
+    }
     if let Some(mut items) = value::list_items_mut(obj) {
         let Some(raw) = value::as_integer(index) else {
             // Drop the graph lock before allocating the exception object.
@@ -911,6 +1122,29 @@ pub(crate) fn subscript_set(obj: i64, index: i64, new_value: i64) -> i64 {
 /// A list index out of range raises `IndexError`, a missing dict key
 /// `KeyError` (with the key's `repr`) and every other receiver `TypeError`.
 pub(crate) fn delete_subscript(obj: i64, index: i64) -> i64 {
+    // Deleting a bytearray element shrinks the sequence; memoryview elements
+    // are fixed-size slots, so deletion is rejected like Python does.
+    if let Some(bytes) = value::as_bytearray(obj) {
+        let Some(raw) = value::as_integer(index) else {
+            return type_error(format!(
+                "bytearray indices must be integers or slices, not {}",
+                value::type_name(index)
+            ));
+        };
+        let Some(position) = normalize_index(raw, bytes.len()) else {
+            return exc::raise_with_message(INDEX_ERROR, "bytearray index out of range");
+        };
+        return match value::bytearray_bytes_mut(obj) {
+            Some(bytes) => {
+                bytes.remove(position);
+                NONE
+            }
+            None => type_error("bytearray deletion on a non-bytearray".to_string()),
+        };
+    }
+    if value::as_memoryview(obj).is_some() {
+        return type_error("'memoryview' object does not support item deletion".to_string());
+    }
     if let Some(mut items) = value::list_items_mut(obj) {
         let Some(raw) = value::as_integer(index) else {
             // Drop the graph lock before allocating the exception object.
@@ -973,6 +1207,32 @@ fn type_error(message: String) -> i64 {
     exc::raise_with_message(TYPE_ERROR, &message)
 }
 
+/// Decodes a Python value as one byte (`0..=255`); `None` when it is not an
+/// in-range integer.
+pub(crate) fn byte_value(v: i64) -> Option<u8> {
+    value::as_integer(v).and_then(|n| u8::try_from(n).ok())
+}
+
+/// Maps a `MemoryViewState` error message to the tagged Python exception.
+///
+/// A released view is a `ValueError`, a read-only write is a `TypeError`
+/// ("cannot modify read-only memory") and an out-of-range index is an
+/// `IndexError`, matching CPython.
+pub(crate) fn memoryview_error(message: &'static str) -> i64 {
+    if message == value::MEMORYVIEW_RELEASED {
+        exc::raise_with_message(VALUE_ERROR, message)
+    } else if message == value::MEMORYVIEW_OUT_OF_RANGE {
+        exc::raise_with_message(INDEX_ERROR, message)
+    } else {
+        exc::raise_with_message(TYPE_ERROR, message)
+    }
+}
+
+/// Length of a bytes-like exporter, `0` when it is not bytes-like.
+fn as_bytes_len(buffer: i64) -> usize {
+    value::as_bytes(buffer).map_or(0, |bytes| bytes.len())
+}
+
 // Slicing
 
 enum SliceError {
@@ -1024,6 +1284,55 @@ pub(crate) fn slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
         }
         return value::str_alloc(out);
     }
+    // Checked before `as_bytes`, which also accepts a `bytearray`.
+    if let Some(bytes) = value::as_bytearray(obj) {
+        let (start, stop, step) = match slice_indices(start, stop, step, bytes.len()) {
+            Ok(bounds) => bounds,
+            Err(err) => return slice_error(err),
+        };
+        let mut out = Vec::new();
+        for pos in slice_positions(start, stop, step) {
+            out.push(bytes[pos]);
+        }
+        return value::bytearray_new(out);
+    }
+    if let Some(view) = value::as_memoryview(obj) {
+        if view.released {
+            return exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED);
+        }
+        let (start, stop, step) = match slice_indices(start, stop, step, view.len()) {
+            Ok(bounds) => bounds,
+            Err(err) => return slice_error(err),
+        };
+        let positions = slice_positions(start, stop, step);
+        if positions.is_empty() {
+            // No visible element, so the exact origin is unobservable; keep a
+            // valid window instead of a negative offset.
+            return value::memoryview_with_window(
+                view.buffer,
+                view.offset.min(as_bytes_len(view.buffer)),
+                0,
+                1,
+                view.format,
+            );
+        }
+        let first = positions[0] as i128;
+        let offset = view.offset as i128 + first * view.stride as i128;
+        let stride = view.stride as i128 * step as i128;
+        let Ok(offset) = usize::try_from(offset) else {
+            return exc::raise_with_message(INDEX_ERROR, value::MEMORYVIEW_OUT_OF_RANGE);
+        };
+        let Ok(stride) = isize::try_from(stride) else {
+            return exc::raise_with_message(INDEX_ERROR, value::MEMORYVIEW_OUT_OF_RANGE);
+        };
+        return value::memoryview_with_window(
+            view.buffer,
+            offset,
+            positions.len(),
+            stride,
+            view.format,
+        );
+    }
     if let Some(bytes) = value::as_bytes(obj) {
         let (start, stop, step) = match slice_indices(start, stop, step, bytes.len()) {
             Ok(bounds) => bounds,
@@ -1060,6 +1369,97 @@ pub(crate) fn slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
 /// while the list is locked. Returns `None`; errors are reported through the
 /// pending exception.
 pub(crate) fn slice_set(obj: i64, start: i64, stop: i64, step: i64, new_value: i64) -> i64 {
+    if value::as_bytearray(obj).is_some() || value::as_memoryview(obj).is_some() {
+        if let Some(view) = value::as_memoryview(obj) {
+            if view.released {
+                let _ = exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED);
+                return NONE;
+            }
+        }
+        if let Err(err) = validate_slice_args(start, stop, step) {
+            let _ = slice_error(err);
+            return NONE;
+        }
+        let Some(values) = slice_assignment_values(new_value) else {
+            return NONE;
+        };
+        let mut bytes = Vec::with_capacity(values.len());
+        for item in values {
+            let Some(byte) = byte_value(item) else {
+                let _ = if value::as_integer(item).is_some() {
+                    exc::raise_with_message(VALUE_ERROR, "byte must be in range(0, 256)")
+                } else {
+                    type_error(format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        value::type_name(item)
+                    ))
+                };
+                return NONE;
+            };
+            bytes.push(byte);
+        }
+        if let Some(view) = value::as_memoryview(obj) {
+            let len = view.len();
+            let Ok((start, stop, step)) = slice_indices(start, stop, step, len) else {
+                return NONE;
+            };
+            let positions: Vec<usize> = if step == 1 {
+                let stop = stop.max(start);
+                (start as usize..(stop as usize).min(len)).collect()
+            } else {
+                slice_positions(start, stop, step)
+            };
+            if positions.len() != bytes.len() {
+                let _ = exc::raise_with_message(
+                    VALUE_ERROR,
+                    "memoryview assignment: lvalue and rvalue have different structures",
+                );
+                return NONE;
+            }
+            for (&position, &byte) in positions.iter().zip(bytes.iter()) {
+                if let Err(message) = value::memoryview_set_byte(view, position, byte) {
+                    let _ = memoryview_error(message);
+                    return NONE;
+                }
+            }
+            return NONE;
+        }
+        let Some(len) = value::as_bytearray(obj).map(|bytes| bytes.len()) else {
+            return NONE;
+        };
+        let Ok((start, stop, step)) = slice_indices(start, stop, step, len) else {
+            return NONE;
+        };
+        let Some(target) = value::bytearray_bytes_mut(obj) else {
+            return NONE;
+        };
+        if step == 1 {
+            let stop = stop.max(start);
+            let low = (start as usize).min(target.len());
+            let high = (stop as usize).min(target.len()).max(low);
+            target.splice(low..high, bytes);
+            return NONE;
+        }
+        let positions = slice_positions(start, stop, step);
+        if positions.len() != bytes.len() {
+            let _ = exc::raise_with_message(
+                VALUE_ERROR,
+                &format!(
+                    "attempt to assign bytes of size {} to extended slice of size {}",
+                    bytes.len(),
+                    positions.len()
+                ),
+            );
+            return NONE;
+        }
+        for (position, &byte) in positions.into_iter().zip(bytes.iter()) {
+            if position >= target.len() {
+                break;
+            }
+            target[position] = byte;
+        }
+        return NONE;
+    }
     if value::as_list(obj).is_none() {
         if value::as_dict(obj).is_some() || value::as_defaultdict(obj).is_some() {
             let _ = type_error(unhashable_message("slice"));
@@ -1145,6 +1545,46 @@ pub(crate) fn slice_set(obj: i64, start: i64, stop: i64, step: i64, new_value: i
 /// collection. Returns `None`; errors are reported through the pending
 /// exception.
 pub(crate) fn delete_slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
+    // Deleting a bytearray slice shrinks the sequence; a view has fixed slots.
+    if value::as_bytearray(obj).is_some() {
+        if let Err(err) = validate_slice_args(start, stop, step) {
+            let _ = slice_error(err);
+            return NONE;
+        }
+        let Some(len) = value::as_bytearray(obj).map(|bytes| bytes.len()) else {
+            return NONE;
+        };
+        let Ok((start, stop, step)) = slice_indices(start, stop, step, len) else {
+            return NONE;
+        };
+        let Some(bytes) = value::bytearray_bytes_mut(obj) else {
+            return NONE;
+        };
+        if step == 1 {
+            let stop = stop.max(start);
+            let low = (start as usize).min(bytes.len());
+            let high = (stop as usize).min(bytes.len()).max(low);
+            bytes.drain(low..high);
+            return NONE;
+        }
+        let mut positions = slice_positions(start, stop, step);
+        // Descending removal keeps the earlier positions valid.
+        positions.sort_unstable_by(|a, b| b.cmp(a));
+        for position in positions {
+            if position < bytes.len() {
+                bytes.remove(position);
+            }
+        }
+        return NONE;
+    }
+    if let Some(view) = value::as_memoryview(obj) {
+        if view.released {
+            let _ = exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED);
+        } else {
+            let _ = type_error("'memoryview' object does not support item deletion".to_string());
+        }
+        return NONE;
+    }
     if value::as_list(obj).is_none() {
         if value::as_dict(obj).is_some() || value::as_defaultdict(obj).is_some() {
             let _ = type_error(unhashable_message("slice"));
@@ -1410,6 +1850,51 @@ fn equals_depth(a: i64, b: i64, depth: usize) -> bool {
     }
     if let (Some(s), Some(t)) = (value::as_bytes(a), value::as_bytes(b)) {
         return s == t;
+    }
+    // `memoryview` compares by format, shape and content; a view also compares
+    // equal to the bytes it exposes.
+    if let (Some(x), Some(y)) = (value::as_memoryview(a), value::as_memoryview(b)) {
+        if x.format != y.format || x.len() != y.len() {
+            return false;
+        }
+        return match (value::memoryview_bytes(x), value::memoryview_bytes(y)) {
+            (Ok(xs), Ok(ys)) => xs == ys,
+            _ => false,
+        };
+    }
+    if let (Some(view), Some(bytes)) = (value::as_memoryview(a), value::as_bytes(b)) {
+        return value::memoryview_bytes(view)
+            .map(|seen| seen == bytes)
+            .unwrap_or(false);
+    }
+    if let (Some(view), Some(bytes)) = (value::as_memoryview(b), value::as_bytes(a)) {
+        return value::memoryview_bytes(view)
+            .map(|seen| seen == bytes)
+            .unwrap_or(false);
+    }
+    // `dict_keys`/`dict_items` compare as sets; `dict_values` has no content
+    // equality (only the identity shortcut below).
+    if let (Some(x), Some(y)) = (value::as_dict_view(a), value::as_dict_view(b)) {
+        if x.kind != y.kind {
+            return false;
+        }
+        if x.kind == value::DictViewKind::Values {
+            return false;
+        }
+        let (Some(xs), Some(ys)) = (dict_view_elements(x), dict_view_elements(y)) else {
+            return false;
+        };
+        return set_like_equal(&xs, &ys);
+    }
+    if let (Some(view), Some(items)) = (value::as_dict_view(a), value::as_set(b)) {
+        return dict_view_elements(view)
+            .map(|elements| set_like_equal(&elements, items))
+            .unwrap_or(false);
+    }
+    if let (Some(view), Some(items)) = (value::as_dict_view(b), value::as_set(a)) {
+        return dict_view_elements(view)
+            .map(|elements| set_like_equal(items, &elements))
+            .unwrap_or(false);
     }
     // Identity shortcut: equal tagged values are the same immediate or the
     // same heap object. This also terminates comparisons of self-referential

@@ -160,6 +160,15 @@ pub static MODULES: &[&ModuleSpec] = &[
     &AST,
     &FRACTIONS,
     &IMPORTLIB,
+    &WARNINGS,
+    &_WARNINGS,
+    &MARSHAL,
+    &_TOKENIZE,
+    &_COLLECTIONS_ABC,
+    &COLLECTIONS_ABC,
+    &GC,
+    &ATEXIT,
+    &SITE,
 ];
 
 pub fn module(name: &str) -> Option<&'static ModuleSpec> {

@@ -324,6 +324,13 @@ pub enum Builtin {
     Filter,
     /// `bytes()` / `bytes(int)` / `bytes(iterable)` / `bytes(str, encoding)`.
     Bytes,
+    /// `bytearray()` / `bytearray(bytes_like)` / `bytearray(iterable)` /
+    /// `bytearray(str, encoding)`: a mutable byte sequence. The runtime owns
+    /// the value kind (`KIND_BYTEARRAY`); this variant names the callable.
+    ByteArray,
+    /// `memoryview(bytes_like)`: a view over a bytes-like value. The runtime
+    /// owns the value kind (`KIND_MEMORYVIEW`).
+    MemoryView,
     /// `iter(obj)`: the object's iterator (an iterator/generator is returned
     /// unchanged).
     Iter,
@@ -421,6 +428,8 @@ impl Builtin {
             Builtin::Map => "map",
             Builtin::Filter => "filter",
             Builtin::Bytes => "bytes",
+            Builtin::ByteArray => "bytearray",
+            Builtin::MemoryView => "memoryview",
             Builtin::Iter => "iter",
             Builtin::Next => "next",
             Builtin::Frozenset => "frozenset",
@@ -471,6 +480,8 @@ impl Builtin {
             "map" => Builtin::Map,
             "filter" => Builtin::Filter,
             "bytes" => Builtin::Bytes,
+            "bytearray" => Builtin::ByteArray,
+            "memoryview" => Builtin::MemoryView,
             "iter" => Builtin::Iter,
             "next" => Builtin::Next,
             "frozenset" => Builtin::Frozenset,

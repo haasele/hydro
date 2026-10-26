@@ -301,6 +301,7 @@ impl SessionCompiler {
 
             let mut infer = Infer::new();
             let mut lowerer = Lowerer::new(&unit.source, &unit.display, &mut infer);
+            lowerer.set_templates(&unit.templates);
             lowerer.set_fid_base(base);
             // A session fragment is a compilation unit of its own: every
             // module-level binding must survive into the shared global table.

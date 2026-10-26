@@ -26,7 +26,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hydro_ir::{FunctionId, Program};
-use rustpython_parser::{ast, Mode};
+use rustpython_parser::{ast, Mode, TemplateString};
 
 use diag::codes;
 use lower::{HFunction, HParam, LHir, Lowerer, UserModule};
@@ -37,10 +37,11 @@ use sema::{Infer, Ty};
 /// Errors are collected rather than short-circuited where practical; the
 /// returned vector is never empty on failure.
 pub fn check_source(source: &str, filename: &str) -> Result<Program, Vec<Diagnostic>> {
-    let module = parse_module(source, filename)?;
+    let (module, templates) = parse_module(source, filename)?;
 
     let mut infer = Infer::new();
     let mut lowerer = Lowerer::new(source, filename, &mut infer);
+    lowerer.set_templates(&templates);
     let hir = lowerer.lower_module(&module);
     let diags = std::mem::take(&mut lowerer.diags);
     drop(lowerer);
@@ -52,9 +53,14 @@ pub fn check_source(source: &str, filename: &str) -> Result<Program, Vec<Diagnos
     Ok(sema::emit(&hir, &mut infer))
 }
 
-/// Parse `source` into a module AST, reporting syntax errors as diagnostics.
-fn parse_module(source: &str, filename: &str) -> Result<ast::ModModule, Vec<Diagnostic>> {
-    let parsed = match rustpython_parser::parse(source, Mode::Module, filename) {
+/// Parse `source` into a module AST plus the PEP 750 template side table,
+/// reporting syntax errors (including malformed template strings) as
+/// diagnostics.
+fn parse_module(
+    source: &str,
+    filename: &str,
+) -> Result<(ast::ModModule, Vec<TemplateString>), Vec<Diagnostic>> {
+    let parsed = match rustpython_parser::parse_module_with_templates(source, filename) {
         Ok(module) => module,
         Err(error) => {
             let offset = u32::from(error.offset) as usize;
@@ -71,8 +77,8 @@ fn parse_module(source: &str, filename: &str) -> Result<ast::ModModule, Vec<Diag
         }
     };
 
-    match parsed {
-        ast::Mod::Module(module) => Ok(module),
+    match parsed.module {
+        ast::Mod::Module(module) => Ok((module, parsed.templates)),
         _ => Err(vec![Diagnostic::new(
             filename,
             1,
@@ -234,6 +240,10 @@ struct LoadedModule {
     display: String,
     source: String,
     module: ast::ModModule,
+    /// PEP 750 template strings of this module, keyed by source range. The
+    /// AST represents each literal as a reserved placeholder `Name`; the
+    /// lowerer resolves it here and never treats it as a variable.
+    templates: Vec<TemplateString>,
     /// Units this module imports, in discovery order.
     deps: Vec<usize>,
     /// User modules this unit imports but cannot link directly: they are still
@@ -381,7 +391,7 @@ impl ModuleLoader {
     ) -> Result<usize, Vec<Diagnostic>> {
         let diags_before = self.diags.len();
         let file = filename.clone();
-        let module = parse_module(&source, &file)?;
+        let (module, templates) = parse_module(&source, &file)?;
 
         let display = PathBuf::from(&filename);
         self.stack
@@ -410,6 +420,7 @@ impl ModuleLoader {
             display: file,
             source,
             module,
+            templates,
             deps: scan.deps,
             late: scan.late,
             deferred: scan.deferred,
@@ -461,8 +472,8 @@ impl ModuleLoader {
             }
         };
         let file = display.to_string_lossy().into_owned();
-        let module = match parse_module(&source, &file) {
-            Ok(module) => module,
+        let (module, templates) = match parse_module(&source, &file) {
+            Ok(parsed) => parsed,
             Err(mut diagnostics) => {
                 self.diags.append(&mut diagnostics);
                 self.failed.insert(key);
@@ -501,6 +512,7 @@ impl ModuleLoader {
             display: file,
             source,
             module,
+            templates,
             deps: scan.deps,
             late: scan.late,
             deferred: scan.deferred,
@@ -1634,6 +1646,7 @@ fn lower_modules(
         let base = all_functions.len() as FunctionId;
         let mut infer = Infer::new();
         let mut lowerer = Lowerer::new(&unit.source, &unit.display, &mut infer);
+        lowerer.set_templates(&unit.templates);
         lowerer.set_fid_base(base);
         // Imported units may be read by name from their global table while
         // they are still initializing, so they mirror every module-level

@@ -88,6 +88,12 @@ pub(crate) fn len(v: i64) -> i64 {
     if let Some(bytes) = value::as_bytes(v) {
         return ops::int_result(bytes.len() as i64);
     }
+    if let Some(view) = value::as_memoryview(v) {
+        return ops::int_result(view.len() as i64);
+    }
+    if let Some(view) = value::as_dict_view(v) {
+        return ops::int_result(container::dict_view_len(view) as i64);
+    }
     if let Some(pairs) = value::as_dict(v) {
         return ops::int_result(pairs.len() as i64);
     }
@@ -574,6 +580,14 @@ pub(crate) fn bytes_build(argc: usize, argv: *const i64) -> i64 {
     if let Some(bytes) = value::as_bytes(args[0]) {
         return value::bytes_from_slice(bytes);
     }
+    // `bytes(memoryview)` copies the visible bytes (contiguous by
+    // construction in this runtime).
+    if let Some(view) = value::as_memoryview(args[0]) {
+        return match value::memoryview_bytes(view) {
+            Ok(bytes) => value::bytes_new(bytes),
+            Err(message) => exc::raise_with_message(exc::VALUE_ERROR, message),
+        };
+    }
     if let Some(count) = value::as_integer(args[0]) {
         if count < 0 {
             return exc::raise_with_message(VALUE_ERROR, "negative count");
@@ -626,6 +640,86 @@ pub(crate) fn bytes_build(argc: usize, argv: *const i64) -> i64 {
             value::type_name(args[0])
         ),
     )
+}
+
+/// `bytearray(...)`: the mutable byte-sequence constructor.
+///
+/// The 0/1/2-argument forms share [`bytes_build`] and wrap its result in a
+/// fresh `bytearray`; the 3-argument form (`str`, encoding, errors) validates
+/// the encoding and error handler itself. A failing conversion keeps the
+/// pending exception and returns `None`.
+pub(crate) fn bytearray_build(argc: usize, argv: *const i64) -> i64 {
+    if argc > 3 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("bytearray() takes at most 3 arguments ({argc} given)"),
+        );
+    }
+    if argc > 0 && argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "bytearray() received arguments without an argument buffer",
+        );
+    }
+    // SAFETY: ABI contract: `argv` points at `argc` readable values.
+    let args: &[i64] = if argc == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    };
+    if argc == 3 {
+        let Some(text) = value::as_str(args[0]) else {
+            return exc::raise_with_message(TYPE_ERROR, "encoding without a string argument");
+        };
+        let Some(encoding) = value::as_str(args[1]) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("encoding must be str, not {}", value::type_name(args[1])),
+            );
+        };
+        let Some(errors) = value::as_str(args[2]) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("errors must be str, not {}", value::type_name(args[2])),
+            );
+        };
+        if !is_utf8_encoding(encoding) {
+            return exc::raise_with_message(VALUE_ERROR, &format!("unknown encoding: {encoding}"));
+        }
+        if !matches!(errors, "strict" | "ignore" | "replace") {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("unknown error handler name '{errors}'"),
+            );
+        }
+        return value::bytearray_new(text.as_bytes().to_vec());
+    }
+    let converted = bytes_build(argc, argv);
+    if exc::pending() {
+        return converted;
+    }
+    // `bytes_build` yields a fresh `bytes` object for every accepted form; the
+    // bytes are copied into the mutable payload before it can be collected.
+    match value::as_bytes(converted) {
+        Some(bytes) => value::bytearray_new(bytes.to_vec()),
+        None => converted,
+    }
+}
+
+/// `memoryview(value)`: a live buffer view over `bytes`/`bytearray`.
+pub(crate) fn memoryview_build(argc: usize, argv: *const i64) -> i64 {
+    if argc != 1 {
+        return builtin_arity_error("memoryview", "exactly one", argc);
+    }
+    if argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "memoryview() received 1 argument without an argument buffer",
+        );
+    }
+    // SAFETY: ABI contract: one readable tagged value.
+    let argument = unsafe { *argv };
+    value::memoryview_abi(argument)
 }
 
 /// `list(iterable)`: materialises the runtime iteration order. The result is
@@ -1211,6 +1305,9 @@ fn call_with_keywords(target: i64, args: Vec<i64>, keywords: &[(String, i64)]) -
         );
     }
     let params = value::function_params(target);
+    // Positional-only parameters never receive a keyword value; they always
+    // form the leading run of the positional names.
+    let posonly = value::function_posonly_count(target);
     let mut slots: Vec<Option<i64>> = vec![None; params.len()];
     for (index, &arg) in args.iter().enumerate() {
         let Some(slot) = slots.get_mut(index) else {
@@ -1226,7 +1323,12 @@ fn call_with_keywords(target: i64, args: Vec<i64>, keywords: &[(String, i64)]) -
         *slot = Some(arg);
     }
     for (keyword, value) in keywords {
-        let Some(index) = params.iter().position(|param| param == keyword) else {
+        let Some(index) = params
+            .iter()
+            .skip(posonly)
+            .position(|param| param == keyword)
+            .map(|offset| offset + posonly)
+        else {
             return exc::raise_with_message(
                 TYPE_ERROR,
                 &format!("{name}() got an unexpected keyword argument '{keyword}'"),
@@ -1328,6 +1430,117 @@ pub(crate) fn call_star(function: i64, argc: usize, argv: *const i64, star: i64)
     args.extend_from_slice(&items);
     let roots = crate::heap::root_values(&args);
     let result = call(function, args.len(), args.as_ptr());
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// `fn(args..., *star, name=value..., **star_map)`: the general indirect call.
+///
+/// `star`/`star_map` are `NONE` when the caller used no `*`/`**` operand.
+/// Positional operands are flattened first (the `argv` prefix, then `star`),
+/// named keywords are merged with the `star_map` entries in mapping order, and
+/// the result dispatches through [`call_kw`] exactly like a literal keyword
+/// call. Duplicate keyword names and non-string mapping keys report CPython's
+/// `TypeError`; the flattened values stay rooted while user code runs.
+pub(crate) fn call_star_kw(
+    function: i64,
+    argc: usize,
+    argv: *const i64,
+    star: i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+    star_map: i64,
+) -> i64 {
+    if argc > 0 && argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("function call received {argc} argument(s) without an argument buffer"),
+        );
+    }
+    if argc > isize::MAX as usize / std::mem::size_of::<i64>()
+        || kwargc > isize::MAX as usize / (2 * std::mem::size_of::<i64>())
+    {
+        return exc::raise_with_message(TYPE_ERROR, "function call has too many arguments");
+    }
+    let name = value::as_function(function)
+        .map(|func| func.name.clone())
+        .unwrap_or_else(|| "function".to_string());
+    // SAFETY: ABI contract: `argv`/`kw_argv` point at readable buffers whose
+    // lengths were validated above.
+    let mut args: Vec<i64> = if argc == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+    };
+    if star != NONE {
+        match star_sequence(star) {
+            Ok(items) => args.extend_from_slice(&items),
+            Err(err) => return err,
+        }
+    }
+    let mut keywords: Vec<(String, i64)> = Vec::with_capacity(kwargc);
+    if kwargc > 0 {
+        if kw_argv.is_null() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "keyword arguments were passed without an argument buffer",
+            );
+        }
+        // SAFETY: ABI contract: `kw_argv` holds `2 * kwargc` readable values.
+        let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+        for pair in pairs.as_chunks::<2>().0 {
+            let Some(keyword) = value::as_str(pair[0]) else {
+                return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+            };
+            keywords.push((keyword.to_string(), pair[1]));
+        }
+    }
+    if star_map != NONE {
+        let Some(mapping) = value::as_dict(star_map) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "argument after ** must be a mapping, not '{}'",
+                    value::type_name(star_map)
+                ),
+            );
+        };
+        // Copy before allocating: the slice borrows the dict.
+        let entries: Vec<(i64, i64)> = mapping.to_vec();
+        for (key, item) in entries {
+            let Some(keyword) = value::as_str(key) else {
+                return exc::raise_with_message(TYPE_ERROR, "keywords must be strings");
+            };
+            if keywords
+                .iter()
+                .any(|(existing, _)| existing.as_str() == keyword)
+            {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{name}() got multiple values for keyword argument '{keyword}'"),
+                );
+            }
+            keywords.push((keyword.to_string(), item));
+        }
+    }
+    // Publish every flattened positional and keyword value as a root: the
+    // vectors are native memory the collector cannot scan, and the keyword
+    // name allocations below can collect.
+    let mut roots_source: Vec<i64> = args.clone();
+    roots_source.extend(keywords.iter().map(|(_, item)| *item));
+    let roots = crate::heap::root_values(&roots_source);
+    let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+    for (keyword, item) in &keywords {
+        pairs.push(value::str_alloc(keyword.clone()));
+        pairs.push(*item);
+    }
+    let result = call_kw(
+        function,
+        args.len(),
+        args.as_ptr(),
+        keywords.len(),
+        pairs.as_ptr(),
+    );
     crate::heap::release_roots(roots);
     result
 }
@@ -1530,7 +1743,9 @@ pub(crate) fn call_kw(
     let mut vararg_items: Vec<i64> = Vec::new();
     for (index, param) in signature.iter().enumerate() {
         match param.kind {
-            ParamKind::Positional => {
+            // Positional-only parameters fill from the positional stream
+            // exactly like ordinary positional parameters.
+            ParamKind::Positional | ParamKind::PosOnly => {
                 if next_positional < args.len() {
                     slots[index] = Some(args[next_positional]);
                     next_positional += 1;
@@ -1550,7 +1765,7 @@ pub(crate) fn call_kw(
                 "{name}() takes at most {} positional argument(s) ({} given)",
                 signature
                     .iter()
-                    .filter(|param| param.kind == ParamKind::Positional)
+                    .filter(|param| param.kind.is_positional())
                     .count(),
                 args.len()
             ),
@@ -1628,10 +1843,7 @@ pub(crate) fn call_kw(
         // Generator/coroutine calls must create a suspended fiber instead of
         // running the concrete entry. Plain positional signatures can go
         // through the regular wrapper with the fully bound slot vector.
-        if signature
-            .iter()
-            .all(|param| param.kind == ParamKind::Positional)
-        {
+        if signature.iter().all(|param| param.kind.is_positional()) {
             return call(function, full.len(), full.as_ptr());
         }
         return exc::raise_with_message(
@@ -1794,6 +2006,31 @@ fn instantiate_exception(tag: u32, argc: usize, argv: *const i64) -> i64 {
     exc::exception_value(tag, &message, args)
 }
 
+/// Builds the native payload for a user-defined exception class.
+///
+/// Unlike the built-in exception constructors this accepts any argument count
+/// (matching a Python class deriving from `BaseException`): every rendered
+/// argument becomes an `args` element and the first one is the message.
+fn derived_exception_payload(tag: u32, argc: usize, argv: *const i64) -> i64 {
+    if argc == 0 || argv.is_null() {
+        return exc::exception_value(tag, "", Vec::new());
+    }
+    if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "exception instantiation has too many arguments",
+        );
+    }
+    // SAFETY: ABI contract: `argv` points at `argc` readable values.
+    let values = unsafe { std::slice::from_raw_parts(argv, argc) };
+    let rendered: Vec<String> = values
+        .iter()
+        .map(|argument| value::to_string(*argument))
+        .collect();
+    let message = rendered.first().cloned().unwrap_or_default();
+    exc::exception_value(tag, &message, rendered)
+}
+
 fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -1806,6 +2043,41 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     }
     if let Some(tag) = exc::exception_tag_of_class(class) {
         return instantiate_exception(tag, argc, argv);
+    }
+    // A user class derived from a native exception class instantiates as a
+    // real exception payload that still remembers its Python class, so
+    // `raise MyError('x')`, `type(e) is MyError`, `isinstance(e, MyError)` and
+    // the native `except ValueError:` ancestry all hold.
+    if let Some(tag) = value::exception_tag_of_derived_class(class) {
+        // User exception classes accept any number of constructor arguments;
+        // the native payload records the rendered `args` and the first one as
+        // the message, while a user `__init__` (below) sees the values.
+        let plain = derived_exception_payload(tag, argc, argv);
+        if exc::pending() {
+            return NONE;
+        }
+        let Some(data) = value::exception_clone(plain) else {
+            return plain;
+        };
+        let instance = value::exc_instance_new(class, data);
+        // A user `__init__` runs on the exception instance with `self` bound,
+        // so `class E(Exception): def __init__(self, extra): self.extra = extra`
+        // keeps working alongside the exception payload.
+        if let Some((kind, init)) = value::class_member(class, "__init__") {
+            if !value::function_signature(init).is_empty() && value::function_full_entry(init) != 0
+            {
+                let args = if argc == 0 {
+                    Vec::new()
+                } else {
+                    // SAFETY: checked above; caller contract.
+                    unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+                };
+                let _ =
+                    methods::call_user_method(instance, class, kind, init, "__init__", &args, &[]);
+                return if exc::pending() { NONE } else { instance };
+            }
+        }
+        return instance;
     }
     // Copy the class name before allocating: a reference into a heap object
     // must not be read after an allocation that may collect.
@@ -1847,6 +2119,68 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
         return NONE;
     }
     instance
+}
+
+/// `type(name, bases, namespace)`: dynamic class creation.
+///
+/// The bases are validated and linearized with C3, `__slots__` is honored, and
+/// the metaclass resolved from the bases runs its `__new__`/`__init__` hooks
+/// (see [`value::class_new_multi`]). Functions in the namespace become normal
+/// methods; every other value is a class attribute.
+fn type_three_arg(name: i64, bases: i64, namespace: i64) -> i64 {
+    let Some(name_text) = value::as_str(name) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "type() argument 1 must be str, not {}",
+                value::type_name(name)
+            ),
+        );
+    };
+    let name_text = name_text.to_string();
+    let Some(base_values) = value::as_tuple(bases) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "type() argument 2 must be tuple, not {}",
+                value::type_name(bases)
+            ),
+        );
+    };
+    let base_values = base_values.to_vec();
+    for &base in &base_values {
+        if value::as_class(base).is_none() && base != NONE {
+            return exc::raise_with_message(TYPE_ERROR, "type() argument 2 must be tuple of types");
+        }
+    }
+    // `None` in the bases list is a no-op, as in class bodies.
+    let base_values: Vec<i64> = base_values
+        .into_iter()
+        .filter(|&base| base != NONE)
+        .collect();
+    let Some(entries) = value::as_dict(namespace) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "type() argument 3 must be dict, not {}",
+                value::type_name(namespace)
+            ),
+        );
+    };
+    let entries = entries.to_vec();
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::with_capacity(entries.len());
+    let mut attrs: Vec<(String, i64)> = Vec::with_capacity(entries.len());
+    for (key, item) in entries {
+        let Some(attr) = value::as_str(key) else {
+            return exc::raise_with_message(TYPE_ERROR, "type() namespace keys must be strings");
+        };
+        if value::as_function(item).is_some() {
+            methods.push((attr.to_string(), item, MethodKind::Normal));
+        } else {
+            attrs.push((attr.to_string(), item));
+        }
+    }
+    value::class_new_multi(name_text, base_values, NONE, methods, attrs)
 }
 
 /// Shared `getattr(obj, name)` lookup used by the 2- and 3-argument forms.
@@ -1911,6 +2245,8 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
     match builtin {
         Builtin::Print => print(argc, argv),
         Builtin::Bytes => bytes_build(argc, argv),
+        Builtin::ByteArray => bytearray_build(argc, argv),
+        Builtin::MemoryView => memoryview_build(argc, argv),
         Builtin::Zip => zip(argc, argv),
         Builtin::Set => match args {
             [] => container::set_new(0, std::ptr::null()),
@@ -2035,7 +2371,8 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
         },
         Builtin::Type => match args {
             [value] => value::type_class(*value),
-            _ => builtin_arity_error("type", "exactly 1", argc),
+            [name, bases, namespace] => type_three_arg(*name, *bases, *namespace),
+            _ => builtin_arity_error("type", "1 or 3", argc),
         },
         Builtin::Reversed => match args {
             [value] => reversed(*value),
@@ -2879,28 +3216,15 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
     ) {
         return Ok(exc::tag_is_subclass(sub_tag, class_tag));
     }
-    // User classes: follow the single base chain, checking every native
-    // exception class on the way for the tag relationship (so
-    // `class E(ValueError)` is a subclass of `Exception`).
-    let class_tag = exc::exception_tag_of_class(class);
-    let mut current = subclass;
-    for _ in 0..1024 {
-        let Some(state) = value::as_class(current) else {
-            return Ok(false);
-        };
-        if state.base == NONE {
-            return Ok(false);
-        }
-        current = state.base;
-        if current == class {
-            return Ok(true);
-        }
-        if let Some(class_tag) = class_tag {
-            if let Some(current_tag) = exc::exception_tag_of_class(current) {
-                if exc::tag_is_subclass(current_tag, class_tag) {
-                    return Ok(true);
-                }
-            }
+    // User classes: follow the C3 linearization, then check every native
+    // exception ancestor for the tag relationship (so `class E(ValueError)` is
+    // a subclass of `Exception`).
+    if value::class_mro(subclass).contains(&class) {
+        return Ok(true);
+    }
+    if let Some(class_tag) = exc::exception_tag_of_class(class) {
+        if let Some(sub_tag) = value::exception_tag_of_derived_class(subclass) {
+            return Ok(exc::tag_is_subclass(sub_tag, class_tag));
         }
     }
     Ok(false)
@@ -2981,7 +3305,13 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
         "bool" => value::type_name(value) == "bool",
         "float" => value::as_float(value).is_some(),
         "str" => value::as_str(value).is_some(),
-        "bytes" => value::as_bytes(value).is_some(),
+        // `bytearray` is bytes-like but not a `bytes` instance.
+        "bytes" => value::as_bytearray(value).is_none() && value::as_bytes(value).is_some(),
+        "bytearray" => value::as_bytearray(value).is_some(),
+        "memoryview" => value::as_memoryview(value).is_some(),
+        "dict_keys" | "dict_values" | "dict_items" => value::as_dict_view(value)
+            .map(|view| view.kind.type_name() == name)
+            .unwrap_or(false),
         "list" => value::as_list(value).is_some(),
         "dict" => value::as_dict(value).is_some() || value::as_defaultdict(value).is_some(),
         "tuple" => value::as_tuple(value).is_some(),
@@ -3007,11 +3337,34 @@ fn instance_of(value: i64, class: i64) -> bool {
     if value::is_object_class(class) {
         return true;
     }
+    // Classes are instances of their metaclass (the cached `type` class when no
+    // explicit metaclass was given), so `isinstance(C, Meta)` works for a
+    // `type` subclass.
+    if value::as_class(value).is_some() {
+        let metaclass = value::type_class(value);
+        if metaclass == class {
+            return true;
+        }
+        if value::as_class(class).is_some() && value::is_subclass_of(metaclass, class) {
+            return true;
+        }
+    }
     if value::is_type_class(class) {
         return value::as_class(value).is_some();
     }
     if is_protocol_class(class) {
         return protocol_instance_of(value, class);
+    }
+    // A user-defined exception instance keeps its Python class identity; its
+    // native payload adds the built-in exception ancestry.
+    if let Some(exception) = value::as_exc_instance(value) {
+        if value::class_mro(exception.class).contains(&class) {
+            return true;
+        }
+        return match exc::exception_tag_of_class(class) {
+            Some(handler_tag) => exc::tag_is_subclass(exception.data.tag, handler_tag),
+            None => false,
+        };
     }
     // Built-in exception objects carry their tag, not a class instance.
     if let Some(data) = value::exception_data(value) {
@@ -3021,29 +3374,15 @@ fn instance_of(value: i64, class: i64) -> bool {
         };
     }
     if let Some(instance) = value::as_instance(value) {
-        let class_tag = exc::exception_tag_of_class(class);
-        let mut current = instance.class;
-        for _ in 0..1024 {
-            if current == class {
-                return true;
+        if value::class_mro(instance.class).contains(&class) {
+            return true;
+        }
+        // A user class derived from a native exception class inherits its
+        // whole CPython ancestry (`class E(ValueError)` is an `Exception`).
+        if let Some(class_tag) = exc::exception_tag_of_class(class) {
+            if let Some(current_tag) = value::exception_tag_of_derived_class(instance.class) {
+                return exc::tag_is_subclass(current_tag, class_tag);
             }
-            // A user class derived from a native exception class inherits its
-            // whole CPython ancestry (`class E(ValueError)` is an `Exception`).
-            if let Some(class_tag) = class_tag {
-                if let Some(current_tag) = exc::exception_tag_of_class(current) {
-                    if exc::tag_is_subclass(current_tag, class_tag) {
-                        return true;
-                    }
-                }
-            }
-            let Some(base_state) = value::as_class(current) else {
-                // `instance.class` is always a class; defensive only.
-                return false;
-            };
-            if base_state.base == NONE {
-                return false;
-            }
-            current = base_state.base;
         }
         return false;
     }

@@ -141,6 +141,21 @@ pub(crate) fn binop(op: u32, a: i64, b: i64) -> i64 {
     if op == OP_DIV && value::as_path(a).is_some() {
         return path_join_op(a, b);
     }
+    // Set operators over sets and live `dict` views (`dict_keys`/`dict_items`).
+    if matches!(op, OP_BIT_AND | OP_BIT_OR | OP_BIT_XOR | OP_SUB)
+        && container::is_set_like(a)
+        && container::is_set_like(b)
+    {
+        let set_op = match op {
+            OP_BIT_AND => container::SetOp::And,
+            OP_BIT_OR => container::SetOp::Or,
+            OP_SUB => container::SetOp::Sub,
+            _ => container::SetOp::Xor,
+        };
+        if let Some(result) = container::set_operation(set_op, a, b) {
+            return result;
+        }
+    }
     match op {
         OP_ADD => add(a, b),
         OP_SUB => sub(a, b),
@@ -307,6 +322,31 @@ fn contains(left: i64, right: i64, negate: bool) -> i64 {
                 ),
             );
         }
+    } else if let Some(view) = value::as_memoryview(right) {
+        if view.released {
+            return exc::raise_with_message(exc::VALUE_ERROR, value::MEMORYVIEW_RELEASED);
+        }
+        let mut found = false;
+        for index in 0..view.len() {
+            match value::memoryview_get(view, index) {
+                Ok(item) => {
+                    if container::equals(item, left) {
+                        found = true;
+                        break;
+                    }
+                }
+                Err(message) => return container::memoryview_error(message),
+            }
+        }
+        found
+    } else if let Some(view) = value::as_dict_view(right) {
+        // Keys and items require a hashable operand, like a dict lookup.
+        if view.kind != value::DictViewKind::Values {
+            if let Some(name) = container::unhashable_name(left) {
+                return exc::raise_with_message(TYPE_ERROR, &container::unhashable_message(name));
+            }
+        }
+        container::dict_view_contains(view, left)
     } else if let Some(items) = value::as_set(right) {
         if let Some(name) = container::unhashable_name(left) {
             return exc::raise_with_message(TYPE_ERROR, &container::unhashable_message(name));
@@ -431,6 +471,21 @@ pub(crate) fn add(a: i64, b: i64) -> i64 {
             _ => overflow(),
         };
     }
+    // `bytearray + bytes-like` keeps the mutable result type; `bytes +
+    // bytearray` stays `bytes` (the generic branch below).
+    if value::as_bytearray(a).is_some() {
+        if let (Some(xs), Some(ys)) = (value::as_bytes(a), value::as_bytes(b)) {
+            return match xs.len().checked_add(ys.len()) {
+                Some(n) if n <= isize::MAX as usize => {
+                    let mut out = Vec::with_capacity(n);
+                    out.extend_from_slice(xs);
+                    out.extend_from_slice(ys);
+                    value::bytearray_new(out)
+                }
+                _ => overflow(),
+            };
+        }
+    }
     if let (Some(xs), Some(ys)) = (value::as_bytes(a), value::as_bytes(b)) {
         // `bytes + bytes` concatenates into a fresh bytes object.
         return match xs.len().checked_add(ys.len()) {
@@ -538,6 +593,14 @@ fn mul(a: i64, b: i64) -> i64 {
     if let (Some(n), Some(s)) = (value::as_integer(a), value::as_str(b)) {
         return repeat_str(s, n);
     }
+    // `bytearray * int` / `int * bytearray` (checked before the bytes-like
+    // form so the result type stays mutable).
+    if let (Some(bytes), Some(n)) = (value::as_bytearray(a), value::as_integer(b)) {
+        return repeat_bytearray(bytes, n);
+    }
+    if let (Some(n), Some(bytes)) = (value::as_integer(a), value::as_bytearray(b)) {
+        return repeat_bytearray(bytes, n);
+    }
     // `bytes * int` / `int * bytes`.
     if let (Some(bytes), Some(n)) = (value::as_bytes(a), value::as_integer(b)) {
         return repeat_bytes(bytes, n);
@@ -591,6 +654,24 @@ fn repeat_bytes(bytes: &[u8], n: i64) -> i64 {
                 out.extend_from_slice(bytes);
             }
             value::bytes_new(out)
+        }
+        _ => overflow(),
+    }
+}
+
+/// `bytearray * int` / `int * bytearray`: the repetition stays mutable.
+fn repeat_bytearray(bytes: &[u8], n: i64) -> i64 {
+    if n <= 0 || bytes.is_empty() {
+        return value::bytearray_new(Vec::new());
+    }
+    let count = n as usize;
+    match bytes.len().checked_mul(count) {
+        Some(total) if total <= isize::MAX as usize => {
+            let mut out = Vec::with_capacity(total);
+            for _ in 0..count {
+                out.extend_from_slice(bytes);
+            }
+            value::bytearray_new(out)
         }
         _ => overflow(),
     }
@@ -1154,6 +1235,17 @@ fn compare(op: u32, a: i64, b: i64) -> i64 {
     // Containers compare structurally (lists element-wise, dicts
     // order-insensitively); ordering is not defined for them in Phase 2.0.
     if matches!(op, OP_EQ | OP_NE) && (is_container(a) || is_container(b)) {
+        let equal = container::equals(a, b);
+        return value::bool_value(if op == OP_EQ { equal } else { !equal });
+    }
+    // Live views compare structurally too (`memoryview` against bytes-like
+    // values, `dict_keys`/`dict_items` as sets and `dict_values` by identity).
+    if matches!(op, OP_EQ | OP_NE)
+        && (value::as_memoryview(a).is_some()
+            || value::as_memoryview(b).is_some()
+            || value::as_dict_view(a).is_some()
+            || value::as_dict_view(b).is_some())
+    {
         let equal = container::equals(a, b);
         return value::bool_value(if op == OP_EQ { equal } else { !equal });
     }

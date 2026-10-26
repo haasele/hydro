@@ -194,10 +194,18 @@ impl Interp {
             StmtKind::ClassDef {
                 target,
                 name,
-                base,
+                bases,
+                metaclass,
                 methods,
                 attributes,
-            } => self.exec_class_def(*target, name, base.as_ref(), methods, attributes),
+            } => self.exec_class_def(
+                *target,
+                name,
+                bases,
+                metaclass.as_ref(),
+                methods,
+                attributes,
+            ),
             StmtKind::SetAttr {
                 object,
                 name,
@@ -437,18 +445,27 @@ impl Interp {
         &mut self,
         target: hydro_ir::LocalId,
         name: &str,
-        base: Option<&Expr>,
+        bases: &[Expr],
+        metaclass: Option<&Expr>,
         methods: &[hydro_ir::ClassMethod],
         attributes: &[hydro_ir::ClassAttr],
     ) -> Exec {
         let mark = self.scratch_mark();
-        let base = match base {
+        // CPython evaluates the bases, then the `metaclass=` keyword, before
+        // the class body.
+        let mut base_values = Vec::with_capacity(bases.len());
+        for base in bases {
+            let value = self.eval(base)?;
+            self.scratch_push(value);
+            base_values.push(value);
+        }
+        let metaclass_value = match metaclass {
             Some(expr) => {
                 let value = self.eval(expr)?;
                 self.scratch_push(value);
-                value
+                Some(value)
             }
-            None => host::none(),
+            None => None,
         };
         let mut names = Vec::with_capacity(methods.len());
         let mut functions = Vec::with_capacity(methods.len());
@@ -482,18 +499,38 @@ impl Interp {
             let attr_names_token = abi::hydro_gc_scope_push(attr_names.as_ptr(), attr_names.len());
             let attr_values_token =
                 abi::hydro_gc_scope_push(attr_values.as_ptr(), attr_values.len());
-            let class = abi::hydro_class_new(
-                name.as_ptr(),
-                name.len(),
-                base,
-                methods.len(),
-                names.as_ptr(),
-                functions.as_ptr(),
-                kinds.as_ptr(),
-                attributes.len(),
-                attr_names.as_ptr(),
-                attr_values.as_ptr(),
-            );
+            let bases_token = abi::hydro_gc_scope_push(base_values.as_ptr(), base_values.len());
+            let class = if base_values.len() <= 1 && metaclass_value.is_none() {
+                let base = base_values.first().copied().unwrap_or_else(host::none);
+                abi::hydro_class_new(
+                    name.as_ptr(),
+                    name.len(),
+                    base,
+                    methods.len(),
+                    names.as_ptr(),
+                    functions.as_ptr(),
+                    kinds.as_ptr(),
+                    attributes.len(),
+                    attr_names.as_ptr(),
+                    attr_values.as_ptr(),
+                )
+            } else {
+                abi::hydro_class_new_multi(
+                    name.as_ptr(),
+                    name.len(),
+                    base_values.as_ptr(),
+                    base_values.len(),
+                    metaclass_value.unwrap_or_else(host::none),
+                    names.as_ptr(),
+                    functions.as_ptr(),
+                    kinds.as_ptr(),
+                    methods.len(),
+                    attr_names.as_ptr(),
+                    attr_values.as_ptr(),
+                    attributes.len(),
+                )
+            };
+            abi::hydro_gc_scope_pop(bases_token);
             abi::hydro_gc_scope_pop(attr_values_token);
             abi::hydro_gc_scope_pop(attr_names_token);
             abi::hydro_gc_scope_pop(functions_token);

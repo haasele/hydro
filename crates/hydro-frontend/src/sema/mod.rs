@@ -977,12 +977,16 @@ impl<'a> Checker<'a> {
             }
             HStmtKind::ClassDef {
                 target,
-                base,
+                bases,
+                metaclass,
                 attributes,
                 ..
             } => {
-                if let Some(base) = base {
+                for base in bases {
                     self.check_expr(base, f);
+                }
+                if let Some(metaclass) = metaclass {
+                    self.check_expr(metaclass, f);
                 }
                 // Attribute values are ordinary expressions evaluated when the
                 // class statement runs; they do not need a static type.
@@ -1687,7 +1691,17 @@ impl<'a> Checker<'a> {
                 args,
                 star,
                 keywords,
-            } => self.check_method(expr, object, method, args, star.as_deref(), keywords, f),
+                double_star,
+            } => self.check_method(
+                expr,
+                object,
+                method,
+                args,
+                star.as_deref(),
+                keywords,
+                double_star.as_deref(),
+                f,
+            ),
             HExprKind::FunctionRef(_) => {
                 let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Function));
             }
@@ -1810,6 +1824,55 @@ impl<'a> Checker<'a> {
                 }
                 self.force_any(expr.ty);
             }
+            HExprKind::CallFull {
+                callee,
+                args,
+                star,
+                keywords,
+                double_star,
+            } => {
+                self.check_expr(callee, f);
+                for arg in args {
+                    self.check_expr(arg, f);
+                }
+                if let Some(star) = star {
+                    self.check_expr(star, f);
+                }
+                for (_, value) in keywords {
+                    self.check_expr(value, f);
+                }
+                if let Some(mapping) = double_star {
+                    self.check_expr(mapping, f);
+                    // `**mapping` must be a dict; a runtime value that cannot
+                    // be a mapping is rejected here when its type is known.
+                    if let Ty::Concrete(got) = self.inf.resolve(mapping.ty) {
+                        if !matches!(got, Type::Dict | Type::Any) {
+                            self.error_code(
+                                mapping.line,
+                                mapping.col,
+                                codes::CALL,
+                                format!(
+                                    "argument after ** must be a mapping, not '{}'",
+                                    got.name()
+                                ),
+                            );
+                        }
+                    }
+                }
+                match self.inf.resolve(callee.ty) {
+                    Ty::Concrete(Type::Function) | Ty::Concrete(Type::Any) => {}
+                    Ty::Var(_) => {
+                        let _ = self.inf.unify(callee.ty, Ty::Concrete(Type::Any));
+                    }
+                    Ty::Concrete(got) => self.error_code(
+                        expr.line,
+                        expr.col,
+                        codes::CALL,
+                        format!("'{}' object is not callable", got.name()),
+                    ),
+                }
+                self.force_any(expr.ty);
+            }
             HExprKind::ClassCall { class, args, .. } => {
                 self.check_expr(class, f);
                 for arg in args {
@@ -1844,6 +1907,18 @@ impl<'a> Checker<'a> {
             HExprKind::YieldFrom { value } => {
                 self.check_expr(value, f);
                 // The delegate's return value is only known at runtime.
+                self.force_any(expr.ty);
+            }
+            HExprKind::Template { interpolations, .. } => {
+                // A template is not a `str`; its static type is dynamic.
+                // Interpolation values and format specs are ordinary
+                // expressions and keep their own checks.
+                for interpolation in interpolations {
+                    self.check_expr(&interpolation.value, f);
+                    if let Some(spec) = &interpolation.format_spec {
+                        self.check_expr(spec, f);
+                    }
+                }
                 self.force_any(expr.ty);
             }
         }
@@ -1953,6 +2028,7 @@ impl<'a> Checker<'a> {
         args: &[HExpr],
         star: Option<&HExpr>,
         keywords: &[(String, HExpr)],
+        double_star: Option<&HExpr>,
         f: &HFunction,
     ) {
         self.check_expr(object, f);
@@ -1964,6 +2040,22 @@ impl<'a> Checker<'a> {
         }
         for (_, value) in keywords {
             self.check_expr(value, f);
+        }
+        let mut dynamic_keywords = false;
+        if let Some(mapping) = double_star {
+            self.check_expr(mapping, f);
+            if let Ty::Concrete(got) = self.inf.resolve(mapping.ty) {
+                if !matches!(got, Type::Dict | Type::Any) {
+                    self.error_code(
+                        mapping.line,
+                        mapping.col,
+                        codes::CALL,
+                        format!("argument after ** must be a mapping, not '{}'", got.name()),
+                    );
+                }
+            }
+            // A dynamic mapping supplies keywords with names unknown here.
+            dynamic_keywords = true;
         }
 
         let result = match self.inf.resolve(object.ty) {
@@ -1994,7 +2086,7 @@ impl<'a> Checker<'a> {
                 // positional count is checked here. Keywords fill the
                 // remaining slots at runtime; the runtime binder diagnoses
                 // unknown and duplicate keywords.
-                let arity_ok = if star.is_some() {
+                let arity_ok = if star.is_some() || dynamic_keywords {
                     args.len() <= signature.max_args
                 } else if keywords.is_empty() {
                     args.len() >= signature.min_args && args.len() <= signature.max_args
@@ -3167,6 +3259,24 @@ impl<'a> Checker<'a> {
                 // attribute access (`.__class__.__name__`).
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
             }
+            Builtin::ByteArray | Builtin::MemoryView => {
+                // `bytearray()` takes 0 to 3 arguments; `memoryview()` takes
+                // exactly one. Values are dynamically typed byte containers.
+                let max = if builtin == Builtin::ByteArray { 3 } else { 1 };
+                if count > max {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!(
+                            "{}() takes at most {max} argument(s) ({count} given)",
+                            builtin.name()
+                        ),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
         }
     }
 
@@ -3615,13 +3725,15 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
         HStmtKind::ClassDef {
             target,
             name,
-            base,
+            bases,
+            metaclass,
             methods,
             attributes,
         } => StmtKind::ClassDef {
             target: *target,
             name: name.clone(),
-            base: base.as_ref().map(|b| emit_expr(b, inf)),
+            bases: bases.iter().map(|b| emit_expr(b, inf)).collect(),
+            metaclass: metaclass.as_ref().map(|m| emit_expr(m, inf)),
             methods: methods
                 .iter()
                 .map(|(name, function, kind)| ClassMethod {
@@ -3908,6 +4020,7 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
             args,
             star,
             keywords,
+            double_star,
         } => ExprKind::MethodCall {
             object: Box::new(emit_expr(object, inf)),
             method: method.clone(),
@@ -3917,6 +4030,9 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
                 .iter()
                 .map(|(name, value)| (name.clone(), emit_expr(value, inf)))
                 .collect(),
+            double_star: double_star
+                .as_ref()
+                .map(|value| Box::new(emit_expr(value, inf))),
         },
         HExprKind::FunctionRef(id) => ExprKind::FunctionRef(*id),
         HExprKind::BuiltinRef(builtin) => ExprKind::BuiltinRef(*builtin),
@@ -3979,6 +4095,24 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
                 .map(|(name, value)| (name.clone(), emit_expr(value, inf)))
                 .collect(),
         },
+        HExprKind::CallFull {
+            callee,
+            args,
+            star,
+            keywords,
+            double_star,
+        } => ExprKind::CallFull {
+            callee: Box::new(emit_expr(callee, inf)),
+            args: args.iter().map(|a| emit_expr(a, inf)).collect(),
+            star: star.as_ref().map(|star| Box::new(emit_expr(star, inf))),
+            keywords: keywords
+                .iter()
+                .map(|(name, value)| (name.clone(), emit_expr(value, inf)))
+                .collect(),
+            double_star: double_star
+                .as_ref()
+                .map(|value| Box::new(emit_expr(value, inf))),
+        },
         HExprKind::ClassCall {
             class,
             init,
@@ -4012,6 +4146,25 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
         },
         HExprKind::YieldFrom { value } => ExprKind::YieldFrom {
             value: Box::new(emit_expr(value, inf)),
+        },
+        HExprKind::Template {
+            strings,
+            interpolations,
+        } => ExprKind::Template {
+            strings: strings.clone(),
+            interpolations: interpolations
+                .iter()
+                .map(|interpolation| hydro_ir::TemplateInterpolation {
+                    value: emit_expr(&interpolation.value, inf),
+                    expression: interpolation.expression.clone(),
+                    conversion: interpolation.conversion,
+                    format_spec: interpolation
+                        .format_spec
+                        .as_ref()
+                        .map(|spec| Box::new(emit_expr(spec, inf))),
+                    self_documenting: interpolation.self_documenting,
+                })
+                .collect(),
         },
     };
     IrExpr::new(kind, inf.type_of(expr.ty), expr.line)

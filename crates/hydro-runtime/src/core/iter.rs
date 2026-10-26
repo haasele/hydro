@@ -55,6 +55,8 @@ pub(crate) fn iter_new(obj: i64) -> i64 {
     if value::as_list(obj).is_some()
         || value::as_str(obj).is_some()
         || value::as_bytes(obj).is_some()
+        || value::as_memoryview(obj).is_some()
+        || value::as_dict_view(obj).is_some()
         || value::as_dict(obj).is_some()
         || value::as_defaultdict(obj).is_some()
         || value::as_tuple(obj).is_some()
@@ -170,11 +172,38 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
         s.chars()
             .nth(state.index)
             .map(|ch| value::str_alloc(ch.to_string()))
+    } else if let Some(view) = value::as_memoryview(target) {
+        if view.released {
+            exc::raise_with_message(exc::VALUE_ERROR, value::MEMORYVIEW_RELEASED);
+            return 0;
+        }
+        match value::memoryview_get(view, state.index) {
+            Ok(item) => Some(item),
+            Err(value::MEMORYVIEW_OUT_OF_RANGE) => None,
+            Err(message) => {
+                exc::raise_with_message(exc::VALUE_ERROR, message);
+                return 0;
+            }
+        }
+    } else if let Some(view) = value::as_dict_view(target) {
+        let pairs: Vec<(i64, i64)> = value::as_dict(view.dict)
+            .map(|pairs| pairs.to_vec())
+            .unwrap_or_default();
+        match pairs.get(state.index) {
+            Some(&(key, value)) => match view.kind {
+                value::DictViewKind::Keys => Some(key),
+                value::DictViewKind::Values => Some(value),
+                // A fresh tuple per step, like CPython's live items view.
+                value::DictViewKind::Items => Some(value::tuple_new(vec![key, value])),
+            },
+            None => None,
+        }
     } else if let Some(bytes) = value::as_bytes(target) {
-        // Iterating bytes yields each byte as an integer in `0..=255`.
+        // Iterating bytes yields each byte as an integer in `0..=255`
+        // (a `bytearray` is accepted through the same bytes-like accessor).
         bytes
             .get(state.index)
-            .and_then(|byte| value::encode_int(*byte as i64))
+            .map(|byte| crate::ops::int_result(*byte as i64))
     } else if let Some(pairs) = value::as_dict(target) {
         pairs.get(state.index).map(|(key, _)| *key)
     } else if let Some((pairs, _)) = value::as_defaultdict(target) {

@@ -6,4 +6,7 @@ license.workspace = true
 
 [dependencies]
 hydro-ir.workspace = true
-rustpython-parser.workspace = true
+# Workspace-local fork of rustpython-parser 0.4.0 with CPython 3.14 syntax
+# (PEP 701 f-strings, PEP 750 template strings). Kept under the historical
+# dependency name so the AST/text-size types stay identical.
+rustpython-parser = { package = "hydro-python-parser", path = "../hydro-python-parser" }

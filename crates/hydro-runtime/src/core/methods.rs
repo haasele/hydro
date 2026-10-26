@@ -7,9 +7,17 @@
 //! runtime never panics on user input.
 //!
 //! Details that differ from CPython are documented here: `dict.keys()`,
-//! `dict.values()` and `dict.items()` materialise plain lists (insertion
-//! order) rather than views; only the method subset in ARCHITECTURE §3.2 is
-//! provided. `dict.items()` yields `(key, value)` tuples.
+//! `dict.values()` and `dict.items()` return live views (`dict_keys`,
+//! `dict_values`, `dict_items`) that observe later dict mutations, so
+//! `len(view)`, iteration, membership, set operators and `repr` always reflect
+//! the current contents. `dict_items` iteration yields `(key, value)` tuples.
+//! `bytearray` and `memoryview` expose CPython's mutable sequence and buffer
+//! surfaces; unsupported buffer formats report a tagged error rather than a
+//! placeholder.
+//!
+//! Class instances follow Python's descriptor precedence (data descriptor,
+//! instance dictionary, non-data descriptor/method), class namespaces accept
+//! runtime assignment, and `__slots__` restricts instance attributes.
 //!
 //! Generator objects expose `send`, `throw` and `close`. `throw` accepts an
 //! exception *instance* only (Hydro has no exception class objects) and supports
@@ -43,6 +51,10 @@ pub(crate) fn call(
     let Some(method) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    // Template values expose only `Interpolation.convert()`.
+    if let Some(result) = crate::core::template::call_method(obj, &method, argc, argv) {
+        return result;
+    }
     if let Some(module) = value::as_module(obj) {
         let function = modules::module_get_by_name(module.name(), &method);
         if exc::pending() {
@@ -63,9 +75,15 @@ pub(crate) fn call(
         };
         return super_init(obj, &args, &[]);
     }
-    // Instances bind `self` while collecting the arguments, so they skip the
-    // generic copy below (one allocation instead of two).
-    if value::as_instance(obj).is_some() {
+    // `self.$super_new([class])` materialises a `super` proxy for the runtime
+    // (zero-argument `super()` cannot name its class without frame context).
+    if method == "$super_new" {
+        return super_proxy(obj, argc, argv);
+    }
+    // Instances (including user-defined exception instances) bind `self`
+    // while collecting the arguments, so they skip the generic copy below
+    // (one allocation instead of two).
+    if value::instance_class_value(obj).is_some() {
         return instance_method(obj, &method, argc, argv);
     }
     // `Class.method(...)` resolves through the class namespace; the binding
@@ -99,6 +117,19 @@ pub(crate) fn call(
         // Copy the receiver before any allocation: a reference into a heap
         // object must not be read after an allocation that may collect.
         return str_method(obj, s.to_string(), &method, &args);
+    }
+    // Checked before `as_bytes`, which also accepts a `bytearray`.
+    if value::as_bytearray(obj).is_some() {
+        return bytearray_method(obj, &method, &args);
+    }
+    if value::as_memoryview(obj).is_some() {
+        return memoryview_method(obj, &method, &args);
+    }
+    if value::as_dict_view(obj).is_some() {
+        return dict_view_method(obj, &method, &args);
+    }
+    if value::as_super(obj).is_some() {
+        return super_method(obj, &method, &args);
     }
     if let Some(bytes) = value::as_bytes(obj) {
         // Same rule as for strings: copy the payload out first.
@@ -170,32 +201,177 @@ pub(crate) fn call(
     attribute_error(obj, &method)
 }
 
-/// Implements the lowered `super().__init__(...)` form. Python resolves the
-/// initializer on the class after the one that defines the current method;
-/// with Hydro's single-base approximation the direct base of the instance class
-/// is the correct target.
+/// Implements the lowered `super().__init__(...)` form.
+///
+/// Python resolves the initializer on the class after the one that defines the
+/// current method. Without runtime frame context the runtime can only start
+/// after the receiver's class, which is the same position for the common
+/// `__init__` case and, with the C3 linearization, now follows the full MRO
+/// (so diamond hierarchies reach the shared ancestor exactly once).
 fn super_init(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
-    let Some(state) = value::as_instance(obj) else {
+    let Some(class) = value::instance_class_value(obj) else {
         return type_error("super(): __self__ is not a class instance".to_string());
     };
-    let Some(class) = value::as_class(state.class) else {
-        return type_error("super(): instance has no class".to_string());
-    };
-    let base = class.base;
-    if base == NONE {
-        return NONE;
-    }
-    let Some((kind, function)) = value::class_member(base, "__init__") else {
+    let Some(entry) = value::class_lookup_after(class, class, "__init__") else {
         return NONE;
     };
-    if let Some(function) = value::as_function(function) {
-        if let value::FunctionBody::Native { module, name } = &function.body {
-            if *module == "threading" && *name == "_threadbase_init" {
-                return NONE;
+    if let value::ClassEntry::Method(_, function) = &entry {
+        if let Some(function) = value::as_function(*function) {
+            if let value::FunctionBody::Native { module, name } = &function.body {
+                if *module == "threading" && *name == "_threadbase_init" {
+                    return NONE;
+                }
             }
         }
     }
-    call_user_method(obj, base, kind, function, "__init__", args, keywords)
+    call_bound_entry(obj, class, entry, "__init__", args, keywords)
+}
+
+/// `self.$super_new([class])`: materialises a `super` proxy.
+///
+/// Zero-argument `super()` cannot name its defining class without frame
+/// context, so the proxy starts after the receiver's class. An explicit class
+/// argument is validated against the receiver's linearization.
+fn super_proxy(obj: i64, argc: usize, argv: *const i64) -> i64 {
+    // `__self__` may be an instance (ordinary method) or a class object
+    // (`classmethod` calling `super()`), matching CPython's second argument.
+    let start = match value::instance_class_value(obj) {
+        Some(class) => class,
+        None if value::as_class(obj).is_some() => obj,
+        None => return type_error("super(): no arguments".to_string()),
+    };
+    let mut class = start;
+    if argc > 0 {
+        if argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>() {
+            return type_error("super() received arguments without an argument buffer".to_string());
+        }
+        // SAFETY: ABI contract: `argv` points at `argc` readable values.
+        let args = unsafe { std::slice::from_raw_parts(argv, argc) };
+        if args.len() != 1 {
+            return type_error("super() takes at most 1 argument here".to_string());
+        }
+        let explicit = args[0];
+        if value::as_class(explicit).is_none() {
+            return type_error(format!(
+                "super() argument 1 must be a type, not '{}'",
+                value::type_name(explicit)
+            ));
+        }
+        if !value::class_mro(start).contains(&explicit) {
+            return type_error(
+                "super(type, obj): obj must be an instance or subtype of type".to_string(),
+            );
+        }
+        class = explicit;
+    }
+    value::super_new(class, obj)
+}
+
+/// Calls `super(...).name(...)` through the proxy's MRO position.
+fn super_method(proxy: i64, method: &str, args: &[i64]) -> i64 {
+    let Some(state) = value::as_super(proxy) else {
+        return attribute_error(proxy, method);
+    };
+    let owner = if let Some(class) = value::instance_class_value(state.object) {
+        class
+    } else if value::as_class(state.object).is_some() {
+        state.object
+    } else {
+        return attribute_error(proxy, method);
+    };
+    let Some(entry) = value::class_lookup_after(owner, state.class, method) else {
+        return attribute_error(proxy, method);
+    };
+    call_bound_entry(state.object, owner, entry, method, args, &[])
+}
+
+/// Reads `super(...).name` through the proxy's MRO position.
+fn super_getattr(proxy: i64, attr: &str) -> Option<i64> {
+    let state = value::as_super(proxy)?;
+    let owner = if let Some(class) = value::instance_class_value(state.object) {
+        class
+    } else if value::as_class(state.object).is_some() {
+        state.object
+    } else {
+        return None;
+    };
+    let entry = value::class_lookup_after(owner, state.class, attr)?;
+    match entry {
+        value::ClassEntry::Method(MethodKind::Property, function) => {
+            let args = [state.object];
+            Some(builtins::call(function, 1, args.as_ptr()))
+        }
+        value::ClassEntry::Method(_, _) => {
+            Some(value::bound_method_new(state.object, attr.to_string()))
+        }
+        value::ClassEntry::Attr(value) => {
+            if let Some(result) = descriptor_get(value, state.object, owner) {
+                return Some(result);
+            }
+            if value::as_function(value).is_some() {
+                return Some(value::bound_method_new(state.object, attr.to_string()));
+            }
+            Some(value)
+        }
+    }
+}
+
+/// Calls one class-namespace entry with Python's receiver binding.
+fn call_bound_entry(
+    receiver: i64,
+    owner: i64,
+    entry: value::ClassEntry,
+    method: &str,
+    args: &[i64],
+    keywords: &[(String, i64)],
+) -> i64 {
+    let (kind, function) = match entry {
+        value::ClassEntry::Attr(value) => {
+            // A descriptor instance resolves through `__get__` first.
+            if let Some(result) = descriptor_get(value, receiver, owner) {
+                if exc::pending() {
+                    return NONE;
+                }
+                return builtins::call(result, args.len(), args.as_ptr());
+            }
+            if value::as_function(value).is_some() {
+                (MethodKind::Normal, value)
+            } else {
+                return builtins::call(value, args.len(), args.as_ptr());
+            }
+        }
+        value::ClassEntry::Method(kind, function) => (kind, function),
+    };
+    let bound = match kind {
+        MethodKind::Normal | MethodKind::Property => Some(receiver),
+        MethodKind::Classmethod => Some(owner),
+        MethodKind::Staticmethod => None,
+    };
+    if !value::function_signature(function).is_empty() && value::function_full_entry(function) != 0
+    {
+        return call_user_method_kw(
+            bound.unwrap_or(receiver),
+            owner,
+            kind,
+            function,
+            method,
+            args,
+            &KeywordArgs {
+                items: keywords.to_vec(),
+            },
+        );
+    }
+    // Callables without parameter metadata cannot bind keywords; reject like
+    // the other native call paths instead of silently dropping them.
+    if let Some((name, _)) = keywords.first() {
+        return type_error(format!(
+            "{method}() got an unexpected keyword argument '{name}'"
+        ));
+    }
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.extend(bound);
+    call_args.extend_from_slice(args);
+    builtins::call(function, call_args.len(), call_args.as_ptr())
 }
 
 fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
@@ -210,52 +386,163 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
             argc
         ));
     }
-    let Some(state) = value::as_instance(obj) else {
+    let Some(class) = value::instance_class_value(obj) else {
         return attribute_error(obj, method);
     };
-    let class = state.class;
     let entry = value::class_lookup(class, method);
-    // An instance attribute shadows a normal method; only a property (a data
-    // descriptor) wins over the instance dictionary.
-    if !matches!(
-        entry,
-        Some(value::ClassEntry::Method(MethodKind::Property, _))
-    ) {
-        if let Some(attribute) = value::instance_attr(obj, method) {
-            return builtins::call(attribute, argc, argv);
+    // Python's precedence: a data descriptor wins over the instance
+    // dictionary, which wins over a normal method / non-data descriptor.
+    if let Some(entry) = &entry {
+        if let Some(result) = data_descriptor_get(obj, class, entry) {
+            if exc::pending() {
+                return NONE;
+            }
+            return builtins::call(result, argc, argv);
         }
+        if !is_data_descriptor(entry) {
+            if let Some(attribute) = value::instance_attr(obj, method) {
+                return builtins::call(attribute, argc, argv);
+            }
+        }
+    } else if let Some(attribute) = value::instance_attr(obj, method) {
+        return builtins::call(attribute, argc, argv);
     }
     let Some(entry) = entry else {
         return attribute_error(obj, method);
     };
-    let (kind, function) = match entry {
-        // A callable class attribute is called without a bound receiver.
-        value::ClassEntry::Attr(value) => return builtins::call(value, argc, argv),
-        value::ClassEntry::Method(kind, function) => (kind, function),
+    let args = if argc == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: checked above; caller contract.
+        unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
     };
+    call_bound_entry(obj, class, entry, method, &args, &[])
+}
+
+/// Whether a class-namespace entry is a data descriptor.
+///
+/// Properties are data descriptors; an object whose class implements
+/// `__set__` or `__delete__` is one too. Plain functions and other values are
+/// non-data descriptors (they have `__get__` at most).
+fn is_data_descriptor(entry: &value::ClassEntry) -> bool {
+    match entry {
+        value::ClassEntry::Method(MethodKind::Property, _) => true,
+        value::ClassEntry::Method(_, _) => false,
+        value::ClassEntry::Attr(value) => {
+            descriptor_method(*value, "__set__").is_some()
+                || descriptor_method(*value, "__delete__").is_some()
+        }
+    }
+}
+
+/// Reads a data descriptor stored in a class namespace.
+///
+/// Returns `None` when the entry is not a data descriptor (the instance
+/// dictionary then wins) and `Some(NONE)` when it is one without `__get__`
+/// (CPython raises `AttributeError` for that shape).
+fn data_descriptor_get(instance: i64, owner: i64, entry: &value::ClassEntry) -> Option<i64> {
+    match entry {
+        value::ClassEntry::Method(MethodKind::Property, function) => {
+            // A property getter takes exactly the instance: the descriptor
+            // call binds the receiver and passes no extra arguments.
+            let result = call_descriptor(
+                owner,
+                MethodKind::Normal,
+                *function,
+                "property",
+                instance,
+                &[],
+            );
+            Some(result)
+        }
+        value::ClassEntry::Method(_, _) => None,
+        value::ClassEntry::Attr(value) => {
+            if !is_data_descriptor(entry) {
+                return None;
+            }
+            // A data descriptor with only `__set__`/`__delete__` has no
+            // getter: reading falls back to the instance dictionary.
+            descriptor_get(*value, instance, owner)
+        }
+    }
+}
+
+/// Returns the class and resolved method of `name` on the class of the
+/// descriptor object `value`.
+fn descriptor_method(value: i64, name: &str) -> Option<(i64, MethodKind, i64)> {
+    let class = value::as_instance(value)?.class;
+    match value::class_lookup(class, name)? {
+        value::ClassEntry::Method(kind, function) => Some((class, kind, function)),
+        value::ClassEntry::Attr(function) if value::as_function(function).is_some() => {
+            Some((class, MethodKind::Normal, function))
+        }
+        value::ClassEntry::Attr(_) => None,
+    }
+}
+
+/// Calls `value.__get__(instance, owner)` when the object implements the
+/// descriptor protocol. `None` means "not a descriptor".
+fn descriptor_get(value: i64, instance: i64, owner: i64) -> Option<i64> {
+    let (class, kind, function) = descriptor_method(value, "__get__")?;
+    let args = [instance, owner];
+    Some(call_descriptor(
+        class, kind, function, "__get__", value, &args,
+    ))
+}
+
+/// Calls `value.__set__(instance, new_value)` for a data descriptor.
+fn descriptor_set(value: i64, instance: i64, _owner: i64, new_value: i64) -> Option<i64> {
+    let (class, kind, function) = descriptor_method(value, "__set__")?;
+    let args = [instance, new_value];
+    Some(call_descriptor(
+        class, kind, function, "__set__", value, &args,
+    ))
+}
+
+/// Calls `value.__delete__(instance)` for a data descriptor.
+fn descriptor_delete(value: i64, instance: i64, _owner: i64) -> Option<i64> {
+    let (class, kind, function) = descriptor_method(value, "__delete__")?;
+    let args = [instance];
+    Some(call_descriptor(
+        class,
+        kind,
+        function,
+        "__delete__",
+        value,
+        &args,
+    ))
+}
+
+/// Shared descriptor call: user methods bind through the keyword binder,
+/// native/property functions through a positional call.
+fn call_descriptor(
+    class: i64,
+    kind: MethodKind,
+    function: i64,
+    name: &str,
+    receiver: i64,
+    args: &[i64],
+) -> i64 {
     if !value::function_signature(function).is_empty() && value::function_full_entry(function) != 0
     {
-        let args = if argc == 0 {
-            Vec::new()
-        } else {
-            // SAFETY: checked above; caller contract.
-            unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
-        };
-        let keywords = KeywordArgs { items: Vec::new() };
-        return call_user_method_kw(obj, class, kind, function, method, &args, &keywords);
+        return call_user_method_kw(
+            receiver,
+            class,
+            kind,
+            function,
+            name,
+            args,
+            &KeywordArgs { items: Vec::new() },
+        );
     }
-    let receiver = match kind {
-        MethodKind::Normal | MethodKind::Property => Some(obj),
+    let bound = match kind {
+        MethodKind::Normal | MethodKind::Property => Some(receiver),
         MethodKind::Classmethod => Some(class),
         MethodKind::Staticmethod => None,
     };
-    let mut call_args = Vec::with_capacity(argc + 1);
-    call_args.extend(receiver);
-    if argc > 0 {
-        // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
-        let args = unsafe { std::slice::from_raw_parts(argv, argc) };
-        call_args.extend_from_slice(args);
-    }
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.extend(bound);
+    call_args.extend_from_slice(args);
     builtins::call(function, call_args.len(), call_args.as_ptr())
 }
 
@@ -266,9 +553,9 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
 /// attributes of instances, not callables on the class, so they report an
 /// `AttributeError` here.
 fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
-    if method == "__new__" {
-        // `Cls.__new__(Cls)` allocates without running `__init__`. Hydro has no
-        // custom `__new__` protocol; extra arguments are tolerated.
+    if method == "__new__" && value::class_lookup(class, "__new__").is_none() {
+        // `Cls.__new__(Cls)` allocates without running `__init__` when the
+        // class defines no custom `__new__`.
         return value::instance_new(class);
     }
     if argc > 0 && (argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>()) {
@@ -400,7 +687,9 @@ fn call_user_method_kw(
     let mut vararg_items: Vec<i64> = Vec::new();
     for (index, param) in signature.iter().enumerate().skip(receiver_count) {
         match param.kind {
-            ParamKind::Positional => {
+            // Positional-only parameters bind exactly like positional ones;
+            // only keyword matching treats them differently.
+            ParamKind::Positional | ParamKind::PosOnly => {
                 if next_positional < args.len() {
                     slots[index] = Some(args[next_positional]);
                     next_positional += 1;
@@ -490,10 +779,7 @@ fn call_user_method_kw(
     }
     if let Some(func) = value::as_function(function) {
         if func.flags & (value::FUNCTION_FLAG_GENERATOR | value::FUNCTION_FLAG_ASYNC) != 0 {
-            if signature
-                .iter()
-                .all(|param| param.kind == ParamKind::Positional)
-            {
+            if signature.iter().all(|param| param.kind.is_positional()) {
                 return builtins::call(function, full.len(), full.as_ptr());
             }
             return type_error(format!(
@@ -656,6 +942,26 @@ pub(crate) fn call_kw(
     if method == "$super_init" {
         return super_init(obj, &args, &keywords.items);
     }
+    if method == "$super_new" {
+        // The lowering passes the defining class positionally; keywords are
+        // never part of the `super()` protocol.
+        return type_error("$super_new() takes no keyword arguments".to_string());
+    }
+    // `super().name(...)` keyword calls resolve through the proxy's MRO
+    // position, exactly like the positional path.
+    if let Some(state) = value::as_super(obj) {
+        let owner = if let Some(class) = value::instance_class_value(state.object) {
+            class
+        } else if value::as_class(state.object).is_some() {
+            state.object
+        } else {
+            return attribute_error(obj, &method);
+        };
+        let Some(entry) = value::class_lookup_after(owner, state.class, &method) else {
+            return attribute_error(obj, &method);
+        };
+        return call_bound_entry(state.object, owner, entry, &method, &args, &keywords.items);
+    }
     if crate::modules::argparse::is_handle(obj) {
         return crate::modules::argparse::handle_method_kw(obj, &method, &mut args, &keywords);
     }
@@ -732,6 +1038,110 @@ pub(crate) fn call_kw(
     keywords.reject(value::type_name(obj), &method)
 }
 
+/// `obj.name(args..., *star, name=value..., **star_map)`.
+///
+/// Normalizes the positional and keyword operands exactly like
+/// [`crate::core::builtins::call_star_kw`], then dispatches through [`call_kw`]
+/// so every receiver kind (class, instance, native object) keeps its existing
+/// keyword rules.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn method_star_kw(
+    receiver: i64,
+    name_ptr: *const u8,
+    name_len: usize,
+    argc: usize,
+    argv: *const i64,
+    star: i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+    star_map: i64,
+) -> i64 {
+    if argc > 0 && argv.is_null() {
+        return type_error(format!(
+            "method call received {argc} argument(s) without an argument buffer"
+        ));
+    }
+    if argc > isize::MAX as usize / std::mem::size_of::<i64>()
+        || kwargc > isize::MAX as usize / (2 * std::mem::size_of::<i64>())
+    {
+        return type_error("method call has too many arguments".to_string());
+    }
+    let Some(method) = decode_name(name_ptr, name_len) else {
+        return attribute_error(receiver, "");
+    };
+    // SAFETY: ABI contract: `argv`/`kw_argv` point at readable buffers whose
+    // lengths were validated above.
+    let mut args: Vec<i64> = if argc == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+    };
+    if star != NONE {
+        match builtins::star_sequence(star) {
+            Ok(items) => args.extend_from_slice(&items),
+            Err(err) => return err,
+        }
+    }
+    let mut keywords: Vec<(String, i64)> = Vec::with_capacity(kwargc);
+    if kwargc > 0 {
+        if kw_argv.is_null() {
+            return type_error(
+                "keyword arguments were passed without an argument buffer".to_string(),
+            );
+        }
+        // SAFETY: ABI contract: `kw_argv` holds `2 * kwargc` readable values.
+        let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+        for pair in pairs.as_chunks::<2>().0 {
+            let Some(keyword) = value::as_str(pair[0]) else {
+                return type_error("keyword name must be str".to_string());
+            };
+            keywords.push((keyword.to_string(), pair[1]));
+        }
+    }
+    if star_map != NONE {
+        let Some(mapping) = value::as_dict(star_map) else {
+            return type_error(format!(
+                "argument after ** must be a mapping, not '{}'",
+                value::type_name(star_map)
+            ));
+        };
+        let entries: Vec<(i64, i64)> = mapping.to_vec();
+        for (key, item) in entries {
+            let Some(keyword) = value::as_str(key) else {
+                return type_error("keywords must be strings".to_string());
+            };
+            if keywords
+                .iter()
+                .any(|(existing, _)| existing.as_str() == keyword)
+            {
+                return type_error(format!(
+                    "{method}() got multiple values for keyword argument '{keyword}'"
+                ));
+            }
+            keywords.push((keyword.to_string(), item));
+        }
+    }
+    let mut roots_source: Vec<i64> = args.clone();
+    roots_source.extend(keywords.iter().map(|(_, item)| *item));
+    let roots = crate::heap::root_values(&roots_source);
+    let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+    for (keyword, item) in &keywords {
+        pairs.push(value::str_alloc(keyword.clone()));
+        pairs.push(*item);
+    }
+    let result = call_kw(
+        receiver,
+        name_ptr,
+        name_len,
+        args.len(),
+        args.as_ptr(),
+        keywords.len(),
+        pairs.as_ptr(),
+    );
+    crate::heap::release_roots(roots);
+    result
+}
+
 /// Keyword dispatch for string methods: `split`, `replace`, `startswith` and
 /// `endswith` bind their named parameters; every other method rejects them.
 fn str_method_kw(
@@ -796,8 +1206,23 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    // PEP 750 template values expose `strings`, `interpolations`, `values`
+    // and the interpolation fields directly.
+    if let Some(attribute) = crate::core::template::getattr(obj, &attr) {
+        return attribute;
+    }
     if let Some(module) = value::as_module(obj) {
         return crate::modules::module_get_by_name(module.name(), &attr);
+    }
+    // Function metadata: the generated code stores the bare definition name,
+    // so `f.__name__`/`f.__qualname__` report it and `__doc__` stays `None`
+    // (Hydro keeps no docstring payload on function values).
+    if let Some(function) = value::as_function(obj) {
+        return match attr.as_str() {
+            "__name__" | "__qualname__" => value::str_alloc(function.name.clone()),
+            "__doc__" => NONE,
+            _ => attribute_error(obj, &attr),
+        };
     }
     // Built-in exception objects expose `args`, `__class__`, `__cause__`,
     // `__context__`, `__suppress_context__` and `__traceback__`. The check is
@@ -908,8 +1333,11 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         }
         return attribute_error(obj, &attr);
     }
-    if let Some(state) = value::as_instance(obj) {
+    if let Some(class) = value::instance_class_value(obj) {
         if attr == "__dict__" {
+            if !value::class_has_dict(class) {
+                return attribute_error(obj, &attr);
+            }
             return match value::instance_dict(obj) {
                 Some(mapping) => mapping,
                 None => attribute_error(obj, &attr),
@@ -918,41 +1346,78 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         // `__class__` is a data descriptor on every Python object, so it wins
         // over an instance attribute of the same name.
         if attr == "__class__" {
-            return state.class;
+            return class;
         }
-        // Data attributes come next (`__dict__` wins over the class namespace).
+        let entry = value::class_lookup(class, &attr);
+        // 1. A data descriptor wins over the instance dictionary.
+        if let Some(entry) = entry.as_ref().filter(|entry| is_data_descriptor(entry)) {
+            if let Some(result) = data_descriptor_get(obj, class, entry) {
+                return result;
+            }
+        }
+        // 2. The instance dictionary.
         if let Some(attribute) = value::instance_attr(obj, &attr) {
             return attribute;
         }
-        // Methods are called through `hydro_method`; properties and class
-        // attributes are data attributes (the latter inherited as fallback).
-        match value::class_lookup(state.class, &attr) {
-            Some(value::ClassEntry::Attr(value)) => return value,
-            Some(value::ClassEntry::Method(MethodKind::Property, function)) => {
+        // 3. Class attributes, non-data descriptors and methods.
+        let Some(entry) = entry else {
+            return attribute_error(obj, &attr);
+        };
+        return match entry {
+            // A non-data descriptor resolves `__get__(instance, owner)`.
+            value::ClassEntry::Attr(item) => {
+                if let Some(result) = descriptor_get(item, obj, class) {
+                    return result;
+                }
+                if value::as_function(item).is_some() {
+                    // A function assigned to the class binds the receiver,
+                    // exactly like a class-body method.
+                    return value::bound_method_new(obj, attr);
+                }
+                item
+            }
+            value::ClassEntry::Method(MethodKind::Property, function) => {
                 let args = [obj];
-                return builtins::call(function, 1, args.as_ptr());
+                builtins::call(function, 1, args.as_ptr())
             }
-            Some(value::ClassEntry::Method(_, _)) => {
-                // Reading `obj.method` yields a callable bound to the
-                // receiver instead of raising; Python libraries store such
-                // callbacks (`datetime.now`, `self.render`).
-                return value::bound_method_new(obj, attr);
-            }
-            None => {}
-        }
-        return attribute_error(obj, &attr);
+            value::ClassEntry::Method(_, _) => value::bound_method_new(obj, attr),
+        };
     }
     if let Some(class) = value::as_class(obj) {
         // Every class object knows its Python-visible name; its attributes
-        // were frozen when the class statement ran.
-        if attr == "__name__" {
-            return value::str_alloc(class.name.clone());
+        // were frozen when the class statement ran and later assignments live
+        // in the overlay.
+        match attr.as_str() {
+            "__name__" | "__qualname__" => return value::str_alloc(class.name.clone()),
+            "__bases__" => return value::tuple_new(class.bases.clone()),
+            "__base__" => return class.bases.first().copied().unwrap_or(NONE),
+            "__mro__" => return value::tuple_new(value::class_mro(obj)),
+            "__class__" => return value::type_class(obj),
+            "__dict__" => {
+                let pairs = value::class_namespace(obj);
+                let dict = value::dict_new(Vec::new());
+                let root = crate::heap::root_values(&[dict]);
+                for (name, item) in pairs {
+                    let key = value::str_alloc(name);
+                    container::dict_set(dict, key, item);
+                }
+                crate::heap::release_roots(root);
+                return dict;
+            }
+            _ => {}
         }
         if attr == "__new__" && value::class_lookup(obj, "__new__").is_none() {
             return value::bound_method_new(obj, attr);
         }
         match value::class_lookup(obj, &attr) {
-            Some(value::ClassEntry::Attr(value)) => return value,
+            Some(value::ClassEntry::Attr(item)) => {
+                // A descriptor stored as a class attribute receives
+                // `(None, owner)` when read from the class.
+                if let Some(result) = descriptor_get(item, NONE, obj) {
+                    return result;
+                }
+                return item;
+            }
             Some(value::ClassEntry::Method(MethodKind::Property, _)) => {}
             Some(value::ClassEntry::Method(_, _)) => {
                 return value::bound_method_new(obj, attr);
@@ -960,6 +1425,75 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             None => {}
         }
         return attribute_error(obj, &attr);
+    }
+    if value::as_super(obj).is_some() {
+        if let Some(result) = super_getattr(obj, &attr) {
+            return result;
+        }
+        return attribute_error(obj, &attr);
+    }
+    if value::as_bytearray(obj).is_some() {
+        if matches!(
+            attr.as_str(),
+            "append"
+                | "extend"
+                | "insert"
+                | "pop"
+                | "remove"
+                | "reverse"
+                | "clear"
+                | "copy"
+                | "decode"
+                | "hex"
+                | "count"
+                | "find"
+                | "replace"
+                | "split"
+                | "strip"
+                | "lstrip"
+                | "rstrip"
+                | "join"
+                | "upper"
+                | "lower"
+                | "startswith"
+                | "endswith"
+                | "__len__"
+                | "__getitem__"
+                | "__setitem__"
+                | "__delitem__"
+                | "__contains__"
+        ) {
+            return value::bound_method_new(obj, attr);
+        }
+        return attribute_error(obj, &attr);
+    }
+    if let Some(view) = value::as_memoryview(obj) {
+        if view.released {
+            return exc::raise_with_message(exc::VALUE_ERROR, value::MEMORYVIEW_RELEASED);
+        }
+        return match attr.as_str() {
+            "format" => value::str_alloc(view.format.to_string()),
+            "itemsize" => ops::int_result(view.itemsize as i64),
+            "ndim" => ops::int_result(1),
+            "shape" => value::tuple_new(vec![ops::int_result(view.len() as i64)]),
+            "strides" => value::tuple_new(vec![ops::int_result(view.stride as i64)]),
+            "readonly" => value::bool_value(view.readonly),
+            "nbytes" => ops::int_result(view.nbytes() as i64),
+            "contiguous" => value::TRUE,
+            "obj" => view.buffer,
+            "tobytes" | "tolist" | "release" | "cast" | "__len__" | "__getitem__"
+            | "__setitem__" | "__contains__" => value::bound_method_new(obj, attr),
+            _ => attribute_error(obj, &attr),
+        };
+    }
+    if let Some(view) = value::as_dict_view(obj) {
+        return match attr.as_str() {
+            "mapping" => view.dict,
+            "__len__" | "__iter__" | "__contains__" | "isdisjoint" => {
+                value::bound_method_new(obj, attr)
+            }
+            _ => attribute_error(obj, &attr),
+        };
     }
     attribute_error(obj, &attr)
 }
@@ -981,52 +1515,94 @@ pub(crate) fn hasattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     NONE
 }
 
-/// `obj.name = value` for class instances.
+/// `obj.name = value` for class instances and classes.
 ///
-/// Instance attributes are Python's `__dict__`: an existing name keeps its
-/// position and any value may be stored. Classes have no writable namespace in
-/// this runtime, so assigning to a class raises `TypeError`; every other
-/// receiver reports `AttributeError` and never aborts.
+/// Instance wiring follows Python's data-descriptor rule: a data descriptor
+/// (property, or an object whose class implements `__set__`) receives the
+/// assignment; otherwise the instance dictionary stores it, subject to
+/// `__slots__` restrictions. Class assignment writes the runtime overlay, so
+/// it never mutates the frozen class body.
 pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
-    if value::as_instance(obj).is_some() {
+    if let Some(class) = value::instance_class_value(obj) {
         if attr == "__dict__" {
             if value::instance_set_dict(obj, new_value) {
                 return NONE;
             }
             return type_error("__dict__ must be set to a dict".to_string());
         }
+        if let Some(entry) = value::class_lookup(class, &attr).filter(is_data_descriptor) {
+            match &entry {
+                value::ClassEntry::Method(MethodKind::Property, _) => {
+                    let name = value::instance_class_name(obj).unwrap_or("object");
+                    return exc::raise_with_message(
+                        ATTRIBUTE_ERROR,
+                        &format!("property '{attr}' of '{name}' object has no setter"),
+                    );
+                }
+                value::ClassEntry::Attr(descriptor) => {
+                    if let Some(result) = descriptor_set(*descriptor, obj, class, new_value) {
+                        return result;
+                    }
+                    let name = value::instance_class_name(obj).unwrap_or("object");
+                    return exc::raise_with_message(
+                        ATTRIBUTE_ERROR,
+                        &format!("can't set attribute '{attr}' of '{name}' object"),
+                    );
+                }
+                value::ClassEntry::Method(_, _) => {}
+            }
+        }
+        if !value::class_allows_attr(class, &attr) {
+            let name = value::instance_class_name(obj).unwrap_or("object");
+            return exc::raise_with_message(
+                ATTRIBUTE_ERROR,
+                &format!("'{name}' object has no attribute '{attr}'"),
+            );
+        }
         value::instance_setattr(obj, attr, new_value);
         return NONE;
     }
     if let Some(class) = value::as_class(obj) {
+        if value::class_set_attr(obj, attr, new_value) {
+            return NONE;
+        }
         return type_error(format!("cannot set attributes of class '{}'", class.name));
     }
     attribute_error(obj, &attr)
 }
 
-/// `del obj.name` for class instances.
+/// `del obj.name` for class instances and classes.
 ///
-/// Only instance attributes can be removed, matching Python's `__delattr__`
-/// for plain classes: an unknown name raises `AttributeError`, deleting from
-/// a class object raises `TypeError` (the namespace is frozen) and every other
-/// receiver reports `AttributeError`. Returns `None` on success.
+/// A data descriptor with `__delete__` receives the deletion; otherwise the
+/// instance attribute is removed. Class deletion tombstones the name (or drops
+/// a runtime assignment). Every other receiver reports `AttributeError`.
 pub(crate) fn delete_attr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
-    if let Some(state) = value::as_instance(obj) {
-        if state.attrs.remove(&attr).is_some() {
+    if let Some(class) = value::instance_class_value(obj) {
+        if let Some(value::ClassEntry::Attr(descriptor)) = value::class_lookup(class, &attr) {
+            if descriptor_method(descriptor, "__delete__").is_some() {
+                if let Some(result) = descriptor_delete(descriptor, obj, class) {
+                    return result;
+                }
+            }
+        }
+        if value::instance_remove_attr(obj, &attr).is_some() {
             return NONE;
         }
         return attribute_error(obj, &attr);
     }
     if let Some(class) = value::as_class(obj) {
+        if value::class_delete_attr(obj, &attr) {
+            return NONE;
+        }
         return type_error(format!(
-            "cannot delete attributes of class '{}'",
-            class.name
+            "cannot delete attribute '{}' of class '{}'",
+            attr, class.name
         ));
     }
     attribute_error(obj, &attr)
@@ -2085,6 +2661,432 @@ fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
     }
 }
 
+// bytearray
+
+/// Methods of a mutable `bytearray`.
+///
+/// Mutations go through [`value::bytearray_bytes_mut`]; the payload is never
+/// borrowed across an allocation. Read-only transformations reuse
+/// [`bytes_method`] and wrap a bytes result back into a `bytearray`, matching
+/// CPython (`bytearray.replace` returns a `bytearray`, `split` a list of
+/// them).
+fn bytearray_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    match method {
+        "__len__" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 0, 0) {
+                return err;
+            }
+            ops::int_result(value::as_bytearray(obj).map_or(0, |bytes| bytes.len() as i64))
+        }
+        "__getitem__" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 1, 1) {
+                return err;
+            }
+            container::subscript(obj, args[0])
+        }
+        "__setitem__" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 2, 2) {
+                return err;
+            }
+            container::subscript_set(obj, args[0], args[1])
+        }
+        "__delitem__" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 1, 1) {
+                return err;
+            }
+            container::delete_subscript(obj, args[0])
+        }
+        "__contains__" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 1, 1) {
+                return err;
+            }
+            bytearray_contains(obj, args[0])
+        }
+        "append" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 1, 1) {
+                return err;
+            }
+            let Some(byte) = byte_item(args[0]) else {
+                return bytearray_item_error(args[0]);
+            };
+            match value::bytearray_bytes_mut(obj) {
+                Some(bytes) => {
+                    bytes.push(byte);
+                    NONE
+                }
+                None => attribute_error(obj, method),
+            }
+        }
+        "extend" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 1, 1) {
+                return err;
+            }
+            let items = match builtins::star_sequence(args[0]) {
+                Ok(items) => items,
+                Err(err) => return err,
+            };
+            let mut appended = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(byte) = byte_item(item) else {
+                    return bytearray_item_error(item);
+                };
+                appended.push(byte);
+            }
+            match value::bytearray_bytes_mut(obj) {
+                Some(bytes) => {
+                    bytes.extend_from_slice(&appended);
+                    NONE
+                }
+                None => attribute_error(obj, method),
+            }
+        }
+        "insert" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 2, 2) {
+                return err;
+            }
+            let Ok(raw) = int_arg(args[0]) else {
+                return type_error(format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    value::type_name(args[0])
+                ));
+            };
+            let Some(byte) = byte_item(args[1]) else {
+                return bytearray_item_error(args[1]);
+            };
+            match value::bytearray_bytes_mut(obj) {
+                Some(bytes) => {
+                    let len = bytes.len() as i64;
+                    let index = if raw < 0 { (raw + len).max(0) } else { raw };
+                    let position = (index as usize).min(bytes.len());
+                    bytes.insert(position, byte);
+                    NONE
+                }
+                None => attribute_error(obj, method),
+            }
+        }
+        "pop" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 0, 1) {
+                return err;
+            }
+            let Some(len) = value::as_bytearray(obj).map(|bytes| bytes.len()) else {
+                return attribute_error(obj, method);
+            };
+            if len == 0 {
+                return exc::raise_with_message(INDEX_ERROR, "pop from empty bytearray");
+            }
+            let raw = if args.is_empty() {
+                -1
+            } else {
+                match int_arg(args[0]) {
+                    Ok(raw) => raw,
+                    Err(_) => {
+                        return type_error(format!(
+                            "'{}' object cannot be interpreted as an integer",
+                            value::type_name(args[0])
+                        ))
+                    }
+                }
+            };
+            let Some(position) = container::normalize_index(raw, len) else {
+                return exc::raise_with_message(INDEX_ERROR, "pop index out of range");
+            };
+            match value::bytearray_bytes_mut(obj) {
+                Some(bytes) => ops::int_result(bytes.remove(position) as i64),
+                None => attribute_error(obj, method),
+            }
+        }
+        "remove" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 1, 1) {
+                return err;
+            }
+            let Some(byte) = byte_item(args[0]) else {
+                return bytearray_item_error(args[0]);
+            };
+            match value::bytearray_bytes_mut(obj) {
+                Some(bytes) => match bytes.iter().position(|&existing| existing == byte) {
+                    Some(position) => {
+                        bytes.remove(position);
+                        NONE
+                    }
+                    None => exc::raise_with_message(VALUE_ERROR, "value not found in bytearray"),
+                },
+                None => attribute_error(obj, method),
+            }
+        }
+        "reverse" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 0, 0) {
+                return err;
+            }
+            if let Some(bytes) = value::bytearray_bytes_mut(obj) {
+                bytes.reverse();
+            }
+            NONE
+        }
+        "clear" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 0, 0) {
+                return err;
+            }
+            if let Some(bytes) = value::bytearray_bytes_mut(obj) {
+                bytes.clear();
+            }
+            NONE
+        }
+        "copy" => {
+            if let Some(err) = check_arity("bytearray", method, args.len(), 0, 0) {
+                return err;
+            }
+            let copy = value::as_bytearray(obj).cloned().unwrap_or_default();
+            value::bytearray_new(copy)
+        }
+        // Read-only byte-string methods; transformations return a bytearray.
+        "decode" | "hex" | "count" | "find" | "startswith" | "endswith" => {
+            let data = value::as_bytearray(obj).cloned().unwrap_or_default();
+            bytes_method(obj, data, method, args)
+        }
+        "replace" | "split" | "strip" | "lstrip" | "rstrip" | "join" | "upper" | "lower" => {
+            let data = value::as_bytearray(obj).cloned().unwrap_or_default();
+            let result = bytes_method(obj, data, method, args);
+            if exc::pending() {
+                return result;
+            }
+            bytes_result_as_bytearray(result)
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
+/// Decodes one `bytearray.append`/`extend`/`insert`/`remove` argument.
+///
+/// An integer must be in `0..=255`; a length-1 bytes-like value is accepted
+/// like CPython's buffer-protocol path.
+fn byte_item(v: i64) -> Option<u8> {
+    if let Some(byte) = container::byte_value(v) {
+        return Some(byte);
+    }
+    match value::as_bytes(v) {
+        Some([single]) => Some(*single),
+        _ => None,
+    }
+}
+
+/// Reports the CPython error for an invalid `bytearray` item.
+fn bytearray_item_error(v: i64) -> i64 {
+    if value::as_integer(v).is_some() {
+        exc::raise_with_message(VALUE_ERROR, "byte must be in range(0, 256)")
+    } else if value::as_bytes(v).is_some() {
+        type_error("bytearray item must be a byte or a bytes-like value".to_string())
+    } else {
+        type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            value::type_name(v)
+        ))
+    }
+}
+
+/// Wraps a bytes-method result back into `bytearray` (`split` returns a list
+/// of bytearrays).
+fn bytes_result_as_bytearray(result: i64) -> i64 {
+    if let Some(bytes) = value::as_bytes(result) {
+        return value::bytearray_new(bytes.to_vec());
+    }
+    if let Some(items) = value::as_list(result) {
+        let source: Vec<i64> = items.to_vec();
+        let output = value::list_new(Vec::new());
+        for item in source {
+            if let Some(bytes) = value::as_bytes(item) {
+                let converted = value::bytearray_new(bytes.to_vec());
+                container::list_append(output, converted);
+            }
+        }
+        return output;
+    }
+    result
+}
+
+/// `x in bytearray`: an integer tests one byte, a bytes-like tests a
+/// subsequence.
+fn bytearray_contains(obj: i64, needle: i64) -> i64 {
+    let Some(bytes) = value::as_bytearray(obj) else {
+        return attribute_error(obj, "__contains__");
+    };
+    if let Some(single) = container::byte_value(needle) {
+        return value::bool_value(bytes.contains(&single));
+    }
+    if let Some(pattern) = value::as_bytes(needle) {
+        if pattern.is_empty() {
+            return value::TRUE;
+        }
+        return value::bool_value(bytes.windows(pattern.len()).any(|window| window == pattern));
+    }
+    type_error(format!(
+        "a bytes-like object is required, not '{}'",
+        value::type_name(needle)
+    ))
+}
+
+// memoryview
+
+/// Methods and data attributes of a `memoryview`.
+fn memoryview_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    let Some(view) = value::as_memoryview(obj) else {
+        return attribute_error(obj, method);
+    };
+    if view.released {
+        return exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED);
+    }
+    match method {
+        "tobytes" => {
+            if let Some(err) = check_arity("memoryview", method, args.len(), 0, 0) {
+                return err;
+            }
+            match value::memoryview_bytes(view) {
+                Ok(bytes) => value::bytes_new(bytes),
+                Err(message) => container::memoryview_error(message),
+            }
+        }
+        "tolist" => {
+            if let Some(err) = check_arity("memoryview", method, args.len(), 0, 0) {
+                return err;
+            }
+            let len = view.len();
+            let output = value::list_new(Vec::new());
+            for index in 0..len {
+                match value::memoryview_get(view, index) {
+                    Ok(item) => {
+                        container::list_append(output, item);
+                    }
+                    Err(message) => return container::memoryview_error(message),
+                }
+            }
+            output
+        }
+        "release" => {
+            if let Some(err) = check_arity("memoryview", method, args.len(), 0, 0) {
+                return err;
+            }
+            if let Some(state) = value::memoryview_mut(obj) {
+                state.released = true;
+                state.buffer = NONE;
+                state.length = 0;
+            }
+            NONE
+        }
+        "cast" => {
+            if let Some(err) = check_arity("memoryview", method, args.len(), 1, 1) {
+                return err;
+            }
+            let format = match str_arg(method, 1, args[0]) {
+                Ok(format) => format,
+                Err(err) => return err,
+            };
+            let mut chars = format.chars();
+            let code = match (chars.next(), chars.next()) {
+                (Some(code), None) => code,
+                _ => {
+                    return exc::raise_with_message(
+                        VALUE_ERROR,
+                        "memoryview: destination format must be a single character",
+                    )
+                }
+            };
+            if !matches!(code, 'B' | 'b' | 'c') {
+                return exc::raise_with_message(
+                    crate::exc::NOT_IMPLEMENTED_ERROR,
+                    &format!("memoryview: format '{code}' is not supported"),
+                );
+            }
+            value::memoryview_with_window(view.buffer, view.offset, view.len(), view.stride, code)
+        }
+        "__len__" => {
+            if let Some(err) = check_arity("memoryview", method, args.len(), 0, 0) {
+                return err;
+            }
+            ops::int_result(view.len() as i64)
+        }
+        "__getitem__" => {
+            if let Some(err) = check_arity("memoryview", method, args.len(), 1, 1) {
+                return err;
+            }
+            container::subscript(obj, args[0])
+        }
+        "__setitem__" => {
+            if let Some(err) = check_arity("memoryview", method, args.len(), 2, 2) {
+                return err;
+            }
+            container::subscript_set(obj, args[0], args[1])
+        }
+        "__contains__" => {
+            if let Some(err) = check_arity("memoryview", method, args.len(), 1, 1) {
+                return err;
+            }
+            let needle = args[0];
+            let len = view.len();
+            for index in 0..len {
+                match value::memoryview_get(view, index) {
+                    Ok(item) => {
+                        if container::equals(item, needle) {
+                            return value::TRUE;
+                        }
+                    }
+                    Err(message) => return container::memoryview_error(message),
+                }
+            }
+            value::FALSE
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
+// dict views
+
+/// Methods of `dict_keys`/`dict_values`/`dict_items`.
+fn dict_view_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    let Some(view) = value::as_dict_view(obj) else {
+        return attribute_error(obj, method);
+    };
+    match method {
+        "__len__" => {
+            if let Some(err) = check_arity(view.kind.type_name(), method, args.len(), 0, 0) {
+                return err;
+            }
+            ops::int_result(container::dict_view_len(view) as i64)
+        }
+        "__iter__" => {
+            if let Some(err) = check_arity(view.kind.type_name(), method, args.len(), 0, 0) {
+                return err;
+            }
+            value::iter_new(obj)
+        }
+        "__contains__" => {
+            if let Some(err) = check_arity(view.kind.type_name(), method, args.len(), 1, 1) {
+                return err;
+            }
+            if view.kind != value::DictViewKind::Values {
+                if let Some(name) = container::unhashable_name(args[0]) {
+                    return type_error(container::unhashable_message(name));
+                }
+            }
+            value::bool_value(container::dict_view_contains(view, args[0]))
+        }
+        "isdisjoint" => {
+            if let Some(err) = check_arity(view.kind.type_name(), method, args.len(), 1, 1) {
+                return err;
+            }
+            let items = match builtins::star_sequence(args[0]) {
+                Ok(items) => items,
+                Err(err) => return err,
+            };
+            for item in items {
+                if container::dict_view_contains(view, item) {
+                    return value::FALSE;
+                }
+            }
+            value::TRUE
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
 // list
 
 fn list_method(obj: i64, method: &str, args: &[i64]) -> i64 {
@@ -2558,6 +3560,12 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             }
             container::subscript_set(obj, args[0], args[1])
         }
+        "__delitem__" => {
+            if let Some(err) = check_arity("dict", method, args.len(), 1, 1) {
+                return err;
+            }
+            container::delete_subscript(obj, args[0])
+        }
         "__contains__" => {
             if let Some(err) = check_arity("dict", method, args.len(), 1, 1) {
                 return err;
@@ -2619,17 +3627,14 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_arity("dict", method, args.len(), 0, 0) {
                 return err;
             }
-            // Copy before allocating: the slice borrows the dict.
-            let pairs: Vec<(i64, i64)> = value::as_dict(obj).unwrap_or(&[]).to_vec();
-            if method == "items" {
-                return dict_items_list(pairs);
-            }
-            let want_keys = method == "keys";
-            let items: Vec<i64> = pairs
-                .into_iter()
-                .map(|(key, val)| if want_keys { key } else { val })
-                .collect();
-            value::list_new(items)
+            // Live views: no copy, no snapshot. The view observes the dict's
+            // current contents for len/iteration/membership/repr.
+            let kind = match method {
+                "keys" => value::DictViewKind::Keys,
+                "values" => value::DictViewKind::Values,
+                _ => value::DictViewKind::Items,
+            };
+            value::dict_view_new(obj, kind)
         }
         "pop" => {
             if let Some(err) = check_arity("dict", method, args.len(), 1, 2) {
@@ -2697,26 +3702,8 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     }
 }
 
-/// Builds the `dict.items()` result: a list of fresh `(key, value)` tuples in
-/// insertion order (documented deviation from CPython's view).
-///
-/// GC: the result list is allocated first and held in a tagged local across
-/// the per-pair tuple allocations, so the collector can reach the tuples
-/// pushed into it so far.
-fn dict_items_list(pairs: Vec<(i64, i64)>) -> i64 {
-    let result = value::list_new(Vec::new());
-    for (key, val) in pairs {
-        let item = value::tuple_new(vec![key, val]);
-        if let Some(mut items) = value::list_items_mut(result) {
-            items.push(item);
-            crate::heap::write_barrier_edge(result, item);
-        }
-    }
-    result
-}
-
 /// Rejects dict keys that Python considers unhashable (`list`, `dict`,
-/// `iterator`, or a tuple containing one).
+/// `iterator`, a bytes-like mutable/view value, or a tuple containing one).
 fn check_hashable(key: i64) -> Option<i64> {
     container::unhashable_name(key).map(|name| type_error(container::unhashable_message(name)))
 }
@@ -4553,9 +5540,13 @@ mod tests {
         assert_eq!(invoke(d, "get", &[string("a")]), int(1));
         assert_eq!(invoke(d, "get", &[string("z")]), NONE);
         assert_eq!(invoke(d, "get", &[string("z"), int(0)]), int(0));
-        // Lookups must not mutate.
-        assert_eq!(rendered_list(invoke(d, "keys", &[])), "['a', 'b']");
-        assert_eq!(rendered_list(invoke(d, "values", &[])), "[1, 2]");
+        // Lookups must not mutate, and the views report their own type.
+        let keys = invoke(d, "keys", &[]);
+        let values = invoke(d, "values", &[]);
+        assert_eq!(value::type_name(keys), "dict_keys");
+        assert_eq!(value::type_name(values), "dict_values");
+        assert_eq!(rendered_list(keys), "dict_keys(['a', 'b'])");
+        assert_eq!(rendered_list(values), "dict_values([1, 2])");
 
         assert_eq!(invoke(d, "pop", &[string("a")]), int(1));
         assert_eq!(rendered_list(d), "{'b': 2}");
@@ -4567,30 +5558,34 @@ mod tests {
         assert_eq!(message(), "'z'");
 
         crate::exc::clear();
-        // keys()/values() return fresh lists, not views.
-        let ks = invoke(d, "keys", &[]);
-        invoke(ks, "append", &[string("c")]);
-        assert_eq!(rendered_list(invoke(d, "keys", &[])), "['b']");
+        // The view is live: it observes dict mutations and is not a list.
+        invoke(d, "__setitem__", &[string("c"), int(3)]);
+        assert_eq!(rendered_list(keys), "dict_keys(['b', 'c'])");
+        assert_eq!(rendered_list(values), "dict_values([2, 3])");
+        invoke(keys, "append", &[string("z")]);
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        crate::exc::clear();
+        // Membership and length go through the view.
+        assert_eq!(invoke(keys, "__contains__", &[string("b")]), TRUE);
+        assert_eq!(invoke(keys, "__len__", &[]), int(2));
+        assert!(!crate::exc::pending());
     }
 
     #[test]
-    fn dict_items_are_tuples_in_order() {
+    fn dict_items_view_is_live_and_yields_tuples() {
         reset();
         let d = dict(&[(string("a"), int(1)), (string("b"), int(2))]);
         let pairs = invoke(d, "items", &[]);
-        // The result is a list of two-element tuples, insertion-ordered.
-        let entries = items(pairs);
+        assert_eq!(value::type_name(pairs), "dict_items");
+        assert_eq!(rendered_list(pairs), "dict_items([('a', 1), ('b', 2)])");
+        // Iteration materialises fresh two-element tuples in insertion order.
+        let entries = items(crate::builtins::list_from(pairs));
         assert_eq!(entries.len(), 2);
         assert_eq!(value::to_string(entries[0]), "('a', 1)");
-        assert_eq!(value::to_string(entries[1]), "('b', 2)");
         assert_eq!(value::type_name(entries[0]), "tuple");
-        assert_eq!(rendered_list(pairs), "[('a', 1), ('b', 2)]");
-        // Mutating the returned list does not affect the dict.
-        invoke(pairs, "clear", &[]);
-        assert_eq!(
-            rendered_list(invoke(d, "items", &[])),
-            "[('a', 1), ('b', 2)]"
-        );
+        // Deleting a key is visible through the live view.
+        invoke(d, "pop", &[string("a")]);
+        assert_eq!(rendered_list(pairs), "dict_items([('b', 2)])");
         assert!(!crate::exc::pending());
     }
 
@@ -4881,12 +5876,13 @@ mod tests {
         assert_eq!(text(getattr(class, b"__name__".as_ptr(), 8)), "C");
         assert!(!crate::exc::pending());
 
-        // The class namespace is frozen.
+        // Runtime class assignment writes the overlay and is visible to
+        // existing instances.
         crate::exc::clear();
-        super::setattr(class, b"limit".as_ptr(), 5, int(6));
-        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
-        crate::exc::clear();
-        assert_eq!(getattr(class, b"limit".as_ptr(), 5), int(5));
+        assert_eq!(super::setattr(class, b"limit".as_ptr(), 5, int(6)), NONE);
+        assert!(!crate::exc::pending());
+        assert_eq!(getattr(class, b"limit".as_ptr(), 5), int(6));
+        assert_eq!(getattr(instance, b"limit".as_ptr(), 5), int(6));
     }
 
     #[test]
@@ -5017,7 +6013,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_attr_removes_instance_attributes_only() {
+    fn delete_attr_removes_instance_and_class_attributes() {
         reset();
         let class = value::class_new("Thing".to_string(), NONE, Vec::new());
         let instance = value::instance_new(class);
@@ -5037,10 +6033,24 @@ mod tests {
         assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
         crate::exc::clear();
 
-        // Class namespaces are frozen.
+        // Class namespaces accept runtime assignment, visible to instances.
+        assert_eq!(super::setattr(class, "value".as_ptr(), 5, int(9)), NONE);
+        assert!(!crate::exc::pending());
+        assert_eq!(getattr(class, "value".as_ptr(), 5), int(9));
+        assert_eq!(getattr(instance, "value".as_ptr(), 5), int(9));
+        assert_eq!(delete_attr(class, "value".as_ptr(), 5), NONE);
+        assert!(!crate::exc::pending());
+        assert_eq!(getattr(instance, "value".as_ptr(), 5), NONE);
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        crate::exc::clear();
+
+        // Deleting a name that the class never had raises TypeError.
         assert_eq!(delete_attr(class, "value".as_ptr(), 5), NONE);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
-        assert_eq!(message(), "cannot delete attributes of class 'Thing'");
+        assert_eq!(
+            message(),
+            "cannot delete attribute 'value' of class 'Thing'"
+        );
         crate::exc::clear();
 
         // Non-instance receivers report AttributeError.

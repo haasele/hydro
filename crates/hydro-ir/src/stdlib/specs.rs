@@ -639,7 +639,10 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
 pub static COLLECTIONS: ModuleSpec = ModuleSpec {
     name: "collections",
     functions: &[kw("defaultdict", 1, 1, Type::Any, &["default_factory"])],
-    constants: &[],
+    // `collections.abc` is a nested module; the constant lets the frontend
+    // resolve `collections.abc.Mapping` through the runtime module value
+    // (the general nested-module chain is still a frontend follow-up).
+    constants: &[c("abc", Type::Any)],
 };
 
 pub static SOCKET: ModuleSpec = ModuleSpec {
@@ -1694,6 +1697,226 @@ pub static _WEAKREF: ModuleSpec = ModuleSpec {
     ],
 };
 
+/// `warnings`: the warning registry, filters and display helpers. Every
+/// implemented function is declared here; a name that is absent from this
+/// table raises `AttributeError` instead of returning invented data.
+const WARNING_FUNCTIONS: &[FunctionSpec] = &[
+    kw(
+        "warn",
+        1,
+        3,
+        Type::None,
+        &["message", "category", "stacklevel"],
+    ),
+    kw(
+        "warn_explicit",
+        4,
+        7,
+        Type::None,
+        &[
+            "message",
+            "category",
+            "filename",
+            "lineno",
+            "module",
+            "registry",
+            "module_globals",
+        ],
+    ),
+    kw(
+        "filterwarnings",
+        1,
+        6,
+        Type::None,
+        &[
+            "action", "message", "category", "module", "lineno", "append",
+        ],
+    ),
+    kw(
+        "simplefilter",
+        1,
+        4,
+        Type::None,
+        &["action", "category", "lineno", "append"],
+    ),
+    f("resetwarnings", 0, 0, Type::None),
+    kw(
+        "showwarning",
+        4,
+        6,
+        Type::None,
+        &["message", "category", "filename", "lineno", "file", "line"],
+    ),
+    kw(
+        "formatwarning",
+        4,
+        5,
+        Type::Str,
+        &["message", "category", "filename", "lineno", "line"],
+    ),
+];
+
+/// `warnings`: the stable module spellings. `filters` is a snapshot list of
+/// the currently installed filter tuples (see the runtime module docs).
+pub static WARNINGS: ModuleSpec = ModuleSpec {
+    name: "warnings",
+    functions: WARNING_FUNCTIONS,
+    constants: &[c("filters", Type::List)],
+};
+
+/// `_warnings`: the accelerator alias. The same registry and filters are
+/// shared with [`WARNINGS`].
+pub static _WARNINGS: ModuleSpec = ModuleSpec {
+    name: "_warnings",
+    functions: WARNING_FUNCTIONS,
+    constants: &[c("filters", Type::List)],
+};
+
+/// `marshal`: importable, but Hydro has no CPython marshal byte stream, so
+/// every conversion function raises `NotImplementedError` instead of
+/// fabricating a payload. `version` reports the CPython 3.14 format version.
+pub static MARSHAL: ModuleSpec = ModuleSpec {
+    name: "marshal",
+    functions: &[
+        kw("dump", 2, 3, Type::None, &["value", "file", "version"]),
+        kw("dumps", 1, 2, Type::Bytes, &["value", "version"]),
+        f("load", 1, 1, Type::Any),
+        f("loads", 1, 1, Type::Any),
+    ],
+    constants: &[c("version", Type::Int)],
+};
+
+/// `_tokenize`: only the C tokenizer iterator name is exposed, and calling it
+/// raises `NotImplementedError`; Hydro never fabricates tokens.
+pub static _TOKENIZE: ModuleSpec = ModuleSpec {
+    name: "_tokenize",
+    functions: &[kw(
+        "TokenizerIter",
+        1,
+        3,
+        Type::Any,
+        &["source", "encoding", "extra_tokens"],
+    )],
+    constants: &[],
+};
+
+/// `_collections_abc`: the abstract base class objects. The pure-Python
+/// `collections.abc` module imports every name from here.
+pub static _COLLECTIONS_ABC: ModuleSpec = ModuleSpec {
+    name: "_collections_abc",
+    // Native body of the `register` method installed on every ABC class. The
+    // name is underscore-hidden from `import *` and the method raises
+    // `NotImplementedError`; virtual subclass registration is not emulated.
+    functions: &[f("_abc_register", 1, 1, Type::None)],
+    constants: &[
+        c("Awaitable", Type::Any),
+        c("AsyncIterable", Type::Any),
+        c("AsyncIterator", Type::Any),
+        c("AsyncGenerator", Type::Any),
+        c("Hashable", Type::Any),
+        c("Iterable", Type::Any),
+        c("Iterator", Type::Any),
+        c("Generator", Type::Any),
+        c("Reversible", Type::Any),
+        c("Sized", Type::Any),
+        c("Container", Type::Any),
+        c("Callable", Type::Any),
+        c("Collection", Type::Any),
+        c("Set", Type::Any),
+        c("MutableSet", Type::Any),
+        c("Mapping", Type::Any),
+        c("MutableMapping", Type::Any),
+        c("Sequence", Type::Any),
+        c("MutableSequence", Type::Any),
+        c("Coroutine", Type::Any),
+    ],
+};
+
+/// `collections.abc`: the same class objects as [`_COLLECTIONS_ABC`].
+///
+/// The extra `abc` constant is a frontend workaround: `import collections.abc`
+/// binds `collections` to this spec, and the nested-module chain resolver only
+/// knows `os.path`, so `collections.abc.Mapping` reaches the runtime as
+/// `collections.abc` followed by a dynamic attribute. The constant resolves
+/// that intermediate expression to this module's value.
+pub static COLLECTIONS_ABC: ModuleSpec = ModuleSpec {
+    name: "collections.abc",
+    functions: &[],
+    constants: &[
+        c("abc", Type::Any),
+        c("Awaitable", Type::Any),
+        c("AsyncIterable", Type::Any),
+        c("AsyncIterator", Type::Any),
+        c("AsyncGenerator", Type::Any),
+        c("Hashable", Type::Any),
+        c("Iterable", Type::Any),
+        c("Iterator", Type::Any),
+        c("Generator", Type::Any),
+        c("Reversible", Type::Any),
+        c("Sized", Type::Any),
+        c("Container", Type::Any),
+        c("Callable", Type::Any),
+        c("Collection", Type::Any),
+        c("Set", Type::Any),
+        c("MutableSet", Type::Any),
+        c("Mapping", Type::Any),
+        c("MutableMapping", Type::Any),
+        c("Sequence", Type::Any),
+        c("MutableSequence", Type::Any),
+        c("Coroutine", Type::Any),
+    ],
+};
+
+/// `gc`: the collector's introspection surface. Names the current collector
+/// cannot honour (`disable`, `set_threshold`, `freeze`, ...) are declared so
+/// they raise a tagged `NotImplementedError` rather than a misleading
+/// `AttributeError`.
+pub static GC: ModuleSpec = ModuleSpec {
+    name: "gc",
+    functions: &[
+        kw("collect", 0, 1, Type::Int, &["generation"]),
+        f("isenabled", 0, 0, Type::Bool),
+        f("enable", 0, 0, Type::None),
+        f("disable", 0, 0, Type::None),
+        f("get_count", 0, 0, Type::Tuple),
+        f("get_stats", 0, 0, Type::List),
+        f("get_threshold", 0, 0, Type::Tuple),
+        f("set_threshold", 1, 3, Type::None),
+        f("freeze", 0, 0, Type::None),
+        f("unfreeze", 0, 0, Type::None),
+        kw("get_objects", 0, 1, Type::List, &["generation"]),
+    ],
+    constants: &[],
+};
+
+/// `atexit`: LIFO shutdown callbacks.
+pub static ATEXIT: ModuleSpec = ModuleSpec {
+    name: "atexit",
+    functions: &[
+        f("register", 1, usize::MAX, Type::Any),
+        f("unregister", 1, 1, Type::None),
+        f("_run_exitfuncs", 0, 0, Type::None),
+        f("_clear", 0, 0, Type::None),
+    ],
+    constants: &[],
+};
+
+/// `site`: the importable site stub. Hydro performs no site processing, so
+/// `main()` is a truthful no-op and `addsitedir` reports the limitation.
+pub static SITE: ModuleSpec = ModuleSpec {
+    name: "site",
+    functions: &[
+        kw("main", 0, 1, Type::None, &["known_paths"]),
+        kw("addsitedir", 1, 2, Type::None, &["path", "known_paths"]),
+    ],
+    constants: &[
+        c("ENABLE_USER_SITE", Type::Bool),
+        c("USER_SITE", Type::Any),
+        c("USER_BASE", Type::Any),
+        c("PREFIXES", Type::List),
+    ],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1996,6 +2219,136 @@ mod tests {
             "__debug__",
         ] {
             assert!(constant("builtins", name).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn warnings_marshal_and_tokenize_specs_are_registered() {
+        for module in ["warnings", "_warnings"] {
+            for name in [
+                "warn",
+                "warn_explicit",
+                "filterwarnings",
+                "simplefilter",
+                "resetwarnings",
+                "showwarning",
+                "formatwarning",
+            ] {
+                assert!(function(module, name).is_some(), "{module}.{name}");
+            }
+            assert_eq!(constant(module, "filters").unwrap().ty, Type::List);
+        }
+        let warn = function("warnings", "warn").unwrap();
+        assert_eq!((warn.min_args, warn.max_args), (1, 3));
+        assert_eq!(warn.params, &["message", "category", "stacklevel"][..]);
+        let explicit = function("warnings", "warn_explicit").unwrap();
+        assert_eq!((explicit.min_args, explicit.max_args), (4, 7));
+
+        let dumps = function("marshal", "dumps").unwrap();
+        assert_eq!((dumps.min_args, dumps.max_args), (1, 2));
+        assert_eq!(dumps.ret, Type::Bytes);
+        assert_eq!(function("marshal", "load").unwrap().min_args, 1);
+        assert_eq!(constant("marshal", "version").unwrap().ty, Type::Int);
+
+        let tokenizer = function("_tokenize", "TokenizerIter").unwrap();
+        assert_eq!(tokenizer.min_args, 1);
+        assert_eq!(
+            tokenizer.params,
+            &["source", "encoding", "extra_tokens"][..]
+        );
+    }
+
+    #[test]
+    fn collections_abc_gc_atexit_and_site_specs_are_registered() {
+        let required = [
+            "Iterable",
+            "Iterator",
+            "Sized",
+            "Container",
+            "Collection",
+            "Sequence",
+            "MutableSequence",
+            "Mapping",
+            "MutableMapping",
+            "Set",
+            "MutableSet",
+            "Hashable",
+            "Callable",
+            "Generator",
+            "Coroutine",
+            "Awaitable",
+            "AsyncIterable",
+            "AsyncIterator",
+        ];
+        for module in ["collections.abc", "_collections_abc"] {
+            let spec = crate::stdlib::module(module).unwrap();
+            if module == "_collections_abc" {
+                // Internal `register` method body only.
+                assert_eq!(spec.functions.len(), 1);
+                assert!(function(module, "_abc_register").is_some());
+            } else {
+                assert!(spec.functions.is_empty());
+            }
+            for &name in &required {
+                assert_eq!(constant(module, name).unwrap().ty, Type::Any, "{name}");
+            }
+        }
+        assert_eq!(constant("collections", "abc").unwrap().ty, Type::Any);
+
+        for name in [
+            "collect",
+            "isenabled",
+            "enable",
+            "disable",
+            "get_count",
+            "get_stats",
+            "get_threshold",
+            "set_threshold",
+            "freeze",
+            "unfreeze",
+            "get_objects",
+        ] {
+            assert!(function("gc", name).is_some(), "gc.{name}");
+        }
+        assert_eq!(function("gc", "collect").unwrap().max_args, 1);
+        assert_eq!(function("gc", "get_stats").unwrap().ret, Type::List);
+        assert_eq!(function("gc", "get_count").unwrap().ret, Type::Tuple);
+
+        assert_eq!(function("atexit", "register").unwrap().min_args, 1);
+        assert_eq!(function("atexit", "register").unwrap().max_args, usize::MAX);
+        assert!(function("atexit", "_run_exitfuncs").is_some());
+        assert!(function("atexit", "unregister").is_some());
+        assert!(function("atexit", "_clear").is_some());
+
+        assert_eq!(constant("site", "ENABLE_USER_SITE").unwrap().ty, Type::Bool);
+        assert_eq!(constant("site", "USER_SITE").unwrap().ty, Type::Any);
+        assert_eq!(constant("site", "PREFIXES").unwrap().ty, Type::List);
+        assert_eq!(function("site", "main").unwrap().min_args, 0);
+        assert_eq!(function("site", "addsitedir").unwrap().min_args, 1);
+    }
+
+    #[test]
+    fn module_table_lists_the_new_shims_once() {
+        for name in [
+            "warnings",
+            "_warnings",
+            "marshal",
+            "_tokenize",
+            "_collections_abc",
+            "collections.abc",
+            "gc",
+            "atexit",
+            "site",
+        ] {
+            assert!(crate::stdlib::module(name).is_some(), "{name} missing");
+            assert_eq!(
+                crate::stdlib::MODULES
+                    .iter()
+                    .filter(|module| module.name == name)
+                    .count(),
+                1,
+                "{name} registered more than once"
+            );
         }
     }
 }

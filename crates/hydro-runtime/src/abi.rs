@@ -76,6 +76,20 @@ pub extern "C" fn hydro_bytes_new(ptr: *const c_uchar, len: usize) -> i64 {
     value::bytes_from_ptr(ptr, len)
 }
 
+/// `bytearray` literal: copies `len` bytes from `ptr` into a mutable
+/// bytearray. A NULL buffer or zero length yields an empty bytearray.
+#[no_mangle]
+pub extern "C" fn hydro_bytearray_new(ptr: *const c_uchar, len: usize) -> i64 {
+    value::bytearray_from_bytes(ptr, len)
+}
+
+/// `memoryview(value)`: creates a memoryview over a bytes or bytearray value.
+/// Any other operand raises `TypeError` and returns `None`.
+#[no_mangle]
+pub extern "C" fn hydro_memoryview_new(value: i64) -> i64 {
+    crate::value::memoryview_abi(value)
+}
+
 /// `bytes(...)`: the constructor (0, 1 or 2 arguments).
 #[no_mangle]
 pub extern "C" fn hydro_bytes_build(argc: usize, argv: *const i64) -> i64 {
@@ -85,6 +99,48 @@ pub extern "C" fn hydro_bytes_build(argc: usize, argv: *const i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn hydro_float_new(f: f64) -> i64 {
     value::float_new(f)
+}
+
+/// One PEP 750 template interpolation (`string.templatelib.Interpolation`).
+///
+/// `expression` is the source text of the field's expression (a pointer/length
+/// pair), `conversion` is `0` none / `1` `!s` / `2` `!r` / `3` `!a`,
+/// `format_spec` is a tagged `str` or `None`, and `self_documenting` marks the
+/// `=` debug specifier. Invalid input raises and returns `None`; this function
+/// never panics.
+#[no_mangle]
+pub extern "C" fn hydro_interpolation_new(
+    value: i64,
+    expression: *const c_uchar,
+    expression_len: usize,
+    conversion: u8,
+    format_spec: i64,
+    self_documenting: u8,
+) -> i64 {
+    crate::core::template::interpolation_new(
+        value,
+        expression,
+        expression_len,
+        conversion,
+        format_spec,
+        self_documenting,
+    )
+}
+
+/// A PEP 750 template string (`string.templatelib.Template`).
+///
+/// `strings` points to `strings_len` tagged `str` values and `interpolations`
+/// to `interpolations_len` tagged `Interpolation` values. The
+/// `strings_len == interpolations_len + 1` invariant is enforced; invalid
+/// input raises and returns `None`; this function never panics.
+#[no_mangle]
+pub extern "C" fn hydro_template_new(
+    strings_len: usize,
+    strings: *const i64,
+    interpolations_len: usize,
+    interpolations: *const i64,
+) -> i64 {
+    crate::core::template::template_new(strings_len, strings, interpolations_len, interpolations)
 }
 
 /// `list` literal: copies `argc` tagged items from `argv`.
@@ -266,6 +322,7 @@ pub extern "C" fn hydro_class_new(
     } else {
         base
     };
+    let base = value::normalize_class_base(base);
     if base != value::NONE && value::as_class(base).is_none() {
         return exc::raise_with_message(
             exc::TYPE_ERROR,
@@ -372,6 +429,45 @@ pub extern "C" fn hydro_class_new(
         }
     }
     value::class_new_full(name, base, methods, attrs)
+}
+
+/// `class Name(Base1, Base2, metaclass=Meta): ...` with multiple bases.
+///
+/// `bases_ptr` holds `base_count` tagged class objects (or `None`),
+/// `metaclass` is the tagged metaclass or `None`, and the method/attribute
+/// buffers follow [`hydro_class_new`]'s layout. Forwards to the runtime's
+/// multi-base constructor, which validates every operand, resolves the MRO and
+/// raises `TypeError` on malformed input; it never panics.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+pub extern "C" fn hydro_class_new_multi(
+    name_ptr: *const c_uchar,
+    name_len: usize,
+    bases_ptr: *const i64,
+    base_count: usize,
+    metaclass: i64,
+    names_ptr: *const i64,
+    funcs_ptr: *const i64,
+    kinds_ptr: *const i64,
+    method_count: usize,
+    attr_names_ptr: *const i64,
+    attr_values_ptr: *const i64,
+    attr_count: usize,
+) -> i64 {
+    crate::value::class_new_multi_abi(
+        name_ptr,
+        name_len,
+        bases_ptr,
+        base_count,
+        metaclass,
+        names_ptr,
+        funcs_ptr,
+        kinds_ptr,
+        method_count,
+        attr_names_ptr,
+        attr_values_ptr,
+        attr_count,
+    )
 }
 
 /// Routes a dynamic `**mapping` operand into a class-constructor slot array.
@@ -615,6 +711,7 @@ pub extern "C" fn hydro_function_meta(
             1 => hydro_ir::ParamKind::VarArg,
             2 => hydro_ir::ParamKind::KwOnly,
             3 => hydro_ir::ParamKind::KwArg,
+            4 => hydro_ir::ParamKind::PosOnly,
             _ => {
                 return exc::raise_with_message(
                     exc::TYPE_ERROR,
@@ -799,6 +896,26 @@ pub extern "C" fn hydro_call_kw(
     kw_argv: *const i64,
 ) -> i64 {
     crate::core::builtins::call_kw(function, argc, argv, kwargc, kw_argv)
+}
+
+/// `f(prefix_args..., *star, named_kw..., **star_map)`.
+///
+/// `star` and `star_map` are the tagged `None` value when the operand is
+/// absent. `kw_argv` holds `2 * kwargc` tagged values in `[name, value, ...]`
+/// order. Forwarded to the runtime binder; invalid operands raise and return
+/// `None`.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn hydro_call_star_kw(
+    function: i64,
+    argc: usize,
+    argv: *const i64,
+    star: i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+    star_map: i64,
+) -> i64 {
+    crate::core::builtins::call_star_kw(function, argc, argv, star, kwargc, kw_argv, star_map)
 }
 
 /// `f(*args, **kwargs)` at a call site the frontend could not bind statically.
@@ -1243,6 +1360,30 @@ pub extern "C" fn hydro_method_star(
         items.as_ptr(),
         kwargc,
         kw_argv,
+    )
+}
+
+/// `receiver.name(prefix_args..., *star, named_kw..., **star_map)`.
+///
+/// `star` and `star_map` are the tagged `None` value when the operand is
+/// absent; `kw_argv` holds `2 * kwargc` tagged values in `[name, value, ...]`
+/// order. Forwarded to the runtime binder; invalid operands raise and return
+/// `None`.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn hydro_method_star_kw(
+    receiver: i64,
+    name_ptr: *const c_uchar,
+    name_len: usize,
+    argc: usize,
+    argv: *const i64,
+    star: i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+    star_map: i64,
+) -> i64 {
+    crate::core::methods::method_star_kw(
+        receiver, name_ptr, name_len, argc, argv, star, kwargc, kw_argv, star_map,
     )
 }
 

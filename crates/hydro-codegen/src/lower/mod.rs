@@ -144,6 +144,12 @@ struct Runtime {
     to_repr: FuncId,
     hash: FuncId,
     format: FuncId,
+    /// PEP 750 template construction: `Template` from ordered strings and
+    /// interpolation objects.
+    template_new: FuncId,
+    /// One `Interpolation` object (value, expression text, conversion,
+    /// format spec and debug flag).
+    interpolation_new: FuncId,
     to_int: FuncId,
     to_float: FuncId,
     abs: FuncId,
@@ -211,6 +217,8 @@ struct Runtime {
     setattr: FuncId,
     delete_attr: FuncId,
     class_new: FuncId,
+    /// Class creation with several bases and/or an explicit metaclass.
+    class_new_multi: FuncId,
     /// Allocates an instance without calling `__init__` (class-call lowering
     /// invokes the concrete initializer itself).
     instance_new: FuncId,
@@ -221,7 +229,10 @@ struct Runtime {
     method: FuncId,
     method_kw: FuncId,
     call_kw: FuncId,
-    method_star: FuncId,
+    /// Call through a value with `*args` and/or `**kwargs` operands.
+    call_star_kw: FuncId,
+    /// Method call with `*args` and/or `**kwargs` operands.
+    method_star_kw: FuncId,
     iter_new: FuncId,
     iter_next: FuncId,
     iter_of: FuncId,
@@ -310,6 +321,23 @@ impl Runtime {
                 module,
                 "hydro_format_value",
                 &[i64t, ptr, ptr, i32t],
+                Some(i64t),
+            )?,
+            // `strings_len`/`interpolations_len` are `size_t` in the ABI
+            // (pointer-width); the two pointers reference tagged arrays.
+            template_new: declare_runtime(
+                module,
+                "hydro_template_new",
+                &[ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
+            // `value`, expression bytes (ptr+len), a `uint8_t` conversion in a
+            // 32-bit register, the tagged format spec (or `None`) and a
+            // `uint8_t` debug flag in a 32-bit register.
+            interpolation_new: declare_runtime(
+                module,
+                "hydro_interpolation_new",
+                &[i64t, ptr, ptr, i32t, i64t, i32t],
                 Some(i64t),
             )?,
             to_int: declare_runtime(module, "hydro_to_int", &[i64t], Some(i64t))?,
@@ -577,6 +605,15 @@ impl Runtime {
                 Some(i64t),
             )?,
             instance_new: declare_runtime(module, "hydro_instance_new", &[i64t], Some(i64t))?,
+            // `name_len`/`base_count`/`method_count`/`attr_count` are
+            // pointer-width; `bases_ptr` points at `base_count` class values
+            // and `metaclass` is the tagged class value or `None`.
+            class_new_multi: declare_runtime(
+                module,
+                "hydro_class_new_multi",
+                &[ptr, ptr, ptr, ptr, i64t, ptr, ptr, ptr, ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
             bind_class_kwargs: declare_runtime(
                 module,
                 "hydro_bind_class_kwargs",
@@ -609,10 +646,19 @@ impl Runtime {
             )?,
             // `name_len` and `kwargc` are pointer-width; `star` is the tagged
             // operand to flatten, `kw_argv` holds `[name, value]` pairs.
-            method_star: declare_runtime(
+            // `f(args..., *star, kw=..., **star_map)`: `argc`/`kwargc` are
+            // pointer-width, `star`/`star_map` are tagged values (`None`
+            // sentinel when absent).
+            call_star_kw: declare_runtime(
                 module,
-                "hydro_method_star",
-                &[i64t, ptr, ptr, i64t, ptr, ptr],
+                "hydro_call_star_kw",
+                &[i64t, ptr, ptr, i64t, ptr, ptr, i64t],
+                Some(i64t),
+            )?,
+            method_star_kw: declare_runtime(
+                module,
+                "hydro_method_star_kw",
+                &[i64t, ptr, ptr, ptr, ptr, i64t, ptr, ptr, i64t],
                 Some(i64t),
             )?,
             iter_new: declare_runtime(module, "hydro_iter_new", &[i64t], Some(i64t))?,
@@ -1491,6 +1537,7 @@ fn count_expr(expr: &Expr) -> usize {
             args,
             star,
             keywords,
+            double_star,
             ..
         } => {
             count_expr(object)
@@ -1500,6 +1547,7 @@ fn count_expr(expr: &Expr) -> usize {
                     .iter()
                     .map(|(_, value)| count_expr(value))
                     .sum::<usize>()
+                + double_star.as_deref().map_or(0, count_expr)
         }
         ExprKind::Call { args, .. } => args.iter().map(count_expr).sum(),
         ExprKind::CallKw {
@@ -1513,6 +1561,22 @@ fn count_expr(expr: &Expr) -> usize {
                     .iter()
                     .map(|(_, value)| count_expr(value))
                     .sum::<usize>()
+        }
+        ExprKind::CallFull {
+            callee,
+            args,
+            star,
+            keywords,
+            double_star,
+        } => {
+            count_expr(callee)
+                + args.iter().map(count_expr).sum::<usize>()
+                + star.as_deref().map_or(0, count_expr)
+                + keywords
+                    .iter()
+                    .map(|(_, value)| count_expr(value))
+                    .sum::<usize>()
+                + double_star.as_deref().map_or(0, count_expr)
         }
         ExprKind::ClassCall {
             class,
@@ -1529,6 +1593,22 @@ fn count_expr(expr: &Expr) -> usize {
         }
         ExprKind::Await { value } | ExprKind::YieldFrom { value } => count_expr(value),
         ExprKind::Yield { value } => value.as_deref().map_or(0, count_expr),
+        ExprKind::Template {
+            strings,
+            interpolations,
+        } => {
+            // Strings, each interpolation's value/spec and the per-field
+            // scratch roots all occupy shadow-frame slots.
+            strings.len()
+                + interpolations
+                    .iter()
+                    .map(|interpolation| {
+                        count_expr(&interpolation.value)
+                            + interpolation.format_spec.as_deref().map_or(0, count_expr)
+                            + 2
+                    })
+                    .sum::<usize>()
+        }
     }
 }
 
@@ -1623,12 +1703,14 @@ fn count_stmt(stmt: &Stmt) -> usize {
         }
         StmtKind::Closure { captures, .. } => captures.len(),
         StmtKind::ClassDef {
-            base,
+            bases,
+            metaclass,
             methods,
             attributes,
             ..
         } => {
-            base.as_ref().map_or(0, count_expr)
+            bases.iter().map(count_expr).sum::<usize>()
+                + metaclass.as_ref().map_or(0, count_expr)
                 + methods.len()
                 + attributes
                     .iter()
@@ -2827,7 +2909,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     )));
                 }
                 let user_arity = func.call_arity();
-                let name = func.name.clone();
+                let name = Self::value_name(&func.name).to_string();
                 let wrapper = *self.wrappers.get(function).ok_or_else(|| {
                     CodegenError::new(format!(
                         "closure refers to undeclared wrapper for function id {function}"
@@ -2837,12 +2919,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 // Capture values are read at the definition site; only the
                 // tagged values are copied into the function object.
                 let captures_slot = self.stack_array_slot(captures.len(), "closure captures")?;
+                let mut capture_values = Vec::with_capacity(captures.len());
                 for (position, capture) in captures.iter().enumerate() {
                     let var = self.local_var(*capture)?;
                     let value = self.builder.use_var(var);
                     self.builder
                         .ins()
                         .stack_store(value, captures_slot, (position * 8) as i32);
+                    capture_values.push(value);
                 }
 
                 let reference = self.func_ref(wrapper);
@@ -2874,11 +2958,16 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 )?;
                 self.close_scope(captures_scope);
                 self.emit_exc_check()?;
-                // `attach_function_params` allocates; keep the new closure in
-                // a permanent root slot across it.
+                // Metadata attachment allocates (default values, trampoline
+                // registration); keep the new closure in a permanent root slot
+                // across it. Full parameter metadata is what lets a closure
+                // value be called with keywords and `**mapping` through the
+                // runtime binder, exactly like a named function value.
                 let closure_holder = self.temp_var()?;
                 self.define_var(closure_holder, closure)?;
                 let closure = self.builder.use_var(closure_holder);
+                let closure =
+                    self.attach_closure_signature(closure, func, *function, &capture_values)?;
                 let closure = self.attach_function_params(closure, func)?;
                 let var = self.local_var(*target)?;
                 self.define_var(var, closure)?;
@@ -2886,22 +2975,32 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             StmtKind::ClassDef {
                 target,
                 name,
-                base,
+                bases,
+                metaclass,
                 methods,
                 attributes,
             } => {
-                // Python evaluates the base expression first, then executes the
-                // class body (creating methods and evaluating attributes).
-                let base = match base {
-                    Some(base) => self.lower_expr(base)?,
+                // Python evaluates the base expressions first, then the
+                // metaclass keyword, then executes the class body (creating
+                // methods and evaluating attributes).
+                let mark = self.scratch_mark();
+                let bases_slot = self.stack_array_slot(bases.len(), "class bases")?;
+                for (index, base) in bases.iter().enumerate() {
+                    let value = self.lower_expr(base)?;
+                    self.scratch_push(value)?;
+                    self.builder
+                        .ins()
+                        .stack_store(value, bases_slot, (index * 8) as i32);
+                }
+                let metaclass_value = match metaclass {
+                    Some(expression) => {
+                        let value = self.lower_expr(expression)?;
+                        self.scratch_push(value)?;
+                        value
+                    }
                     None => self.none(),
                 };
-                // Kept in a variable: function creation may branch into a new
-                // block on a pending exception.
-                let base_holder = self.temp_var()?;
-                self.define_var(base_holder, base)?;
 
-                let mark = self.scratch_mark();
                 let names_slot = self.stack_array_slot(methods.len(), "class method names")?;
                 let funcs_slot = self.stack_array_slot(methods.len(), "class method functions")?;
                 let kinds_slot = self.stack_array_slot(methods.len(), "class method kinds")?;
@@ -2976,29 +3075,59 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     self.builder
                         .ins()
                         .stack_addr(self.ptr_ty, attr_values_slot, 0);
-                let base = self.builder.use_var(base_holder);
                 // Only the arrays that hold tagged values are registered as
                 // scopes; `kinds` stores raw integer tags.
                 let names_scope = self.open_scope(names_ptr, methods.len())?;
                 let funcs_scope = self.open_scope(funcs_ptr, methods.len())?;
                 let attr_names_scope = self.open_scope(attr_names_ptr, attributes.len())?;
                 let attr_values_scope = self.open_scope(attr_values_ptr, attributes.len())?;
-                let id = self.runtime.class_new;
-                let class = self.call_rt(
-                    id,
-                    &[
-                        class_ptr,
-                        class_len,
-                        base,
-                        count,
-                        names_ptr,
-                        funcs_ptr,
-                        kinds_ptr,
-                        attr_count,
-                        attr_names_ptr,
-                        attr_values_ptr,
-                    ],
-                )?;
+                let bases_ptr = self.builder.ins().stack_addr(self.ptr_ty, bases_slot, 0);
+                let bases_scope = self.open_scope(bases_ptr, bases.len())?;
+                let class = if bases.len() <= 1 && metaclass.is_none() {
+                    // The single-base fast path: one base value or `None`.
+                    let base = if bases.is_empty() {
+                        self.none()
+                    } else {
+                        self.builder.ins().stack_load(types::I64, bases_slot, 0)
+                    };
+                    let id = self.runtime.class_new;
+                    self.call_rt(
+                        id,
+                        &[
+                            class_ptr,
+                            class_len,
+                            base,
+                            count,
+                            names_ptr,
+                            funcs_ptr,
+                            kinds_ptr,
+                            attr_count,
+                            attr_names_ptr,
+                            attr_values_ptr,
+                        ],
+                    )?
+                } else {
+                    let base_count = self.builder.ins().iconst(self.ptr_ty, bases.len() as i64);
+                    let id = self.runtime.class_new_multi;
+                    self.call_rt(
+                        id,
+                        &[
+                            class_ptr,
+                            class_len,
+                            bases_ptr,
+                            base_count,
+                            metaclass_value,
+                            names_ptr,
+                            funcs_ptr,
+                            kinds_ptr,
+                            count,
+                            attr_names_ptr,
+                            attr_values_ptr,
+                            attr_count,
+                        ],
+                    )?
+                };
+                self.close_scope(bases_scope);
                 self.close_scope(attr_values_scope);
                 self.close_scope(attr_names_scope);
                 self.close_scope(funcs_scope);
@@ -4218,6 +4347,114 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let id = self.runtime.set_new;
                 self.lower_items_literal(items, "set literal", id)
             }
+            ExprKind::Template {
+                strings,
+                interpolations,
+            } => {
+                // PEP 750: build each `Interpolation` in source order, then
+                // the `Template`. Every intermediate value stays rooted while
+                // later interpolations allocate.
+                let mark = self.scratch_mark();
+                let mut string_values = Vec::with_capacity(strings.len());
+                for text in strings {
+                    let value = self.str_const(text)?;
+                    self.scratch_push(value)?;
+                    string_values.push(value);
+                }
+                let mut interpolation_values = Vec::with_capacity(interpolations.len());
+                for interpolation in interpolations {
+                    let iter_mark = self.scratch_mark();
+                    let value = self.lower_expr(&interpolation.value)?;
+                    self.scratch_push(value)?;
+                    let format_spec = match &interpolation.format_spec {
+                        Some(spec) => {
+                            let spec = self.lower_expr(spec)?;
+                            self.scratch_push(spec)?;
+                            spec
+                        }
+                        None => self.none(),
+                    };
+                    let (expression_slot, expression_len) =
+                        make_bytes_slot(&mut self.builder, interpolation.expression.as_bytes())?;
+                    let expression_ptr =
+                        self.builder
+                            .ins()
+                            .stack_addr(self.ptr_ty, expression_slot, 0);
+                    let expression_len = self
+                        .builder
+                        .ins()
+                        .iconst(self.ptr_ty, expression_len as i64);
+                    let conversion = self
+                        .builder
+                        .ins()
+                        .iconst(types::I32, i64::from(interpolation.conversion));
+                    let self_documenting = self.builder.ins().iconst(
+                        types::I32,
+                        i64::from(u8::from(interpolation.self_documenting)),
+                    );
+                    let id = self.runtime.interpolation_new;
+                    let result = self.call_rt(
+                        id,
+                        &[
+                            value,
+                            expression_ptr,
+                            expression_len,
+                            conversion,
+                            format_spec,
+                            self_documenting,
+                        ],
+                    )?;
+                    self.scratch_release(iter_mark)?;
+                    self.scratch_push(result)?;
+                    self.emit_exc_check()?;
+                    interpolation_values.push(result);
+                }
+                let strings_slot =
+                    self.stack_array_slot(string_values.len(), "template strings")?;
+                for (index, value) in string_values.iter().enumerate() {
+                    self.builder
+                        .ins()
+                        .stack_store(*value, strings_slot, (index * 8) as i32);
+                }
+                let interpolations_slot =
+                    self.stack_array_slot(interpolation_values.len(), "template interpolations")?;
+                for (index, value) in interpolation_values.iter().enumerate() {
+                    self.builder
+                        .ins()
+                        .stack_store(*value, interpolations_slot, (index * 8) as i32);
+                }
+                let strings_ptr = self.builder.ins().stack_addr(self.ptr_ty, strings_slot, 0);
+                let strings_len = self
+                    .builder
+                    .ins()
+                    .iconst(self.ptr_ty, string_values.len() as i64);
+                let interpolations_ptr =
+                    self.builder
+                        .ins()
+                        .stack_addr(self.ptr_ty, interpolations_slot, 0);
+                let interpolations_len = self
+                    .builder
+                    .ins()
+                    .iconst(self.ptr_ty, interpolation_values.len() as i64);
+                let strings_scope = self.open_scope(strings_ptr, string_values.len())?;
+                let interpolations_scope =
+                    self.open_scope(interpolations_ptr, interpolation_values.len())?;
+                let id = self.runtime.template_new;
+                let result = self.call_rt(
+                    id,
+                    &[
+                        strings_len,
+                        strings_ptr,
+                        interpolations_len,
+                        interpolations_ptr,
+                    ],
+                )?;
+                self.close_scope(interpolations_scope);
+                self.close_scope(strings_scope);
+                self.scratch_release(mark)?;
+                self.emit_exc_check()?;
+                Ok(result)
+            }
             ExprKind::Dict(pairs) => {
                 let mark = self.scratch_mark();
                 let mut keys = Vec::with_capacity(pairs.len());
@@ -4342,7 +4579,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 args,
                 star,
                 keywords,
-            } => self.lower_method_call(object, method, args, star.as_deref(), keywords),
+                double_star,
+            } => self.lower_method_call(
+                object,
+                method,
+                args,
+                star.as_deref(),
+                keywords,
+                double_star.as_deref(),
+            ),
             ExprKind::FunctionRef(id) => self.lower_function_ref(*id),
             ExprKind::BuiltinRef(builtin) => self.lower_builtin_ref(*builtin),
             ExprKind::ExceptionClass(kind) => {
@@ -4356,6 +4601,19 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.lower_indirect_call(callee, args, star.as_deref())
             }
             ExprKind::Call { callee, args } => self.lower_call(callee, args),
+            ExprKind::CallFull {
+                callee,
+                args,
+                star,
+                keywords,
+                double_star,
+            } => self.lower_call_full(
+                callee,
+                args,
+                star.as_deref(),
+                keywords,
+                double_star.as_deref(),
+            ),
             ExprKind::CallKw {
                 callee,
                 args,
@@ -4738,15 +4996,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         args: &'a [Expr],
         star: Option<&'a Expr>,
         keywords: &'a [(String, Expr)],
+        double_star: Option<&'a Expr>,
     ) -> Result<Value, CodegenError> {
-        if star.is_some() && !args.is_empty() {
-            return Err(CodegenError::new(
-                "method call cannot mix positional and starred arguments",
-            ));
-        }
         // Evaluate every operand left to right, rooting each one in the
         // scratch region so a later argument's allocation cannot collect an
-        // earlier one. The arrays are only populated afterwards; they are
+        // earlier one. The buffers are only populated afterwards; they are
         // registered as scopes for the single runtime call.
         let mark = self.scratch_mark();
         let receiver = self.lower_expr(object)?;
@@ -4757,8 +5011,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             self.scratch_push(value)?;
             arg_values.push(value);
         }
-        // The starred operand is evaluated after the receiver and before the
-        // keywords, matching its position in the call.
+        // The starred operand is evaluated after the positional arguments and
+        // before the keywords, matching its position in the call.
         let star_value = match star {
             Some(star) => {
                 let value = self.lower_expr(star)?;
@@ -4777,6 +5031,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             self.scratch_push(value)?;
             kw_values.push((keyword, value));
         }
+        // `**mapping` is evaluated last.
+        let double_star_value = match double_star {
+            Some(mapping) => {
+                let value = self.lower_expr(mapping)?;
+                self.scratch_push(value)?;
+                Some(value)
+            }
+            None => None,
+        };
 
         let receiver_slot = self.stack_array_slot(1, "method receiver")?;
         self.builder.ins().stack_store(receiver, receiver_slot, 0);
@@ -4786,14 +5049,6 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 .ins()
                 .stack_store(*value, argv_slot, (index * 8) as i32);
         }
-        let star_slot = match star_value {
-            Some(value) => {
-                let slot = self.stack_array_slot(1, "method starred argument")?;
-                self.builder.ins().stack_store(value, slot, 0);
-                Some(slot)
-            }
-            None => None,
-        };
         let pairs = keywords
             .len()
             .checked_mul(2)
@@ -4822,21 +5077,47 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let kw_argv = self.builder.ins().stack_addr(self.ptr_ty, kw_slot, 0);
 
         let receiver_scope = self.open_scope(receiver_ptr, 1)?;
-        let result = if star_value.is_some() {
-            let Some(star_slot) = star_slot else {
-                return Err(CodegenError::new(
-                    "internal error: starred method call without a stack slot",
-                ));
+        let result = if star_value.is_some() || double_star_value.is_some() {
+            // Runtime flattener: `*star` is appended to the positional
+            // arguments, `**mapping` is merged into the keyword buffer and a
+            // duplicate key is a `TypeError` raised by the runtime.
+            let star_operand = match star_value {
+                Some(value) => value,
+                None => self.none(),
             };
+            let map_operand = match double_star_value {
+                Some(value) => value,
+                None => self.none(),
+            };
+            let star_slot = self.stack_array_slot(1, "method starred argument")?;
+            self.builder.ins().stack_store(star_operand, star_slot, 0);
+            let map_slot = self.stack_array_slot(1, "method double-star argument")?;
+            self.builder.ins().stack_store(map_operand, map_slot, 0);
             let star_ptr = self.builder.ins().stack_addr(self.ptr_ty, star_slot, 0);
-            let star_scope = self.open_scope(star_ptr, 1)?;
+            let map_ptr = self.builder.ins().stack_addr(self.ptr_ty, map_slot, 0);
+            let argv_scope = self.open_scope(argv, args.len())?;
             let kw_scope = self.open_scope(kw_argv, pairs)?;
-            let star = self.builder.ins().stack_load(types::I64, star_slot, 0);
-            let id = self.runtime.method_star;
-            let result: Result<Value, CodegenError> =
-                self.call_rt(id, &[receiver, name, name_len, star, kwargc, kw_argv]);
-            self.close_scope(kw_scope);
+            let star_scope = self.open_scope(star_ptr, 1)?;
+            let map_scope = self.open_scope(map_ptr, 1)?;
+            let id = self.runtime.method_star_kw;
+            let result: Result<Value, CodegenError> = self.call_rt(
+                id,
+                &[
+                    receiver,
+                    name,
+                    name_len,
+                    argc,
+                    argv,
+                    star_operand,
+                    kwargc,
+                    kw_argv,
+                    map_operand,
+                ],
+            );
+            self.close_scope(map_scope);
             self.close_scope(star_scope);
+            self.close_scope(kw_scope);
+            self.close_scope(argv_scope);
             result
         } else if keywords.is_empty() {
             let argv_scope = self.open_scope(argv, args.len())?;
@@ -4856,6 +5137,124 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             result
         };
         self.close_scope(receiver_scope);
+        self.scratch_release(mark)?;
+        let result = result?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
+    /// Lower `f(args..., *star, kw=value..., **double_star)` through a
+    /// function value with `hydro_call_star_kw`.
+    ///
+    /// Python's order is preserved: callee, positional operands, the starred
+    /// operand, each named keyword value, then the `**mapping`. The runtime
+    /// flattens the starred operand, merges the keywords and raises `TypeError`
+    /// for a non-mapping `**` operand, a non-`str` key or a key bound twice.
+    fn lower_call_full(
+        &mut self,
+        callee: &'a Expr,
+        args: &'a [Expr],
+        star: Option<&'a Expr>,
+        keywords: &'a [(String, Expr)],
+        double_star: Option<&'a Expr>,
+    ) -> Result<Value, CodegenError> {
+        let mark = self.scratch_mark();
+        let callee_value = self.lower_expr(callee)?;
+        self.scratch_push(callee_value)?;
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = self.lower_expr(arg)?;
+            self.scratch_push(value)?;
+            arg_values.push(value);
+        }
+        let star_value = match star {
+            Some(star) => {
+                let value = self.lower_expr(star)?;
+                self.scratch_push(value)?;
+                Some(value)
+            }
+            None => None,
+        };
+        let mut kw_values = Vec::with_capacity(keywords.len());
+        for (keyword, value) in keywords {
+            let keyword = self.str_const(keyword)?;
+            self.scratch_push(keyword)?;
+            let value = self.lower_expr(value)?;
+            self.scratch_push(value)?;
+            kw_values.push((keyword, value));
+        }
+        let map_value = match double_star {
+            Some(mapping) => {
+                let value = self.lower_expr(mapping)?;
+                self.scratch_push(value)?;
+                Some(value)
+            }
+            None => None,
+        };
+        let star_operand = match star_value {
+            Some(value) => value,
+            None => self.none(),
+        };
+        let map_operand = match map_value {
+            Some(value) => value,
+            None => self.none(),
+        };
+
+        let argv_slot = self.stack_array_slot(args.len(), "call arguments")?;
+        for (index, value) in arg_values.iter().enumerate() {
+            self.builder
+                .ins()
+                .stack_store(*value, argv_slot, (index * 8) as i32);
+        }
+        let pairs = keywords
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| CodegenError::new("call: too many keyword arguments"))?;
+        let kw_slot = self.stack_array_slot(pairs, "call keyword arguments")?;
+        for (index, (keyword, value)) in kw_values.iter().enumerate() {
+            self.builder
+                .ins()
+                .stack_store(*keyword, kw_slot, (index * 16) as i32);
+            self.builder
+                .ins()
+                .stack_store(*value, kw_slot, (index * 16 + 8) as i32);
+        }
+        let star_slot = self.stack_array_slot(1, "call starred argument")?;
+        self.builder.ins().stack_store(star_operand, star_slot, 0);
+        let map_slot = self.stack_array_slot(1, "call double-star argument")?;
+        self.builder.ins().stack_store(map_operand, map_slot, 0);
+
+        let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
+        let kwargc = self
+            .builder
+            .ins()
+            .iconst(self.ptr_ty, keywords.len() as i64);
+        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        let kw_argv = self.builder.ins().stack_addr(self.ptr_ty, kw_slot, 0);
+        let star_ptr = self.builder.ins().stack_addr(self.ptr_ty, star_slot, 0);
+        let map_ptr = self.builder.ins().stack_addr(self.ptr_ty, map_slot, 0);
+
+        let argv_scope = self.open_scope(argv, args.len())?;
+        let kw_scope = self.open_scope(kw_argv, pairs)?;
+        let star_scope = self.open_scope(star_ptr, 1)?;
+        let map_scope = self.open_scope(map_ptr, 1)?;
+        let id = self.runtime.call_star_kw;
+        let result = self.call_rt(
+            id,
+            &[
+                callee_value,
+                argc,
+                argv,
+                star_operand,
+                kwargc,
+                kw_argv,
+                map_operand,
+            ],
+        );
+        self.close_scope(map_scope);
+        self.close_scope(star_scope);
+        self.close_scope(kw_scope);
+        self.close_scope(argv_scope);
         self.scratch_release(mark)?;
         let result = result?;
         self.emit_exc_check()?;
@@ -5504,6 +5903,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         }
     }
 
+    /// User-visible name of a function value: the `def` name without the
+    /// qualified prefix Hydro uses for diagnostics (`deco.apply.wrapper` ->
+    /// `wrapper`, `C.method` -> `method`). `function.__name__` reports this.
+    fn value_name(name: &str) -> &str {
+        name.rsplit('.').next().unwrap_or(name)
+    }
+
     /// Lower a reference to a program function to a first-class function
     /// value via `hydro_function_new(wrapper, arity, name, name_len, flags)`.
     fn lower_function_ref(&mut self, id: FunctionId) -> Result<Value, CodegenError> {
@@ -5530,7 +5936,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             .builder
             .ins()
             .iconst(self.ptr_ty, function.call_arity() as i64);
-        let (name_slot, name_len) = make_bytes_slot(&mut self.builder, function.name.as_bytes())?;
+        let (name_slot, name_len) = make_bytes_slot(
+            &mut self.builder,
+            Self::value_name(&function.name).as_bytes(),
+        )?;
         let name = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
         let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
         let flags = self.function_flags(function);
@@ -5554,6 +5963,39 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         function: &'a Function,
         id: FunctionId,
     ) -> Result<Value, CodegenError> {
+        self.attach_signature(value, function, id, None)
+    }
+
+    /// Attaches metadata to a closure value.
+    ///
+    /// A closure's leading parameters are its captures: they are supplied by
+    /// the function value, never by the caller. The runtime binder must
+    /// therefore see them as non-bindable slots that already carry a value.
+    /// They are encoded as keyword-only parameters whose name is a NUL-prefixed
+    /// sentinel (never a valid Python identifier, so no keyword can target
+    /// them) and whose default is the captured value. Their position still
+    /// matches the full-argv trampoline, which forwards captures followed by
+    /// the user-visible parameters; the binder fills the capture slots from
+    /// their defaults and binds only the trailing user parameters.
+    fn attach_closure_signature(
+        &mut self,
+        value: Value,
+        function: &'a Function,
+        id: FunctionId,
+        capture_values: &[Value],
+    ) -> Result<Value, CodegenError> {
+        self.attach_signature(value, function, id, Some(capture_values))
+    }
+
+    /// Shared implementation of [`Self::attach_function_signature`] and
+    /// [`Self::attach_closure_signature`].
+    fn attach_signature(
+        &mut self,
+        value: Value,
+        function: &'a Function,
+        id: FunctionId,
+        captures: Option<&[Value]>,
+    ) -> Result<Value, CodegenError> {
         let full_wrapper = *self.full_wrappers.get(&id).ok_or_else(|| {
             CodegenError::new(format!("full wrapper for function {id} was not declared"))
         })?;
@@ -5570,7 +6012,30 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let defaults = self.stack_array_slot(count, "function parameter defaults")?;
         let flags = self.stack_array_slot(count, "function parameter default flags")?;
         for (index, param) in function.params.iter().enumerate() {
-            let (name_slot, name_len) = make_bytes_slot(&mut self.builder, param.name.as_bytes())?;
+            // A capture slot: the closure already carries the value, so it is
+            // hidden from keyword binding and pre-filled from the captured
+            // local. `function.capture_count` leading parameters are captures.
+            let capture = captures.and_then(|values| {
+                if index < function.capture_count {
+                    values.get(index).copied()
+                } else {
+                    None
+                }
+            });
+            // The name is not a valid Python identifier, so a caller cannot
+            // target a capture even through `**{"..."}` without spelling the
+            // NUL-prefixed sentinel explicitly.
+            let capture_name = capture.map(|_| format!("\u{0}capture{index}"));
+            let name_bytes = match &capture_name {
+                Some(name) => name.as_bytes(),
+                None => param.name.as_bytes(),
+            };
+            let kind_tag = if capture.is_some() {
+                ParamKind::KwOnly.abi_tag()
+            } else {
+                param.kind.abi_tag()
+            };
+            let (name_slot, name_len) = make_bytes_slot(&mut self.builder, name_bytes)?;
             let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
             let name_ptr = self.pointer_to_i64(name_ptr);
             self.builder
@@ -5580,21 +6045,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             self.builder
                 .ins()
                 .stack_store(len, names, (index * 16 + 8) as i32);
-            let kind = match param.kind {
-                ParamKind::Positional => 0,
-                ParamKind::VarArg => 1,
-                ParamKind::KwOnly => 2,
-                ParamKind::KwArg => 3,
-            };
-            let kind = self.builder.ins().iconst(types::I64, kind);
+            let kind = self.builder.ins().iconst(types::I64, kind_tag);
             self.builder
                 .ins()
                 .stack_store(kind, kinds, (index * 8) as i32);
-            let default = match &param.default_expr {
-                Some(expression) => Some(self.lower_expr(expression)?),
-                None => match &param.default {
-                    Some(default) => Some(self.lower_const(default)?),
-                    None => None,
+            let default = match capture {
+                Some(value) => Some(value),
+                None => match &param.default_expr {
+                    Some(expression) => Some(self.lower_expr(expression)?),
+                    None => match &param.default {
+                        Some(default) => Some(self.lower_const(default)?),
+                        None => None,
+                    },
                 },
             };
             match default {
@@ -6286,6 +6748,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             | Builtin::Import
             | Builtin::Input
             | Builtin::GetIpython
+            | Builtin::ByteArray
+            | Builtin::MemoryView
             | Builtin::AnyValue => self.lower_builtin_values(builtin, values),
             Builtin::Max | Builtin::Min => {
                 // The frontend always appends the key slot as the final
@@ -7104,6 +7568,7 @@ mod tests {
                 args: vec![text("a"), text("b")],
                 star: None,
                 keywords: vec![("count".to_string(), count)],
+                double_star: None,
             },
             Type::Str,
             1,
@@ -7123,6 +7588,7 @@ mod tests {
                 args: Vec::new(),
                 star: None,
                 keywords: Vec::new(),
+                double_star: None,
             },
             Type::Str,
             1,
@@ -7147,12 +7613,16 @@ mod tests {
                     1,
                 ))),
                 keywords: vec![("style".to_string(), text("bold"))],
+                double_star: None,
             },
             Type::Any,
             1,
         ));
         let object = crate::compile_object(&program).expect("starred method call must lower");
-        assert!(runtime_call_sites(&object, "hydro_method_star") > 0);
+        assert!(
+            runtime_call_sites(&object, "hydro_method_star") > 0
+                || runtime_call_sites(&object, "hydro_method_star_kw") > 0
+        );
     }
 
     #[test]
@@ -7272,7 +7742,8 @@ mod tests {
                     StmtKind::ClassDef {
                         target: 0,
                         name: "C".to_string(),
-                        base: None,
+                        bases: Vec::new(),
+                        metaclass: None,
                         methods: vec![ClassMethod {
                             name: "get".to_string(),
                             function: 1,
@@ -7342,11 +7813,12 @@ mod tests {
                     StmtKind::ClassDef {
                         target: 0,
                         name: "E".to_string(),
-                        base: Some(Expr::new(
+                        bases: vec![Expr::new(
                             ExprKind::ExceptionClass(ExcKind::Exception),
                             Type::Any,
                             1,
-                        )),
+                        )],
+                        metaclass: None,
                         methods: Vec::new(),
                         attributes: Vec::new(),
                     },
@@ -8669,7 +9141,8 @@ mod tests {
                         StmtKind::ClassDef {
                             target: 0,
                             name: "Bench".to_string(),
-                            base: None,
+                            bases: Vec::new(),
+                            metaclass: None,
                             methods: vec![ClassMethod {
                                 name: "__init__".to_string(),
                                 function: 1,

@@ -152,6 +152,7 @@ fn expr_use(expr: &Expr, local: LocalId) -> Use {
             args,
             star,
             keywords,
+            double_star,
             ..
         } => {
             let mut use_ = expr_use(object, local).merge(exprs_use(args, local));
@@ -160,6 +161,28 @@ fn expr_use(expr: &Expr, local: LocalId) -> Use {
             }
             for (_, keyword) in keywords {
                 use_ = use_.merge(expr_use(keyword, local));
+            }
+            if let Some(mapping) = double_star {
+                use_ = use_.merge(expr_use(mapping, local));
+            }
+            use_
+        }
+        ExprKind::CallFull {
+            callee,
+            args,
+            star,
+            keywords,
+            double_star,
+        } => {
+            let mut use_ = expr_use(callee, local).merge(exprs_use(args, local));
+            if let Some(star) = star {
+                use_ = use_.merge(expr_use(star, local));
+            }
+            for (_, keyword) in keywords {
+                use_ = use_.merge(expr_use(keyword, local));
+            }
+            if let Some(mapping) = double_star {
+                use_ = use_.merge(expr_use(mapping, local));
             }
             use_
         }
@@ -198,6 +221,17 @@ fn expr_use(expr: &Expr, local: LocalId) -> Use {
             None => Use::none(),
         },
         ExprKind::YieldFrom { value } => expr_use(value, local),
+        ExprKind::Template { interpolations, .. } => {
+            // Interpolation values and format specs are ordinary reads.
+            let mut use_ = Use::none();
+            for interpolation in interpolations {
+                use_ = use_.merge(expr_use(&interpolation.value, local));
+                if let Some(spec) = &interpolation.format_spec {
+                    use_ = use_.merge(expr_use(spec, local));
+                }
+            }
+            use_
+        }
         ExprKind::ModuleCall { args, keywords, .. } => {
             let mut use_ = exprs_use(args, local);
             for (_, keyword) in keywords {
@@ -397,7 +431,8 @@ fn stmt_use(stmt: &Stmt, local: LocalId) -> Use {
         StmtKind::ClassDef {
             target,
             name: _,
-            base,
+            bases,
+            metaclass,
             methods: _,
             attributes,
         } => {
@@ -405,8 +440,11 @@ fn stmt_use(stmt: &Stmt, local: LocalId) -> Use {
             // scope is a closure capture, which the enclosing statement list
             // records.
             let mut use_ = local_use(*target, local);
-            if let Some(base) = base {
+            for base in bases {
                 use_ = use_.merge(expr_use(base, local));
+            }
+            if let Some(metaclass) = metaclass {
+                use_ = use_.merge(expr_use(metaclass, local));
             }
             for attribute in attributes {
                 use_ = use_.merge(expr_use(&attribute.value, local));

@@ -73,11 +73,7 @@ pub fn function_new(
 ) -> i64 {
     let flags = u32::from(is_async)
         | (u32::from(is_generator) << 1)
-        | (u32::from(
-            params
-                .iter()
-                .any(|param| param.kind != ParamKind::Positional),
-        ) << 2);
+        | (u32::from(params.iter().any(|param| !param.kind.is_positional())) << 2);
     let mut rooted: Vec<i64> = captures.clone();
     rooted.extend(params.iter().filter_map(|param| param.default));
     let roots = heap::root_values(&rooted);

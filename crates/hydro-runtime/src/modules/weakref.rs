@@ -13,15 +13,15 @@
 //!   target is hashable, `__repr__`;
 //! * `proxy`/`ProxyType`/`CallableProxyType` — the callable proxy form (calls
 //!   forward to the target, and a collected target raises `ReferenceError`);
-//! * `getweakrefcount`, `getweakrefs`, `_remove_dead_weakref`.
+//! * `getweakrefcount`, `getweakrefs`, `_remove_dead_weakref`;
+//! * weak-reference callbacks: `ref(obj, callback)` / `proxy(obj, callback)`
+//!   invoke the callable exactly once, with the reference object, when the
+//!   target is collected. Callbacks run outside every GC lock at a safepoint
+//!   or after an explicit `gc.collect()`; a raising callback is reported like
+//!   CPython's unraisable output and cleared.
 //!
 //! Documented limits (reported instead of silently ignored):
 //!
-//! * Weak-reference callbacks are not supported. `ref(obj, callback)` and
-//!   `proxy(obj, callback)` raise `TypeError` when `callback` is not `None`;
-//!   the collector never runs Python callbacks, so accepting one would be a
-//!   lie. This also means `_weakrefset`/`weakref.WeakKeyDictionary` work only
-//!   for operations that do not install a callback.
 //! * A non-callable `proxy` cannot forward attribute reads without a
 //!   dedicated attribute-dispatch hook, so `proxy(non_callable)` raises
 //!   `NotImplementedError` instead of pretending to proxy.
@@ -29,6 +29,11 @@
 //!   this runtime does not dispatch `__hash__`; the correct target hash (and
 //!   `TypeError` for unhashable targets) is available through
 //!   `ref.__hash__()`.
+//! * Pure `weakref.KeyedRef` relies on `__new__` to attach its `key`, and the
+//!   runtime's generic `__new__` ignores that; its callback therefore cannot
+//!   remove `WeakValueDictionary` entries (the callback is reported and
+//!   cleared). `WeakSet` and `WeakKeyDictionary`, which use plain `ref` with a
+//!   closure callback, work.
 //!
 //! Integration contract (the module itself is registered by `modules::mod`):
 //!
@@ -237,21 +242,21 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-/// Rejects a non-`None` callback with a tagged error.
+/// Instance attribute holding the armed callback, mirroring CPython's
+/// `weakref.__callback__`.
+const CALLBACK_ATTR: &str = "__callback__";
+
+/// Reads and validates the callback argument at `index`.
 ///
-/// `index` is the callback's argument position: 1 for module-level
-/// `ref(obj, callback)` / `proxy(obj, callback)`, 2 for the bound methods
-/// (`self` first).
-fn reject_callback(args: &[i64], index: usize) -> bool {
+/// `NONE` means "no callback"; anything else must be callable. A non-callable
+/// callback is a `TypeError`, exactly like CPython.
+fn callback_argument(args: &[i64], index: usize) -> Result<i64, ()> {
     let callback = args.get(index).copied().unwrap_or(NONE);
-    if callback == NONE {
-        return false;
+    if callback != NONE && !is_callable(callback) {
+        exc::raise_with_message(TYPE_ERROR, "argument 2 must be callable");
+        return Err(());
     }
-    exc::raise_with_message(
-        TYPE_ERROR,
-        "weakref callbacks are not supported by this runtime; pass callback=None",
-    );
-    true
+    Ok(callback)
 }
 
 /// Validates the target of a reference, raising `TypeError` for values that
@@ -278,16 +283,20 @@ fn reference_init(args: &[i64]) -> i64 {
     if value::as_instance(args[0]).is_none() {
         return exc::raise_with_message(TYPE_ERROR, "ref() requires a ReferenceType instance");
     }
-    if reject_callback(args, 2) {
-        return NONE;
-    }
+    let callback = match callback_argument(args, 2) {
+        Ok(callback) => callback,
+        Err(()) => return NONE,
+    };
     let target = args[1];
     if !validate_target(target) {
         return NONE;
     }
-    if !heap::weakref_register(args[0], target) {
+    if !heap::weakref_register_with_callback(args[0], target, callback) {
         return exc::raise_with_message(TYPE_ERROR, "cannot create weak reference");
     }
+    // The visible attribute and the side table must agree. The side table is
+    // authoritative for the GC edge; the attribute mirrors CPython.
+    value::instance_setattr(args[0], CALLBACK_ATTR.to_string(), callback);
     NONE
 }
 
@@ -370,17 +379,17 @@ fn module_ref(args: &[i64]) -> i64 {
     let Some(&target) = args.first() else {
         return exc::raise_with_message(TYPE_ERROR, "ref() requires a target object");
     };
-    if reject_callback(args, 1) {
-        return NONE;
-    }
+    let callback = match callback_argument(args, 1) {
+        Ok(callback) => callback,
+        Err(()) => return NONE,
+    };
     if !validate_target(target) {
         return NONE;
     }
     let reference = value::instance_new(reference_class());
-    // The callback was validated above; `reference_init` re-check reads only
-    // the two arguments supplied here. `__init__` returns None, so the module
-    // function has to return the freshly created reference itself.
-    let result = reference_init(&[reference, target]);
+    // `__init__` returns None, so the module function has to return the
+    // freshly created reference itself.
+    let result = reference_init(&[reference, target, callback]);
     if exc::pending() {
         result
     } else {
@@ -397,9 +406,10 @@ fn module_proxy(args: &[i64]) -> i64 {
     let Some(&target) = args.first() else {
         return exc::raise_with_message(TYPE_ERROR, "proxy() requires a target object");
     };
-    if reject_callback(args, 1) {
-        return NONE;
-    }
+    let callback = match callback_argument(args, 1) {
+        Ok(callback) => callback,
+        Err(()) => return NONE,
+    };
     if !validate_target(target) {
         return NONE;
     }
@@ -412,7 +422,7 @@ fn module_proxy(args: &[i64]) -> i64 {
     let proxy = value::instance_new(callable_proxy_class());
     // `ProxyType.__init__` returns None: the module function returns the new
     // proxy instance, and reports a failed initialisation with its exception.
-    let result = proxy_init(&[proxy, target]);
+    let result = proxy_init(&[proxy, target, callback]);
     if exc::pending() {
         result
     } else {
@@ -428,9 +438,10 @@ fn proxy_init(args: &[i64]) -> i64 {
     if value::as_instance(args[0]).is_none() {
         return exc::raise_with_message(TYPE_ERROR, "proxy() requires a ProxyType instance");
     }
-    if reject_callback(args, 2) {
-        return NONE;
-    }
+    let callback = match callback_argument(args, 2) {
+        Ok(callback) => callback,
+        Err(()) => return NONE,
+    };
     let target = args[1];
     if !validate_target(target) {
         return NONE;
@@ -441,9 +452,10 @@ fn proxy_init(args: &[i64]) -> i64 {
             "weakref.proxy of a non-callable object is not supported by this runtime",
         );
     }
-    if !heap::weakref_register(args[0], target) {
+    if !heap::weakref_register_with_callback(args[0], target, callback) {
         return exc::raise_with_message(TYPE_ERROR, "cannot create weak proxy");
     }
+    value::instance_setattr(args[0], CALLBACK_ATTR.to_string(), callback);
     NONE
 }
 
@@ -562,14 +574,42 @@ fn remove_dead_weakref(args: &[i64]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+
     use crate::heap::WEAK_TEST_LOCK;
     use crate::value::{as_class, as_instance, encode_int, str_alloc, FALSE, TRUE};
+
+    /// Counts callback invocations and records the reference argument.
+    static CALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CALLBACK_LAST: AtomicI64 = AtomicI64::new(0);
+
+    /// A generated-wrapper-shaped callback: receives the reference as its
+    /// single positional argument.
+    unsafe extern "C" fn counting_callback(argv: *const i64) -> i64 {
+        CALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+        if !argv.is_null() {
+            // SAFETY: the caller passes one readable tagged argument.
+            CALLBACK_LAST.store(unsafe { *argv }, Ordering::SeqCst);
+        }
+        NONE
+    }
+
+    fn counting_ref_callback() -> i64 {
+        let entry: unsafe extern "C" fn(*const i64) -> i64 = counting_callback;
+        value::function_new_with_flags(entry as usize, 1, "weakref_callback".to_string(), 0)
+    }
+
+    fn reset_callback_counter() {
+        CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        CALLBACK_LAST.store(0, Ordering::SeqCst);
+    }
 
     fn weak_guard() -> std::sync::MutexGuard<'static, ()> {
         let guard = WEAK_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::heap::weakref_tests_clear();
+        reset_callback_counter();
         guard
     }
 
@@ -637,16 +677,119 @@ mod tests {
     }
 
     #[test]
-    fn callbacks_raise_instead_of_being_ignored() {
+    fn non_callable_callback_raises_type_error() {
         let _guard = weak_guard();
         exc::init();
         let target = target_instance("C");
         let reference = new_instance(reference_class());
-        let callback = value::native_function_new("_weakref", "_weakref_ref_init", 3);
-        assert_eq!(reference_init(&[reference, target, callback]), NONE);
+        let not_callable = encode_int(7).unwrap();
+        assert_eq!(reference_init(&[reference, target, not_callable]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
-        assert!(value::to_string(exc::pending_value()).contains("callback"));
+        assert!(value::to_string(exc::pending_value()).contains("callable"));
         exc::clear();
+    }
+
+    #[test]
+    fn callback_is_armed_and_visible() {
+        let _guard = weak_guard();
+        exc::init();
+        let target = target_instance("C");
+        let callback = counting_ref_callback();
+        let reference = new_instance(reference_class());
+        assert_eq!(reference_init(&[reference, target, callback]), NONE);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_attr(reference, "__callback__"),
+            Some(callback)
+        );
+        assert_eq!(reference_call(&[reference]), target);
+        // Merely arming a callback does not run it.
+        assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn callback_runs_once_when_target_is_cleared() {
+        let _guard = weak_guard();
+        exc::init();
+        let target = target_instance("C");
+        let callback = counting_ref_callback();
+        let reference = new_instance(reference_class());
+        assert_eq!(reference_init(&[reference, target, callback]), NONE);
+        assert!(!exc::pending());
+
+        // Clearing the target arms the callback; it must not run inline.
+        crate::heap::weakref_test_kill(reference);
+        assert_eq!(reference_call(&[reference]), NONE);
+        assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+
+        crate::heap::run_pending_weakref_callbacks();
+        assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(CALLBACK_LAST.load(Ordering::SeqCst), reference);
+        assert!(!exc::pending());
+
+        // Clearing/draining again must not invoke it a second time.
+        crate::heap::weakref_test_kill(reference);
+        crate::heap::run_pending_weakref_callbacks();
+        assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn raising_callback_is_reported_and_cleared() {
+        let _guard = weak_guard();
+        exc::init();
+        let target = target_instance("C");
+        // `len(reference)` has no `__len__` and raises TypeError.
+        let callback = value::builtin_function_new(hydro_ir::Builtin::Len);
+        let reference = new_instance(reference_class());
+        assert_eq!(reference_init(&[reference, target, callback]), NONE);
+        assert!(!exc::pending());
+        crate::heap::weakref_test_kill(reference);
+        crate::heap::run_pending_weakref_callbacks();
+        // The unraisable callback exception is reported and cleared; it must
+        // not leak into the caller's exception state.
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn weakset_style_ref_with_closure_callback_is_accepted() {
+        let _guard = weak_guard();
+        exc::init();
+        let target = target_instance("C");
+        let callback = counting_ref_callback();
+        // `_weakrefset` calls `ref(item, self._remove)`; a callable callback
+        // must be accepted (no TypeError) and armed.
+        let reference = module_ref(&[target, callback]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_attr(reference, "__callback__"),
+            Some(callback)
+        );
+        assert_eq!(reference_call(&[reference]), target);
+    }
+
+    #[test]
+    fn callable_proxy_accepts_and_runs_callback() {
+        let _guard = weak_guard();
+        exc::init();
+        let call_body = value::native_function_new("_weakref", "_weakref_proxy_call", usize::MAX);
+        let target_class = value::class_new(
+            "Callable".to_string(),
+            NONE,
+            vec![("__call__".to_string(), call_body)],
+        );
+        let target = new_instance(target_class);
+        let callback = counting_ref_callback();
+        let proxy = module_proxy(&[target, callback]);
+        assert!(!exc::pending());
+        assert_eq!(value::instance_attr(proxy, "__callback__"), Some(callback));
+        assert_eq!(reference_call(&[proxy]), target);
+
+        crate::heap::weakref_test_kill(proxy);
+        crate::heap::run_pending_weakref_callbacks();
+        assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(CALLBACK_LAST.load(Ordering::SeqCst), proxy);
+        assert!(!exc::pending());
     }
 
     #[test]

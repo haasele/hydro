@@ -1288,7 +1288,7 @@ fn class_definitions_emit_the_class_statement_and_self_attribute_stores() {
     let hydro_ir::StmtKind::ClassDef {
         target,
         name,
-        base,
+        bases,
         methods,
         ..
     } = &body[0].kind
@@ -1297,7 +1297,7 @@ fn class_definitions_emit_the_class_statement_and_self_attribute_stores() {
     };
     assert_eq!(name, "C");
     assert_eq!(program.functions[0].locals[*target as usize].name, "C");
-    assert!(base.is_none());
+    assert!(bases.is_empty());
     assert_eq!(methods.len(), 2);
     let init = &program.functions[methods[0].function as usize];
     assert_eq!(init.name, "C.__init__");
@@ -1328,12 +1328,10 @@ fn subclass_emits_its_base_expression() {
     let source = "class C:\n    pass\nclass D(C):\n    pass\n";
     let program = crate::check_source(source, "test.py").expect("valid program");
     let body = &program.functions[0].body;
-    let StmtKind::ClassDef {
-        base: Some(base), ..
-    } = &body[1].kind
-    else {
+    let StmtKind::ClassDef { bases, .. } = &body[1].kind else {
         panic!("expected class D with a base, got {:?}", body[1].kind);
     };
+    let base = bases.first().expect("expected one base");
     assert!(
         matches!(&base.kind, ExprKind::Local(_)),
         "base must reference the C local: {:?}",
@@ -1373,24 +1371,20 @@ class F(E):
         "{:?}",
         make.body[0].kind
     );
-    let StmtKind::ClassDef {
-        base: Some(base), ..
-    } = &body[1].kind
-    else {
+    let StmtKind::ClassDef { bases, .. } = &body[1].kind else {
         panic!("expected class E with a base, got {:?}", body[1].kind);
     };
+    let base = bases.first().expect("expected one base");
     assert!(
         matches!(&base.kind, ExprKind::ExceptionClass(ExcKind::Exception)),
         "base must be the Exception class: {:?}",
         base.kind
     );
     // `class F(E)` keeps referring to the class local created by `class E`.
-    let StmtKind::ClassDef {
-        base: Some(base), ..
-    } = &body[2].kind
-    else {
+    let StmtKind::ClassDef { bases, .. } = &body[2].kind else {
         panic!("expected class F with a base, got {:?}", body[2].kind);
     };
+    let base = bases.first().expect("expected one base");
     assert!(
         matches!(&base.kind, ExprKind::Local(_)),
         "base must reference the E local: {:?}",

@@ -17,6 +17,9 @@ use hydro_ir::{
 };
 use hydro_ir::{PYTHON_ABI_TAG, PYTHON_VERSION_STRING};
 use rustpython_parser::ast::{self, Ranged};
+use rustpython_parser::template::{
+    is_template_placeholder, template_placeholder_range, TemplateString,
+};
 use rustpython_parser::text_size::TextRange;
 
 use crate::diag::{self, codes, line_col, Diagnostic};
@@ -24,7 +27,7 @@ use crate::sema::{Infer, Ty};
 
 pub const MODULE_NAME: &str = "<module>";
 
-const BUILTIN_NAMES: [&str; 24] = [
+const BUILTIN_NAMES: [&str; 26] = [
     "print",
     "len",
     "str",
@@ -41,6 +44,8 @@ const BUILTIN_NAMES: [&str; 24] = [
     "map",
     "filter",
     "bytes",
+    "bytearray",
+    "memoryview",
     "iter",
     "next",
     "all",
@@ -255,12 +260,15 @@ pub enum HStmtKind {
         function: FunctionId,
         captures: Vec<LocalId>,
     },
-    /// `class Name(Base):` with already-lowered method functions. The runtime
-    /// class object is stored in `target`.
+    /// `class Name(bases...):` with already-lowered method functions. The
+    /// runtime class object is stored in `target`.
     ClassDef {
         target: LocalId,
         name: String,
-        base: Option<HExpr>,
+        /// Base expressions in source order; empty means `object`.
+        bases: Vec<HExpr>,
+        /// `metaclass=` keyword value, evaluated after the bases.
+        metaclass: Option<HExpr>,
         methods: Vec<(String, FunctionId, MethodKind)>,
         /// Class attributes in declaration order, evaluated when the class
         /// statement runs and frozen into the class namespace.
@@ -381,11 +389,32 @@ pub struct HExpr {
     pub col: u32,
 }
 
+/// One `{...}` interpolation of a PEP 750 template literal in HIR form.
+#[derive(Clone, Debug)]
+pub struct HTemplateInterpolation {
+    /// Expression inside the braces.
+    pub value: HExpr,
+    /// Source text of the expression exactly as written.
+    pub expression: String,
+    /// `!s`/`!r`/`!a` conversion: `0` none, `1` str, `2` repr, `3` ascii.
+    pub conversion: u8,
+    /// Expression producing the format-spec text, if any.
+    pub format_spec: Option<Box<HExpr>>,
+    /// True when the source used the `=` debug specifier.
+    pub self_documenting: bool,
+}
+
 /// Positional arguments plus `(name, value)` keyword pairs of a lowered call.
 type LoweredArguments = (Vec<HExpr>, Vec<(String, HExpr)>);
 
-/// Positional arguments, an optional starred operand and keyword pairs.
-type LoweredCallArguments = (Vec<HExpr>, Option<HExpr>, Vec<(String, HExpr)>);
+/// Positional arguments, an optional starred operand, keyword pairs and an
+/// optional `**mapping` operand of a lowered call.
+type LoweredCallOperands = (
+    Vec<HExpr>,
+    Option<HExpr>,
+    Vec<(String, HExpr)>,
+    Option<HExpr>,
+);
 
 #[derive(Clone, Debug)]
 pub enum HExprKind {
@@ -461,11 +490,13 @@ pub enum HExprKind {
         method: String,
         args: Vec<HExpr>,
         /// The single starred positional operand (`obj.m(*args)`). The runtime
-        /// flattens a list/tuple into positional arguments; the frontend
-        /// rejects combining it with plain positional arguments.
+        /// flattens a list/tuple into positional arguments.
         star: Option<Box<HExpr>>,
         /// Keyword arguments in source order; the runtime binds them.
         keywords: Vec<(String, HExpr)>,
+        /// A single `**mapping` operand, evaluated after the named keywords.
+        /// Only present in a call that needs the runtime flattener.
+        double_star: Option<Box<HExpr>>,
     },
     /// Reference to a named function or lambda as a value.
     FunctionRef(FunctionId),
@@ -543,6 +574,17 @@ pub enum HExprKind {
         args: Vec<HExpr>,
         keywords: Vec<(String, HExpr)>,
     },
+    /// `f(args..., *star, kw=value..., **double_star)` through a function
+    /// value; see [`hydro_ir::ExprKind::CallFull`]. Emitted whenever a call
+    /// needs runtime argument flattening: a starred operand next to keywords
+    /// or a `**mapping` operand.
+    CallFull {
+        callee: Box<HExpr>,
+        args: Vec<HExpr>,
+        star: Option<Box<HExpr>>,
+        keywords: Vec<(String, HExpr)>,
+        double_star: Option<Box<HExpr>>,
+    },
     /// `Class(args..., name=value, **kwargs)` for a class declared in the
     /// unit whose `__init__` has a dynamic signature. The frontend binds all
     /// `__init__` slots except `self`; codegen allocates the instance and
@@ -586,6 +628,11 @@ pub enum HExprKind {
     /// expression evaluates to the delegate's return value.
     YieldFrom {
         value: Box<HExpr>,
+    },
+    /// PEP 750 template string literal. See [`hydro_ir::ExprKind::Template`].
+    Template {
+        strings: Vec<String>,
+        interpolations: Vec<HTemplateInterpolation>,
     },
 }
 
@@ -634,11 +681,12 @@ impl CallSignature {
         self.params[index].2
     }
 
-    /// First parameter that is not positional.
+    /// First parameter that is not positional (`*args`, keyword-only or
+    /// `**kwargs`).
     fn positional_end(&self) -> usize {
         self.params[self.capture_count.min(self.params.len())..]
             .iter()
-            .position(|(_, _, kind)| *kind != ParamKind::Positional)
+            .position(|(_, _, kind)| !kind.is_positional())
             .map(|offset| self.capture_count + offset)
             .unwrap_or(self.params.len())
     }
@@ -652,9 +700,7 @@ impl CallSignature {
     }
 
     fn has_dynamic_signature(&self) -> bool {
-        self.params
-            .iter()
-            .any(|(_, _, kind)| *kind != ParamKind::Positional)
+        self.params.iter().any(|(_, _, kind)| !kind.is_positional())
     }
 }
 
@@ -715,8 +761,13 @@ struct DataclassField<'a> {
 /// A class header/body registered before any function body is lowered.
 #[derive(Clone, Debug)]
 struct ClassPlan {
-    /// Index of the single base expression in `ClassDef::bases`, if any.
-    base: Option<usize>,
+    /// Indices of the base expressions in `ClassDef::bases`, in source order.
+    bases: Vec<usize>,
+    /// Index of the `metaclass=` keyword expression, if present.
+    metaclass: Option<usize>,
+    /// Indices of the decorator expressions that are applied at runtime,
+    /// bottom-up after the class object is created.
+    decorators: Vec<usize>,
     /// Method name, function id, the index of its `FunctionDef` in the class
     /// body and its binding kind. Methods are lowered after their signatures
     /// are registered. A synthesized method (the dataclass/NamedTuple
@@ -1252,6 +1303,10 @@ pub struct Lowerer<'a> {
     source: &'a str,
     filename: &'a str,
     infer: &'a mut Infer,
+    /// PEP 750 template literals of the unit, keyed by source range. The AST
+    /// carries a reserved placeholder `Name` for each literal; lowering
+    /// resolves it through this table and never treats it as a variable.
+    templates: Vec<TemplateString>,
     functions: Vec<HFunction>,
     fn_ids: HashMap<String, FunctionId>,
     module_local_names: HashSet<String>,
@@ -1351,6 +1406,16 @@ pub struct Lowerer<'a> {
     /// Next synthetic local of an asynchronous lowering: `$aiterN`,
     /// `$aitemN`, `$aexcN`, `$aloopN`.
     async_counter: u32,
+    /// Next synthetic `$decorN` local holding a decorator callable or the
+    /// function value decorated in place.
+    decorator_counter: u32,
+    /// Next synthetic `$matchN` local holding a `match` subject or a value
+    /// extracted from a pattern.
+    match_counter: u32,
+    /// Module-level functions with at least one runtime decorator. Calls and
+    /// value reads resolve through the module local/global binding, never
+    /// through `fn_ids`, because the decorator may replace the function.
+    decorated_functions: HashMap<String, FunctionId>,
     /// Function frames in which an `await` was lowered (source-level or
     /// synthesized, e.g. by an asynchronous comprehension). A generator
     /// expression whose frame awaits is an async generator.
@@ -1401,6 +1466,7 @@ impl<'a> Lowerer<'a> {
             source,
             filename,
             infer,
+            templates: Vec::new(),
             functions: vec![HFunction {
                 name: MODULE_NAME.to_string(),
                 params: Vec::new(),
@@ -1448,6 +1514,9 @@ impl<'a> Lowerer<'a> {
             multi_counter: 0,
             for_counter: 0,
             async_counter: 0,
+            decorator_counter: 0,
+            match_counter: 0,
+            decorated_functions: HashMap::new(),
             await_frames: HashSet::new(),
             cell_plans: HashMap::new(),
             class_defs: HashMap::new(),
@@ -1493,6 +1562,16 @@ impl<'a> Lowerer<'a> {
 
     pub fn set_fid_base(&mut self, base: FunctionId) {
         self.fid_base = base;
+    }
+
+    /// Installs the PEP 750 template literals of this unit.
+    ///
+    /// The parser emits a reserved placeholder `Name` for each template
+    /// literal and returns the resolved structure out of band. Lowering a
+    /// placeholder without an entry here is a diagnostic, never a variable
+    /// read: a template must never silently become an ordinary name.
+    pub fn set_templates(&mut self, templates: &[TemplateString]) {
+        self.templates = templates.to_vec();
     }
 
     /// Sets the string bound to `__name__` in the module body.
@@ -1575,6 +1654,13 @@ impl<'a> Lowerer<'a> {
     pub fn exported_names(&self) -> HashMap<String, UserExport> {
         let mut exports = HashMap::with_capacity(self.fn_ids.len() + self.global_names.len());
         for (name, id) in &self.fn_ids {
+            // A decorated function is replaced by the decorator's result at
+            // runtime, so importers read the mirrored module global instead
+            // of linking the raw function id.
+            if self.decorated_functions.contains_key(name) {
+                exports.insert(name.clone(), UserExport::Global);
+                continue;
+            }
             exports.insert(name.clone(), UserExport::Function(*id));
         }
         for name in &self.global_names {
@@ -1649,6 +1735,13 @@ impl<'a> Lowerer<'a> {
         //    lets us explain why a module-level name is not visible there.
         let mut module_names = Vec::new();
         collect_names(&module.body, &mut module_names, false);
+        // A decorated function's binding is the decorator's result, so the
+        // name needs an ordinary module local slot.
+        for name in self.decorated_functions.keys() {
+            if !module_names.iter().any(|existing| existing == name) {
+                module_names.push(name.clone());
+            }
+        }
         // A session fragment that only augments a name bound by an earlier
         // fragment must not allocate a fresh local for it: the read and the
         // write both go through the runtime global table. Names the fragment
@@ -1748,9 +1841,54 @@ impl<'a> Lowerer<'a> {
         let mut body = Vec::new();
         for (idx, stmt) in module.body.iter().enumerate() {
             match stmt {
-                ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => {
+                ast::Stmt::FunctionDef(f) => {
+                    if let Some(&fid) = def_ids.get(&idx) {
+                        if self.has_runtime_function_decorators(&f.decorator_list) {
+                            let (line, col) = self.span(f.range);
+                            self.lower_module_function_definition(
+                                &f.decorator_list,
+                                fid,
+                                f.range,
+                                &mut fs,
+                                &mut body,
+                                line,
+                                col,
+                            );
+                            continue;
+                        }
+                    }
                     self.mirror_module_function(idx, &def_ids, &mut body);
                     continue;
+                }
+                ast::Stmt::AsyncFunctionDef(f) => {
+                    if let Some(&fid) = def_ids.get(&idx) {
+                        if self.has_runtime_function_decorators(&f.decorator_list) {
+                            let (line, col) = self.span(f.range);
+                            self.lower_module_function_definition(
+                                &f.decorator_list,
+                                fid,
+                                f.range,
+                                &mut fs,
+                                &mut body,
+                                line,
+                                col,
+                            );
+                            continue;
+                        }
+                    }
+                    self.mirror_module_function(idx, &def_ids, &mut body);
+                    continue;
+                }
+                ast::Stmt::ClassDef(c) => {
+                    let has_decorators = self
+                        .class_defs
+                        .get(&(u32::from(c.range.start()) as usize))
+                        .is_some_and(|plan| !plan.decorators.is_empty());
+                    if has_decorators {
+                        let (line, col) = self.span(c.range);
+                        self.lower_decorated_class(c, &mut fs, &mut body, line, col);
+                        continue;
+                    }
                 }
                 ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) if !self.session_mode => continue,
                 _ => {}
@@ -2368,7 +2506,7 @@ impl<'a> Lowerer<'a> {
 
         let mut inits = Vec::new();
         for (name, value) in bindings {
-            if !module_references_name(&module.body, name) {
+            if !module_references_name(&module.body, name) && !self.template_loads_name(name) {
                 continue;
             }
             let ty = Ty::Concrete(value.ty());
@@ -2535,6 +2673,8 @@ impl<'a> Lowerer<'a> {
     fn collect_function_read_globals(&mut self, stmts: &[ast::Stmt]) {
         let mut names = Vec::new();
         collect_module_function_free_names(stmts, &mut names);
+        // Templates hide their interpolation loads from the AST walk.
+        names.extend(self.template_free_names());
         for name in names {
             if self.global_names.contains(&name) {
                 self.used_globals.insert(name);
@@ -3744,10 +3884,11 @@ impl<'a> Lowerer<'a> {
         decorator_kind: Option<MethodKind>,
     ) -> Option<FunctionId> {
         // Method decorators were classified by `create_method_function`, which
-        // also reported the unsupported ones. Other functions only accept the
-        // decorators this gate ignores.
+        // also reported the unsupported ones. Function decorators are applied
+        // at runtime (see [`Self::lower_decorators`]); only the shapes this
+        // frontend cannot apply are diagnosed here.
         if decorator_kind.is_none() {
-            self.reject_unsupported_decorators(decl.decorators);
+            self.validate_function_decorators(decl.decorators);
         }
         if !decl.type_params.is_empty() {
             self.error_at(decl.range, "type parameters are not supported in Phase 1");
@@ -3782,13 +3923,24 @@ impl<'a> Lowerer<'a> {
             });
         }
 
-        if !args.posonlyargs.is_empty() {
-            self.error_at(
-                args.posonlyargs[0].def.range,
-                "positional-only parameters are not supported in Phase 1",
+        // Positional-only parameters (`/`) bind from the positional argument
+        // stream only; the frontend binder and the runtime metadata keep them
+        // distinct from ordinary positional parameters so a keyword of the
+        // same name is forwarded to `**kwargs` or rejected.
+        for arg in &args.posonlyargs {
+            let default = self.param_default(arg.default.as_deref());
+            let default_expr = self.lowered_default(arg.default.as_deref());
+            self.add_param(
+                &arg.def,
+                default,
+                default_expr,
+                ParamKind::PosOnly,
+                &mut params,
+                &mut locals,
+                &mut seen,
             );
         }
-        for arg in args.posonlyargs.iter().chain(args.args.iter()) {
+        for arg in &args.args {
             let default = self.param_default(arg.default.as_deref());
             let default_expr = self.lowered_default(arg.default.as_deref());
             self.add_param(
@@ -3874,6 +4026,7 @@ impl<'a> Lowerer<'a> {
         collect_nested_nonlocals(decl.body, &mut mutated);
         let mut needed = HashSet::new();
         collect_nested_needed(decl.body, &mut needed);
+        needed.extend(self.nested_function_template_names(decl.body));
         let owned = bound
             .iter()
             .filter(|name| needed.contains(*name) && mutated.contains(*name))
@@ -3900,16 +4053,44 @@ impl<'a> Lowerer<'a> {
                 .insert(self.fid_base + id, signature);
         }
         if global {
-            self.fn_ids.insert(name, self.fid_base + id);
+            self.fn_ids.insert(name.clone(), self.fid_base + id);
+            if self.has_runtime_function_decorators(decl.decorators) {
+                // The name binds the decorator's result, not the function
+                // value: reads and calls resolve through the module local
+                // (module body) or the mirrored global table (functions).
+                self.decorated_functions
+                    .insert(name.clone(), self.fid_base + id);
+                self.global_names.insert(name);
+            }
         }
         Some(id)
     }
 
-    /// Report every decorator that lowering does not ignore.
-    fn reject_unsupported_decorators(&mut self, decorators: &[ast::Expr]) {
+    /// Diagnose decorator shapes the frontend cannot apply to a plain
+    /// function.
+    ///
+    /// Every other decorator is applied at runtime, bottom-up, exactly like
+    /// CPython: the decorator expressions are evaluated top-down when the
+    /// `def` statement runs, the function value is created, and each
+    /// decorator is called with the value produced by the one below it. The
+    /// pytest markers are compile-time directives consumed by the pytest
+    /// synthesis pass, and `@overload` declares a type-only stub that never
+    /// produces a function value.
+    fn validate_function_decorators(&mut self, decorators: &[ast::Expr]) {
         for decorator in decorators {
-            if !is_ignored_function_decorator(decorator) {
-                self.error_at(decorator.range(), "decorators are not supported in Phase 1");
+            let name = decorator_final_name(decorator);
+            if matches!(
+                name.as_deref(),
+                Some("property" | "classmethod" | "staticmethod")
+            ) {
+                self.error_at_code(
+                    decorator.range(),
+                    codes::UNSUPPORTED,
+                    format!(
+                        "'@{}' is only supported on class methods",
+                        name.unwrap_or_default()
+                    ),
+                );
             }
         }
     }
@@ -3946,43 +4127,68 @@ impl<'a> Lowerer<'a> {
     fn register_class<'s>(&mut self, s: &'s ast::StmtClassDef) -> ClassPlan {
         let class = s.name.to_string();
         self.class_names.insert(class.clone());
-        // `@dataclass` is the one supported class decorator. It is never
-        // evaluated: the frontend only needs to recognise the imported name to
-        // synthesize `__init__`. The no-op decorators accepted for functions
-        // stay ignored here too (e.g. `@runtime_checkable`), and `@rich_repr`
-        // is ignored as presentation metadata (see
-        // [`is_noop_class_decorator`]); everything else is diagnosed.
+        // `@dataclass` is consumed at compile time: the frontend only needs
+        // to recognise the imported name to synthesize `__init__`. Every other
+        // class decorator is evaluated and applied at runtime, bottom-up, in
+        // source order. `@overload` is a type-only marker and `@rich_repr`
+        // would install a generated `__repr__` that Hydro cannot synthesize,
+        // so it is diagnosed instead of being silently ignored.
         let mut is_dataclass = false;
-        for decorator in &s.decorator_list {
+        let mut decorators = Vec::new();
+        for (index, decorator) in s.decorator_list.iter().enumerate() {
             if self.is_dataclass_decorator(decorator) {
                 is_dataclass = true;
-            } else if !is_ignored_function_decorator(decorator)
-                && !is_noop_class_decorator(decorator)
-            {
-                self.error_at(decorator.range(), "class decorators are not supported yet");
+            } else if is_overload_decorator(decorator) {
+                // Type-only class stub; no runtime effect.
+            } else if is_pytest_decorator(decorator) {
+                self.error_at_code(
+                    decorator.range(),
+                    codes::UNSUPPORTED,
+                    "pytest markers cannot decorate a class",
+                );
+            } else if is_noop_class_decorator(decorator) {
+                self.error_at_code(
+                    decorator.range(),
+                    codes::UNSUPPORTED,
+                    "'@rich_repr' is not supported: Hydro cannot synthesize the generated __repr__",
+                );
+            } else {
+                decorators.push(index);
             }
         }
         if !s.type_params.is_empty() {
             self.error_at(s.range, "type parameters are not supported yet");
         }
-        if !s.keywords.is_empty() {
-            self.error_at(
-                s.range,
-                "class keywords (metaclass, ...) are not supported yet",
-            );
+        let mut metaclass = None;
+        for keyword in &s.keywords {
+            match keyword.arg.as_ref().map(|name| name.as_str()) {
+                Some("metaclass") if metaclass.is_none() => {
+                    metaclass = Some(
+                        s.keywords
+                            .iter()
+                            .position(|candidate| std::ptr::eq(candidate, keyword))
+                            .unwrap_or(0),
+                    );
+                }
+                Some("metaclass") => self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    "duplicate metaclass keyword",
+                ),
+                other => self.error_at_code(
+                    keyword.range,
+                    codes::UNSUPPORTED,
+                    format!(
+                        "class keyword '{}' is not supported; only metaclass= is valid in a class header",
+                        other.unwrap_or("**")
+                    ),
+                ),
+            }
         }
 
-        let base = match s.bases.as_slice() {
-            [] => None,
-            // Any single base expression is accepted; the frontend lowers it
-            // like any other value (e.g. `unittest.TestCase` is a module
-            // attribute) and the runtime validates it at class creation.
-            [_] => Some(0),
-            // Multiple inheritance is approximated by the first base; rich
-            // uses it for mixin pairs where the primary class supplies the
-            // relevant protocol methods. Additional bases are ignored.
-            [_, _, ..] => Some(0),
-        };
+        // Every base expression is evaluated in source order and passed to the
+        // runtime, which resolves the MRO (C3) and validates the operands.
+        let bases: Vec<usize> = (0..s.bases.len()).collect();
         // `class Point(NamedTuple):` gets a synthesized `__init__` exactly like
         // a dataclass. Only the class form is supported (no functional form).
         let is_namedtuple = s
@@ -4058,6 +4264,20 @@ impl<'a> Lowerer<'a> {
                         format!("duplicate class member '{class}.{name}'"),
                     );
                     continue;
+                }
+                // `__sub__ = difference` aliases an earlier method of the same
+                // class body. The alias must behave exactly like the method
+                // (receiver binding included), so it becomes another entry in
+                // the method table instead of a frozen attribute value.
+                if let ast::Expr::Name(value) = &*assign.value {
+                    if let Some((_, function, _, kind)) = methods
+                        .iter()
+                        .find(|(method, _, _, _)| method.as_str() == value.id.as_str())
+                    {
+                        let (function, kind) = (*function, *kind);
+                        methods.push((name, function, None, kind));
+                        continue;
+                    }
                 }
                 attributes.push((name, idx));
                 continue;
@@ -4140,7 +4360,9 @@ impl<'a> Lowerer<'a> {
         }
 
         ClassPlan {
-            base,
+            bases,
+            metaclass,
+            decorators,
             methods,
             attributes,
         }
@@ -4818,6 +5040,14 @@ impl<'a> Lowerer<'a> {
         // and classes are separate, non-closure scopes.
         let mut loaded = Vec::new();
         collect_free_name_loads(decl.body, &mut loaded);
+        // Templates are placeholder names in the AST; add the loads hidden in
+        // their interpolations so the closure captures them.
+        let mut loaded_seen: HashSet<String> = loaded.iter().cloned().collect();
+        for name in self.template_free_names_in(decl.range, &HashSet::new()) {
+            if loaded_seen.insert(name.clone()) {
+                loaded.push(name);
+            }
+        }
 
         // Names that belong to the nested function itself never become
         // captures: parameters and everything `collect_names` sees as a local.
@@ -4892,11 +5122,59 @@ impl<'a> Lowerer<'a> {
         let body = self.lower_function_body(fid, decl.body);
         self.functions[fid as usize].body = body;
 
-        Some(HStmt {
+        let function = self.fid_base + fid;
+        let decorators = self.runtime_function_decorators(decl.decorators);
+        if decorators.is_empty() {
+            return Some(HStmt {
+                kind: HStmtKind::Closure {
+                    target,
+                    function,
+                    captures: capture_locals,
+                },
+                line,
+                col,
+            });
+        }
+        // Decorated nested function: evaluate the decorators top-down, create
+        // the closure in a hidden local, apply the decorators bottom-up and
+        // bind the final value to the function's name. The block statement
+        // keeps this a single lowered statement.
+        let mut body = Vec::new();
+        let temps = self.lower_decorator_temps(&decorators, fs, &mut body);
+        let (function_temp, _) = self.hidden_temp(fs, "$decor", Type::Any);
+        body.push(HStmt {
             kind: HStmtKind::Closure {
-                target,
-                function: self.fid_base + fid,
+                target: function_temp,
+                function,
                 captures: capture_locals,
+            },
+            line,
+            col,
+        });
+        self.apply_decorator_temps(&temps, function_temp, fs, &mut body, line, col);
+        body.push(HStmt {
+            kind: HStmtKind::Assign {
+                target,
+                value: HExpr {
+                    kind: HExprKind::Local(function_temp),
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                },
+            },
+            line,
+            col,
+        });
+        Some(HStmt {
+            kind: HStmtKind::If {
+                cond: HExpr {
+                    kind: HExprKind::Const(Const::Bool(true)),
+                    ty: Ty::Concrete(Type::Bool),
+                    line,
+                    col,
+                },
+                then_body: body,
+                else_body: Vec::new(),
             },
             line,
             col,
@@ -5289,72 +5567,7 @@ impl<'a> Lowerer<'a> {
                 }
                 return self.lower_nested_function(FnDecl::from_async_def(s), fs, line, col);
             }
-            ast::Stmt::ClassDef(s) => {
-                if !fs.is_module {
-                    self.error_at(s.range, "nested class definitions are not supported yet");
-                    return None;
-                }
-                let name = s.name.to_string();
-                let Some(target) = fs.lookup(&name) else {
-                    self.error_name(
-                        s.range,
-                        &name,
-                        fs,
-                        format!("class '{name}' has no local slot"),
-                    );
-                    return None;
-                };
-                let Some(plan) = self
-                    .class_defs
-                    .get(&(u32::from(s.range.start()) as usize))
-                    .cloned()
-                else {
-                    self.error_at(
-                        s.range,
-                        "class definitions are only supported directly at module level",
-                    );
-                    return None;
-                };
-                let base = plan
-                    .base
-                    .and_then(|index| s.bases.get(index))
-                    .map(|base| self.expr(base, fs));
-                HStmtKind::ClassDef {
-                    target,
-                    name,
-                    base,
-                    methods: plan
-                        .methods
-                        .iter()
-                        .map(|(name, function, _, kind)| {
-                            (name.clone(), self.fid_base + *function, *kind)
-                        })
-                        .collect(),
-                    attributes: {
-                        self.class_attr_scopes.push(HashMap::new());
-                        let mut attributes = Vec::with_capacity(plan.attributes.len());
-                        for (name, index) in &plan.attributes {
-                            // The value expression is evaluated when the class
-                            // statement runs, in declaration order, and may
-                            // refer to attributes declared before it.
-                            let value = match &s.body[*index] {
-                                ast::Stmt::Assign(assign) => self.expr(&assign.value, fs),
-                                ast::Stmt::AnnAssign(assign) => match assign.value.as_deref() {
-                                    Some(value) => self.expr(value, fs),
-                                    None => self.error_expr(assign.range),
-                                },
-                                other => self.error_expr(other.range()),
-                            };
-                            if let Some(scope) = self.class_attr_scopes.last_mut() {
-                                scope.insert(name.clone(), value.clone());
-                            }
-                            attributes.push((name.clone(), value));
-                        }
-                        self.class_attr_scopes.pop();
-                        attributes
-                    },
-                }
-            }
+            ast::Stmt::ClassDef(s) => return self.lower_class_stmt(s, fs, line, col),
             // Imports were resolved into the binding tables in step 1. A
             // session fragment also mirrors them into the runtime global
             // table so a later fragment sees the same names.
@@ -5410,20 +5623,1471 @@ impl<'a> Lowerer<'a> {
                 }
                 return None;
             }
-            ast::Stmt::Match(s) => {
-                self.error_at(s.range, "match is not supported in Phase 1");
-                return None;
-            }
+            ast::Stmt::Match(s) => return self.lower_match(s, fs, line, col),
             ast::Stmt::TypeAlias(s) => {
                 self.error_at(s.range, "type aliases are not supported in Phase 1");
                 return None;
             }
-            ast::Stmt::TryStar(s) => {
-                self.error_at(s.range, "try/except* is not supported in Phase 1");
-                return None;
-            }
+            ast::Stmt::TryStar(s) => return self.lower_try_star(s, fs, line, col),
         };
         Some(HStmt { kind, line, col })
+    }
+
+    // ------------------------------------------------------------------
+    // `match` statements
+    // ------------------------------------------------------------------
+
+    /// Lower `match subject:` into a chain of guarded `if` statements.
+    ///
+    /// The subject is evaluated once into a hidden local; each case is tested
+    /// only while no earlier case matched. Patterns lower to ordinary runtime
+    /// predicates (`==`, `is`, `isinstance`, `len`, membership, subscripts and
+    /// attribute reads) plus assignments for captures, so no new runtime
+    /// protocol is needed. Irrefutable patterns, duplicate captures and
+    /// OR-alternatives that bind different names are compile-time diagnostics.
+    fn lower_match(
+        &mut self,
+        s: &ast::StmtMatch,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        // Validate every case before lowering, so a malformed pattern does not
+        // produce a partially matched program.
+        let mut valid = true;
+        for (index, case) in s.cases.iter().enumerate() {
+            if !self.validate_match_case(case, index + 1 == s.cases.len()) {
+                valid = false;
+            }
+        }
+        if !valid {
+            return None;
+        }
+
+        let (subject_local, subject) = self.hidden_temp(fs, "$match", Type::Any);
+        let mut body = Vec::new();
+        let subject_value = self.expr(&s.subject, fs);
+        body.push(self.match_assign(subject_local, subject_value, line, col));
+        let (done_local, done) = self.bool_temp(fs, line, col);
+        body.push(self.match_assign(done_local, self.bool_const(false, line, col), line, col));
+        for case in &s.cases {
+            let mut case_body = Vec::new();
+            let ok = self.compile_match_pattern(
+                &case.pattern,
+                subject.clone(),
+                fs,
+                &mut case_body,
+                line,
+                col,
+            )?;
+            let mut success = Vec::new();
+            let statements = self.lower_block(&case.body, fs);
+            match &case.guard {
+                Some(guard) => {
+                    let guard = self.expr(guard, fs);
+                    let mut guarded = statements;
+                    guarded.push(self.match_assign(
+                        done_local,
+                        self.bool_const(true, line, col),
+                        line,
+                        col,
+                    ));
+                    success.push(HStmt {
+                        kind: HStmtKind::If {
+                            cond: guard,
+                            then_body: guarded,
+                            else_body: Vec::new(),
+                        },
+                        line,
+                        col,
+                    });
+                }
+                None => {
+                    success.extend(statements);
+                    success.push(self.match_assign(
+                        done_local,
+                        self.bool_const(true, line, col),
+                        line,
+                        col,
+                    ));
+                }
+            }
+            case_body.push(HStmt {
+                kind: HStmtKind::If {
+                    cond: HExpr {
+                        kind: HExprKind::Local(ok),
+                        ty: Ty::Concrete(Type::Bool),
+                        line,
+                        col,
+                    },
+                    then_body: success,
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            });
+            body.push(HStmt {
+                kind: HStmtKind::If {
+                    cond: HExpr {
+                        kind: HExprKind::Un {
+                            op: hydro_ir::UnOp::Not,
+                            operand: Box::new(done.clone()),
+                        },
+                        ty: Ty::Concrete(Type::Bool),
+                        line,
+                        col,
+                    },
+                    then_body: case_body,
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            });
+        }
+        Some(HStmt {
+            kind: HStmtKind::If {
+                cond: self.bool_const(true, line, col),
+                then_body: body,
+                else_body: Vec::new(),
+            },
+            line,
+            col,
+        })
+    }
+
+    /// Validate one `case`: patterns must be well formed, OR alternatives must
+    /// bind the same names, and an irrefutable unguarded case must be last.
+    fn validate_match_case(&mut self, case: &ast::MatchCase, is_last: bool) -> bool {
+        let mut ok = true;
+        let mut names = Vec::new();
+        if !self.validate_pattern(&case.pattern, true, &mut names, &mut ok) {
+            ok = false;
+        }
+        if let Some(duplicate) = names
+            .iter()
+            .find(|name| {
+                let mut count = 0;
+                for candidate in &names {
+                    if candidate == *name {
+                        count += 1;
+                    }
+                }
+                count > 1
+            })
+            .cloned()
+        {
+            self.error_at_code(
+                case.pattern.range(),
+                codes::SYNTAX,
+                format!("multiple assignments to name '{duplicate}' in pattern"),
+            );
+            ok = false;
+        }
+        if case.guard.is_none() && pattern_is_irrefutable(&case.pattern) && !is_last {
+            let label = match &case.pattern {
+                ast::Pattern::MatchAs(as_pattern) => as_pattern
+                    .name
+                    .as_ref()
+                    .map(|name| format!("name capture '{}'", name))
+                    .unwrap_or_else(|| "wildcard pattern".to_string()),
+                _ => "pattern".to_string(),
+            };
+            self.error_at_code(
+                case.pattern.range(),
+                codes::SYNTAX,
+                format!("{label} makes the remaining patterns unreachable"),
+            );
+            ok = false;
+        }
+        ok
+    }
+
+    /// Validate a pattern recursively, collecting the names it binds.
+    fn validate_pattern(
+        &mut self,
+        pattern: &ast::Pattern,
+        in_sequence: bool,
+        names: &mut Vec<String>,
+        ok: &mut bool,
+    ) -> bool {
+        match pattern {
+            ast::Pattern::MatchValue(value) => {
+                // A bare name would be a capture, so a value pattern is always
+                // a dotted name or a literal expression; any expression the
+                // frontend can lower is accepted.
+                if !matches!(
+                    &*value.value,
+                    ast::Expr::Attribute(_) | ast::Expr::Subscript(_) | ast::Expr::Call(_)
+                ) && !is_literal_pattern_expr(&value.value)
+                {
+                    self.error_at_code(
+                        value.value.range(),
+                        codes::SYNTAX,
+                        "value pattern must be a dotted name or a literal",
+                    );
+                    *ok = false;
+                }
+            }
+            ast::Pattern::MatchSingleton(_) => {}
+            ast::Pattern::MatchSequence(sequence) => {
+                let stars = sequence
+                    .patterns
+                    .iter()
+                    .filter(|pattern| matches!(pattern, ast::Pattern::MatchStar(_)))
+                    .count();
+                if stars > 1 {
+                    self.error_at_code(
+                        sequence.range,
+                        codes::SYNTAX,
+                        "multiple starred names in a sequence pattern",
+                    );
+                    *ok = false;
+                }
+                for child in &sequence.patterns {
+                    self.validate_pattern(child, true, names, ok);
+                }
+            }
+            ast::Pattern::MatchMapping(mapping) => {
+                let mut literal_keys: Vec<String> = Vec::new();
+                for key in &mapping.keys {
+                    if let Some(text) = literal_pattern_key(key) {
+                        if literal_keys.contains(&text) {
+                            self.error_at_code(
+                                key.range(),
+                                codes::SYNTAX,
+                                format!("mapping pattern checks duplicate key {text}"),
+                            );
+                            *ok = false;
+                        }
+                        literal_keys.push(text);
+                    }
+                }
+                for child in &mapping.patterns {
+                    self.validate_pattern(child, false, names, ok);
+                }
+                if let Some(rest) = &mapping.rest {
+                    names.push(rest.to_string());
+                }
+            }
+            ast::Pattern::MatchClass(class) => {
+                for child in &class.patterns {
+                    self.validate_pattern(child, false, names, ok);
+                }
+                for child in &class.kwd_patterns {
+                    self.validate_pattern(child, false, names, ok);
+                }
+            }
+            ast::Pattern::MatchStar(star) => {
+                if !in_sequence {
+                    self.error_at_code(
+                        star.range,
+                        codes::SYNTAX,
+                        "star pattern is only valid inside a sequence pattern",
+                    );
+                    *ok = false;
+                }
+                if let Some(name) = &star.name {
+                    names.push(name.to_string());
+                }
+            }
+            ast::Pattern::MatchAs(as_pattern) => {
+                if let Some(inner) = &as_pattern.pattern {
+                    self.validate_pattern(inner, false, names, ok);
+                }
+                if let Some(name) = &as_pattern.name {
+                    names.push(name.to_string());
+                }
+            }
+            ast::Pattern::MatchOr(or_pattern) => {
+                // Every alternative must bind the same names, otherwise a
+                // capture in the case body could be unbound.
+                let mut alternatives: Vec<HashSet<String>> = Vec::new();
+                for alternative in &or_pattern.patterns {
+                    let mut alternative_names = Vec::new();
+                    self.validate_pattern(alternative, in_sequence, &mut alternative_names, ok);
+                    alternatives.push(alternative_names.into_iter().collect());
+                }
+                if let Some(first) = alternatives.first().cloned() {
+                    for other in &alternatives[1..] {
+                        if *other != first {
+                            self.error_at_code(
+                                or_pattern.range,
+                                codes::SYNTAX,
+                                "alternative patterns bind different names",
+                            );
+                            *ok = false;
+                        }
+                    }
+                    names.extend(first);
+                }
+            }
+        }
+        *ok
+    }
+
+    fn match_assign(&self, target: LocalId, value: HExpr, line: u32, col: u32) -> HStmt {
+        HStmt {
+            kind: HStmtKind::Assign { target, value },
+            line,
+            col,
+        }
+    }
+
+    fn bool_const(&self, value: bool, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::Const(Const::Bool(value)),
+            ty: Ty::Concrete(Type::Bool),
+            line,
+            col,
+        }
+    }
+
+    fn bool_temp(&mut self, fs: &mut FuncState, line: u32, col: u32) -> (LocalId, HExpr) {
+        let (local, mut read) = self.hidden_temp(fs, "$match", Type::Bool);
+        read.ty = Ty::Concrete(Type::Bool);
+        read.line = line;
+        read.col = col;
+        (local, read)
+    }
+
+    fn local_read_expr(&self, local: LocalId, ty: Type, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::Local(local),
+            ty: Ty::Concrete(ty),
+            line,
+            col,
+        }
+    }
+
+    /// A builtin call expression (`len(x)`, `isinstance(x, T)`, ...).
+    fn builtin_expr(
+        &self,
+        builtin: Builtin,
+        args: Vec<HExpr>,
+        ty: Type,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Builtin(builtin),
+                args,
+            },
+            ty: Ty::Concrete(ty),
+            line,
+            col,
+        }
+    }
+
+    fn bin_expr(&self, op: BinOp, lhs: HExpr, rhs: HExpr, ty: Type, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::Bin {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            ty: Ty::Concrete(ty),
+            line,
+            col,
+        }
+    }
+
+    fn and_expr(&self, items: Vec<HExpr>, line: u32, col: u32) -> Option<HExpr> {
+        let mut iter = items.into_iter();
+        let mut result = iter.next()?;
+        for item in iter {
+            result = HExpr {
+                kind: HExprKind::BoolOp {
+                    op: hydro_ir::BoolOp::And,
+                    lhs: Box::new(result),
+                    rhs: Box::new(item),
+                },
+                ty: Ty::Concrete(Type::Bool),
+                line,
+                col,
+            };
+        }
+        Some(result)
+    }
+
+    fn or_expr(&self, items: Vec<HExpr>, line: u32, col: u32) -> Option<HExpr> {
+        let mut iter = items.into_iter();
+        let mut result = iter.next()?;
+        for item in iter {
+            result = HExpr {
+                kind: HExprKind::BoolOp {
+                    op: hydro_ir::BoolOp::Or,
+                    lhs: Box::new(result),
+                    rhs: Box::new(item),
+                },
+                ty: Ty::Concrete(Type::Bool),
+                line,
+                col,
+            };
+        }
+        Some(result)
+    }
+
+    /// Compile one pattern into `out`, returning a boolean local that is
+    /// `True` when the pattern matched. Capture assignments run only after the
+    /// pattern (and all nested sub-patterns) matched.
+    fn compile_match_pattern(
+        &mut self,
+        pattern: &ast::Pattern,
+        subject: HExpr,
+        fs: &mut FuncState,
+        out: &mut Vec<HStmt>,
+        line: u32,
+        col: u32,
+    ) -> Option<LocalId> {
+        let (ok, _) = self.bool_temp(fs, line, col);
+        out.push(self.match_assign(ok, self.bool_const(false, line, col), line, col));
+        match pattern {
+            ast::Pattern::MatchAs(as_pattern) => {
+                if let Some(inner) = &as_pattern.pattern {
+                    let inner_ok =
+                        self.compile_match_pattern(inner, subject.clone(), fs, out, line, col)?;
+                    out.push(self.match_assign(
+                        ok,
+                        self.local_read_expr(inner_ok, Type::Bool, line, col),
+                        line,
+                        col,
+                    ));
+                } else {
+                    out.push(self.match_assign(ok, self.bool_const(true, line, col), line, col));
+                }
+                if let Some(name) = &as_pattern.name {
+                    let target = self.pattern_binding(name.as_str(), pattern.range(), fs)?;
+                    let bind = self.pattern_assign(target, subject.clone(), fs, line, col);
+                    out.push(HStmt {
+                        kind: HStmtKind::If {
+                            cond: self.local_read_expr(ok, Type::Bool, line, col),
+                            then_body: vec![bind],
+                            else_body: Vec::new(),
+                        },
+                        line,
+                        col,
+                    });
+                }
+                Some(ok)
+            }
+            ast::Pattern::MatchStar(star) => {
+                if let Some(name) = &star.name {
+                    let _ = self.pattern_binding(name.as_str(), star.range, fs)?;
+                }
+                self.error_at_code(
+                    star.range,
+                    codes::SYNTAX,
+                    "star pattern is only valid inside a sequence pattern",
+                );
+                None
+            }
+            ast::Pattern::MatchValue(value) => {
+                let value_expr = self.expr(&value.value, fs);
+                let test = self.bin_expr(BinOp::Eq, subject, value_expr, Type::Bool, line, col);
+                out.push(self.match_assign(ok, test, line, col));
+                Some(ok)
+            }
+            ast::Pattern::MatchSingleton(singleton) => {
+                let constant = match &singleton.value {
+                    ast::Constant::None => Const::None,
+                    ast::Constant::Bool(value) => Const::Bool(*value),
+                    ast::Constant::Ellipsis => Const::Ellipsis,
+                    other => {
+                        self.error_at_code(
+                            singleton.range,
+                            codes::SYNTAX,
+                            format!("unsupported singleton pattern {other:?}"),
+                        );
+                        return None;
+                    }
+                };
+                let test = self.bin_expr(
+                    BinOp::Is,
+                    subject,
+                    HExpr {
+                        kind: HExprKind::Const(constant),
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    },
+                    Type::Bool,
+                    line,
+                    col,
+                );
+                out.push(self.match_assign(ok, test, line, col));
+                Some(ok)
+            }
+            ast::Pattern::MatchOr(or_pattern) => {
+                let alternatives = or_pattern.patterns.clone();
+                let body = self.compile_match_or(&alternatives, subject, fs, ok, 0, (line, col))?;
+                out.extend(body);
+                Some(ok)
+            }
+            ast::Pattern::MatchSequence(sequence) => {
+                self.compile_match_sequence(sequence, subject, fs, out, ok, (line, col))?;
+                Some(ok)
+            }
+            ast::Pattern::MatchMapping(mapping) => {
+                self.compile_match_mapping(mapping, subject, fs, out, ok, (line, col))?;
+                Some(ok)
+            }
+            ast::Pattern::MatchClass(class) => {
+                self.compile_match_class(class, subject, fs, out, ok, (line, col))?;
+                Some(ok)
+            }
+        }
+    }
+
+    fn compile_match_or(
+        &mut self,
+        alternatives: &[ast::Pattern],
+        subject: HExpr,
+        fs: &mut FuncState,
+        ok: LocalId,
+        index: usize,
+        (line, col): (u32, u32),
+    ) -> Option<Vec<HStmt>> {
+        let alternative = alternatives.get(index)?;
+        let mut body = Vec::new();
+        let alternative_ok =
+            self.compile_match_pattern(alternative, subject.clone(), fs, &mut body, line, col)?;
+        let then_body = vec![self.match_assign(ok, self.bool_const(true, line, col), line, col)];
+        let else_body = if index + 1 < alternatives.len() {
+            self.compile_match_or(alternatives, subject, fs, ok, index + 1, (line, col))?
+        } else {
+            Vec::new()
+        };
+        body.push(HStmt {
+            kind: HStmtKind::If {
+                cond: self.local_read_expr(alternative_ok, Type::Bool, line, col),
+                then_body,
+                else_body,
+            },
+            line,
+            col,
+        });
+        Some(body)
+    }
+
+    /// `isinstance(subject, T)` for every supported sequence type.
+    fn sequence_test(&self, subject: &HExpr, line: u32, col: u32) -> HExpr {
+        let mut tests = Vec::new();
+        for builtin in [Builtin::List, Builtin::Tuple, Builtin::Str, Builtin::Bytes] {
+            let type_value = HExpr {
+                kind: HExprKind::BuiltinRef(builtin),
+                ty: Ty::Concrete(Type::Function),
+                line,
+                col,
+            };
+            tests.push(self.builtin_expr(
+                Builtin::Isinstance,
+                vec![subject.clone(), type_value],
+                Type::Bool,
+                line,
+                col,
+            ));
+        }
+        // `range` has no first-class type value; `type(range(0))` is its
+        // cached class object.
+        let range_value = self.builtin_expr(
+            Builtin::Range,
+            vec![
+                HExpr {
+                    kind: HExprKind::Const(Const::Int(0)),
+                    ty: Ty::Concrete(Type::Int),
+                    line,
+                    col,
+                },
+                HExpr {
+                    kind: HExprKind::Const(Const::Int(0)),
+                    ty: Ty::Concrete(Type::Int),
+                    line,
+                    col,
+                },
+            ],
+            Type::Range,
+            line,
+            col,
+        );
+        let range_type = self.builtin_expr(Builtin::Type, vec![range_value], Type::Any, line, col);
+        tests.push(self.builtin_expr(
+            Builtin::Isinstance,
+            vec![subject.clone(), range_type],
+            Type::Bool,
+            line,
+            col,
+        ));
+        self.or_expr(tests, line, col)
+            .unwrap_or_else(|| self.bool_const(false, line, col))
+    }
+
+    fn len_expr(&self, subject: &HExpr, line: u32, col: u32) -> HExpr {
+        self.builtin_expr(Builtin::Len, vec![subject.clone()], Type::Int, line, col)
+    }
+
+    fn int_const(&self, value: i64, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::Const(Const::Int(value)),
+            ty: Ty::Concrete(Type::Int),
+            line,
+            col,
+        }
+    }
+
+    /// Build the `if children... { binds } else { ok = False }` statement.
+    fn child_gate(
+        &mut self,
+        ok: LocalId,
+        children: Vec<LocalId>,
+        parent_binds: Vec<HStmt>,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        if children.is_empty() {
+            return None;
+        }
+        let checks: Vec<HExpr> = children
+            .into_iter()
+            .map(|child| self.local_read_expr(child, Type::Bool, line, col))
+            .collect();
+        let cond = self.and_expr(checks, line, col)?;
+        Some(HStmt {
+            kind: HStmtKind::If {
+                cond,
+                then_body: parent_binds,
+                else_body: vec![self.match_assign(
+                    ok,
+                    self.bool_const(false, line, col),
+                    line,
+                    col,
+                )],
+            },
+            line,
+            col,
+        })
+    }
+
+    fn compile_match_sequence(
+        &mut self,
+        sequence: &ast::PatternMatchSequence,
+        subject: HExpr,
+        fs: &mut FuncState,
+        out: &mut Vec<HStmt>,
+        ok: LocalId,
+        (line, col): (u32, u32),
+    ) -> Option<()> {
+        let star = sequence
+            .patterns
+            .iter()
+            .position(|pattern| matches!(pattern, ast::Pattern::MatchStar(_)));
+        let count = sequence.patterns.len();
+        let length = self.len_expr(&subject, line, col);
+        let length_ok = match star {
+            // `case [a, *rest, b]`: at least the fixed elements must be there.
+            Some(_) => self.bin_expr(
+                BinOp::Ge,
+                length,
+                self.int_const((count - 1) as i64, line, col),
+                Type::Bool,
+                line,
+                col,
+            ),
+            None => self.bin_expr(
+                BinOp::Eq,
+                length,
+                self.int_const(count as i64, line, col),
+                Type::Bool,
+                line,
+                col,
+            ),
+        };
+        let sequence_test = self.sequence_test(&subject, line, col);
+        let guard = self.and_expr(vec![sequence_test, length_ok], line, col)?;
+        out.push(self.match_assign(ok, guard, line, col));
+
+        let mut body = Vec::new();
+        let mut children = Vec::new();
+        let prefix = star.unwrap_or(count);
+        for (index, child) in sequence.patterns[..prefix].iter().enumerate() {
+            let element = HExpr {
+                kind: HExprKind::Subscript {
+                    object: Box::new(subject.clone()),
+                    index: Box::new(self.int_const(index as i64, line, col)),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            };
+            children.push(self.compile_match_pattern(child, element, fs, &mut body, line, col)?);
+        }
+        if let Some(star_index) = star {
+            if let ast::Pattern::MatchStar(star_pattern) = &sequence.patterns[star_index] {
+                if let Some(name) = &star_pattern.name {
+                    let target = self.pattern_binding(name.as_str(), star_pattern.range, fs)?;
+                    let rest_end = count - star_index - 1;
+                    let stop = if rest_end == 0 {
+                        self.len_expr(&subject, line, col)
+                    } else {
+                        self.bin_expr(
+                            BinOp::Sub,
+                            self.len_expr(&subject, line, col),
+                            self.int_const(rest_end as i64, line, col),
+                            Type::Int,
+                            line,
+                            col,
+                        )
+                    };
+                    let slice = HExpr {
+                        kind: HExprKind::Slice {
+                            object: Box::new(subject.clone()),
+                            start: Some(Box::new(self.int_const(star_index as i64, line, col))),
+                            stop: Some(Box::new(stop)),
+                            step: None,
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    };
+                    let bind = self.pattern_assign(target, slice, fs, line, col);
+                    body.push(bind);
+                }
+            }
+            // The trailing elements are read from the end of the sequence.
+            let after = count - star_index - 1;
+            for offset in 0..after {
+                let from_end = (after - offset) as i64;
+                let index = self.bin_expr(
+                    BinOp::Sub,
+                    self.len_expr(&subject, line, col),
+                    self.int_const(from_end, line, col),
+                    Type::Int,
+                    line,
+                    col,
+                );
+                let element = HExpr {
+                    kind: HExprKind::Subscript {
+                        object: Box::new(subject.clone()),
+                        index: Box::new(index),
+                    },
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                };
+                let Some(child) = sequence.patterns.get(star_index + 1 + offset) else {
+                    continue;
+                };
+                children
+                    .push(self.compile_match_pattern(child, element, fs, &mut body, line, col)?);
+            }
+        }
+        if let Some(gate) = self.child_gate(ok, children, Vec::new(), line, col) {
+            body.push(gate);
+        }
+        // Children and captures only run after the structural guard matched;
+        // `ok` already carries that result and the gate clears it on failure.
+        out.push(HStmt {
+            kind: HStmtKind::If {
+                cond: self.local_read_expr(ok, Type::Bool, line, col),
+                then_body: body,
+                else_body: Vec::new(),
+            },
+            line,
+            col,
+        });
+        Some(())
+    }
+
+    fn compile_match_mapping(
+        &mut self,
+        mapping: &ast::PatternMatchMapping,
+        subject: HExpr,
+        fs: &mut FuncState,
+        out: &mut Vec<HStmt>,
+        ok: LocalId,
+        (line, col): (u32, u32),
+    ) -> Option<()> {
+        let dict_type = HExpr {
+            kind: HExprKind::BuiltinRef(Builtin::Dict),
+            ty: Ty::Concrete(Type::Function),
+            line,
+            col,
+        };
+        let guard = self.builtin_expr(
+            Builtin::Isinstance,
+            vec![subject.clone(), dict_type],
+            Type::Bool,
+            line,
+            col,
+        );
+        out.push(self.match_assign(ok, guard, line, col));
+
+        let mut key_locals = Vec::new();
+        let mut body = Vec::new();
+        for key in &mapping.keys {
+            let (key_local, _) = self.hidden_temp(fs, "$match", Type::Any);
+            body.push(HStmt {
+                kind: HStmtKind::If {
+                    cond: self.local_read_expr(ok, Type::Bool, line, col),
+                    then_body: {
+                        let value = self.expr(key, fs);
+                        vec![
+                            self.match_assign(key_local, value, line, col),
+                            self.match_assign(
+                                ok,
+                                self.bin_expr(
+                                    BinOp::In,
+                                    self.local_read_expr(key_local, Type::Any, line, col),
+                                    subject.clone(),
+                                    Type::Bool,
+                                    line,
+                                    col,
+                                ),
+                                line,
+                                col,
+                            ),
+                        ]
+                    },
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            });
+            key_locals.push(key_local);
+        }
+
+        let mut extract = Vec::new();
+        let mut children = Vec::new();
+        for (key_local, child) in key_locals.iter().zip(&mapping.patterns) {
+            let (value_local, _) = self.hidden_temp(fs, "$match", Type::Any);
+            let value = HExpr {
+                kind: HExprKind::Subscript {
+                    object: Box::new(subject.clone()),
+                    index: Box::new(self.local_read_expr(*key_local, Type::Any, line, col)),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            };
+            extract.push(self.match_assign(value_local, value, line, col));
+            children.push(self.compile_match_pattern(
+                child,
+                self.local_read_expr(value_local, Type::Any, line, col),
+                fs,
+                &mut extract,
+                line,
+                col,
+            )?);
+        }
+        if let Some(rest) = &mapping.rest {
+            let target = self.pattern_binding(rest.as_str(), mapping.range, fs)?;
+            if let Some(value) = self.match_rest_dict(&subject, &key_locals, fs, line, col) {
+                let bind = self.pattern_assign(target, value, fs, line, col);
+                extract.push(bind);
+            }
+        }
+        if let Some(gate) = self.child_gate(ok, children, Vec::new(), line, col) {
+            extract.push(gate);
+        }
+        body.push(HStmt {
+            kind: HStmtKind::If {
+                cond: self.local_read_expr(ok, Type::Bool, line, col),
+                then_body: extract,
+                else_body: Vec::new(),
+            },
+            line,
+            col,
+        });
+        out.extend(body);
+        Some(())
+    }
+
+    /// Build the `**rest` dict: every item of `subject` whose key is not one
+    /// of the matched pattern keys.
+    fn match_rest_dict(
+        &mut self,
+        subject: &HExpr,
+        keys: &[LocalId],
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HExpr> {
+        let (key_var, _) = self.hidden_temp(fs, "$match", Type::Any);
+        let (value_var, _) = self.hidden_temp(fs, "$match", Type::Any);
+        let key_read = self.local_read_expr(key_var, Type::Any, line, col);
+        let value_read = self.local_read_expr(value_var, Type::Any, line, col);
+        let key_tuple = HExpr {
+            kind: HExprKind::Tuple(
+                keys.iter()
+                    .map(|key| self.local_read_expr(*key, Type::Any, line, col))
+                    .collect(),
+            ),
+            ty: Ty::Concrete(Type::Tuple),
+            line,
+            col,
+        };
+        let condition = HExpr {
+            kind: HExprKind::Un {
+                op: hydro_ir::UnOp::Not,
+                operand: Box::new(self.bin_expr(
+                    BinOp::In,
+                    key_read.clone(),
+                    key_tuple,
+                    Type::Bool,
+                    line,
+                    col,
+                )),
+            },
+            ty: Ty::Concrete(Type::Bool),
+            line,
+            col,
+        };
+        let items = HExpr {
+            kind: HExprKind::MethodCall {
+                object: Box::new(subject.clone()),
+                method: "items".to_string(),
+                args: Vec::new(),
+                star: None,
+                keywords: Vec::new(),
+                double_star: None,
+            },
+            ty: Ty::Concrete(Type::List),
+            line,
+            col,
+        };
+        // `{k: v for k, v in subject.items() if k not in (...)}`.
+        let target = HCompTarget::Unpack(vec![
+            HUnpackTarget::Name(key_var),
+            HUnpackTarget::Name(value_var),
+        ]);
+        Some(HExpr {
+            kind: HExprKind::DictComp {
+                key: Box::new(key_read),
+                value: Box::new(value_read),
+                clauses: vec![HCompClause {
+                    target,
+                    iterable: items,
+                    conditions: vec![condition],
+                    is_async: false,
+                }],
+            },
+            ty: Ty::Concrete(Type::Dict),
+            line,
+            col,
+        })
+    }
+
+    fn compile_match_class(
+        &mut self,
+        class: &ast::PatternMatchClass,
+        subject: HExpr,
+        fs: &mut FuncState,
+        out: &mut Vec<HStmt>,
+        ok: LocalId,
+        (line, col): (u32, u32),
+    ) -> Option<()> {
+        let class_value = self.expr(&class.cls, fs);
+        let guard = self.builtin_expr(
+            Builtin::Isinstance,
+            vec![subject.clone(), class_value.clone()],
+            Type::Bool,
+            line,
+            col,
+        );
+        out.push(self.match_assign(ok, guard, line, col));
+
+        let mut body = Vec::new();
+        let mut children = Vec::new();
+        if !class.patterns.is_empty() {
+            let match_args_name = HExpr {
+                kind: HExprKind::Const(Const::Str("__match_args__".to_string())),
+                ty: Ty::Concrete(Type::Str),
+                line,
+                col,
+            };
+            let has_match_args = self.builtin_expr(
+                Builtin::Hasattr,
+                vec![class_value.clone(), match_args_name.clone()],
+                Type::Bool,
+                line,
+                col,
+            );
+            let missing = HExpr {
+                kind: HExprKind::Un {
+                    op: hydro_ir::UnOp::Not,
+                    operand: Box::new(has_match_args),
+                },
+                ty: Ty::Concrete(Type::Bool),
+                line,
+                col,
+            };
+            let message = self.bin_expr(
+                BinOp::Add,
+                HExpr {
+                    kind: HExprKind::GetAttr {
+                        object: Box::new(class_value.clone()),
+                        name: "__name__".to_string(),
+                    },
+                    ty: Ty::Concrete(Type::Str),
+                    line,
+                    col,
+                },
+                HExpr {
+                    kind: HExprKind::Const(Const::Str(format!(
+                        "() accepts 0 positional sub-patterns ({} given); define __match_args__",
+                        class.patterns.len()
+                    ))),
+                    ty: Ty::Concrete(Type::Str),
+                    line,
+                    col,
+                },
+                Type::Str,
+                line,
+                col,
+            );
+            body.push(HStmt {
+                kind: HStmtKind::If {
+                    cond: missing,
+                    then_body: vec![HStmt {
+                        kind: HStmtKind::Raise {
+                            exc: Some(ExcKind::TypeError),
+                            msg: Some(message),
+                            cause: None,
+                        },
+                        line,
+                        col,
+                    }],
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            });
+            let (match_args_local, _) = self.hidden_temp(fs, "$match", Type::Any);
+            let match_args = self.builtin_expr(
+                Builtin::Getattr,
+                vec![class_value, match_args_name],
+                Type::Any,
+                line,
+                col,
+            );
+            body.push(self.match_assign(match_args_local, match_args, line, col));
+            // Enough entries for every positional sub-pattern.
+            let enough = self.bin_expr(
+                BinOp::Ge,
+                self.len_expr(
+                    &self.local_read_expr(match_args_local, Type::Any, line, col),
+                    line,
+                    col,
+                ),
+                self.int_const(class.patterns.len() as i64, line, col),
+                Type::Bool,
+                line,
+                col,
+            );
+            let too_short = HExpr {
+                kind: HExprKind::Un {
+                    op: hydro_ir::UnOp::Not,
+                    operand: Box::new(enough),
+                },
+                ty: Ty::Concrete(Type::Bool),
+                line,
+                col,
+            };
+            body.push(HStmt {
+                kind: HStmtKind::If {
+                    cond: too_short,
+                    then_body: vec![HStmt {
+                        kind: HStmtKind::Raise {
+                            exc: Some(ExcKind::TypeError),
+                            msg: Some(HExpr {
+                                kind: HExprKind::Const(Const::Str(format!(
+                                    "class pattern has {} positional sub-pattern(s) but __match_args__ has fewer entries",
+                                    class.patterns.len()
+                                ))),
+                                ty: Ty::Concrete(Type::Str),
+                                line,
+                                col,
+                            }),
+                            cause: None,
+                        },
+                        line,
+                        col,
+                    }],
+                    else_body: Vec::new(),
+                },
+                line,
+                col,
+            });
+            for (index, child) in class.patterns.iter().enumerate() {
+                let name = HExpr {
+                    kind: HExprKind::Subscript {
+                        object: Box::new(self.local_read_expr(
+                            match_args_local,
+                            Type::Any,
+                            line,
+                            col,
+                        )),
+                        index: Box::new(self.int_const(index as i64, line, col)),
+                    },
+                    ty: Ty::Concrete(Type::Str),
+                    line,
+                    col,
+                };
+                let (attribute_local, _) = self.hidden_temp(fs, "$match", Type::Any);
+                let value = self.builtin_expr(
+                    Builtin::Getattr,
+                    vec![subject.clone(), name],
+                    Type::Any,
+                    line,
+                    col,
+                );
+                body.push(self.match_assign(attribute_local, value, line, col));
+                children.push(self.compile_match_pattern(
+                    child,
+                    self.local_read_expr(attribute_local, Type::Any, line, col),
+                    fs,
+                    &mut body,
+                    line,
+                    col,
+                )?);
+            }
+        }
+        for (attribute, child) in class.kwd_attrs.iter().zip(&class.kwd_patterns) {
+            let (attribute_local, _) = self.hidden_temp(fs, "$match", Type::Any);
+            let value = HExpr {
+                kind: HExprKind::GetAttr {
+                    object: Box::new(subject.clone()),
+                    name: attribute.to_string(),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            };
+            body.push(self.match_assign(attribute_local, value, line, col));
+            children.push(self.compile_match_pattern(
+                child,
+                self.local_read_expr(attribute_local, Type::Any, line, col),
+                fs,
+                &mut body,
+                line,
+                col,
+            )?);
+        }
+        if let Some(gate) = self.child_gate(ok, children, Vec::new(), line, col) {
+            body.push(gate);
+        }
+        out.push(HStmt {
+            kind: HStmtKind::If {
+                cond: self.local_read_expr(ok, Type::Bool, line, col),
+                then_body: body,
+                else_body: Vec::new(),
+            },
+            line,
+            col,
+        });
+        Some(())
+    }
+
+    /// Assign to a pattern capture, honoring closure cells.
+    fn pattern_assign(
+        &self,
+        target: LocalId,
+        value: HExpr,
+        fs: &FuncState,
+        line: u32,
+        col: u32,
+    ) -> HStmt {
+        let kind = if fs.is_cell(target) {
+            HStmtKind::CellAssign { target, value }
+        } else {
+            HStmtKind::Assign { target, value }
+        };
+        HStmt { kind, line, col }
+    }
+
+    /// Resolve a pattern capture name to a local slot of the current scope.
+    fn pattern_binding(
+        &mut self,
+        name: &str,
+        range: TextRange,
+        fs: &mut FuncState,
+    ) -> Option<LocalId> {
+        if let Some(local) = fs.lookup(name) {
+            return Some(local);
+        }
+        // The pre-pass registers pattern captures as locals; reaching this
+        // point means the name was not collected (a malformed pattern AST).
+        self.error_name(range, name, fs, format!("unknown pattern name '{name}'"));
+        None
+    }
+
+    /// Lower `try: ... except* E: ...`.
+    ///
+    /// Full PEP 654 semantics require splitting an `ExceptionGroup` into the
+    /// exceptions each `except*` clause matches, running every clause on its
+    /// share and re-raising the unhandled remainder (possibly re-grouped). The
+    /// runtime has no exception-group representation yet, so this lowering is
+    /// deliberately explicit instead of pretending: the `try` body runs
+    /// normally, `else`/`finally` keep their meaning, and the first exception
+    /// escaping the body raises `NotImplementedError` explaining that no
+    /// `except*` handler ran. The intended runtime protocol is:
+    ///
+    /// - `hydro_exc_star_begin() -> i64` — start splitting the pending
+    ///   exception, returning the group (or a one-element group).
+    /// - `hydro_exc_star_take(handler_class: i64) -> i64` — remove and return
+    ///   the subset of the current group matched by `handler_class`, or `None`.
+    /// - `hydro_exc_star_finish() -> i64` — re-raise the unmatched remainder
+    ///   after the last clause (clearing the pending exception when empty).
+    ///
+    /// These names and their exact argument order are reported to the
+    /// orchestrator; no generated code calls them until the runtime provides
+    /// them.
+    fn lower_try_star(
+        &mut self,
+        s: &ast::StmtTryStar,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        for handler in &s.handlers {
+            let ast::ExceptHandler::ExceptHandler(handler) = handler;
+            if handler.type_.is_none() {
+                self.error_at_code(
+                    handler.range,
+                    codes::SYNTAX,
+                    "except* requires an exception type",
+                );
+            }
+        }
+        let body = self.lower_block(&s.body, fs);
+        let else_body = self.lower_block(&s.orelse, fs);
+        let finally_body = self.lower_block(&s.finalbody, fs);
+        let message = HExpr {
+            kind: HExprKind::Const(Const::Str(
+                "except* (PEP 654 exception groups) is not implemented: Hydro cannot split an ExceptionGroup; no except* handler was run"
+                    .to_string(),
+            )),
+            ty: Ty::Concrete(Type::Str),
+            line,
+            col,
+        };
+        let raise = HStmt {
+            kind: HStmtKind::Raise {
+                exc: Some(ExcKind::NotImplementedError),
+                msg: Some(message),
+                cause: None,
+            },
+            line,
+            col,
+        };
+        Some(HStmt {
+            kind: HStmtKind::Try {
+                body,
+                handlers: vec![HHandler {
+                    exc: None,
+                    binding: None,
+                    binding_cell: false,
+                    body: vec![raise],
+                }],
+                else_body,
+                finally_body,
+            },
+            line,
+            col,
+        })
+    }
+
+    /// Whether a user binding shadows the builtin `super` name.
+    fn super_name_is_shadowed(&self, fs: &FuncState) -> bool {
+        fs.lookup("super").is_some()
+            || fs.is_global("super")
+            || self.fn_ids.contains_key("super")
+            || self.imported_user_functions.contains_key("super")
+            || self.imported_user_globals.contains_key("super")
+            || self.imported_functions.contains_key("super")
+            || self.imported_constants.contains_key("super")
+            || self.global_names.contains("super")
+    }
+
+    /// Materialise zero-argument `super()` for the enclosing method.
+    ///
+    /// The runtime's `$super_new` helper needs the receiver and, to start at
+    /// the right MRO position, the class whose body contains the call. We pass
+    /// the defining class explicitly so inherited methods resolve correctly
+    /// for subclass instances and across multiple inheritance.
+    fn lower_super_proxy(
+        &mut self,
+        fs: &mut FuncState,
+        range: TextRange,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let receiver_name = if fs.lookup("self").is_some() {
+            "self"
+        } else {
+            "cls"
+        };
+        let Some(receiver_local) = fs.lookup(receiver_name) else {
+            self.error_at_code(
+                range,
+                codes::NAME,
+                "zero-argument super() is only supported inside a method with a 'self' receiver",
+            );
+            return self.error_expr(range);
+        };
+        let mut args = Vec::new();
+        if let Some((class, _, _)) = self.current_class_method.clone() {
+            if self.global_names.contains(&class) {
+                self.used_globals.insert(class.clone());
+                args.push(HExpr {
+                    kind: HExprKind::GlobalGet {
+                        module: self.dunder_name.clone(),
+                        name: class,
+                    },
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                });
+            }
+        }
+        HExpr {
+            kind: HExprKind::MethodCall {
+                object: Box::new(HExpr {
+                    kind: HExprKind::Local(receiver_local),
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                }),
+                method: "$super_new".to_string(),
+                args,
+                star: None,
+                keywords: Vec::new(),
+                double_star: None,
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        }
+    }
+
+    /// Lower a `class` statement: bases and `metaclass=` in source order,
+    /// then the method functions and class attribute values of the body.
+    ///
+    /// Runtime decorators are applied by [`Self::lower_class_definition`],
+    /// which wraps this statement; a class with only compile-time decorators
+    /// (or none) lowers directly to [`HStmtKind::ClassDef`].
+    fn lower_class_stmt(
+        &mut self,
+        s: &ast::StmtClassDef,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        if !fs.is_module {
+            self.error_at(s.range, "nested class definitions are not supported yet");
+            return None;
+        }
+        let name = s.name.to_string();
+        let Some(target) = fs.lookup(&name) else {
+            self.error_name(
+                s.range,
+                &name,
+                fs,
+                format!("class '{name}' has no local slot"),
+            );
+            return None;
+        };
+        let Some(plan) = self
+            .class_defs
+            .get(&(u32::from(s.range.start()) as usize))
+            .cloned()
+        else {
+            self.error_at(
+                s.range,
+                "class definitions are only supported directly at module level",
+            );
+            return None;
+        };
+        // `__slots__` has no runtime meaning for Hydro classes (every instance
+        // has a dynamic attribute table), so it is diagnosed rather than
+        // silently ignored.
+        if plan
+            .attributes
+            .iter()
+            .any(|(attribute, _)| attribute == "__slots__")
+        {
+            self.error_at_code(
+                s.range,
+                codes::UNSUPPORTED,
+                "__slots__ is not supported: Hydro class instances always use a dynamic attribute table",
+            );
+        }
+        let bases: Vec<HExpr> = plan
+            .bases
+            .iter()
+            .filter_map(|index| s.bases.get(*index))
+            .map(|base| self.expr(base, fs))
+            .collect();
+        let metaclass = plan
+            .metaclass
+            .and_then(|index| s.keywords.get(index))
+            .map(|keyword| self.expr(&keyword.value, fs));
+        let methods: Vec<(String, FunctionId, MethodKind)> = plan
+            .methods
+            .iter()
+            .map(|(name, function, _, kind)| (name.clone(), self.fid_base + *function, *kind))
+            .collect();
+        let attributes = {
+            self.class_attr_scopes.push(HashMap::new());
+            // Class-body expressions can read methods and method aliases that
+            // were created earlier in the body; the value is the function
+            // object, exactly like a name read in CPython's class namespace.
+            if let Some(scope) = self.class_attr_scopes.last_mut() {
+                for (method, function, _) in &methods {
+                    scope.insert(
+                        method.clone(),
+                        HExpr {
+                            kind: HExprKind::FunctionRef(*function),
+                            ty: Ty::Concrete(Type::Function),
+                            line,
+                            col,
+                        },
+                    );
+                }
+            }
+            let mut attributes = Vec::with_capacity(plan.attributes.len());
+            for (name, index) in &plan.attributes {
+                // The value expression is evaluated when the class statement
+                // runs, in declaration order, and may refer to attributes
+                // declared before it.
+                let value = match &s.body[*index] {
+                    ast::Stmt::Assign(assign) => self.expr(&assign.value, fs),
+                    ast::Stmt::AnnAssign(assign) => match assign.value.as_deref() {
+                        Some(value) => self.expr(value, fs),
+                        None => self.error_expr(assign.range),
+                    },
+                    other => self.error_expr(other.range()),
+                };
+                if let Some(scope) = self.class_attr_scopes.last_mut() {
+                    scope.insert(name.clone(), value.clone());
+                }
+                attributes.push((name.clone(), value));
+            }
+            self.class_attr_scopes.pop();
+            attributes
+        };
+        Some(HStmt {
+            kind: HStmtKind::ClassDef {
+                target,
+                name,
+                bases,
+                metaclass,
+                methods,
+                attributes,
+            },
+            line,
+            col,
+        })
     }
 
     /// Lower `target = value` (plain or annotated assignment).
@@ -5844,6 +7508,264 @@ impl<'a> Lowerer<'a> {
         (var, value)
     }
 
+    /// Create a hidden local in the current function. `prefix` names it for
+    /// diagnostics; the counter keeps names unique.
+    fn hidden_temp(&mut self, fs: &mut FuncState, prefix: &str, ty: Type) -> (LocalId, HExpr) {
+        let counter = if prefix == "$decor" {
+            let counter = self.decorator_counter;
+            self.decorator_counter += 1;
+            counter
+        } else {
+            let counter = self.match_counter;
+            self.match_counter += 1;
+            counter
+        };
+        let name = format!("{prefix}{counter}");
+        let var = self.functions[fs.fid as usize].locals.len() as LocalId;
+        self.functions[fs.fid as usize].locals.push(HLocal {
+            name: name.clone(),
+            ty: Ty::Concrete(ty),
+        });
+        fs.locals.insert(name, var);
+        let value = HExpr {
+            kind: HExprKind::Local(var),
+            ty: Ty::Concrete(ty),
+            line: 0,
+            col: 0,
+        };
+        (var, value)
+    }
+
+    /// Decorator expressions of a function that are applied at runtime, in
+    /// source order. Pytest markers are compile-time directives and
+    /// `@overload` never creates a function value; everything else is a real
+    /// decorator.
+    fn runtime_function_decorators<'d>(&self, decorators: &'d [ast::Expr]) -> Vec<&'d ast::Expr> {
+        decorators
+            .iter()
+            .filter(|decorator| {
+                !is_pytest_decorator(decorator) && !is_overload_decorator(decorator)
+            })
+            .collect()
+    }
+
+    /// Whether a function definition needs runtime decorator application.
+    fn has_runtime_function_decorators(&self, decorators: &[ast::Expr]) -> bool {
+        !self.runtime_function_decorators(decorators).is_empty()
+    }
+
+    /// Evaluate the decorator expressions top-down, storing each callable in a
+    /// hidden local. CPython evaluates them before the function/class object
+    /// is created.
+    fn lower_decorator_temps(
+        &mut self,
+        decorators: &[&ast::Expr],
+        fs: &mut FuncState,
+        out: &mut Vec<HStmt>,
+    ) -> Vec<LocalId> {
+        let mut temps = Vec::with_capacity(decorators.len());
+        for decorator in decorators {
+            let (line, col) = self.span(decorator.range());
+            let (local, _) = self.hidden_temp(fs, "$decor", Type::Any);
+            let value = self.expr(decorator, fs);
+            out.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: local,
+                    value,
+                },
+                line,
+                col,
+            });
+            temps.push(local);
+        }
+        temps
+    }
+
+    /// Apply decorator values bottom-up: `target = dec(target)` starting with
+    /// the last-evaluated decorator (`@a @b def f` is `f = a(b(f))`).
+    fn apply_decorator_temps(
+        &mut self,
+        temps: &[LocalId],
+        target: LocalId,
+        fs: &mut FuncState,
+        out: &mut Vec<HStmt>,
+        line: u32,
+        col: u32,
+    ) {
+        let ty = self.functions[fs.fid as usize]
+            .locals
+            .get(target as usize)
+            .map(|local| local.ty)
+            .unwrap_or(Ty::Concrete(Type::Any));
+        for decorator in temps.iter().rev() {
+            let callee = HExpr {
+                kind: HExprKind::Local(*decorator),
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            };
+            let argument = HExpr {
+                kind: HExprKind::Local(target),
+                ty,
+                line,
+                col,
+            };
+            let value = HExpr {
+                kind: HExprKind::IndirectCall {
+                    callee: Box::new(callee),
+                    args: vec![argument],
+                    star: None,
+                },
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            };
+            out.push(HStmt {
+                kind: HStmtKind::Assign { target, value },
+                line,
+                col,
+            });
+        }
+    }
+
+    /// Lower a module-level `def`/`async def` that carries runtime
+    /// decorators: evaluate the decorators, create the function value (with
+    /// its defaults), apply the decorators bottom-up and bind the result to
+    /// the module local and, when importers or functions read it, the runtime
+    /// global table.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_module_function_definition(
+        &mut self,
+        decorators: &[ast::Expr],
+        fid: FunctionId,
+        range: TextRange,
+        fs: &mut FuncState,
+        out: &mut Vec<HStmt>,
+        line: u32,
+        col: u32,
+    ) {
+        let Some(function) = self.functions.get(fid as usize) else {
+            return;
+        };
+        let name = function.name.clone();
+        let Some(target) = fs.lookup(&name) else {
+            self.error_name(
+                range,
+                &name,
+                fs,
+                format!("function '{name}' has no local slot"),
+            );
+            return;
+        };
+        let decorators = self.runtime_function_decorators(decorators);
+        let temps = self.lower_decorator_temps(&decorators, fs, out);
+        let (function_temp, _) = self.hidden_temp(fs, "$decor", Type::Any);
+        out.push(HStmt {
+            kind: HStmtKind::Assign {
+                target: function_temp,
+                value: HExpr {
+                    kind: HExprKind::FunctionRef(self.fid_base + fid),
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                },
+            },
+            line,
+            col,
+        });
+        self.apply_decorator_temps(&temps, function_temp, fs, out, line, col);
+        let ty = Ty::Concrete(Type::Any);
+        out.push(HStmt {
+            kind: HStmtKind::Assign {
+                target,
+                value: HExpr {
+                    kind: HExprKind::Local(function_temp),
+                    ty,
+                    line,
+                    col,
+                },
+            },
+            line,
+            col,
+        });
+        // The name is read through the global table by functions of this unit
+        // and by importers, so the decorated value is always mirrored even
+        // though the read-usage scan ran before this function was registered.
+        out.push(HStmt {
+            kind: HStmtKind::GlobalSet {
+                module: self.dunder_name.clone(),
+                name,
+                value: HExpr {
+                    kind: HExprKind::Local(target),
+                    ty,
+                    line,
+                    col,
+                },
+            },
+            line,
+            col,
+        });
+    }
+
+    /// Lower a module-level class statement with runtime decorators.
+    fn lower_decorated_class(
+        &mut self,
+        s: &ast::StmtClassDef,
+        fs: &mut FuncState,
+        out: &mut Vec<HStmt>,
+        line: u32,
+        col: u32,
+    ) {
+        let name = s.name.to_string();
+        let Some(plan) = self
+            .class_defs
+            .get(&(u32::from(s.range.start()) as usize))
+            .cloned()
+        else {
+            self.error_at(
+                s.range,
+                "class definitions are only supported directly at module level",
+            );
+            return;
+        };
+        let decorators: Vec<&ast::Expr> = plan
+            .decorators
+            .iter()
+            .filter_map(|index| s.decorator_list.get(*index))
+            .collect();
+        let temps = self.lower_decorator_temps(&decorators, fs, out);
+        if let Some(statement) = self.lower_class_stmt(s, fs, line, col) {
+            out.push(statement);
+        } else {
+            return;
+        }
+        let Some(target) = fs.lookup(&name) else {
+            return;
+        };
+        self.apply_decorator_temps(&temps, target, fs, out, line, col);
+        if self.mirror_all_globals || self.used_globals.contains(&name) {
+            let ty = self.functions[fs.fid as usize]
+                .locals
+                .get(target as usize)
+                .map(|local| local.ty)
+                .unwrap_or(Ty::Concrete(Type::Any));
+            out.push(HStmt {
+                kind: HStmtKind::GlobalSet {
+                    module: self.dunder_name.clone(),
+                    name,
+                    value: HExpr {
+                        kind: HExprKind::Local(target),
+                        ty,
+                        line,
+                        col,
+                    },
+                },
+                line,
+                col,
+            });
+        }
+    }
+
     /// Create the hidden `$forN` local that receives the value bound by a
     /// `for` statement whose target is a closure cell.
     fn for_temp(&mut self, fs: &mut FuncState, range: TextRange) -> (LocalId, HExpr) {
@@ -5888,6 +7810,7 @@ impl<'a> Lowerer<'a> {
         // observing the enclosing function's single cell.
         let mut captured_here = HashSet::new();
         collect_nested_needed(body, &mut captured_here);
+        captured_here.extend(self.nested_function_template_names(body));
         let mut cells: Vec<LocalId> = mutated
             .iter()
             .filter(|name| captured_here.contains(*name))
@@ -7007,6 +8930,26 @@ impl<'a> Lowerer<'a> {
         }
         for element in elements {
             walk_free_expr(element, &bound, &mut free, &mut seen);
+        }
+        // Template literals are opaque placeholder names to `walk_free_expr`;
+        // recover the loads inside their interpolations. The ranges come from
+        // the same expressions, so capture order stays source order.
+        let mut template_ranges = Vec::new();
+        for generator in generators {
+            template_ranges.push(generator.iter.range());
+            for condition in &generator.ifs {
+                template_ranges.push(condition.range());
+            }
+        }
+        for element in elements {
+            template_ranges.push(element.range());
+        }
+        for range in template_ranges {
+            for name in self.template_free_names_in(range, &bound) {
+                if seen.insert(name.clone()) {
+                    free.push(name);
+                }
+            }
         }
 
         let mut capture_names = Vec::new();
@@ -8301,6 +10244,7 @@ impl<'a> Lowerer<'a> {
                 args,
                 star: None,
                 keywords: Vec::new(),
+                double_star: None,
             },
             ty: self.infer.fresh(),
             line,
@@ -8349,12 +10293,41 @@ impl<'a> Lowerer<'a> {
             ast::Expr::Constant(c) => self.const_expr(c, e.range(), line, col),
             ast::Expr::Name(n) => {
                 let name = n.id.as_str();
-                if let Some(local) = fs.lookup(name) {
+                if let Some(range) = template_placeholder_range(name) {
+                    // PEP 750 template literal: the parser emitted a reserved
+                    // placeholder `Name`. Resolve it through the unit's
+                    // template side table; it is never a variable.
+                    return self.template_expr(range, fs, line, col);
+                }
+                // A class body resolves names against its own namespace
+                // first (methods and attributes declared earlier), before any
+                // enclosing module/function binding or builtin.
+                if let Some(attribute) = self
+                    .class_attr_scopes
+                    .last()
+                    .and_then(|scope| scope.get(name))
+                    .cloned()
+                {
+                    attribute
+                } else if let Some(local) = fs.lookup(name) {
                     let ty = self.infer.fresh();
                     self.local_read(fs, local, ty, line, col)
                 } else if fs.is_global(name) {
                     // `global name`: the value lives in the runtime global
                     // table of this module.
+                    self.used_globals.insert(name.to_string());
+                    HExpr {
+                        kind: HExprKind::GlobalGet {
+                            module: self.dunder_name.clone(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
+                } else if self.decorated_functions.contains_key(name) {
+                    // The name binds the decorator's result, mirrored into the
+                    // runtime global table when the module body ran.
                     self.used_globals.insert(name.to_string());
                     HExpr {
                         kind: HExprKind::GlobalGet {
@@ -8478,15 +10451,6 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
-                } else if let Some(attribute) = self
-                    .class_attr_scopes
-                    .last()
-                    .and_then(|scope| scope.get(name))
-                    .cloned()
-                {
-                    // A class body may refer to attributes declared earlier
-                    // in the same class namespace.
-                    attribute
                 } else if self.global_names.contains(name) {
                     // Module-level value read from a function. The module body
                     // mirrors every assignment into the runtime global table,
@@ -9180,7 +11144,25 @@ impl<'a> Lowerer<'a> {
         let mut seen = HashSet::new();
         let mut rejected = false;
 
-        for arg in l.args.posonlyargs.iter().chain(l.args.args.iter()) {
+        for arg in &l.args.posonlyargs {
+            if arg.default.is_some() {
+                self.error_at(
+                    arg.def.range,
+                    "lambda default parameter values are not supported",
+                );
+                rejected = true;
+            }
+            self.add_param(
+                &arg.def,
+                None,
+                None,
+                ParamKind::PosOnly,
+                &mut params,
+                &mut locals,
+                &mut seen,
+            );
+        }
+        for arg in &l.args.args {
             if arg.default.is_some() {
                 self.error_at(
                     arg.def.range,
@@ -9385,6 +11367,134 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         }
+    }
+
+    /// Lowers a PEP 750 template literal placeholder to an HIR
+    /// [`HExprKind::Template`].
+    ///
+    /// The parser returns each literal's structure out of band, keyed by the
+    /// literal's source range. Every interpolation value and format spec is
+    /// lowered in source order, so nested template literals (also placeholders)
+    /// resolve recursively. A placeholder without a side-table entry is an
+    /// explicit diagnostic: a template is never silently treated as a normal
+    /// name.
+    fn template_expr(
+        &mut self,
+        range: TextRange,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let Some(template) = self
+            .templates
+            .iter()
+            .find(|template| template.range == range)
+            .cloned()
+        else {
+            self.error_at_code(
+                range,
+                codes::UNSUPPORTED,
+                "template string literal could not be resolved; recompile this unit with template support",
+            );
+            return self.error_expr(range);
+        };
+
+        let mut interpolations = Vec::with_capacity(template.interpolations.len());
+        for interpolation in &template.interpolations {
+            let value = self.expr(&interpolation.value, fs);
+            let format_spec = interpolation
+                .format_spec
+                .as_deref()
+                .map(|spec| Box::new(self.expr(spec, fs)));
+            let conversion = match interpolation.conversion {
+                ast::ConversionFlag::None => 0u8,
+                ast::ConversionFlag::Str => 1,
+                ast::ConversionFlag::Repr => 2,
+                ast::ConversionFlag::Ascii => 3,
+            };
+            interpolations.push(HTemplateInterpolation {
+                value,
+                expression: interpolation.expression.clone(),
+                conversion,
+                format_spec,
+                self_documenting: interpolation.self_documenting,
+            });
+        }
+
+        HExpr {
+            kind: HExprKind::Template {
+                strings: template
+                    .strings
+                    .iter()
+                    .map(|constant| constant.value.clone())
+                    .collect(),
+                interpolations,
+            },
+            // A template is a distinct runtime value, not a `str`.
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        }
+    }
+
+    /// Names loaded by template interpolations whose literal lies inside
+    /// `range`, in source order.
+    ///
+    /// Free-variable analysis walks the AST, where a template is an opaque
+    /// placeholder `Name`; this recovers the loads hidden inside its
+    /// interpolations so closure capture, cell selection and module-global
+    /// mirroring stay correct.
+    fn template_free_names_in(&self, range: TextRange, shadowed: &HashSet<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for template in &self.templates {
+            if template.range.start() < range.start() || template.range.end() > range.end() {
+                continue;
+            }
+            for interpolation in &template.interpolations {
+                walk_free_expr(&interpolation.value, shadowed, &mut out, &mut seen);
+                if let Some(spec) = &interpolation.format_spec {
+                    walk_free_expr(spec, shadowed, &mut out, &mut seen);
+                }
+            }
+        }
+        out
+    }
+
+    /// Names loaded by any template interpolation of this unit.
+    fn template_free_names(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for template in &self.templates {
+            for interpolation in &template.interpolations {
+                walk_free_expr(&interpolation.value, &HashSet::new(), &mut out, &mut seen);
+                if let Some(spec) = &interpolation.format_spec {
+                    walk_free_expr(spec, &HashSet::new(), &mut out, &mut seen);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether any template interpolation of this unit loads `name`.
+    fn template_loads_name(&self, name: &str) -> bool {
+        self.template_free_names()
+            .iter()
+            .any(|loaded| loaded == name)
+    }
+
+    /// Names loaded by templates inside nested `def` bodies of `stmts`.
+    ///
+    /// Cell selection only cares about templates a nested function evaluates;
+    /// a template in the current scope must not force a cell on a local.
+    fn nested_function_template_names(&self, stmts: &[ast::Stmt]) -> HashSet<String> {
+        let mut ranges = Vec::new();
+        collect_nested_function_ranges(stmts, &mut ranges);
+        let mut out = HashSet::new();
+        for range in ranges {
+            out.extend(self.template_free_names_in(range, &HashSet::new()));
+        }
+        out
     }
 
     /// Lowers `["a", *xs, "b"]` into left-to-right list concatenations: each
@@ -9828,9 +11938,20 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> HExpr {
-        // Zero-argument `super()` is only approximated for the common
-        // `super().__init__(...)` form: the base initializer is skipped, while
-        // the subclass body continues to initialize its own state.
+        // Zero-argument `super()`: materialise the runtime super proxy for
+        // the enclosing method. `super().name`, `super().method(...)` and
+        // chained access all resolve through the proxy's MRO position.
+        if let ast::Expr::Name(name) = &*call.func {
+            if name.id.as_str() == "super"
+                && call.args.is_empty()
+                && call.keywords.is_empty()
+                && !self.super_name_is_shadowed(fs)
+            {
+                return self.lower_super_proxy(fs, call.range, line, col);
+            }
+        }
+        // `super().__init__(...)` keeps the dedicated initializer helper: it
+        // binds keyword arguments against the base signature directly.
         if let ast::Expr::Attribute(attribute) = &*call.func {
             if attribute.attr.as_str() == "__init__" {
                 if let ast::Expr::Call(super_call) = &*attribute.value {
@@ -9886,6 +12007,7 @@ impl<'a> Lowerer<'a> {
                                     args,
                                     star: None,
                                     keywords,
+                                    double_star: None,
                                 },
                                 ty: self.infer.fresh(),
                                 line,
@@ -9986,23 +12108,38 @@ impl<'a> Lowerer<'a> {
                     }
                 }
             }
-            // A receiver method keeps its dedicated `hydro_method_star` ABI
-            // (unchanged). A module/user-module/extension member is not a
-            // method: its attribute lowers to a first-class function value
-            // and the call uses the general starred-call ABI below.
-            let method_star = match &*call.func {
-                ast::Expr::Attribute(attr) => {
-                    call.keywords.iter().all(|keyword| keyword.arg.is_some())
-                        && self.resolve_module_chain(&attr.value, fs).is_none()
-                        && self.resolve_user_module(&attr.value, fs).is_none()
-                        && self.resolve_extension_alias(&attr.value, fs).is_none()
-                        && self.resolve_deferred_import(&call.func, fs).is_none()
+            // A receiver method call keeps the method ABI, which expands the
+            // starred operand and merges the keywords (named and `**`) in the
+            // runtime binder. A module/user-module/extension member is not a
+            // method: its attribute lowers to a first-class function value and
+            // the call uses the general starred-call ABI.
+            if let ast::Expr::Attribute(attr) = &*call.func {
+                if self.resolve_module_chain(&attr.value, fs).is_none()
+                    && self.resolve_user_module(&attr.value, fs).is_none()
+                    && self.resolve_extension_alias(&attr.value, fs).is_none()
+                    && self.resolve_deferred_import(&call.func, fs).is_none()
+                {
+                    let object = self.expr(&attr.value, fs);
+                    let Some((args, star, keywords, double_star)) = self.call_operands(call, fs)
+                    else {
+                        return self.error_expr(call.range);
+                    };
+                    return HExpr {
+                        kind: HExprKind::MethodCall {
+                            object: Box::new(object),
+                            method: attr.attr.to_string(),
+                            args,
+                            star: star.map(Box::new),
+                            keywords,
+                            double_star: double_star.map(Box::new),
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
                 }
-                _ => false,
-            };
-            if !method_star {
-                return self.lower_starred_or_deferred_call(call, fs, line, col);
             }
+            return self.lower_dynamic_call(call, fs, line, col);
         }
         let name_expr = match &*call.func {
             ast::Expr::Name(name_expr) => name_expr,
@@ -10052,7 +12189,7 @@ impl<'a> Lowerer<'a> {
                     };
                 }
                 let object = self.expr(&attr.value, fs);
-                let Some((args, star, keywords)) = self.call_arguments(call, fs) else {
+                let Some((args, star, keywords, double_star)) = self.call_operands(call, fs) else {
                     return self.error_expr(call.range);
                 };
                 return HExpr {
@@ -10062,6 +12199,7 @@ impl<'a> Lowerer<'a> {
                         args,
                         star: star.map(Box::new),
                         keywords,
+                        double_star: double_star.map(Box::new),
                     },
                     ty: self.infer.fresh(),
                     line,
@@ -10277,6 +12415,45 @@ impl<'a> Lowerer<'a> {
             };
         }
 
+        if self.decorated_functions.contains_key(name) {
+            // The decorator may have replaced the function with any callable,
+            // so the call goes through the module global and the runtime call
+            // protocol (keywords included).
+            self.used_globals.insert(name.to_string());
+            let (callee_line, callee_col) = self.span(name_expr.range);
+            let callee = HExpr {
+                kind: HExprKind::GlobalGet {
+                    module: self.dunder_name.clone(),
+                    name: name.to_string(),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line: callee_line,
+                col: callee_col,
+            };
+            if call_has_dynamic_arguments(call) {
+                return self.lower_dynamic_call(call, fs, line, col);
+            }
+            if !call.keywords.is_empty() {
+                let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                    return self.error_expr(call.range);
+                };
+                return result;
+            }
+            let Some(args) = self.plain_call_args(call, fs) else {
+                return self.error_expr(call.range);
+            };
+            return HExpr {
+                kind: HExprKind::IndirectCall {
+                    callee: Box::new(callee),
+                    args,
+                    star: None,
+                },
+                ty: self.infer.fresh(),
+                line,
+                col,
+            };
+        }
+
         if let Some(&id) = self.imported_user_functions.get(name) {
             // Exact positional calls link directly; calls with keywords or
             // omitted defaults go through the runtime metadata binder.
@@ -10285,9 +12462,7 @@ impl<'a> Lowerer<'a> {
                     let param_count = signature
                         .params
                         .iter()
-                        .filter(|(_, _, kind)| {
-                            matches!(kind, ParamKind::Positional | ParamKind::KwOnly)
-                        })
+                        .filter(|(_, _, kind)| kind.is_positional() || *kind == ParamKind::KwOnly)
                         .count();
                     if let Some(args) = self.plain_call_args(call, fs) {
                         if args.len() == param_count {
@@ -10408,7 +12583,44 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        if let Some((_module, constant)) = self.imported_constants.get(name).copied() {
+        if let Some((module, constant)) = self.imported_constants.get(name).copied() {
+            // A dynamically typed constant member is often a class or a
+            // factory exposed by a native module (`from _weakref import ref`).
+            // It is callable at runtime, so lower the call through its value
+            // instead of rejecting it statically.
+            if constant.ty == Type::Any {
+                if call_has_dynamic_arguments(call) {
+                    return self.lower_dynamic_call(call, fs, line, col);
+                }
+                let callee = HExpr {
+                    kind: HExprKind::ModuleAttr {
+                        module: module.name.to_string(),
+                        name: constant.name.to_string(),
+                    },
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                };
+                if !call.keywords.is_empty() {
+                    let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                        return self.error_expr(call.range);
+                    };
+                    return result;
+                }
+                let Some(args) = self.plain_call_args(call, fs) else {
+                    return self.error_expr(call.range);
+                };
+                return HExpr {
+                    kind: HExprKind::IndirectCall {
+                        callee: Box::new(callee),
+                        args,
+                        star: None,
+                    },
+                    ty: self.infer.fresh(),
+                    line,
+                    col,
+                };
+            }
             self.error_at_code(
                 call.range,
                 codes::CALL,
@@ -10675,13 +12887,6 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        // Zero-argument `super()` needs runtime class-context tracking that
-        // this runtime does not provide. Keep the expression compilable but
-        // make an actual evaluation fail clearly.
-        if name == "super" && call.args.is_empty() && call.keywords.is_empty() {
-            return self.deferred_import_expr("super()", None, line, col);
-        }
-
         if self.session_mode {
             // A callable bound by an earlier fragment lives in the session
             // global table; call it through the runtime function-value ABI.
@@ -10735,74 +12940,64 @@ impl<'a> Lowerer<'a> {
         self.error_expr(call.range)
     }
 
-    /// Lower a general call with a single starred positional operand.
+    /// Lower a call that needs runtime argument flattening.
     ///
-    /// `callee(args..., *star)` keeps Python's evaluation order: the callee
-    /// first, then the positional operands that precede the star, then the
-    /// starred iterable. The IR keeps the leading operands and the star
-    /// separately and codegen hands them to the runtime's starred-call ABI,
-    /// which flattens a list/tuple into positional arguments.
-    ///
-    /// A second `*`, a positional operand after the star, a `**` keyword and
-    /// (for now) any keyword argument cannot be represented by that ABI: the
-    /// first two are diagnosed at the call site, the others stay a deferred
-    /// call that evaluates its operands and reports the unsupported dynamic
-    /// call at runtime.
-    fn lower_starred_or_deferred_call(
+    /// Used for `f(*args)`, `f(**kwargs)` and any combination of a starred
+    /// positional operand with keywords on a callee that is not a receiver
+    /// method. Python evaluates the callee, then the positional operands (the
+    /// starred operand's iterable at its source position), then each keyword
+    /// value and finally the `**mapping`. The IR keeps those operand groups in
+    /// order and codegen forwards them to the runtime flattener, which raises
+    /// `TypeError` for a non-mapping `**` operand, a non-`str` key or a key
+    /// bound twice.
+    fn lower_dynamic_call(
         &mut self,
         call: &ast::ExprCall,
         fs: &mut FuncState,
         line: u32,
         col: u32,
     ) -> HExpr {
-        let mut star_index = None;
-        for (index, arg) in call.args.iter().enumerate() {
-            if let ast::Expr::Starred(starred) = arg {
-                if star_index.is_some() {
-                    self.error_at_code(
-                        starred.range,
-                        codes::CALL,
-                        "only one starred argument is supported",
-                    );
-                    return self.error_expr(call.range);
-                }
-                star_index = Some(index);
+        let callee = self.starred_callee(&call.func, fs);
+        let Some((args, star, keywords, double_star)) = self.call_operands(call, fs) else {
+            return self.error_expr(call.range);
+        };
+        // Shapes the narrower nodes already express exactly: no keyword at
+        // all keeps `IndirectCall`, keywords without `*`/`**` keep `CallKw`.
+        // Both are preserved so existing lowering behaviour (and its tests)
+        // stays byte-identical.
+        if double_star.is_none() {
+            if keywords.is_empty() {
+                return HExpr {
+                    kind: HExprKind::IndirectCall {
+                        callee: Box::new(callee),
+                        args,
+                        star: star.map(Box::new),
+                    },
+                    ty: self.infer.fresh(),
+                    line,
+                    col,
+                };
+            }
+            if star.is_none() {
+                return HExpr {
+                    kind: HExprKind::CallKw {
+                        callee: Box::new(callee),
+                        args,
+                        keywords,
+                    },
+                    ty: self.infer.fresh(),
+                    line,
+                    col,
+                };
             }
         }
-        let Some(star_index) = star_index else {
-            // Only `**kwargs` made the call dynamic.
-            return self.lower_deferred_call(call, fs, line, col);
-        };
-        if !call.keywords.is_empty() {
-            // Keyword binding for a starred call is not part of the general
-            // call ABI yet; the deferred path keeps the evaluation order and
-            // reports it at runtime.
-            return self.lower_deferred_call(call, fs, line, col);
-        }
-        if star_index + 1 != call.args.len() {
-            self.error_at_code(
-                call.args[star_index + 1].range(),
-                codes::CALL,
-                "a positional argument cannot follow a starred argument",
-            );
-            return self.error_expr(call.range);
-        }
-
-        let callee = self.starred_callee(&call.func, fs);
-        let mut args = Vec::with_capacity(star_index);
-        for arg in &call.args[..star_index] {
-            args.push(self.expr(arg, fs));
-        }
-        let ast::Expr::Starred(starred) = &call.args[star_index] else {
-            // `star_index` was found above.
-            return self.error_expr(call.range);
-        };
-        let star = self.expr(&starred.value, fs);
         HExpr {
-            kind: HExprKind::IndirectCall {
+            kind: HExprKind::CallFull {
                 callee: Box::new(callee),
                 args,
-                star: Some(Box::new(star)),
+                star: star.map(Box::new),
+                keywords,
+                double_star: double_star.map(Box::new),
             },
             ty: self.infer.fresh(),
             line,
@@ -10917,18 +13112,20 @@ impl<'a> Lowerer<'a> {
         Some(args)
     }
 
-    /// Lower positional arguments, one optional starred operand and the
-    /// keyword pairs of a method call. Source order is preserved: plain
-    /// arguments, then the starred operand, then the keywords.
+    /// Lower every operand of a call in source order: the positional
+    /// arguments, at most one starred operand (which must be the last
+    /// positional operand, because the IR evaluates it after them), the named
+    /// keyword values and at most one `**mapping` (which must come last).
     ///
-    /// The method ABI has no separate positional buffer next to the starred
-    /// operand, so a call may not mix the two forms.
-    fn call_arguments(
+    /// The restricted positions are diagnosed at the call site instead of
+    /// silently reordering side effects.
+    #[allow(clippy::type_complexity)]
+    fn call_operands(
         &mut self,
         call: &ast::ExprCall,
         fs: &mut FuncState,
-    ) -> Option<LoweredCallArguments> {
-        let mut args = Vec::with_capacity(call.args.len());
+    ) -> Option<LoweredCallOperands> {
+        let mut args: Vec<HExpr> = Vec::with_capacity(call.args.len());
         let mut star: Option<HExpr> = None;
         for arg in &call.args {
             if let ast::Expr::Starred(starred) = arg {
@@ -10937,14 +13134,6 @@ impl<'a> Lowerer<'a> {
                         starred.range,
                         codes::CALL,
                         "only one starred argument is supported",
-                    );
-                    return None;
-                }
-                if !args.is_empty() {
-                    self.error_at_code(
-                        starred.range,
-                        codes::CALL,
-                        "a starred argument cannot be combined with positional arguments",
                     );
                     return None;
                 }
@@ -10962,15 +13151,30 @@ impl<'a> Lowerer<'a> {
             args.push(self.expr(arg, fs));
         }
         let mut keywords: Vec<(String, HExpr)> = Vec::with_capacity(call.keywords.len());
+        let mut double_star: Option<HExpr> = None;
         for keyword in &call.keywords {
             let Some(name) = keyword.arg.as_ref() else {
+                if double_star.is_some() {
+                    self.error_at_code(
+                        keyword.range,
+                        codes::CALL,
+                        "only one **mapping argument is allowed",
+                    );
+                    return None;
+                }
+                // A `**mapping` must be the last operand: the IR evaluates the
+                // named keywords before it.
+                double_star = Some(self.expr(&keyword.value, fs));
+                continue;
+            };
+            if double_star.is_some() {
                 self.error_at_code(
                     keyword.range,
                     codes::CALL,
-                    "**kwargs arguments are not supported",
+                    "a named keyword argument cannot follow a **mapping argument",
                 );
                 return None;
-            };
+            }
             if keywords
                 .iter()
                 .any(|(existing, _)| existing.as_str() == name.as_str())
@@ -10984,7 +13188,7 @@ impl<'a> Lowerer<'a> {
             }
             keywords.push((name.to_string(), self.expr(&keyword.value, fs)));
         }
-        Some((args, star, keywords))
+        Some((args, star, keywords, double_star))
     }
 
     /// Cloned signature of a function of this unit.
@@ -11117,7 +13321,12 @@ impl<'a> Lowerer<'a> {
                 return None;
             };
             let mut bound = None;
+            // Positional-only parameters are not keyword-bindable: a keyword
+            // with the same name falls through to `**kwargs` or is rejected.
             for index in capture_count..positional_end {
+                if signature.kind_at(index) == ParamKind::PosOnly {
+                    continue;
+                }
                 if signature.params[index].0 == keyword_name.as_str() {
                     bound = Some(index);
                     break;
@@ -11198,6 +13407,8 @@ impl<'a> Lowerer<'a> {
                 None => {
                     let label = if kind == ParamKind::KwOnly {
                         "keyword-only argument"
+                    } else if kind == ParamKind::PosOnly {
+                        "positional argument"
                     } else {
                         "argument"
                     };
@@ -11362,10 +13573,9 @@ impl<'a> Lowerer<'a> {
                 );
                 return None;
             };
-            let Some(index) = signature.params[1..]
-                .iter()
-                .position(|(name, _, _)| name.as_str() == keyword_name.as_str())
-            else {
+            let Some(index) = signature.params[1..].iter().position(|(name, _, kind)| {
+                *kind != ParamKind::PosOnly && name.as_str() == keyword_name.as_str()
+            }) else {
                 self.error_at_code(
                     keyword.range,
                     codes::CALL,
@@ -11431,7 +13641,7 @@ impl<'a> Lowerer<'a> {
         let params = &signature.params[1..];
         let fixed_positional = params
             .iter()
-            .take_while(|(_, _, kind)| *kind == ParamKind::Positional)
+            .take_while(|(_, _, kind)| kind.is_positional())
             .count();
         let vararg_index = params
             .iter()
@@ -11570,7 +13780,7 @@ impl<'a> Lowerer<'a> {
 
         // Fill positional and keyword-only slots with their literal defaults.
         for (index, (name, default, kind)) in params.iter().enumerate() {
-            if !matches!(kind, ParamKind::Positional | ParamKind::KwOnly) {
+            if !kind.is_positional() && *kind != ParamKind::KwOnly {
                 continue;
             }
             if slots[index].is_some() {
@@ -11641,6 +13851,7 @@ impl<'a> Lowerer<'a> {
                             }],
                             star: None,
                             keywords: Vec::new(),
+                            double_star: None,
                         },
                         ty: Ty::Concrete(Type::Dict),
                         line,
@@ -11696,13 +13907,16 @@ impl<'a> Lowerer<'a> {
             };
             args.push(value);
         }
+        // Positional-only slots carry no bindable name: a `**mapping` key with
+        // that name must be routed to `**kwargs`, never into the slot.
         let param_names = params
             .iter()
             .map(|(name, _, kind)| {
-                if matches!(kind, ParamKind::VarArg | ParamKind::KwArg) {
-                    String::new()
-                } else {
+                if kind.is_positional() && *kind != ParamKind::PosOnly || *kind == ParamKind::KwOnly
+                {
                     name.clone()
+                } else {
+                    String::new()
                 }
             })
             .collect();
@@ -12610,6 +14824,12 @@ fn body_has_yield(stmts: &[ast::Stmt]) -> bool {
         ast::Stmt::TryStar(s) => {
             try_parts_have_yield(&s.body, &s.handlers, &s.orelse, &s.finalbody)
         }
+        ast::Stmt::Match(s) => {
+            expr_has_yield(&s.subject)
+                || s.cases.iter().any(|case| {
+                    case.guard.as_deref().is_some_and(expr_has_yield) || body_has_yield(&case.body)
+                })
+        }
         _ => false,
     })
 }
@@ -13209,7 +15429,60 @@ fn collect_scope_mutations(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
             }
             ast::Stmt::Match(s) => {
                 for case in &s.cases {
+                    // A capture is a binding in this scope: a nested function
+                    // that captures and mutates it must share a cell.
+                    let mut captures = Vec::new();
+                    collect_pattern_binding_names(&case.pattern, &mut captures);
+                    out.extend(captures);
                     collect_scope_mutations(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Source ranges of `def`/`async def` statements nested in `stmts`.
+///
+/// The walk follows compound statements exactly like
+/// [`collect_nested_needed`] and does not descend into function bodies: a
+/// nested function's own range already covers its descendants, so its
+/// template interpolations are collected once.
+fn collect_nested_function_ranges(stmts: &[ast::Stmt], out: &mut Vec<TextRange>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::FunctionDef(f) => out.push(f.range),
+            ast::Stmt::AsyncFunctionDef(f) => out.push(f.range),
+            ast::Stmt::If(s) => {
+                collect_nested_function_ranges(&s.body, out);
+                collect_nested_function_ranges(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_nested_function_ranges(&s.body, out);
+                collect_nested_function_ranges(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_nested_function_ranges(&s.body, out);
+                collect_nested_function_ranges(&s.orelse, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_nested_function_ranges(&s.body, out);
+                collect_nested_function_ranges(&s.orelse, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_nested_function_ranges(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_nested_function_ranges(&handler.body, out);
+                }
+                collect_nested_function_ranges(&s.orelse, out);
+                collect_nested_function_ranges(&s.finalbody, out);
+            }
+            ast::Stmt::With(s) => collect_nested_function_ranges(&s.body, out),
+            ast::Stmt::AsyncWith(s) => collect_nested_function_ranges(&s.body, out),
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_nested_function_ranges(&case.body, out);
                 }
             }
             _ => {}
@@ -13508,6 +15781,134 @@ fn collect_import_bindings(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
 /// `include_defs` binds nested `def` names here (true for function bodies,
 /// false for the module body, where functions live in the function table).
 /// Nested function bodies and lambdas are never descended into.
+/// Names bound by a `match` pattern (captures, `as` names, `*rest`, `**rest`).
+fn collect_pattern_binding_names(pattern: &ast::Pattern, out: &mut Vec<String>) {
+    match pattern {
+        ast::Pattern::MatchValue(_) | ast::Pattern::MatchSingleton(_) => {}
+        ast::Pattern::MatchSequence(sequence) => {
+            for child in &sequence.patterns {
+                collect_pattern_binding_names(child, out);
+            }
+        }
+        ast::Pattern::MatchMapping(mapping) => {
+            for child in &mapping.patterns {
+                collect_pattern_binding_names(child, out);
+            }
+            if let Some(rest) = &mapping.rest {
+                out.push(rest.to_string());
+            }
+        }
+        ast::Pattern::MatchClass(class) => {
+            for child in class.patterns.iter().chain(&class.kwd_patterns) {
+                collect_pattern_binding_names(child, out);
+            }
+        }
+        ast::Pattern::MatchStar(star) => {
+            if let Some(name) = &star.name {
+                out.push(name.to_string());
+            }
+        }
+        ast::Pattern::MatchAs(as_pattern) => {
+            if let Some(inner) = &as_pattern.pattern {
+                collect_pattern_binding_names(inner, out);
+            }
+            if let Some(name) = &as_pattern.name {
+                out.push(name.to_string());
+            }
+        }
+        ast::Pattern::MatchOr(or_pattern) => {
+            for alternative in &or_pattern.patterns {
+                collect_pattern_binding_names(alternative, out);
+            }
+        }
+    }
+}
+
+/// Free-name loads of a pattern: value/class expressions and mapping keys.
+/// Capture names are stores and never recorded here.
+fn walk_free_pattern(
+    pattern: &ast::Pattern,
+    shadowed: &HashSet<String>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match pattern {
+        ast::Pattern::MatchValue(value) => walk_free_expr(&value.value, shadowed, out, seen),
+        ast::Pattern::MatchSingleton(_) => {}
+        ast::Pattern::MatchSequence(sequence) => {
+            for child in &sequence.patterns {
+                walk_free_pattern(child, shadowed, out, seen);
+            }
+        }
+        ast::Pattern::MatchMapping(mapping) => {
+            for key in &mapping.keys {
+                walk_free_expr(key, shadowed, out, seen);
+            }
+            for child in &mapping.patterns {
+                walk_free_pattern(child, shadowed, out, seen);
+            }
+        }
+        ast::Pattern::MatchClass(class) => {
+            walk_free_expr(&class.cls, shadowed, out, seen);
+            for child in class.patterns.iter().chain(&class.kwd_patterns) {
+                walk_free_pattern(child, shadowed, out, seen);
+            }
+        }
+        ast::Pattern::MatchStar(_) => {}
+        ast::Pattern::MatchAs(as_pattern) => {
+            if let Some(inner) = &as_pattern.pattern {
+                walk_free_pattern(inner, shadowed, out, seen);
+            }
+        }
+        ast::Pattern::MatchOr(or_pattern) => {
+            for alternative in &or_pattern.patterns {
+                walk_free_pattern(alternative, shadowed, out, seen);
+            }
+        }
+    }
+}
+
+/// Whether a pattern matches every value: a capture or wildcard (also through
+/// `as` bindings and OR alternatives).
+fn pattern_is_irrefutable(pattern: &ast::Pattern) -> bool {
+    match pattern {
+        ast::Pattern::MatchAs(as_pattern) => {
+            as_pattern.pattern.is_none()
+                || as_pattern
+                    .pattern
+                    .as_deref()
+                    .is_some_and(pattern_is_irrefutable)
+        }
+        ast::Pattern::MatchOr(or_pattern) => or_pattern.patterns.iter().any(pattern_is_irrefutable),
+        _ => false,
+    }
+}
+
+/// A literal expression usable in a value pattern (`1`, `"x"`, `-2`, `1+2j`).
+fn is_literal_pattern_expr(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Constant(_) => true,
+        ast::Expr::UnaryOp(unary) => is_literal_pattern_expr(&unary.operand),
+        ast::Expr::BinOp(binary) => {
+            is_literal_pattern_expr(&binary.left) && is_literal_pattern_expr(&binary.right)
+        }
+        ast::Expr::Tuple(tuple) => tuple.elts.iter().all(is_literal_pattern_expr),
+        _ => false,
+    }
+}
+
+/// Text form of a literal mapping-pattern key, used to reject duplicates.
+fn literal_pattern_key(expr: &ast::Expr) -> Option<String> {
+    match expr {
+        ast::Expr::Constant(constant) => Some(format!("{constant:?}")),
+        ast::Expr::UnaryOp(unary) => {
+            let inner = literal_pattern_key(&unary.operand)?;
+            Some(format!("{:?}({inner})", unary.op))
+        }
+        _ => None,
+    }
+}
+
 fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool) {
     for stmt in stmts {
         match stmt {
@@ -13582,6 +15983,24 @@ fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool)
                     }
                 }
                 collect_names(&s.body, out, include_defs);
+            }
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_pattern_binding_names(&case.pattern, out);
+                    collect_names(&case.body, out, include_defs);
+                }
+            }
+            ast::Stmt::TryStar(s) => {
+                collect_names(&s.body, out, include_defs);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    if let Some(name) = &h.name {
+                        out.push(name.to_string());
+                    }
+                    collect_names(&h.body, out, include_defs);
+                }
+                collect_names(&s.orelse, out, include_defs);
+                collect_names(&s.finalbody, out, include_defs);
             }
             _ => {}
         }
@@ -13677,6 +16096,25 @@ fn walk_free_stmts(
                 }
                 walk_free_stmts(&s.orelse, shadowed, out, seen);
                 walk_free_stmts(&s.finalbody, shadowed, out, seen);
+            }
+            ast::Stmt::TryStar(s) => {
+                walk_free_stmts(&s.body, shadowed, out, seen);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    walk_free_stmts(&h.body, shadowed, out, seen);
+                }
+                walk_free_stmts(&s.orelse, shadowed, out, seen);
+                walk_free_stmts(&s.finalbody, shadowed, out, seen);
+            }
+            ast::Stmt::Match(s) => {
+                walk_free_expr(&s.subject, shadowed, out, seen);
+                for case in &s.cases {
+                    walk_free_pattern(&case.pattern, shadowed, out, seen);
+                    if let Some(guard) = &case.guard {
+                        walk_free_expr(guard, shadowed, out, seen);
+                    }
+                    walk_free_stmts(&case.body, shadowed, out, seen);
+                }
             }
             ast::Stmt::Assert(s) => {
                 walk_free_expr(&s.test, shadowed, out, seen);
@@ -13797,7 +16235,15 @@ fn walk_free_expr(
     seen: &mut HashSet<String>,
 ) {
     match expr {
-        ast::Expr::Name(n) => record_name_load(n.id.as_str(), shadowed, out, seen),
+        ast::Expr::Name(n) => {
+            // A PEP 750 template literal is an opaque placeholder `Name` in
+            // the AST. Its interpolation loads are recovered separately from
+            // the template side table (`Lowerer::template_free_names_in`);
+            // the placeholder itself is never a variable.
+            if !is_template_placeholder(n.id.as_str()) {
+                record_name_load(n.id.as_str(), shadowed, out, seen);
+            }
+        }
         ast::Expr::Constant(_) => {}
         ast::Expr::BinOp(b) => {
             walk_free_expr(&b.left, shadowed, out, seen);

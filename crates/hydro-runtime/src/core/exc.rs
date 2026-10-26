@@ -781,7 +781,8 @@ pub(crate) fn raise_value(v: i64) -> i64 {
                 Some(context) if data.context.is_none() => {
                     let mut data = data.clone();
                     data.context = Some(context);
-                    publish(value::exception_new(data))
+                    // Keep a user-defined exception's Python class identity.
+                    publish(value::exception_with_data(v, data))
                 }
                 _ => publish(v),
             }
@@ -818,7 +819,8 @@ pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
             if let Some(context) = handled().filter(|&h| h != v) {
                 data.context = Some(context);
             }
-            publish(value::exception_new(data))
+            // Keep a user-defined exception's Python class identity.
+            publish(value::exception_with_data(v, data))
         }
         None => raise_with_message(RUNTIME_ERROR, "exceptions must derive from BaseException"),
     }

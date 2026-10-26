@@ -1,4 +1,5 @@
 use super::*;
+use rustpython_parser::template::TemplateString;
 use rustpython_parser::Mode;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -543,7 +544,7 @@ fn undefined_name_without_a_close_match_has_no_help() {
 
 #[test]
 fn unsupported_construct_sets_the_span_and_help() {
-    let source = "match x:\n    case 1:\n        pass\n";
+    let source = "type X = int\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, codes::UNSUPPORTED);
@@ -3382,17 +3383,25 @@ fn starred_calls_use_the_general_starred_abi() {
 }
 
 #[test]
-fn double_star_calls_defer_to_runtime() {
+fn double_star_calls_use_the_runtime_flattener() {
     let source = "def f(**kwargs):\n    return kwargs\nx = f(**{\"a\": 1})\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
-    let HExprKind::DeferredCall { args, .. } = &assigned(&hir, "x").kind else {
+    let HExprKind::CallFull {
+        args,
+        star,
+        double_star,
+        ..
+    } = &assigned(&hir, "x").kind
+    else {
         panic!(
-            "expected a deferred call, got {:?}",
+            "expected a dynamically bound call, got {:?}",
             assigned(&hir, "x").kind
         );
     };
-    assert_eq!(args.len(), 1);
+    assert!(args.is_empty());
+    assert!(star.is_none());
+    assert!(double_star.is_some());
 }
 
 #[test]
@@ -3411,7 +3420,7 @@ fn keyword_call_on_a_function_value_uses_the_runtime_binder() {
 }
 
 #[test]
-fn method_double_star_call_defers() {
+fn method_double_star_call_lowers_to_the_method_binder() {
     let source = "\
 class C:
     def m(self, a):
@@ -3421,14 +3430,14 @@ x = c.m(**{\"a\": 1})
 ";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
-    let HExprKind::DeferredCall { callee, args } = &assigned(&hir, "x").kind else {
-        panic!(
-            "expected a deferred call, got {:?}",
-            assigned(&hir, "x").kind
-        );
+    let HExprKind::MethodCall {
+        args, double_star, ..
+    } = &assigned(&hir, "x").kind
+    else {
+        panic!("expected a method call, got {:?}", assigned(&hir, "x").kind);
     };
-    assert!(callee.is_some(), "the object is still evaluated");
-    assert_eq!(args.len(), 1);
+    assert!(args.is_empty());
+    assert!(double_star.is_some());
 }
 
 #[test]
@@ -3792,7 +3801,7 @@ fn class_definition_lowers_with_methods_and_self_attributes() {
     let HStmtKind::ClassDef {
         target,
         name,
-        base,
+        bases,
         methods,
         ..
     } = &hir.functions[0].body[0].kind
@@ -3804,7 +3813,7 @@ fn class_definition_lowers_with_methods_and_self_attributes() {
     };
     assert_eq!(name, "C");
     assert_eq!(locals[*target as usize].name, "C");
-    assert!(base.is_none(), "{base:?}");
+    assert!(bases.is_empty(), "{bases:?}");
     assert_eq!(methods.len(), 2);
     assert_eq!(methods[0].0, "__init__");
     assert_eq!(methods[1].0, "get");
@@ -3882,7 +3891,7 @@ fn class_inheritance_keeps_the_base_expression() {
     let HStmtKind::ClassDef {
         target,
         name,
-        base: Some(base),
+        bases,
         ..
     } = &hir.functions[0].body[1].kind
     else {
@@ -3891,6 +3900,7 @@ fn class_inheritance_keeps_the_base_expression() {
             hir.functions[0].body[1].kind
         );
     };
+    let base = bases.first().expect("class D base");
     assert_eq!(name, "D");
     assert_eq!(local_of(base), *c_target);
     assert_eq!(locals[*target as usize].name, "D");
@@ -3918,12 +3928,13 @@ class F(E):
     let HStmtKind::ClassDef {
         target: e_target,
         name: e_name,
-        base: Some(e_base),
+        bases: e_bases,
         ..
     } = &hir.functions[0].body[1].kind
     else {
         panic!("expected class E, got {:?}", hir.functions[0].body[1].kind);
     };
+    let e_base = e_bases.first().expect("class E base");
     assert_eq!(e_name, "E");
     assert!(
         matches!(&e_base.kind, HExprKind::ExceptionClass(ExcKind::Exception)),
@@ -3932,12 +3943,13 @@ class F(E):
 
     let HStmtKind::ClassDef {
         name: f_name,
-        base: Some(f_base),
+        bases: f_bases,
         ..
     } = &hir.functions[0].body[2].kind
     else {
         panic!("expected class F, got {:?}", hir.functions[0].body[2].kind);
     };
+    let f_base = f_bases.first().expect("class F base");
     assert_eq!(f_name, "F");
     assert_eq!(local_of(f_base), *e_target);
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
@@ -4004,7 +4016,7 @@ fn class_methods_may_share_names_and_stay_out_of_the_global_namespace() {
 
 #[test]
 fn class_attributes_are_frozen_in_the_class_statement() {
-    let source = "class C:\n    __slots__ = ['a', 'b']\n    mark = 7\n    ratio: int = 1\n";
+    let source = "class C:\n    mark = 7\n    ratio: int = 1\n";
     let (hir, mut infer, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
     let HStmtKind::ClassDef {
@@ -4020,18 +4032,13 @@ fn class_attributes_are_frozen_in_the_class_statement() {
     };
     assert!(methods.is_empty(), "{methods:?}");
     let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, vec!["__slots__", "mark", "ratio"]);
-    assert!(
-        matches!(&attributes[0].1.kind, HExprKind::List(items) if items.len() == 2),
-        "{:?}",
-        attributes[0].1.kind
-    );
+    assert_eq!(names, vec!["mark", "ratio"]);
     assert!(matches!(
-        &attributes[1].1.kind,
+        &attributes[0].1.kind,
         HExprKind::Const(Const::Int(7))
     ));
     assert!(matches!(
-        &attributes[2].1.kind,
+        &attributes[1].1.kind,
         HExprKind::Const(Const::Int(1))
     ));
 
@@ -4044,8 +4051,8 @@ fn class_attributes_are_frozen_in_the_class_statement() {
     else {
         panic!("expected a class statement");
     };
-    assert_eq!(emitted.len(), 3);
-    assert_eq!(emitted[1].name, "mark");
+    assert_eq!(emitted.len(), 2);
+    assert_eq!(emitted[0].name, "mark");
 }
 
 #[test]
@@ -4114,7 +4121,7 @@ class Point(NamedTuple):
     assert!(diags.is_empty(), "{diags:?}");
     let HStmtKind::ClassDef {
         name,
-        base: Some(_),
+        bases,
         methods,
         ..
     } = &hir.functions[0].body[0].kind
@@ -4125,6 +4132,7 @@ class Point(NamedTuple):
         );
     };
     assert_eq!(name, "Point");
+    assert_eq!(bases.len(), 1, "{bases:?}");
     assert_eq!(methods.len(), 2, "{methods:?}");
     assert_eq!(methods[0].0, "total");
     assert_eq!(methods[0].2, MethodKind::Normal);
@@ -4218,7 +4226,10 @@ fn assert_lowers_to_a_test_and_an_optional_message() {
 }
 
 #[test]
-fn rich_repr_class_decorator_is_ignored() {
+fn rich_repr_class_decorator_is_diagnosed() {
+    // `@rich_repr` installs a generated `__repr__` in CPython. Hydro cannot
+    // synthesize that method, so the frontend reports it instead of silently
+    // dropping the decorator.
     let source = "\
 @rich_repr
 class C:
@@ -4227,26 +4238,23 @@ class C:
 class D:
     pass
 ";
-    let (hir, _, diags) = lower_source(source, &parse(source));
-    assert!(diags.is_empty(), "{diags:?}");
-    let names: Vec<&str> = hir.functions[0]
-        .body
-        .iter()
-        .filter_map(|stmt| match &stmt.kind {
-            HStmtKind::ClassDef { name, .. } => Some(name.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(names, vec!["C", "D"]);
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 2, "{diags:?}");
+    assert!(
+        diags.iter().all(|diag| diag.message.contains("rich_repr")),
+        "{diags:?}"
+    );
 }
 
 #[test]
-fn class_decorators_are_rejected() {
+fn unresolved_class_decorator_name_is_diagnosed() {
+    // Class decorators are now applied at runtime, so an unknown name is an
+    // ordinary unresolved-name diagnostic instead of a blanket rejection.
     let source = "@dec\nclass C:\n    pass\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert!(
-        diags[0].message.contains("class decorators"),
+        diags[0].message.contains("not defined"),
         "{:?}",
         diags[0].message
     );
@@ -6311,15 +6319,13 @@ fn unittest_test_case_is_accepted_as_a_class_base() {
         "import unittest\nclass T(unittest.TestCase):\n    def test_errno(self):\n        pass\n";
     let (hir, mut infer, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
-    let HStmtKind::ClassDef {
-        base: Some(base), ..
-    } = &hir.functions[0].body[0].kind
-    else {
+    let HStmtKind::ClassDef { bases, .. } = &hir.functions[0].body[0].kind else {
         panic!(
             "expected a class with a base, got {:?}",
             hir.functions[0].body[0].kind
         );
     };
+    let base = bases.first().expect("class T base");
     match &base.kind {
         HExprKind::ModuleAttr { module, name } => {
             assert_eq!((module.as_str(), name.as_str()), ("unittest", "TestCase"));
@@ -6338,7 +6344,7 @@ fn multiple_class_bases_use_the_first_base() {
         .body
         .iter()
         .find_map(|stmt| match &stmt.kind {
-            HStmtKind::ClassDef { name, base, .. } if name == "T" => Some(base),
+            HStmtKind::ClassDef { name, bases, .. } if name == "T" => Some(bases.first()),
             _ => None,
         })
         .expect("class T");
@@ -6788,7 +6794,7 @@ class Console:
     let (hir, mut infer, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
 
-    let HStmtKind::ClassDef { base, .. } = hir.functions[0]
+    let HStmtKind::ClassDef { bases, .. } = hir.functions[0]
         .body
         .iter()
         .find_map(|stmt| match &stmt.kind {
@@ -6801,7 +6807,7 @@ class Console:
     };
     assert!(
         matches!(
-            base.as_ref().map(|base| &base.kind),
+            bases.first().map(|base| &base.kind),
             Some(HExprKind::ModuleAttr { module, name })
                 if module == "threading" && name == "local"
         ),
@@ -7228,6 +7234,7 @@ def f(t, cells, style):
         args,
         star,
         keywords,
+        ..
     } = &value.kind
     else {
         panic!("expected a method call");
@@ -7243,20 +7250,20 @@ def f(t, cells, style):
     assert_eq!(keywords[0].0, "style");
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 
-    for (source, expected) in [
-        (
-            "def f(t, a, b):\n    return t.add_row(*a, *b)\n",
-            "only one starred argument is supported",
-        ),
-        (
-            "def f(t, a):\n    return t.add_row(1, *a)\n",
-            "a starred argument cannot be combined with positional arguments",
-        ),
+    // A positional operand before the star and a `**mapping` are both part of
+    // the extended method ABI now.
+    for source in [
+        "def f(t, a):\n    return t.add_row(1, *a)\n",
+        "def f(t, a, b):\n    return t.add_row(*a, **b)\n",
     ] {
         let (_, _, diags) = lower_source(source, &parse(source));
-        assert_eq!(diags.len(), 1, "{source}: {diags:?}");
-        assert!(diags[0].message.contains(expected), "{diags:?}");
+        assert!(diags.is_empty(), "{source}: {diags:?}");
     }
+    // Two starred operands still cannot be represented.
+    let source = "def f(t, a, b):\n    return t.add_row(*a, *b)\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{source}: {diags:?}");
+    assert!(diags[0].message.contains("only one starred argument"));
 }
 
 #[test]
@@ -8045,4 +8052,836 @@ fn negating_a_bigint_literal_that_fits_the_tagged_range_becomes_int() {
         HExprKind::Const(Const::Int(v)) if *v == -1152921504606846976
     ));
     assert_eq!(assigned(&hir, "x").ty, Ty::Concrete(Type::Int));
+}
+
+// ---------------------------------------------------------------------------
+// PEP 701 f-strings and PEP 750 template strings
+// ---------------------------------------------------------------------------
+
+/// Parse a module and keep the template side table.
+fn parse_with_templates(source: &str) -> (ast::ModModule, Vec<TemplateString>) {
+    match rustpython_parser::parse_module_with_templates(source, "test.py") {
+        Ok(parsed) => match parsed.module {
+            ast::Mod::Module(module) => (module, parsed.templates),
+            _ => panic!("expected a module"),
+        },
+        Err(error) => panic!("parse failed: {}", error.error),
+    }
+}
+
+fn lower_source_with_templates(source: &str) -> (LHir, Infer, Vec<Diagnostic>) {
+    let (module, templates) = parse_with_templates(source);
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_templates(&templates);
+    let hir = lowerer.lower_module(&module);
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    (hir, infer, diags)
+}
+
+#[test]
+fn pep701_same_quote_and_nested_fstrings_lower() {
+    // Quote reuse inside a replacement field (PEP 701).
+    let source = "x = f\"{\"hi\"}\"\n";
+    let (hir, _, diags) = lower_source_with_templates(source);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(assigned(&hir, "x").ty, Ty::Concrete(Type::Str));
+
+    // A nested f-string in a replacement field.
+    let source = "y = 'a'\nx = f\"{f'{y}'}\"\n";
+    let (hir, _, diags) = lower_source_with_templates(source);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(assigned(&hir, "x").ty, Ty::Concrete(Type::Str));
+}
+
+#[test]
+fn simple_template_literal_lowers_to_a_template() {
+    let source = "name = 'world'\nx = t\"hello {name}\"\n";
+    let (hir, _, diags) = lower_source_with_templates(source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let value = assigned(&hir, "x");
+    assert_eq!(value.ty, Ty::Concrete(Type::Any));
+    let HExprKind::Template {
+        strings,
+        interpolations,
+    } = &value.kind
+    else {
+        panic!("expected a template expression, got {:?}", value.kind);
+    };
+    assert_eq!(strings, &vec!["hello ".to_string(), String::new()]);
+    assert_eq!(interpolations.len(), 1);
+    assert_eq!(interpolations[0].expression, "name");
+    assert_eq!(interpolations[0].conversion, 0);
+    assert!(interpolations[0].format_spec.is_none());
+    assert!(!interpolations[0].self_documenting);
+}
+
+#[test]
+fn template_conversions_are_preserved() {
+    let source = "name = 'w'\nx = t\"{name!r}{name!s}{name!a}\"\n";
+    let (hir, _, diags) = lower_source_with_templates(source);
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::Template { interpolations, .. } = &assigned(&hir, "x").kind else {
+        panic!("expected a template expression");
+    };
+    let conversions: Vec<u8> = interpolations
+        .iter()
+        .map(|interpolation| interpolation.conversion)
+        .collect();
+    assert_eq!(conversions, vec![2, 1, 3]);
+}
+
+#[test]
+fn template_format_spec_lowers_to_an_expression() {
+    let source = "n = 42\nx = t\"{n:>10}\"\n";
+    let (hir, _, diags) = lower_source_with_templates(source);
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::Template { interpolations, .. } = &assigned(&hir, "x").kind else {
+        panic!("expected a template expression");
+    };
+    let spec = interpolations[0].format_spec.as_ref().expect("format spec");
+    assert!(matches!(&spec.kind, HExprKind::Const(Const::Str(text)) if text == ">10"));
+}
+
+#[test]
+fn template_self_documenting_keeps_text_and_repr_conversion() {
+    let source = "n = 42\nx = t\"{n=}\"\n";
+    let (hir, _, diags) = lower_source_with_templates(source);
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::Template {
+        strings,
+        interpolations,
+    } = &assigned(&hir, "x").kind
+    else {
+        panic!("expected a template expression");
+    };
+    // `t"{n=}"` is `strings=('n=', '')` with an implicit `!r` conversion.
+    assert_eq!(strings, &vec!["n=".to_string(), String::new()]);
+    assert_eq!(interpolations[0].expression, "n");
+    assert_eq!(interpolations[0].conversion, 2);
+    assert!(interpolations[0].self_documenting);
+}
+
+#[test]
+fn nested_templates_are_preserved() {
+    let source = "name = 'w'\nx = t\"outer {t'inner {name}'}\"\n";
+    let (module, templates) = parse_with_templates(source);
+    assert_eq!(templates.len(), 2, "outer and nested literal");
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_templates(&templates);
+    let hir = lowerer.lower_module(&module);
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let HExprKind::Template { interpolations, .. } = &assigned(&hir, "x").kind else {
+        panic!("expected a template expression");
+    };
+    assert!(
+        matches!(&interpolations[0].value.kind, HExprKind::Template { .. }),
+        "nested template must stay a template, got {:?}",
+        interpolations[0].value.kind
+    );
+}
+
+#[test]
+fn template_spans_cover_the_literal_and_expression() {
+    let source = "x = t\"a{b}c\"\n";
+    let (_, templates) = parse_with_templates(source);
+    assert_eq!(templates.len(), 1);
+    let template = &templates[0];
+    let literal = &source[template.range.start().to_usize()..template.range.end().to_usize()];
+    assert_eq!(literal, "t\"a{b}c\"");
+    let interpolation = &template.interpolations[0];
+    let expression = &source[interpolation.expression_range.start().to_usize()
+        ..interpolation.expression_range.end().to_usize()];
+    assert_eq!(expression, "b");
+    let field =
+        &source[interpolation.range.start().to_usize()..interpolation.range.end().to_usize()];
+    assert_eq!(field, "{b}");
+    assert_eq!(
+        template
+            .strings
+            .iter()
+            .map(|part| part.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "c"]
+    );
+}
+
+#[test]
+fn malformed_templates_are_syntax_errors() {
+    for source in [
+        "x = t\"{name\"\n",
+        "x = t\"name}\"\n",
+        "x = t\"{a}\" \"b\"\n",
+    ] {
+        let parsed = rustpython_parser::parse_module_with_templates(source, "test.py");
+        assert!(parsed.is_err(), "expected a syntax error for {source:?}");
+        let diagnostics = crate::check_source(source, "test.py")
+            .expect_err("check_source must reject malformed templates");
+        assert_eq!(diagnostics[0].code, crate::diag::codes::SYNTAX);
+    }
+}
+
+#[test]
+fn stdlib_template_and_pep701_lines_compile() {
+    // `Lib/annotationlib.py`: `_Template = type(t"")`.
+    let source = "_Template = type(t\"\")\n";
+    let (hir, _, diags) = lower_source_with_templates(source);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "_Template").kind,
+        HExprKind::Call { .. }
+    ));
+
+    // `Lib/traceback.py` (`_extract_from_extended_frame_gen`): an f-string
+    // whose replacement field contains string literals and a conditional.
+    let source = "def f(count):\n    return f'  [Previous line repeated {count} more time{\"s\" if count > 1 else \"\"}]\\n'\n";
+    let (hir, _, diags) = lower_source_with_templates(source);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(function(&hir, "f").body.len(), 1);
+}
+
+/// Expression statements of the module body, in order.
+fn module_exprs(hir: &LHir) -> Vec<&HExpr> {
+    hir.functions[0]
+        .body
+        .iter()
+        .filter_map(|stmt| match &stmt.kind {
+            HStmtKind::Expr(value) => Some(value),
+            _ => None,
+        })
+        .collect()
+}
+
+fn lower_ok(source: &str) -> LHir {
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    hir
+}
+
+#[test]
+fn positional_only_parameters_are_recorded_and_bound() {
+    let source = "\
+def f(x, /, y, *args, z=1, **kw):
+    return (x, y, args, z, kw)
+f(1, 2, 3, z=4, extra=5)
+";
+    let hir = lower_ok(source);
+    let kinds: Vec<ParamKind> = function(&hir, "f").params.iter().map(|p| p.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ParamKind::PosOnly,
+            ParamKind::Positional,
+            ParamKind::VarArg,
+            ParamKind::KwOnly,
+            ParamKind::KwArg,
+        ]
+    );
+    // A keyword name that matches a positional-only parameter is forwarded to
+    // `**kwargs`; the positional-only slot still needs a positional value.
+    lower_ok("def f(x=0, /, **kw):\n    return kw\nf(x=1)\n");
+    let source = "def f(x, /, **kw):\n    return kw\nf(x=1)\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0]
+            .message
+            .contains("missing required positional argument 'x'"),
+        "{diags:?}"
+    );
+    // Without `**kwargs`, the keyword name is not bindable at all.
+    let source = "def f(x=0, /):\n    return x\nf(x=1)\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0].message.contains("unexpected keyword argument 'x'"),
+        "{diags:?}"
+    );
+    // Positional filling still sees the positional-only slot.
+    lower_ok("def f(x, /, y):\n    return x + y\nf(1, 2)\n");
+}
+
+#[test]
+fn star_and_double_star_calls_lower_to_the_runtime_flattener() {
+    let source = "\
+def f(a, b=0, **kw):
+    return a
+xs = [1]
+kw = {'b': 2}
+obj = None
+f(0, *xs, b=3, **kw)
+obj.m(0, *xs, b=3, **kw)
+";
+    let hir = lower_ok(source);
+    let exprs = module_exprs(&hir);
+    let call = exprs
+        .iter()
+        .find(|expr| matches!(expr.kind, HExprKind::CallFull { .. }))
+        .expect("function call with * and ** lowers to CallFull");
+    let HExprKind::CallFull {
+        args,
+        star,
+        keywords,
+        double_star,
+        ..
+    } = &call.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(args.len(), 1);
+    assert!(star.is_some());
+    assert_eq!(keywords.len(), 1);
+    assert!(double_star.is_some());
+    let method = exprs
+        .iter()
+        .find(|expr| matches!(expr.kind, HExprKind::MethodCall { .. }))
+        .expect("method call with * and ** lowers to MethodCall");
+    let HExprKind::MethodCall {
+        star,
+        keywords,
+        double_star,
+        ..
+    } = &method.kind
+    else {
+        unreachable!()
+    };
+    assert!(star.is_some());
+    assert_eq!(keywords.len(), 1);
+    assert!(double_star.is_some());
+}
+
+#[test]
+fn match_patterns_lower_to_guarded_branches() {
+    let source = "\
+class Point:
+    x = 0
+    y = 0
+def classify(value):
+    match value:
+        case 0:
+            return 'zero'
+        case [a, *rest]:
+            return (a, rest)
+        case {'name': name, **extra}:
+            return (name, extra)
+        case Point(x=px, y=py) as point:
+            return (px, py, point)
+        case 1 | 2:
+            return 'small'
+        case other if other > 10:
+            return 'big'
+        case _:
+            return 'other'
+";
+    let hir = lower_ok(source);
+    let body = &function(&hir, "classify").body;
+    assert!(
+        body.iter()
+            .any(|stmt| matches!(stmt.kind, HStmtKind::If { .. })),
+        "match must lower to guarded branches: {body:#?} functions={:?}",
+        hir.functions
+            .iter()
+            .map(|f| (f.name.clone(), f.body.len()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn malformed_match_patterns_are_diagnosed() {
+    for (source, needle) in [
+        (
+            "def f(v):\n    match v:\n        case x:\n            pass\n        case _:\n            pass\n",
+            "unreachable",
+        ),
+        (
+            "def f(v):\n    match v:\n        case 1 | x:\n            pass\n",
+            "bind different names",
+        ),
+        (
+            "def f(v):\n    match v:\n        case [x, x]:\n            pass\n",
+            "multiple assignments",
+        ),
+    ] {
+        let (_, _, diags) = lower_source(source, &parse(source));
+        assert!(!diags.is_empty(), "expected a diagnostic for {source:?}");
+        assert!(
+            diags.iter().any(|diag| diag.message.contains(needle)),
+            "expected {needle:?} in {diags:?}"
+        );
+    }
+}
+
+#[test]
+fn except_star_lowers_to_an_explicit_unsupported_error() {
+    let source = "\
+def f():
+    try:
+        raise ValueError('x')
+    except* ValueError as group:
+        return group
+";
+    let hir = lower_ok(source);
+    let body = &function(&hir, "f").body;
+    let try_stmt = body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Try { handlers, .. } => Some(handlers),
+            _ => None,
+        })
+        .expect("except* lowers to a Try with one explicit handler");
+    assert_eq!(try_stmt.len(), 1);
+    assert!(matches!(
+        try_stmt[0].body[0].kind,
+        HStmtKind::Raise {
+            exc: Some(ExcKind::NotImplementedError),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn function_and_class_decorators_apply_bottom_up() {
+    let source = "\
+def first(fn):
+    return fn
+def second(fn):
+    return fn
+@first
+@second
+def target():
+    return 1
+@first
+class C:
+    pass
+";
+    let hir = lower_ok(source);
+    let body = &hir.functions[0].body;
+    let mut decorator_calls = 0;
+    let mut saw_function_ref = false;
+    for stmt in body {
+        if let HStmtKind::Assign { value, .. } = &stmt.kind {
+            match &value.kind {
+                HExprKind::FunctionRef(_) => saw_function_ref = true,
+                HExprKind::IndirectCall { .. } => decorator_calls += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_function_ref, "the function value must be created");
+    // Two decorators on the function and one on the class.
+    assert_eq!(decorator_calls, 3, "{body:?}");
+    assert!(
+        body.iter()
+            .any(|stmt| matches!(stmt.kind, HStmtKind::ClassDef { .. })),
+        "the class itself must still be created"
+    );
+}
+
+#[test]
+fn class_bases_metaclass_and_slots_are_lowered_or_diagnosed() {
+    let source = "\
+class A:
+    pass
+class B:
+    pass
+class C(A, B, metaclass=type):
+    pass
+";
+    let hir = lower_ok(source);
+    let class = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::ClassDef { name, .. } if name == "C" => Some(&stmt.kind),
+            _ => None,
+        })
+        .expect("class C");
+    let HStmtKind::ClassDef {
+        bases, metaclass, ..
+    } = class
+    else {
+        unreachable!()
+    };
+    assert_eq!(bases.len(), 2);
+    assert!(metaclass.is_some());
+
+    let source = "class D:\n    __slots__ = ('x',)\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(
+        diags.iter().any(|diag| diag.message.contains("__slots__")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn bytearray_and_memoryview_lower_as_builtin_callables() {
+    let source = "\
+a = bytearray()
+b = bytearray(4)
+c = bytearray('hi', 'utf-8')
+m = memoryview(b)
+f = bytearray
+";
+    let hir = lower_ok(source);
+    for (name, builtin) in [
+        ("a", Builtin::ByteArray),
+        ("b", Builtin::ByteArray),
+        ("c", Builtin::ByteArray),
+        ("m", Builtin::MemoryView),
+    ] {
+        let HExprKind::Call {
+            callee: Callee::Builtin(actual),
+            ..
+        } = &assigned(&hir, name).kind
+        else {
+            panic!(
+                "expected a builtin call for {name}: {:?}",
+                assigned(&hir, name).kind
+            );
+        };
+        assert_eq!(*actual, builtin, "{name}");
+    }
+    assert!(matches!(
+        &assigned(&hir, "f").kind,
+        HExprKind::BuiltinRef(Builtin::ByteArray)
+    ));
+}
+
+#[test]
+fn dynamic_module_constant_members_are_callable_values() {
+    let source = "\
+from _weakref import ref
+class Holder:
+    pass
+item = Holder()
+callback = None
+x = ref(item, callback)
+y = ref(item)
+";
+    let hir = lower_ok(source);
+    for name in ["x", "y"] {
+        let HExprKind::IndirectCall { callee, args, .. } = &assigned(&hir, name).kind else {
+            panic!(
+                "expected an indirect call for {name}: {:?}",
+                assigned(&hir, name).kind
+            );
+        };
+        assert!(matches!(
+            &callee.kind,
+            HExprKind::ModuleAttr { module, name } if module == "_weakref" && name == "ref"
+        ));
+        assert!(!args.is_empty());
+    }
+}
+
+#[test]
+fn class_body_method_aliases_become_method_entries() {
+    let source = "\
+class S:
+    def difference(self, other):
+        return other
+    __sub__ = difference
+    def __rsub__(self, other):
+        return self.difference(other)
+";
+    let hir = lower_ok(source);
+    let HStmtKind::ClassDef {
+        methods,
+        attributes,
+        ..
+    } = &hir.functions[0].body[0].kind
+    else {
+        panic!("expected class S");
+    };
+    assert!(attributes.is_empty(), "{attributes:?}");
+    let difference = methods
+        .iter()
+        .find(|(name, _, _)| name == "difference")
+        .map(|(_, function, _)| *function)
+        .expect("difference method");
+    let alias = methods
+        .iter()
+        .find(|(name, _, _)| name == "__sub__")
+        .map(|(_, function, kind)| (*function, *kind))
+        .expect("__sub__ alias");
+    assert_eq!(alias.0, difference, "the alias reuses the method function");
+    assert_eq!(alias.1, MethodKind::Normal);
+}
+
+#[test]
+fn class_body_names_prefer_the_class_namespace() {
+    let source = "\
+value = 1
+class C:
+    value = 2
+    copy = value
+";
+    let hir = lower_ok(source);
+    let HStmtKind::ClassDef { attributes, .. } = &hir.functions[0].body[1].kind else {
+        panic!("expected class C");
+    };
+    let copy = attributes
+        .iter()
+        .find(|(name, _)| name == "copy")
+        .map(|(_, value)| value)
+        .expect("copy attribute");
+    assert!(
+        matches!(copy.kind, HExprKind::Const(Const::Int(2))),
+        "{copy:?}"
+    );
+}
+
+#[test]
+fn zero_argument_super_supports_attributes_and_methods() {
+    let source = "\
+class A:
+    def who(self):
+        return 'a'
+    def __init__(self):
+        self.tag = 1
+class B:
+    def who(self):
+        return 'b'
+class C(A, B):
+    def who(self):
+        first = super().who()
+        other = super().tag
+        return first, other
+    def __init__(self):
+        super().__init__()
+";
+    let hir = lower_ok(source);
+    let body = &function(&hir, "C.who").body;
+    // `super().who()` and `super().tag` both build the proxy through
+    // `self.$super_new(<defining class>)`.
+    fn count_expr(expr: &HExpr, predicate: &dyn Fn(&HExprKind) -> bool) -> usize {
+        let mut count = usize::from(predicate(&expr.kind));
+        match &expr.kind {
+            HExprKind::Bin { lhs, rhs, .. } => {
+                count += count_expr(lhs, predicate) + count_expr(rhs, predicate);
+            }
+            HExprKind::BoolOp { lhs, rhs, .. } => {
+                count += count_expr(lhs, predicate) + count_expr(rhs, predicate);
+            }
+            HExprKind::Un { operand, .. } => count += count_expr(operand, predicate),
+            HExprKind::IfExp { test, then, orelse } => {
+                count += count_expr(test, predicate)
+                    + count_expr(then, predicate)
+                    + count_expr(orelse, predicate);
+            }
+            HExprKind::List(items) | HExprKind::Tuple(items) | HExprKind::Set(items) => {
+                count += items
+                    .iter()
+                    .map(|item| count_expr(item, predicate))
+                    .sum::<usize>();
+            }
+            HExprKind::Dict(pairs) => {
+                count += pairs
+                    .iter()
+                    .map(|(key, value)| count_expr(key, predicate) + count_expr(value, predicate))
+                    .sum::<usize>();
+            }
+            HExprKind::Subscript { object, index } => {
+                count += count_expr(object, predicate) + count_expr(index, predicate);
+            }
+            HExprKind::GetAttr { object, .. } => count += count_expr(object, predicate),
+            HExprKind::MethodCall {
+                object,
+                args,
+                star,
+                keywords,
+                double_star,
+                ..
+            } => {
+                count += count_expr(object, predicate)
+                    + args
+                        .iter()
+                        .map(|arg| count_expr(arg, predicate))
+                        .sum::<usize>()
+                    + star
+                        .as_deref()
+                        .map_or(0, |star| count_expr(star, predicate))
+                    + keywords
+                        .iter()
+                        .map(|(_, value)| count_expr(value, predicate))
+                        .sum::<usize>()
+                    + double_star
+                        .as_deref()
+                        .map_or(0, |value| count_expr(value, predicate));
+            }
+            HExprKind::IndirectCall { callee, args, star } => {
+                count += count_expr(callee, predicate)
+                    + args
+                        .iter()
+                        .map(|arg| count_expr(arg, predicate))
+                        .sum::<usize>()
+                    + star
+                        .as_deref()
+                        .map_or(0, |star| count_expr(star, predicate));
+            }
+            HExprKind::CallKw {
+                callee,
+                args,
+                keywords,
+            } => {
+                count += count_expr(callee, predicate)
+                    + args
+                        .iter()
+                        .map(|arg| count_expr(arg, predicate))
+                        .sum::<usize>()
+                    + keywords
+                        .iter()
+                        .map(|(_, value)| count_expr(value, predicate))
+                        .sum::<usize>();
+            }
+            HExprKind::CallFull {
+                callee,
+                args,
+                star,
+                keywords,
+                double_star,
+            } => {
+                count += count_expr(callee, predicate)
+                    + args
+                        .iter()
+                        .map(|arg| count_expr(arg, predicate))
+                        .sum::<usize>()
+                    + star
+                        .as_deref()
+                        .map_or(0, |star| count_expr(star, predicate))
+                    + keywords
+                        .iter()
+                        .map(|(_, value)| count_expr(value, predicate))
+                        .sum::<usize>()
+                    + double_star
+                        .as_deref()
+                        .map_or(0, |value| count_expr(value, predicate));
+            }
+            _ => {}
+        }
+        count
+    }
+    let statements_count = |predicate: &dyn Fn(&HExprKind) -> bool| {
+        body.iter()
+            .map(|stmt| match &stmt.kind {
+                HStmtKind::Assign { value, .. } | HStmtKind::Expr(value) => {
+                    count_expr(value, predicate)
+                }
+                HStmtKind::Return(Some(value)) => count_expr(value, predicate),
+                _ => 0,
+            })
+            .sum::<usize>()
+    };
+    let proxies = statements_count(&|kind| {
+        matches!(
+            kind,
+            HExprKind::MethodCall {
+                method,
+                args,
+                ..
+            } if method == "$super_new" && args.len() == 1
+        )
+    });
+    assert_eq!(proxies, 2, "expected a super proxy per access: {body:#?}");
+    let method_calls = statements_count(
+        &|kind| matches!(kind, HExprKind::MethodCall { method, .. } if method == "who"),
+    );
+    assert_eq!(method_calls, 1, "{body:#?}");
+    let getattr =
+        statements_count(&|kind| matches!(kind, HExprKind::GetAttr { name, .. } if name == "tag"));
+    assert_eq!(getattr, 1, "{body:#?}");
+    // `super().__init__()` keeps the keyword-capable initializer helper.
+    let init = &function(&hir, "C.__init__").body;
+    assert!(init.iter().any(|stmt| {
+        matches!(
+            &stmt.kind,
+            HStmtKind::Expr(HExpr {
+                kind: HExprKind::MethodCall { method, .. },
+                ..
+            }) if method == "$super_init"
+        )
+    }));
+}
+
+#[test]
+fn decorated_functions_keep_name_access_and_indirect_calls() {
+    let source = "\
+def deco(tag):
+    def apply(fn):
+        def wrapper(*args, **kwargs):
+            return tag + fn(*args, **kwargs)
+        return wrapper
+    return apply
+@deco('[')
+def add(a, /, b, *, c=0):
+    return a + b + c
+name = add.__name__
+result = add(1, 2, c=3)
+";
+    let hir = lower_ok(source);
+    let name = assigned(&hir, "name");
+    assert!(matches!(&name.kind, HExprKind::GetAttr { name, .. } if name == "__name__"));
+    // The call goes through the decorated binding, never the raw function id.
+    let result = assigned(&hir, "result");
+    let callee = match &result.kind {
+        HExprKind::CallKw { callee, .. } | HExprKind::CallFull { callee, .. } => callee,
+        other => panic!("expected a call through the decorated binding, got {other:?}"),
+    };
+    assert!(
+        matches!(&callee.kind, HExprKind::Local(_)),
+        "the decorated binding must be called, got {callee:?}"
+    );
+}
+
+#[test]
+fn three_level_decorator_supports_keyword_calls() {
+    // Regression: the returned `wrapper(*args, **kwargs)` closure captures
+    // `tag` and `fn`; a keyword call on the decorated name must bind against
+    // `wrapper`'s own signature, never the captures of `apply`.
+    let source = "\
+def deco2(tag):
+    def apply(fn):
+        def wrapper(*args, **kwargs):
+            return tag + str(fn(*args, **kwargs))
+        return wrapper
+    return apply
+@deco2('x')
+def mul(a, b=0):
+    return a * b
+first = mul(2, 3)
+second = mul(2, b=3)
+";
+    let hir = lower_ok(source);
+    let wrapper = function(&hir, "deco2.apply.wrapper");
+    assert_eq!(wrapper.capture_count, 2, "tag and fn are captures");
+    assert_eq!(wrapper.params[0].name, "tag");
+    assert_eq!(wrapper.params[1].name, "fn");
+    let kinds: Vec<ParamKind> = wrapper.params.iter().map(|param| param.kind).collect();
+    assert_eq!(
+        &kinds[2..],
+        &[ParamKind::VarArg, ParamKind::KwArg],
+        "wrapper keeps its own *args/**kwargs signature"
+    );
+    // Both calls go through the decorated module binding.
+    for name in ["first", "second"] {
+        let call = assigned(&hir, name);
+        let callee = match &call.kind {
+            HExprKind::CallKw { callee, .. }
+            | HExprKind::CallFull { callee, .. }
+            | HExprKind::IndirectCall { callee, .. } => callee,
+            other => panic!("expected an indirect call for {name}, got {other:?}"),
+        };
+        assert!(matches!(&callee.kind, HExprKind::Local(_)), "{callee:?}");
+    }
+    let HExprKind::CallKw { keywords, .. } = &assigned(&hir, "second").kind else {
+        panic!("expected a keyword call");
+    };
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "b");
 }

@@ -207,6 +207,19 @@ impl Interp {
                 self.eval_indirect_call(callee, args, star.as_deref())
             }
             ExprKind::Call { callee, args } => self.eval_call(callee, args),
+            ExprKind::CallFull {
+                callee,
+                args,
+                star,
+                keywords,
+                double_star,
+            } => self.eval_call_full(
+                callee,
+                args,
+                star.as_deref(),
+                keywords,
+                double_star.as_deref(),
+            ),
             ExprKind::CallKw {
                 callee,
                 args,
@@ -218,7 +231,15 @@ impl Interp {
                 args,
                 star,
                 keywords,
-            } => self.eval_method_call(object, method, args, star.as_deref(), keywords),
+                double_star,
+            } => self.eval_method_call(
+                object,
+                method,
+                args,
+                star.as_deref(),
+                keywords,
+                double_star.as_deref(),
+            ),
             ExprKind::ClassCall {
                 class,
                 init,
@@ -269,6 +290,62 @@ impl Interp {
                 let value = self.eval(value)?;
                 self.scratch_push(value);
                 let result = abi::hydro_yield_from(value);
+                self.check(result)
+            }
+            ExprKind::Template {
+                strings,
+                interpolations,
+            } => {
+                let mark = self.scratch_mark();
+                let mut string_values = Vec::with_capacity(strings.len());
+                for text in strings {
+                    let value = abi::hydro_str_new(text.as_ptr(), text.len());
+                    self.scratch_push(value);
+                    string_values.push(value);
+                }
+                let mut interpolation_values = Vec::with_capacity(interpolations.len());
+                for interpolation in interpolations {
+                    let value = self.eval(&interpolation.value)?;
+                    self.scratch_push(value);
+                    let format_spec = match &interpolation.format_spec {
+                        Some(spec) => {
+                            let spec = self.eval(spec)?;
+                            self.scratch_push(spec);
+                            spec
+                        }
+                        None => abi::hydro_none(),
+                    };
+                    let expression = interpolation.expression.as_bytes();
+                    let interpolation_value = abi::hydro_interpolation_new(
+                        value,
+                        expression.as_ptr(),
+                        expression.len(),
+                        interpolation.conversion,
+                        format_spec,
+                        u8::from(interpolation.self_documenting),
+                    );
+                    self.check(interpolation_value)?;
+                    self.scratch_push(interpolation_value);
+                    interpolation_values.push(interpolation_value);
+                }
+                let result = {
+                    let strings_token =
+                        abi::hydro_gc_scope_push(string_values.as_ptr(), string_values.len());
+                    let interpolations_token = abi::hydro_gc_scope_push(
+                        interpolation_values.as_ptr(),
+                        interpolation_values.len(),
+                    );
+                    let result = abi::hydro_template_new(
+                        string_values.len(),
+                        string_values.as_ptr(),
+                        interpolation_values.len(),
+                        interpolation_values.as_ptr(),
+                    );
+                    abi::hydro_gc_scope_pop(interpolations_token);
+                    abi::hydro_gc_scope_pop(strings_token);
+                    result
+                };
+                self.scratch_release(mark);
                 self.check(result)
             }
             ExprKind::ListComp { element, clauses } => {
@@ -577,6 +654,7 @@ impl Interp {
         self.check(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn eval_method_call(
         &mut self,
         object: &Expr,
@@ -584,6 +662,7 @@ impl Interp {
         args: &[Expr],
         star: Option<&Expr>,
         keywords: &[(String, Expr)],
+        double_star: Option<&Expr>,
     ) -> Result<i64, Signal> {
         let mark = self.scratch_mark();
         let receiver = self.eval(object)?;
@@ -613,6 +692,14 @@ impl Interp {
             pairs.push(name);
             pairs.push(value);
         }
+        let map_value = match double_star {
+            Some(mapping) => {
+                let value = self.eval(mapping)?;
+                self.scratch_push(value);
+                Some(value)
+            }
+            None => None,
+        };
         let (name_ptr, name_len) = bytes(method);
         let result = {
             let receiver_scope = [receiver];
@@ -620,23 +707,32 @@ impl Interp {
                 abi::hydro_gc_scope_push(receiver_scope.as_ptr(), receiver_scope.len());
             let argv_token = abi::hydro_gc_scope_push(arg_values.as_ptr(), arg_values.len());
             let kw_token = abi::hydro_gc_scope_push(pairs.as_ptr(), pairs.len());
-            let result = match star_value {
-                Some(star) => abi::hydro_method_star(
-                    receiver,
-                    name_ptr,
-                    name_len,
-                    star,
-                    keywords.len(),
-                    pairs.as_ptr(),
-                ),
-                None if keywords.is_empty() => abi::hydro_method(
+            let star_scope = [star_value.unwrap_or_else(host::none)];
+            let star_token = abi::hydro_gc_scope_push(star_scope.as_ptr(), star_scope.len());
+            let map_scope = [map_value.unwrap_or_else(host::none)];
+            let map_token = abi::hydro_gc_scope_push(map_scope.as_ptr(), map_scope.len());
+            let result = if star_value.is_some() || map_value.is_some() {
+                abi::hydro_method_star_kw(
                     receiver,
                     name_ptr,
                     name_len,
                     arg_values.len(),
                     arg_values.as_ptr(),
-                ),
-                None => abi::hydro_method_kw(
+                    star_value.unwrap_or_else(host::none),
+                    keywords.len(),
+                    pairs.as_ptr(),
+                    map_value.unwrap_or_else(host::none),
+                )
+            } else if keywords.is_empty() {
+                abi::hydro_method(
+                    receiver,
+                    name_ptr,
+                    name_len,
+                    arg_values.len(),
+                    arg_values.as_ptr(),
+                )
+            } else {
+                abi::hydro_method_kw(
                     receiver,
                     name_ptr,
                     name_len,
@@ -644,11 +740,86 @@ impl Interp {
                     arg_values.as_ptr(),
                     keywords.len(),
                     pairs.as_ptr(),
-                ),
+                )
             };
+            abi::hydro_gc_scope_pop(map_token);
+            abi::hydro_gc_scope_pop(star_token);
             abi::hydro_gc_scope_pop(kw_token);
             abi::hydro_gc_scope_pop(argv_token);
             abi::hydro_gc_scope_pop(receiver_token);
+            result
+        };
+        self.scratch_release(mark);
+        self.check(result)
+    }
+
+    /// `f(args..., *star, kw=..., **double_star)` through a value.
+    fn eval_call_full(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        star: Option<&Expr>,
+        keywords: &[(String, Expr)],
+        double_star: Option<&Expr>,
+    ) -> Result<i64, Signal> {
+        let mark = self.scratch_mark();
+        let function = self.eval(callee)?;
+        self.scratch_push(function);
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = self.eval(arg)?;
+            self.scratch_push(value);
+            arg_values.push(value);
+        }
+        let star_value = match star {
+            Some(star) => {
+                let value = self.eval(star)?;
+                self.scratch_push(value);
+                Some(value)
+            }
+            None => None,
+        };
+        let mut pairs = Vec::with_capacity(keywords.len() * 2);
+        for (name, value) in keywords {
+            let (ptr, len) = bytes(name);
+            let name = abi::hydro_str_new(ptr, len);
+            self.check(name)?;
+            self.scratch_push(name);
+            let value = self.eval(value)?;
+            self.scratch_push(value);
+            pairs.push(name);
+            pairs.push(value);
+        }
+        let map_value = match double_star {
+            Some(mapping) => {
+                let value = self.eval(mapping)?;
+                self.scratch_push(value);
+                Some(value)
+            }
+            None => None,
+        };
+        let star_operand = star_value.unwrap_or_else(host::none);
+        let map_operand = map_value.unwrap_or_else(host::none);
+        let result = {
+            let argv_token = abi::hydro_gc_scope_push(arg_values.as_ptr(), arg_values.len());
+            let kw_token = abi::hydro_gc_scope_push(pairs.as_ptr(), pairs.len());
+            let star_scope = [star_operand];
+            let star_token = abi::hydro_gc_scope_push(star_scope.as_ptr(), star_scope.len());
+            let map_scope = [map_operand];
+            let map_token = abi::hydro_gc_scope_push(map_scope.as_ptr(), map_scope.len());
+            let result = abi::hydro_call_star_kw(
+                function,
+                arg_values.len(),
+                arg_values.as_ptr(),
+                star_operand,
+                keywords.len(),
+                pairs.as_ptr(),
+                map_operand,
+            );
+            abi::hydro_gc_scope_pop(map_token);
+            abi::hydro_gc_scope_pop(star_token);
+            abi::hydro_gc_scope_pop(kw_token);
+            abi::hydro_gc_scope_pop(argv_token);
             result
         };
         self.scratch_release(mark);
@@ -731,7 +902,14 @@ impl Interp {
         let is_async = func.is_async;
         let is_generator = func.is_generator;
         let arity = func.call_arity();
-        let name = func.name.clone();
+        // `function.__name__` is the def name, without the diagnostic
+        // qualification (`deco.apply.wrapper` -> `wrapper`).
+        let name = func
+            .name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&func.name)
+            .to_string();
         let mark = self.scratch_mark();
         let mut host_params = Vec::with_capacity(params.len());
         for param in params {

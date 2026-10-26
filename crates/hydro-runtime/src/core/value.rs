@@ -108,9 +108,10 @@ pub(crate) const KIND_MATCH: u32 = 27;
 /// Blocking TCP `socket` object. Holds native state only, no Hydro values; the
 /// descriptor is closed when the object is dropped.
 pub(crate) const KIND_SOCKET: u32 = 28;
-/// Class object created by `hydro_class_new`. Traces its base class, every
-/// method value and every frozen class attribute. The class namespace is
-/// immutable after creation.
+/// Class object created by `hydro_class_new`/`hydro_class_new_multi`. Traces
+/// its bases, its C3 linearization, its metaclass, every method value, every
+/// frozen class attribute and the post-creation overlay. The class body
+/// namespace is frozen; runtime assignment writes the traced overlay.
 pub(crate) const KIND_CLASS: u32 = 29;
 /// Instance of a class. Traces its class and every instance attribute.
 pub(crate) const KIND_INSTANCE: u32 = 30;
@@ -143,6 +144,26 @@ pub(crate) const KIND_CELL: u32 = 37;
 /// Holds native text only, plus the value of a defensive non-string
 /// concatenation as a traced edge.
 pub(crate) const KIND_STR_BUILDER: u32 = 38;
+/// PEP 750 template string value (`Template`). Holds the ordered constant
+/// strings and interpolation objects; both are GC edges.
+pub(crate) const KIND_TEMPLATE: u32 = 39;
+/// One PEP 750 `{...}` interpolation (`Interpolation`). Traces its value and
+/// its format-spec string.
+pub(crate) const KIND_INTERPOLATION: u32 = 40;
+/// Mutable byte sequence (`bytearray`). Holds native bytes only.
+pub(crate) const KIND_BYTEARRAY: u32 = 41;
+/// Buffer view (`memoryview`) over a `bytes`/`bytearray` exporter. The exporter
+/// is a traced GC edge; reads and writes go through it, so a view is live.
+pub(crate) const KIND_MEMORYVIEW: u32 = 42;
+/// A live `dict.keys()`/`dict.values()`/`dict.items()` view. The dict is a
+/// traced GC edge and every operation observes its current contents.
+pub(crate) const KIND_DICT_VIEW: u32 = 43;
+/// `super(C, obj)` proxy. Both the starting class and the receiver are traced.
+pub(crate) const KIND_SUPER: u32 = 44;
+/// Instance of a user class that derives from a native exception class. Holds
+/// the class value (identity for `type`/`isinstance`) and the native
+/// `ExcData` payload the exception machinery operates on.
+pub(crate) const KIND_EXC_INSTANCE: u32 = 45;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
 pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
@@ -1576,18 +1597,41 @@ impl Attributes {
     }
 }
 
-/// State of a class object: its Python-visible name, its base class (or
-/// `NONE`), the methods collected from `class Name(Base):` and the class
-/// attributes frozen when the class statement ran.
+/// State of a class object: its Python-visible name, its bases, its C3
+/// linearization, its methods, the attributes frozen when the class statement
+/// ran and the attributes assigned after creation.
 ///
-/// A method is an ordinary function value plus its binding kind. The namespace
-/// is immutable after construction, so lookups need no lock and the collector
-/// can read it directly.
+/// A method is an ordinary function value plus its binding kind. `base` is the
+/// first entry of `bases` and stays available to the native modules that walk
+/// the primary inheritance chain; `mro` is the authoritative lookup order for
+/// [`class_lookup`], `isinstance`, `issubclass` and `super`.
+///
+/// The frozen namespace (`methods`/`attrs`) is immutable after construction, so
+/// lookups need no lock and the collector can read it directly. Runtime class
+/// assignment writes to `overlay` (a locked table with insertion barriers) and
+/// runtime deletion records the name in `deleted`; both shadow the frozen
+/// namespace without touching it.
 pub(crate) struct ClassState {
     pub(crate) name: String,
     pub(crate) base: i64,
+    /// All declared bases in order (`bases[0] == base`, or empty).
+    pub(crate) bases: Vec<i64>,
+    /// C3 linearization of the ancestors in lookup order. Excludes `self`.
+    pub(crate) mro: Vec<i64>,
+    /// Explicit metaclass, or `NONE` when the default `type` behaviour applies.
+    pub(crate) metaclass: i64,
     pub(crate) methods: Vec<(String, i64, MethodKind)>,
     pub(crate) attrs: Vec<(String, i64)>,
+    /// Attributes assigned through `Cls.name = value` after creation.
+    pub(crate) overlay: Attributes,
+    /// Names removed through `del Cls.name` after creation.
+    pub(crate) deleted: Mutex<Vec<String>>,
+    /// `__slots__` names; empty when the class has an instance `__dict__`.
+    pub(crate) slots: Vec<String>,
+    /// Whether instances of the class have a `__dict__`. False for a
+    /// slots-only class (a `__slots__` declaration without `"__dict__"`),
+    /// which rejects attributes outside `slots`.
+    pub(crate) has_dict: bool,
 }
 
 impl ClassState {
@@ -1604,6 +1648,26 @@ impl ClassState {
             .find(|(existing, _)| existing.as_str() == name)
             .map(|(_, value)| *value)
     }
+
+    /// Locks the post-creation overlay for the collector; the guard must stay
+    /// alive until the marker turns the class black.
+    pub(crate) fn lock_overlay(&self) -> MutexGuard<'_, Vec<(String, i64)>> {
+        self.overlay.lock()
+    }
+
+    /// Locks the deleted-name list, ignoring poisoning.
+    fn lock_deleted(&self) -> MutexGuard<'_, Vec<String>> {
+        self.deleted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether `name` was deleted from this class after creation.
+    fn is_deleted(&self, name: &str) -> bool {
+        self.lock_deleted()
+            .iter()
+            .any(|existing| existing.as_str() == name)
+    }
 }
 
 /// State of a class instance: the class it was created from and its mutable
@@ -1614,6 +1678,126 @@ pub(crate) struct InstanceState {
 }
 
 impl InstanceState {
+    /// Locks the attribute table for the collector: the guard must stay alive
+    /// until the marker turns the instance black.
+    pub(crate) fn lock_attrs(&self) -> MutexGuard<'_, Vec<(String, i64)>> {
+        self.attrs.lock()
+    }
+}
+
+/// Payload of a `memoryview` value.
+///
+/// The view never copies the exporter: `buffer` is the `bytes`/`bytearray`
+/// object itself and is traced, so a live view keeps it alive. `offset` and
+/// `stride` address the view through the exporter's current payload, which is
+/// what makes writes through a view observable on the buffer (and vice versa).
+/// Only one-dimensional, single-byte-element views are constructed by the
+/// runtime; `shape`/`strides` are still reported (and traced as native state)
+/// so the Python-visible attributes behave.
+pub(crate) struct MemoryViewState {
+    /// Exporter object (`bytes` or `bytearray`); `NONE` after `release()`.
+    pub(crate) buffer: i64,
+    /// Byte offset of the first element inside the exporter.
+    pub(crate) offset: usize,
+    /// Number of elements.
+    pub(crate) length: usize,
+    /// Byte stride between elements (negative for a reversed slice).
+    pub(crate) stride: isize,
+    /// Struct format character; `'B'` (unsigned bytes) by default.
+    pub(crate) format: char,
+    /// Bytes per element (`1` for every supported format).
+    pub(crate) itemsize: usize,
+    /// Whether the exporter is immutable (`bytes`).
+    pub(crate) readonly: bool,
+    /// `true` once `release()` ran; every other operation then raises.
+    pub(crate) released: bool,
+    /// `true` for a view created over the whole exporter. Such a view follows
+    /// the exporter's current length (a `bytearray` that grows or shrinks is
+    /// observed live); slices and casts are fixed windows.
+    pub(crate) whole: bool,
+}
+
+impl MemoryViewState {
+    /// Number of visible elements.
+    ///
+    /// A whole-exporter view reports the exporter's current length, so a
+    /// `memoryview(ba)` observes `ba.append(...)`/`del ba[:]`; a sliced view
+    /// keeps the window it was created with. A released view has no elements.
+    pub(crate) fn len(&self) -> usize {
+        if self.released {
+            return 0;
+        }
+        if self.whole {
+            return as_bytes(self.buffer).map_or(0, |bytes| bytes.len());
+        }
+        self.length
+    }
+
+    /// Whether the view has no visible elements.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of visible bytes.
+    pub(crate) fn nbytes(&self) -> usize {
+        self.length.saturating_mul(self.itemsize)
+    }
+
+    /// Byte offset of element `index`, or `None` when out of range.
+    pub(crate) fn element_offset(&self, index: usize) -> Option<usize> {
+        if index >= self.len() {
+            return None;
+        }
+        let delta = self.stride.checked_mul(index as isize)?;
+        self.offset.checked_add_signed(delta)
+    }
+}
+
+/// Which `dict` view a [`DictViewState`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DictViewKind {
+    Keys,
+    Values,
+    Items,
+}
+
+impl DictViewKind {
+    /// Python-visible type name (`dict_keys`, ...).
+    pub(crate) fn type_name(self) -> &'static str {
+        match self {
+            DictViewKind::Keys => "dict_keys",
+            DictViewKind::Values => "dict_values",
+            DictViewKind::Items => "dict_items",
+        }
+    }
+}
+
+/// Payload of a live `dict` view. The dict is a traced GC edge; every
+/// operation re-reads its current contents, so a view never copies.
+pub(crate) struct DictViewState {
+    pub(crate) dict: i64,
+    pub(crate) kind: DictViewKind,
+}
+
+/// Payload of a `super(C, obj)` proxy: the class whose position in the MRO the
+/// lookup starts after, plus the receiver the attributes bind to.
+pub(crate) struct SuperState {
+    pub(crate) class: i64,
+    pub(crate) object: i64,
+}
+
+/// Payload of a user-defined exception instance: the Python class value (which
+/// preserves identity for `type`, `isinstance` and `except`) and the native
+/// `ExcData` the exception machinery raises, matches and prints.
+pub(crate) struct ExcInstanceState {
+    pub(crate) class: i64,
+    pub(crate) data: ExcData,
+    /// Instance attributes (`e.extra = 7`), shared with ordinary instances so
+    /// user exception classes keep their class methods and data attributes.
+    pub(crate) attrs: Attributes,
+}
+
+impl ExcInstanceState {
     /// Locks the attribute table for the collector: the guard must stay alive
     /// until the marker turns the instance black.
     pub(crate) fn lock_attrs(&self) -> MutexGuard<'_, Vec<(String, i64)>> {
@@ -1697,6 +1881,20 @@ pub(crate) enum ObjData {
     Exception(ExcData),
     /// Text accumulator for a proved `s += ...` loop ([`KIND_STR_BUILDER`]).
     StrBuilder(StrBuilderState),
+    /// PEP 750 template string ([`KIND_TEMPLATE`]).
+    Template(crate::core::template::TemplateState),
+    /// One template interpolation ([`KIND_INTERPOLATION`]).
+    Interpolation(crate::core::template::InterpolationState),
+    /// Mutable byte sequence ([`KIND_BYTEARRAY`]).
+    ByteArray(Vec<u8>),
+    /// Live buffer view ([`KIND_MEMORYVIEW`]).
+    MemoryView(MemoryViewState),
+    /// Live `dict` view ([`KIND_DICT_VIEW`]).
+    DictView(DictViewState),
+    /// `super` proxy ([`KIND_SUPER`]).
+    Super(SuperState),
+    /// User-defined exception instance ([`KIND_EXC_INSTANCE`]).
+    ExcInstance(ExcInstanceState),
     /// Insertion-ordered list elements.
     List(Vec<i64>),
     /// Insertion-ordered `(key, value)` pairs with a hash index over the
@@ -1813,6 +2011,13 @@ pub(crate) enum ObjDataRef<'a> {
     Float(f64),
     Exception(&'a ExcData),
     StrBuilder(&'a StrBuilderState),
+    Template(&'a crate::core::template::TemplateState),
+    Interpolation(&'a crate::core::template::InterpolationState),
+    ByteArray(&'a Vec<u8>),
+    MemoryView(&'a MemoryViewState),
+    DictView(&'a DictViewState),
+    Super(&'a SuperState),
+    ExcInstance(&'a ExcInstanceState),
     List(&'a Vec<i64>),
     Dict(&'a DictData),
     Iter(&'a Box<IterState>),
@@ -1867,6 +2072,13 @@ pub(crate) enum ObjDataMut<'a> {
     Float(&'a mut f64),
     Exception(&'a mut ExcData),
     StrBuilder(&'a mut StrBuilderState),
+    Template(&'a mut crate::core::template::TemplateState),
+    Interpolation(&'a mut crate::core::template::InterpolationState),
+    ByteArray(&'a mut Vec<u8>),
+    MemoryView(&'a mut MemoryViewState),
+    DictView(&'a mut DictViewState),
+    Super(&'a mut SuperState),
+    ExcInstance(&'a mut ExcInstanceState),
     List(&'a mut Vec<i64>),
     Dict(&'a mut DictData),
     Iter(&'a mut Box<IterState>),
@@ -1923,6 +2135,19 @@ impl HydroObj {
                 KIND_FLOAT => ObjDataRef::Float(*(payload as *const f64)),
                 KIND_EXCEPTION => ObjDataRef::Exception(&*(payload as *const ExcData)),
                 KIND_STR_BUILDER => ObjDataRef::StrBuilder(&*(payload as *const StrBuilderState)),
+                KIND_TEMPLATE => {
+                    ObjDataRef::Template(&*(payload as *const crate::core::template::TemplateState))
+                }
+                KIND_INTERPOLATION => ObjDataRef::Interpolation(
+                    &*(payload as *const crate::core::template::InterpolationState),
+                ),
+                KIND_BYTEARRAY => ObjDataRef::ByteArray(&*(payload as *const Vec<u8>)),
+                KIND_MEMORYVIEW => ObjDataRef::MemoryView(&*(payload as *const MemoryViewState)),
+                KIND_DICT_VIEW => ObjDataRef::DictView(&*(payload as *const DictViewState)),
+                KIND_SUPER => ObjDataRef::Super(&*(payload as *const SuperState)),
+                KIND_EXC_INSTANCE => {
+                    ObjDataRef::ExcInstance(&*(payload as *const ExcInstanceState))
+                }
                 KIND_LIST => ObjDataRef::List(&*(payload as *const Vec<i64>)),
                 KIND_DICT => ObjDataRef::Dict(&*(payload as *const DictData)),
                 KIND_ITER => ObjDataRef::Iter(&*(payload as *const Box<IterState>)),
@@ -2006,6 +2231,19 @@ impl HydroObj {
                 KIND_FLOAT => ObjDataMut::Float(&mut *(payload as *mut f64)),
                 KIND_EXCEPTION => ObjDataMut::Exception(&mut *(payload as *mut ExcData)),
                 KIND_STR_BUILDER => ObjDataMut::StrBuilder(&mut *(payload as *mut StrBuilderState)),
+                KIND_TEMPLATE => ObjDataMut::Template(
+                    &mut *(payload as *mut crate::core::template::TemplateState),
+                ),
+                KIND_INTERPOLATION => ObjDataMut::Interpolation(
+                    &mut *(payload as *mut crate::core::template::InterpolationState),
+                ),
+                KIND_BYTEARRAY => ObjDataMut::ByteArray(&mut *(payload as *mut Vec<u8>)),
+                KIND_MEMORYVIEW => ObjDataMut::MemoryView(&mut *(payload as *mut MemoryViewState)),
+                KIND_DICT_VIEW => ObjDataMut::DictView(&mut *(payload as *mut DictViewState)),
+                KIND_SUPER => ObjDataMut::Super(&mut *(payload as *mut SuperState)),
+                KIND_EXC_INSTANCE => {
+                    ObjDataMut::ExcInstance(&mut *(payload as *mut ExcInstanceState))
+                }
                 KIND_LIST => ObjDataMut::List(&mut *(payload as *mut Vec<i64>)),
                 KIND_DICT => ObjDataMut::Dict(&mut *(payload as *mut DictData)),
                 KIND_ITER => ObjDataMut::Iter(&mut *(payload as *mut Box<IterState>)),
@@ -2072,6 +2310,21 @@ macro_rules! for_each_payload_type {
         $m!(KIND_FLOAT, Float, f64);
         $m!(KIND_EXCEPTION, Exception, ExcData);
         $m!(KIND_STR_BUILDER, StrBuilder, StrBuilderState);
+        $m!(
+            KIND_TEMPLATE,
+            Template,
+            crate::core::template::TemplateState
+        );
+        $m!(
+            KIND_INTERPOLATION,
+            Interpolation,
+            crate::core::template::InterpolationState
+        );
+        $m!(KIND_BYTEARRAY, ByteArray, Vec<u8>);
+        $m!(KIND_MEMORYVIEW, MemoryView, MemoryViewState);
+        $m!(KIND_DICT_VIEW, DictView, DictViewState);
+        $m!(KIND_SUPER, Super, SuperState);
+        $m!(KIND_EXC_INSTANCE, ExcInstance, ExcInstanceState);
         $m!(KIND_LIST, List, Vec<i64>);
         $m!(KIND_DICT, Dict, DictData);
         $m!(KIND_ITER, Iter, Box<IterState>);
@@ -2174,6 +2427,13 @@ pub(crate) unsafe fn write_payload(kind: u32, data: ObjData, dst: *mut u8) {
         KIND_FLOAT, Float, f64,
         KIND_EXCEPTION, Exception, ExcData,
         KIND_STR_BUILDER, StrBuilder, StrBuilderState,
+        KIND_TEMPLATE, Template, crate::core::template::TemplateState,
+        KIND_INTERPOLATION, Interpolation, crate::core::template::InterpolationState,
+        KIND_BYTEARRAY, ByteArray, Vec<u8>,
+        KIND_MEMORYVIEW, MemoryView, MemoryViewState,
+        KIND_DICT_VIEW, DictView, DictViewState,
+        KIND_SUPER, Super, SuperState,
+        KIND_EXC_INSTANCE, ExcInstance, ExcInstanceState,
         KIND_LIST, List, Vec<i64>,
         KIND_DICT, Dict, DictData,
         KIND_ITER, Iter, Box<IterState>,
@@ -2453,18 +2713,146 @@ pub(crate) fn as_str(v: i64) -> Option<&'static str> {
     }
 }
 
-/// Borrows the contents of a `bytes` object. `None` for any other value.
+/// Borrows the contents of a bytes-like value (`bytes` or `bytearray`).
+/// `None` for any other value.
+///
+/// The borrow aliases a `bytearray` payload: callers must copy what they need
+/// before running user code or mutating the receiver, exactly like the
+/// existing string/bytes rule. Read-only protocols (comparison, hashing of
+/// `bytes`, JSON, iteration) use this on purpose.
 pub(crate) fn as_bytes(v: i64) -> Option<&'static [u8]> {
     if !is_heap(v) {
         return None;
     }
-    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
-    if obj.kind != KIND_BYTES {
+    match obj.kind {
+        KIND_BYTES => match obj.data_ref() {
+            ObjDataRef::Bytes(bytes) => Some(bytes.as_slice()),
+            _ => None,
+        },
+        KIND_BYTEARRAY => match obj.data_ref() {
+            ObjDataRef::ByteArray(bytes) => Some(bytes.as_slice()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Borrows the payload of a `bytearray` object. `None` for any other value,
+/// including `bytes`.
+pub(crate) fn as_bytearray(v: i64) -> Option<&'static Vec<u8>> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_BYTEARRAY {
         return None;
     }
     match obj.data_ref() {
-        ObjDataRef::Bytes(bytes) => Some(bytes.as_slice()),
+        ObjDataRef::ByteArray(bytes) => Some(bytes),
+        _ => None,
+    }
+}
+
+/// Exclusively borrows a `bytearray` payload for an in-place mutation.
+///
+/// Callers copy anything they need from the bytes before allocating: the
+/// returned reference must not be held across a call that can collect or run
+/// user code.
+pub(crate) fn bytearray_bytes_mut(v: i64) -> Option<&'static mut Vec<u8>> {
+    if !is_heap(v) || (v & !TAG_MASK) == 0 {
+        return None;
+    }
+    // SAFETY: caller contract: `v` is a runtime-owned bytearray reachable from
+    // the executing program, so the collector keeps the cell alive.
+    let obj = unsafe { &mut *((v & !TAG_MASK) as *mut HydroObj) };
+    if obj.kind != KIND_BYTEARRAY {
+        return None;
+    }
+    match obj.data_mut() {
+        ObjDataMut::ByteArray(bytes) => Some(bytes),
+        _ => None,
+    }
+}
+
+/// Borrows the payload of a `memoryview` object.
+pub(crate) fn as_memoryview(v: i64) -> Option<&'static MemoryViewState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_MEMORYVIEW {
+        return None;
+    }
+    match obj.data_ref() {
+        ObjDataRef::MemoryView(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Exclusively borrows a `memoryview` payload (`release()` flips state).
+pub(crate) fn memoryview_mut(v: i64) -> Option<&'static mut MemoryViewState> {
+    if !is_heap(v) || (v & !TAG_MASK) == 0 {
+        return None;
+    }
+    // SAFETY: caller contract: `v` is a runtime-owned live memoryview.
+    let obj = unsafe { &mut *((v & !TAG_MASK) as *mut HydroObj) };
+    if obj.kind != KIND_MEMORYVIEW {
+        return None;
+    }
+    match obj.data_mut() {
+        ObjDataMut::MemoryView(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Borrows the payload of a live `dict` view.
+pub(crate) fn as_dict_view(v: i64) -> Option<&'static DictViewState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_DICT_VIEW {
+        return None;
+    }
+    match obj.data_ref() {
+        ObjDataRef::DictView(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Borrows the payload of a `super` proxy.
+pub(crate) fn as_super(v: i64) -> Option<&'static SuperState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_SUPER {
+        return None;
+    }
+    match obj.data_ref() {
+        ObjDataRef::Super(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Borrows the payload of a user-defined exception instance.
+pub(crate) fn as_exc_instance(v: i64) -> Option<&'static ExcInstanceState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_EXC_INSTANCE {
+        return None;
+    }
+    match obj.data_ref() {
+        ObjDataRef::ExcInstance(state) => Some(state),
         _ => None,
     }
 }
@@ -2611,11 +2999,19 @@ pub(crate) fn exception_data(v: i64) -> Option<&'static ExcData> {
     }
     // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
-    if obj.kind != KIND_EXCEPTION {
-        return None;
-    }
-    match obj.data_ref() {
-        ObjDataRef::Exception(e) => Some(e),
+    match obj.kind {
+        KIND_EXCEPTION => match obj.data_ref() {
+            ObjDataRef::Exception(e) => Some(e),
+            _ => None,
+        },
+        // A user-defined exception instance carries the native payload the
+        // exception machinery raises, matches and prints, so every existing
+        // `ExcData` consumer keeps working while `type`/`isinstance` observe
+        // the Python class value.
+        KIND_EXC_INSTANCE => match obj.data_ref() {
+            ObjDataRef::ExcInstance(state) => Some(&state.data),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -2713,15 +3109,65 @@ pub(crate) fn as_instance(v: i64) -> Option<&'static InstanceState> {
     }
 }
 
+/// The class of an instance-like value (a class instance or a user-defined
+/// exception instance).
+pub(crate) fn instance_class_value(v: i64) -> Option<i64> {
+    if let Some(state) = as_instance(v) {
+        return Some(state.class);
+    }
+    as_exc_instance(v).map(|state| state.class)
+}
+
+/// The mutable attribute table of an instance-like value.
+pub(crate) fn instance_attributes(v: i64) -> Option<&'static Attributes> {
+    if let Some(state) = as_instance(v) {
+        return Some(&state.attrs);
+    }
+    as_exc_instance(v).map(|state| &state.attrs)
+}
+
+/// Borrows the payload of a PEP 750 `Template` value.
+pub(crate) fn as_template(v: i64) -> Option<&'static crate::core::template::TemplateState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_TEMPLATE {
+        return None;
+    }
+    match obj.data_ref() {
+        ObjDataRef::Template(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Borrows the payload of a PEP 750 `Interpolation` value.
+pub(crate) fn as_interpolation(
+    v: i64,
+) -> Option<&'static crate::core::template::InterpolationState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_INTERPOLATION {
+        return None;
+    }
+    match obj.data_ref() {
+        ObjDataRef::Interpolation(state) => Some(state),
+        _ => None,
+    }
+}
+
 /// The Python-visible name of a class object.
 pub(crate) fn class_display_name(v: i64) -> Option<&'static str> {
     as_class(v).map(|state| state.name.as_str())
 }
 
-/// The name of the class an instance belongs to.
+/// The name of the class an instance-like value belongs to.
 pub(crate) fn instance_class_name(v: i64) -> Option<&'static str> {
-    let state = as_instance(v)?;
-    class_display_name(state.class)
+    class_display_name(instance_class_value(v)?)
 }
 
 /// One entry of a class namespace, as resolved through the base chain.
@@ -2730,35 +3176,267 @@ pub(crate) fn instance_class_name(v: i64) -> Option<&'static str> {
 /// it), but a subclass attribute may shadow a base-class method, so attribute
 /// and method lookups share one namespace walk.
 pub(crate) enum ClassEntry {
-    /// Frozen class attribute value.
+    /// Frozen class attribute value (including a runtime class assignment).
     Attr(i64),
     /// Method with its binding kind.
     Method(MethodKind, i64),
 }
 
-/// Looks up `name` on `class` and its bases.
+/// Looks up `name` in the namespace of `class` only, honoring the
+/// post-creation overlay and deletion tombstones.
+fn own_class_lookup(class: i64, name: &str) -> Option<ClassEntry> {
+    let state = as_class(class)?;
+    if state.is_deleted(name) {
+        return None;
+    }
+    if let Some(value) = state.overlay.get(name) {
+        return Some(ClassEntry::Attr(value));
+    }
+    // Attributes and methods live in separate vectors for tracing, but they
+    // model one class dictionary; attributes are checked first because
+    // duplicate names are rejected when the class is created.
+    if let Some(value) = state.attr(name) {
+        return Some(ClassEntry::Attr(value));
+    }
+    state
+        .method(name)
+        .map(|(kind, function)| ClassEntry::Method(kind, function))
+}
+
+/// Looks up `name` on `class` and its ancestors in C3 linearization order.
 ///
-/// The class namespace is immutable after construction, so bases form a finite
-/// chain; the iteration cap is defensive against a malformed heap object.
+/// The linearization is computed at class creation; the iteration cap below is
+/// defensive against a malformed heap object.
 pub(crate) fn class_lookup(class: i64, name: &str) -> Option<ClassEntry> {
-    let mut current = class;
+    let state = as_class(class)?;
+    if let Some(entry) = own_class_lookup(class, name) {
+        return Some(entry);
+    }
+    if !state.mro.is_empty() {
+        for &ancestor in &state.mro {
+            if let Some(entry) = own_class_lookup(ancestor, name) {
+                return Some(entry);
+            }
+        }
+        return None;
+    }
+    // Defensive fallback for a class built before `mro` was populated (only
+    // possible through a malformed heap object): walk the primary base chain.
+    let mut current = state.base;
     for _ in 0..1024 {
-        let state = as_class(current)?;
-        // Attributes and methods live in separate vectors for tracing, but
-        // they model one class dictionary; attributes are checked first
-        // because duplicate names are rejected when the class is created.
-        if let Some(value) = state.attr(name) {
-            return Some(ClassEntry::Attr(value));
-        }
-        if let Some((kind, function)) = state.method(name) {
-            return Some(ClassEntry::Method(kind, function));
-        }
-        if state.base == NONE {
+        if current == NONE {
             return None;
         }
-        current = state.base;
+        if let Some(entry) = own_class_lookup(current, name) {
+            return Some(entry);
+        }
+        current = as_class(current)?.base;
     }
     None
+}
+
+/// Looks up `name` in the MRO of `class` after the position of `start`.
+///
+/// This is `super(start, instance).name` resolution: `None` when `start` is not
+/// part of `class`'s linearization or no ancestor defines the name.
+pub(crate) fn class_lookup_after(class: i64, start: i64, name: &str) -> Option<ClassEntry> {
+    let state = as_class(class)?;
+    let position = if class == start {
+        0
+    } else {
+        state.mro.iter().position(|&ancestor| ancestor == start)? + 1
+    };
+    for &ancestor in &state.mro[position.min(state.mro.len())..] {
+        if let Some(entry) = own_class_lookup(ancestor, name) {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+/// Full C3 linearization of `class`, starting with the class itself.
+pub(crate) fn class_mro(class: i64) -> Vec<i64> {
+    let Some(state) = as_class(class) else {
+        return Vec::new();
+    };
+    let mut mro = Vec::with_capacity(state.mro.len() + 1);
+    mro.push(class);
+    mro.extend_from_slice(&state.mro);
+    mro
+}
+
+/// Explicit metaclass of `class`, or `NONE` for the default `type` behaviour.
+pub(crate) fn class_metaclass(class: i64) -> i64 {
+    as_class(class).map(|state| state.metaclass).unwrap_or(NONE)
+}
+
+/// Whether `subclass` is `ancestor` or derives from it through the C3 MRO.
+pub(crate) fn is_subclass_of(subclass: i64, ancestor: i64) -> bool {
+    if as_class(subclass).is_none() {
+        return false;
+    }
+    if subclass == ancestor {
+        return true;
+    }
+    as_class(subclass)
+        .map(|state| state.mro.contains(&ancestor))
+        .unwrap_or(false)
+}
+
+/// Tag of the nearest native exception class in `class`'s ancestry.
+///
+/// A user class derived from `ValueError` reports `VALUE_ERROR`; a native
+/// exception class reports its own tag. `None` for a plain class.
+pub(crate) fn exception_tag_of_derived_class(class: i64) -> Option<u32> {
+    if let Some(tag) = crate::exc::exception_tag_of_class(class) {
+        return Some(tag);
+    }
+    class_mro(class)
+        .iter()
+        .skip(1)
+        .find_map(|&ancestor| crate::exc::exception_tag_of_class(ancestor))
+}
+
+/// Rebuilds an exception value with `data`, preserving the Python class
+/// identity of a user-defined exception instance.
+///
+/// `raise` copies an exception payload when it records an implicit context;
+/// this helper keeps the wrapper kind so `type`/`isinstance` do not degrade to
+/// the native ancestor class.
+pub(crate) fn exception_with_data(v: i64, data: ExcData) -> i64 {
+    let Some(state) = as_exc_instance(v) else {
+        return exception_new(data);
+    };
+    let class = state.class;
+    // Re-raising copies the payload; the instance attribute table (including
+    // attributes set by a user `__init__`) is carried over so the copied
+    // exception is observationally the same object.
+    let attributes = state.attrs.snapshot();
+    let result = exc_instance_new(class, data);
+    if let Some(attrs) = instance_attributes(result) {
+        for (name, value) in attributes {
+            attrs.set(result, name, value);
+        }
+    }
+    result
+}
+
+/// Whether instances of `class` have a `__dict__` (true unless the class or an
+/// ancestor declares `__slots__` without `"__dict__"`).
+pub(crate) fn class_has_dict(class: i64) -> bool {
+    class_mro(class).iter().any(|&current| {
+        as_class(current)
+            .map(|state| state.has_dict)
+            .unwrap_or(true)
+    })
+}
+
+/// Whether `class` (or an ancestor) allows attribute `name` on an instance.
+///
+/// A class without a `__slots__` declaration accepts any name. A slots-only
+/// class accepts its own names, inherited slot names and any name the class
+/// namespace defines (a class attribute, method or runtime assignment).
+pub(crate) fn class_allows_attr(class: i64, name: &str) -> bool {
+    let Some(state) = as_class(class) else {
+        return true;
+    };
+    if state.has_dict {
+        return true;
+    }
+    for &ancestor in class_mro(class).iter() {
+        let Some(current) = as_class(ancestor) else {
+            continue;
+        };
+        if current.has_dict {
+            return true;
+        }
+        if current.slots.iter().any(|slot| slot == name) {
+            return true;
+        }
+        if current.attr(name).is_some()
+            || current.method(name).is_some()
+            || current.overlay.get(name).is_some()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Stores a runtime class attribute (`Cls.name = value`).
+///
+/// Returns `false` when `class` is not a class object. The value is published
+/// through the overlay's insertion barrier, so the collector sees the new edge.
+pub(crate) fn class_set_attr(class: i64, name: String, value: i64) -> bool {
+    let Some(state) = as_class(class) else {
+        return false;
+    };
+    // A name that was deleted may be assigned again.
+    {
+        let mut deleted = state.lock_deleted();
+        if let Some(position) = deleted
+            .iter()
+            .position(|existing| existing.as_str() == name)
+        {
+            deleted.remove(position);
+        }
+    }
+    state.overlay.set(class, name, value);
+    true
+}
+
+/// Removes a runtime class attribute (`del Cls.name`).
+///
+/// A name from the frozen class body is tombstoned; an overlay name is removed
+/// from the overlay. Returns `false` when the class has no such attribute.
+pub(crate) fn class_delete_attr(class: i64, name: &str) -> bool {
+    let Some(state) = as_class(class) else {
+        return false;
+    };
+    if state.overlay.remove(name).is_some() {
+        return true;
+    }
+    if state.attr(name).is_some() || state.method(name).is_some() {
+        let mut deleted = state.lock_deleted();
+        if !deleted.iter().any(|existing| existing.as_str() == name) {
+            deleted.push(name.to_string());
+        }
+        return true;
+    }
+    false
+}
+
+/// Snapshot of a class namespace for `Cls.__dict__`/`vars(Cls)`.
+///
+/// Returns `(name, value)` pairs in definition order: the frozen body
+/// namespace first, then runtime assignments, with deleted names removed. The
+/// snapshot owns its names, so the caller may allocate afterwards.
+pub(crate) fn class_namespace(class: i64) -> Vec<(String, i64)> {
+    let Some(state) = as_class(class) else {
+        return Vec::new();
+    };
+    let deleted = state.lock_deleted().clone();
+    let mut pairs: Vec<(String, i64)> = Vec::new();
+    let mut push = |name: &str, value: i64| {
+        if deleted.iter().any(|existing| existing.as_str() == name) {
+            return;
+        }
+        if let Some(position) = pairs.iter().position(|(existing, _)| existing == name) {
+            pairs[position].1 = value;
+        } else {
+            pairs.push((name.to_string(), value));
+        }
+    };
+    for (name, value) in &state.attrs {
+        push(name, *value);
+    }
+    for (name, function, _) in &state.methods {
+        push(name, *function);
+    }
+    for (name, value) in state.overlay.snapshot() {
+        push(&name, value);
+    }
+    pairs
 }
 
 /// Looks up `name` on `class` and its bases, returning its binding kind and
@@ -2779,8 +3457,8 @@ pub(crate) fn class_method(class: i64, name: &str) -> Option<i64> {
 /// Snapshot of `instance.__dict__` in insertion order. Method attributes are
 /// resolved by [`crate::methods::call`] instead.
 pub(crate) fn instance_dict(instance: i64) -> Option<i64> {
-    let state = as_instance(instance)?;
-    let snapshot = state.attrs.snapshot();
+    let attrs = instance_attributes(instance)?;
+    let snapshot = attrs.snapshot();
     let result = dict_new(Vec::new());
     let root = crate::heap::root_values(&[result]);
     for (name, value) in snapshot {
@@ -2793,34 +3471,39 @@ pub(crate) fn instance_dict(instance: i64) -> Option<i64> {
 
 /// Replaces `instance.__dict__` from a mapping of string keys.
 pub(crate) fn instance_set_dict(instance: i64, mapping: i64) -> bool {
-    let Some(state) = as_instance(instance) else {
+    let Some(attrs) = instance_attributes(instance) else {
         return false;
     };
     let Some(pairs) = as_dict(mapping) else {
         return false;
     };
     let copy = pairs.to_vec();
-    state.attrs.clear();
+    attrs.clear();
     for (key, value) in copy {
         // `__dict__` keys must be strings; ignore foreign keys rather than
         // rejecting the whole mapping, so a partially malformed mapping still
         // restores the valid attribute set.
         if let Some(name) = as_str(key) {
-            state.attrs.set(instance, name.to_string(), value);
+            attrs.set(instance, name.to_string(), value);
         }
     }
     true
 }
 
 pub(crate) fn instance_attr(instance: i64, name: &str) -> Option<i64> {
-    as_instance(instance)?.attrs.get(name)
+    instance_attributes(instance)?.get(name)
 }
 
 /// Stores an instance data attribute, preserving its first insertion position.
 pub(crate) fn instance_setattr(instance: i64, name: String, value: i64) {
-    if let Some(state) = as_instance(instance) {
-        state.attrs.set(instance, name, value);
+    if let Some(attrs) = instance_attributes(instance) {
+        attrs.set(instance, name, value);
     }
+}
+
+/// Removes an instance data attribute, returning its previous value.
+pub(crate) fn instance_remove_attr(instance: i64, name: &str) -> Option<i64> {
+    instance_attributes(instance)?.remove(name)
 }
 
 /// `dataclasses.replace(obj, **changes)`: shallow copy of `instance`'s
@@ -3406,6 +4089,39 @@ pub(crate) fn str_alloc(s: String) -> i64 {
     alloc(KIND_STR, ObjData::Str(s))
 }
 
+/// Allocates a PEP 750 `Template` value. Both vectors hold tagged values:
+/// constant `str` objects and `Interpolation` objects.
+pub(crate) fn template_alloc(strings: Vec<i64>, interpolations: Vec<i64>) -> i64 {
+    alloc(
+        KIND_TEMPLATE,
+        ObjData::Template(crate::core::template::TemplateState {
+            strings,
+            interpolations,
+        }),
+    )
+}
+
+/// Allocates one PEP 750 `Interpolation` value. `format_spec` is a tagged
+/// `str` or `None`.
+pub(crate) fn interpolation_alloc(
+    value: i64,
+    expression: String,
+    conversion: u8,
+    format_spec: i64,
+    self_documenting: bool,
+) -> i64 {
+    alloc(
+        KIND_INTERPOLATION,
+        ObjData::Interpolation(crate::core::template::InterpolationState {
+            value,
+            expression,
+            conversion,
+            format_spec,
+            self_documenting,
+        }),
+    )
+}
+
 /// Copies `bytes` into a fresh string object. Invalid UTF-8 is replaced
 /// defensively (the ABI only ever carries UTF-8).
 pub(crate) fn str_from_bytes(bytes: &[u8]) -> i64 {
@@ -3476,6 +4192,233 @@ pub(crate) fn bytes_new(bytes: Vec<u8>) -> i64 {
     alloc(KIND_BYTES, ObjData::Bytes(bytes))
 }
 
+/// Allocates a `bytearray` from an owned buffer.
+pub(crate) fn bytearray_new(bytes: Vec<u8>) -> i64 {
+    alloc(KIND_BYTEARRAY, ObjData::ByteArray(bytes))
+}
+
+/// Allocates a `bytearray` copying `len` bytes from `ptr`.
+///
+/// ABI contract: `ptr..ptr+len` is readable when `len > 0`. A NULL or
+/// over-long buffer yields an empty `bytearray` instead of panicking, so a
+/// malformed call cannot abort the runtime.
+pub(crate) fn bytearray_from_bytes(ptr: *const u8, len: usize) -> i64 {
+    if ptr.is_null() || len == 0 {
+        return bytearray_new(Vec::new());
+    }
+    if len > isize::MAX as usize {
+        return bytearray_new(Vec::new());
+    }
+    // SAFETY: ABI contract: the caller passes a readable buffer of `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    bytearray_new(bytes.to_vec())
+}
+
+/// Exporter kind of a `memoryview` buffer.
+fn memoryview_exporter(buffer: i64) -> Option<bool> {
+    if as_bytearray(buffer).is_some() {
+        Some(true)
+    } else if as_bytes(buffer).is_some() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Creates a `memoryview` over `buffer`, which must be `bytes` or `bytearray`.
+///
+/// Any other value raises `TypeError` and returns `NONE`, matching CPython's
+/// "memoryview: a bytes-like object is required" contract.
+pub(crate) fn memoryview_abi(buffer: i64) -> i64 {
+    let Some(writable) = memoryview_exporter(buffer) else {
+        return crate::exc::raise_with_message(
+            crate::exc::TYPE_ERROR,
+            &format!(
+                "memoryview: a bytes-like object is required, not '{}'",
+                type_name(buffer)
+            ),
+        );
+    };
+    let len = as_bytes(buffer).map(|bytes| bytes.len()).unwrap_or(0);
+    alloc(
+        KIND_MEMORYVIEW,
+        ObjData::MemoryView(MemoryViewState {
+            buffer,
+            offset: 0,
+            length: len,
+            stride: 1,
+            format: 'B',
+            itemsize: 1,
+            readonly: !writable,
+            released: false,
+            whole: true,
+        }),
+    )
+}
+
+/// Allocates a view over `buffer` with an explicit window.
+pub(crate) fn memoryview_with_window(
+    buffer: i64,
+    offset: usize,
+    length: usize,
+    stride: isize,
+    format: char,
+) -> i64 {
+    let readonly = as_bytearray(buffer).is_none();
+    alloc(
+        KIND_MEMORYVIEW,
+        ObjData::MemoryView(MemoryViewState {
+            buffer,
+            offset,
+            length,
+            stride,
+            format,
+            itemsize: 1,
+            readonly,
+            released: false,
+            whole: false,
+        }),
+    )
+}
+
+/// Error text for an operation on a released view.
+pub(crate) const MEMORYVIEW_RELEASED: &str = "operation forbidden on released memoryview object";
+/// Error text for a write through a read-only view.
+pub(crate) const MEMORYVIEW_READONLY: &str = "cannot modify read-only memory";
+/// Error text for an out-of-range view index.
+pub(crate) const MEMORYVIEW_OUT_OF_RANGE: &str = "index out of bounds on memoryview";
+
+/// Visible bytes of a view, in view order.
+pub(crate) fn memoryview_bytes(state: &MemoryViewState) -> Result<Vec<u8>, &'static str> {
+    if state.released {
+        return Err(MEMORYVIEW_RELEASED);
+    }
+    let Some(source) = as_bytes(state.buffer) else {
+        return Err(MEMORYVIEW_RELEASED);
+    };
+    let mut out = Vec::with_capacity(state.len());
+    for index in 0..state.len() {
+        let Some(offset) = state.element_offset(index) else {
+            return Err(MEMORYVIEW_OUT_OF_RANGE);
+        };
+        let Some(&byte) = source.get(offset) else {
+            return Err(MEMORYVIEW_OUT_OF_RANGE);
+        };
+        out.push(byte);
+    }
+    Ok(out)
+}
+
+/// Reads one element as a Python value (`int` for `'B'`/`'b'`, one-byte
+/// `bytes` for `'c'`).
+pub(crate) fn memoryview_get(state: &MemoryViewState, index: usize) -> Result<i64, &'static str> {
+    if state.released {
+        return Err(MEMORYVIEW_RELEASED);
+    }
+    let Some(source) = as_bytes(state.buffer) else {
+        return Err(MEMORYVIEW_RELEASED);
+    };
+    let Some(offset) = state.element_offset(index) else {
+        return Err(MEMORYVIEW_OUT_OF_RANGE);
+    };
+    match source.get(offset) {
+        Some(&byte) => Ok(match state.format {
+            'c' => bytes_new(vec![byte]),
+            'b' => crate::ops::int_result(byte as i8 as i64),
+            _ => crate::ops::int_result(byte as i64),
+        }),
+        None => Err(MEMORYVIEW_OUT_OF_RANGE),
+    }
+}
+
+/// Writes one raw byte into a view (used by slice assignment and the
+/// `int`/`bytes` element paths).
+pub(crate) fn memoryview_set_byte(
+    state: &MemoryViewState,
+    index: usize,
+    byte: u8,
+) -> Result<(), &'static str> {
+    if state.released {
+        return Err(MEMORYVIEW_RELEASED);
+    }
+    if state.readonly {
+        return Err(MEMORYVIEW_READONLY);
+    }
+    let Some(offset) = state.element_offset(index) else {
+        return Err(MEMORYVIEW_OUT_OF_RANGE);
+    };
+    let Some(target) = bytearray_bytes_mut(state.buffer) else {
+        return Err(MEMORYVIEW_READONLY);
+    };
+    match target.get_mut(offset) {
+        Some(slot) => {
+            *slot = byte;
+            Ok(())
+        }
+        None => Err(MEMORYVIEW_OUT_OF_RANGE),
+    }
+}
+
+/// Writes one element from a Python value.
+pub(crate) fn memoryview_set(
+    state: &MemoryViewState,
+    index: usize,
+    value: i64,
+) -> Result<(), &'static str> {
+    if state.released {
+        return Err(MEMORYVIEW_RELEASED);
+    }
+    if state.readonly {
+        return Err(MEMORYVIEW_READONLY);
+    }
+    let byte = match state.format {
+        'c' => {
+            let Some(bytes) = as_bytes(value) else {
+                return Err("memoryview: invalid type for format 'c'");
+            };
+            match bytes {
+                [single] => *single,
+                _ => return Err("memoryview: invalid value for format 'c'"),
+            }
+        }
+        'b' => match as_integer(value).and_then(|n| i8::try_from(n).ok()) {
+            Some(n) => n as u8,
+            None => return Err("memoryview: invalid value for format 'b'"),
+        },
+        _ => match as_integer(value).and_then(|n| u8::try_from(n).ok()) {
+            Some(n) => n,
+            None => return Err("memoryview: invalid value for format 'B'"),
+        },
+    };
+    memoryview_set_byte(state, index, byte)
+}
+
+/// Allocates a live `dict` view over `dict`.
+pub(crate) fn dict_view_new(dict: i64, kind: DictViewKind) -> i64 {
+    alloc(
+        KIND_DICT_VIEW,
+        ObjData::DictView(DictViewState { dict, kind }),
+    )
+}
+
+/// Allocates a `super` proxy starting after `class` for `object`.
+pub(crate) fn super_new(class: i64, object: i64) -> i64 {
+    alloc(KIND_SUPER, ObjData::Super(SuperState { class, object }))
+}
+
+/// Allocates a user-defined exception instance carrying its class identity and
+/// native `ExcData` payload.
+pub(crate) fn exc_instance_new(class: i64, data: ExcData) -> i64 {
+    alloc(
+        KIND_EXC_INSTANCE,
+        ObjData::ExcInstance(ExcInstanceState {
+            class,
+            data,
+            attrs: Attributes::new(),
+        }),
+    )
+}
+
 /// Allocates a `random.Random` object. `seed == None` draws entropy.
 pub(crate) fn random_new(seed: Option<u64>) -> i64 {
     let state = match seed {
@@ -3518,13 +4461,334 @@ pub(crate) fn class_new_full(
     methods: Vec<(String, i64, MethodKind)>,
     attrs: Vec<(String, i64)>,
 ) -> i64 {
+    let bases = if base == NONE { Vec::new() } else { vec![base] };
+    class_new_multi(name, bases, NONE, methods, attrs)
+}
+
+/// C3 merge of the ancestor linearizations plus the direct bases list.
+///
+/// `None` means the bases have no consistent linearization (CPython's
+/// "Cannot create a consistent method resolution order" case).
+fn c3_merge(sequences: &[Vec<i64>]) -> Option<Vec<i64>> {
+    let mut seqs: Vec<Vec<i64>> = sequences.to_vec();
+    let mut merged = Vec::new();
+    loop {
+        seqs.retain(|sequence| !sequence.is_empty());
+        if seqs.is_empty() {
+            return Some(merged);
+        }
+        let mut candidate = None;
+        for sequence in &seqs {
+            let head = sequence[0];
+            let in_tail = seqs
+                .iter()
+                .any(|other| other.len() > 1 && other[1..].contains(&head));
+            if !in_tail {
+                candidate = Some(head);
+                break;
+            }
+        }
+        let head = candidate?;
+        merged.push(head);
+        for sequence in &mut seqs {
+            if sequence.first() == Some(&head) {
+                sequence.remove(0);
+            }
+        }
+    }
+}
+
+/// Computes the ancestor linearization of a class with `bases`.
+fn compute_mro(bases: &[i64]) -> Option<Vec<i64>> {
+    let mut sequences: Vec<Vec<i64>> = Vec::with_capacity(bases.len() + 1);
+    for &base in bases {
+        let state = as_class(base)?;
+        let mut sequence = Vec::with_capacity(state.mro.len() + 1);
+        sequence.push(base);
+        sequence.extend_from_slice(&state.mro);
+        sequences.push(sequence);
+    }
+    sequences.push(bases.to_vec());
+    c3_merge(&sequences)
+}
+
+/// Maps a class-base operand to the class value it denotes.
+///
+/// Python's `type` is both a callable and the default metaclass; the runtime
+/// represents the bare name as the `type` builtin function value. As a base it
+/// denotes the cached native `type` class, so `class Meta(type)` creates a
+/// subclass of it. Every other value is returned unchanged.
+pub(crate) fn normalize_class_base(v: i64) -> i64 {
+    if let Some(function) = as_function(v) {
+        if matches!(
+            &function.body,
+            FunctionBody::Builtin(hydro_ir::Builtin::Type)
+        ) {
+            return native_class("type");
+        }
+    }
+    v
+}
+
+/// Resolves the metaclass of a new class from its bases and an explicit value.
+///
+/// `NONE` (both for the bases and for `explicit`) means the default `type`
+/// behaviour. A metaclass conflict reports CPython's message.
+fn resolve_metaclass(bases: &[i64], explicit: i64) -> Result<i64, String> {
+    let mut chosen = NONE;
+    for &base in bases {
+        let meta = class_metaclass(base);
+        if meta == NONE {
+            continue;
+        }
+        if chosen == NONE || is_subclass_of(meta, chosen) {
+            chosen = meta;
+        } else if !is_subclass_of(chosen, meta) {
+            return Err(
+                "metaclass conflict: the metaclass of a derived class must be a \
+                 (non-strict) subclass of the metaclasses of all its bases"
+                    .to_string(),
+            );
+        }
+    }
+    if explicit == NONE {
+        return Ok(chosen);
+    }
+    if as_class(explicit).is_none() {
+        return Err(format!(
+            "metaclass must be a class, not '{}'",
+            type_name(explicit)
+        ));
+    }
+    if chosen != NONE && !is_subclass_of(explicit, chosen) {
+        return Err(
+            "metaclass conflict: the metaclass of a derived class must be a \
+             (non-strict) subclass of the metaclasses of all its bases"
+                .to_string(),
+        );
+    }
+    Ok(explicit)
+}
+
+/// Parses a `__slots__` declaration from the frozen class attributes.
+///
+/// Returns `(slots, has_dict)`; `None` when the class has no `__slots__` (and
+/// therefore a normal instance `__dict__`). A non-string item raises
+/// `TypeError` like CPython.
+fn parse_slots(attrs: &[(String, i64)]) -> Result<Option<(Vec<String>, bool)>, String> {
+    let Some(&(_, declared)) = attrs.iter().find(|(name, _)| name.as_str() == "__slots__") else {
+        return Ok(None);
+    };
+    let mut slots: Vec<String> = Vec::new();
+    let push = |slot: String, slots: &mut Vec<String>| {
+        if !slots.iter().any(|existing| existing == &slot) {
+            slots.push(slot);
+        }
+    };
+    if let Some(name) = as_str(declared) {
+        push(name.to_string(), &mut slots);
+    } else {
+        let items: Vec<i64> = if let Some(items) = as_list(declared) {
+            items.to_vec()
+        } else if let Some(items) = as_tuple(declared) {
+            items.to_vec()
+        } else if let Some(items) = as_set(declared) {
+            items.to_vec()
+        } else {
+            return Err("__slots__ must be a string or an iterable of strings".to_string());
+        };
+        for item in items {
+            let Some(name) = as_str(item) else {
+                return Err("__slots__ items must be strings".to_string());
+            };
+            push(name.to_string(), &mut slots);
+        }
+    }
+    let has_dict = slots.iter().any(|slot| slot == "__dict__");
+    Ok(Some((slots, has_dict)))
+}
+
+/// Allocates a class object from explicit bases, an optional metaclass and a
+/// frozen namespace.
+///
+/// Validates every base, resolves the metaclass, computes the C3 linearization
+/// and records `__slots__`. Invalid input reports a pending `TypeError` and
+/// returns `NONE`; this function never panics on user data.
+///
+/// The metaclass hooks (`__new__`/`__init__`) are invoked by the `type(name,
+/// bases, namespace)` builtin path, which decides whether a metaclass value
+/// needs to run user code; class-statement creation (which cannot name a
+/// metaclass) allocates directly here.
+pub(crate) fn class_new_multi(
+    name: String,
+    bases: Vec<i64>,
+    metaclass: i64,
+    methods: Vec<(String, i64, MethodKind)>,
+    attrs: Vec<(String, i64)>,
+) -> i64 {
+    // `type` used as a base denotes the native `type` class, not the builtin
+    // function value.
+    let bases: Vec<i64> = bases.into_iter().map(normalize_class_base).collect();
+    let metaclass = normalize_class_base(metaclass);
+    for &base in &bases {
+        if as_class(base).is_none() {
+            return crate::exc::raise_with_message(
+                crate::exc::TYPE_ERROR,
+                &format!(
+                    "class base of '{name}' must be a class object, got '{}'",
+                    type_name(base)
+                ),
+            );
+        }
+    }
+    let resolved = match resolve_metaclass(&bases, metaclass) {
+        Ok(meta) => meta,
+        Err(message) => return crate::exc::raise_with_message(crate::exc::TYPE_ERROR, &message),
+    };
+    let mro = match compute_mro(&bases) {
+        Some(mro) => mro,
+        None => {
+            let names: Vec<String> = bases
+                .iter()
+                .map(|&base| class_display_name(base).unwrap_or("object").to_string())
+                .collect();
+            return crate::exc::raise_with_message(
+                crate::exc::TYPE_ERROR,
+                &format!(
+                    "Cannot create a consistent method resolution order (MRO) for bases {}",
+                    names.join(", ")
+                ),
+            );
+        }
+    };
+    let (slots, has_dict) = match parse_slots(&attrs) {
+        Ok(Some((slots, has_dict))) => (slots, has_dict),
+        Ok(None) => (Vec::new(), true),
+        Err(message) => return crate::exc::raise_with_message(crate::exc::TYPE_ERROR, &message),
+    };
+    let base = bases.first().copied().unwrap_or(NONE);
+    // A metaclass subclass may implement `__new__`/`__init__`; both receive
+    // `(name, bases, namespace)`. The namespace mirrors the frozen class body.
+    let has_new = resolved != NONE && class_member(resolved, "__new__").is_some();
+    let init_hook = if resolved == NONE {
+        None
+    } else {
+        class_member(resolved, "__init__")
+    };
+    let hook_arguments = if has_new || init_hook.is_some() {
+        Some(metaclass_hook_arguments(&name, &bases, &methods, &attrs))
+    } else {
+        None
+    };
+    let mut created = NONE;
+    if let Some(arguments) = hook_arguments.as_ref().filter(|_| has_new) {
+        let result = invoke_metaclass_hook(resolved, "__new__", resolved, arguments);
+        if crate::exc::pending() {
+            return NONE;
+        }
+        if as_class(result).is_some() {
+            created = result;
+        } else if result != NONE {
+            return result;
+        }
+    }
+    if created == NONE {
+        created = allocate_class(
+            name, base, bases, mro, resolved, methods, attrs, slots, has_dict,
+        );
+    }
+    // `__init__` runs after creation and may mutate the new class namespace
+    // (the overlay accepts runtime assignment).
+    if let (Some((kind, function)), Some(arguments)) = (init_hook, &hook_arguments) {
+        let _ =
+            invoke_metaclass_hook_with(resolved, "__init__", kind, function, created, arguments);
+        if crate::exc::pending() {
+            return NONE;
+        }
+    }
+    created
+}
+
+/// Builds the `(name, bases, namespace)` argument list for a metaclass hook.
+fn metaclass_hook_arguments(
+    name: &str,
+    bases: &[i64],
+    methods: &[(String, i64, MethodKind)],
+    attrs: &[(String, i64)],
+) -> Vec<i64> {
+    let name_value = str_alloc(name.to_string());
+    let bases_value = tuple_new(bases.to_vec());
+    let namespace = dict_new(Vec::new());
+    let root = crate::heap::root_values(&[name_value, bases_value, namespace]);
+    for (method_name, function, _) in methods {
+        let key = str_alloc(method_name.clone());
+        crate::container::dict_set(namespace, key, *function);
+    }
+    for (attr_name, value) in attrs {
+        let key = str_alloc(attr_name.clone());
+        crate::container::dict_set(namespace, key, *value);
+    }
+    crate::heap::release_roots(root);
+    vec![name_value, bases_value, namespace]
+}
+
+/// Calls a metaclass hook method (`__new__`/`__init__`) with `receiver` bound
+/// as the first positional argument unless the hook is a staticmethod.
+///
+/// Only generated user methods run this way; a native/property entry is
+/// ignored so class creation never invokes runtime internals by accident.
+fn invoke_metaclass_hook(metaclass: i64, name: &str, receiver: i64, args: &[i64]) -> i64 {
+    let Some((kind, function)) = class_member(metaclass, name) else {
+        return NONE;
+    };
+    invoke_metaclass_hook_with(metaclass, name, kind, function, receiver, args)
+}
+
+fn invoke_metaclass_hook_with(
+    metaclass: i64,
+    name: &str,
+    kind: MethodKind,
+    function: i64,
+    receiver: i64,
+    args: &[i64],
+) -> i64 {
+    if function_signature(function).is_empty() || function_full_entry(function) == 0 {
+        return NONE;
+    }
+    let kind = match kind {
+        MethodKind::Staticmethod => MethodKind::Staticmethod,
+        _ => MethodKind::Normal,
+    };
+    crate::core::methods::call_user_method(receiver, metaclass, kind, function, name, args, &[])
+}
+
+/// Allocates the class object and registers framework subclasses.
+#[allow(clippy::too_many_arguments)]
+fn allocate_class(
+    name: String,
+    base: i64,
+    bases: Vec<i64>,
+    mro: Vec<i64>,
+    metaclass: i64,
+    methods: Vec<(String, i64, MethodKind)>,
+    attrs: Vec<(String, i64)>,
+    slots: Vec<String>,
+    has_dict: bool,
+) -> i64 {
     let class = alloc(
         KIND_CLASS,
         ObjData::Class(ClassState {
             name,
             base,
+            bases,
+            mro,
+            metaclass,
             methods,
             attrs,
+            overlay: Attributes::new(),
+            deleted: Mutex::new(Vec::new()),
+            slots,
+            has_dict,
         }),
     );
     // A subclass of the native unittest `TestCase` joins the test registry so
@@ -3538,6 +4802,148 @@ pub(crate) fn class_new_full(
         crate::modules::pytest::register_class(class);
     }
     class
+}
+
+/// ABI body of `hydro_class_new_multi`.
+///
+/// Decodes the same method/attribute buffers as `hydro_class_new`, resolves
+/// the bases and optional metaclass, and creates the class. Malformed buffers
+/// report a tagged `TypeError` and return `NONE`; nothing here panics.
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+pub(crate) fn class_new_multi_abi(
+    name_ptr: *const u8,
+    name_len: usize,
+    bases_ptr: *const i64,
+    base_count: usize,
+    metaclass: i64,
+    names_ptr: *const i64,
+    funcs_ptr: *const i64,
+    kinds_ptr: *const i64,
+    method_count: usize,
+    attr_names_ptr: *const i64,
+    attr_values_ptr: *const i64,
+    attr_count: usize,
+) -> i64 {
+    if name_ptr.is_null() || name_len == 0 || name_len > isize::MAX as usize {
+        return crate::exc::raise_with_message(
+            crate::exc::TYPE_ERROR,
+            "class name must be a non-empty string",
+        );
+    }
+    // SAFETY: ABI contract: `name_ptr..name_ptr+name_len` is readable.
+    let name = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(name_ptr, name_len) })
+        .into_owned();
+    if name.is_empty() {
+        return crate::exc::raise_with_message(
+            crate::exc::TYPE_ERROR,
+            "class name must be a non-empty string",
+        );
+    }
+    let mut bases: Vec<i64> = Vec::with_capacity(base_count.min(64));
+    if base_count > 0 {
+        if bases_ptr.is_null() || base_count > isize::MAX as usize / std::mem::size_of::<i64>() {
+            return crate::exc::raise_with_message(
+                crate::exc::TYPE_ERROR,
+                &format!("class definition received {base_count} base(s) without a base buffer"),
+            );
+        }
+        // SAFETY: ABI contract: `bases_ptr` holds `base_count` readable values.
+        bases.extend_from_slice(unsafe { std::slice::from_raw_parts(bases_ptr, base_count) });
+    }
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::with_capacity(method_count.min(256));
+    if method_count > 0 {
+        if names_ptr.is_null()
+            || funcs_ptr.is_null()
+            || kinds_ptr.is_null()
+            || method_count > isize::MAX as usize / std::mem::size_of::<(String, i64, MethodKind)>()
+        {
+            return crate::exc::raise_with_message(
+                crate::exc::TYPE_ERROR,
+                &format!(
+                    "class definition received {method_count} method(s) without a method buffer"
+                ),
+            );
+        }
+        // SAFETY: ABI contract: three buffers hold `method_count` readable entries.
+        let names = unsafe { std::slice::from_raw_parts(names_ptr, method_count) };
+        let funcs = unsafe { std::slice::from_raw_parts(funcs_ptr, method_count) };
+        let kinds = unsafe { std::slice::from_raw_parts(kinds_ptr, method_count) };
+        for ((name_value, function), kind_tag) in names.iter().zip(funcs).zip(kinds) {
+            let Some(method_name) = as_str(*name_value) else {
+                return crate::exc::raise_with_message(
+                    crate::exc::TYPE_ERROR,
+                    "class method name must be a string",
+                );
+            };
+            if method_name.is_empty() {
+                return crate::exc::raise_with_message(
+                    crate::exc::TYPE_ERROR,
+                    "class method name must not be empty",
+                );
+            }
+            if as_function(*function).is_none() {
+                return crate::exc::raise_with_message(
+                    crate::exc::TYPE_ERROR,
+                    &format!("class method '{method_name}' is not a function"),
+                );
+            }
+            let Some(kind) = MethodKind::from_abi_tag(*kind_tag) else {
+                return crate::exc::raise_with_message(
+                    crate::exc::TYPE_ERROR,
+                    &format!("class method '{method_name}' has an unknown method kind"),
+                );
+            };
+            match methods
+                .iter()
+                .position(|(existing, _, _)| existing.as_str() == method_name)
+            {
+                Some(index) => {
+                    methods[index].1 = *function;
+                    methods[index].2 = kind;
+                }
+                None => methods.push((method_name.to_string(), *function, kind)),
+            }
+        }
+    }
+    let mut attrs: Vec<(String, i64)> = Vec::with_capacity(attr_count.min(256));
+    if attr_count > 0 {
+        if attr_names_ptr.is_null()
+            || attr_values_ptr.is_null()
+            || attr_count > isize::MAX as usize / std::mem::size_of::<(String, i64)>()
+        {
+            return crate::exc::raise_with_message(
+                crate::exc::TYPE_ERROR,
+                &format!(
+                    "class definition received {attr_count} attribute(s) without an attribute buffer"
+                ),
+            );
+        }
+        // SAFETY: ABI contract: both buffers hold `attr_count` readable values.
+        let attr_names = unsafe { std::slice::from_raw_parts(attr_names_ptr, attr_count) };
+        let attr_values = unsafe { std::slice::from_raw_parts(attr_values_ptr, attr_count) };
+        for (name_value, attr_value) in attr_names.iter().zip(attr_values) {
+            let Some(attr_name) = as_str(*name_value) else {
+                return crate::exc::raise_with_message(
+                    crate::exc::TYPE_ERROR,
+                    "class attribute name must be a string",
+                );
+            };
+            if attr_name.is_empty() {
+                return crate::exc::raise_with_message(
+                    crate::exc::TYPE_ERROR,
+                    "class attribute name must not be empty",
+                );
+            }
+            match attrs
+                .iter()
+                .position(|(existing, _)| existing.as_str() == attr_name)
+            {
+                Some(index) => attrs[index].1 = *attr_value,
+                None => attrs.push((attr_name.to_string(), *attr_value)),
+            }
+        }
+    }
+    class_new_multi(name, bases, metaclass, methods, attrs)
 }
 
 /// Allocates a module value rendering as `<module 'name'>`.
@@ -4115,14 +5521,29 @@ pub(crate) fn function_set_signature(function: i64, signature: Vec<ParamMeta>) {
     let obj = unsafe { &mut *((function & !TAG_MASK) as *mut HydroObj) };
     if obj.kind == KIND_FUNCTION {
         if let ObjDataMut::Function(func) = obj.data_mut() {
+            // Positional-only parameters count for arity and are reported by
+            // name in "missing required argument" messages; keyword binding
+            // skips them through [`function_posonly_count`].
             func.params = signature
                 .iter()
-                .filter(|param| param.kind == ParamKind::Positional)
+                .filter(|param| param.kind.is_positional())
                 .map(|param| param.name.clone())
                 .collect();
             func.signature = signature;
         }
     }
+}
+
+/// Number of leading positional-only parameters of a function value.
+///
+/// `PosOnly` parameters always form the leading positional run, so callers can
+/// exclude the first `n` entries of [`function_params`] from keyword matching.
+pub(crate) fn function_posonly_count(function: i64) -> usize {
+    function_signature(function)
+        .iter()
+        .take_while(|param| param.kind.is_positional())
+        .filter(|param| param.kind == ParamKind::PosOnly)
+        .count()
 }
 
 /// Full parameter metadata of a function value.
@@ -4455,6 +5876,15 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             Some(ObjDataRef::Module(_)) => "module",
             Some(ObjDataRef::StdStream(_)) => "TextIOWrapper",
             Some(ObjDataRef::Cell(_)) => "cell",
+            Some(ObjDataRef::Template(_)) => "Template",
+            Some(ObjDataRef::Interpolation(_)) => "Interpolation",
+            Some(ObjDataRef::ByteArray(_)) => "bytearray",
+            Some(ObjDataRef::MemoryView(_)) => "memoryview",
+            Some(ObjDataRef::DictView(state)) => state.kind.type_name(),
+            Some(ObjDataRef::Super(_)) => "super",
+            // A user-defined exception reports its nearest native ancestor
+            // here; [`type_name_of`] resolves the Python class name.
+            Some(ObjDataRef::ExcInstance(state)) => state.data.name,
             Some(ObjDataRef::Fiber(state)) => match state.kind {
                 crate::fiber::FiberKind::Generator => "generator",
                 crate::fiber::FiberKind::Coroutine => "coroutine",
@@ -4524,16 +5954,26 @@ pub(crate) fn type_class(v: i64) -> i64 {
     if let Some(instance) = as_instance(v) {
         return instance.class;
     }
+    // A user-defined exception instance keeps the Python class it was created
+    // from, so `type(MyError('x')) is MyError` holds.
+    if let Some(exception) = as_exc_instance(v) {
+        return exception.class;
+    }
     // A built-in exception's type is the same cached class object the name
     // `ValueError` resolves to, so `type(e) is ValueError` holds.
     if let Some(tag) = exception_data(v).map(|data| data.tag) {
         return crate::exc::exception_class(tag);
     }
-    let name = if as_class(v).is_some() {
-        "type".to_string()
-    } else {
-        type_name_of(v)
-    };
+    if as_class(v).is_some() {
+        // A class is an instance of its metaclass (the cached `type` class
+        // when no explicit metaclass was given).
+        let metaclass = class_metaclass(v);
+        if metaclass != NONE {
+            return metaclass;
+        }
+        return native_class("type");
+    }
+    let name = type_name_of(v);
     // Opaque runtime kinds report `object`; use the cached root class rather
     // than creating a second class with the same name.
     if name == "object" {
@@ -4550,8 +5990,16 @@ pub(crate) fn type_name_of(v: i64) -> String {
     if let Some(name) = instance_class_name(v) {
         return name.to_string();
     }
+    if let Some(exception) = as_exc_instance(v) {
+        if let Some(name) = class_display_name(exception.class) {
+            return name.to_string();
+        }
+    }
     if as_instance(v).is_some() {
         return "instance".to_string();
+    }
+    if let Some(name) = class_display_name(v) {
+        return name.to_string();
     }
     type_name(v).to_string()
 }
@@ -4585,6 +6033,17 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjDataRef::Bytes(bytes)) => !bytes.is_empty(),
             Some(ObjDataRef::Range { start, stop, step }) => range_len(start, stop, step) > 0,
             Some(ObjDataRef::Function(_)) => true,
+            // Templates and interpolations are always truthy objects.
+            Some(ObjDataRef::Template(_)) | Some(ObjDataRef::Interpolation(_)) => true,
+            Some(ObjDataRef::ByteArray(bytes)) => !bytes.is_empty(),
+            // A view is truthy when it has visible elements, like a sequence.
+            Some(ObjDataRef::MemoryView(state)) => !state.is_empty(),
+            // Dict views have the truthiness of the dict they observe.
+            Some(ObjDataRef::DictView(state)) => as_dict(state.dict)
+                .map(|pairs| !pairs.is_empty())
+                .unwrap_or(false),
+            // `super` proxies and exception instances are always truthy.
+            Some(ObjDataRef::Super(_)) | Some(ObjDataRef::ExcInstance(_)) => true,
             // Like CPython, a lock object is always truthy.
             Some(ObjDataRef::Lock(_)) => true,
             // Synchronisation objects are always truthy.
@@ -4636,6 +6095,86 @@ fn instance_default_repr(state: &InstanceState) -> String {
     format!("<{name} object>")
 }
 
+/// `repr(bytearray)`: the bytes literal wrapped in `bytearray(...)`.
+pub(crate) fn bytearray_repr(bytes: &[u8]) -> String {
+    format!("bytearray({})", quote_bytes(bytes))
+}
+
+/// `repr(memoryview)`. CPython prints the exporter address; Hydro prints a
+/// stable placeholder so output stays reproducible.
+pub(crate) fn memoryview_repr(state: &MemoryViewState) -> String {
+    if state.released {
+        return "<released memory at 0x0>".to_string();
+    }
+    "<memory at 0x0>".to_string()
+}
+
+/// `repr(dict_keys/values/items)` over the view's current contents.
+pub(crate) fn dict_view_repr(state: &DictViewState) -> String {
+    let pairs: Vec<(i64, i64)> = as_dict(state.dict)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default();
+    let name = state.kind.type_name();
+    let mut out = String::with_capacity(name.len() + 4);
+    out.push_str(name);
+    out.push_str("([");
+    for (index, (key, value)) in pairs.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        match state.kind {
+            DictViewKind::Keys => out.push_str(&repr(*key)),
+            DictViewKind::Values => out.push_str(&repr(*value)),
+            DictViewKind::Items => {
+                out.push('(');
+                out.push_str(&repr(*key));
+                out.push_str(", ");
+                out.push_str(&repr(*value));
+                out.push(')');
+            }
+        }
+    }
+    out.push_str("])");
+    out
+}
+
+/// `repr(super(C, obj))`.
+pub(crate) fn super_repr(state: &SuperState) -> String {
+    let class = class_display_name(state.class).unwrap_or("object");
+    let receiver = if let Some(instance) = as_instance(state.object) {
+        instance_default_repr(instance)
+    } else if let Some(name) = class_display_name(state.object) {
+        format!("<class '{name}'>")
+    } else {
+        repr(state.object)
+    };
+    format!("<super: <class '{class}'>, {receiver}>")
+}
+
+/// `repr(MyError('boom'))` for a user-defined exception instance.
+pub(crate) fn exc_instance_repr(state: &ExcInstanceState) -> String {
+    let name = class_display_name(state.class)
+        .map(str::to_string)
+        .unwrap_or_else(|| state.data.name.to_string());
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push_str(&name);
+    out.push('(');
+    if state.data.args.is_empty() {
+        if !state.data.msg.is_empty() {
+            out.push_str(&quote_str(&state.data.msg));
+        }
+    } else {
+        for (index, argument) in state.data.args.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&quote_str(argument));
+        }
+    }
+    out.push(')');
+    out
+}
+
 /// CPython-style identity rendering of a generator/coroutine object.
 fn fiber_repr(state: &crate::fiber::FiberState) -> String {
     let (kind, fallback) = match state.kind {
@@ -4678,6 +6217,20 @@ pub(crate) fn to_string(v: i64) -> String {
                     StrBuilderState::Building(text) => text.clone(),
                     StrBuilderState::Materialized(value) => to_string(*value),
                 },
+                // `str(template)` concatenates the literal parts and the
+                // formatted interpolations; `str(interpolation)` applies its
+                // conversion and format spec to the value.
+                ObjDataRef::Template(state) => crate::core::template::template_to_string(state),
+                ObjDataRef::Interpolation(state) => {
+                    crate::core::template::interpolation_to_string(state)
+                }
+                // `str(bytearray)` is its `repr`, like CPython.
+                ObjDataRef::ByteArray(bytes) => bytearray_repr(bytes),
+                ObjDataRef::MemoryView(state) => memoryview_repr(state),
+                ObjDataRef::DictView(state) => dict_view_repr(state),
+                ObjDataRef::Super(state) => super_repr(state),
+                // `str(exception instance)` is its message.
+                ObjDataRef::ExcInstance(state) => state.data.msg.clone(),
                 ObjDataRef::Float(f) => format_float(f),
                 ObjDataRef::BigInt(n) => n.to_string(),
                 // `str(exception)` is its message (Python behaviour).
@@ -4876,8 +6429,25 @@ fn repr_depth(v: i64, depth: usize) -> String {
     if let Some(s) = as_str(v) {
         return quote_str(s);
     }
+    // Checked before `as_bytes`, which also accepts a `bytearray` for the
+    // read-only protocols: its repr keeps the `bytearray(...)` wrapper.
+    if let Some(bytes) = as_bytearray(v) {
+        return bytearray_repr(bytes);
+    }
     if let Some(bytes) = as_bytes(v) {
         return quote_bytes(bytes);
+    }
+    if let Some(state) = as_memoryview(v) {
+        return memoryview_repr(state);
+    }
+    if let Some(state) = as_dict_view(v) {
+        return dict_view_repr(state);
+    }
+    if let Some(state) = as_super(v) {
+        return super_repr(state);
+    }
+    if let Some(state) = as_exc_instance(v) {
+        return exc_instance_repr(state);
     }
     if let Some((start, stop, step)) = as_range(v) {
         return range_repr(start, stop, step);
@@ -5014,6 +6584,12 @@ fn repr_depth(v: i64, depth: usize) -> String {
         out.push('}');
         return out;
     }
+    if let Some(state) = as_template(v) {
+        return crate::core::template::template_repr(state);
+    }
+    if let Some(state) = as_interpolation(v) {
+        return crate::core::template::interpolation_repr(state);
+    }
     to_string(v)
 }
 
@@ -5021,7 +6597,7 @@ fn repr_depth(v: i64, depth: usize) -> String {
 /// quotes when the string contains a single quote but no double quote; `\\`,
 /// the active quote, `\n`, `\r`, `\t` escaped and other control bytes rendered
 /// as `\xNN`.
-fn quote_str(s: &str) -> String {
+pub(crate) fn quote_str(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') {
         '"'
     } else {

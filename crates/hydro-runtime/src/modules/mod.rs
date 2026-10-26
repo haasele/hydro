@@ -30,12 +30,14 @@ pub(crate) mod abc;
 pub(crate) mod argparse;
 pub(crate) mod ast;
 pub(crate) mod asyncio;
+pub(crate) mod atexit;
 pub(crate) mod base64;
 pub(crate) mod binascii;
 pub(crate) mod bisect;
 pub(crate) mod builtins;
 pub(crate) mod codecs;
 pub(crate) mod collections;
+pub(crate) mod collections_abc;
 pub(crate) mod colorsys;
 pub(crate) mod datetime;
 pub(crate) mod r#enum;
@@ -44,12 +46,14 @@ pub(crate) mod extension;
 pub(crate) mod fnmatch;
 pub(crate) mod fractions;
 pub(crate) mod future;
+pub(crate) mod gc;
 pub(crate) mod getopt;
 pub(crate) mod heapq;
 pub(crate) mod imp;
 pub(crate) mod importlib;
 pub(crate) mod itertools;
 pub(crate) mod keyword;
+pub(crate) mod marshal;
 pub(crate) mod mimetypes;
 pub(crate) mod opcode;
 pub(crate) mod pytest;
@@ -57,6 +61,7 @@ pub(crate) mod quopri;
 pub(crate) mod re;
 pub(crate) mod select;
 pub(crate) mod shutil;
+pub(crate) mod site;
 pub(crate) mod socket;
 pub(crate) mod stat;
 pub(crate) mod string;
@@ -64,9 +69,11 @@ pub(crate) mod subprocess;
 pub(crate) mod tempfile;
 pub(crate) mod textwrap;
 pub(crate) mod timeit;
+pub(crate) mod tokenize;
 pub(crate) mod types;
 pub(crate) mod typing;
 pub(crate) mod unittest;
+pub(crate) mod warnings;
 pub(crate) mod weakref;
 
 use crate::container;
@@ -663,6 +670,13 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "_codecs" => codecs::call(function, args),
         "_string" => string::call(function, args),
         "_weakref" | "weakref" => weakref::call(function, args),
+        "warnings" | "_warnings" => warnings::call(function, args),
+        "marshal" => marshal::call(function, args),
+        "_tokenize" => tokenize::call(function, args),
+        "_collections_abc" | "collections.abc" => collections_abc::call(function, args),
+        "gc" => gc::call(function, args),
+        "atexit" => atexit::call(function, args),
+        "site" => site::call(function, args),
         _ => missing_attribute(module, function),
     }
 }
@@ -747,6 +761,14 @@ pub(crate) fn registry_lookup(name: &str) -> Option<i64> {
     value::as_dict(modules)?
         .iter()
         .find_map(|(key, value)| (value::as_str(*key) == Some(name)).then_some(*value))
+}
+
+/// Module value of the nested `collections.abc` module, shared by the
+/// `collections.abc` and `collections.abc.abc` constant spellings so both
+/// resolve to the exact `sys.modules` entry.
+fn collections_abc_module() -> i64 {
+    registry_lookup("collections.abc")
+        .unwrap_or_else(|| value::module_value("collections.abc".to_string()))
 }
 
 /// `sys.path`: the documented search path, as a cached `list[str]`.
@@ -848,7 +870,7 @@ fn prefix_site_packages(prefix: &Path) -> Vec<PathBuf> {
 /// `HYDRO_STDLIB` names the bundled stdlib directory, so its parent is the
 /// installation root; without it the executable's directory is used. The
 /// result is always a string (possibly empty) rather than a failure.
-fn base_prefix() -> String {
+pub(crate) fn base_prefix() -> String {
     let from_stdlib = std::env::var_os("HYDRO_STDLIB")
         .as_deref()
         .map(Path::new)
@@ -866,7 +888,7 @@ fn base_prefix() -> String {
 
 /// `sys.prefix`: the active virtual environment, else the installation
 /// prefix.
-fn installation_prefix() -> String {
+pub(crate) fn installation_prefix() -> String {
     for variable in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
         if let Some(prefix) = std::env::var_os(variable) {
             if !prefix.is_empty() {
@@ -1029,6 +1051,17 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("builtins", name) => builtins::constant(name),
         ("_opcode", name) => opcode::constant(name),
         ("_weakref" | "weakref", name) => weakref::constant(name),
+        ("warnings" | "_warnings", name) => warnings::constant(name),
+        ("marshal", name) => marshal::constant(name),
+        // `collections.abc` is a nested module. These constants expose the
+        // module value so `collections.abc.Mapping` resolves through the
+        // runtime module (the frontend does not model general nested-module
+        // chains yet). `import collections` reaches the first spelling and
+        // `import collections.abc` the second; the specific arm must precede
+        // the module-wide constant table below.
+        ("collections" | "collections.abc", "abc") => collections_abc_module(),
+        ("_collections_abc" | "collections.abc", name) => collections_abc::constant(name),
+        ("site", name) => site::constant(name),
         // The `@dataclass` decorator is expanded by the frontend; the runtime
         // value only has to exist for the import.
         ("dataclasses", "dataclass") => NONE,

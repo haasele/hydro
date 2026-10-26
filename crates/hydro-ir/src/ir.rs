@@ -67,6 +67,31 @@ pub struct CompClause {
     pub conditions: Vec<Expr>,
 }
 
+/// One `{...}` interpolation of a PEP 750 template string.
+///
+/// The parser reports template literals out of band (a reserved `Name`
+/// placeholder plus a side table), so the IR carries the resolved structure
+/// instead of pretending the literal is an f-string. Codegen evaluates
+/// `value` and `format_spec` in source order and materialises an
+/// `Interpolation` runtime value for each entry.
+#[derive(Clone, Debug)]
+pub struct TemplateInterpolation {
+    /// Expression inside the braces. Its value is the interpolation's
+    /// `value` attribute.
+    pub value: Expr,
+    /// Source text of the expression exactly as written (CPython's
+    /// `Interpolation.expression`), used by the runtime attribute and repr.
+    pub expression: String,
+    /// `!s`/`!r`/`!a` conversion: `0` none, `1` `str`, `2` `repr`,
+    /// `3` `ascii`.
+    pub conversion: u8,
+    /// Expression producing the format-spec text, or `None` when no `:`
+    /// spec was written. The expression always evaluates to a `str`.
+    pub format_spec: Option<Box<Expr>>,
+    /// True when the source used the `=` debug specifier (`t"{x=}"`).
+    pub self_documenting: bool,
+}
+
 /// Expression node with its inferred type and source line.
 #[derive(Clone, Debug)]
 pub struct Expr {
@@ -252,19 +277,22 @@ pub enum ExprKind {
         value: Box<Expr>,
         clauses: Vec<CompClause>,
     },
-    /// `object.method(args...)`. A bare `object.method` without a call is a
-    /// [`ExprKind::GetAttr`] and raises `AttributeError` at runtime.
+    /// `object.method(args..., *star, kw=value..., **double_star)`.
     MethodCall {
         object: Box<Expr>,
         method: String,
         args: Vec<Expr>,
-        /// `object.method(*star, ...)`: the single starred positional operand.
-        /// It is evaluated after `args` (which must then be empty, see the
-        /// frontend restriction) and before `keywords`; the runtime flattens a
-        /// list/tuple into positional arguments.
+        /// `object.method(*star, ...)`: the single starred positional
+        /// operand. It is evaluated after `args` and before `keywords`; the
+        /// runtime flattens a list/tuple into positional arguments.
         star: Option<Box<Expr>>,
         /// Keyword arguments in source order; the runtime binds them.
         keywords: Vec<(String, Expr)>,
+        /// A single `**mapping` operand, evaluated after the named keywords.
+        /// Present only together with `star` or a non-empty keyword list; the
+        /// runtime merges it into the keyword set and raises `TypeError` for a
+        /// non-mapping, a non-`str` key or a duplicate key.
+        double_star: Option<Box<Expr>>,
     },
     Call {
         callee: Callee,
@@ -278,6 +306,26 @@ pub enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
         keywords: Vec<(String, Expr)>,
+    },
+    /// `f(args..., *star, kw=value..., **double_star)` through a function
+    /// value. Used whenever an operand shape needs runtime flattening that
+    /// [`ExprKind::IndirectCall`] (no keywords) or [`ExprKind::CallKw`] (no
+    /// starred operand) cannot express.
+    ///
+    /// Evaluation order is Python's: `callee`, then every positional operand
+    /// in source order (the starred operand is evaluated at its source
+    /// position, which the frontend limits to the end of the positional list),
+    /// then each named keyword value, then the `**mapping`. Codegen forwards
+    /// the buffers to `hydro_call_star_kw`, which flattens `star`, merges the
+    /// keywords and raises `TypeError` for a non-mapping `double_star`, a
+    /// non-`str` key or a key bound twice. A class, function, builtin or
+    /// native function value is dispatched by the shared call protocol.
+    CallFull {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        star: Option<Box<Expr>>,
+        keywords: Vec<(String, Expr)>,
+        double_star: Option<Box<Expr>>,
     },
     /// `Class(args..., name=value, **kwargs)` for a class declared in the
     /// unit whose `__init__` has a dynamic signature. The frontend binds the
@@ -330,6 +378,21 @@ pub enum ExprKind {
     /// expression evaluates to the delegate's return value.
     YieldFrom {
         value: Box<Expr>,
+    },
+    /// PEP 750 template string literal (`t"..."`, `rt"..."`).
+    ///
+    /// `strings.len() == interpolations.len() + 1`, matching CPython's
+    /// `Template.strings` invariant. This is a distinct expression on
+    /// purpose: a template is not a `str` and must never be lowered to an
+    /// f-string, a normal variable or a string concatenation. Codegen builds
+    /// a runtime `Template` through `hydro_template_new` and evaluates every
+    /// interpolation (value, then format spec) in source order.
+    Template {
+        /// Literal parts in source order, decoded exactly like an f-string
+        /// constant part.
+        strings: Vec<String>,
+        /// `{...}` fields in source order.
+        interpolations: Vec<TemplateInterpolation>,
     },
 }
 
@@ -508,15 +571,22 @@ pub enum StmtKind {
         function: FunctionId,
         captures: Vec<LocalId>,
     },
-    /// `class Name(Base):` with already-lowered method functions and class
-    /// attribute values. The runtime class object is stored in `target`.
+    /// `class Name(bases...):` with already-lowered method functions and
+    /// class attribute values. The runtime class object is stored in
+    /// `target`.
     ///
     /// Attribute values are evaluated in declaration order when the class
     /// statement runs; the resulting class namespace is immutable.
     ClassDef {
         target: LocalId,
         name: String,
-        base: Option<Expr>,
+        /// Base expressions in source order (at most one for the single-base
+        /// `hydro_class_new` path; more use `hydro_class_new_multi`).
+        bases: Vec<Expr>,
+        /// `metaclass=value` keyword, evaluated after the bases and before
+        /// the class body (CPython order). `None` selects the metatype of the
+        /// bases at runtime.
+        metaclass: Option<Expr>,
         methods: Vec<ClassMethod>,
         attributes: Vec<ClassAttr>,
     },
@@ -648,6 +718,13 @@ pub enum ParamKind {
     /// Ordinary positional parameter (or a closure capture).
     #[default]
     Positional,
+    /// `def f(x, /)`: a positional-only parameter. It binds from the
+    /// positional argument stream exactly like [`ParamKind::Positional`], but
+    /// a keyword argument with the same name never binds it: the keyword goes
+    /// to `**kwargs` when the signature has one, otherwise the call raises
+    /// `TypeError: ... got an unexpected keyword argument 'x'`. PosOnly
+    /// parameters are always the leading run of positional parameters.
+    PosOnly,
     /// `*args`: the slot always receives a list.
     VarArg,
     /// Keyword-only parameter: its slot receives the keyword value or the
@@ -655,6 +732,28 @@ pub enum ParamKind {
     KwOnly,
     /// `**kwargs`: the slot always receives a dict.
     KwArg,
+}
+
+impl ParamKind {
+    /// True for parameters filled from the positional argument stream
+    /// (`Positional` and `PosOnly`).
+    pub fn is_positional(self) -> bool {
+        matches!(self, ParamKind::Positional | ParamKind::PosOnly)
+    }
+
+    /// Stable encoding used by the `hydro_function_meta` ABI.
+    ///
+    /// `4` is positional-only; the remaining tags keep their historical
+    /// values so existing metadata stays decodable.
+    pub fn abi_tag(self) -> i64 {
+        match self {
+            ParamKind::Positional => 0,
+            ParamKind::VarArg => 1,
+            ParamKind::KwOnly => 2,
+            ParamKind::KwArg => 3,
+            ParamKind::PosOnly => 4,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -693,7 +792,7 @@ impl Function {
     pub fn positional_end(&self) -> usize {
         self.params[self.capture_count.min(self.params.len())..]
             .iter()
-            .position(|param| param.kind != ParamKind::Positional)
+            .position(|param| !param.kind.is_positional())
             .map(|offset| self.capture_count + offset)
             .unwrap_or(self.params.len())
     }
@@ -726,9 +825,7 @@ impl Function {
     /// called through the runtime binder when the caller only has a function
     /// value.
     pub fn has_dynamic_signature(&self) -> bool {
-        self.params
-            .iter()
-            .any(|param| param.kind != ParamKind::Positional)
+        self.params.iter().any(|param| !param.kind.is_positional())
     }
 
     /// Keyword-only parameter range.

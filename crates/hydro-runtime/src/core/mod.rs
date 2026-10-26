@@ -13,4 +13,5 @@ pub(crate) mod globals;
 pub(crate) mod iter;
 pub(crate) mod methods;
 pub(crate) mod ops;
+pub(crate) mod template;
 pub(crate) mod value;
