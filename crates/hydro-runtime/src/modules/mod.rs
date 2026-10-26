@@ -477,6 +477,16 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if matches!(module, "collections" | "_collections") && name == "defaultdict" {
         return collections::defaultdict_function();
     }
+    // AST node/operator names are declared as functions so `ast.Name(...)`
+    // lowers as a module call, but the value itself is a real class:
+    // `isinstance(node, ast.Name)` and `class T(ast.NodeTransformer)` need the
+    // class, not the constructor function.
+    if let Some(class) = ast::class_value(module, name) {
+        return class;
+    }
+    if let Some(class) = typing::class_value(module, name) {
+        return class;
+    }
     if let Some(spec) = stdlib::function(module, name) {
         let module_name = stdlib::module(module).map(|m| m.name).unwrap_or("<module>");
         return value::native_function_new(module_name, spec.name, spec.max_args);
@@ -736,6 +746,9 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "ssl" => socket::ssl_call_kw(function, args, keywords),
         "select" => select::call_kw(function, args, keywords),
         "pytest" => pytest::call_kw(function, args, keywords),
+        "warnings" | "_warnings" => warnings::call_kw(function, args, &keywords),
+        "typing" => typing::call_kw(function, args, &keywords),
+        "ast" => ast::call_kw(function, args, &keywords),
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("{module}.{function}() does not accept keyword arguments"),
@@ -3957,6 +3970,7 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "access" => os_access(args),
         "sysconf" => os_sysconf(args),
         "getloadavg" => os_getloadavg(),
+        "uname" => os_uname(),
         "open" => os_open(args),
         "dup2" => os_dup2(args),
         "get_terminal_size" => os_get_terminal_size(args),
@@ -4058,6 +4072,114 @@ fn os_getloadavg() -> i64 {
         RUNTIME_ERROR,
         "os.getloadavg is not supported on this platform",
     )
+}
+
+/// `os.uname()` on POSIX: the five identity strings from `uname(2)`.
+#[cfg(unix)]
+fn os_uname() -> i64 {
+    let mut info: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: `uname` initialises every field of the provided `utsname`.
+    if unsafe { libc::uname(&mut info) } != 0 {
+        return os_error_from_io("uname", std::io::Error::last_os_error(), None);
+    }
+    let field = |bytes: &[libc::c_char]| -> String {
+        // SAFETY: `uname` NUL-terminates each field.
+        unsafe { std::ffi::CStr::from_ptr(bytes.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    uname_result([
+        ("sysname", field(&info.sysname)),
+        ("nodename", field(&info.nodename)),
+        ("release", field(&info.release)),
+        ("version", field(&info.version)),
+        ("machine", field(&info.machine)),
+    ])
+}
+
+/// `os.uname()` elsewhere: the portable platform helpers.
+#[cfg(not(unix))]
+fn os_uname() -> i64 {
+    uname_result([
+        ("sysname", platform_system().to_string()),
+        ("nodename", platform_node()),
+        ("release", platform_release()),
+        ("version", platform_version()),
+        ("machine", platform_machine().to_string()),
+    ])
+}
+
+/// Builds the `os.uname()` value: a `uname_result`-shaped namedtuple instance
+/// with CPython's five fields.
+///
+/// `typing.NamedTuple` instances expose their fields as attributes and iterate
+/// in field order, so `os.uname().release` and
+/// `system, node, release, version, machine = os.uname()` both work. The
+/// `__len__`/`__getitem__` methods make the value index like the tuple
+/// subclass CPython returns.
+fn uname_result(fields: [(&str, String); 5]) -> i64 {
+    // The marker base is what makes an ordinary class instance iterate in
+    // attribute order (`value::namedtuple_values`).
+    let marker = value::class_new("NamedTuple".to_string(), NONE, Vec::new());
+    let roots = crate::heap::root_values(&[marker]);
+    let methods = vec![
+        (
+            "__len__".to_string(),
+            value::function_new(uname_len as *const () as usize, 1, "__len__".to_string()),
+        ),
+        (
+            "__getitem__".to_string(),
+            value::function_new(
+                uname_getitem as *const () as usize,
+                2,
+                "__getitem__".to_string(),
+            ),
+        ),
+    ];
+    let class = value::class_new("uname_result".to_string(), marker, methods);
+    crate::heap::root_values(&[class]);
+    let result = value::instance_new(class);
+    crate::heap::root_values(&[result]);
+    for (name, text) in fields {
+        let field = value::str_alloc(text);
+        value::instance_setattr(result, name.to_string(), field);
+    }
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// Field order of `uname_result`, matching CPython's `posix.uname_result`.
+const UNAME_FIELDS: [&str; 5] = ["sysname", "nodename", "release", "version", "machine"];
+
+/// `uname_result.__len__`: always five fields.
+extern "C" fn uname_len(_argv: *const i64) -> i64 {
+    // 5 always fits the tagged-integer range.
+    value::encode_int(UNAME_FIELDS.len() as i64).expect("five is a tagged int")
+}
+
+/// `uname_result.__getitem__`: positional access and negative indices.
+extern "C" fn uname_getitem(argv: *const i64) -> i64 {
+    // SAFETY: a method call passes `(self, index)` in that order.
+    let object = unsafe { *argv };
+    let index_value = unsafe { *argv.add(1) };
+    let Some(index) = value::as_integer(index_value) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "uname_result indices must be integers, not slices",
+        );
+    };
+    let index = if index < 0 {
+        index + UNAME_FIELDS.len() as i64
+    } else {
+        index
+    };
+    let Some(name) = usize::try_from(index)
+        .ok()
+        .and_then(|position| UNAME_FIELDS.get(position).copied())
+    else {
+        return exc::raise_with_message(INDEX_ERROR, "uname_result index out of range");
+    };
+    value::instance_attr(object, name).unwrap_or(NONE)
 }
 
 /// `os.get_terminal_size(fd=1)`: the `columns`/`lines` of the terminal behind
@@ -5626,6 +5748,36 @@ mod tests {
     }
 
     #[test]
+    fn compiled_module_globals_read_as_module_attributes() {
+        // A compiled package mirrors its imported globals (`from .version
+        // import __version__`) and submodules into the global store; reading
+        // them through the module value must find them.
+        exc::init();
+        globals::set("numpy", "__version__", string("2.5.0"));
+        globals::set(
+            "numpy",
+            "version",
+            value::module_value("numpy.version".to_string()),
+        );
+        assert_eq!(value::as_str(get("numpy", "__version__")), Some("2.5.0"));
+        assert_eq!(
+            value::as_module(get("numpy", "version")).map(|module| module.name()),
+            Some("numpy.version")
+        );
+        assert!(!exc::pending());
+
+        // A name the module never bound is still an `AttributeError`.
+        exc::init();
+        assert_eq!(get("numpy", "missing_attr"), NONE);
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        assert_eq!(message(), "module 'numpy' has no attribute 'missing_attr'");
+
+        // The registry caches and the globals store are reset per program run.
+        globals::remove("numpy", "__version__");
+        globals::remove("numpy", "version");
+    }
+
+    #[test]
     fn abi_module_entries() {
         exc::init();
         let sqrt = crate::abi::hydro_module_get(b"math".as_ptr(), 4, b"sqrt".as_ptr(), 4);
@@ -6188,6 +6340,53 @@ mod tests {
         exc::init();
         assert_eq!(call("os", "sysconf", &[value::float_new(1.0)]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_uname_exposes_the_platform_identity() {
+        exc::init();
+        let result = call("os", "uname", &[]);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        // Attribute access like `os.uname().release`.
+        let sysname = value::instance_attr(result, "sysname").expect("sysname");
+        assert_eq!(value::as_str(sysname), Some(platform_system()));
+        let machine = value::instance_attr(result, "machine").expect("machine");
+        assert_eq!(value::as_str(machine), Some(platform_machine()));
+        let release = value::instance_attr(result, "release").expect("release");
+        assert!(
+            !value::as_str(release).unwrap_or_default().is_empty(),
+            "uname release must be the real kernel release"
+        );
+        let _ = value::instance_attr(result, "nodename").expect("nodename");
+        let _ = value::instance_attr(result, "version").expect("version");
+
+        // Tuple unpacking, as used by `system, _, _, _, machine = os.uname()`.
+        let fields = value::namedtuple_values(result).expect("uname_result fields");
+        assert_eq!(fields.len(), 5);
+        for (index, name) in ["sysname", "nodename", "release", "version", "machine"]
+            .iter()
+            .enumerate()
+        {
+            let attribute = value::instance_attr(result, name).expect(name);
+            assert_eq!(fields[index], attribute, "field {name} out of order");
+        }
+
+        // Tuple protocol: `len(os.uname())` and `os.uname()[0]`.
+        assert_eq!(crate::core::builtins::len(result), int(5));
+        assert_eq!(
+            value::as_str(container::subscript(result, int(0))),
+            Some(platform_system())
+        );
+        assert_eq!(
+            value::as_str(container::subscript(result, int(-1))),
+            Some(platform_machine())
+        );
+        exc::init();
     }
 
     #[test]

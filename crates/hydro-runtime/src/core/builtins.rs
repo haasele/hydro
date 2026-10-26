@@ -172,6 +172,20 @@ pub(crate) fn hash(v: i64) -> i64 {
     ops::int_result((container::key_hash(v) >> 4) as i64)
 }
 
+/// `id(v)`: the value's identity as an integer.
+///
+/// Heap values report their runtime address with the tag bits masked off;
+/// tagged immediates (`int`, `bool`, `None`, ...) are mapped injectively away
+/// from the heap tag. This is the same encoding `builtins.id` uses, so both
+/// spellings return the same number for a value and the number never collides
+/// between an immediate and a heap object.
+pub(crate) fn id_value(v: i64) -> i64 {
+    if value::is_heap(v) {
+        return ops::int_result(v & !value::TAG_MASK);
+    }
+    ops::int_result((v as u64 ^ 0x9e37_79b9_7f4a_7c17u64) as i64)
+}
+
 /// `len(v)`: strings count Unicode scalar values, lists/tuples their elements
 /// and dicts their keys.
 pub(crate) fn len(v: i64) -> i64 {
@@ -1694,18 +1708,35 @@ pub(crate) fn call_kw(
             keywords.push((keyword.to_string(), pair[1]));
         }
         if let Some(tag) = exc::exception_tag_of_class(class) {
-            if !keywords.is_empty() {
-                return exc::raise_with_message(
-                    TYPE_ERROR,
-                    "exception class does not accept keyword arguments",
-                );
-            }
-            return instantiate_exception(tag, args.len(), args.as_ptr());
+            return instantiate_exception_kw(tag, &args, &keywords);
         }
         let instance = value::instance_new(class);
         let Some((kind, init)) = value::class_member(class, "__init__") else {
             if !args.is_empty() || !keywords.is_empty() {
-                return exc::raise_with_message(TYPE_ERROR, "class takes no arguments");
+                let name = value::class_display_name(class)
+                    .unwrap_or("class")
+                    .to_string();
+                if let Some((keyword, _)) = keywords.first() {
+                    // A built-in exception class keeps its constructor contract
+                    // even when it reaches the generic class path (for example
+                    // after its tag cache entry was dropped): name the class
+                    // and the offending keyword instead of the generic
+                    // "class takes no arguments". User exception classes with
+                    // no `__init__` inherit `BaseException`'s keyword refusal.
+                    let is_exception = value::exception_tag_of_derived_class(class).is_some()
+                        || hydro_ir::ExcKind::from_class_name(&name).is_some()
+                        || hydro_ir::ExcKind::from_name(&name).is_some();
+                    let message = if is_exception {
+                        format!("{name}() got an unexpected keyword argument '{keyword}'")
+                    } else {
+                        format!("{name}() takes no keyword arguments")
+                    };
+                    return exc::raise_with_message(TYPE_ERROR, &message);
+                }
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{name}() takes no arguments"),
+                );
             }
             return instance;
         };
@@ -2115,26 +2146,103 @@ pub(crate) fn call_full_entry(entry: usize, args: &[i64]) -> i64 {
     trampoline(args.as_ptr())
 }
 
-/// Resolves a name bound by a function-local import.
+/// Resolves a name bound by an import that was deferred at compile time.
 ///
-/// Hydro links imports at compile time, so a deferred import that is reached at
-/// runtime cannot be executed. This reports the unresolved module (and member)
-/// and always raises `RuntimeError`; the returned `None` is only the pending
-/// exception placeholder for generated code.
+/// The loader links every module that is part of the program, so a deferred
+/// import is served from the runtime module registry (`sys.modules`), never by
+/// compiling at runtime:
+///
+/// - a module alias returns the module value;
+/// - `from pkg import sub` returns the registered submodule when it was
+///   preloaded, otherwise an attribute of `pkg` (a function, class or
+///   constant), and finally the module registry again for dotted attribute
+///   chains (`from pkg import sub.value`);
+/// - a name that is not registered raises `ModuleNotFoundError` carrying the
+///   exact dotted name, so `except ImportError` handlers run with CPython's
+///   error taxonomy.
+///
+/// The returned `None` is only the pending-exception placeholder for
+/// generated code.
 pub(crate) fn deferred_import(module: &str, member: Option<&str>) -> i64 {
-    // A nested import that names a value of an already-initialized module can
-    // be served from the mirrored module global table. The loader links every
-    // module that is part of the program, so no dynamic loading is needed.
-    if let Some(member) = member {
-        if let Some(value) = crate::core::globals::try_get(module, member) {
-            return value;
+    let Some(member) = member else {
+        return match modules::registry_lookup(module) {
+            Some(value) => value,
+            None => module_not_found(module),
+        };
+    };
+    // Walk the member chain one component at a time: each leading component
+    // that names a registered module becomes the new receiver, so
+    // `from pkg import sub` and `from pkg import sub.value` share one path.
+    let mut current = module.to_string();
+    let mut remaining = member;
+    loop {
+        let (head, tail) = match remaining.split_once('.') {
+            Some((head, tail)) => (head, Some(tail)),
+            None => (remaining, None),
+        };
+        let full = format!("{current}.{head}");
+        if let Some(value) = modules::registry_lookup(&full) {
+            match tail {
+                Some(tail) => {
+                    current = full;
+                    remaining = tail;
+                    continue;
+                }
+                None => return value,
+            }
+        }
+        if let Some(value) = globals::try_get(&current, head) {
+            return match tail {
+                Some(tail) => attribute_chain(value, tail),
+                None => value,
+            };
+        }
+        // Native modules resolve their members on demand from the central
+        // spec, exactly like `getattr(module, name)`.
+        if stdlib::module(&current).is_some() {
+            let value = modules::module_get_by_name(&current, head);
+            if exc::pending() {
+                return NONE;
+            }
+            return match tail {
+                Some(tail) => attribute_chain(value, tail),
+                None => value,
+            };
+        }
+        return module_not_found(&full);
+    }
+}
+
+/// Follows a dotted attribute path from `value`, propagating the pending
+/// `AttributeError` of a missing member.
+fn attribute_chain(value: i64, path: &str) -> i64 {
+    let mut value = value;
+    for name in path.split('.') {
+        value = methods::getattr(value, name.as_ptr(), name.len());
+        if exc::pending() {
+            return NONE;
         }
     }
-    let message = match member {
-        Some(member) => format!("dynamic import of '{module}.{member}' is not supported"),
-        None => format!("dynamic import of '{module}' is not supported"),
-    };
-    exc::raise_with_message(RUNTIME_ERROR, &message)
+    value
+}
+
+/// Raises `ModuleNotFoundError` naming `name` exactly, like CPython's importer.
+///
+/// The `name` keyword is stored on the exception object so runtime consumers
+/// can inspect the missing module; the message keeps the standard
+/// `No module named '<name>'` spelling.
+pub(crate) fn module_not_found(name: &str) -> i64 {
+    let message = format!("No module named '{name}'");
+    let missing = value::str_alloc(name.to_string());
+    let roots = crate::heap::root_values(&[missing]);
+    let exception = exc::exception_value_with_keywords(
+        exc::MODULE_NOT_FOUND_ERROR,
+        &message,
+        vec![message.clone()],
+        vec![("name".to_string(), missing)],
+    );
+    crate::heap::release_roots(roots);
+    exc::raise_value(exception)
 }
 
 /// Applies an `operator.attrgetter` value to its single argument.
@@ -2220,32 +2328,75 @@ fn push_item(list: i64, item: i64) {
 /// tuple. Extra positional arguments are rejected (Hydro stores one message,
 /// not arbitrary argument objects).
 fn instantiate_exception(tag: u32, argc: usize, argv: *const i64) -> i64 {
-    if argc > 1 {
+    let args: &[i64] = if argc > 0 && !argv.is_null() {
+        if argc > 1 {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "{}() takes at most 1 argument ({} given)",
+                    exc::tag_name(tag),
+                    argc
+                ),
+            );
+        }
+        // SAFETY: ABI contract: `argv` points at one readable tagged value.
+        unsafe { std::slice::from_raw_parts(argv, 1) }
+    } else {
+        &[]
+    };
+    instantiate_exception_kw(tag, args, &[])
+}
+
+/// Instantiates a built-in exception class with keyword arguments:
+/// `AttributeError(msg, name=None)`, `NameError(msg, name=...)`, and the
+/// `SyntaxError` family's source-position keywords.
+///
+/// The keyword set accepted by each class comes from
+/// [`exc::exception_keyword_names`]. An unsupported name raises `TypeError`
+/// naming the class and keyword instead of being silently dropped, matching
+/// CPython's constructor.
+fn instantiate_exception_kw(tag: u32, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if args.len() > 1 {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
                 "{}() takes at most 1 argument ({} given)",
                 exc::tag_name(tag),
-                argc
+                args.len()
             ),
         );
     }
-    let (message, args) = if argc == 1 && !argv.is_null() {
-        // SAFETY: ABI contract: `argv` points at one readable tagged value.
-        let argument = unsafe { *argv };
-        let text = value::to_string(argument);
-        // `KeyError` renders its argument with `repr()` in `str(exception)`
-        // while `args` keeps the argument itself (as text).
-        let message = if tag == exc::KEY_ERROR {
-            value::repr(argument)
-        } else {
-            text.clone()
-        };
-        (message, vec![text])
-    } else {
-        (String::new(), Vec::new())
+    let allowed = exc::exception_keyword_names(tag);
+    for (name, _) in keywords {
+        if !allowed.contains(&name.as_str()) {
+            let message = if allowed.is_empty() {
+                format!("{}() takes no keyword arguments", exc::tag_name(tag))
+            } else {
+                format!(
+                    "{}() got an unexpected keyword argument '{}'",
+                    exc::tag_name(tag),
+                    name
+                )
+            };
+            return exc::raise_with_message(TYPE_ERROR, &message);
+        }
+    }
+    let (message, rendered_args) = match args.first() {
+        Some(&argument) => {
+            let text = value::to_string(argument);
+            // `KeyError` renders its argument with `repr()` in
+            // `str(exception)` while `args` keeps the argument itself (as
+            // text).
+            let message = if tag == exc::KEY_ERROR {
+                value::repr(argument)
+            } else {
+                text.clone()
+            };
+            (message, vec![text])
+        }
+        None => (String::new(), Vec::new()),
     };
-    exc::exception_value(tag, &message, args)
+    exc::exception_value_with_keywords(tag, &message, rendered_args, keywords.to_vec())
 }
 
 /// Builds the native payload for a user-defined exception class.
@@ -3605,7 +3756,8 @@ fn builtin_arity_error(name: &str, expected: &str, argc: usize) -> i64 {
 /// `(iterable, key, reverse)`, `round` one or two, `format` two (or
 /// three for the internal conversion flag), `isinstance` and `issubclass`
 /// exactly two, `all` exactly one, `ord`/`chr` exactly one, `divmod` exactly
-/// two, `callable` exactly one and the internal dict merge exactly two.
+/// two, `callable` exactly one, `id` exactly one and the internal dict merge
+/// exactly two.
 pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -3749,6 +3901,10 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
         Builtin::Hash => match args {
             [value] => hash(*value),
             _ => builtin_arity_error("hash", "exactly 1", argc),
+        },
+        Builtin::Id => match args {
+            [value] => id_value(*value),
+            _ => builtin_arity_error("id", "exactly 1", argc),
         },
         Builtin::Int => match args {
             [] => ops::int_result(0),
@@ -6077,6 +6233,231 @@ mod tests {
     }
 
     #[test]
+    fn exception_keyword_constructors_store_attributes() {
+        // Every `exc::init()` frees the previous run's heap and clears the
+        // exception-class cache, so classes and strings are reacquired after
+        // each one instead of being reused.
+        exc::init();
+        let attribute_error = exc::exception_class(exc::ATTRIBUTE_ERROR);
+        let message = [string("boom")];
+        let name = string("missing");
+
+        // `AttributeError('boom', name='missing')`: the keyword is stored and
+        // exposed as `.name`; `.obj` defaults to None.
+        let pairs = [string("name"), name];
+        let raised = call_kw(attribute_error, 1, message.as_ptr(), 1, pairs.as_ptr());
+        assert!(!exc::pending());
+        assert_eq!(getattr_builtin(raised, string("name")), name);
+        assert_eq!(getattr_builtin(raised, string("obj")), NONE);
+        assert_eq!(rendered(raised), "boom");
+        assert_eq!(
+            rendered(getattr_builtin(raised, string("args"))),
+            "('boom',)"
+        );
+
+        // `NameError` accepts `name`.
+        let name_error = exc::exception_class(exc::NAME_ERROR);
+        let named = call_kw(name_error, 1, message.as_ptr(), 1, pairs.as_ptr());
+        assert!(!exc::pending());
+        assert_eq!(getattr_builtin(named, string("name")), name);
+
+        // `NameError` rejects `obj`, naming the class and the keyword.
+        exc::init();
+        let name_error = exc::exception_class(exc::NAME_ERROR);
+        let message = [string("boom")];
+        let pairs = [string("obj"), string("missing")];
+        assert_eq!(
+            call_kw(name_error, 1, message.as_ptr(), 1, pairs.as_ptr()),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), exc::TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "NameError() got an unexpected keyword argument 'obj'"
+        );
+
+        // Classes without keyword parameters reject every keyword.
+        exc::init();
+        let value_error = exc::exception_class(exc::VALUE_ERROR);
+        let message = [string("boom")];
+        let pairs = [string("name"), string("missing")];
+        assert_eq!(
+            call_kw(value_error, 1, message.as_ptr(), 1, pairs.as_ptr()),
+            NONE
+        );
+        assert_eq!(pending_message(), "ValueError() takes no keyword arguments");
+
+        exc::init();
+        let attribute_error = exc::exception_class(exc::ATTRIBUTE_ERROR);
+        let message = [string("boom")];
+        let pairs = [string("foo"), int(1)];
+        assert_eq!(
+            call_kw(attribute_error, 1, message.as_ptr(), 1, pairs.as_ptr()),
+            NONE
+        );
+        assert_eq!(
+            pending_message(),
+            "AttributeError() got an unexpected keyword argument 'foo'"
+        );
+        exc::init();
+    }
+
+    #[test]
+    fn every_builtin_exception_rejects_unknown_keywords_by_name() {
+        // The constructor path must be the per-class one for every built-in
+        // exception, never the generic class fallback that reported
+        // "class takes no arguments".
+        for tag in [
+            exc::VALUE_ERROR,
+            exc::TYPE_ERROR,
+            exc::ATTRIBUTE_ERROR,
+            exc::NAME_ERROR,
+            exc::OS_ERROR,
+            exc::KEY_ERROR,
+            exc::RUNTIME_ERROR,
+            exc::SYNTAX_ERROR,
+            exc::INDENTATION_ERROR,
+            exc::TAB_ERROR,
+            exc::STOP_ITERATION,
+            exc::ASSERTION_ERROR,
+            exc::IMPORT_ERROR,
+            exc::MEMORY_ERROR,
+        ] {
+            exc::init();
+            let class = exc::exception_class(tag);
+            let message = [string("boom")];
+            let pairs = [string("not_a_keyword"), int(1)];
+            assert_eq!(
+                call_kw(class, 1, message.as_ptr(), 1, pairs.as_ptr()),
+                NONE,
+                "{} accepted an unknown keyword",
+                exc::tag_name(tag)
+            );
+            assert_eq!(exc::pending_tag(), exc::TYPE_ERROR as i64);
+            let rendered = pending_message();
+            assert!(
+                rendered.starts_with(&format!("{}()", exc::tag_name(tag))),
+                "{} rejection must name the class: {rendered}",
+                exc::tag_name(tag)
+            );
+            assert!(
+                !rendered.contains("class takes no arguments"),
+                "{} used the generic class fallback: {rendered}",
+                exc::tag_name(tag)
+            );
+        }
+        exc::init();
+    }
+
+    extern "C" fn matmul_forty_one(_argv: *const i64) -> i64 {
+        int(41)
+    }
+
+    extern "C" fn matmul_seven(_argv: *const i64) -> i64 {
+        int(7)
+    }
+
+    extern "C" fn matmul_in_place(_argv: *const i64) -> i64 {
+        int(99)
+    }
+
+    #[test]
+    fn matmul_dispatches_user_dunders_and_scalars() {
+        exc::init();
+        // Scalar operands multiply.
+        assert_eq!(
+            value::as_integer(ops::binop(ops::OP_MATMUL, int(6), int(7))),
+            Some(42)
+        );
+        assert_eq!(
+            value::as_float(ops::binop(ops::OP_MATMUL, value::float_new(1.5), int(2))),
+            Some(3.0)
+        );
+
+        // `__matmul__` on the left operand.
+        let left = value::function_new(
+            matmul_forty_one as *const () as usize,
+            2,
+            "__matmul__".to_string(),
+        );
+        let left_class = value::class_new(
+            "Left".to_string(),
+            NONE,
+            vec![("__matmul__".to_string(), left)],
+        );
+        let left_instance = value::instance_new(left_class);
+        assert_eq!(
+            value::as_integer(ops::binop(ops::OP_MATMUL, left_instance, int(1))),
+            Some(41)
+        );
+
+        // `__rmatmul__` on the right operand, reflected form.
+        let right = value::function_new(
+            matmul_seven as *const () as usize,
+            2,
+            "__rmatmul__".to_string(),
+        );
+        let right_class = value::class_new(
+            "Right".to_string(),
+            NONE,
+            vec![("__rmatmul__".to_string(), right)],
+        );
+        let right_instance = value::instance_new(right_class);
+        assert_eq!(
+            value::as_integer(ops::binop(ops::OP_MATMUL, int(1), right_instance)),
+            Some(7)
+        );
+
+        // `@=` prefers `__imatmul__`; `@` uses `__matmul__`.
+        let in_place = value::function_new(
+            matmul_in_place as *const () as usize,
+            2,
+            "__imatmul__".to_string(),
+        );
+        let both_class = value::class_new(
+            "Both".to_string(),
+            NONE,
+            vec![
+                ("__matmul__".to_string(), left),
+                ("__imatmul__".to_string(), in_place),
+            ],
+        );
+        let both = value::instance_new(both_class);
+        assert_eq!(
+            value::as_integer(ops::binop(ops::OP_MATMUL_INPLACE, both, both)),
+            Some(99)
+        );
+        assert_eq!(
+            value::as_integer(ops::binop(ops::OP_MATMUL, both, both)),
+            Some(41)
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn matmul_without_a_protocol_raises_type_error() {
+        exc::init();
+        assert_eq!(ops::binop(ops::OP_MATMUL, string("a"), string("b")), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for @: 'str' and 'str'"
+        );
+
+        exc::init();
+        assert_eq!(
+            ops::binop(ops::OP_MATMUL_INPLACE, string("a"), string("b")),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for @=: 'str' and 'str'"
+        );
+        exc::init();
+    }
+
+    #[test]
     fn all_uses_truthiness_and_accepts_empty_iterables() {
         exc::init();
         assert_eq!(all(value::list_new(vec![int(1), string("x"), TRUE])), TRUE);
@@ -6333,6 +6714,41 @@ mod tests {
 
         exc::init();
         assert_eq!(builtin_call(Builtin::Hash, &[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn id_is_stable_and_matches_the_builtins_module() {
+        // Identity values are integers; compare them by value because an
+        // out-of-range immediate id is a heap `BigInt`.
+        let same_id = |left: i64, right: i64| ops::binop(BinOp::Eq.code(), left, right) == TRUE;
+        exc::init();
+        let immediate = int(7);
+        let immediate_id = builtin_call(Builtin::Id, &[immediate]);
+        assert!(same_id(
+            immediate_id,
+            builtin_call(Builtin::Id, &[immediate])
+        ));
+        // Immediates are mapped injectively, so distinct values differ.
+        assert!(!same_id(immediate_id, builtin_call(Builtin::Id, &[int(8)])));
+        assert!(!exc::pending());
+
+        // Heap values keep one identity for their lifetime and never share it
+        // with a different object.
+        let first = value::list_new(Vec::new());
+        let second = value::list_new(Vec::new());
+        let roots = crate::heap::root_values(&[first, second]);
+        let first_id = builtin_call(Builtin::Id, &[first]);
+        assert!(same_id(first_id, builtin_call(Builtin::Id, &[first])));
+        assert!(!same_id(first_id, builtin_call(Builtin::Id, &[second])));
+        // The `builtins.id` spelling returns the same number.
+        assert_eq!(first_id, crate::modules::builtins::call("id", &[first]));
+        crate::heap::release_roots(roots);
+        assert!(!exc::pending());
+
+        // Arity is enforced.
+        exc::init();
+        assert_eq!(builtin_call(Builtin::Id, &[]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
     }
 
@@ -6898,5 +7314,50 @@ mod tests {
             value::class_lookup(class, "size"),
             Some(value::ClassEntry::Method(MethodKind::Normal, _))
         ));
+    }
+
+    #[test]
+    fn deferred_import_resolves_registered_modules_by_exact_name() {
+        globals::reset();
+        exc::init();
+        // A compiled module is registered by the `__name__` global its
+        // initializer stores; submodules are ordinary dotted entries.
+        globals::set("pkg", "__name__", string("pkg"));
+        globals::set("pkg.sub", "__name__", string("pkg.sub"));
+        globals::set("pkg.sub", "value", int(7));
+
+        // Module alias (`import pkg.sub as s`).
+        let module = deferred_import("pkg.sub", None);
+        assert!(!exc::pending());
+        assert_eq!(value::as_module(module).map(|m| m.name()), Some("pkg.sub"));
+
+        // `from pkg import sub` returns the preloaded submodule, not an
+        // attribute of the package.
+        let submodule = deferred_import("pkg", Some("sub"));
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_module(submodule).map(|m| m.name()),
+            Some("pkg.sub")
+        );
+
+        // `from pkg.sub import value` returns the module attribute.
+        let attribute = deferred_import("pkg.sub", Some("value"));
+        assert!(!exc::pending());
+        assert_eq!(value::as_integer(attribute), Some(7));
+
+        // A missing submodule reports the exact dotted name.
+        exc::clear();
+        assert_eq!(deferred_import("pkg", Some("missing")), NONE);
+        assert_eq!(exc::pending_tag(), exc::MODULE_NOT_FOUND_ERROR as i64);
+        assert_eq!(pending_message(), "No module named 'pkg.missing'");
+
+        // A missing module alias reports its own exact name.
+        exc::clear();
+        assert_eq!(deferred_import("nowhere", None), NONE);
+        assert_eq!(exc::pending_tag(), exc::MODULE_NOT_FOUND_ERROR as i64);
+        assert_eq!(pending_message(), "No module named 'nowhere'");
+
+        globals::reset();
+        exc::init();
     }
 }

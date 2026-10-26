@@ -44,6 +44,11 @@ pub(crate) struct ExcData {
     /// Exceptions raised without arguments have an empty vector, so
     /// `e.args == ()`.
     pub(crate) args: Vec<String>,
+    /// Keyword-only constructor payload. `AttributeError` stores `name` and
+    /// `obj`, `NameError` stores `name`, and the `SyntaxError` family stores
+    /// the source-position keywords. The tagged values are GC edges (see
+    /// `gc::heap::mark_value`).
+    pub(crate) keywords: Vec<(String, i64)>,
 }
 
 // Exception tags, fixed by ARCHITECTURE §3.2.
@@ -442,6 +447,21 @@ pub(crate) fn exception_tag_of_class(class: i64) -> Option<u32> {
 /// `args` are the already-rendered Python arguments (empty for `Tag()`);
 /// they become the `args` tuple exposed by [`exception_attr`].
 pub(crate) fn exception_value(tag: u32, message: &str, args: Vec<String>) -> i64 {
+    exception_value_with_keywords(tag, message, args, Vec::new())
+}
+
+/// [`exception_value`] with the keyword-only constructor payload stored.
+///
+/// The values stay tagged (not rendered) because `AttributeError.name`,
+/// `AttributeError.obj` and the `SyntaxError` position attributes expose the
+/// original objects. Callers validate the keyword names against
+/// [`exception_keyword_names`] before constructing.
+pub(crate) fn exception_value_with_keywords(
+    tag: u32,
+    message: &str,
+    args: Vec<String>,
+    keywords: Vec<(String, i64)>,
+) -> i64 {
     value::exception_new(ExcData {
         tag,
         name: tag_name(tag),
@@ -454,7 +474,24 @@ pub(crate) fn exception_value(tag: u32, message: &str, args: Vec<String>) -> i64
         suppress_context: false,
         exit_code: None,
         args,
+        keywords,
     })
+}
+
+/// Keyword names accepted by the built-in exception constructor `tag`.
+///
+/// CPython's `AttributeError` takes `name` and `obj`, `NameError` takes
+/// `name`, and the `SyntaxError` family carries source-position keywords.
+/// Every other built-in exception rejects keyword arguments with `TypeError`.
+pub(crate) fn exception_keyword_names(tag: u32) -> &'static [&'static str] {
+    match tag {
+        ATTRIBUTE_ERROR => &["name", "obj"],
+        NAME_ERROR => &["name"],
+        SYNTAX_ERROR | INDENTATION_ERROR | TAB_ERROR => {
+            &["lineno", "offset", "text", "end_lineno", "end_offset"]
+        }
+        _ => &[],
+    }
 }
 
 #[derive(Default)]
@@ -668,6 +705,7 @@ fn raise_with_message_cause(
         suppress_context,
         exit_code: None,
         args,
+        keywords: Vec::new(),
     };
     publish(value::exception_new(data))
 }
@@ -710,6 +748,7 @@ pub(crate) fn raise_exit(code: i64) -> i64 {
         suppress_context: true,
         exit_code,
         args,
+        keywords: Vec::new(),
     };
     publish(value::exception_new(data))
 }
@@ -859,13 +898,17 @@ pub(crate) fn matches_handler(handler_tag: u32) -> i32 {
 }
 
 /// Exception attribute surface used by the stdlib: `args`, `__class__`,
-/// `__cause__`, `__context__`, `__suppress_context__` and `__traceback__`.
+/// `__cause__`, `__context__`, `__suppress_context__`, `__traceback__`, plus
+/// the keyword-backed attributes (`AttributeError.name`/`.obj`,
+/// `NameError.name`, `SyntaxError.lineno`/`.offset`/`.text`/`.end_lineno`/
+/// `.end_offset`).
 ///
 /// Returns `None` when `value` is not a built-in exception object or when the
 /// name is not an exception attribute, so the caller can raise
 /// `AttributeError`. `__cause__`/`__context__` are `None` when unset and
 /// `__traceback__` is always `None`: Hydro records the raise location in
-/// [`ExcData`] but has no traceback object.
+/// [`ExcData`] but has no traceback object. A keyword-backed attribute that
+/// was not supplied to the constructor is `None`, like CPython.
 pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
     let data = value::exception_data(object)?;
     Some(match name {
@@ -875,8 +918,22 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
         "__context__" => data.context.unwrap_or(NONE),
         "__suppress_context__" => value::bool_value(data.suppress_context),
         "__traceback__" => NONE,
-        _ => return None,
+        _ => {
+            if !exception_keyword_names(data.tag).contains(&name) {
+                return None;
+            }
+            keyword_value(data, name).unwrap_or(NONE)
+        }
     })
+}
+
+/// Value stored for the keyword-only constructor argument `name`, if the
+/// exception was built with it.
+fn keyword_value(data: &ExcData, name: &str) -> Option<i64> {
+    data.keywords
+        .iter()
+        .find(|(keyword, _)| keyword == name)
+        .map(|(_, value)| *value)
 }
 
 /// Builds the `args` tuple for [`exception_attr`].
@@ -929,6 +986,7 @@ pub(crate) fn uncaught() -> i64 {
         suppress_context: false,
         exit_code: None,
         args: Vec::new(),
+        keywords: Vec::new(),
     });
 
     // `SystemExit` never renders a traceback. An integer code becomes the
@@ -1246,6 +1304,7 @@ mod tests {
             suppress_context: false,
             exit_code: None,
             args: vec![msg.to_string()],
+            keywords: Vec::new(),
         }
     }
 
@@ -1441,6 +1500,7 @@ mod tests {
             suppress_context: false,
             exit_code: None,
             args: Vec::new(),
+            keywords: Vec::new(),
         };
         publish(value::exception_new(data));
         assert_eq!(matches_handler(EXCEPTION), 1);
@@ -1549,6 +1609,45 @@ mod tests {
         // Non-exception values have no exception attributes.
         assert_eq!(exception_attr(NONE, "args"), None);
         assert_eq!(exception_attr(value::encode_int(1).unwrap(), "args"), None);
+        init();
+    }
+
+    #[test]
+    fn keyword_attributes_are_exposed_and_default_to_none() {
+        init();
+        let name = value::str_from_bytes(b"attr");
+        let object = value::encode_int(7).unwrap();
+        let exc = exception_value_with_keywords(
+            ATTRIBUTE_ERROR,
+            "boom",
+            vec!["boom".to_string()],
+            vec![("name".to_string(), name), ("obj".to_string(), object)],
+        );
+        assert_eq!(exception_attr(exc, "name"), Some(name));
+        assert_eq!(exception_attr(exc, "obj"), Some(object));
+
+        // A keyword attribute the constructor did not receive is `None`, and
+        // attributes of another exception class stay non-existent.
+        let named = exception_value_with_keywords(NAME_ERROR, "x", Vec::new(), Vec::new());
+        assert_eq!(exception_attr(named, "name"), Some(NONE));
+        assert_eq!(exception_attr(named, "obj"), None);
+
+        let value_error = exception_value(VALUE_ERROR, "x", Vec::new());
+        assert_eq!(exception_attr(value_error, "name"), None);
+
+        // The `SyntaxError` family stores source-position keywords and
+        // defaults the omitted ones to `None`.
+        let lineno = value::encode_int(3).unwrap();
+        let syntax = exception_value_with_keywords(
+            SYNTAX_ERROR,
+            "bad",
+            Vec::new(),
+            vec![("lineno".to_string(), lineno)],
+        );
+        assert_eq!(exception_attr(syntax, "lineno"), Some(lineno));
+        assert_eq!(exception_attr(syntax, "offset"), Some(NONE));
+        assert_eq!(exception_attr(syntax, "text"), Some(NONE));
+        assert_eq!(exception_attr(syntax, "filename"), None);
         init();
     }
 

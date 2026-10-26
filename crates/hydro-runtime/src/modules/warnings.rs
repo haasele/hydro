@@ -1,3 +1,4 @@
+#![allow(dead_code, clippy::question_mark, clippy::nonminimal_bool)]
 //! `warnings` / `_warnings`: warning categories, filters, registries and the
 //! standard display helpers.
 //!
@@ -14,6 +15,13 @@
 //! * `warn`, `warn_explicit`, `filterwarnings`, `simplefilter`,
 //!   `resetwarnings`, `showwarning`, `formatwarning`, plus the `filters`
 //!   snapshot list;
+//! * `catch_warnings(...)` as a real context manager: entering snapshots the
+//!   filters, `record=True` installs an `always` filter and returns a list
+//!   that receives one `WarningMessage`-shaped object per emitted warning,
+//!   and exiting restores the snapshot (nested managers are independent);
+//! * the private `_deprecated` helper used by `annotationlib` (and the rest
+//!   of the 3.14 standard library): it validates its required arguments,
+//!   formats the removal message and emits a `DeprecationWarning`;
 //! * the CPython default filters (`__main__` deprecations shown, the usual
 //!   `DeprecationWarning` / `PendingDeprecationWarning` / `ImportWarning` /
 //!   `ResourceWarning` categories ignored);
@@ -32,9 +40,13 @@
 //!   `re.I`-compiled `re.match` CPython uses for the common patterns; full
 //!   regular expressions are not compiled here.
 //! * `warnings.showwarning` is a native function, not a rebindable module
-//!   attribute (native modules have no writable attributes in Hydro), so
-//!   `catch_warnings(record=True)` style hooks are unavailable. Call
-//!   `showwarning` directly to route a warning to a stream.
+//!   attribute (native modules have no writable attributes in Hydro).
+//!   `catch_warnings(record=True)` does not rebind it either: the recording
+//!   list is consulted directly by the emission path, which is observationally
+//!   equivalent for callers that use the list returned by `__enter__`.
+//! * `catch_warnings(module=...)` accepts only the real `warnings` module
+//!   (or `None`); substituting another module object needs a Python-level
+//!   filter stack Hydro does not have and reports `NotImplementedError`.
 //!
 //! The filter stack and both once-registries live behind one mutex, so
 //! concurrent warnings from `_thread` workers are serialized and see one
@@ -51,7 +63,10 @@ use std::io::Write as _;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::container;
-use crate::exc::{self, ATTRIBUTE_ERROR, TYPE_ERROR, VALUE_ERROR, WARNING};
+use crate::exc::{
+    self, ATTRIBUTE_ERROR, DEPRECATION_WARNING, NOT_IMPLEMENTED_ERROR, PENDING_DEPRECATION_WARNING,
+    RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR, WARNING,
+};
 use crate::heap;
 use crate::methods;
 use crate::ops;
@@ -119,12 +134,24 @@ impl Filter {
 /// Key of the per-call registry CPython writes into `__warningregistry__`.
 type RegistryKey = (String, u32, i64);
 
+/// One active `catch_warnings(record=True)` block. The list is pinned with a
+/// persistent root so warnings emitted from another thread cannot lose it.
+#[derive(Clone, Copy)]
+struct RecordTarget {
+    list: i64,
+    root: usize,
+}
+
 struct State {
     /// Heap generation the state was built for; a runtime reset (which frees
     /// the heap and clears every collector root) invalidates the filters'
     /// cached class values.
     generation: u64,
     filters: Vec<Filter>,
+    /// Innermost recording target; nested `record=True` blocks push, exit
+    /// pops. An outer target stays visible to a nested `record=False` block,
+    /// matching CPython's shared `_showwarnmsg_impl` hook.
+    record_stack: Vec<RecordTarget>,
     /// Bumped by every filter mutation; external registries compare it.
     version: u64,
     /// `default` and `module` records for `warn` (no external registry).
@@ -138,6 +165,7 @@ impl State {
         let mut state = State {
             generation,
             filters: Vec::new(),
+            record_stack: Vec::new(),
             version: 0,
             registry: HashSet::new(),
             once: HashSet::new(),
@@ -434,7 +462,64 @@ fn raw_emit(
             return NONE;
         }
     }
-    show(&text, category, &filename, lineno, NONE, NONE)
+    let target = state().record_stack.last().copied();
+    match target {
+        Some(target) => record_warning(&target, &text, category, tag, &filename, lineno),
+        None => show(&text, category, &filename, lineno, NONE, NONE),
+    }
+}
+
+/// Appends one `WarningMessage`-shaped object to a recording list.
+///
+/// The message attribute is the `Warning` instance (`category(text)`), the
+/// same object CPython passes to `showwarning`; `category` keeps the class the
+/// caller supplied. Everything remains inspectable as attributes, which is
+/// what `numpy.testing` and `warnings.catch_warnings(record=True)` consumers
+/// read.
+fn record_warning(
+    target: &RecordTarget,
+    text: &str,
+    category: i64,
+    tag: u32,
+    filename: &str,
+    lineno: i64,
+) -> i64 {
+    // The warning instance and the wrapper class are both fresh allocations;
+    // root the parts while the class and instance attributes are created.
+    let message = exc::exception_value(tag, text, vec![text.to_string()]);
+    let warning = value::instance_new(warning_message_class());
+    let category_name = value::class_display_name(category).unwrap_or("Warning");
+    let fields = [
+        ("message".to_string(), message),
+        ("category".to_string(), category),
+        (
+            "filename".to_string(),
+            value::str_alloc(filename.to_string()),
+        ),
+        ("lineno".to_string(), ops::int_result(lineno)),
+        ("file".to_string(), NONE),
+        ("line".to_string(), NONE),
+        ("source".to_string(), NONE),
+        (
+            "_category_name".to_string(),
+            value::str_alloc(category_name.to_string()),
+        ),
+    ];
+    let roots = heap::root_values(&[message, warning, category, fields[2].1, fields[3].1]);
+    for (name, item) in fields {
+        value::instance_setattr(warning, name, item);
+    }
+    container::list_append(target.list, warning);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// The `WarningMessage` wrapper class recorded in a list.
+///
+/// A fresh empty class is enough: every field is a per-instance attribute and
+/// consumers only read them.
+fn warning_message_class() -> i64 {
+    value::class_new("WarningMessage".to_string(), NONE, Vec::new())
 }
 
 /// Records the warning in the caller-supplied registry dict (CPython's
@@ -631,6 +716,458 @@ fn resetwarnings() -> i64 {
     NONE
 }
 
+/// `warnings.catch_warnings(...)`: builds the native context manager.
+///
+/// The arguments are parsed by name because the central keyword binder only
+/// fills leading slots: `catch_warnings(action="ignore")` would otherwise be
+/// mistaken for `record`.
+fn catch_warnings(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let mut record = false;
+    let mut module = NONE;
+    let mut action = NONE;
+    let mut append = false;
+    if args.len() > 4 {
+        return type_error("catch_warnings() takes at most 4 arguments");
+    }
+    for (index, &value) in args.iter().enumerate() {
+        let result = match index {
+            0 => assign_bool(&mut record, value, "record"),
+            1 => {
+                module = value;
+                Ok(())
+            }
+            2 => {
+                action = value;
+                Ok(())
+            }
+            _ => assign_bool(&mut append, value, "append"),
+        };
+        if let Err(error) = result {
+            return error;
+        }
+    }
+    for (name, value) in keywords {
+        let value = *value;
+        let result = match name.as_str() {
+            "record" => assign_bool(&mut record, value, "record"),
+            "module" => {
+                module = value;
+                Ok(())
+            }
+            "action" => {
+                action = value;
+                Ok(())
+            }
+            "append" => assign_bool(&mut append, value, "append"),
+            other => Err(type_error(&format!(
+                "catch_warnings() got an unexpected keyword argument '{other}'"
+            ))),
+        };
+        if let Err(error) = result {
+            return error;
+        }
+    }
+    if module != NONE {
+        match value::as_module(module) {
+            Some(state) if matches!(state.name(), "warnings" | "_warnings") => {}
+            Some(_) => {
+                return exc::raise_with_message(
+                    NOT_IMPLEMENTED_ERROR,
+                    "catch_warnings(module=...) only supports the warnings module in Hydro",
+                )
+            }
+            None => return type_error("catch_warnings() module must be a module or None"),
+        }
+    }
+    if action != NONE {
+        let Some(text) = string_arg(action) else {
+            return type_error("catch_warnings() action must be a string or None");
+        };
+        if Action::parse(&text).is_none() {
+            return value_error(&format!("invalid action: {text:?}"));
+        }
+    }
+    let class = catch_warnings_class();
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance, action]);
+    value::instance_setattr(instance, "_record".to_string(), bool_value(record));
+    value::instance_setattr(instance, "_action".to_string(), action);
+    value::instance_setattr(instance, "_append".to_string(), bool_value(append));
+    value::instance_setattr(instance, "_entered".to_string(), value::FALSE);
+    value::instance_setattr(instance, "_saved_filters".to_string(), NONE);
+    value::instance_setattr(instance, "_record_list".to_string(), NONE);
+    value::instance_setattr(instance, "_record_root".to_string(), NONE);
+    heap::release_roots(roots);
+    instance
+}
+
+/// True/False for a Python bool argument, `TypeError` otherwise.
+fn bool_value(value: bool) -> i64 {
+    if value {
+        value::TRUE
+    } else {
+        value::FALSE
+    }
+}
+
+fn assign_bool(slot: &mut bool, value: i64, name: &str) -> Result<(), i64> {
+    match bool_arg(value) {
+        Some(flag) => {
+            *slot = flag;
+            Ok(())
+        }
+        None => Err(type_error(&format!("{name} must be a bool"))),
+    }
+}
+
+/// The native `catch_warnings` class. A fresh class per constructed manager is
+/// unnecessary but harmless: the manager never compares class identity.
+fn catch_warnings_class() -> i64 {
+    let methods = vec![
+        (
+            "__enter__".to_string(),
+            value::native_function_new("warnings", "_catch_warnings_enter", 1),
+        ),
+        (
+            "__exit__".to_string(),
+            value::native_function_new("warnings", "_catch_warnings_exit", 4),
+        ),
+    ];
+    value::class_new("catch_warnings".to_string(), NONE, methods)
+}
+
+/// `catch_warnings.__enter__`.
+fn catch_warnings_enter(instance: i64) -> i64 {
+    let entered = value::instance_attr(instance, "_entered").unwrap_or(value::FALSE);
+    if entered == value::TRUE {
+        return exc::raise_with_message(RUNTIME_ERROR, "Cannot enter catch_warnings twice");
+    }
+    let record = value::instance_attr(instance, "_record").unwrap_or(value::FALSE) == value::TRUE;
+    let action = value::instance_attr(instance, "_action").unwrap_or(NONE);
+    let append = value::instance_attr(instance, "_append").unwrap_or(value::FALSE) == value::TRUE;
+    let snapshot = filters();
+    let roots = heap::root_values(&[instance, snapshot]);
+    value::instance_setattr(instance, "_entered".to_string(), value::TRUE);
+    value::instance_setattr(instance, "_saved_filters".to_string(), snapshot);
+    heap::release_roots(roots);
+    if let Some(text) = string_arg(action) {
+        let result = install_filter(&text, String::new(), NONE, String::new(), 0, append);
+        if exc::pending() {
+            return result;
+        }
+    }
+    if !record {
+        return NONE;
+    }
+    let list = value::list_new(Vec::new());
+    let root = heap::add_persistent_root(list);
+    let root_value = if root == usize::MAX {
+        NONE
+    } else {
+        ops::int_result(root as i64)
+    };
+    let roots = heap::root_values(&[instance, list, root_value]);
+    value::instance_setattr(instance, "_record_list".to_string(), list);
+    value::instance_setattr(instance, "_record_root".to_string(), root_value);
+    state().record_stack.push(RecordTarget { list, root });
+    heap::release_roots(roots);
+    // CPython installs `simplefilter("always")` for recording; it keeps every
+    // warning visible even when the surrounding filters ignored it.
+    let result = install_filter("always", String::new(), NONE, String::new(), 0, false);
+    if exc::pending() {
+        return result;
+    }
+    list
+}
+
+/// `catch_warnings.__exit__(self, exc_type, exc_value, tb)`.
+fn catch_warnings_exit(instance: i64) -> i64 {
+    let entered = value::instance_attr(instance, "_entered").unwrap_or(value::FALSE);
+    if entered != value::TRUE {
+        return exc::raise_with_message(
+            RUNTIME_ERROR,
+            "Cannot exit catch_warnings without entering first",
+        );
+    }
+    let saved = value::instance_attr(instance, "_saved_filters").unwrap_or(NONE);
+    restore_filters(saved);
+    let record = value::instance_attr(instance, "_record").unwrap_or(value::FALSE) == value::TRUE;
+    if record {
+        let root = value::instance_attr(instance, "_record_root").unwrap_or(NONE);
+        if let Some(root) = int_arg(root) {
+            if let Ok(root) = usize::try_from(root) {
+                heap::remove_persistent_root(root);
+            }
+        }
+        let _ = state().record_stack.pop();
+        value::instance_setattr(instance, "_record_list".to_string(), NONE);
+        value::instance_setattr(instance, "_record_root".to_string(), NONE);
+    }
+    value::instance_setattr(instance, "_entered".to_string(), value::FALSE);
+    value::instance_setattr(instance, "_saved_filters".to_string(), NONE);
+    value::FALSE
+}
+
+/// Replaces the live filter stack with the snapshot produced by [`filters`].
+fn restore_filters(snapshot: i64) {
+    let Some(items) = value::as_list(snapshot) else {
+        return;
+    };
+    // Copy the entries out before taking the state lock: reading a tuple and
+    // materialising strings allocates, and the lock is never held across an
+    // allocation that may collect.
+    let mut restored: Vec<(Action, String, u32, String, i64)> = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(fields) = value::as_tuple(*item) else {
+            continue;
+        };
+        if fields.len() != 5 {
+            continue;
+        }
+        let Some(action) = string_arg(fields[0]).and_then(|text| Action::parse(&text)) else {
+            continue;
+        };
+        let message = string_arg(fields[1]).unwrap_or_default();
+        let Some(tag) = category_tag(fields[2]) else {
+            continue;
+        };
+        let module = string_arg(fields[3]).unwrap_or_default();
+        let lineno = int_arg(fields[4]).unwrap_or(0);
+        restored.push((action, message, tag, module, lineno));
+    }
+    let mut state = state();
+    state.filters.clear();
+    state.filters.extend(restored.into_iter().map(
+        |(action, message, category_tag, module, lineno)| Filter {
+            action,
+            message: message.to_lowercase(),
+            category_tag,
+            module: module.to_lowercase(),
+            lineno,
+        },
+    ));
+    state.mutated();
+}
+
+/// `warnings._deprecated(...)`: the private CPython helper.
+///
+/// Two spellings are accepted because the standard library uses both across
+/// versions:
+///
+/// * 3.14: `_deprecated(name, message=..., *, remove=(major, minor))`;
+/// * the newer helper shape: `_deprecated(message, *, name, since,
+///   alternative=None, pending=False, stacklevel=2)`.
+///
+/// Both validate the required arguments before emitting; nothing is silently
+/// defaulted into a misleading deprecation.
+fn deprecated(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let mut name_keyword: Option<i64> = None;
+    let mut since: Option<i64> = None;
+    let mut alternative = NONE;
+    let mut pending = false;
+    let mut remove: Option<i64> = None;
+    let mut version: Option<i64> = None;
+    let mut stacklevel = 2i64;
+    for (keyword, value) in keywords {
+        let value = *value;
+        match keyword.as_str() {
+            "name" => name_keyword = Some(value),
+            "since" => since = Some(value),
+            "alternative" => alternative = value,
+            "pending" => match bool_arg(value) {
+                Some(flag) => pending = flag,
+                None => return type_error("pending must be a bool"),
+            },
+            "remove" => remove = Some(value),
+            "_version" => version = Some(value),
+            "stacklevel" => match int_arg(value) {
+                Some(level) => stacklevel = level,
+                None => return type_error("stacklevel must be an int"),
+            },
+            other => {
+                return type_error(&format!(
+                    "_deprecated() got an unexpected keyword argument '{other}'"
+                ))
+            }
+        }
+    }
+    if let Some(remove) = remove {
+        return deprecated_removal(args, remove, version, stacklevel);
+    }
+    let Some(message_value) = args.first().copied() else {
+        return type_error("_deprecated() missing required argument 'message'");
+    };
+    let Some(message) = string_arg(message_value) else {
+        return type_error("_deprecated() message must be a string");
+    };
+    let Some(name_value) = name_keyword.or_else(|| args.get(1).copied()) else {
+        return type_error("_deprecated() missing required keyword argument 'name'");
+    };
+    let Some(name) = string_arg(name_value) else {
+        return type_error("_deprecated() name must be a string");
+    };
+    let Some(since_value) = since else {
+        return type_error("_deprecated() missing required keyword argument 'since'");
+    };
+    let since_text = version_text(since_value)
+        .ok_or_else(|| type_error("_deprecated() since must be a (major, minor) tuple"));
+    let since_text = match since_text {
+        Ok(text) => text,
+        Err(error) => return error,
+    };
+    let alternative_text = match alternative {
+        NONE => String::new(),
+        value => match string_arg(value) {
+            Some(text) => text,
+            None => return type_error("_deprecated() alternative must be a string or None"),
+        },
+    };
+    let text = format_deprecation(
+        &message,
+        &[
+            ("name", name.as_str()),
+            ("since", since_text.as_str()),
+            ("alternative", alternative_text.as_str()),
+        ],
+    );
+    emit_private_warning(
+        &text,
+        if pending {
+            PENDING_DEPRECATION_WARNING
+        } else {
+            DEPRECATION_WARNING
+        },
+    )
+}
+
+/// 3.14 `_deprecated(name, message, *, remove=...)` semantics.
+fn deprecated_removal(args: &[i64], remove: i64, version: Option<i64>, _stacklevel: i64) -> i64 {
+    let Some(name) = args.first().copied().and_then(string_arg) else {
+        return type_error("_deprecated() missing required argument 'name'");
+    };
+    let message = match args.get(1).copied() {
+        None | Some(NONE) => {
+            "{name!r} is deprecated and slated for removal in Python {remove}".to_string()
+        }
+        Some(value) => match string_arg(value) {
+            Some(text) => text,
+            None => return type_error("_deprecated() message must be a string"),
+        },
+    };
+    deprecated_removal_message(&name, &message, remove, version)
+}
+
+fn deprecated_removal_message(name: &str, message: &str, remove: i64, version: Option<i64>) -> i64 {
+    let Some((remove_major, remove_minor)) = version_pair(remove) else {
+        return type_error("_deprecated() remove must be a (major, minor) tuple");
+    };
+    let current = match version {
+        Some(value) => match version_triple(value) {
+            Some(triple) => triple,
+            None => return type_error("_deprecated() _version must be a 3-item version tuple"),
+        },
+        None => {
+            let (major, minor, micro) = hydro_ir::PYTHON_VERSION;
+            (major as i64, minor as i64, micro as i64)
+        }
+    };
+    let removal_text = format!("{remove_major}.{remove_minor}");
+    if (current.0, current.1) >= (remove_major, remove_minor) {
+        return exc::raise_with_message(
+            RUNTIME_ERROR,
+            &format!("'{name}' was slated for removal after Python {removal_text} alpha"),
+        );
+    }
+    let text = format_deprecation(
+        message,
+        &[
+            ("name", name),
+            ("remove", removal_text.as_str()),
+            ("since", ""),
+            ("alternative", ""),
+        ],
+    );
+    emit_private_warning(&text, DEPRECATION_WARNING)
+}
+
+/// Formats one of the CPython deprecation messages with named placeholders.
+fn format_deprecation(message: &str, values: &[(&str, &str)]) -> String {
+    let mut text = message.to_string();
+    for (name, value) in values {
+        // `!r` is the common CPython spelling; format it with Python's repr
+        // of the string and then substitute the plain placeholder.
+        let repr = format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
+        text = text.replace(&format!("{{{name}!r}}"), &repr);
+        text = text.replace(&format!("{{{name}}}"), value);
+    }
+    text
+}
+
+/// Emits a warning from a private helper, outside the public filters API.
+///
+/// Filters still apply (a `catch_warnings(record=True)` block records it, and
+/// the default `DeprecationWarning` filter ignores it outside `__main__`);
+/// only the parameter validation differs.
+fn emit_private_warning(message: &str, tag: u32) -> i64 {
+    let text = value::str_alloc(message.to_string());
+    emit(
+        text,
+        exc::exception_class(tag),
+        "<unknown>".to_string(),
+        0,
+        String::new(),
+        NONE,
+        NONE,
+        tag,
+    )
+}
+
+/// Parses a two-element version tuple (or list).
+fn version_pair(value: i64) -> Option<(i64, i64)> {
+    let items = version_items(value)?;
+    if items.len() != 2 {
+        return None;
+    }
+    Some((items[0], items[1]))
+}
+
+/// Parses a version tuple with at least three integer items.
+fn version_triple(value: i64) -> Option<(i64, i64, i64)> {
+    let items = version_items(value)?;
+    if items.len() < 3 {
+        return None;
+    }
+    Some((items[0], items[1], items[2]))
+}
+
+fn version_items(value: i64) -> Option<Vec<i64>> {
+    let items: Vec<i64> = if let Some(tuple) = value::as_tuple(value) {
+        tuple.to_vec()
+    } else if let Some(list) = value::as_list(value) {
+        list.to_vec()
+    } else {
+        return None;
+    };
+    let mut numbers = Vec::with_capacity(items.len());
+    for item in items {
+        numbers.push(int_arg(item)?);
+    }
+    Some(numbers)
+}
+
+/// Renders a `since` value as `major.minor` for message formatting.
+fn version_text(value: i64) -> Option<String> {
+    if let Some((major, minor)) = version_pair(value) {
+        return Some(format!("{major}.{minor}"));
+    }
+    string_arg(value)
+}
+
+/// Internal entry point used by `typing._deprecation_warning_for_no_type_params_passed`.
+pub(crate) fn warn_category(message: &str, tag: u32) -> i64 {
+    emit_private_warning(message, tag)
+}
+
 /// `warnings.formatwarning(message, category, filename, lineno, line=None)`.
 fn format_warning(text: &str, category: i64, filename: &str, lineno: i64, line: i64) -> i64 {
     let name = value::class_display_name(category).unwrap_or("Warning");
@@ -794,6 +1331,16 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "filterwarnings" => filterwarnings(args),
         "simplefilter" => simplefilter(args),
         "resetwarnings" => resetwarnings(),
+        "catch_warnings" => catch_warnings(args, &[]),
+        "_deprecated" => deprecated(args, &[]),
+        "_catch_warnings_enter" => match args.first().copied() {
+            Some(instance) => catch_warnings_enter(instance),
+            None => type_error("__enter__() missing self"),
+        },
+        "_catch_warnings_exit" => match args.first().copied() {
+            Some(instance) => catch_warnings_exit(instance),
+            None => type_error("__exit__() missing self"),
+        },
         "formatwarning" => {
             let text = match display_message(args) {
                 Ok(text) => text,
@@ -843,6 +1390,22 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         }
         _ => attribute_error(function),
     }
+}
+
+/// Keyword-aware dispatch for `catch_warnings` and `_deprecated`.
+pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match function {
+        "catch_warnings" => catch_warnings(args, keywords),
+        "_deprecated" => deprecated(args, keywords),
+        _ => function_attribute_error(function),
+    }
+}
+
+fn function_attribute_error(function: &str) -> i64 {
+    exc::raise_with_message(
+        ATTRIBUTE_ERROR,
+        &format!("module 'warnings' has no attribute '{function}'"),
+    )
 }
 
 /// Materialises a `warnings` constant.

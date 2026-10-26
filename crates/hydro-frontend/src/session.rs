@@ -621,12 +621,19 @@ mod tests {
     }
 
     fn expr_of_first_assign(program: &Program) -> &hydro_ir::Expr {
-        program
-            .main_function()
+        let function = program.main_function();
+        function
             .body
             .iter()
             .find_map(|stmt| match &stmt.kind {
-                StmtKind::Assign { value, .. } => Some(value),
+                // Imported units mirror `__name__`; a session fragment may
+                // carry that binding before the user assignment, so look for
+                // the first assignment that is not the module dunder.
+                StmtKind::Assign { target, value }
+                    if function.local(*target).name != "__name__" =>
+                {
+                    Some(value)
+                }
                 _ => None,
             })
             .expect("fragment must assign a value")
@@ -712,15 +719,24 @@ mod tests {
         assert!(!diags.is_empty());
         assert!(!compiler.globals().iter().any(|name| name == "y"));
         let fragment = compile(&mut compiler, "print(x)\n");
-        match &fragment.program.main_function().body[0].kind {
-            StmtKind::Expr(expr) => match &expr.kind {
-                ExprKind::Call { args, .. } => {
-                    assert_eq!(global_get(&args[0]), Some(("__main__", "x")));
-                }
-                other => panic!("expected a print call, got {other:?}"),
-            },
-            other => panic!("expected an expression statement, got {other:?}"),
-        }
+        let print = fragment
+            .program
+            .main_function()
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                StmtKind::Expr(expr) => match &expr.kind {
+                    ExprKind::Call { callee, args }
+                        if *callee == hydro_ir::Callee::Builtin(Builtin::Print) =>
+                    {
+                        Some(args)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("print call");
+        assert_eq!(global_get(&print[0]), Some(("__main__", "x")));
     }
 
     #[test]
@@ -843,16 +859,20 @@ mod tests {
         let mut compiler = session_in(&dir);
         compile(&mut compiler, "from helper import add\n");
         let fragment = compile(&mut compiler, "add(1, 2)\n");
-        let stmt = &fragment.program.main_function().body[0];
-        match &stmt.kind {
-            StmtKind::Expr(expr) => match &expr.kind {
-                ExprKind::IndirectCall { callee, .. } => {
-                    assert_eq!(global_get(callee), Some(("__main__", "add")));
-                }
-                other => panic!("expected an indirect call, got {other:?}"),
-            },
-            other => panic!("expected an expression statement, got {other:?}"),
-        }
+        let callee = fragment
+            .program
+            .main_function()
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                StmtKind::Expr(expr) => match &expr.kind {
+                    ExprKind::IndirectCall { callee, .. } => Some(callee),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("indirect call");
+        assert_eq!(global_get(callee), Some(("__main__", "add")));
     }
 
     // ------------------------------------------------------------------

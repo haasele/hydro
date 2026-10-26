@@ -366,6 +366,64 @@ fn function_local_deferred_names_do_not_shadow_top_level_imports() {
 }
 
 #[test]
+fn module_level_try_import_binds_a_preloaded_submodule() {
+    let source =
+        "try:\n    from . import sub\nexcept ImportError:\n    pass\n\ndef get():\n    return sub.value()\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "pkg/__init__.py", &mut infer);
+    lowerer.set_dunder_name("pkg");
+    lowerer.set_package("pkg");
+    lowerer.set_mirror_all_globals(true);
+    lowerer.set_user_modules(HashMap::from([(
+        "pkg.sub".to_string(),
+        UserModule {
+            name: "pkg.sub".to_string(),
+            exports: HashMap::from([("value".to_string(), UserExport::Function(9))]),
+            all: None,
+        },
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    // The function links the submodule export directly.
+    let body = function_body(&hir, "get");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(
+        matches!(
+            &value.kind,
+            HExprKind::Call {
+                callee: Callee::Function(9),
+                ..
+            }
+        ),
+        "expected a linked submodule function, got {:?}",
+        value.kind
+    );
+
+    // The try body mirrors the module binding so later code and importers can
+    // read `pkg.sub` through the package module value.
+    let bound = hir.functions[0].body.iter().any(|stmt| {
+        matches!(
+            &stmt.kind,
+            HStmtKind::Try { body, .. }
+                if body.iter().any(|inner| matches!(
+                    &inner.kind,
+                    HStmtKind::GlobalSet { name, .. } if name == "sub"
+                ))
+        )
+    });
+    assert!(
+        bound,
+        "the try body must bind the submodule: {:?}",
+        hir.functions[0].body
+    );
+}
+
+#[test]
 fn imports_inside_blocks_bind_names() {
     let source = "if True:\n    from math import sqrt\n\nx = sqrt(4)\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
@@ -5846,6 +5904,41 @@ c = add
 }
 
 #[test]
+fn relative_extension_submodule_inside_try_binds_the_loader() {
+    // `from . import ext` inside a module-level `try` resolves the extension
+    // from the package root (the source file lives inside the package) and
+    // binds the lazy loader; the extension is never loaded at compile time, so
+    // a load failure stays catchable by the handler.
+    let dir = ExtensionDir::new("relative-try-ext");
+    let so = dir.add_extension("pkg/ext.abi3.so");
+    let expected = fs::canonicalize(&so)
+        .expect("canonical extension path")
+        .to_string_lossy()
+        .into_owned();
+    fs::create_dir_all(dir.path.join("pkg")).expect("create package dir");
+    let source = "try:\n    from . import ext\nexcept ImportError:\n    pass\n\ndef get():\n    return ext.value()\n";
+    let filename = dir.path.join("pkg").join("__init__.py");
+    fs::write(&filename, source).expect("write package init");
+
+    let mut infer = Infer::new();
+    let filename_display = filename.to_string_lossy();
+    let mut lowerer = Lowerer::new(source, &filename_display, &mut infer);
+    lowerer.set_dunder_name("pkg");
+    lowerer.set_package("pkg");
+    lowerer.set_deferred_imports(std::collections::HashSet::from(["pkg".to_string()]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let body = function_body(&hir, "get");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert_eq!(extension_callee(value), (expected.as_str(), "value"));
+}
+
+#[test]
 fn locals_shadow_extension_aliases() {
     let dir = ExtensionDir::new("shadow");
     dir.add_extension("mod_ext.abi3.so");
@@ -6287,7 +6380,10 @@ fn module_value_arguments_lower_to_module_refs() {
 }
 
 #[test]
-fn module_alias_still_rejects_user_module_values() {
+fn module_alias_lowers_to_a_first_class_module_value() {
+    // A compiled user module is a real runtime value: `x = helper` binds the
+    // same module object `sys.modules['helper']` holds, so `getattr(helper,
+    // name)` and module identity work.
     let source = "import helper\nx = helper\n";
     let mut infer = Infer::new();
     let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
@@ -6302,14 +6398,210 @@ fn module_alias_still_rejects_user_module_values() {
     let hir = lowerer.lower_module(&parse(source));
     let diags = std::mem::take(&mut lowerer.diags);
     drop(lowerer);
-    let _ = hir;
-    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "x").kind {
+        HExprKind::ModuleRef { module } => assert_eq!(module, "helper"),
+        other => panic!("expected a module reference, got {other:?}"),
+    }
+}
+
+/// Builds a lowerer whose only visible user module is `name` with `exports`.
+fn lowerer_with_user_module<'a>(
+    source: &'a str,
+    infer: &'a mut Infer,
+    name: &str,
+    exports: HashMap<String, UserExport>,
+) -> Lowerer<'a> {
+    let mut lowerer = Lowerer::new(source, "test.py", infer);
+    lowerer.set_user_modules(HashMap::from([(
+        name.to_string(),
+        UserModule {
+            name: name.to_string(),
+            exports,
+            all: None,
+        },
+    )]));
+    lowerer
+}
+
+#[test]
+fn imported_module_globals_read_through_the_module_value() {
+    // `np.__version__` is not in the static export table: it is a module
+    // global of the imported module at runtime, so the attribute becomes a
+    // module lookup that raises `AttributeError` when it is really absent.
+    let source = "import numpy as np\na = np.__version__\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lowerer_with_user_module(source, &mut infer, "numpy", HashMap::new());
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "a").kind {
+        HExprKind::ModuleAttr { module, name } => {
+            assert_eq!((module.as_str(), name.as_str()), ("numpy", "__version__"))
+        }
+        other => panic!("expected a runtime module lookup, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_user_module_attributes_call_dynamically() {
+    let source = "import numpy as np\nb = np.linspace(0, 1)\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lowerer_with_user_module(source, &mut infer, "numpy", HashMap::new());
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "b").kind {
+        HExprKind::IndirectCall { callee, args, .. } => {
+            assert_eq!(args.len(), 2);
+            match &callee.kind {
+                HExprKind::ModuleAttr { module, name } => {
+                    assert_eq!((module.as_str(), name.as_str()), ("numpy", "linspace"))
+                }
+                other => panic!("expected a module attribute callee, got {other:?}"),
+            }
+        }
+        other => panic!("expected a dynamic module call, got {other:?}"),
+    }
+}
+
+#[test]
+fn known_user_module_members_keep_their_static_path() {
+    let source = "import helper\nx = helper.add(1, 2)\ny = helper.VALUE\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lowerer_with_user_module(
+        source,
+        &mut infer,
+        "helper",
+        HashMap::from([
+            ("add".to_string(), UserExport::Function(1)),
+            ("VALUE".to_string(), UserExport::Global),
+        ]),
+    );
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "x").kind {
+        HExprKind::Call { callee, args } => {
+            assert_eq!(*callee, Callee::Function(1));
+            assert_eq!(args.len(), 2);
+        }
+        other => panic!("expected a direct function call, got {other:?}"),
+    }
+    match &assigned(&hir, "y").kind {
+        HExprKind::GlobalGet { module, name } => {
+            assert_eq!((module.as_str(), name.as_str()), ("helper", "VALUE"))
+        }
+        other => panic!("expected a module global read, got {other:?}"),
+    }
+}
+
+#[test]
+fn imported_units_mirror_their_import_bindings() {
+    // A package `__init__.py` re-exports what it imported; importers read
+    // those names through the package module value, so the bindings must land
+    // in the runtime global table.
+    let source = "from helper import VALUE, add\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lowerer_with_user_module(
+        source,
+        &mut infer,
+        "helper",
+        HashMap::from([
+            ("add".to_string(), UserExport::Function(1)),
+            ("VALUE".to_string(), UserExport::Global),
+        ]),
+    );
+    lowerer.set_dunder_name("pkg");
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    // Multiple bindings from one statement are wrapped in an `if True:` block
+    // so they keep the import statement's position.
+    let mut stores: Vec<&HStmt> = Vec::new();
+    for stmt in &hir.functions[0].body {
+        match &stmt.kind {
+            HStmtKind::GlobalSet { .. } => stores.push(stmt),
+            HStmtKind::If { then_body, .. } => stores.extend(then_body.iter()),
+            _ => {}
+        }
+    }
+    let mut saw_value = false;
+    let mut saw_function = false;
+    for stmt in stores {
+        let HStmtKind::GlobalSet {
+            module,
+            name,
+            value,
+        } = &stmt.kind
+        else {
+            panic!("unexpected non-store statement {:?}", stmt.kind);
+        };
+        assert_eq!(module, "pkg");
+        match name.as_str() {
+            "VALUE" => {
+                saw_value = true;
+                assert!(matches!(
+                    &value.kind,
+                    HExprKind::GlobalGet { module, name }
+                        if module == "helper" && name == "VALUE"
+                ));
+            }
+            "add" => {
+                saw_function = true;
+                assert!(matches!(&value.kind, HExprKind::FunctionRef(1)));
+            }
+            // Imported units always register their module name so the runtime
+            // module registry can resolve them, including empty submodules.
+            "__name__" => {
+                assert!(
+                    matches!(
+                        &value.kind,
+                        HExprKind::Local(_) | HExprKind::Const(Const::Str(_))
+                    ),
+                    "unexpected __name__ binding: {value:?}"
+                );
+            }
+            other => panic!("unexpected mirrored binding '{other}'"),
+        }
+    }
     assert!(
-        diags[0]
-            .message
-            .contains("module values are not supported yet"),
-        "{:?}",
-        diags[0].message
+        saw_value && saw_function,
+        "import bindings were not mirrored: {:?}",
+        hir.functions[0].body
+    );
+}
+
+#[test]
+fn id_is_a_first_class_builtin() {
+    let source = "a = id(1)\nf = id\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "a").kind {
+        HExprKind::Call { callee, args } => {
+            assert_eq!(*callee, Callee::Builtin(Builtin::Id));
+            assert_eq!(args.len(), 1);
+        }
+        other => panic!("expected a direct builtin call, got {other:?}"),
+    }
+    assert!(matches!(
+        &assigned(&hir, "f").kind,
+        HExprKind::BuiltinRef(Builtin::Id)
+    ));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+
+    // Arity is checked like every other builtin.
+    let source = "x = id()\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        crate::sema::check(&hir, &mut infer, "test.py").is_err(),
+        "id() without an argument must be rejected"
     );
 }
 
@@ -7479,6 +7771,133 @@ fn bitwise_operators_lower_and_typecheck() {
             .unwrap_or_else(|| panic!("missing local {name}"));
         assert_eq!(local.ty, Type::Int, "wrong type for {name}");
     }
+}
+
+#[test]
+fn matrix_multiplication_lowers_as_a_binary_operator() {
+    let source = "a = 2 @ 3\nb = 2.0 @ 3\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    for name in ["a", "b"] {
+        let HExprKind::Bin { op, .. } = &assigned(&hir, name).kind else {
+            panic!("expected a binary expression for {name}");
+        };
+        assert_eq!(*op, BinOp::MatMul);
+    }
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+    let program = crate::sema::emit(&hir, &mut infer);
+    let a_ty = program.functions[0]
+        .locals
+        .iter()
+        .find(|local| local.name == "a")
+        .map(|local| local.ty);
+    assert_eq!(a_ty, Some(Type::Int));
+}
+
+#[test]
+fn matrix_multiplication_of_class_instances_stays_dynamic() {
+    let source = "class M:\n    def __matmul__(self, other):\n        return 1\n\
+                  class R:\n    def __rmatmul__(self, other):\n        return 2\n\
+                  a = M() @ M()\nb = 1 @ R()\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    for name in ["a", "b"] {
+        let HExprKind::Bin { op, .. } = &assigned(&hir, name).kind else {
+            panic!("expected a binary expression for {name}");
+        };
+        assert_eq!(*op, BinOp::MatMul);
+    }
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn augmented_matrix_multiplication_lowers_the_in_place_operator() {
+    let source = "x = 1\nx @= 2\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::AugAssign { op, target, .. } = &hir.functions[0].body[1].kind else {
+        panic!(
+            "expected an augmented assignment, got {:?}",
+            hir.functions[0].body[1]
+        );
+    };
+    assert_eq!(*op, BinOp::MatMulInPlace);
+    assert_eq!(*target, 0);
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn raise_with_keyword_exception_constructor_raises_the_value() {
+    let source = "def f(x):\n    raise AttributeError(x, name=None)\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let raise = function(&hir, "f")
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Raise { exc, msg, cause } => Some((*exc, msg, cause)),
+            _ => None,
+        })
+        .expect("raise statement");
+    assert_eq!(raise.0, None, "the value form replaces the tag form");
+    assert!(raise.2.is_none());
+    let HExprKind::CallKw {
+        callee,
+        args,
+        keywords,
+    } = &raise.1.as_ref().expect("raised value").kind
+    else {
+        panic!(
+            "expected the constructor call, got {:?}",
+            raise.1.as_ref().map(|expr| &expr.kind)
+        );
+    };
+    assert!(matches!(
+        &callee.kind,
+        HExprKind::ExceptionClass(ExcKind::AttributeError)
+    ));
+    assert_eq!(args.len(), 1);
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "name");
+    assert!(matches!(&keywords[0].1.kind, HExprKind::Const(Const::None)));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+    let program = crate::sema::emit(&hir, &mut infer);
+    let function = program.functions.iter().find(|f| f.name == "f").expect("f");
+    let raise = function
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            hydro_ir::StmtKind::Raise { exc, msg, .. } => Some((*exc, msg)),
+            _ => None,
+        })
+        .expect("IR raise");
+    assert_eq!(raise.0, None);
+    assert!(matches!(
+        raise.1.as_ref().map(|value| &value.kind),
+        Some(hydro_ir::ExprKind::CallKw { .. })
+    ));
+}
+
+#[test]
+fn keyword_exception_constructor_is_a_dynamic_expression() {
+    let source = "e = AttributeError('boom', name=None)\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::CallKw {
+        callee, keywords, ..
+    } = &assigned(&hir, "e").kind
+    else {
+        panic!(
+            "expected a keyword constructor call, got {:?}",
+            assigned(&hir, "e")
+        );
+    };
+    assert!(matches!(
+        &callee.kind,
+        HExprKind::ExceptionClass(ExcKind::AttributeError)
+    ));
+    assert_eq!(keywords.len(), 1);
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 
 #[test]

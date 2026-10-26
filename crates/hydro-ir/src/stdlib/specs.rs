@@ -261,6 +261,9 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("access", 2, 2, Type::Bool),
         f("sysconf", 1, 1, Type::Int),
         f("getloadavg", 0, 0, Type::Tuple),
+        // `os.uname()`: the POSIX identity as a `uname_result`-shaped value
+        // with `sysname`/`nodename`/`release`/`version`/`machine`.
+        f("uname", 0, 0, Type::Any),
         // `os.get_terminal_size(fd=1)`: a `(columns, lines)`-style namespace.
         kw("get_terminal_size", 0, 1, Type::Any, &["fd"]),
         // `os.open(path, flags, mode=0o777)` returns the new descriptor.
@@ -479,11 +482,14 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         ),
         f("input", 0, 1, Type::Str),
         f("get_ipython", 0, 0, Type::Any),
+        // `id` is both a compiler builtin (`Builtin::Id`) and an attribute of
+        // the `builtins` module; the runtime dispatches both spellings to the
+        // same identity encoding.
+        f("id", 1, 1, Type::Int),
         // Attribute-only names (not unqualified compiler builtins).
         f("object", 0, 0, Type::Any),
         f("setattr", 3, 3, Type::None),
         f("delattr", 2, 2, Type::None),
-        f("id", 1, 1, Type::Int),
         f("dir", 0, 1, Type::List),
         f("vars", 0, 1, Type::Dict),
         f("globals", 0, 0, Type::Dict),
@@ -1462,8 +1468,23 @@ pub static TYPING: ModuleSpec = ModuleSpec {
         f("overload", 1, 1, Type::Any),
         f("TypeVar", 1, 3, Type::Any),
         f("NewType", 2, 2, Type::Any),
+        // `ForwardRef(arg, *, module=None, owner=None, is_argument=True,
+        // is_class=False)`: the runtime returns the native class for the
+        // attribute value and constructs instances through this call.
+        kw_dynamic("ForwardRef", 0, 6, Type::Any, &[]),
         f("get_type_hints", 0, 1, Type::Dict),
         f("get_args", 1, 1, Type::Tuple),
+        // `annotationlib` helpers: keyword names are parsed by the runtime
+        // module so `globals=...`/`locals=...` do not have to fill leading
+        // positional slots.
+        kw_dynamic(
+            "_deprecation_warning_for_no_type_params_passed",
+            0,
+            2,
+            Type::None,
+            &[],
+        ),
+        kw_dynamic("evaluate_forward_ref", 0, 7, Type::Any, &[]),
     ],
     constants: &[
         c("TYPE_CHECKING", Type::Bool),
@@ -1570,11 +1591,128 @@ pub static ITERTOOLS: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
-/// `ast`: literal parsing for markup parameters.
+/// `ast`: literal parsing, the runtime AST node surface used by
+/// `annotationlib`, and `parse`/`unparse`.
+///
+/// Node constructors are declared as functions (so `ast.Name(...)` lowers as a
+/// module call) even though `module_get` returns the corresponding native
+/// class value: class identity is what `isinstance`/subclassing need.
 pub static AST: ModuleSpec = ModuleSpec {
     name: "ast",
-    functions: &[f("literal_eval", 1, 1, Type::Any)],
-    constants: &[],
+    functions: &[
+        f("literal_eval", 1, 1, Type::Any),
+        // `parse(source, filename='<unknown>', mode='exec', *,
+        // type_comments=False, feature_version=None)`; the runtime module
+        // parses the keyword names because they are not a fixed leading run.
+        kw_dynamic("parse", 1, 5, Type::Any, &[]),
+        f("unparse", 1, 1, Type::Str),
+        f("fix_missing_locations", 1, 1, Type::Any),
+        f("_node_visit", 2, 2, Type::Any),
+        f("_node_generic_visit", 2, 2, Type::Any),
+        kw_dynamic("Module", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Expression", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Expr", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Name", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Constant", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Attribute", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Subscript", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Call", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("keyword", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Tuple", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("List", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Set", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Dict", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Slice", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Starred", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("BinOp", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("UnaryOp", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("BoolOp", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Compare", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("IfExp", 0, usize::MAX, Type::Any, &[]),
+        // Operator/context node classes: declared as functions so `ast.Add()`
+        // compiles; the module lookup returns the class value itself.
+        f("Add", 0, 0, Type::Any),
+        f("Sub", 0, 0, Type::Any),
+        f("Mult", 0, 0, Type::Any),
+        f("MatMult", 0, 0, Type::Any),
+        f("Div", 0, 0, Type::Any),
+        f("Mod", 0, 0, Type::Any),
+        f("Pow", 0, 0, Type::Any),
+        f("LShift", 0, 0, Type::Any),
+        f("RShift", 0, 0, Type::Any),
+        f("BitOr", 0, 0, Type::Any),
+        f("BitXor", 0, 0, Type::Any),
+        f("BitAnd", 0, 0, Type::Any),
+        f("FloorDiv", 0, 0, Type::Any),
+        f("UAdd", 0, 0, Type::Any),
+        f("USub", 0, 0, Type::Any),
+        f("Invert", 0, 0, Type::Any),
+        f("Not", 0, 0, Type::Any),
+        f("And", 0, 0, Type::Any),
+        f("Or", 0, 0, Type::Any),
+        f("Eq", 0, 0, Type::Any),
+        f("NotEq", 0, 0, Type::Any),
+        f("Lt", 0, 0, Type::Any),
+        f("LtE", 0, 0, Type::Any),
+        f("Gt", 0, 0, Type::Any),
+        f("GtE", 0, 0, Type::Any),
+        f("Is", 0, 0, Type::Any),
+        f("IsNot", 0, 0, Type::Any),
+        f("In", 0, 0, Type::Any),
+        f("NotIn", 0, 0, Type::Any),
+        f("Load", 0, 0, Type::Any),
+        f("Store", 0, 0, Type::Any),
+        f("Del", 0, 0, Type::Any),
+    ],
+    constants: &[
+        c("AST", Type::Any),
+        c("NodeVisitor", Type::Any),
+        c("NodeTransformer", Type::Any),
+        c("mod", Type::Any),
+        c("stmt", Type::Any),
+        c("expr", Type::Any),
+        c("expr_context", Type::Any),
+        c("boolop", Type::Any),
+        c("operator", Type::Any),
+        c("unaryop", Type::Any),
+        c("cmpop", Type::Any),
+        c("comprehension", Type::Any),
+        c("excepthandler", Type::Any),
+        c("arguments", Type::Any),
+        c("alias", Type::Any),
+        c("Add", Type::Any),
+        c("Sub", Type::Any),
+        c("Mult", Type::Any),
+        c("MatMult", Type::Any),
+        c("Div", Type::Any),
+        c("Mod", Type::Any),
+        c("Pow", Type::Any),
+        c("LShift", Type::Any),
+        c("RShift", Type::Any),
+        c("BitOr", Type::Any),
+        c("BitXor", Type::Any),
+        c("BitAnd", Type::Any),
+        c("FloorDiv", Type::Any),
+        c("UAdd", Type::Any),
+        c("USub", Type::Any),
+        c("Invert", Type::Any),
+        c("Not", Type::Any),
+        c("And", Type::Any),
+        c("Or", Type::Any),
+        c("Eq", Type::Any),
+        c("NotEq", Type::Any),
+        c("Lt", Type::Any),
+        c("LtE", Type::Any),
+        c("Gt", Type::Any),
+        c("GtE", Type::Any),
+        c("Is", Type::Any),
+        c("IsNot", Type::Any),
+        c("In", Type::Any),
+        c("NotIn", Type::Any),
+        c("Load", Type::Any),
+        c("Store", Type::Any),
+        c("Del", Type::Any),
+    ],
 };
 
 /// `fractions`: `Fraction` evaluates to a float quotient in this runtime.
@@ -1752,6 +1890,14 @@ const WARNING_FUNCTIONS: &[FunctionSpec] = &[
         &["action", "category", "lineno", "append"],
     ),
     f("resetwarnings", 0, 0, Type::None),
+    // Natives behind the `catch_warnings` instance.
+    f("_catch_warnings_enter", 1, 1, Type::Any),
+    f("_catch_warnings_exit", 4, 4, Type::None),
+    // `catch_warnings(*, record=False, module=None, action=None, append=False)`
+    // and the private `_deprecated` helper used by `annotationlib`. The runtime
+    // module parses the keyword names so skipped leading slots stay correct.
+    kw_dynamic("catch_warnings", 0, 4, Type::Any, &[]),
+    kw_dynamic("_deprecated", 0, 8, Type::None, &[]),
     kw(
         "showwarning",
         4,
@@ -1979,6 +2125,11 @@ mod tests {
     fn os_and_platform_new_entries() {
         assert_eq!(function("os", "sysconf").unwrap().ret, Type::Int);
         assert_eq!(function("os", "getloadavg").unwrap().ret, Type::Tuple);
+        let uname = function("os", "uname").expect("os.uname");
+        assert_eq!(
+            (uname.min_args, uname.max_args, uname.ret),
+            (0, 0, Type::Any)
+        );
         assert_eq!(function("platform", "processor").unwrap().ret, Type::Str);
     }
 

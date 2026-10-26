@@ -13,6 +13,10 @@ fn op_codes_are_stable() {
     assert_eq!(BinOp::BitXor.code(), 19);
     assert_eq!(BinOp::Shl.code(), 20);
     assert_eq!(BinOp::Shr.code(), 21);
+    assert_eq!(BinOp::MatMul.code(), 22);
+    assert_eq!(BinOp::MatMul.symbol(), "@");
+    assert_eq!(BinOp::MatMulInPlace.code(), 23);
+    assert_eq!(BinOp::MatMulInPlace.symbol(), "@=");
     assert_eq!(UnOp::Not.code(), 2);
     assert_eq!(UnOp::Invert.code(), 3);
     assert_eq!(UnOp::Invert.symbol(), "~");

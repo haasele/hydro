@@ -37,6 +37,10 @@ pub(crate) const OP_BIT_OR: u32 = 18;
 pub(crate) const OP_BIT_XOR: u32 = 19;
 pub(crate) const OP_SHL: u32 = 20;
 pub(crate) const OP_SHR: u32 = 21;
+/// `@`: `__matmul__`/`__rmatmul__` dispatch with a numeric scalar fallback.
+pub(crate) const OP_MATMUL: u32 = 22;
+/// `@=`: like [`OP_MATMUL`] but tries `__imatmul__` first.
+pub(crate) const OP_MATMUL_INPLACE: u32 = 23;
 
 // `hydro_unop` op codes.
 pub(crate) const OP_NEG: u32 = 0;
@@ -177,6 +181,8 @@ pub(crate) fn binop(op: u32, a: i64, b: i64) -> i64 {
         OP_BIT_XOR => bitwise(op, a, b),
         OP_SHL => shift(a, b, true),
         OP_SHR => shift(a, b, false),
+        OP_MATMUL => matmul(a, b, false),
+        OP_MATMUL_INPLACE => matmul(a, b, true),
         _ => exc::raise_with_message(TYPE_ERROR, "unknown binary operator"),
     }
 }
@@ -623,6 +629,32 @@ fn mul(a: i64, b: i64) -> i64 {
         return repeat_tuple(items, n);
     }
     arithmetic_type_error("*", a, b)
+}
+
+/// `a @ b` / `a @= b`.
+///
+/// The operator is a protocol hook first: a user `__matmul__` on the left
+/// operand, then `__rmatmul__` on the right one. `@=` additionally tries the
+/// left operand's `__imatmul__` before those reflected forms, like CPython.
+/// Scalar operands (int/float/bool/BigInt) fall back to multiplication so
+/// numpy-style scalar products work; every other operand pair raises the
+/// standard tagged `TypeError`.
+fn matmul(a: i64, b: i64, inplace: bool) -> i64 {
+    if inplace {
+        if let Some(result) = instance_method_call(a, "__imatmul__", &[a, b]) {
+            if exc::pending() || result != value::NOT_IMPLEMENTED {
+                return result;
+            }
+        }
+    }
+    if let Some(result) = instance_dunder_binop(a, b, "__matmul__", "__rmatmul__") {
+        return result;
+    }
+    let numeric = |v: i64| value::num_of(v).is_some() || value::is_bigint(v);
+    if numeric(a) && numeric(b) {
+        return mul(a, b);
+    }
+    arithmetic_type_error(if inplace { "@=" } else { "@" }, a, b)
 }
 
 fn repeat_str(s: &str, n: i64) -> i64 {

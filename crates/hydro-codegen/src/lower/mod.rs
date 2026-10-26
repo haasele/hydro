@@ -6982,6 +6982,44 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_exc_check()?;
                 Ok(result)
             }
+            Builtin::Id => {
+                // The identity implementation is shared with `builtins.id`;
+                // dispatching through the module ABI reuses it without a
+                // per-call function-value allocation.
+                if values.len() != 1 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin id expects exactly 1 argument, got {actual}"
+                    )));
+                }
+                let argv_slot = self.stack_array_slot(1, "builtin id argument")?;
+                self.builder.ins().stack_store(values[0], argv_slot, 0);
+                let (module_slot, module_len) = make_bytes_slot(&mut self.builder, b"builtins")?;
+                let module_ptr = self.builder.ins().stack_addr(self.ptr_ty, module_slot, 0);
+                let module_len = self.builder.ins().iconst(self.ptr_ty, module_len as i64);
+                let (function_slot, function_len) = make_bytes_slot(&mut self.builder, b"id")?;
+                let function_ptr = self.builder.ins().stack_addr(self.ptr_ty, function_slot, 0);
+                let function_len = self.builder.ins().iconst(self.ptr_ty, function_len as i64);
+                let argc = self.builder.ins().iconst(self.ptr_ty, 1);
+                let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+                let scope = self.open_scope(argv, 1)?;
+                let id = self.runtime.module_call;
+                let result = self.call_rt(
+                    id,
+                    &[
+                        module_ptr,
+                        module_len,
+                        function_ptr,
+                        function_len,
+                        argc,
+                        argv,
+                    ],
+                );
+                self.close_scope(scope);
+                let result = result?;
+                self.emit_exc_check()?;
+                Ok(result)
+            }
             Builtin::Isinstance => {
                 if values.len() != 2 {
                     let actual = values.len();
@@ -9781,6 +9819,29 @@ mod tests {
         ));
         let object = crate::compile_object(&program).expect("hash must lower");
         assert!(runtime_call_sites(&object, "hydro_hash") > 0);
+    }
+
+    #[test]
+    fn id_builtin_calls_the_builtins_module_entry() {
+        // `id` reuses the identity implementation of `builtins.id`, so the
+        // direct call goes through the module-call ABI (no per-call function
+        // value is materialised) and type-checks in source order.
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let program = program_assigning(Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::Id),
+                args: vec![int(7)],
+            },
+            Type::Int,
+            1,
+        ));
+        let object = crate::compile_object(&program).expect("id must lower");
+        assert!(runtime_call_sites(&object, "hydro_module_call") > 0);
+        assert_eq!(
+            runtime_call_sites(&object, "hydro_builtin_function"),
+            0,
+            "the direct path must not materialise a builtin function value"
+        );
     }
 
     #[test]

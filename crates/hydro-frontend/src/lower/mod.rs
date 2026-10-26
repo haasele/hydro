@@ -27,7 +27,7 @@ use crate::sema::{Infer, Ty};
 
 pub const MODULE_NAME: &str = "<module>";
 
-const BUILTIN_NAMES: [&str; 29] = [
+const BUILTIN_NAMES: [&str; 30] = [
     "print",
     "len",
     "str",
@@ -57,6 +57,7 @@ const BUILTIN_NAMES: [&str; 29] = [
     "chr",
     "input",
     "get_ipython",
+    "id",
 ];
 
 /// A resolved source unit prior to type inference.
@@ -989,6 +990,37 @@ fn extension_lookup_in(dir: &Path, name: &str) -> ExtensionLookup {
 /// [`extension_search_paths_from`]).
 pub(crate) fn find_extension_for_source(source: &Path, name: &str) -> ExtensionLookup {
     lookup_extension_in_search_dirs(source, &extension_search_paths(), name)
+}
+
+/// Looks up an absolute dotted extension name from the root of `package`.
+///
+/// A relative import inside a package resolves to an absolute module name
+/// (`pkg.ext`), but the source file lives inside the package directory, so the
+/// source-relative lookup would search `<package>/pkg/ext`. Walking up one
+/// directory per package component recovers the search root that contains the
+/// top-level package.
+pub(crate) fn extension_lookup_from_package(
+    source: &Path,
+    package: &str,
+    name: &str,
+) -> ExtensionLookup {
+    if package.is_empty() {
+        return ExtensionLookup::Missing;
+    }
+    let mut dir = match source
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => parent,
+        None => return ExtensionLookup::Missing,
+    };
+    for _ in package.split('.').filter(|part| !part.is_empty()) {
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return ExtensionLookup::Missing,
+        }
+    }
+    extension_lookup_in(dir, name)
 }
 
 /// Looks up `name` in the source file's directory, then in each of
@@ -1952,7 +1984,15 @@ impl<'a> Lowerer<'a> {
                         continue;
                     }
                 }
-                ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) if !self.session_mode => continue,
+                // Imported units also mirror their import bindings: a package
+                // `__init__.py` re-exports the modules and globals it imported
+                // (`from .version import __version__`), and importers read
+                // them through the module value at runtime.
+                ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_)
+                    if !self.session_mode && !self.mirror_all_globals =>
+                {
+                    continue
+                }
                 _ => {}
             }
             if let Some(s) = self.lower_stmt(stmt, &mut fs) {
@@ -2755,7 +2795,10 @@ impl<'a> Lowerer<'a> {
     /// module name, `__main__` for the entry), `__file__` and `__doc__`.
     /// Each binding becomes an `Assign` of a constant followed by the matching
     /// `GlobalSet`, so functions and methods of the unit can read it with a
-    /// `GlobalGet`. Nothing is emitted for a dunder the unit never loads.
+    /// `GlobalGet`. Nothing is emitted for a dunder the unit never loads,
+    /// except `__name__` of an imported unit: storing it is what registers the
+    /// module in the runtime globals store, so the module registry can resolve
+    /// compiled modules (including empty and dotted submodules) by name.
     fn lower_dunder_bindings(
         &mut self,
         module: &ast::ModModule,
@@ -2774,7 +2817,15 @@ impl<'a> Lowerer<'a> {
 
         let mut inits = Vec::new();
         for (name, value) in bindings {
-            if !module_references_name(&module.body, name) && !self.template_loads_name(name) {
+            // Only imported units register in the runtime module registry.
+            // The entry module and REPL fragments are `__main__` and have no
+            // importer, so they keep the historical conditional binding.
+            let registers_module =
+                name == "__name__" && self.mirror_all_globals && self.dunder_name != "__main__";
+            if !registers_module
+                && !module_references_name(&module.body, name)
+                && !self.template_loads_name(name)
+            {
                 continue;
             }
             let ty = Ty::Concrete(value.ty());
@@ -3103,6 +3154,14 @@ impl<'a> Lowerer<'a> {
                 return;
             }
             ExtensionLookup::Incompatible { path, reason } => {
+                // An optional import (inside a module-level `try`) must not
+                // turn an unloadable wheel into a compile error: leave the
+                // binding deferred so the handler sees the runtime import
+                // failure.
+                if nested && self.may_defer(imported) {
+                    self.record_deferred(binding, module, None);
+                    return;
+                }
                 self.error_incompatible_extension(alias.range, &path, &reason);
                 return;
             }
@@ -3222,6 +3281,27 @@ impl<'a> Lowerer<'a> {
                         .insert(binding.to_string(), submodule);
                     continue;
                 }
+                // `from pkg import ext` may name a compiled extension
+                // submodule. Bind it to the shared object path so attribute
+                // access lowers to the lazy extension ABI; an incompatible
+                // wheel stays deferred inside an optional import so the
+                // runtime import failure is catchable.
+                match self.find_extension(&submodule) {
+                    ExtensionLookup::Found(path) => {
+                        self.extension_aliases
+                            .insert(binding.to_string(), path.to_string_lossy().into_owned());
+                        continue;
+                    }
+                    ExtensionLookup::Incompatible { path, reason } => {
+                        if nested && self.may_defer(imported) {
+                            self.record_deferred(binding, imported, Some(member));
+                        } else {
+                            self.error_incompatible_extension(alias.range, &path, &reason);
+                        }
+                        continue;
+                    }
+                    ExtensionLookup::Missing => {}
+                }
                 let export = if self_package {
                     self.self_export(member)
                 } else {
@@ -3301,6 +3381,34 @@ impl<'a> Lowerer<'a> {
             ExtensionLookup::Found(path) => {
                 let path = path.to_string_lossy().into_owned();
                 self.collect_extension_members(s, imported, &path, nested);
+            }
+            ExtensionLookup::Incompatible { path, reason }
+                if nested && self.may_defer(imported) =>
+            {
+                // Optional import of an unloadable wheel: defer every binding
+                // so the runtime raises the import error inside the `try`.
+                let _ = (path, reason);
+                for alias in &s.names {
+                    let member = alias.name.as_str();
+                    if member == "*" {
+                        self.error_at_code(
+                            alias.range,
+                            codes::UNSUPPORTED,
+                            format!(
+                                "'from {imported} import *' is not supported for a module that is not loaded"
+                            ),
+                        );
+                        continue;
+                    }
+                    let binding = match &alias.asname {
+                        Some(name) => name.as_str(),
+                        None => member,
+                    };
+                    if !self.claim_import_binding(binding, true) {
+                        continue;
+                    }
+                    self.record_deferred(binding, imported, Some(member));
+                }
             }
             ExtensionLookup::Incompatible { path, reason } => {
                 self.error_incompatible_extension(s.range, &path, &reason);
@@ -3513,8 +3621,18 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Looks up a compiled extension for `name` (possibly dotted).
+    ///
+    /// The source-relative search handles imports written from the project
+    /// root. An absolute dotted name reached through a relative import inside
+    /// a package (`from . import ext`) is looked up again from the package
+    /// root, because the source file itself lives one or more directories
+    /// below it.
     fn find_extension(&self, name: &str) -> ExtensionLookup {
-        find_extension_for_source(Path::new(self.filename), name)
+        let source = Path::new(self.filename);
+        match find_extension_for_source(source, name) {
+            ExtensionLookup::Missing => extension_lookup_from_package(source, &self.package, name),
+            found => found,
+        }
     }
 
     /// Reports a shared object whose wheel ABI tag Hydro cannot load.
@@ -3561,11 +3679,13 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Mirrors the bindings of a module-level `import` statement into the
-    /// session global table.
+    /// runtime global table of this unit.
     ///
     /// A REPL fragment is compiled separately from the fragment that follows
     /// it, so import names must live in the runtime table rather than only in
-    /// the binding tables of this compilation unit. Extension module aliases
+    /// the binding tables of this compilation unit. Imported units mirror too:
+    /// a package `__init__.py` re-exports the modules it imported, and
+    /// importers read them through the module value. Extension module aliases
     /// have no first-class value in the IR and are therefore not mirrored;
     /// their members (`from ext import name`) are.
     fn lower_session_import(&mut self, s: &ast::StmtImport, line: u32, col: u32) -> Option<HStmt> {
@@ -3585,7 +3705,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Mirrors the bindings of a module-level `from ... import ...` statement
-    /// into the session global table.
+    /// into the runtime global table of this unit (see
+    /// [`Self::lower_session_import`]).
     fn lower_session_import_from(
         &mut self,
         s: &ast::StmtImportFrom,
@@ -3866,10 +3987,12 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Lowers `module.f(...)` for a name exported by a user module.
+    /// Lowers `module.f(...)` for a member of a user module.
     ///
-    /// Functions link directly; classes and other module-level values are read
-    /// from the runtime global table and called indirectly.
+    /// Statically linked functions link directly; classes and other
+    /// module-level values are read from the runtime global table and called
+    /// indirectly. A member the export table does not know becomes a dynamic
+    /// module-attribute call, so runtime-provided names keep working.
     fn user_module_call(
         &mut self,
         module: &UserModule,
@@ -3881,15 +4004,12 @@ impl<'a> Lowerer<'a> {
     ) -> HExpr {
         let export = module.exports.get(member).copied();
         let Some(export) = export else {
-            self.error_at_code(
-                call.func.range(),
-                codes::ATTRIBUTE,
-                format!(
-                    "module '{}' does not export a function named '{member}'",
-                    module.name
-                ),
-            );
-            return self.error_expr(call.range);
+            // The member is not statically linked: resolve the attribute and
+            // expand the operands at runtime. The lookup happens at call time
+            // and a missing name raises `AttributeError` from the runtime, so
+            // modules that only define it at runtime (`__getattr__`,
+            // dynamically populated namespaces) keep working.
+            return self.lower_dynamic_call(call, fs, line, col);
         };
         if !call.keywords.is_empty() {
             self.error_at_code(
@@ -5780,7 +5900,7 @@ impl<'a> Lowerer<'a> {
                     );
                     return None;
                 };
-                let op = self.bin_op(s.op, s.range)?;
+                let op = self.aug_bin_op(s.op, s.range)?;
                 if let Some(ns) = fs.class_ns.as_ref().map(|state| state.ns) {
                     // `name op= value` in a class body: read the namespace
                     // entry, apply the operator and store it back.
@@ -6096,12 +6216,14 @@ impl<'a> Lowerer<'a> {
             ast::Stmt::ClassDef(s) => return self.lower_class_stmt(s, fs, line, col),
             // Imports were resolved into the binding tables in step 1. A
             // session fragment also mirrors them into the runtime global
-            // table so a later fragment sees the same names.
+            // table so a later fragment sees the same names; an imported unit
+            // does the same so its importers can read them through the module
+            // value.
             ast::Stmt::Import(s) => {
                 if fs.class_ns.is_some() {
                     return self.lower_class_body_import(&s.names, fs, line, col);
                 }
-                if !self.session_mode || !fs.is_module {
+                if (!self.session_mode && !self.mirror_all_globals) || !fs.is_module {
                     return None;
                 }
                 return self.lower_session_import(s, line, col);
@@ -6110,7 +6232,7 @@ impl<'a> Lowerer<'a> {
                 if fs.class_ns.is_some() {
                     return self.lower_class_body_import_from(s, fs, line, col);
                 }
-                if !self.session_mode || !fs.is_module {
+                if (!self.session_mode && !self.mirror_all_globals) || !fs.is_module {
                     return None;
                 }
                 return self.lower_session_import_from(s, line, col);
@@ -9228,7 +9350,7 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
-        let op = self.bin_op(s.op, s.range)?;
+        let op = self.aug_bin_op(s.op, s.range)?;
         let object = self.expr(&attr.value, fs);
         let (object_local, object_ref) = self.aug_temp(fs, attr.value.range());
         let value = self.expr(&s.value, fs);
@@ -9282,7 +9404,7 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
-        let op = self.bin_op(s.op, s.range)?;
+        let op = self.aug_bin_op(s.op, s.range)?;
         let object = self.expr(&sub.value, fs);
         let index = self.expr(&sub.slice, fs);
         let (object_local, object_ref) = self.aug_temp(fs, sub.value.range());
@@ -10610,8 +10732,18 @@ impl<'a> Lowerer<'a> {
                 }
                 ast::Expr::Call(call) => {
                     if !call.keywords.is_empty() {
-                        self.error_at(call.range, "keyword arguments are not supported in Phase 1");
-                        return None;
+                        // `raise AttributeError(msg, name=None)`: the keyword
+                        // form has no tag-only representation, so build the
+                        // exception object through the real constructor and
+                        // raise that value. The runtime validates the keyword
+                        // set (unsupported names raise `TypeError`).
+                        return self.lower_raise_call_with_keywords(
+                            call,
+                            s.cause.as_deref(),
+                            fs,
+                            line,
+                            col,
+                        );
                     }
                     if call.args.len() != 1 {
                         self.error_at_code(
@@ -10687,6 +10819,74 @@ impl<'a> Lowerer<'a> {
         let cause = s.cause.as_ref().map(|c| self.expr(c, fs));
         Some(HStmt {
             kind: HStmtKind::Raise { exc, msg, cause },
+            line,
+            col,
+        })
+    }
+
+    /// Lowers `raise ExcKind(args..., keyword=value, ...)` and
+    /// `raise UserError(args..., keyword=value, ...)`.
+    ///
+    /// The exception constructor runs as a normal call so argument and
+    /// keyword operands keep Python's evaluation order; the constructed value
+    /// is then raised through the `raise value` form. Built-in exception
+    /// classes route through [`Self::exception_class_call`], whose runtime
+    /// constructor accepts only the class's documented keywords.
+    fn lower_raise_call_with_keywords(
+        &mut self,
+        call: &ast::ExprCall,
+        cause: Option<&ast::Expr>,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let value = match &*call.func {
+            ast::Expr::Name(n) => {
+                if let Some(kind) = ExcKind::from_class_name(n.id.as_str()) {
+                    self.exception_class_call(kind, call, fs, line, col)
+                } else if self.is_user_exception_name(n.id.as_str()) {
+                    self.call_expr(call, fs, line, col)
+                } else {
+                    self.error_at_code(
+                        n.range,
+                        codes::NAME,
+                        format!("unknown exception type '{}'", n.id),
+                    );
+                    return None;
+                }
+            }
+            ast::Expr::Attribute(_) => {
+                let Some(name) = dotted_expr_name(&call.func) else {
+                    self.error_at(
+                        call.func.range(),
+                        "raise only supports exception names and classes",
+                    );
+                    return None;
+                };
+                match ExcKind::from_name(&name) {
+                    Some(kind) => self.exception_class_call(kind, call, fs, line, col),
+                    // An imported exception class keeps its Python class
+                    // identity through the ordinary call path, including its
+                    // keyword arguments.
+                    None => self.call_expr(call, fs, line, col),
+                }
+            }
+            _ => {
+                self.error_at(
+                    call.func.range(),
+                    "raise only supports exception names and classes",
+                );
+                return None;
+            }
+        };
+        // Python evaluates the raised exception before the explicit cause.
+        let cause = cause.map(|c| self.expr(c, fs));
+        Some(HStmt {
+            kind: HStmtKind::Raise {
+                exc: None,
+                msg: Some(value),
+                cause,
+            },
             line,
             col,
         })
@@ -11690,9 +11890,20 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
-                } else if self.user_module_aliases.contains_key(name)
-                    || self.extension_aliases.contains_key(name)
-                {
+                } else if let Some(module) = self.user_module_aliases.get(name) {
+                    // A compiled user module is a first-class runtime value:
+                    // `getattr(pkg, name)`, `sys.modules[...]` and module
+                    // identity all work through the module registry. Attribute
+                    // access still uses the direct module path above.
+                    HExpr {
+                        kind: HExprKind::ModuleRef {
+                            module: module.clone(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
+                } else if self.extension_aliases.contains_key(name) {
                     self.error_module_value(n.range, name);
                     self.error_expr(e.range())
                 } else if let Some(binding) = self.deferred_imports.get(name) {
@@ -12031,15 +12242,22 @@ impl<'a> Lowerer<'a> {
                             col: member_col,
                         },
                         None => {
-                            self.error_at_code(
-                                a.range,
-                                codes::ATTRIBUTE,
-                                format!(
-                                    "module '{}' does not export a function named '{member}'",
-                                    module.name
-                                ),
-                            );
-                            self.error_expr(e.range())
+                            // The export table only knows statically linked
+                            // names. A module may expose more attributes at
+                            // runtime: plain globals, submodules and
+                            // `__getattr__` results. Read it through the
+                            // runtime module namespace instead of rejecting the
+                            // program; a name that is genuinely absent raises
+                            // `AttributeError` there.
+                            HExpr {
+                                kind: HExprKind::ModuleAttr {
+                                    module: module.name.clone(),
+                                    name: member.to_string(),
+                                },
+                                ty: Ty::Concrete(Type::Any),
+                                line: member_line,
+                                col: member_col,
+                            }
                         }
                     };
                 }
@@ -13224,6 +13442,65 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    /// Lowers a call whose callee is the built-in exception class `kind`.
+    ///
+    /// A plain positional call keeps the historical `IndirectCall` shape; any
+    /// keyword, `*` or `**` operand goes through the runtime class constructor
+    /// so the accepted keyword set is validated there and unsupported keywords
+    /// raise `TypeError` at call time, exactly like CPython.
+    fn exception_class_call(
+        &mut self,
+        kind: ExcKind,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let (callee_line, callee_col) = self.span(call.func.range());
+        let callee = HExpr {
+            kind: HExprKind::ExceptionClass(kind),
+            ty: Ty::Concrete(Type::Any),
+            line: callee_line,
+            col: callee_col,
+        };
+        if call_has_dynamic_arguments(call) {
+            let Some((args, star, keywords, double_star)) = self.call_operands(call, fs) else {
+                return self.error_expr(call.range);
+            };
+            return HExpr {
+                kind: HExprKind::CallFull {
+                    callee: Box::new(callee),
+                    args,
+                    star: star.map(Box::new),
+                    keywords,
+                    double_star: double_star.map(Box::new),
+                },
+                ty: self.infer.fresh(),
+                line,
+                col,
+            };
+        }
+        if !call.keywords.is_empty() {
+            return match self.call_kw_expr(callee, call, fs, line, col) {
+                Some(result) => result,
+                None => self.error_expr(call.range),
+            };
+        }
+        let Some(args) = self.plain_call_args(call, fs) else {
+            return self.error_expr(call.range);
+        };
+        HExpr {
+            kind: HExprKind::IndirectCall {
+                callee: Box::new(callee),
+                args,
+                star: None,
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
     fn call_expr(
         &mut self,
         call: &ast::ExprCall,
@@ -13484,7 +13761,12 @@ impl<'a> Lowerer<'a> {
                     );
                 }
                 if let Some(module) = self.resolve_user_module(&attr.value, fs) {
-                    if !call.keywords.is_empty() {
+                    // A statically linked member of a user function keeps the
+                    // existing keyword restriction. An unknown member is a
+                    // runtime lookup, so the general dynamic call path binds
+                    // its keywords and starred operands.
+                    if !call.keywords.is_empty() && module.exports.contains_key(attr.attr.as_str())
+                    {
                         return self.lower_deferred_call(call, fs, line, col);
                     }
                     return self.user_module_call(&module, attr.attr.as_str(), call, fs, line, col);
@@ -14209,32 +14491,12 @@ impl<'a> Lowerer<'a> {
 
         if let Some(kind) = ExcKind::from_class_name(name) {
             // A built-in exception class is callable like any class object:
-            // instantiating it allocates a plain instance (the native classes
-            // have no `__init__`). Keyword and starred forms stay deferred so
-            // they fail cleanly at runtime instead of at the call site.
-            if !call.keywords.is_empty() {
-                return self.lower_deferred_call(call, fs, line, col);
-            }
-            let Some(args) = self.plain_call_args(call, fs) else {
-                return self.error_expr(call.range);
-            };
-            let (callee_line, callee_col) = self.span(name_expr.range);
-            let callee = HExpr {
-                kind: HExprKind::ExceptionClass(kind),
-                ty: Ty::Concrete(Type::Any),
-                line: callee_line,
-                col: callee_col,
-            };
-            return HExpr {
-                kind: HExprKind::IndirectCall {
-                    callee: Box::new(callee),
-                    args,
-                    star: None,
-                },
-                ty: self.infer.fresh(),
-                line,
-                col,
-            };
+            // instantiating it allocates a plain exception payload (the native
+            // classes have no `__init__`). Keyword and starred forms go
+            // through the runtime constructor, which validates the accepted
+            // keyword set (`AttributeError(name=, obj=)`, `NameError(name=)`,
+            // ...) and raises `TypeError` otherwise.
+            return self.exception_class_call(kind, call, fs, line, col);
         }
 
         if self.session_mode {
@@ -15633,7 +15895,7 @@ impl<'a> Lowerer<'a> {
     // Operators
     // ------------------------------------------------------------------
 
-    fn bin_op(&mut self, op: ast::Operator, range: TextRange) -> Option<BinOp> {
+    fn bin_op(&mut self, op: ast::Operator, _range: TextRange) -> Option<BinOp> {
         Some(match op {
             ast::Operator::Add => BinOp::Add,
             ast::Operator::Sub => BinOp::Sub,
@@ -15642,18 +15904,24 @@ impl<'a> Lowerer<'a> {
             ast::Operator::FloorDiv => BinOp::FloorDiv,
             ast::Operator::Mod => BinOp::Mod,
             ast::Operator::Pow => BinOp::Pow,
-            ast::Operator::MatMult => {
-                self.error_at(
-                    range,
-                    "matrix multiplication (@) is not supported in Phase 1",
-                );
-                return None;
-            }
+            ast::Operator::MatMult => BinOp::MatMul,
             ast::Operator::LShift => BinOp::Shl,
             ast::Operator::RShift => BinOp::Shr,
             ast::Operator::BitOr => BinOp::BitOr,
             ast::Operator::BitXor => BinOp::BitXor,
             ast::Operator::BitAnd => BinOp::BitAnd,
+        })
+    }
+
+    /// Maps an augmented-assignment operator. `x @= y` is the one augmented
+    /// form that is not plain `x = x op y`: the runtime tries `__imatmul__`
+    /// before falling back to `__matmul__`/`__rmatmul__`.
+    fn aug_bin_op(&mut self, op: ast::Operator, range: TextRange) -> Option<BinOp> {
+        let op = self.bin_op(op, range)?;
+        Some(if op == BinOp::MatMul {
+            BinOp::MatMulInPlace
+        } else {
+            op
         })
     }
 

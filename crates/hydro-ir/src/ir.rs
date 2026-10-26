@@ -608,6 +608,11 @@ pub enum StmtKind {
     },
     /// `raise` when both fields are `None` (bare re-raise), otherwise
     /// `raise ExcKind(msg)` or `raise ExcKind`.
+    ///
+    /// `exc: None, msg: Some(value)` is `raise value`: the expression
+    /// evaluates to an exception object that is raised as-is. Keyword
+    /// exception constructors (`raise AttributeError(msg, name=None)`) lower
+    /// through this form so the runtime constructor validates the keywords.
     Raise {
         exc: Option<ExcKind>,
         msg: Option<Expr>,

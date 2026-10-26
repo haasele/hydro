@@ -164,6 +164,13 @@ pub enum BinOp {
     Shl,
     /// `left >> right`
     Shr,
+    /// `left @ right` (matrix multiplication). The runtime dispatches
+    /// `__matmul__`/`__rmatmul__` and falls back to scalar multiplication for
+    /// numeric operands; anything else raises `TypeError`.
+    MatMul,
+    /// `left @= right` (augmented matrix multiplication). Identical to
+    /// [`BinOp::MatMul`], except that the runtime tries `__imatmul__` first.
+    MatMulInPlace,
 }
 
 impl BinOp {
@@ -192,6 +199,8 @@ impl BinOp {
             BinOp::BitXor => 19,
             BinOp::Shl => 20,
             BinOp::Shr => 21,
+            BinOp::MatMul => 22,
+            BinOp::MatMulInPlace => 23,
         }
     }
 
@@ -219,6 +228,8 @@ impl BinOp {
             BinOp::BitXor => "^",
             BinOp::Shl => "<<",
             BinOp::Shr => ">>",
+            BinOp::MatMul => "@",
+            BinOp::MatMulInPlace => "@=",
         }
     }
 
@@ -286,6 +297,14 @@ pub enum Builtin {
     Str,
     /// `repr(value)`: Python's representation string.
     Repr,
+    /// `id(value)`: the value's identity as an integer.
+    ///
+    /// Heap values report their runtime address with the tag bits masked off;
+    /// tagged immediates (`int`, `bool`, `None`, ...) are mapped injectively
+    /// away from the heap tag. The number is stable for the lifetime of the
+    /// value, distinct values never collide, and it matches what `builtins.id`
+    /// returns, which is the same runtime identity `is` compares.
+    Id,
     /// `hash(value)`: a deterministic integer hash. Equal values hash equally
     /// and unhashable values (`list`, `dict`, `set`, iterator, or a tuple
     /// containing one) raise `TypeError`. The value is implementation-defined
@@ -471,6 +490,7 @@ impl Builtin {
             Builtin::Str => "str",
             Builtin::Repr => "repr",
             Builtin::Hash => "hash",
+            Builtin::Id => "id",
             Builtin::Int => "int",
             Builtin::Float => "float",
             Builtin::Abs => "abs",
@@ -537,6 +557,7 @@ impl Builtin {
             "str" => Builtin::Str,
             "repr" => Builtin::Repr,
             "hash" => Builtin::Hash,
+            "id" => Builtin::Id,
             "int" => Builtin::Int,
             "float" => Builtin::Float,
             "abs" => Builtin::Abs,

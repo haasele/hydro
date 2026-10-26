@@ -3207,6 +3207,9 @@ unsafe fn trace(addr: usize) {
                     if let Some(context) = exception.context {
                         mark_value(context);
                     }
+                    for &(_, value) in &exception.keywords {
+                        mark_value(value);
+                    }
                 }
                 // Scalars, ranges, locks, events, cross-process
                 // queues, files, csv readers, paths, compiled patterns and

@@ -615,6 +615,17 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
                 None
             }
         }
+        // `@` is numeric multiplication for scalars and a protocol hook
+        // (`__matmul__`/`__rmatmul__`/`__imatmul__`) for user types. Hydro
+        // cannot see dunders of a statically known non-numeric operand, so
+        // the runtime decides and reports `TypeError`; never reject here.
+        BinOp::MatMul | BinOp::MatMulInPlace => {
+            if a.is_numeric() && b.is_numeric() {
+                Some(numeric_result(a, b))
+            } else {
+                Some(Type::Any)
+            }
+        }
         BinOp::Div => {
             if any {
                 Some(Type::Any)
@@ -3191,6 +3202,20 @@ impl<'a> Checker<'a> {
                 // is dynamic (the common case) are never rejected early.
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Int));
             }
+            Builtin::Id => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("id() takes exactly one argument ({count} given)"),
+                    );
+                    return;
+                }
+                // Every value has an identity; the runtime encodes it as an
+                // integer.
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Int));
+            }
             Builtin::DictMerge => {
                 // Internal node produced by a dict display with `**`; both
                 // operands must be mappings.
@@ -3631,6 +3656,14 @@ impl<'a> Checker<'a> {
             return;
         }
 
+        // `@` dispatches through user dunders at runtime, so a statically
+        // known operand must not constrain the other side: `1 @ obj` may be
+        // handled by `obj.__rmatmul__`. Its result is dynamic.
+        if matches!(binary, BinOp::MatMul | BinOp::MatMulInPlace) {
+            self.force_any(op.out);
+            return;
+        }
+
         let compatible = match binary {
             BinOp::Eq | BinOp::Ne | BinOp::Is | BinOp::IsNot => true,
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -3661,6 +3694,9 @@ impl<'a> Checker<'a> {
             // rejected by the runtime with `TypeError`, so the unknown side
             // does not constrain the type.
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => true,
+            // `@` dispatches through user dunders at runtime, so an unknown
+            // side never constrains the other operand's type.
+            BinOp::MatMul | BinOp::MatMulInPlace => true,
             // Handled above; membership accepts any unknown side.
             BinOp::In | BinOp::NotIn => true,
         };

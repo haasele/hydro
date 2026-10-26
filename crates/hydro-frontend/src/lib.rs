@@ -951,6 +951,160 @@ impl ModuleLoader {
         })
     }
 
+    /// Links a module imported by a module-level `try` body.
+    ///
+    /// The import runs in normal execution order, so a module that resolves
+    /// and compiles can become a regular dependency; its initializer then runs
+    /// once, before the importer, exactly like an eager import. Anything that
+    /// cannot be linked (absent module, compile diagnostics, a cycle) leaves
+    /// the binding deferred, so the runtime raises `ModuleNotFoundError` and
+    /// the enclosing `except ImportError` handles it. The load is transactional:
+    /// a failed attempt restores every loader table.
+    fn optional_import(
+        &mut self,
+        name: &str,
+        importer_dir: &Path,
+        module_root: &Path,
+        scan: &mut ImportScan,
+    ) -> bool {
+        if hydro_ir::stdlib::module(name).is_some() {
+            return true;
+        }
+        if let Some(&index) = self.by_name.get(name) {
+            if !scan.deps.contains(&index) {
+                scan.deps.push(index);
+            }
+            return true;
+        }
+        if !self.optional_preloadable(name, importer_dir, module_root) {
+            return false;
+        }
+        let units_before = self.units.len();
+        let diags_before = self.diags.len();
+        let loaded_before: Vec<PathBuf> = self.loaded.keys().cloned().collect();
+        let names_before: Vec<String> = self.by_name.keys().cloned().collect();
+        let namespaces_before = self.namespaces.clone();
+        let failed_before = self.failed.clone();
+        let loaded = self.load_named(name, importer_dir, module_root);
+        let succeeded = matches!(&loaded, NamedLoad::Loaded(_)) && self.diags.len() == diags_before;
+        if !succeeded {
+            self.diags.truncate(diags_before);
+            self.units.truncate(units_before);
+            self.loaded.retain(|path, _| loaded_before.contains(path));
+            self.by_name.retain(|name, _| names_before.contains(name));
+            self.namespaces = namespaces_before;
+            self.failed = failed_before;
+            return false;
+        }
+        if let NamedLoad::Loaded(loaded) = loaded {
+            for index in loaded {
+                if !scan.deps.contains(&index) {
+                    scan.deps.push(index);
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether a module named by a module-level `try` import is safe to link
+    /// eagerly.
+    ///
+    /// Linking runs the module initializer before the importer, so only
+    /// modules whose body has no control flow and no extension import are
+    /// accepted. The statement whitelist (imports, definitions, assignments,
+    /// docstrings and statically dead guards) covers ordinary package helper
+    /// modules while keeping optional dependency graphs and extension loaders
+    /// lazy; everything else stays deferred and reports `ModuleNotFoundError`
+    /// at runtime. An extension import would otherwise move the loader failure
+    /// outside the `try`, where the handler could not see it.
+    fn optional_preloadable(&self, name: &str, importer_dir: &Path, module_root: &Path) -> bool {
+        let roots = module_search_roots(importer_dir, module_root);
+        let Some(chain) = resolve_module(&roots, name) else {
+            return false;
+        };
+        let Some(final_module) = chain.last() else {
+            return false;
+        };
+        if final_module.namespace {
+            return false;
+        }
+        let Ok(source) = fs::read_to_string(&final_module.path) else {
+            return false;
+        };
+        let Ok(ast::Mod::Module(module)) =
+            rustpython_parser::parse(&source, Mode::Module, &final_module.path.to_string_lossy())
+        else {
+            return false;
+        };
+        let package = final_module.package.as_str();
+        for stmt in &module.body {
+            match stmt {
+                ast::Stmt::Import(s) => {
+                    for alias in &s.names {
+                        let imported = alias.name.as_str();
+                        if hydro_ir::stdlib::module(imported).is_some() {
+                            continue;
+                        }
+                        if extension_referenced(&final_module.path, package, imported) {
+                            return false;
+                        }
+                    }
+                }
+                ast::Stmt::ImportFrom(s) => {
+                    let level = s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0);
+                    let Ok(module_name) = lower::resolve_import_name(
+                        level,
+                        s.module.as_ref().map(|module| module.as_str()),
+                        package,
+                    ) else {
+                        return false;
+                    };
+                    if hydro_ir::stdlib::module(&module_name).is_some() {
+                        continue;
+                    }
+                    if extension_referenced(&final_module.path, package, &module_name) {
+                        return false;
+                    }
+                    for alias in &s.names {
+                        if alias.name.as_str() == "*" {
+                            // Star imports cannot be linked without knowing
+                            // the extension's members.
+                            return false;
+                        }
+                        let full = format!("{module_name}.{}", alias.name);
+                        if extension_referenced(&final_module.path, package, &full) {
+                            return false;
+                        }
+                    }
+                }
+                ast::Stmt::FunctionDef(_)
+                | ast::Stmt::AsyncFunctionDef(_)
+                | ast::Stmt::ClassDef(_)
+                | ast::Stmt::Assign(_)
+                | ast::Stmt::AnnAssign(_)
+                | ast::Stmt::AugAssign(_)
+                | ast::Stmt::Pass(_) => {}
+                // Only a docstring is a side-effect-free expression.
+                ast::Stmt::Expr(s) => {
+                    if !matches!(
+                        &*s.value,
+                        ast::Expr::Constant(constant)
+                            if matches!(constant.value, ast::Constant::Str(_))
+                    ) {
+                        return false;
+                    }
+                }
+                ast::Stmt::If(s) => {
+                    if lower::static_if_branch(&s.test, name) != Some(false) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Whether `name` is the module currently being scanned or one of its
     /// ancestor packages. Both are on the load stack when a module-level
     /// import reaches back to the package that is initializing them.
@@ -986,6 +1140,7 @@ impl ModuleLoader {
             package,
             scan,
             false,
+            false,
         );
     }
 
@@ -1005,6 +1160,12 @@ impl ModuleLoader {
     /// — `if TYPE_CHECKING:` never runs (annotations are not evaluated) and
     /// `if __name__ == "__main__":` is false for an imported module — so
     /// type-only and demo imports are not even recorded.
+    ///
+    /// `optional` marks the body of a module-level `try`: imports there are
+    /// linked when they resolve (so the binding is a normal module reference)
+    /// and otherwise recorded as deferred, leaving the runtime
+    /// `ModuleNotFoundError` for the handler. Nested functions, classes and
+    /// handler bodies are never optional.
     #[allow(clippy::too_many_arguments)]
     fn scan_stmts(
         &mut self,
@@ -1017,6 +1178,7 @@ impl ModuleLoader {
         package: &str,
         scan: &mut ImportScan,
         deferred: bool,
+        optional: bool,
     ) {
         for stmt in stmts {
             match stmt {
@@ -1028,17 +1190,33 @@ impl ModuleLoader {
                             // lowerer can link it; an optional module that
                             // fails to resolve stays deferred.
                             if hydro_ir::stdlib::module(alias.name.as_str()).is_none() {
-                                if self.import_free_module(alias.name.as_str(), importer_dir, root)
-                                {
-                                    if let Some(index) =
-                                        self.probe_named(alias.name.as_str(), importer_dir, root)
-                                    {
-                                        if !scan.deps.contains(&index) {
-                                            scan.deps.push(index);
+                                if optional {
+                                    if !self.optional_import(
+                                        alias.name.as_str(),
+                                        importer_dir,
+                                        root,
+                                        scan,
+                                    ) {
+                                        scan.record_deferred(alias.name.as_str(), None);
+                                    }
+                                } else {
+                                    if self.import_free_module(
+                                        alias.name.as_str(),
+                                        importer_dir,
+                                        root,
+                                    ) {
+                                        if let Some(index) = self.probe_named(
+                                            alias.name.as_str(),
+                                            importer_dir,
+                                            root,
+                                        ) {
+                                            if !scan.deps.contains(&index) {
+                                                scan.deps.push(index);
+                                            }
                                         }
                                     }
+                                    scan.record_deferred(alias.name.as_str(), None);
                                 }
-                                scan.record_deferred(alias.name.as_str(), None);
                             }
                             continue;
                         }
@@ -1071,6 +1249,32 @@ impl ModuleLoader {
                         continue;
                     }
                     if deferred {
+                        if optional {
+                            // A module-level `try` body runs in normal
+                            // execution order, so a submodule that resolves can
+                            // be linked like an eager import. A submodule that
+                            // is absent (or cannot be compiled) stays deferred
+                            // and raises `ModuleNotFoundError` at runtime, which
+                            // the surrounding `except ImportError` handles.
+                            for alias in &s.names {
+                                if alias.name.as_str() == "*" {
+                                    scan.record_deferred(&module_name, None);
+                                    continue;
+                                }
+                                let full = format!("{module_name}.{}", alias.name);
+                                if self.optional_import(&full, importer_dir, root, scan) {
+                                    continue;
+                                }
+                                // `from pkg import name` may bind an attribute
+                                // of `pkg`; linking the base module lets the
+                                // lowerer resolve exports. If the name is not
+                                // an export, the deferred edge below keeps the
+                                // runtime import error.
+                                self.optional_import(&module_name, importer_dir, root, scan);
+                                scan.record_deferred(&module_name, Some(alias.name.as_str()));
+                            }
+                            continue;
+                        }
                         if self.import_free_module(&module_name, importer_dir, root) {
                             if let Some(index) = self.probe_named(&module_name, importer_dir, root)
                             {
@@ -1133,6 +1337,7 @@ impl ModuleLoader {
                     package,
                     scan,
                     true,
+                    false,
                 ),
                 ast::Stmt::AsyncFunctionDef(s) => self.scan_stmts(
                     &s.body,
@@ -1144,6 +1349,7 @@ impl ModuleLoader {
                     package,
                     scan,
                     true,
+                    false,
                 ),
                 // A class body executes when the class statement runs, but it
                 // can also sit inside a deferred function: keep its imports
@@ -1158,6 +1364,7 @@ impl ModuleLoader {
                     package,
                     scan,
                     true,
+                    false,
                 ),
                 ast::Stmt::If(s) => {
                     let branch = lower::static_if_branch(&s.test, current);
@@ -1172,6 +1379,7 @@ impl ModuleLoader {
                             package,
                             scan,
                             true,
+                            optional,
                         );
                     }
                     if branch != Some(true) {
@@ -1185,6 +1393,7 @@ impl ModuleLoader {
                             package,
                             scan,
                             true,
+                            optional,
                         );
                     }
                 }
@@ -1199,6 +1408,7 @@ impl ModuleLoader {
                         current,
                         package,
                         scan,
+                        optional,
                     );
                 }
                 ast::Stmt::AsyncFor(s) => {
@@ -1212,6 +1422,7 @@ impl ModuleLoader {
                         current,
                         package,
                         scan,
+                        optional,
                     );
                 }
                 ast::Stmt::While(s) => {
@@ -1225,9 +1436,14 @@ impl ModuleLoader {
                         current,
                         package,
                         scan,
+                        optional,
                     );
                 }
                 ast::Stmt::Try(s) => {
+                    // The body of a module-level `try` runs in normal
+                    // execution order: imports that resolve can be linked
+                    // eagerly, while missing ones stay deferred so the handler
+                    // catches the runtime `ModuleNotFoundError`.
                     self.scan_stmts(
                         &s.body,
                         source,
@@ -1238,6 +1454,7 @@ impl ModuleLoader {
                         package,
                         scan,
                         true,
+                        optional || !deferred,
                     );
                     for handler in &s.handlers {
                         let ast::ExceptHandler::ExceptHandler(handler) = handler;
@@ -1251,6 +1468,7 @@ impl ModuleLoader {
                             package,
                             scan,
                             true,
+                            false,
                         );
                     }
                     self.scan_stmts(
@@ -1263,6 +1481,7 @@ impl ModuleLoader {
                         package,
                         scan,
                         true,
+                        false,
                     );
                     self.scan_stmts(
                         &s.finalbody,
@@ -1274,6 +1493,7 @@ impl ModuleLoader {
                         package,
                         scan,
                         true,
+                        false,
                     );
                 }
                 ast::Stmt::With(s) => self.scan_stmts(
@@ -1286,6 +1506,7 @@ impl ModuleLoader {
                     package,
                     scan,
                     true,
+                    optional,
                 ),
                 ast::Stmt::AsyncWith(s) => self.scan_stmts(
                     &s.body,
@@ -1297,6 +1518,7 @@ impl ModuleLoader {
                     package,
                     scan,
                     true,
+                    optional,
                 ),
                 _ => {}
             }
@@ -1316,6 +1538,7 @@ impl ModuleLoader {
         current: &str,
         package: &str,
         scan: &mut ImportScan,
+        optional: bool,
     ) {
         self.scan_stmts(
             body,
@@ -1327,6 +1550,7 @@ impl ModuleLoader {
             package,
             scan,
             true,
+            optional,
         );
         self.scan_stmts(
             orelse,
@@ -1338,6 +1562,7 @@ impl ModuleLoader {
             package,
             scan,
             true,
+            optional,
         );
     }
 
@@ -1440,6 +1665,22 @@ impl ModuleLoader {
                 .with_span(end_col),
         );
     }
+}
+
+/// Whether `name` resolves to a compiled extension visible from `source`.
+///
+/// Both the source-relative and the package-root lookups are consulted: a
+/// relative import inside a package names an absolute dotted module, which is
+/// rooted at the directory containing the package rather than at the source
+/// file's own directory.
+fn extension_referenced(source: &Path, package: &str, name: &str) -> bool {
+    !matches!(
+        lower::find_extension_for_source(source, name),
+        lower::ExtensionLookup::Missing
+    ) || !matches!(
+        lower::extension_lookup_from_package(source, package, name),
+        lower::ExtensionLookup::Missing
+    )
 }
 
 /// Directories searched for user modules, in order: the importing file's
@@ -1861,6 +2102,18 @@ mod tests {
         fn write(&self, name: &str, source: &str) -> PathBuf {
             let path = self.path.join(name);
             fs::write(&path, source).expect("write source");
+            path
+        }
+
+        /// Creates an empty shared-object stub at `name` (directories
+        /// included). The frontend only resolves the path; loading happens at
+        /// runtime.
+        fn add_extension(&self, name: &str) -> PathBuf {
+            let path = self.path.join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create extension dir");
+            }
+            fs::write(&path, b"").expect("write extension stub");
             path
         }
     }
@@ -2861,6 +3114,139 @@ mod tests {
             ExprKind::DeferredImport { module, member }
                 if module == "nowhere" && member.as_deref() == Some("thing")
         ));
+    }
+
+    #[test]
+    fn module_level_try_import_links_a_sibling_source_module() {
+        let dir = TestDir::new("try-source");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "try:\n    from . import sub\nexcept ImportError:\n    pass\n\ndef get():\n    return sub.value()\n",
+        )
+        .expect("write package init");
+        fs::write(pkg.join("sub.py"), "def value():\n    return 7\n").expect("write submodule");
+        let main = dir.write("main.py", "from pkg import get\nprint(get())\n");
+        let program = program(&main);
+
+        // The try body runs in normal order, so `sub` is compiled and
+        // initialized before the package body, exactly like an eager import.
+        let sub_value = function_id(&program, "pkg.sub.value");
+        let get = function_id(&program, "pkg.get");
+        use hydro_ir::{Callee, ExprKind, StmtKind};
+        let returned = returned_expression(&program, get);
+        assert!(
+            matches!(
+                &returned.kind,
+                ExprKind::Call {
+                    callee: Callee::Function(id),
+                    ..
+                } if *id == sub_value
+            ),
+            "pkg.get must call the linked submodule function: {:?}",
+            returned.kind
+        );
+
+        assert_eq!(program.initializers.len(), 2, "{:?}", program.initializers);
+        let names: Vec<&str> = program
+            .initializers
+            .iter()
+            .map(|id| program.functions[*id as usize].name.as_str())
+            .collect();
+        assert_eq!(names, vec!["pkg.sub.<module>", "pkg.<module>"]);
+
+        // The try body binds the preloaded submodule through a real module
+        // reference; it does not execute the import twice.
+        let pkg_init = &program.functions[program.initializers[1] as usize].body;
+        let stored = pkg_init
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                StmtKind::GlobalSet { name, value, .. } if name == "sub" => Some(value),
+                StmtKind::Try { body, .. } => body.iter().find_map(|inner| match &inner.kind {
+                    StmtKind::GlobalSet { name, value, .. } if name == "sub" => Some(value),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the try body must bind `sub`");
+        assert!(
+            matches!(&stored.kind, ExprKind::ModuleRef { module } if module == "pkg.sub"),
+            "the binding must be a module reference: {:?}",
+            stored.kind
+        );
+    }
+
+    #[test]
+    fn module_level_try_import_of_a_missing_submodule_stays_deferred() {
+        let dir = TestDir::new("try-missing");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "try:\n    from . import missing\nexcept ImportError:\n    pass\n\ndef get():\n    return missing\n",
+        )
+        .expect("write package init");
+        let main = dir.write("main.py", "from pkg import get\nprint(get())\n");
+        let program = program(&main);
+
+        // Nothing was preloaded: the handler owns the missing import and the
+        // binding is resolved at runtime, where `ModuleNotFoundError` runs the
+        // `except ImportError` handler.
+        assert_eq!(program.initializers.len(), 1, "{:?}", program.initializers);
+        assert_eq!(
+            program.functions[program.initializers[0] as usize].name,
+            "pkg.<module>"
+        );
+        let get = function_id(&program, "pkg.get");
+        use hydro_ir::ExprKind;
+        let returned = returned_expression(&program, get);
+        assert!(
+            matches!(
+                &returned.kind,
+                ExprKind::DeferredImport { module, member }
+                    if module == "pkg" && member.as_deref() == Some("missing")
+            ),
+            "the missing submodule must stay deferred: {:?}",
+            returned.kind
+        );
+    }
+
+    #[test]
+    fn module_level_try_import_of_an_extension_submodule_uses_the_loader() {
+        let dir = TestDir::new("try-extension");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "try:\n    from . import ext\nexcept ImportError:\n    pass\n\ndef get():\n    return ext.value()\n",
+        )
+        .expect("write package init");
+        let so = dir.add_extension("pkg/ext.abi3.so");
+        let expected = fs::canonicalize(&so)
+            .expect("canonical extension path")
+            .to_string_lossy()
+            .into_owned();
+        let main = dir.write("main.py", "from pkg import get\nprint(get())\n");
+        let program = program(&main);
+
+        // The extension is not a compiled unit: it binds to the shared object
+        // and the runtime loader stays inside the `try`, so a load failure
+        // runs the handler.
+        assert_eq!(program.initializers.len(), 1, "{:?}", program.initializers);
+        let get = function_id(&program, "pkg.get");
+        use hydro_ir::{Callee, ExprKind};
+        let returned = returned_expression(&program, get);
+        match &returned.kind {
+            ExprKind::Call {
+                callee: Callee::Extension { path, member },
+                ..
+            } => {
+                assert_eq!(path, &expected);
+                assert_eq!(member, "value");
+            }
+            other => panic!("expected an extension call, got {other:?}"),
+        }
     }
 
     #[test]

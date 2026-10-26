@@ -12,7 +12,7 @@
 //! single default-width range for every codepoint instead of failing the
 //! import. The real per-width tables are not bundled.
 
-use crate::exc::{self, MODULE_NOT_FOUND_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{self, IMPORT_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value;
 
 /// Placeholder modules that are still synthesized on demand.
@@ -22,7 +22,10 @@ const UNICODE_TABLE_PREFIX: &str = "rich._unicode_data";
 /// spec before this point.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "import_module" => import_module(args[0]),
+        "import_module" => import_module(
+            args.first().copied().unwrap_or(value::NONE),
+            args.get(1).copied().unwrap_or(value::NONE),
+        ),
         _ => exc::raise_with_message(
             exc::ATTRIBUTE_ERROR,
             &format!("module 'importlib' has no attribute '{function}'"),
@@ -31,7 +34,14 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 }
 
 /// `importlib.import_module(name, package=None)`.
-fn import_module(name_arg: i64) -> i64 {
+///
+/// A relative name (`".sub"`, `"..sibling"`) is resolved against `package`
+/// first, exactly like CPython. The resolved dotted name is then looked up in
+/// the runtime module registry, which contains every compiled user module
+/// (including package submodules), every native module and every module value
+/// materialized by an extension import. Names outside the registry raise
+/// `ModuleNotFoundError` with the exact requested name.
+fn import_module(name_arg: i64, package_arg: i64) -> i64 {
     let Some(name) = value::as_str(name_arg) else {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -44,13 +54,14 @@ fn import_module(name_arg: i64) -> i64 {
     if name.is_empty() {
         return exc::raise_with_message(VALUE_ERROR, "Empty module name");
     }
+    let name = match resolve_relative(name, package_arg) {
+        Ok(name) => name,
+        Err(raised) => return raised,
+    };
     if name.split('.').any(|part| part.is_empty()) {
-        return exc::raise_with_message(
-            MODULE_NOT_FOUND_ERROR,
-            &format!("No module named '{name}'"),
-        );
+        return crate::builtins::module_not_found(&name);
     }
-    if let Some(module) = super::registry_lookup(name) {
+    if let Some(module) = super::registry_lookup(&name) {
         return module;
     }
     if name == UNICODE_TABLE_PREFIX || name.starts_with("rich._unicode_data.") {
@@ -58,7 +69,49 @@ fn import_module(name_arg: i64) -> i64 {
     }
     // Unknown names never become a fake namespace: callers rely on the import
     // failing so their fallback/probe logic runs.
-    exc::raise_with_message(MODULE_NOT_FOUND_ERROR, &format!("No module named '{name}'"))
+    crate::builtins::module_not_found(&name)
+}
+
+/// Resolves a relative module name against `package`.
+///
+/// One leading dot names the package itself, two dots its parent, and so on;
+/// the remainder is appended as a dotted suffix. Absolute names pass through
+/// unchanged. A relative name without a package raises `TypeError`, and
+/// escaping the top-level package raises `ImportError`, matching CPython.
+fn resolve_relative(name: &str, package_arg: i64) -> Result<String, i64> {
+    if !name.starts_with('.') {
+        return Ok(name.to_string());
+    }
+    let Some(package) = value::as_str(package_arg) else {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            "package argument required for relative module names",
+        ));
+    };
+    if package.is_empty() {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            "package argument required for relative module names",
+        ));
+    }
+    let dots = name.bytes().take_while(|byte| *byte == b'.').count();
+    let rest = &name[dots..];
+    let mut parts: Vec<&str> = package.split('.').filter(|part| !part.is_empty()).collect();
+    let up = dots - 1;
+    if up > parts.len() {
+        return Err(exc::raise_with_message(
+            IMPORT_ERROR,
+            "attempted relative import beyond top-level package",
+        ));
+    }
+    parts.truncate(parts.len() - up);
+    if !rest.is_empty() {
+        parts.push(rest);
+    }
+    if parts.is_empty() {
+        return Err(exc::raise_with_message(VALUE_ERROR, "Empty module name"));
+    }
+    Ok(parts.join("."))
 }
 
 /// Placeholder for the generated Unicode width tables.
@@ -86,6 +139,7 @@ fn unicode_table_placeholder() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exc::MODULE_NOT_FOUND_ERROR;
     use crate::value::{as_module, as_namespace, encode_int, str_alloc};
 
     fn text(s: &str) -> i64 {
@@ -135,6 +189,46 @@ mod tests {
         exc::init();
         call("import_module", &[text("rich.not_a_width_table")]);
         assert_eq!(exc::pending_tag(), i64::from(MODULE_NOT_FOUND_ERROR));
+    }
+
+    #[test]
+    fn dotted_user_submodules_and_relative_names_resolve() {
+        crate::core::globals::reset();
+        exc::init();
+        // Compiled modules register themselves through the `__name__` global
+        // their initializer stores, dotted submodules included.
+        crate::core::globals::set("pkg", "__name__", text("pkg"));
+        crate::core::globals::set("pkg.sub", "__name__", text("pkg.sub"));
+        crate::core::globals::set("pkg.sub", "value", encode_int(7).expect("small integer"));
+
+        let submodule = call("import_module", &[text("pkg.sub")]);
+        assert!(!exc::pending());
+        assert_eq!(
+            as_module(submodule).map(|module| module.name()),
+            Some("pkg.sub")
+        );
+
+        // A relative name resolves against the explicit package first.
+        let relative = call("import_module", &[text(".sub"), text("pkg")]);
+        assert!(!exc::pending());
+        assert_eq!(relative, submodule, "relative import must use the registry");
+
+        // A missing dotted submodule reports the exact requested name.
+        exc::clear();
+        call("import_module", &[text("pkg.missing")]);
+        assert_eq!(exc::pending_tag(), i64::from(MODULE_NOT_FOUND_ERROR));
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "No module named 'pkg.missing'"
+        );
+
+        // A relative name without a package is a `TypeError`, like CPython.
+        exc::clear();
+        call("import_module", &[text(".sub")]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+
+        crate::core::globals::reset();
+        exc::init();
     }
 
     #[test]
