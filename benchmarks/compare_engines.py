@@ -167,7 +167,7 @@ def detect_hydro(explicit: str | None) -> Engine:
     which = shutil.which("tea")
     if which:
         candidates.append(Path(which))
-    candidates.extend((ROOT.parent / "tea" / "../tea/target/release/tea", ROOT.parent / "tea" / "target/debug/tea"))
+    candidates.extend((ROOT.parent / "tea" / "target/release/tea", ROOT.parent / "tea" / "target/debug/tea"))
 
     for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):

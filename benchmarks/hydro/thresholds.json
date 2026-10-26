@@ -15,7 +15,7 @@
   "generated": "2026-10-24 15:45:52",
   "note": "Generated from the Hydro micro-benchmark baseline. max_ms is the allowed median for a failing run; regenerate with `python3 scripts/check_benchmarks.py --update`.",
   "schema": 1,
-  "source": "benchmarks/tea/results/latest.json",
+  "source": "benchmarks/hydro/results/latest.json",
   "workloads": {
     "dict_insert": {
       "hydro-aot": {

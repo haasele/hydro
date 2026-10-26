@@ -81,7 +81,7 @@ cargo build --release -p hydro-runtime
 cargo build --release --manifest-path ../tea/Cargo.toml
 
 # 3. Compatibility mode (CPython via uv)
-../tea/target/release/tea infuse main.py
+../tea/target/release/tea run main.py
 
 # 4. Hydro engine (JIT)
 ../tea/target/release/tea infuse main.py

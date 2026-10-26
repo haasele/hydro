@@ -173,7 +173,7 @@ See `CHANGELOG.md` for details; this is only the resume pointer.
 - Deterministic container/GC property tests (SplitMix64 models, no new deps)
   and dependency-free fuzz smoke tests for the frontend and runtime ABI.
 - Same-host AOT reproducibility lives in the Tea repository
-  (`docs/REPRODUCIBLE.md`, `scripts/repro_check.sh`).
+  (Tea repository: `docs/REPRODUCIBLE.md`, `scripts/repro_check.sh`).
 - Hyperfine adapter, engine comparison, explicit threshold `--check` +
   deterministic gate tests, non-blocking CI threshold report, tag-driven
   `release.yml` for Linux x64.

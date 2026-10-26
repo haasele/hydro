@@ -757,6 +757,25 @@ a data attribute (see above) or `AttributeError`. For `str`, `list`,
 - Shared mutable containers require user locks; without a GIL,
   unprotected mutations are data races and not supported behavior.
 
+#### Profile collection ABI (Tea PGO)
+
+Hydro exposes three profile-entry symbols used by `tea steep` and by AOT
+builds with `--flavor`:
+
+| Symbol | Signature | Contract |
+|---|---|---|
+| `hydro_profile_reset` | `() -> void` | Clear the process-profile map. |
+| `hydro_profile_hit` | `(const u8 *name, usize len) -> void` | Increment the entry count for a function name; null/non-UTF-8 names are ignored. |
+| `hydro_profile_dump` | `(const u8 *path, usize len) -> i32` | Write `# hydro-profile-v1` plus sorted `<count>\t<name>` lines; returns 0 on success, -1 on invalid path/IO. |
+
+Codegen uses `CodegenOptions { collect_profile, hot_functions }`:
+`collect_profile` emits a `hydro_profile_hit` at each IR-function entry; a
+non-empty `hot_functions` map lowers real function bodies in descending
+observed-count order (stable by original id) so hot code is emitted first.
+Default options emit no profile calls and preserve the historical object.
+Tea owns the durable flavor JSON and merges profile runs; Hydro only consumes
+the hot-function map.
+
 ### 3.4 Error Protocol
 
 Error-capable runtime calls set a **pending exception** on failure and

@@ -13,7 +13,7 @@ führen zu Exit-Code 1.
 
   uv run bench_hydro.py
   uv run bench_hydro.py --n 50000 --repeat 2
-  uv run bench_hydro.py --tea ../../tea/target/release/tea --json out.json
+  uv run bench_hydro.py --tea ../tea/target/release/tea --json out.json
 
 Das Hydro-Binary wird über --tea, $HYDRO_BIN, ../tea/target/release/tea oder
 ../tea/target/debug/tea (relativ zum Repo-Root) gesucht.
