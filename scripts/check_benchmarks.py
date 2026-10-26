@@ -32,8 +32,8 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULTS = ROOT / "benchmarks" / "tea" / "results" / "latest.json"
-DEFAULT_THRESHOLDS = ROOT / "benchmarks" / "tea" / "thresholds.json"
+DEFAULT_RESULTS = ROOT / "benchmarks" / "hydro" / "results" / "latest.json"
+DEFAULT_THRESHOLDS = ROOT / "benchmarks" / "hydro" / "thresholds.json"
 
 # Implementations that the gate enforces. CPython is measured for context in
 # the baseline but intentionally not gated: it is not part of this repository.
