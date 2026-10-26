@@ -194,6 +194,61 @@ impl NativeCache {
     }
 }
 
+/// Runtime-only module functions that the static spec table predates.
+///
+/// They live on the same modules and use the same arity validation as the
+/// static table; the frontend has an identical table so call sites bind the
+/// parameters by name. `types.CellType` is exposed as a callable (its value is
+/// the cached native class) and `builtins.eval`/`exec` are the builtin
+/// implementations.
+static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
+    (
+        "builtins.eval",
+        stdlib::FunctionSpec {
+            name: "eval",
+            min_args: 1,
+            max_args: 3,
+            ret: hydro_ir::Type::Any,
+            params: &["source", "globals", "locals"],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "builtins.exec",
+        stdlib::FunctionSpec {
+            name: "exec",
+            min_args: 1,
+            max_args: 3,
+            ret: hydro_ir::Type::Any,
+            params: &["source", "globals", "locals"],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "types.CellType",
+        stdlib::FunctionSpec {
+            name: "CellType",
+            min_args: 0,
+            max_args: 1,
+            ret: hydro_ir::Type::Any,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+];
+
+/// Resolves a [`SUPPLEMENTAL_FUNCTIONS`] entry by module and member name.
+fn supplemental_function(module: &str, function: &str) -> Option<&'static stdlib::FunctionSpec> {
+    SUPPLEMENTAL_FUNCTIONS
+        .iter()
+        .find(|(qualified, _)| {
+            qualified
+                .split_once('.')
+                .is_some_and(|(owner, name)| owner == module && name == function)
+        })
+        .map(|(_, spec)| spec)
+}
+
 /// Resolves a native call without the cache. The spec table owns the names,
 /// so they are interned as `&'static str` and error rendering never allocates
 /// on the hit path.
@@ -201,8 +256,11 @@ fn resolve_native(
     module: &str,
     function: &str,
 ) -> Option<(&'static str, &'static str, &'static stdlib::FunctionSpec)> {
-    let spec = stdlib::function(module, function)?;
     let module_name = stdlib::module(module)?.name;
+    if let Some(spec) = supplemental_function(module, function) {
+        return Some((module_name, spec.name, spec));
+    }
+    let spec = stdlib::function(module, function)?;
     Some((module_name, spec.name, spec))
 }
 
@@ -426,13 +484,11 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if stdlib::constant(module, name).is_some() {
         return constant_value(module, name);
     }
-    // Builtins that Hydro knows as bare compiler builtins but that have no
-    // central spec entry (`eval`, `exec`) still exist on the `builtins`
-    // module, matching `builtins.__dict__` below.
-    if module == "builtins" {
-        if let Some(value) = extra_builtin(name) {
-            return value;
-        }
+    // Runtime-only members (`builtins.eval`, `builtins.exec`,
+    // `types.CellType`) have no central spec entry but still exist on their
+    // modules, matching `module.__dict__` below.
+    if let Some(value) = supplemental_value(module, name) {
+        return value;
     }
     // Compiled user modules keep their attributes in the globals side store.
     // Native modules win above, so a user module named like a stdlib module
@@ -444,15 +500,16 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     missing_attribute(module, name)
 }
 
-/// Builtins without a central spec entry, exposed through the `builtins`
-/// module and its namespace mapping.
-fn extra_builtin(name: &str) -> Option<i64> {
-    let builtin = match name {
-        "eval" => hydro_ir::Builtin::Eval,
-        "exec" => hydro_ir::Builtin::Exec,
-        _ => return None,
-    };
-    Some(value::builtin_function_new(builtin))
+/// Values of the runtime-only module members. `builtins.eval`/`exec` are the
+/// builtin function objects; `types.CellType` is the cached native class (a
+/// class value is callable and works as an `isinstance` target).
+fn supplemental_value(module: &str, name: &str) -> Option<i64> {
+    match (module, name) {
+        ("builtins", "eval") => Some(value::builtin_function_new(hydro_ir::Builtin::Eval)),
+        ("builtins", "exec") => Some(value::builtin_function_new(hydro_ir::Builtin::Exec)),
+        ("types", "CellType") => Some(types::cell_type_class()),
+        _ => None,
+    }
 }
 
 /// `module.__dict__` / `vars(module)`: the module's namespace mapping.
@@ -479,9 +536,13 @@ pub(crate) fn module_dict(module: &str) -> i64 {
     };
     let mut names: Vec<&'static str> = spec.functions.iter().map(|f| f.name).collect();
     names.extend(spec.constants.iter().map(|c| c.name));
-    if module == "builtins" {
-        names.push("eval");
-        names.push("exec");
+    match module {
+        "builtins" => {
+            names.push("eval");
+            names.push("exec");
+        }
+        "types" => names.push("CellType"),
+        _ => {}
     }
     for name in names {
         let item = module_get_named(module, name);

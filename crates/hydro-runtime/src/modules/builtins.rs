@@ -21,9 +21,9 @@
 //!   is not part of the frontend's class model).
 //! - `iter(callable, sentinel)`: `NotImplementedError` (only container
 //!   iterators exist).
-//! - `__dict__` on the `builtins` module: absent, because no real mutable
-//!   namespace backs it (dropping it is honest; returning a detached dict
-//!   would not be).
+//! - `builtins.__dict__` is a snapshot of the module namespace (the same
+//!   mapping `vars(builtins)` returns): the names and values are real, but
+//!   mutating the snapshot does not change the module.
 //!
 //! `vars(instance)` returns the same fresh dict snapshot as `obj.__dict__`;
 //! `vars(class)` snapshots the frozen class namespace. Hydro class namespaces

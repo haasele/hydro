@@ -8484,7 +8484,7 @@ class C:
 }
 
 #[test]
-fn class_bases_metaclass_and_slots_are_lowered_or_diagnosed() {
+fn class_bases_metaclass_and_slots_are_lowered() {
     let source = "\
 class A:
     pass
@@ -8511,12 +8511,22 @@ class C(A, B, metaclass=type):
     assert_eq!(bases.len(), 2);
     assert!(metaclass.is_some());
 
+    // `__slots__` is a class attribute: the runtime parses it into the class's
+    // slot table (`value::parse_slots`), so the frontend must accept it.
     let source = "class D:\n    __slots__ = ('x',)\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert!(
-        diags.iter().any(|diag| diag.message.contains("__slots__")),
-        "{diags:?}"
-    );
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let class = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::ClassDef {
+                name, attributes, ..
+            } if name == "D" => Some(attributes),
+            _ => None,
+        })
+        .expect("class D");
+    assert!(class.iter().any(|(name, _)| name == "__slots__"));
 }
 
 #[test]
@@ -9114,4 +9124,245 @@ fn class_body_statements_run_against_a_runtime_namespace() {
         hir.functions[0].body[0].kind
     );
     crate::sema::check(&hir, &mut infer, "test.py").expect("valid program");
+}
+
+#[test]
+fn conditional_module_definitions_bind_through_the_global_table() {
+    let source = "\
+if True:
+    def f():
+        return 1
+try:
+    def g():
+        return 2
+except Exception:
+    pass
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(hir.functions.iter().any(|function| function.name == "f"));
+    assert!(hir.functions.iter().any(|function| function.name == "g"));
+    assert!(has_global_set(&hir.functions[0].body));
+
+    // The definitions are conditional, so they never enter the static
+    // function table: calls resolve through the runtime binding.
+    let call = "if True:\n    def f():\n        return 1\nx = f()\n";
+    let (hir, _, diags) = lower_source(call, &parse(call));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        assigned(&hir, "x").kind,
+        HExprKind::IndirectCall { .. }
+    ));
+}
+
+#[test]
+fn conditional_module_class_definitions_are_registered() {
+    let source = "\
+if True:
+    class C:
+        def m(self):
+            return 1
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(hir.functions.iter().any(|function| function.name == "C.m"));
+    fn has_class(stmts: &[HStmt]) -> bool {
+        stmts.iter().any(|stmt| match &stmt.kind {
+            HStmtKind::ClassDef { name, .. } if name == "C" => true,
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => has_class(then_body) || has_class(else_body),
+            _ => false,
+        })
+    }
+    assert!(has_class(&hir.functions[0].body));
+}
+
+#[test]
+fn class_body_delete_binds_and_missing_names_raise_name_error() {
+    let source = "\
+class C:
+    x = 1
+    del x
+    del missing
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    fn contains_name_error(stmts: &[HStmt]) -> bool {
+        stmts.iter().any(|stmt| match &stmt.kind {
+            HStmtKind::Raise {
+                exc: Some(ExcKind::NameError),
+                ..
+            } => true,
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => contains_name_error(then_body) || contains_name_error(else_body),
+            HStmtKind::While {
+                body, else_body, ..
+            }
+            | HStmtKind::ForRange {
+                body, else_body, ..
+            }
+            | HStmtKind::ForEach {
+                body, else_body, ..
+            } => contains_name_error(body) || contains_name_error(else_body),
+            HStmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                contains_name_error(body)
+                    || handlers
+                        .iter()
+                        .any(|handler| contains_name_error(&handler.body))
+                    || contains_name_error(else_body)
+                    || contains_name_error(finally_body)
+            }
+            _ => false,
+        })
+    }
+    assert!(contains_name_error(&hir.functions[0].body));
+}
+
+#[test]
+fn builtins_module_exposes_dict_eval_exec_globals_and_locals() {
+    let source = "\
+import builtins
+d = builtins.__dict__
+e = builtins.eval
+x = builtins.exec
+g = builtins.globals
+l = builtins.locals
+";
+    let hir = lower_ok(source);
+    for (name, member) in [
+        ("d", "__dict__"),
+        ("e", "eval"),
+        ("x", "exec"),
+        ("g", "globals"),
+        ("l", "locals"),
+    ] {
+        match &assigned(&hir, name).kind {
+            HExprKind::ModuleAttr { module, name } => {
+                assert_eq!((module.as_str(), name.as_str()), ("builtins", member));
+            }
+            other => panic!("expected module attribute for {name}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn eval_keyword_arguments_are_folded_into_positional_slots() {
+    let source = "\
+a = eval('x + 1', globals={'x': 1}, locals={})
+b = eval('x', locals={'x': 2})
+";
+    let hir = lower_ok(source);
+    for name in ["a", "b"] {
+        match &assigned(&hir, name).kind {
+            HExprKind::Call {
+                callee: Callee::Builtin(Builtin::Eval),
+                args,
+            } => {
+                assert_eq!(args.len(), 3, "{name}");
+                if name == "b" {
+                    assert!(matches!(&args[1].kind, HExprKind::Const(Const::None)));
+                }
+            }
+            other => panic!("expected eval() call for {name}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn types_celltype_is_a_callable_module_member() {
+    let source = "\
+import types
+c = types.CellType(1)
+flag = isinstance(c, types.CellType)
+";
+    let hir = lower_ok(source);
+    match &assigned(&hir, "c").kind {
+        HExprKind::ModuleCall {
+            module, function, ..
+        } => assert_eq!((module.as_str(), function.as_str()), ("types", "CellType")),
+        other => panic!("expected types.CellType call, got {other:?}"),
+    }
+}
+
+#[test]
+fn bootstrap_language_slice_is_implemented() {
+    // The implemented slice that unblocks the first NumPy/annotationlib
+    // lowering stages. This deliberately does not claim annotationlib itself
+    // imports cleanly: its remaining dependencies are tracked in docs/TODO.
+    let source = "\
+if True:
+    def conditional():
+        return 1
+class WithSlots:
+    __slots__ = ('x',)
+class Dynamic:
+    value = 1
+    del value
+    del missing
+import builtins
+namespace = builtins.__dict__
+number = eval('1 + 2 * 3', globals={}, locals={})
+import types
+cell = types.CellType(1)
+flag = isinstance(cell, types.CellType)
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(hir
+        .functions
+        .iter()
+        .any(|function| function.name == "conditional"));
+
+    let mut has_slots = false;
+    let mut has_dynamic_class = false;
+    for stmt in &hir.functions[0].body {
+        match &stmt.kind {
+            HStmtKind::ClassDef {
+                name, attributes, ..
+            } => {
+                if name == "WithSlots" {
+                    has_slots |= attributes.iter().any(|(name, _)| name == "__slots__");
+                }
+                if name == "Dynamic" {
+                    has_dynamic_class = true;
+                }
+            }
+            HStmtKind::If { then_body, .. } => {
+                has_dynamic_class |= then_body
+                    .iter()
+                    .any(|stmt| matches!(&stmt.kind, HStmtKind::SetSubscript { .. }));
+            }
+            _ => {}
+        }
+    }
+    assert!(has_slots);
+    // A class body with `del` lowers to the dynamic namespace sequence.
+    assert!(has_dynamic_class);
+}
+
+#[test]
+#[ignore = "blocked on typing/warnings/ast/NameError parity; tracked in docs/TODO"]
+fn annotationlib_lowers_without_diagnostics() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.hydro/cpython/Python-3.14.9/Lib/annotationlib.py");
+    let Ok(source) = fs::read_to_string(&path) else {
+        // The CPython source tree is an optional fixture; the gate that owns
+        // it runs the real import.
+        return;
+    };
+    let module = parse(&source);
+    let (_, _, diags) = lower_source(&source, &module);
+    assert!(diags.is_empty(), "{diags:?}");
 }

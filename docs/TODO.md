@@ -1122,7 +1122,12 @@ checked entries count as delivered slices, not as complete parity.
 - [ ] `_strptime`
 - [ ] `_threading_local`
 - [ ] `_weakrefset`
-- [ ] `annotationlib`
+- [ ] `annotationlib` — blocked on these exact runtime surfaces:
+  - `typing._deprecation_warning_for_no_type_params_passed`
+  - `typing.evaluate_forward_ref`
+  - `warnings._deprecated`
+  - `ast.parse` / `ast.unparse` (Hydro's `ast` shim only implements `literal_eval`)
+  - `NameError` keyword arguments (`NameError(msg, name=...)`)
 - [ ] `antigravity`
 - [x] `ast`
 - [x] `base64`

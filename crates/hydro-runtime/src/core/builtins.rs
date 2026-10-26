@@ -4,7 +4,8 @@
 
 use std::io::Write as _;
 
-use hydro_ir::{stdlib, Builtin, MethodKind, ParamKind};
+use hydro_ir::{stdlib, BinOp, Builtin, MethodKind, ParamKind, UnOp};
+use num_bigint::BigInt;
 
 use crate::container;
 use crate::core::globals;
@@ -1817,6 +1818,73 @@ pub(crate) fn call_kw(
         );
     };
     let name = func.name.clone();
+    // `eval`/`exec` are builtins with named parameters. Bind `source`,
+    // `globals` and `locals` keywords into the positional slots their runtime
+    // entry points expect; every other builtin rejects keywords (matching its
+    // direct call lowering).
+    if let FunctionBody::Builtin(builtin) = &func.body {
+        if matches!(builtin, Builtin::Eval | Builtin::Exec) {
+            let args = if argc == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: nil with argc > 0 was rejected by the caller.
+                unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+            };
+            if args.len() > 3 {
+                return builtin_arity_error(builtin.name(), "1 to 3", args.len());
+            }
+            let mut slots: Vec<Option<i64>> = vec![None; 3];
+            for (index, argument) in args.into_iter().enumerate() {
+                slots[index] = Some(argument);
+            }
+            let pairs = if kwargc == 0 {
+                &[][..]
+            } else {
+                // SAFETY: the caller validated the buffer and its length.
+                unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) }
+            };
+            let mut provided = slots
+                .iter()
+                .rposition(Option::is_some)
+                .map_or(0, |index| index + 1);
+            for pair in pairs.as_chunks::<2>().0 {
+                let Some(keyword) = value::as_str(pair[0]) else {
+                    return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                };
+                let index = match keyword {
+                    "source" => 0,
+                    "globals" => 1,
+                    "locals" => 2,
+                    _ => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!(
+                                "{}() got an unexpected keyword argument '{keyword}'",
+                                builtin.name()
+                            ),
+                        )
+                    }
+                };
+                if slots[index].is_some() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!(
+                            "{}() got multiple values for argument '{keyword}'",
+                            builtin.name()
+                        ),
+                    );
+                }
+                slots[index] = Some(pair[1]);
+                provided = provided.max(index + 1);
+            }
+            let bound: Vec<i64> = slots
+                .into_iter()
+                .take(provided)
+                .map(|slot| slot.unwrap_or(NONE))
+                .collect();
+            return call_builtin(*builtin, bound.len(), bound.as_ptr());
+        }
+    }
     let signature = value::function_signature(function);
     let entry = value::function_full_entry(function);
     if signature.is_empty() {
@@ -2215,6 +2283,20 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return exc::raise_with_message(TYPE_ERROR, "class instantiation has too many arguments");
     }
+    // `types.CellType` is a plain native class with one optional initial
+    // value. Its cached class value is callable through the normal class
+    // path, so route it to the cell constructor before generic instantiation
+    // rejects the argument.
+    if globals::registry_get("types.CellType") == Some(class) {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: argc > 0 implies a non-null, readable buffer; the check
+            // above validated the count.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        return modules::types::call("CellType", args);
+    }
     if let Some(tag) = exc::exception_tag_of_class(class) {
         return instantiate_exception(tag, argc, argv);
     }
@@ -2512,28 +2594,6 @@ fn source_snippet(source: &str) -> String {
     snippet
 }
 
-/// Whether `text` is a plain Python identifier (ASCII or Unicode letters).
-fn is_python_identifier(text: &str) -> bool {
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) if first == '_' || first.is_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|c| c == '_' || c.is_alphanumeric())
-}
-
-/// Splits a dotted name expression (`pkg.attr`) into its identifier parts.
-fn dotted_name_parts(text: &str) -> Option<Vec<&str>> {
-    let mut parts = Vec::new();
-    for part in text.split('.') {
-        if !is_python_identifier(part) {
-            return None;
-        }
-        parts.push(part);
-    }
-    (!parts.is_empty()).then_some(parts)
-}
-
 /// Reads `name` from a namespace dict, without raising for a miss.
 fn namespace_get(namespace: i64, name: &str) -> Option<i64> {
     let entries = value::as_dict(namespace)?;
@@ -2544,13 +2604,13 @@ fn namespace_get(namespace: i64, name: &str) -> Option<i64> {
 
 /// `eval(source[, globals[, locals]])`.
 ///
-/// Hydro has no runtime Python compiler. The forms a bootstrap path actually
-/// evaluates are supported without one: literals through the shared `ast`
-/// literal parser (which gives `ast.literal_eval` the same grammar) and bare
-/// or dotted names looked up in the caller-supplied namespaces, then in
-/// `builtins` (a miss is `NameError`, which probe code relies on). Any other
-/// expression raises a tagged `NotImplementedError`; nothing is guessed or
-/// silently returned.
+/// Hydro has no runtime Python compiler. A recursive-descent evaluator covers
+/// the forms annotation libraries actually evaluate: literals, names,
+/// attribute reads, subscripts, unary/binary arithmetic, shifts, bitwise
+/// operators, comparisons and boolean operators. Names resolve in `locals`,
+/// then `globals`, then `builtins`; a miss is a real `NameError`. Call,
+/// comprehension and lambda forms raise a tagged `NotImplementedError`
+/// instead of guessing.
 fn eval_builtin(args: &[i64]) -> i64 {
     let (source, global_ns, local_ns) = match args {
         [source] => (*source, NONE, NONE),
@@ -2595,49 +2655,827 @@ fn eval_builtin(args: &[i64]) -> i64 {
     }
     exc::clear();
 
-    let Some(parts) = dotted_name_parts(trimmed) else {
-        return exc::raise_with_message(
+    let mut parser = EvalParser::new(trimmed, global_ns, local_ns);
+    match parser.parse_document() {
+        Ok(value) => value,
+        Err(EvalError::Pending) => NONE,
+        Err(EvalError::Name(name)) => {
+            exc::raise_with_message(NAME_ERROR, &format!("name '{name}' is not defined"))
+        }
+        Err(EvalError::Syntax) => exc::raise_with_message(SYNTAX_ERROR, "invalid syntax"),
+        Err(EvalError::Unsupported) => exc::raise_with_message(
             NOT_IMPLEMENTED_ERROR,
             &format!(
-                "eval() cannot compile Python source at runtime in Hydro: '{}' \
-                 (whole programs are compiled ahead of time)",
+                "eval() cannot compile this expression at runtime in Hydro: '{}' \
+                 (only literals, names, attributes, subscripts and arithmetic \
+                 expressions are evaluated; whole programs are compiled ahead of time)",
                 source_snippet(trimmed)
             ),
-        );
-    };
-    let mut found = None;
-    for namespace in [local_ns, global_ns] {
-        if namespace == NONE {
-            continue;
+        ),
+    }
+}
+
+/// Failure of the runtime expression evaluator.
+enum EvalError {
+    /// A runtime operation raised; the pending exception is already set.
+    Pending,
+    Name(String),
+    Syntax,
+    Unsupported,
+}
+
+type EvalResult = Result<i64, EvalError>;
+
+/// Recursive-descent evaluator for the expression subset `eval` supports.
+///
+/// The grammar covers the forms annotation libraries actually evaluate:
+/// literals, names, attribute reads, subscripts, unary/binary arithmetic,
+/// shifts, bitwise operators, comparisons and short-circuiting boolean
+/// operators. A call, comprehension or lambda is reported as unsupported
+/// (`NotImplementedError`) instead of being guessed.
+struct EvalParser {
+    chars: Vec<char>,
+    position: usize,
+    global_ns: i64,
+    local_ns: i64,
+}
+
+impl EvalParser {
+    fn new(source: &str, global_ns: i64, local_ns: i64) -> EvalParser {
+        EvalParser {
+            chars: source.chars().collect(),
+            position: 0,
+            global_ns,
+            local_ns,
         }
-        if let Some(item) = namespace_get(namespace, parts[0]) {
-            found = Some(item);
+    }
+
+    fn parse_document(&mut self) -> EvalResult {
+        let value = self.parse_or()?;
+        self.skip_whitespace();
+        if self.position != self.chars.len() {
+            return Err(EvalError::Syntax);
+        }
+        Ok(value)
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.position).copied()
+    }
+
+    fn peek_at(&self, offset: usize) -> Option<char> {
+        self.chars.get(self.position + offset).copied()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.peek().is_some_and(char::is_whitespace) {
+            self.position += 1;
+        }
+    }
+
+    /// Consumes `symbol` after optional whitespace, rewinding on failure.
+    fn match_symbol(&mut self, symbol: &str) -> bool {
+        self.skip_whitespace();
+        let start = self.position;
+        for expected in symbol.chars() {
+            if self.peek() != Some(expected) {
+                self.position = start;
+                return false;
+            }
+            self.position += 1;
+        }
+        true
+    }
+
+    /// Consumes a keyword only when it ends at an identifier boundary.
+    fn eat_keyword(&mut self, keyword: &str) -> bool {
+        self.skip_whitespace();
+        let start = self.position;
+        for expected in keyword.chars() {
+            if self.peek() != Some(expected) {
+                self.position = start;
+                return false;
+            }
+            self.position += 1;
+        }
+        if self
+            .peek()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+        {
+            self.position = start;
+            return false;
+        }
+        true
+    }
+
+    fn match_phrase(&mut self, phrase: &[&str]) -> bool {
+        self.skip_whitespace();
+        let start = self.position;
+        for word in phrase {
+            if !self.eat_keyword(word) {
+                self.position = start;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True when the next two non-space characters are `**` (so the
+    /// multiplication level must not consume a single `*`).
+    fn peek_double_star(&mut self) -> bool {
+        self.skip_whitespace();
+        self.peek() == Some('*') && self.peek_at(1) == Some('*')
+    }
+
+    fn parse_or(&mut self) -> EvalResult {
+        let mut left = self.parse_and()?;
+        while self.eat_keyword("or") {
+            let roots = crate::heap::root_values(&[left]);
+            let right = match self.parse_and() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            let selected = if value::truthy(left) { left } else { right };
+            crate::heap::release_roots(roots);
+            left = selected;
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> EvalResult {
+        let mut left = self.parse_not()?;
+        while self.eat_keyword("and") {
+            let roots = crate::heap::root_values(&[left]);
+            let right = match self.parse_not() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            let selected = if value::truthy(left) { right } else { left };
+            crate::heap::release_roots(roots);
+            left = selected;
+        }
+        Ok(left)
+    }
+
+    fn parse_not(&mut self) -> EvalResult {
+        if self.eat_keyword("not") {
+            let operand = self.parse_not()?;
+            return self.apply_unary(UnOp::Not, operand);
+        }
+        self.parse_comparison()
+    }
+
+    fn parse_comparison(&mut self) -> EvalResult {
+        let mut left = self.parse_bitor()?;
+        let mut compared = false;
+        loop {
+            let op = if self.match_phrase(&["is", "not"]) {
+                Some(BinOp::IsNot)
+            } else if self.eat_keyword("is") {
+                Some(BinOp::Is)
+            } else if self.match_phrase(&["not", "in"]) {
+                Some(BinOp::NotIn)
+            } else if self.eat_keyword("in") {
+                Some(BinOp::In)
+            } else if self.match_symbol("==") {
+                Some(BinOp::Eq)
+            } else if self.match_symbol("!=") {
+                Some(BinOp::Ne)
+            } else if self.match_symbol("<=") {
+                Some(BinOp::Le)
+            } else if self.match_symbol(">=") {
+                Some(BinOp::Ge)
+            } else if self.match_symbol("<") {
+                Some(BinOp::Lt)
+            } else if self.match_symbol(">") {
+                Some(BinOp::Gt)
+            } else {
+                None
+            };
+            let Some(op) = op else { break };
+            let roots = crate::heap::root_values(&[left]);
+            let right = match self.parse_bitor() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            let result = ops::binop(op.code(), left, right);
+            crate::heap::release_roots(roots);
+            if exc::pending() {
+                return Err(EvalError::Pending);
+            }
+            compared = true;
+            // Chained comparisons compare the previous right operand next.
+            // Python evaluates until the first false result.
+            left = right;
+            if !value::truthy(result) {
+                return Ok(value::FALSE);
+            }
+        }
+        if compared {
+            Ok(value::TRUE)
+        } else {
+            Ok(left)
+        }
+    }
+
+    fn parse_bitor(&mut self) -> EvalResult {
+        let mut left = self.parse_bitxor()?;
+        while self.match_symbol("|") {
+            let roots = crate::heap::root_values(&[left]);
+            let right = match self.parse_bitxor() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            let result = ops::binop(BinOp::BitOr.code(), left, right);
+            crate::heap::release_roots(roots);
+            if exc::pending() {
+                return Err(EvalError::Pending);
+            }
+            left = result;
+        }
+        Ok(left)
+    }
+
+    fn parse_bitxor(&mut self) -> EvalResult {
+        let mut left = self.parse_bitand()?;
+        while self.match_symbol("^") {
+            let roots = crate::heap::root_values(&[left]);
+            let right = match self.parse_bitand() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            let result = ops::binop(BinOp::BitXor.code(), left, right);
+            crate::heap::release_roots(roots);
+            if exc::pending() {
+                return Err(EvalError::Pending);
+            }
+            left = result;
+        }
+        Ok(left)
+    }
+
+    fn parse_bitand(&mut self) -> EvalResult {
+        let mut left = self.parse_shift()?;
+        while self.match_symbol("&") {
+            let roots = crate::heap::root_values(&[left]);
+            let right = match self.parse_shift() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            let result = ops::binop(BinOp::BitAnd.code(), left, right);
+            crate::heap::release_roots(roots);
+            if exc::pending() {
+                return Err(EvalError::Pending);
+            }
+            left = result;
+        }
+        Ok(left)
+    }
+
+    fn parse_shift(&mut self) -> EvalResult {
+        let mut left = self.parse_additive()?;
+        loop {
+            let op = if self.match_symbol("<<") {
+                Some(BinOp::Shl)
+            } else if self.match_symbol(">>") {
+                Some(BinOp::Shr)
+            } else {
+                None
+            };
+            let Some(op) = op else { break };
+            let roots = crate::heap::root_values(&[left]);
+            let right = match self.parse_additive() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            let result = ops::binop(op.code(), left, right);
+            crate::heap::release_roots(roots);
+            if exc::pending() {
+                return Err(EvalError::Pending);
+            }
+            left = result;
+        }
+        Ok(left)
+    }
+
+    fn parse_additive(&mut self) -> EvalResult {
+        let mut left = self.parse_multiplicative()?;
+        loop {
+            let op = if self.match_symbol("+") {
+                Some(BinOp::Add)
+            } else if self.match_symbol("-") {
+                Some(BinOp::Sub)
+            } else {
+                None
+            };
+            let Some(op) = op else { break };
+            let roots = crate::heap::root_values(&[left]);
+            let right = match self.parse_multiplicative() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            let result = ops::binop(op.code(), left, right);
+            crate::heap::release_roots(roots);
+            if exc::pending() {
+                return Err(EvalError::Pending);
+            }
+            left = result;
+        }
+        Ok(left)
+    }
+
+    fn parse_multiplicative(&mut self) -> EvalResult {
+        let mut left = self.parse_factor()?;
+        loop {
+            if self.peek_double_star() {
+                break;
+            }
+            let op = if self.match_symbol("//") {
+                Some(BinOp::FloorDiv)
+            } else if self.match_symbol("*") {
+                Some(BinOp::Mul)
+            } else if self.match_symbol("/") {
+                Some(BinOp::Div)
+            } else if self.match_symbol("%") {
+                Some(BinOp::Mod)
+            } else {
+                None
+            };
+            let Some(op) = op else { break };
+            let roots = crate::heap::root_values(&[left]);
+            let right = match self.parse_factor() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            let result = ops::binop(op.code(), left, right);
+            crate::heap::release_roots(roots);
+            if exc::pending() {
+                return Err(EvalError::Pending);
+            }
+            left = result;
+        }
+        Ok(left)
+    }
+
+    fn parse_factor(&mut self) -> EvalResult {
+        if self.match_symbol("+") {
+            let operand = self.parse_factor()?;
+            return self.apply_unary(UnOp::Pos, operand);
+        }
+        if self.match_symbol("-") {
+            let operand = self.parse_factor()?;
+            return self.apply_unary(UnOp::Neg, operand);
+        }
+        if self.match_symbol("~") {
+            let operand = self.parse_factor()?;
+            return self.apply_unary(UnOp::Invert, operand);
+        }
+        self.parse_power()
+    }
+
+    fn parse_power(&mut self) -> EvalResult {
+        let base = self.parse_postfix()?;
+        if self.match_symbol("**") {
+            let roots = crate::heap::root_values(&[base]);
+            let exponent = match self.parse_factor() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            let result = ops::binop(BinOp::Pow.code(), base, exponent);
+            crate::heap::release_roots(roots);
+            if exc::pending() {
+                return Err(EvalError::Pending);
+            }
+            return Ok(result);
+        }
+        Ok(base)
+    }
+
+    fn parse_postfix(&mut self) -> EvalResult {
+        let mut value = self.parse_atom()?;
+        loop {
+            if self.match_symbol(".") {
+                let Some(name) = self.parse_identifier() else {
+                    return Err(EvalError::Syntax);
+                };
+                let roots = crate::heap::root_values(&[value]);
+                let attribute = methods::getattr(value, name.as_ptr(), name.len());
+                crate::heap::release_roots(roots);
+                if exc::pending() {
+                    return Err(EvalError::Pending);
+                }
+                value = attribute;
+                continue;
+            }
+            if self.match_symbol("[") {
+                let roots = crate::heap::root_values(&[value]);
+                let index = match self.parse_or() {
+                    Ok(index) => index,
+                    Err(error) => {
+                        crate::heap::release_roots(roots);
+                        return Err(error);
+                    }
+                };
+                if !self.match_symbol("]") {
+                    crate::heap::release_roots(roots);
+                    return Err(EvalError::Syntax);
+                }
+                let roots = crate::heap::root_values(&[index]);
+                let item = container::subscript(value, index);
+                crate::heap::release_roots(roots);
+                if exc::pending() {
+                    return Err(EvalError::Pending);
+                }
+                value = item;
+                continue;
+            }
+            if self.match_symbol("(") {
+                // A runtime call would need the full call protocol; annotation
+                // evaluation does not rely on it, so report it as unsupported
+                // instead of executing only part of the expression.
+                return Err(EvalError::Unsupported);
+            }
             break;
         }
+        Ok(value)
     }
-    let mut current = match found {
-        Some(item) => item,
-        None => {
-            let item = modules::module_get_by_name("builtins", parts[0]);
-            if exc::pending() {
-                if exc::pending_tag() == exc::ATTRIBUTE_ERROR as i64 {
-                    exc::clear();
-                }
-                return exc::raise_with_message(
-                    NAME_ERROR,
-                    &format!("name '{}' is not defined", parts[0]),
-                );
+
+    fn parse_atom(&mut self) -> EvalResult {
+        self.skip_whitespace();
+        match self.peek() {
+            None => Err(EvalError::Syntax),
+            Some('(') => self.parse_parenthesized(),
+            Some('[') => self.parse_list(),
+            Some('{') => self.parse_braces(),
+            Some('"' | '\'') => self.parse_string(),
+            Some(ch) if ch.is_ascii_digit() || ch == '.' => self.parse_number(),
+            Some(ch) if ch == '_' || ch.is_alphabetic() => self.parse_name_atom(),
+            Some(_) => Err(EvalError::Syntax),
+        }
+    }
+
+    fn parse_parenthesized(&mut self) -> EvalResult {
+        self.match_symbol("(");
+        if self.match_symbol(")") {
+            return Ok(value::tuple_new(Vec::new()));
+        }
+        let first = self.parse_or()?;
+        if !self.match_symbol(",") {
+            if !self.match_symbol(")") {
+                return Err(EvalError::Syntax);
             }
-            item
+            return Ok(first);
         }
-    };
-    for part in &parts[1..] {
-        current = methods::getattr(current, part.as_ptr(), part.len());
-        if exc::pending() {
-            return NONE;
+        let roots = crate::heap::root_values(&[first]);
+        let mut items = vec![first];
+        loop {
+            if self.match_symbol(")") {
+                break;
+            }
+            let item = match self.parse_or() {
+                Ok(item) => item,
+                Err(error) => {
+                    crate::heap::release_roots(roots);
+                    return Err(error);
+                }
+            };
+            crate::heap::root_values(&[item]);
+            items.push(item);
+            if self.match_symbol(",") {
+                continue;
+            }
+            if !self.match_symbol(")") {
+                crate::heap::release_roots(roots);
+                return Err(EvalError::Syntax);
+            }
+            break;
+        }
+        let tuple = value::tuple_new(items);
+        crate::heap::release_roots(roots);
+        Ok(tuple)
+    }
+
+    fn parse_list(&mut self) -> EvalResult {
+        self.match_symbol("[");
+        let mark = crate::heap::root_values(&[]);
+        let mut items = Vec::new();
+        loop {
+            if self.match_symbol("]") {
+                break;
+            }
+            let item = match self.parse_or() {
+                Ok(item) => item,
+                Err(error) => {
+                    crate::heap::release_roots(mark);
+                    return Err(error);
+                }
+            };
+            crate::heap::root_values(&[item]);
+            items.push(item);
+            if self.match_symbol(",") {
+                continue;
+            }
+            if !self.match_symbol("]") {
+                crate::heap::release_roots(mark);
+                return Err(EvalError::Syntax);
+            }
+            break;
+        }
+        let list = value::list_new(items);
+        crate::heap::release_roots(mark);
+        Ok(list)
+    }
+
+    fn parse_braces(&mut self) -> EvalResult {
+        self.match_symbol("{");
+        if self.match_symbol("}") {
+            return Ok(value::dict_new(Vec::new()));
+        }
+        let mark = crate::heap::root_values(&[]);
+        let first = match self.parse_or() {
+            Ok(value) => value,
+            Err(error) => {
+                crate::heap::release_roots(mark);
+                return Err(error);
+            }
+        };
+        // Park the first element while the rest of the literal is parsed.
+        crate::heap::root_values(&[first]);
+        if self.match_symbol(":") {
+            let mut pairs = Vec::new();
+            let value = match self.parse_or() {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::heap::release_roots(mark);
+                    return Err(error);
+                }
+            };
+            crate::heap::root_values(&[value]);
+            pairs.push((first, value));
+            loop {
+                if self.match_symbol("}") {
+                    break;
+                }
+                if !self.match_symbol(",") {
+                    crate::heap::release_roots(mark);
+                    return Err(EvalError::Syntax);
+                }
+                if self.match_symbol("}") {
+                    break;
+                }
+                let key = match self.parse_or() {
+                    Ok(key) => key,
+                    Err(error) => {
+                        crate::heap::release_roots(mark);
+                        return Err(error);
+                    }
+                };
+                if !self.match_symbol(":") {
+                    crate::heap::release_roots(mark);
+                    return Err(EvalError::Syntax);
+                }
+                let value = match self.parse_or() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        crate::heap::release_roots(mark);
+                        return Err(error);
+                    }
+                };
+                crate::heap::root_values(&[key, value]);
+                pairs.push((key, value));
+            }
+            let dict = value::dict_new(pairs);
+            crate::heap::release_roots(mark);
+            return Ok(dict);
+        }
+        let mut items = vec![first];
+        loop {
+            if self.match_symbol("}") {
+                break;
+            }
+            if !self.match_symbol(",") {
+                crate::heap::release_roots(mark);
+                return Err(EvalError::Syntax);
+            }
+            if self.match_symbol("}") {
+                break;
+            }
+            let item = match self.parse_or() {
+                Ok(item) => item,
+                Err(error) => {
+                    crate::heap::release_roots(mark);
+                    return Err(error);
+                }
+            };
+            crate::heap::root_values(&[item]);
+            items.push(item);
+        }
+        let set = value::set_new(items);
+        crate::heap::release_roots(mark);
+        Ok(set)
+    }
+
+    fn parse_string(&mut self) -> EvalResult {
+        self.skip_whitespace();
+        let start = self.position;
+        let Some(quote) = self.peek() else {
+            return Err(EvalError::Syntax);
+        };
+        self.position += 1;
+        loop {
+            match self.peek() {
+                None => return Err(EvalError::Syntax),
+                Some('\\') => {
+                    self.position += 1;
+                    if self.peek().is_none() {
+                        return Err(EvalError::Syntax);
+                    }
+                    self.position += 1;
+                }
+                Some(ch) if ch == quote => {
+                    self.position += 1;
+                    break;
+                }
+                Some(_) => self.position += 1,
+            }
+        }
+        let literal: String = self.chars[start..self.position].iter().collect();
+        let source = value::str_alloc(literal);
+        let roots = crate::heap::root_values(&[source]);
+        let parsed = modules::ast::call("literal_eval", &[source]);
+        let failed = exc::pending();
+        if failed {
+            exc::clear();
+        }
+        crate::heap::release_roots(roots);
+        if failed {
+            return Err(EvalError::Syntax);
+        }
+        Ok(parsed)
+    }
+
+    fn parse_number(&mut self) -> EvalResult {
+        self.skip_whitespace();
+        let start = self.position;
+        let hexadecimal = self.peek() == Some('0') && matches!(self.peek_at(1), Some('x' | 'X'))
+            || self.peek() == Some('0') && matches!(self.peek_at(1), Some('o' | 'O'))
+            || self.peek() == Some('0') && matches!(self.peek_at(1), Some('b' | 'B'));
+        if hexadecimal {
+            self.position += 2;
+            while self
+                .peek()
+                .is_some_and(|ch| ch.is_ascii_hexdigit() || ch == '_')
+            {
+                self.position += 1;
+            }
+        } else {
+            let mut previous = '\0';
+            while let Some(ch) = self.peek() {
+                let digit = ch.is_ascii_digit() || ch == '_' || ch == '.';
+                let exponent = matches!(ch, 'e' | 'E');
+                let exponent_sign = matches!(ch, '+' | '-') && matches!(previous, 'e' | 'E');
+                let radix_marker =
+                    matches!(ch, 'x' | 'X' | 'o' | 'O' | 'b' | 'B') && previous == '0';
+                if !(digit || exponent || exponent_sign || radix_marker) {
+                    break;
+                }
+                previous = ch;
+                self.position += 1;
+            }
+        }
+        let text: String = self.chars[start..self.position]
+            .iter()
+            .filter(|ch| **ch != '_')
+            .collect();
+        if text.is_empty() {
+            return Err(EvalError::Syntax);
+        }
+        let lower = text.to_ascii_lowercase();
+        if let Some(digits) = lower.strip_prefix("0x") {
+            return parse_integer(digits, 16);
+        }
+        if let Some(digits) = lower.strip_prefix("0o") {
+            return parse_integer(digits, 8);
+        }
+        if let Some(digits) = lower.strip_prefix("0b") {
+            return parse_integer(digits, 2);
+        }
+        if text.contains('.') || text.contains('e') || text.contains('E') {
+            return text
+                .parse::<f64>()
+                .map(value::float_new)
+                .map_err(|_| EvalError::Syntax);
+        }
+        if let Ok(integer) = text.parse::<i64>() {
+            return Ok(ops::int_result(integer));
+        }
+        match BigInt::parse_bytes(text.as_bytes(), 10) {
+            Some(integer) => Ok(value::bigint_new(integer)),
+            None => Err(EvalError::Syntax),
         }
     }
-    current
+
+    fn parse_name_atom(&mut self) -> EvalResult {
+        let Some(name) = self.parse_identifier() else {
+            return Err(EvalError::Syntax);
+        };
+        match name.as_str() {
+            "True" => Ok(value::TRUE),
+            "False" => Ok(value::FALSE),
+            "None" => Ok(NONE),
+            "and" | "or" | "not" | "in" | "is" => Err(EvalError::Syntax),
+            _ => self.lookup_name(&name),
+        }
+    }
+
+    fn parse_identifier(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        let start = self.position;
+        let first = self.peek()?;
+        if first != '_' && !first.is_alphabetic() {
+            return None;
+        }
+        self.position += 1;
+        while self
+            .peek()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+        {
+            self.position += 1;
+        }
+        Some(self.chars[start..self.position].iter().collect())
+    }
+
+    fn lookup_name(&mut self, name: &str) -> EvalResult {
+        for namespace in [self.local_ns, self.global_ns] {
+            if namespace == NONE {
+                continue;
+            }
+            if let Some(value) = namespace_get(namespace, name) {
+                return Ok(value);
+            }
+        }
+        let value = modules::module_get_by_name("builtins", name);
+        if exc::pending() {
+            if exc::pending_tag() == exc::ATTRIBUTE_ERROR as i64 {
+                exc::clear();
+                return Err(EvalError::Name(name.to_string()));
+            }
+            return Err(EvalError::Pending);
+        }
+        Ok(value)
+    }
+
+    fn apply_unary(&mut self, op: UnOp, operand: i64) -> EvalResult {
+        let roots = crate::heap::root_values(&[operand]);
+        let result = ops::unop(op.code(), operand);
+        crate::heap::release_roots(roots);
+        if exc::pending() {
+            return Err(EvalError::Pending);
+        }
+        Ok(result)
+    }
+}
+
+/// Parses a non-decimal integer literal, promoting out-of-range values to the
+/// runtime `BigInt` kind instead of failing.
+fn parse_integer(digits: &str, radix: u32) -> EvalResult {
+    if let Ok(integer) = i64::from_str_radix(digits, radix) {
+        return Ok(ops::int_result(integer));
+    }
+    match BigInt::parse_bytes(digits.as_bytes(), radix) {
+        Some(integer) => Ok(value::bigint_new(integer)),
+        None => Err(EvalError::Syntax),
+    }
 }
 
 /// `exec(...)`: no runtime statement compiler exists, so fail loudly.
@@ -6000,9 +6838,30 @@ mod tests {
         let _ = builtin_call(Builtin::Eval, &[string("__IPYTHON__")]);
         assert_eq!(exc::pending_tag(), NAME_ERROR as i64);
         exc::clear();
-        // General expression/statement compilation is impossible at runtime
-        // and says so with a tagged NotImplementedError.
-        let _ = builtin_call(Builtin::Eval, &[string("1 + 2")]);
+        // Arithmetic, attributes, subscripts and caller namespaces are
+        // evaluated without a compiler.
+        assert_eq!(
+            value::as_integer(builtin_call(Builtin::Eval, &[string("1 + 2 * 3")])),
+            Some(7)
+        );
+        let namespace = value::dict_new(vec![(string("value"), int(5))]);
+        assert_eq!(
+            value::as_integer(builtin_call(
+                Builtin::Eval,
+                &[string("value + 1"), namespace],
+            )),
+            Some(6)
+        );
+        assert_eq!(
+            value::as_integer(builtin_call(
+                Builtin::Eval,
+                &[string("{'k': 2}['k']"), NONE, NONE],
+            )),
+            Some(2)
+        );
+        // A call requires the full call protocol, which the runtime
+        // expression evaluator does not implement; it says so honestly.
+        let _ = builtin_call(Builtin::Eval, &[string("len([1])")]);
         assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
         exc::clear();
         let _ = builtin_call(Builtin::Exec, &[string("x = 1")]);

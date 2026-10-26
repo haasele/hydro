@@ -791,6 +791,26 @@ struct ClassPlan {
     bindings: HashSet<String>,
 }
 
+/// Inputs shared by the static and dynamic class-emission helpers.
+///
+/// Grouping them keeps the helpers below to two parameters as the number of
+/// per-class details (source statement, plan, binding target, mirroring mode)
+/// grows.
+struct ClassEmission<'a> {
+    /// The source `class` statement.
+    class: &'a ast::StmtClassDef,
+    /// Registered header/body plan.
+    plan: &'a ClassPlan,
+    /// Class name used for `__qualname__` and the runtime class object.
+    name: &'a str,
+    /// Local that receives the class object.
+    target: LocalId,
+    /// Whether the module global table receives the finished class value.
+    mirror_globals: bool,
+    line: u32,
+    col: u32,
+}
+
 /// Cell analysis for one function, computed from its AST before the body is
 /// lowered. Names are resolved to local ids once the body's slots exist.
 #[derive(Default)]
@@ -866,21 +886,71 @@ impl FuncState {
     }
 }
 
-/// A member resolved from `hydro_ir::stdlib`.
+/// A member resolved from `hydro_ir::stdlib` or a runtime-only supplement.
 enum ModuleMember {
     Function(&'static FunctionSpec),
     Constant(&'static ConstantSpec),
 }
 
+/// `module.__dict__`: every module exposes its namespace mapping, including
+/// the native modules whose static spec cannot list it.
+static MODULE_DICT_MEMBER: ConstantSpec = ConstantSpec {
+    name: "__dict__",
+    ty: Type::Dict,
+};
+
+/// `builtins.eval`: present on the module even though the static spec table
+/// predates the runtime evaluator. Parameters mirror CPython's signature so
+/// the frontend binds `globals=`/`locals=` by name.
+static BUILTINS_EVAL_MEMBER: FunctionSpec = FunctionSpec {
+    name: "eval",
+    min_args: 1,
+    max_args: 3,
+    ret: Type::Any,
+    params: &["source", "globals", "locals"],
+    dynamic_keywords: false,
+};
+
+/// `builtins.exec`: same call shape as `eval`; the runtime reports an explicit
+/// `NotImplementedError` because there is no statement compiler.
+static BUILTINS_EXEC_MEMBER: FunctionSpec = FunctionSpec {
+    name: "exec",
+    min_args: 1,
+    max_args: 3,
+    ret: Type::Any,
+    params: &["source", "globals", "locals"],
+    dynamic_keywords: false,
+};
+
+/// `types.CellType`: a cached native class (also callable as the cell
+/// constructor), so `isinstance(cell, types.CellType)` and
+/// `types.CellType(value)` are both valid.
+static TYPES_CELLTYPE_MEMBER: FunctionSpec = FunctionSpec {
+    name: "CellType",
+    min_args: 0,
+    max_args: 1,
+    ret: Type::Any,
+    params: &[],
+    dynamic_keywords: false,
+};
+
 fn module_member(module: &'static ModuleSpec, name: &str) -> Option<ModuleMember> {
     if let Some(function) = module.functions.iter().find(|f| f.name == name) {
         return Some(ModuleMember::Function(function));
     }
-    module
-        .constants
-        .iter()
-        .find(|c| c.name == name)
-        .map(ModuleMember::Constant)
+    if let Some(constant) = module.constants.iter().find(|c| c.name == name) {
+        return Some(ModuleMember::Constant(constant));
+    }
+    // Members the runtime serves without a static spec entry. Keeping the
+    // table here (instead of the shared stdlib metadata) is deliberate: these
+    // values are produced by the runtime on demand.
+    match (module.name, name) {
+        (_, "__dict__") => Some(ModuleMember::Constant(&MODULE_DICT_MEMBER)),
+        ("builtins", "eval") => Some(ModuleMember::Function(&BUILTINS_EVAL_MEMBER)),
+        ("builtins", "exec") => Some(ModuleMember::Function(&BUILTINS_EXEC_MEMBER)),
+        ("types", "CellType") => Some(ModuleMember::Function(&TYPES_CELLTYPE_MEMBER)),
+        _ => None,
+    }
 }
 
 /// Result of looking up a compiled extension module.
@@ -1461,6 +1531,11 @@ pub struct Lowerer<'a> {
     /// Method signatures exist before any body is lowered; the key lets
     /// `lower_stmt` find the plan without threading it through every call.
     class_defs: HashMap<usize, ClassPlan>,
+    /// Functions defined inside a module-level `if`/`try`/loop block, keyed by
+    /// the definition's start offset. Their binding is created only when the
+    /// enclosing statement runs, so it always goes through the runtime global
+    /// table; `fn_ids` never links them directly.
+    conditional_defs: HashMap<usize, FunctionId>,
     /// Classes declared directly by this unit. A `raise` of one of these
     /// classes uses the documented `RuntimeError` fallback (see
     /// [`Lowerer::lower_raise`]) instead of being rejected.
@@ -1554,6 +1629,7 @@ impl<'a> Lowerer<'a> {
             await_frames: HashSet::new(),
             cell_plans: HashMap::new(),
             class_defs: HashMap::new(),
+            conditional_defs: HashMap::new(),
             class_names: HashSet::new(),
             imported_classes: HashMap::new(),
             imported_function_signatures: HashMap::new(),
@@ -1739,27 +1815,14 @@ impl<'a> Lowerer<'a> {
         //    Class methods are registered here too, but only by qualified
         //    name in the diagnostic/function table: they must never enter
         //    `fn_ids`, so methods of different classes may share a name.
+        //
+        //    Definitions nested in module-level `if`/`try`/loop blocks are
+        //    registered as well. They execute conditionally, so they bind at
+        //    runtime through the module global table instead of being linked
+        //    by `fn_ids`; `conditional_defs` maps their source offset to the
+        //    compiled function.
         let mut def_ids: HashMap<usize, FunctionId> = HashMap::new();
-        for (idx, stmt) in module.body.iter().enumerate() {
-            match stmt {
-                ast::Stmt::FunctionDef(f) => {
-                    if let Some(id) = self.create_function(f) {
-                        def_ids.insert(idx, id);
-                    }
-                }
-                ast::Stmt::AsyncFunctionDef(f) => {
-                    if let Some(id) = self.create_async_function(f) {
-                        def_ids.insert(idx, id);
-                    }
-                }
-                ast::Stmt::ClassDef(c) => {
-                    let plan = self.register_class(c);
-                    self.class_defs
-                        .insert(u32::from(c.range.start()) as usize, plan);
-                }
-                _ => {}
-            }
-        }
+        self.register_module_definitions(&module.body, true, &mut def_ids);
 
         // Self-package imports (`from . import f` in a package init) can now
         // resolve functions defined by this unit.
@@ -1810,47 +1873,11 @@ impl<'a> Lowerer<'a> {
 
         // 5. Function bodies (all signatures are already registered). Class
         //    method bodies are lowered here as well: their signatures live in
-        //    the same function table, only the lookup name differs.
-        for (idx, stmt) in module.body.iter().enumerate() {
-            match stmt {
-                ast::Stmt::FunctionDef(f) => {
-                    let Some(&fid) = def_ids.get(&idx) else {
-                        continue;
-                    };
-                    let body = self.lower_function_body(fid, &f.body);
-                    self.functions[fid as usize].body = body;
-                }
-                ast::Stmt::AsyncFunctionDef(f) => {
-                    let Some(&fid) = def_ids.get(&idx) else {
-                        continue;
-                    };
-                    let body = self.lower_function_body(fid, &f.body);
-                    self.functions[fid as usize].body = body;
-                }
-                ast::Stmt::ClassDef(c) => {
-                    let Some(plan) = self
-                        .class_defs
-                        .get(&(u32::from(c.range.start()) as usize))
-                        .cloned()
-                    else {
-                        continue;
-                    };
-                    let bodies = class_method_bodies(&c.body);
-                    for (_, fid, method_start, _) in plan.methods {
-                        // Synthesized methods already carry their body.
-                        let Some(method_start) = method_start else {
-                            continue;
-                        };
-                        let Some(body) = bodies.get(&method_start) else {
-                            continue;
-                        };
-                        let body = self.lower_function_body(fid, body);
-                        self.functions[fid as usize].body = body;
-                    }
-                }
-                _ => {}
-            }
-        }
+        //    the same function table, only the lookup name differs. The walk
+        //    descends into module-level control-flow blocks and nested class
+        //    bodies, because definitions registered there still need their
+        //    bodies lowered unconditionally.
+        self.lower_definition_bodies(&module.body, &def_ids);
 
         // 6. Module body. Function definitions are declarations only (their
         //    values are mirrored for late importers, see
@@ -1873,10 +1900,11 @@ impl<'a> Lowerer<'a> {
             class_ns: None,
         };
         let mut body = Vec::new();
-        for (idx, stmt) in module.body.iter().enumerate() {
+        for stmt in &module.body {
+            let start = u32::from(stmt.range().start()) as usize;
             match stmt {
                 ast::Stmt::FunctionDef(f) => {
-                    if let Some(&fid) = def_ids.get(&idx) {
+                    if let Some(&fid) = def_ids.get(&start) {
                         if self.has_runtime_function_decorators(&f.decorator_list) {
                             let (line, col) = self.span(f.range);
                             self.lower_module_function_definition(
@@ -1891,11 +1919,11 @@ impl<'a> Lowerer<'a> {
                             continue;
                         }
                     }
-                    self.mirror_module_function(idx, &def_ids, &mut body);
+                    self.mirror_module_function(start, &def_ids, &mut body);
                     continue;
                 }
                 ast::Stmt::AsyncFunctionDef(f) => {
-                    if let Some(&fid) = def_ids.get(&idx) {
+                    if let Some(&fid) = def_ids.get(&start) {
                         if self.has_runtime_function_decorators(&f.decorator_list) {
                             let (line, col) = self.span(f.range);
                             self.lower_module_function_definition(
@@ -1910,7 +1938,7 @@ impl<'a> Lowerer<'a> {
                             continue;
                         }
                     }
-                    self.mirror_module_function(idx, &def_ids, &mut body);
+                    self.mirror_module_function(start, &def_ids, &mut body);
                     continue;
                 }
                 ast::Stmt::ClassDef(c) => {
@@ -1940,6 +1968,212 @@ impl<'a> Lowerer<'a> {
             source_name: self.filename.to_string(),
             functions: std::mem::take(&mut self.functions),
         }
+    }
+
+    /// Registers module-level definitions, including those nested in
+    /// module-level control-flow blocks.
+    ///
+    /// A definition directly in the module body is linked statically in
+    /// `fn_ids`. One inside an `if`/`try`/loop executes conditionally: CPython
+    /// still compiles its code object, but the name binds only on the branch
+    /// that runs. Such a definition is therefore created without static
+    /// linkage and binds through the runtime global table at its statement.
+    /// Every read of the name resolves to that runtime binding, so mutually
+    /// exclusive definitions in different branches are all represented.
+    fn register_module_definitions(
+        &mut self,
+        body: &[ast::Stmt],
+        top_level: bool,
+        def_ids: &mut HashMap<usize, FunctionId>,
+    ) {
+        for stmt in body {
+            let start = u32::from(stmt.range().start()) as usize;
+            match stmt {
+                ast::Stmt::FunctionDef(f) => {
+                    let id = if top_level {
+                        self.create_function(f)
+                    } else {
+                        self.create_conditional_function(f)
+                    };
+                    if let Some(id) = id {
+                        def_ids.insert(start, id);
+                    }
+                }
+                ast::Stmt::AsyncFunctionDef(f) => {
+                    let id = if top_level {
+                        self.create_async_function(f)
+                    } else {
+                        self.create_conditional_async_function(f)
+                    };
+                    if let Some(id) = id {
+                        def_ids.insert(start, id);
+                    }
+                }
+                ast::Stmt::ClassDef(c) => {
+                    let name = c.name.to_string();
+                    let plan = self.register_class(c);
+                    self.class_defs.insert(start, plan);
+                    if !top_level {
+                        // The class object is created only when the enclosing
+                        // block runs, so it binds through the global table.
+                        self.global_names.insert(name.clone());
+                        self.used_globals.insert(name);
+                    }
+                }
+                other => {
+                    for block in class_body_blocks(other) {
+                        self.register_module_definitions(block, false, def_ids);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Registers a function defined inside a module-level control-flow block.
+    fn create_conditional_function(&mut self, f: &ast::StmtFunctionDef) -> Option<FunctionId> {
+        self.create_conditional_decl(FnDecl::from_def(f))
+    }
+
+    /// `async def` counterpart of [`Self::create_conditional_function`].
+    fn create_conditional_async_function(
+        &mut self,
+        f: &ast::StmtAsyncFunctionDef,
+    ) -> Option<FunctionId> {
+        self.create_conditional_decl(FnDecl::from_async_def(f))
+    }
+
+    fn create_conditional_decl(&mut self, decl: FnDecl<'_>) -> Option<FunctionId> {
+        // `@overload` declares a type-only stub and binds nothing.
+        if decl.decorators.iter().any(is_overload_decorator) {
+            return None;
+        }
+        let name = decl.name.to_string();
+        // A conditional definition can replace a statically linked top-level
+        // function of the same name. Drop that linkage so every later read
+        // observes the runtime binding instead of the first definition.
+        self.fn_ids.remove(&name);
+        self.global_names.insert(name.clone());
+        let start = u32::from(decl.range.start()) as usize;
+        let id = self.create_function_with_captures(&decl, name, false, &[], &[], None)?;
+        self.conditional_defs.insert(start, id);
+        Some(id)
+    }
+
+    /// Lowers the bodies of every registered function and method.
+    ///
+    /// The walk descends into module-level control-flow blocks (where
+    /// conditional definitions live) and into class bodies (where nested
+    /// classes and their methods live). Method bodies are located through
+    /// [`class_method_bodies`], which already follows a class body's own
+    /// control flow.
+    fn lower_definition_bodies(
+        &mut self,
+        body: &[ast::Stmt],
+        def_ids: &HashMap<usize, FunctionId>,
+    ) {
+        for stmt in body {
+            let start = u32::from(stmt.range().start()) as usize;
+            match stmt {
+                ast::Stmt::FunctionDef(f) => {
+                    let Some(&fid) = def_ids.get(&start) else {
+                        continue;
+                    };
+                    let lowered = self.lower_function_body(fid, &f.body);
+                    self.functions[fid as usize].body = lowered;
+                }
+                ast::Stmt::AsyncFunctionDef(f) => {
+                    let Some(&fid) = def_ids.get(&start) else {
+                        continue;
+                    };
+                    let lowered = self.lower_function_body(fid, &f.body);
+                    self.functions[fid as usize].body = lowered;
+                }
+                ast::Stmt::ClassDef(c) => {
+                    if let Some(plan) = self.class_defs.get(&start).cloned() {
+                        let bodies = class_method_bodies(&c.body);
+                        for (_, fid, method_start, _) in plan.methods {
+                            // Synthesized methods already carry their body.
+                            let Some(method_start) = method_start else {
+                                continue;
+                            };
+                            let Some(method_body) = bodies.get(&method_start) else {
+                                continue;
+                            };
+                            let lowered = self.lower_function_body(fid, method_body);
+                            self.functions[fid as usize].body = lowered;
+                        }
+                    }
+                    // Nested classes are separate `ClassDef` statements inside
+                    // this class body; lower their method bodies too.
+                    self.lower_definition_bodies(&c.body, def_ids);
+                }
+                other => {
+                    for block in class_body_blocks(other) {
+                        self.lower_definition_bodies(block, def_ids);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lower a conditional module-level `def` at the statement where it runs.
+    ///
+    /// The compiled function value is created on that path only, decorators
+    /// are evaluated first and applied bottom-up, and the result is stored in
+    /// the module's runtime global table. Wrapping the sequence in `if True:`
+    /// keeps it one HIR statement; the enclosing branch condition still
+    /// decides whether it runs.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_conditional_function_definition(
+        &mut self,
+        decorators: &[ast::Expr],
+        fid: FunctionId,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let name = self.functions.get(fid as usize)?.name.clone();
+        let mut then_body = Vec::new();
+        let decorators = self.runtime_function_decorators(decorators);
+        let temps = self.lower_decorator_temps(&decorators, fs, &mut then_body);
+        let (target, _) = self.hidden_temp(fs, "$condeff", Type::Any);
+        then_body.push(HStmt {
+            kind: HStmtKind::Assign {
+                target,
+                value: HExpr {
+                    kind: HExprKind::FunctionRef(self.fid_base + fid),
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                },
+            },
+            line,
+            col,
+        });
+        self.apply_decorator_temps(&temps, target, fs, &mut then_body, line, col);
+        then_body.push(HStmt {
+            kind: HStmtKind::GlobalSet {
+                module: self.dunder_name.clone(),
+                name,
+                value: HExpr {
+                    kind: HExprKind::Local(target),
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                },
+            },
+            line,
+            col,
+        });
+        Some(HStmt {
+            kind: HStmtKind::If {
+                cond: self.bool_const(true, line, col),
+                then_body,
+                else_body: Vec::new(),
+            },
+            line,
+            col,
+        })
     }
 
     /// Expands pytest fixtures and parametrization into zero-argument
@@ -2489,14 +2723,14 @@ impl<'a> Lowerer<'a> {
     /// have importers.
     fn mirror_module_function(
         &mut self,
-        index: usize,
+        start: usize,
         def_ids: &HashMap<usize, FunctionId>,
         body: &mut Vec<HStmt>,
     ) {
         if !self.mirror_all_globals {
             return;
         }
-        let Some(&fid) = def_ids.get(&index) else {
+        let Some(&fid) = def_ids.get(&start) else {
             return;
         };
         let function = &self.functions[fid as usize];
@@ -4438,14 +4672,15 @@ impl<'a> Lowerer<'a> {
             // The class statement itself binds these in the namespace.
             bindings.insert("__module__".to_string());
             bindings.insert("__qualname__".to_string());
-            if class_body_assigns_slots(&s.body) {
-                self.error_at_code(
-                    s.range,
-                    codes::UNSUPPORTED,
-                    "__slots__ is not supported: Hydro class instances always use a dynamic attribute table",
-                );
-            }
+            // A dynamic class body may declare `__slots__`; the runtime
+            // parses the value from the class namespace exactly like CPython
+            // (`parse_slots`), so no frontend diagnostic is needed.
         }
+
+        // Nested class definitions execute when the enclosing class body runs
+        // and are registered before any body is lowered, including those
+        // inside class-body control flow.
+        self.register_nested_classes(&s.body);
 
         // A dataclass or class-form NamedTuple gets an ordinary `__init__`
         // unless it declares its own. Only annotated fields take part; methods
@@ -4483,6 +4718,33 @@ impl<'a> Lowerer<'a> {
             attributes,
             dynamic,
             bindings,
+        }
+    }
+
+    /// Registers every nested class definition reachable from a class body.
+    ///
+    /// Nested classes execute when the enclosing class body runs (possibly
+    /// under a class-body `if`/`try`/loop) and therefore need their own plans
+    /// before bodies are lowered. Method bodies are separate scopes and are
+    /// not visited.
+    fn register_nested_classes(&mut self, body: &[ast::Stmt]) {
+        for stmt in body {
+            match stmt {
+                ast::Stmt::ClassDef(c) => {
+                    let start = u32::from(c.range.start()) as usize;
+                    if self.class_defs.contains_key(&start) {
+                        continue;
+                    }
+                    let plan = self.register_class(c);
+                    self.class_defs.insert(start, plan);
+                }
+                ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => {}
+                other => {
+                    for block in class_body_blocks(other) {
+                        self.register_nested_classes(block);
+                    }
+                }
+            }
         }
     }
 
@@ -5784,11 +6046,21 @@ impl<'a> Lowerer<'a> {
                     );
                 }
                 if fs.is_module {
-                    self.error_at(
-                        s.range,
-                        "function definitions are only supported directly at module level",
+                    let start = u32::from(s.range.start()) as usize;
+                    let Some(&fid) = self.conditional_defs.get(&start) else {
+                        self.error_at(
+                            s.range,
+                            "function definitions are only supported directly at module level",
+                        );
+                        return None;
+                    };
+                    return self.lower_conditional_function_definition(
+                        &s.decorator_list,
+                        fid,
+                        fs,
+                        line,
+                        col,
                     );
-                    return None;
                 }
                 return self.lower_nested_function(FnDecl::from_def(s), fs, line, col);
             }
@@ -5803,11 +6075,21 @@ impl<'a> Lowerer<'a> {
                     );
                 }
                 if fs.is_module {
-                    self.error_at(
-                        s.range,
-                        "function definitions are only supported directly at module level",
+                    let start = u32::from(s.range.start()) as usize;
+                    let Some(&fid) = self.conditional_defs.get(&start) else {
+                        self.error_at(
+                            s.range,
+                            "function definitions are only supported directly at module level",
+                        );
+                        return None;
+                    };
+                    return self.lower_conditional_function_definition(
+                        &s.decorator_list,
+                        fid,
+                        fs,
+                        line,
+                        col,
                     );
-                    return None;
                 }
                 return self.lower_nested_function(FnDecl::from_async_def(s), fs, line, col);
             }
@@ -5817,12 +6099,7 @@ impl<'a> Lowerer<'a> {
             // table so a later fragment sees the same names.
             ast::Stmt::Import(s) => {
                 if fs.class_ns.is_some() {
-                    self.error_at_code(
-                        s.range,
-                        codes::UNSUPPORTED,
-                        "imports inside a class body are not supported yet",
-                    );
-                    return None;
+                    return self.lower_class_body_import(&s.names, fs, line, col);
                 }
                 if !self.session_mode || !fs.is_module {
                     return None;
@@ -5831,12 +6108,7 @@ impl<'a> Lowerer<'a> {
             }
             ast::Stmt::ImportFrom(s) => {
                 if fs.class_ns.is_some() {
-                    self.error_at_code(
-                        s.range,
-                        codes::UNSUPPORTED,
-                        "imports inside a class body are not supported yet",
-                    );
-                    return None;
+                    return self.lower_class_body_import_from(s, fs, line, col);
                 }
                 if !self.session_mode || !fs.is_module {
                     return None;
@@ -7269,24 +7541,20 @@ impl<'a> Lowerer<'a> {
     /// The whole sequence is wrapped in an `if True:` block because HIR
     /// statements nest only through statement bodies; the wrapper is a single
     /// statement for the module body loop and decorator handling.
-    fn lower_dynamic_class_stmt(
+    fn lower_dynamic_class_value(
         &mut self,
-        s: &ast::StmtClassDef,
-        plan: &ClassPlan,
         fs: &mut FuncState,
-        line: u32,
-        col: u32,
-    ) -> Option<HStmt> {
-        let name = s.name.to_string();
-        let Some(target) = fs.lookup(&name) else {
-            self.error_name(
-                s.range,
-                &name,
-                fs,
-                format!("class '{name}' has no local slot"),
-            );
-            return None;
-        };
+        emission: ClassEmission<'_>,
+    ) -> Vec<HStmt> {
+        let ClassEmission {
+            class: s,
+            plan,
+            name,
+            target,
+            mirror_globals: mirror,
+            line,
+            col,
+        } = emission;
         let mut statements = Vec::new();
         // Bases, in source order, then the metaclass keyword.
         let mut base_refs = Vec::new();
@@ -7345,7 +7613,7 @@ impl<'a> Lowerer<'a> {
         // CPython publishes `__module__`/`__qualname__` in the namespace.
         for (dunder, constant) in [
             ("__module__", Const::Str(self.dunder_name.clone())),
-            ("__qualname__", Const::Str(name.clone())),
+            ("__qualname__", Const::Str(name.to_string())),
         ] {
             statements.push(HStmt {
                 kind: HStmtKind::SetSubscript {
@@ -7410,7 +7678,7 @@ impl<'a> Lowerer<'a> {
                 callee: Callee::Builtin(Builtin::ClassFromNamespace),
                 args: vec![
                     HExpr {
-                        kind: HExprKind::Const(Const::Str(name.clone())),
+                        kind: HExprKind::Const(Const::Str(name.to_string())),
                         ty: Ty::Concrete(Type::Str),
                         line,
                         col,
@@ -7437,11 +7705,11 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
-        if self.mirror_all_globals || self.used_globals.contains(&name) {
+        if mirror && (self.mirror_all_globals || self.used_globals.contains(name)) {
             statements.push(HStmt {
                 kind: HStmtKind::GlobalSet {
                     module: self.dunder_name.clone(),
-                    name: name.clone(),
+                    name: name.to_string(),
                     value: HExpr {
                         kind: HExprKind::Local(target),
                         ty: Ty::Concrete(Type::Any),
@@ -7453,6 +7721,46 @@ impl<'a> Lowerer<'a> {
                 col,
             });
         }
+        statements
+    }
+
+    /// Lower a module-level class whose body executes statements.
+    ///
+    /// The body runs against a fresh namespace `dict` (CPython's `STORE_NAME`
+    /// semantics) and the class object is built from that dict afterwards by
+    /// `Builtin::ClassFromNamespace`. Base expressions and the `metaclass=`
+    /// keyword are evaluated first, matching CPython's order, and are parked
+    /// in rooted hidden locals across the body.
+    fn lower_dynamic_class_stmt(
+        &mut self,
+        s: &ast::StmtClassDef,
+        plan: &ClassPlan,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let name = s.name.to_string();
+        let Some(target) = fs.lookup(&name) else {
+            self.error_name(
+                s.range,
+                &name,
+                fs,
+                format!("class '{name}' has no local slot"),
+            );
+            return None;
+        };
+        let statements = self.lower_dynamic_class_value(
+            fs,
+            ClassEmission {
+                class: s,
+                plan,
+                name: &name,
+                target,
+                mirror_globals: true,
+                line,
+                col,
+            },
+        );
         Some(HStmt {
             kind: HStmtKind::If {
                 cond: self.bool_const(true, line, col),
@@ -7502,9 +7810,128 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Value a class namespace receives for a method definition: the function
-    /// itself, or the matching descriptor factory call for
-    /// `@classmethod`/`@staticmethod`/`@property`.
+    /// Bind `import ...` names into the class namespace.
+    ///
+    /// CPython executes an import in a class body with `STORE_NAME`, so the
+    /// module value lands in the class namespace rather than the module
+    /// globals. Hydro resolves imports at compile time; when the binding is a
+    /// native module (or an imported member) the value expression can be
+    /// rebuilt here and stored into the namespace dict.
+    fn lower_class_body_import(
+        &mut self,
+        aliases: &[ast::Alias],
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let ns = fs.class_ns.as_ref()?.ns;
+        let mut statements = Vec::new();
+        let mut ok = true;
+        for alias in aliases {
+            let binding = import_binding(alias);
+            match self.class_namespace_import_value(&binding, alias.range, line, col) {
+                Some(value) => {
+                    statements.push(class_namespace_store(ns, &binding, value, line, col))
+                }
+                None => ok = false,
+            }
+        }
+        if !ok {
+            return None;
+        }
+        Some(class_namespace_block(statements, line, col))
+    }
+
+    /// Bind `from ... import ...` names into the class namespace.
+    fn lower_class_body_import_from(
+        &mut self,
+        s: &ast::StmtImportFrom,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let ns = fs.class_ns.as_ref()?.ns;
+        let mut statements = Vec::new();
+        let mut ok = true;
+        for alias in &s.names {
+            if alias.name.as_str() == "*" {
+                self.error_at_code(
+                    alias.range,
+                    codes::UNSUPPORTED,
+                    "'import *' inside a class body is not supported",
+                );
+                ok = false;
+                continue;
+            }
+            let binding = match &alias.asname {
+                Some(name) => name.to_string(),
+                None => alias.name.to_string(),
+            };
+            match self.class_namespace_import_value(&binding, alias.range, line, col) {
+                Some(value) => {
+                    statements.push(class_namespace_store(ns, &binding, value, line, col))
+                }
+                None => ok = false,
+            }
+        }
+        if !ok {
+            return None;
+        }
+        Some(class_namespace_block(statements, line, col))
+    }
+
+    /// Rebuild the runtime value of a compile-time import binding for a
+    /// class-body `import` statement.
+    fn class_namespace_import_value(
+        &mut self,
+        binding: &str,
+        range: TextRange,
+        line: u32,
+        col: u32,
+    ) -> Option<HExpr> {
+        if let Some(module) = self.module_aliases.get(binding).copied() {
+            return Some(HExpr {
+                kind: HExprKind::ModuleRef {
+                    module: module.name.to_string(),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            });
+        }
+        if let Some((module, function)) = self.imported_functions.get(binding).copied() {
+            return Some(HExpr {
+                kind: HExprKind::ModuleAttr {
+                    module: module.name.to_string(),
+                    name: function.name.to_string(),
+                },
+                ty: Ty::Concrete(Type::Function),
+                line,
+                col,
+            });
+        }
+        if let Some((module, constant)) = self.imported_constants.get(binding).copied() {
+            return Some(HExpr {
+                kind: HExprKind::ModuleAttr {
+                    module: module.name.to_string(),
+                    name: constant.name.to_string(),
+                },
+                ty: Ty::Concrete(constant.ty),
+                line,
+                col,
+            });
+        }
+        self.error_at_code(
+            range,
+            codes::UNSUPPORTED,
+            format!(
+                "class-body import binding '{binding}' is not supported: \
+                 only native modules and their members can be stored in a class namespace"
+            ),
+        );
+        None
+    }
+
     fn class_method_binding_value(
         &mut self,
         fid: FunctionId,
@@ -7550,6 +7977,20 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
+        let Some(plan) = self
+            .class_defs
+            .get(&(u32::from(s.range.start()) as usize))
+            .cloned()
+        else {
+            self.error_at(
+                s.range,
+                "class definitions are only supported directly at module level",
+            );
+            return None;
+        };
+        if fs.class_ns.is_some() {
+            return self.lower_class_in_class_body(s, &plan, fs, line, col);
+        }
         if !fs.is_module {
             self.error_at(s.range, "nested class definitions are not supported yet");
             return None;
@@ -7564,34 +8005,39 @@ impl<'a> Lowerer<'a> {
             );
             return None;
         };
-        let Some(plan) = self
-            .class_defs
-            .get(&(u32::from(s.range.start()) as usize))
-            .cloned()
-        else {
-            self.error_at(
-                s.range,
-                "class definitions are only supported directly at module level",
-            );
-            return None;
-        };
-        // `__slots__` has no runtime meaning for Hydro classes (every instance
-        // has a dynamic attribute table), so it is diagnosed rather than
-        // silently ignored.
         if plan.dynamic {
             return self.lower_dynamic_class_stmt(s, &plan, fs, line, col);
         }
-        if plan
-            .attributes
-            .iter()
-            .any(|(attribute, _)| attribute == "__slots__")
-        {
-            self.error_at_code(
-                s.range,
-                codes::UNSUPPORTED,
-                "__slots__ is not supported: Hydro class instances always use a dynamic attribute table",
-            );
-        }
+        self.lower_static_class_def(
+            fs,
+            ClassEmission {
+                class: s,
+                plan: &plan,
+                name: &name,
+                target,
+                mirror_globals: false,
+                line,
+                col,
+            },
+        )
+    }
+
+    /// Build the static `ClassDef` statement for a class whose body is fully
+    /// expressible in the plan (methods, fields and frozen attributes).
+    fn lower_static_class_def(
+        &mut self,
+        fs: &mut FuncState,
+        emission: ClassEmission<'_>,
+    ) -> Option<HStmt> {
+        let ClassEmission {
+            class: s,
+            plan,
+            name,
+            target,
+            line,
+            col,
+            ..
+        } = emission;
         let bases: Vec<HExpr> = plan
             .bases
             .iter()
@@ -7626,7 +8072,7 @@ impl<'a> Lowerer<'a> {
                 }
             }
             let mut attributes = Vec::with_capacity(plan.attributes.len());
-            for (name, index) in &plan.attributes {
+            for (attribute, index) in &plan.attributes {
                 // The value expression is evaluated when the class statement
                 // runs, in declaration order, and may refer to attributes
                 // declared before it.
@@ -7639,9 +8085,9 @@ impl<'a> Lowerer<'a> {
                     other => self.error_expr(other.range()),
                 };
                 if let Some(scope) = self.class_attr_scopes.last_mut() {
-                    scope.insert(name.clone(), value.clone());
+                    scope.insert(attribute.clone(), value.clone());
                 }
-                attributes.push((name.clone(), value));
+                attributes.push((attribute.clone(), value));
             }
             self.class_attr_scopes.pop();
             attributes
@@ -7649,7 +8095,7 @@ impl<'a> Lowerer<'a> {
         Some(HStmt {
             kind: HStmtKind::ClassDef {
                 target,
-                name,
+                name: name.to_string(),
                 bases,
                 metaclass,
                 methods,
@@ -7658,6 +8104,56 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         })
+    }
+
+    /// Lower a class definition nested inside another class body.
+    ///
+    /// The class object is built in a hidden local and then stored in the
+    /// enclosing class namespace, exactly like CPython's `STORE_NAME` in a
+    /// class body. Bases, the metaclass and the nested body are evaluated in
+    /// the enclosing class scope, so names bound earlier in the outer body are
+    /// visible.
+    fn lower_class_in_class_body(
+        &mut self,
+        s: &ast::StmtClassDef,
+        plan: &ClassPlan,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let ns = fs.class_ns.as_ref()?.ns;
+        let name = s.name.to_string();
+        let (target, target_ref) = self.hidden_temp(fs, "$nestedclass", Type::Any);
+        let mut statements = Vec::new();
+        if plan.dynamic {
+            statements.extend(self.lower_dynamic_class_value(
+                fs,
+                ClassEmission {
+                    class: s,
+                    plan,
+                    name: &name,
+                    target,
+                    mirror_globals: false,
+                    line,
+                    col,
+                },
+            ));
+        } else {
+            statements.push(self.lower_static_class_def(
+                fs,
+                ClassEmission {
+                    class: s,
+                    plan,
+                    name: &name,
+                    target,
+                    mirror_globals: false,
+                    line,
+                    col,
+                },
+            )?);
+        }
+        statements.push(class_namespace_store(ns, &name, target_ref, line, col));
+        Some(class_namespace_block(statements, line, col))
     }
 
     /// Lower `target = value` (plain or annotated assignment).
@@ -7802,11 +8298,14 @@ impl<'a> Lowerer<'a> {
     /// Python evaluates and deletes each target in source order: the deletion
     /// of one target happens before the next target's receiver is evaluated.
     /// The IR keeps that order, so codegen emits the deletion immediately
-    /// after each target's operands. A name must resolve to a local slot or a
-    /// module global; `del` of an unknown (or unbound local) name is a
-    /// compile-time diagnostic. In a module body a name also mirrors its
-    /// module-level binding, which is removed from the runtime global table
-    /// when functions of the unit read that binding.
+    /// after each target's operands.
+    ///
+    /// A module-level name that no local slot holds may still be bound by a
+    /// conditional `def`/`class` or an import. Conditional definitions bind in
+    /// the runtime global table and are deleted from there; import bindings
+    /// exist only at compile time and are simply forgotten. A name with no
+    /// binding at all lowers to a global deletion so the runtime raises a real
+    /// `NameError` instead of a spurious compile diagnostic.
     fn lower_delete(
         &mut self,
         s: &ast::StmtDelete,
@@ -7814,6 +8313,9 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
+        if fs.class_ns.is_some() {
+            return self.lower_class_namespace_delete(s, fs, line, col);
+        }
         let mut targets = Vec::with_capacity(s.targets.len());
         for target in &s.targets {
             match target {
@@ -7827,91 +8329,214 @@ impl<'a> Lowerer<'a> {
                         });
                         continue;
                     }
-                    if let Some(class_ns) = &fs.class_ns {
-                        // `del name` in a class body deletes from the class
-                        // namespace (`DELETE_NAME`), even when the module also
-                        // binds the name.
-                        let (name_line, name_col) = self.span(name.range);
-                        targets.push(HDeleteTarget::Subscript {
-                            object: HExpr {
-                                kind: HExprKind::Local(class_ns.ns),
-                                ty: Ty::Concrete(Type::Dict),
-                                line: name_line,
-                                col: name_col,
-                            },
-                            index: HExpr {
-                                kind: HExprKind::Const(Const::Str(text.to_string())),
-                                ty: Ty::Concrete(Type::Str),
-                                line: name_line,
-                                col: name_col,
-                            },
+                    if let Some(local) = fs.lookup(text) {
+                        targets.push(if fs.is_cell(local) {
+                            HDeleteTarget::Cell(local)
+                        } else {
+                            HDeleteTarget::Name(local)
                         });
+                        // A module-body name is mirrored into the runtime
+                        // global table (see `push_lowered_stmt`), so a later
+                        // read from a function must miss it too.
+                        if fs.is_module
+                            && (self.mirror_all_globals || self.used_globals.contains(text))
+                        {
+                            targets.push(HDeleteTarget::Global {
+                                module: self.dunder_name.clone(),
+                                name: text.to_string(),
+                            });
+                        }
                         continue;
                     }
-                    let Some(local) = fs.lookup(text) else {
-                        self.error_name(
-                            name.range,
-                            text,
-                            fs,
-                            format!("cannot delete unknown name '{}'", name.id),
-                        );
-                        return None;
-                    };
-                    targets.push(if fs.is_cell(local) {
-                        HDeleteTarget::Cell(local)
-                    } else {
-                        HDeleteTarget::Name(local)
-                    });
-                    // A module-body name is mirrored into the runtime global
-                    // table (see `push_lowered_stmt`), so a later read from a
-                    // function must miss it too.
-                    if fs.is_module && (self.mirror_all_globals || self.used_globals.contains(text))
-                    {
+                    if fs.is_module {
+                        if self.forget_module_binding(text) {
+                            // An import binding lives only in the compile-time
+                            // tables; it was never stored in the runtime
+                            // global table.
+                            continue;
+                        }
+                        // A statically linked function without a mirrored
+                        // global has no runtime binding to remove.
+                        let was_function = self.fn_ids.remove(text).is_some();
+                        if was_function
+                            && !self.mirror_all_globals
+                            && !self.used_globals.contains(text)
+                        {
+                            continue;
+                        }
                         targets.push(HDeleteTarget::Global {
                             module: self.dunder_name.clone(),
                             name: text.to_string(),
                         });
+                        continue;
                     }
-                }
-                ast::Expr::Attribute(attr) => {
-                    let object = self.expr(&attr.value, fs);
-                    targets.push(HDeleteTarget::Attr {
-                        object,
-                        name: attr.attr.to_string(),
-                    });
-                }
-                ast::Expr::Subscript(sub) => {
-                    if let ast::Expr::Slice(slice) = &*sub.slice {
-                        let object = self.expr(&sub.value, fs);
-                        let start = slice.lower.as_ref().map(|e| Box::new(self.expr(e, fs)));
-                        let stop = slice.upper.as_ref().map(|e| Box::new(self.expr(e, fs)));
-                        let step = slice.step.as_ref().map(|e| Box::new(self.expr(e, fs)));
-                        targets.push(HDeleteTarget::Slice {
-                            object,
-                            start,
-                            stop,
-                            step,
-                        });
-                    } else {
-                        let object = self.expr(&sub.value, fs);
-                        let index = self.expr(&sub.slice, fs);
-                        targets.push(HDeleteTarget::Subscript { object, index });
-                    }
-                }
-                other => {
-                    self.error_at(
-                        other.range(),
-                        "delete target must be a name, attribute or subscript",
+                    self.error_name(
+                        name.range,
+                        text,
+                        fs,
+                        format!("cannot delete unknown name '{}'", name.id),
                     );
                     return None;
                 }
+                other => targets.push(self.lower_delete_expression(other, fs)?),
             }
+        }
+        if targets.is_empty() {
+            return None;
         }
         Some(HStmt {
             kind: HStmtKind::Delete { targets },
             line,
             col,
         })
+    }
+
+    /// Lower an attribute, subscript or slice deletion target.
+    fn lower_delete_expression(
+        &mut self,
+        target: &ast::Expr,
+        fs: &mut FuncState,
+    ) -> Option<HDeleteTarget> {
+        match target {
+            ast::Expr::Attribute(attr) => {
+                let object = self.expr(&attr.value, fs);
+                Some(HDeleteTarget::Attr {
+                    object,
+                    name: attr.attr.to_string(),
+                })
+            }
+            ast::Expr::Subscript(sub) => {
+                if let ast::Expr::Slice(slice) = &*sub.slice {
+                    let object = self.expr(&sub.value, fs);
+                    let start = slice.lower.as_ref().map(|e| Box::new(self.expr(e, fs)));
+                    let stop = slice.upper.as_ref().map(|e| Box::new(self.expr(e, fs)));
+                    let step = slice.step.as_ref().map(|e| Box::new(self.expr(e, fs)));
+                    Some(HDeleteTarget::Slice {
+                        object,
+                        start,
+                        stop,
+                        step,
+                    })
+                } else {
+                    let object = self.expr(&sub.value, fs);
+                    let index = self.expr(&sub.slice, fs);
+                    Some(HDeleteTarget::Subscript { object, index })
+                }
+            }
+            other => {
+                self.error_at(
+                    other.range(),
+                    "delete target must be a name, attribute or subscript",
+                );
+                None
+            }
+        }
+    }
+
+    /// Lower `del name` in a class body: `DELETE_NAME` against the class
+    /// namespace. Deleting a name the namespace never received raises
+    /// `NameError`, exactly like CPython; a plain dict deletion would report
+    /// `KeyError` instead.
+    fn lower_class_namespace_delete(
+        &mut self,
+        s: &ast::StmtDelete,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let ns = fs.class_ns.as_ref()?.ns;
+        let mut statements = Vec::new();
+        for target in &s.targets {
+            if let ast::Expr::Name(name) = target {
+                let (name_line, name_col) = self.span(name.range);
+                let namespace = HExpr {
+                    kind: HExprKind::Local(ns),
+                    ty: Ty::Concrete(Type::Dict),
+                    line: name_line,
+                    col: name_col,
+                };
+                let key = HExpr {
+                    kind: HExprKind::Const(Const::Str(name.id.to_string())),
+                    ty: Ty::Concrete(Type::Str),
+                    line: name_line,
+                    col: name_col,
+                };
+                let present = HExpr {
+                    kind: HExprKind::Bin {
+                        op: BinOp::In,
+                        lhs: Box::new(key.clone()),
+                        rhs: Box::new(namespace.clone()),
+                    },
+                    ty: Ty::Concrete(Type::Bool),
+                    line: name_line,
+                    col: name_col,
+                };
+                statements.push(HStmt {
+                    kind: HStmtKind::If {
+                        cond: present,
+                        then_body: vec![HStmt {
+                            kind: HStmtKind::Delete {
+                                targets: vec![HDeleteTarget::Subscript {
+                                    object: namespace,
+                                    index: key,
+                                }],
+                            },
+                            line: name_line,
+                            col: name_col,
+                        }],
+                        else_body: vec![HStmt {
+                            kind: HStmtKind::Raise {
+                                exc: Some(ExcKind::NameError),
+                                msg: Some(HExpr {
+                                    kind: HExprKind::Const(Const::Str(format!(
+                                        "name '{}' is not defined",
+                                        name.id
+                                    ))),
+                                    ty: Ty::Concrete(Type::Str),
+                                    line: name_line,
+                                    col: name_col,
+                                }),
+                                cause: None,
+                            },
+                            line: name_line,
+                            col: name_col,
+                        }],
+                    },
+                    line: name_line,
+                    col: name_col,
+                });
+                continue;
+            }
+            let target = self.lower_delete_expression(target, fs)?;
+            statements.push(HStmt {
+                kind: HStmtKind::Delete {
+                    targets: vec![target],
+                },
+                line,
+                col,
+            });
+        }
+        if statements.is_empty() {
+            return None;
+        }
+        Some(class_namespace_block(statements, line, col))
+    }
+
+    /// Removes a compile-time import binding of `name`, reporting whether it
+    /// existed. A class nesting a `def` of the same name cannot be shadowed
+    /// by this: class definitions are local slots in a module body.
+    fn forget_module_binding(&mut self, name: &str) -> bool {
+        let mut existed = false;
+        existed |= self.module_aliases.remove(name).is_some();
+        existed |= self.user_module_aliases.remove(name).is_some();
+        existed |= self.extension_aliases.remove(name).is_some();
+        existed |= self.imported_extension_members.remove(name).is_some();
+        existed |= self.imported_functions.remove(name).is_some();
+        existed |= self.imported_constants.remove(name).is_some();
+        existed |= self.imported_user_functions.remove(name).is_some();
+        existed |= self.imported_user_globals.remove(name).is_some();
+        existed |= self.deferred_imports.remove(name).is_some();
+        existed
     }
 
     /// Lower `a = b = value` (chained assignment).
@@ -12686,6 +13311,42 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
+        // A name bound by the current dynamic class body resolves through the
+        // class namespace before module bindings and builtins (`LOAD_NAME`).
+        // That includes calling a class-body function such as
+        // `__add__ = _make_binop(ast.Add())`.
+        if let ast::Expr::Name(name) = &*call.func {
+            if fs
+                .class_ns
+                .as_ref()
+                .is_some_and(|state| state.bindings.contains(name.id.as_str()))
+            {
+                if call_has_dynamic_arguments(call) {
+                    return self.lower_dynamic_call(call, fs, line, col);
+                }
+                let callee = self.expr(&call.func, fs);
+                if !call.keywords.is_empty() {
+                    let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                        return self.error_expr(call.range);
+                    };
+                    return result;
+                }
+                let mut args = Vec::with_capacity(call.args.len());
+                for arg in &call.args {
+                    args.push(self.expr(arg, fs));
+                }
+                return HExpr {
+                    kind: HExprKind::IndirectCall {
+                        callee: Box::new(callee),
+                        args,
+                        star: None,
+                    },
+                    ty: self.infer.fresh(),
+                    line,
+                    col,
+                };
+            }
+        }
         // A starred positional or `**kwargs` operand can only be expanded at
         // runtime. Receiver method calls with a single starred operand keep
         // their dedicated ABI (`hydro_method_star`); the other shapes lower to
@@ -14791,6 +15452,79 @@ impl<'a> Lowerer<'a> {
                     .collect(),
             );
         }
+        // `eval(source, globals=None, locals=None)` and `exec(...)` expose
+        // their parameters by name. Bind the keywords into the positional
+        // slots the runtime entry point expects; omitted slots become `None`.
+        if matches!(builtin, Builtin::Eval | Builtin::Exec) {
+            let positional = args.len();
+            if positional > 3 {
+                self.error_at_code(
+                    call.range,
+                    codes::CALL,
+                    format!(
+                        "{}() takes at most 3 arguments ({} given)",
+                        builtin.name(),
+                        positional
+                    ),
+                );
+                return None;
+            }
+            let mut slots: Vec<Option<HExpr>> = args.into_iter().map(Some).collect();
+            slots.resize(3, None);
+            let mut provided = positional;
+            for keyword in &call.keywords {
+                let Some(name) = keyword.arg.as_ref() else {
+                    self.error_at_code(
+                        keyword.range,
+                        codes::CALL,
+                        "**kwargs arguments are not supported",
+                    );
+                    return None;
+                };
+                let index = match name.as_str() {
+                    "source" => 0,
+                    "globals" => 1,
+                    "locals" => 2,
+                    _ => {
+                        self.error_at_code(
+                            keyword.range,
+                            codes::CALL,
+                            format!(
+                                "{}() got an unexpected keyword argument '{name}'",
+                                builtin.name()
+                            ),
+                        );
+                        return None;
+                    }
+                };
+                if slots[index].is_some() {
+                    self.error_at_code(
+                        keyword.range,
+                        codes::CALL,
+                        format!(
+                            "{}() got multiple values for argument '{name}'",
+                            builtin.name()
+                        ),
+                    );
+                    return None;
+                }
+                slots[index] = Some(self.expr(&keyword.value, fs));
+                provided = provided.max(index + 1);
+            }
+            let none = || HExpr {
+                kind: HExprKind::Const(Const::None),
+                ty: Ty::Concrete(Type::None),
+                line,
+                col,
+            };
+            return Some(
+                slots
+                    .into_iter()
+                    .take(provided)
+                    .map(|slot| slot.unwrap_or_else(none))
+                    .collect(),
+            );
+        }
         let accepts_key = matches!(builtin, Builtin::Max | Builtin::Min | Builtin::Sorted);
         let accepts_reverse = builtin == Builtin::Sorted;
         let none = || HExpr {
@@ -14997,6 +15731,49 @@ fn builtin_by_name(name: &str) -> Option<Builtin> {
     Builtin::from_name(name)
 }
 
+/// One `namespace[name] = value` store used while building a dynamic class
+/// namespace.
+fn class_namespace_store(ns: LocalId, name: &str, value: HExpr, line: u32, col: u32) -> HStmt {
+    HStmt {
+        kind: HStmtKind::SetSubscript {
+            object: HExpr {
+                kind: HExprKind::Local(ns),
+                ty: Ty::Concrete(Type::Dict),
+                line,
+                col,
+            },
+            index: HExpr {
+                kind: HExprKind::Const(Const::Str(name.to_string())),
+                ty: Ty::Concrete(Type::Str),
+                line,
+                col,
+            },
+            value,
+        },
+        line,
+        col,
+    }
+}
+
+/// Wraps a sequence of class-body statements into one `if True:` statement so
+/// it can be returned from `lower_stmt`.
+fn class_namespace_block(statements: Vec<HStmt>, line: u32, col: u32) -> HStmt {
+    HStmt {
+        kind: HStmtKind::If {
+            cond: HExpr {
+                kind: HExprKind::Const(Const::Bool(true)),
+                ty: Ty::Concrete(Type::Bool),
+                line,
+                col,
+            },
+            then_body: statements,
+            else_body: Vec::new(),
+        },
+        line,
+        col,
+    }
+}
+
 /// Child statement blocks of one class-body statement, in source order.
 ///
 /// Used by the class-body walkers: a dynamic class body executes control flow
@@ -15064,30 +15841,6 @@ fn class_body_needs_namespace(body: &[ast::Stmt]) -> bool {
         ast::Stmt::Assign(_) | ast::Stmt::AnnAssign(_) => false,
         ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => false,
         _ => true,
-    })
-}
-
-/// Whether a class body (recursively) assigns `__slots__`.
-fn class_body_assigns_slots(body: &[ast::Stmt]) -> bool {
-    fn assigns(stmt: &ast::Stmt) -> bool {
-        match stmt {
-            ast::Stmt::Assign(assign) => assign.targets.iter().any(
-                |target| matches!(target, ast::Expr::Name(name) if name.id.as_str() == "__slots__"),
-            ),
-            ast::Stmt::AnnAssign(assign) => {
-                matches!(&*assign.target, ast::Expr::Name(name) if name.id.as_str() == "__slots__")
-            }
-            ast::Stmt::AugAssign(assign) => {
-                matches!(&*assign.target, ast::Expr::Name(name) if name.id.as_str() == "__slots__")
-            }
-            _ => false,
-        }
-    }
-    body.iter().any(|stmt| {
-        assigns(stmt)
-            || class_body_blocks(stmt)
-                .into_iter()
-                .any(class_body_assigns_slots)
     })
 }
 
