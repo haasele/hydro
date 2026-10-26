@@ -10,7 +10,7 @@
 //! for this slice: replaced values stay rooted until the runtime resets.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::exc::{self, NAME_ERROR, RUNTIME_ERROR};
 use crate::heap;
@@ -20,6 +20,15 @@ thread_local! {
     /// Module globals of the current thread.
     static GLOBALS: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
 }
+
+/// Pseudo-module that owns runtime cache entries kept in the globals store.
+///
+/// The name starts with NUL, which cannot occur in a Python module name or
+/// identifier, so [`module_names`] never reports it and no user module can
+/// collide with it. Values stored here are rooted and cleared exactly like
+/// ordinary module globals, which is what makes [`reset`] invalidate the
+/// module-registry caches without a separate ABI entry point.
+const REGISTRY_MODULE: &str = "\0hydro.registry";
 
 /// Builds the store key. The NUL separator cannot occur in a Python
 /// identifier, so different `(module, name)` pairs never collide.
@@ -60,8 +69,43 @@ pub(crate) fn get(module: &str, name: &str) -> i64 {
 }
 
 /// Forgets every stored global (a fresh program run).
+///
+/// The map also carries the runtime module-registry caches (see
+/// [`REGISTRY_MODULE`]); clearing it therefore invalidates `sys.modules`,
+/// `sys.path` and every other cached module value as well.
 pub(crate) fn reset() {
     GLOBALS.with(|globals| globals.borrow_mut().clear());
+}
+
+/// Names of the user modules that own at least one stored global, sorted
+/// lexicographically.
+///
+/// This is the discovery source for the runtime module registry: a compiled
+/// user module has no native spec, so its entries in the globals store are the
+/// evidence that it was loaded. The reserved registry pseudo-module is
+/// excluded.
+pub(crate) fn module_names() -> Vec<String> {
+    GLOBALS.with(|globals| {
+        let mut names = BTreeSet::new();
+        for key in globals.borrow().keys() {
+            if let Some((module, _)) = key.split_once('\0') {
+                if !module.is_empty() {
+                    names.insert(module.to_string());
+                }
+            }
+        }
+        names.into_iter().collect()
+    })
+}
+
+/// Reads a runtime cache entry owned by [`REGISTRY_MODULE`].
+pub(crate) fn registry_get(name: &str) -> Option<i64> {
+    try_get(REGISTRY_MODULE, name)
+}
+
+/// Stores a runtime cache entry owned by [`REGISTRY_MODULE`].
+pub(crate) fn registry_set(name: &str, value: i64) {
+    set(REGISTRY_MODULE, name, value);
 }
 
 /// Removes `module.name`, reporting whether the binding existed.
@@ -140,5 +184,31 @@ mod tests {
         reset();
         assert_eq!(get("first", "value"), NONE);
         assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
+    }
+
+    #[test]
+    fn module_names_are_sorted_and_exclude_registry_entries() {
+        reset();
+        set("zebra", "value", int(1));
+        set("alpha", "value", int(2));
+        set("alpha", "other", int(3));
+        registry_set("sys.modules", int(4));
+        assert_eq!(
+            module_names(),
+            vec!["alpha".to_string(), "zebra".to_string()]
+        );
+
+        reset();
+        assert!(module_names().is_empty());
+        assert_eq!(registry_get("sys.modules"), None);
+    }
+
+    #[test]
+    fn reset_invalidates_registry_entries() {
+        reset();
+        registry_set("sys.path", int(11));
+        assert_eq!(registry_get("sys.path"), Some(int(11)));
+        reset();
+        assert_eq!(registry_get("sys.path"), None);
     }
 }

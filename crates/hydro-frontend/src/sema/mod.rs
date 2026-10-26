@@ -2570,6 +2570,21 @@ impl<'a> Checker<'a> {
                 // The target type is validated at runtime.
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Bool));
             }
+            Builtin::Issubclass => {
+                if count != 2 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("issubclass() takes exactly 2 arguments ({count} given)"),
+                    );
+                    return;
+                }
+                // Both arguments are classes (or the second a tuple of
+                // classes); the runtime validates them and reports
+                // `TypeError` for anything else.
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Bool));
+            }
             Builtin::Bytes => {
                 if count > 2 {
                     self.error_code(

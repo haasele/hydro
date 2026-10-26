@@ -1166,13 +1166,71 @@ pub enum UserExport {
 ///
 /// The loader resolves the file and lowers dependencies first, so exported
 /// functions already have final [`FunctionId`]s by the time this unit is
-/// lowered.
+/// lowered. Namespace packages (directories without `__init__.py`) are
+/// represented with empty exports: importing them binds a module but there is
+/// no body to initialize.
 #[derive(Clone, Debug, Default)]
 pub struct UserModule {
     /// Full dotted module name (`helper`, `pkg.sub`, ...).
     pub name: String,
     /// Top-level names exported by the module: functions and global values.
     pub exports: HashMap<String, UserExport>,
+    /// Literal module-level `__all__` of the unit, when it is a tuple/list of
+    /// string constants. `None` means the star export set is every public
+    /// (non-underscore) name, like CPython without `__all__`.
+    pub all: Option<Vec<String>>,
+}
+
+/// Returns the literal `__all__` of a module body, if there is one.
+///
+/// Only a tuple or list of string constants is honoured; an `__all__` built at
+/// runtime cannot be evaluated while compiling, so it falls back to exporting
+/// every non-underscore name (the same fallback CPython uses when `__all__` is
+/// absent). A later assignment wins, matching module execution order.
+pub(crate) fn module_all_names(stmts: &[ast::Stmt]) -> Option<Vec<String>> {
+    fn literal(value: &ast::Expr) -> Option<Vec<String>> {
+        let elements = match value {
+            ast::Expr::List(list) => &list.elts,
+            ast::Expr::Tuple(tuple) => &tuple.elts,
+            _ => return None,
+        };
+        let mut names = Vec::with_capacity(elements.len());
+        for element in elements {
+            let ast::Expr::Constant(constant) = element else {
+                return None;
+            };
+            let ast::Constant::Str(name) = &constant.value else {
+                return None;
+            };
+            names.push(name.clone());
+        }
+        Some(names)
+    }
+
+    let mut all = None;
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Assign(assign) => {
+                if assign
+                    .targets
+                    .iter()
+                    .any(|target| matches!(target, ast::Expr::Name(name) if name.id.as_str() == "__all__"))
+                {
+                    all = literal(&assign.value);
+                }
+            }
+            ast::Stmt::AnnAssign(assign) if matches!(&*assign.target, ast::Expr::Name(name) if name.id.as_str() == "__all__") =>
+            {
+                all = assign.value.as_deref().and_then(literal);
+            }
+            ast::Stmt::AugAssign(assign) if matches!(&*assign.target, ast::Expr::Name(name) if name.id.as_str() == "__all__") =>
+            {
+                all = None;
+            }
+            _ => {}
+        }
+    }
+    all
 }
 
 /// A name bound by an import nested inside a function, class or compound body.
@@ -1216,6 +1274,11 @@ pub struct Lowerer<'a> {
     /// `from . import name` bindings inside a package `__init__.py` that refer
     /// to this unit's own functions; resolved after signatures are registered.
     pending_self_imports: Vec<(String, String, TextRange)>,
+    /// `from . import *` inside a package `__init__.py`: expanded after the
+    /// unit's own functions and globals are known.
+    pending_self_stars: Vec<TextRange>,
+    /// Literal `__all__` of this unit, used by a pending self star import.
+    module_all: Option<Vec<String>>,
     /// Names bound by imports nested inside functions, classes or compound
     /// bodies that could not be linked statically. Reading one raises
     /// `RuntimeError` at runtime.
@@ -1361,6 +1424,8 @@ impl<'a> Lowerer<'a> {
             imported_user_functions: HashMap::new(),
             imported_user_globals: HashMap::new(),
             pending_self_imports: Vec::new(),
+            pending_self_stars: Vec::new(),
+            module_all: None,
             deferred_imports: HashMap::new(),
             top_level_imports: HashSet::new(),
             deferred_modules: HashSet::new(),
@@ -1530,6 +1595,7 @@ impl<'a> Lowerer<'a> {
         //
         //    The exported global names are known first: `from . import name`
         //    inside a package may refer to a name defined by this unit.
+        self.module_all = module_all_names(&module.body);
         collect_global_names(&module.body, &mut self.global_names);
         // Functions may read module globals, so those names must be mirrored
         // even when the assignment is lowered before the function body. Scan
@@ -2680,11 +2746,7 @@ impl<'a> Lowerer<'a> {
             for alias in &s.names {
                 let member = alias.name.as_str();
                 if member == "*" {
-                    self.error_at_code(
-                        alias.range,
-                        codes::UNSUPPORTED,
-                        format!("'from {imported} import *' is not supported in Phase 2.10"),
-                    );
+                    self.import_native_star(module, nested);
                     continue;
                 }
                 let binding = match &alias.asname {
@@ -2721,11 +2783,21 @@ impl<'a> Lowerer<'a> {
             for alias in &s.names {
                 let member = alias.name.as_str();
                 if member == "*" {
-                    self.error_at_code(
-                        alias.range,
-                        codes::UNSUPPORTED,
-                        format!("'from {imported} import *' is not supported for user modules"),
-                    );
+                    if self_package {
+                        // The package's own exports are only complete after
+                        // its signatures are registered.
+                        self.pending_self_stars.push(alias.range);
+                    } else if let Some(module) = &base {
+                        self.import_user_star(imported, module, nested);
+                    } else {
+                        self.error_at_code(
+                            alias.range,
+                            codes::UNSUPPORTED,
+                            format!(
+                                "'from {imported} import *' is not supported for a module that is not loaded"
+                            ),
+                        );
+                    }
                     continue;
                 }
                 let binding = match &alias.asname {
@@ -2790,7 +2862,9 @@ impl<'a> Lowerer<'a> {
                     self.error_at_code(
                         alias.range,
                         codes::UNSUPPORTED,
-                        format!("'from {imported} import *' is not supported in Phase 2.10"),
+                        format!(
+                            "'from {imported} import *' is not supported while '{imported}' is still initializing"
+                        ),
                     );
                     continue;
                 }
@@ -2833,7 +2907,9 @@ impl<'a> Lowerer<'a> {
                         self.error_at_code(
                             alias.range,
                             codes::UNSUPPORTED,
-                            format!("'from {imported} import *' is not supported for user modules"),
+                            format!(
+                                "'from {imported} import *' is not supported for a module that is not loaded"
+                            ),
                         );
                         continue;
                     }
@@ -2848,6 +2924,134 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ExtensionLookup::Missing => self.error_unsupported_module(s.range, imported),
+        }
+    }
+
+    /// Expands `from <native module> import *` into the spec's public
+    /// functions and constants. Underscore-prefixed spec entries are internal,
+    /// exactly like CPython without `__all__`.
+    fn import_native_star(&mut self, module: &'static ModuleSpec, nested: bool) {
+        for function in module.functions {
+            if function.name.starts_with('_') {
+                continue;
+            }
+            if !self.claim_import_binding(function.name, nested) {
+                continue;
+            }
+            self.imported_functions
+                .insert(function.name.to_string(), (module, function));
+        }
+        for constant in module.constants {
+            if constant.name.starts_with('_') {
+                continue;
+            }
+            if !self.claim_import_binding(constant.name, nested) {
+                continue;
+            }
+            self.imported_constants
+                .insert(constant.name.to_string(), (module, constant));
+        }
+    }
+
+    /// Expands `from <user module> import *`.
+    ///
+    /// A literal `__all__` is honoured in order and filtered to names this
+    /// compilation can actually resolve (an exported function/global or a
+    /// visible submodule). Without `__all__`, every non-underscore export and
+    /// direct submodule is bound in stable sorted order.
+    fn import_user_star(&mut self, module_name: &str, module: &UserModule, nested: bool) {
+        let names: Vec<String> = match &module.all {
+            Some(all) => {
+                let mut names = Vec::with_capacity(all.len());
+                for name in all {
+                    let submodule = format!("{module_name}.{name}");
+                    if (module.exports.contains_key(name)
+                        || self.user_modules.contains_key(&submodule))
+                        && !names.contains(name)
+                    {
+                        names.push(name.clone());
+                    }
+                }
+                names
+            }
+            None => {
+                let mut names: Vec<String> = module
+                    .exports
+                    .keys()
+                    .filter(|name| !name.starts_with('_'))
+                    .cloned()
+                    .collect();
+                let prefix = format!("{module_name}.");
+                for candidate in self.user_modules.keys() {
+                    if let Some(rest) = candidate.strip_prefix(&prefix) {
+                        if !rest.contains('.') && !rest.starts_with('_') {
+                            names.push(rest.to_string());
+                        }
+                    }
+                }
+                names.sort();
+                names.dedup();
+                names
+            }
+        };
+        for name in names {
+            if !self.claim_import_binding(&name, nested) {
+                continue;
+            }
+            let submodule = format!("{module_name}.{name}");
+            if self.user_modules.contains_key(&submodule) {
+                self.user_module_aliases.insert(name, submodule);
+                continue;
+            }
+            match module.exports.get(&name).copied() {
+                Some(UserExport::Function(id)) => {
+                    self.imported_user_functions.insert(name, id);
+                }
+                Some(UserExport::Global) => {
+                    self.imported_user_globals
+                        .insert(name.clone(), (module_name.to_string(), name));
+                }
+                // Filtered by the `__all__` check above; anonymous
+                // (`__all__` absent) names are all exports.
+                None => {}
+            }
+        }
+    }
+
+    /// Expands `from . import *` once this unit's own signatures are known.
+    fn resolve_self_stars(&mut self) {
+        let ranges = std::mem::take(&mut self.pending_self_stars);
+        for _range in ranges {
+            let names: Vec<String> = match &self.module_all {
+                Some(all) => all.clone(),
+                None => {
+                    let mut names: Vec<String> = self
+                        .fn_ids
+                        .keys()
+                        .cloned()
+                        .chain(self.global_names.iter().cloned())
+                        .filter(|name| !name.starts_with('_'))
+                        .collect();
+                    names.sort();
+                    names.dedup();
+                    names
+                }
+            };
+            for name in names {
+                if !self.claim_import_binding(&name, false) {
+                    continue;
+                }
+                match self.self_export(&name) {
+                    Some(UserExport::Function(id)) => {
+                        self.imported_user_functions.insert(name, id);
+                    }
+                    Some(UserExport::Global) => {
+                        self.imported_user_globals
+                            .insert(name.clone(), (self.dunder_name.clone(), name));
+                    }
+                    None => {}
+                }
+            }
         }
     }
 
@@ -2897,6 +3101,7 @@ impl<'a> Lowerer<'a> {
                 ),
             }
         }
+        self.resolve_self_stars();
     }
 
     /// Looks up a compiled extension for `name` (possibly dotted).

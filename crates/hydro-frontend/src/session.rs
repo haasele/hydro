@@ -184,6 +184,7 @@ struct Snapshot {
     by_name: HashMap<String, usize>,
     failed: HashSet<PathBuf>,
     stack: usize,
+    namespaces: usize,
     exports: usize,
     lowered_units: usize,
     functions: usize,
@@ -333,8 +334,18 @@ impl SessionCompiler {
                     UserModule {
                         name: dep.name.clone(),
                         exports: self.exports[dep_index].clone(),
+                        all: lower::module_all_names(&dep.module.body),
                     },
                 );
+            }
+            for namespace in &self.loader.namespaces {
+                user_modules
+                    .entry(namespace.clone())
+                    .or_insert_with(|| UserModule {
+                        name: namespace.clone(),
+                        exports: HashMap::new(),
+                        all: None,
+                    });
             }
             lowerer.set_user_modules(user_modules);
             lowerer.set_late_modules(unit.late.iter().cloned().collect());
@@ -367,7 +378,10 @@ impl SessionCompiler {
             self.exports[index] = exported;
 
             if !is_entry {
-                for function in hir.functions.iter_mut().skip(1) {
+                // Same stable identity scheme as a whole-file check: imported
+                // module bodies and their functions are prefixed with the
+                // dotted module name.
+                for function in &mut hir.functions {
                     function.name = format!("{}.{}", unit.name, function.name);
                 }
             }
@@ -424,6 +438,7 @@ impl SessionCompiler {
             by_name: self.loader.by_name.clone(),
             failed: self.loader.failed.clone(),
             stack: self.loader.stack.len(),
+            namespaces: self.loader.namespaces.len(),
             exports: self.exports.len(),
             lowered_units: self.lowered_units,
             functions: self.functions.len(),
@@ -439,6 +454,7 @@ impl SessionCompiler {
         self.loader.by_name = snapshot.by_name;
         self.loader.failed = snapshot.failed;
         self.loader.stack.truncate(snapshot.stack);
+        self.loader.namespaces.truncate(snapshot.namespaces);
         self.exports.truncate(snapshot.exports);
         self.lowered_units = snapshot.lowered_units;
         self.functions.truncate(snapshot.functions);
@@ -777,7 +793,7 @@ mod tests {
             "helper body must be initialized"
         );
         let helper_body = first.initializers[0] as usize;
-        assert_eq!(first.program.functions[helper_body].name, "<module>");
+        assert_eq!(first.program.functions[helper_body].name, "helper.<module>");
         let main_names: Vec<&str> = first
             .program
             .main_function()
@@ -799,14 +815,23 @@ mod tests {
             "an already initialized module must not run again"
         );
         assert_eq!(second.imports.len(), 2);
+        let module_bodies = second
+            .program
+            .functions
+            .iter()
+            .filter(|function| function.name == "<module>")
+            .count();
+        assert_eq!(
+            module_bodies, 2,
+            "each fragment entry body keeps MODULE_NAME"
+        );
         assert!(
             second
                 .program
                 .functions
                 .iter()
-                .filter(|function| function.name == "<module>")
-                .count()
-                >= 2
+                .any(|function| function.name == "helper.<module>"),
+            "the imported helper body keeps its module-qualified name"
         );
     }
 

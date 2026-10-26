@@ -12,18 +12,6 @@ fn bytes(text: &str) -> (*const u8, usize) {
     (text.as_ptr(), text.len())
 }
 
-/// True for the exception kinds whose handler match is decided by the runtime
-/// hierarchy rather than by tag equality.
-fn hierarchy_match(kind: hydro_ir::ExcKind) -> bool {
-    matches!(
-        kind,
-        hydro_ir::ExcKind::Exception
-            | hydro_ir::ExcKind::BaseException
-            | hydro_ir::ExcKind::OSError
-            | hydro_ir::ExcKind::FileNotFoundError
-    )
-}
-
 impl Interp {
     pub(crate) fn exec_stmts(&mut self, stmts: &[Stmt]) -> Exec {
         for stmt in stmts {
@@ -676,8 +664,11 @@ impl Interp {
                 }
                 let catches = match handler.exc {
                     None => true,
-                    Some(kind) if hierarchy_match(kind) => abi::hydro_exc_matches(kind.tag()) != 0,
-                    Some(kind) => abi::hydro_exc_tag() == kind.tag() as i64,
+                    // The runtime owns the complete CPython parent chain, so
+                    // every handler tag (not a hand-picked subset) is resolved
+                    // there. This keeps the interpreter free of a second,
+                    // partial hierarchy table.
+                    Some(kind) => abi::hydro_exc_matches(kind.tag()) != 0,
                 };
                 if catches {
                     matched = Some(handler);

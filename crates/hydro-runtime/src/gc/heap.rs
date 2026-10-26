@@ -37,6 +37,25 @@
 //! payloads are rounded to a class (8..4096 bytes, or an exact large
 //! allocation), headers use their own slab class, and released cells return
 //! to per-class free lists instead of the system allocator.
+//!
+//! # Weak references
+//!
+//! A weak reference (`_weakref.ReferenceType`) is an ordinary class instance
+//! whose target lives in the process-wide `WeakState` side table, keyed by the
+//! reference's cell address. The table stores no tagged strong edge, so
+//! tracing a reference never reaches its target: a reference that is itself
+//! reachable cannot keep its target alive. At the end of marking (with the
+//! world stopped in shared mode, before the sweep in local mode) entries whose
+//! reference object did not survive are dropped and entries whose target did
+//! not survive are cleared. A resolving call during marking marks its target
+//! grey, because the caller then holds a strong reference. The weak lock is
+//! ordered before the `GLOBAL` heap mutex and never held across user code or a
+//! payload drop.
+//!
+//! `getweakrefs` pins the references it materialises into a list: the Rust
+//! vector holding them is invisible to the conservative stack scan, so every
+//! collection also marks the pinned references until the module releases the
+//! pins (`weakrefs_unpin`).
 //! # Precise shadow-stack roots
 //!
 //! Generated code registers its live locals with [`crate::gc::roots`]. At
@@ -127,6 +146,19 @@ static STAT_SWEEP_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 static STAT_FREED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Precise frames marked by the most recent collection (diagnostic only).
 static STAT_PRECISE_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Heap generation, bumped by every [`reset`].
+///
+/// Native modules cache class values (and other heap objects) per thread.
+/// After a reset the old heap is gone, so a cache entry from a previous
+/// generation must never be reused. The counter is the cheap invalidation
+/// token those caches compare against.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the current heap generation. See [`GENERATION`].
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
 
 /// Saturating conversion of a measured phase into whole microseconds.
 fn micros(duration: Duration) -> u64 {
@@ -384,6 +416,60 @@ pub(crate) fn graph_lock() -> MutexGuard<'static, ()> {
 /// and container mutations publish insertion barriers only while this is set.
 static MARKING: AtomicBool = AtomicBool::new(false);
 
+// Weak references
+//
+// A weak reference is an ordinary Python object (`ReferenceType` is a native
+// class, so the reference itself is a normal instance) whose target lives in
+// this side table, never in a payload edge. The collector therefore never
+// traces a weak target: a reference reachable on its own cannot keep its
+// target alive.
+//
+// The table is authoritative for three questions:
+//
+// * did the target survive the last collection (`target != 0`),
+// * does a live reference to a target exist (`getweakrefcount`/`getweakrefs`),
+// * and may a resolving call return the target (`weakref_target`).
+//
+// Entries are pruned and targets cleared while the world is stopped at the
+// end of marking (shared mode) or after the mark phase (local mode), before
+// any white cell is released. Resolution after that point is safe: an entry
+// whose target is still recorded refers to an object this cycle keeps.
+//
+// Lock order: `WEAK` before the `GLOBAL` heap mutex. No path takes `GLOBAL`
+// first and then `WEAK`, and `WEAK` is never held while calling user code or
+// while dropping a payload.
+struct WeakEntry {
+    /// Raw target cell address, or `0` after the target was collected.
+    target: usize,
+    /// Whether the owning reference belongs to the process-wide (shared) heap.
+    shared: bool,
+}
+
+#[derive(Default)]
+struct WeakState {
+    /// Weak references by their own cell address.
+    refs: HashMap<usize, WeakEntry>,
+    /// Conservative "keep this reference object alive" pins, installed by
+    /// `getweakrefs` while it materialises its result list. Pins are marked as
+    /// roots by every collection and released by [`weakrefs_unpin`].
+    pins: HashMap<usize, usize>,
+}
+
+static WEAK: LazyLock<Mutex<WeakState>> = LazyLock::new(|| Mutex::new(WeakState::default()));
+
+/// Set once the shared collector's final rescan has frozen the weak table for
+/// the current cycle. Cleared when the cycle completes.
+static WEAK_FROZEN: AtomicBool = AtomicBool::new(false);
+
+/// Set when the shared sweep has partitioned the registry. From then on a
+/// cell's colour is no longer a liveness signal (survivors are reset to white
+/// immediately); registry membership is.
+static WEAK_PARTITIONED: AtomicBool = AtomicBool::new(false);
+
+fn lock_weak() -> MutexGuard<'static, WeakState> {
+    WEAK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Addresses of grey objects whose children still have to be traced.
 ///
 /// Pushed by root marking, by [`write_barrier_edge`] and by allocation.
@@ -525,6 +611,418 @@ fn mark_value(value: i64) {
     }
     mark_grey(addr);
 }
+
+/// Marks every pinned weak-reference object as a root.
+///
+/// `getweakrefs` pins the references it is about to place in a result list:
+/// those references are only reachable from this side table while the list is
+/// being built (the Rust `Vec` holding them is invisible to a conservative
+/// scan), so the current collection must keep them. `addresses` restricts the
+/// mark to the heap the collector is tracing, which matters for the parallel
+/// unit tests that each own a private heap.
+fn mark_weak_pins(addresses: &AddressSet) {
+    let weak = lock_weak();
+    for &addr in weak.pins.keys() {
+        if addresses.contains(&addr) {
+            mark_grey(addr);
+        }
+    }
+}
+
+/// Whether `target` supports weak references.
+///
+/// Mirrors CPython's weakref-able set for the value kinds this runtime has:
+/// class instances, classes, functions and modules. Built-in containers,
+/// strings and numbers are not weak-referenceable and are rejected by the
+/// module with a `TypeError`.
+pub(crate) fn weakref_supported(target: i64) -> bool {
+    if target & crate::value::TAG_MASK != crate::value::TAG_HEAP {
+        return false;
+    }
+    let addr = (target & !crate::value::TAG_MASK) as usize;
+    if addr == 0 {
+        return false;
+    }
+    // SAFETY: tagged heap address handed out by this allocator. Callers pass
+    // values produced by the runtime, which the collector keeps alive while
+    // they are reachable from the module argument buffer.
+    let obj = unsafe { object_at(addr) };
+    matches!(
+        obj.data_ref(),
+        ObjDataRef::Instance(_)
+            | ObjDataRef::Class(_)
+            | ObjDataRef::Function(_)
+            | ObjDataRef::ExtFunction(_)
+            | ObjDataRef::Module(_)
+    )
+}
+
+/// Borrows a heap object from a raw address known to belong to this runtime.
+///
+/// # Safety
+///
+/// `addr` must be a live registered cell address.
+unsafe fn object_at(addr: usize) -> &'static HydroObj {
+    &*(addr as *const HydroObj)
+}
+
+/// The target to record for a reference created while the shared weak table is
+/// frozen (the sweep window).
+///
+/// Production: a target that is no longer live is dead, so the reference is
+/// recorded as already cleared. Unit tests may own a private heap even when
+/// another test has enabled shared mode, so an address outside the shared
+/// registry is left alone there.
+fn frozen_registration_target(target_addr: usize) -> usize {
+    let heap = lock_global();
+    let registered = heap.addresses.contains(&target_addr);
+    if !registered {
+        // Production: the address was already removed by the partition, so
+        // it is dead. Unit tests may own a private heap even when another
+        // test has enabled shared mode, so leave such an address alone.
+        #[cfg(test)]
+        return target_addr;
+        #[cfg(not(test))]
+        return 0;
+    }
+    // After the partition, every remaining address belongs to a survivor or
+    // an object allocated during the sweep; colours were reset to white.
+    if WEAK_PARTITIONED.load(Ordering::Acquire) {
+        return target_addr;
+    }
+    // Before the partition the rescan colours are authoritative.
+    // SAFETY: registered objects are live until the sweep releases them; the
+    // heap lock keeps the registry stable.
+    if unsafe { object_at(target_addr).marked.load(Ordering::Acquire) != WHITE } {
+        target_addr
+    } else {
+        0
+    }
+}
+
+/// Whether a tagged value is a registered object of the active heap.
+#[allow(dead_code)] // Production-only weak-resolution check; unit tests use private heaps.
+fn registered_object(addr: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    if shared() {
+        lock_global().addresses.contains(&addr)
+    } else {
+        HEAP.with(|cell| cell.borrow().addresses.contains(&addr))
+    }
+}
+
+/// Records `reference` as a weak reference to `target`.
+///
+/// Both values must be tagged heap pointers; the caller (the `_weakref`
+/// module) validates that `target` is weak-referenceable and reports the
+/// Python-level `TypeError`. Returns `false` for a malformed pair or a
+/// reference that already died. During the sweep phase of a collection, a
+/// target that lost the final rescan is recorded as already dead instead of
+/// leaving a dangling address in the table.
+pub(crate) fn weakref_register(reference: i64, target: i64) -> bool {
+    if reference & crate::value::TAG_MASK != crate::value::TAG_HEAP
+        || target & crate::value::TAG_MASK != crate::value::TAG_HEAP
+    {
+        return false;
+    }
+    let ref_addr = (reference & !crate::value::TAG_MASK) as usize;
+    let target_addr = (target & !crate::value::TAG_MASK) as usize;
+    if ref_addr == 0 || target_addr == 0 || ref_addr == target_addr {
+        return false;
+    }
+    let mut weak = lock_weak();
+    // `MARKING && WEAK_FROZEN` is the sweep window: the final rescan chose the
+    // survivors and a white target will be freed. Such a reference resolves to
+    // `None` immediately rather than to a dangling address.
+    let target_addr = if MARKING.load(Ordering::Acquire) && WEAK_FROZEN.load(Ordering::Acquire) {
+        frozen_registration_target(target_addr)
+    } else {
+        target_addr
+    };
+    weak.refs.insert(
+        ref_addr,
+        WeakEntry {
+            target: target_addr,
+            shared: shared(),
+        },
+    );
+    true
+}
+
+/// The target recorded for `reference`, without resolving it.
+///
+/// `None` means the value is not a registered weak reference; `Some(NONE)`
+/// means the reference has been cleared (its target was collected).
+pub(crate) fn weakref_target_raw(reference: i64) -> Option<i64> {
+    if reference & crate::value::TAG_MASK != crate::value::TAG_HEAP {
+        return None;
+    }
+    let ref_addr = (reference & !crate::value::TAG_MASK) as usize;
+    if ref_addr == 0 {
+        return None;
+    }
+    let weak = lock_weak();
+    let entry = weak.refs.get(&ref_addr)?;
+    Some(if entry.target == 0 {
+        crate::value::NONE
+    } else {
+        (entry.target as i64) | crate::value::TAG_HEAP
+    })
+}
+
+/// Resolves `reference` for a call, exactly like CPython's `weakref.__call__`.
+///
+/// Returns the target, or `NONE` once it has been collected. During marking
+/// the target is marked grey before it is handed out: the caller now holds a
+/// strong reference, so the current cycle must keep it (and its children)
+/// alive. When no collection is running the target is returned only if it is
+/// still registered; the caller's stack roots it before the next collection's
+/// final rescan.
+pub(crate) fn weakref_target(reference: i64) -> i64 {
+    if reference & crate::value::TAG_MASK != crate::value::TAG_HEAP {
+        return crate::value::NONE;
+    }
+    let ref_addr = (reference & !crate::value::TAG_MASK) as usize;
+    if ref_addr == 0 {
+        return crate::value::NONE;
+    }
+    if MARKING.load(Ordering::Acquire) {
+        let weak = lock_weak();
+        let Some(entry) = weak.refs.get(&ref_addr) else {
+            return crate::value::NONE;
+        };
+        if entry.target == 0 {
+            return crate::value::NONE;
+        }
+        // While we hold the weak lock the table cannot be frozen. Marking the
+        // target here closes the window between "entry says alive" and the
+        // sweep that could otherwise free it. Only shared entries belong to
+        // the process-wide heap a shared collection is tracing.
+        if entry.shared {
+            mark_grey(entry.target);
+        }
+        return (entry.target as i64) | crate::value::TAG_HEAP;
+    }
+    let target = {
+        let weak = lock_weak();
+        match weak.refs.get(&ref_addr) {
+            Some(entry) if entry.target != 0 => (entry.target as i64) | crate::value::TAG_HEAP,
+            _ => return crate::value::NONE,
+        }
+    };
+    let target_addr = (target & !crate::value::TAG_MASK) as usize;
+    // Unit tests run every module against private heaps while another test
+    // may have switched the process to shared mode; only the production
+    // configuration can assume the active registry is authoritative.
+    #[cfg(not(test))]
+    if !registered_object(target_addr) {
+        // The recorded target is gone (for example after an embedding reset
+        // that bypassed the collector's weak pass); clear it so this and every
+        // later call reports `None`.
+        let mut weak = lock_weak();
+        if let Some(entry) = weak.refs.get_mut(&ref_addr) {
+            if entry.target == target_addr {
+                entry.target = 0;
+            }
+        }
+        return crate::value::NONE;
+    }
+    let _ = target_addr;
+    target
+}
+
+/// Number of live weak references to `target`.
+pub(crate) fn weakref_count(target: i64) -> usize {
+    if target & crate::value::TAG_MASK != crate::value::TAG_HEAP {
+        return 0;
+    }
+    let target_addr = (target & !crate::value::TAG_MASK) as usize;
+    if target_addr == 0 {
+        return 0;
+    }
+    let weak = lock_weak();
+    weak.refs
+        .values()
+        .filter(|entry| entry.target == target_addr)
+        .count()
+}
+
+/// Tagged weak references whose recorded target is `target`.
+///
+/// The returned references are pinned until [`weakrefs_unpin`] is called, so
+/// the caller can allocate the result list without a collection pruning them.
+/// The caller must release the pins on every path.
+pub(crate) fn weakrefs_for(target: i64) -> Vec<i64> {
+    if target & crate::value::TAG_MASK != crate::value::TAG_HEAP {
+        return Vec::new();
+    }
+    let target_addr = (target & !crate::value::TAG_MASK) as usize;
+    if target_addr == 0 {
+        return Vec::new();
+    }
+    let mut weak = lock_weak();
+    let candidates: Vec<usize> = weak
+        .refs
+        .iter()
+        .filter_map(|(&ref_addr, entry)| (entry.target == target_addr).then_some(ref_addr))
+        .collect();
+    let mut refs = Vec::with_capacity(candidates.len());
+    for ref_addr in candidates {
+        // The table is authoritative for "this reference exists", but a stale
+        // entry from a heap that was never swept (embedding reset) must not
+        // produce a dangling tagged value. Unit tests may use a private heap
+        // while another test has enabled shared mode, so the registry check is
+        // production-only.
+        #[cfg(not(test))]
+        if !registered_object(ref_addr) {
+            continue;
+        }
+        *weak.pins.entry(ref_addr).or_insert(0) += 1;
+        refs.push((ref_addr as i64) | crate::value::TAG_HEAP);
+    }
+    refs
+}
+
+/// Releases the pins installed by [`weakrefs_for`].
+pub(crate) fn weakrefs_unpin(refs: &[i64]) {
+    if refs.is_empty() {
+        return;
+    }
+    let mut weak = lock_weak();
+    for &reference in refs {
+        let addr = (reference & !crate::value::TAG_MASK) as usize;
+        if addr == 0 {
+            continue;
+        }
+        let remove = match weak.pins.get_mut(&addr) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if remove {
+            weak.pins.remove(&addr);
+        }
+    }
+}
+
+/// Clears weak references whose targets are white and drops entries whose
+/// reference object is white, before a local sweep releases any cell.
+///
+/// Only entries of this thread's private heap are touched: a parallel test
+/// thread owns a different address set, so its entries must be left alone.
+fn clear_weakrefs_local(heap: &HeapState) {
+    let mut weak = lock_weak();
+    weak.refs.retain(|&ref_addr, entry| {
+        if entry.shared {
+            return true;
+        }
+        let ref_known = heap.addresses.contains(&ref_addr);
+        if ref_known {
+            // SAFETY: the address came from this heap's registry and the
+            // sweep has not released it yet.
+            let color = unsafe { object_at(ref_addr).marked.load(Ordering::Acquire) };
+            if color == WHITE {
+                return false;
+            }
+        }
+        if entry.target != 0 && heap.addresses.contains(&entry.target) {
+            // SAFETY: as above; white targets are still live cells here.
+            let color = unsafe { object_at(entry.target).marked.load(Ordering::Acquire) };
+            if color == WHITE {
+                entry.target = 0;
+            }
+        }
+        true
+    });
+}
+
+/// Freezes the shared weak table at the end of the final rescan.
+///
+/// Runs with every other thread parked, before the sweep releases the white
+/// cells. References whose object did not survive are removed; targets that
+/// did not survive are cleared. From here until the end of the cycle every
+/// recorded target is live, so `weakref.__call__` can return it without a
+/// registry lookup.
+fn clear_weakrefs_shared() {
+    let mut weak = lock_weak();
+    let heap = lock_global();
+    weak.refs.retain(|&ref_addr, entry| {
+        if !entry.shared {
+            return true;
+        }
+        if !shared_object_live_locked(&heap, ref_addr) {
+            return false;
+        }
+        if entry.target != 0 && !shared_object_live_locked(&heap, entry.target) {
+            entry.target = 0;
+        }
+        true
+    });
+    WEAK_FROZEN.store(true, Ordering::SeqCst);
+}
+
+/// Liveness test for a caller already holding the heap lock.
+fn shared_object_live_locked(heap: &HeapState, addr: usize) -> bool {
+    if addr == 0 || !heap.addresses.contains(&addr) {
+        return false;
+    }
+    // SAFETY: registered objects are live until the sweep releases them; the
+    // caller holds the heap lock.
+    unsafe { object_at(addr).marked.load(Ordering::Acquire) != WHITE }
+}
+
+/// Adopts the calling thread's weak references into the shared heap after
+/// [`enable_shared`]. Entries of other (test) heaps that were never migrated
+/// stay on their private address set.
+fn weakrefs_enable_shared() {
+    let mut weak = lock_weak();
+    let addresses = lock_global().addresses.clone();
+    for (&ref_addr, entry) in weak.refs.iter_mut() {
+        if addresses.contains(&ref_addr) {
+            entry.shared = true;
+        }
+    }
+}
+
+/// Drops the whole weak table (runtime reset). Process-wide by design: reset
+/// is documented as valid only while no runtime thread is alive.
+fn weakrefs_reset() {
+    let mut weak = lock_weak();
+    weak.refs.clear();
+    weak.pins.clear();
+    WEAK_FROZEN.store(false, Ordering::SeqCst);
+    WEAK_PARTITIONED.store(false, Ordering::SeqCst);
+}
+
+/// Test-only: forget every weak entry and pin.
+#[cfg(test)]
+pub(crate) fn weakref_tests_clear() {
+    let mut weak = lock_weak();
+    weak.refs.clear();
+    weak.pins.clear();
+    WEAK_FROZEN.store(false, Ordering::SeqCst);
+    WEAK_PARTITIONED.store(false, Ordering::SeqCst);
+}
+
+/// Test-only: mark a registered reference as cleared without running a
+/// collection.
+#[cfg(test)]
+#[allow(dead_code)] // Used by the module's own test suite when it is declared.
+pub(crate) fn weakref_test_kill(reference: i64) {
+    let addr = (reference & !crate::value::TAG_MASK) as usize;
+    if let Some(entry) = lock_weak().refs.get_mut(&addr) {
+        entry.target = 0;
+    }
+}
+
+/// Serialises unit tests that touch the process-wide weak table.
+#[cfg(test)]
+pub(crate) static WEAK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Drains the worklist to a fixed point.
 ///
@@ -1095,6 +1593,10 @@ pub(crate) fn enable_shared() {
         local.addresses.shrink_to_fit();
     });
     SHARED.store(true, Ordering::Release);
+    // The weak table moves with the objects it describes. Take the weak lock
+    // only after releasing the heap lock (documented order: `WEAK` first).
+    drop(global_heap);
+    weakrefs_enable_shared();
     // `_thread` may be started from inside a fiber. The bound/aux mirroring
     // was a no-op while the heap was local; publish the current state now so
     // a shared safepoint can validate this thread's saved context.
@@ -1120,6 +1622,11 @@ pub(crate) fn reset() {
     let _registry_guard = crate::spawn::TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Invalidate per-thread class caches (they compare against the
+    // generation) and drop every weak reference: the heap they describe is
+    // about to be freed.
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    weakrefs_reset();
     // The async loop owns persistent roots; drop it first, then clear every
     // registration's persistent slots. A fresh run must not inherit them.
     crate::modules::asyncio::reset();
@@ -1443,6 +1950,9 @@ fn mark_roots(
             }
         }
     }
+    // References pinned by an in-progress `getweakrefs` are keeping their
+    // result objects reachable from outside the scanned stacks.
+    mark_weak_pins(addresses);
     STAT_PRECISE_FRAMES.store(precise_frames, Ordering::Relaxed);
 }
 
@@ -1462,6 +1972,8 @@ fn abort_shared_collection() -> i64 {
         // no allocation may observe `MARKING` after the heap lock is
         // released without also being seen by the next collection.
         MARKING.store(false, Ordering::SeqCst);
+        WEAK_FROZEN.store(false, Ordering::SeqCst);
+        WEAK_PARTITIONED.store(false, Ordering::SeqCst);
     }
     clear_worklist();
     GC_REQUESTED.store(false, Ordering::SeqCst);
@@ -1512,6 +2024,7 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     // child when the parent is already black, so the mutators may run while
     // the worklist drains.
     MARKING.store(true, Ordering::SeqCst);
+    WEAK_PARTITIONED.store(false, Ordering::SeqCst);
 
     // ---- Stage A: root snapshot (stop the world) ----
     let mut registry = lock_thread_registry();
@@ -1598,6 +2111,11 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
         }
         drain_worklist();
     }
+    // The world is still stopped and no white cell has been released. Freeze
+    // the weak table now: references whose object lost the rescan disappear,
+    // targets that lost it are cleared, and every target that remains is
+    // guaranteed to survive this cycle.
+    clear_weakrefs_shared();
     // Release the world for the sweep. `MARKING` stays set, so allocations
     // made now are born grey and queued; they are live by construction and
     // the partition below keeps them.
@@ -1615,6 +2133,8 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
         let mut heap = lock_global();
         let whites = partition_whites(&mut heap);
         heap.last_collection_objects = heap.objects.len();
+        // Colours are no longer a liveness signal from here on.
+        WEAK_PARTITIONED.store(true, Ordering::SeqCst);
         whites
     };
     let freed = whites.len();
@@ -1649,6 +2169,8 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
             heap.pool.reclaim(obj);
         }
         MARKING.store(false, Ordering::SeqCst);
+        WEAK_FROZEN.store(false, Ordering::SeqCst);
+        WEAK_PARTITIONED.store(false, Ordering::SeqCst);
         heap.pool.stats()
     };
     drop(whites);
@@ -1819,6 +2341,8 @@ pub(crate) fn after_fork_child() {
     // A child inherits neither the collector nor its mark state: drop any
     // in-flight marking request, the worklist and every colour.
     MARKING.store(false, Ordering::SeqCst);
+    WEAK_FROZEN.store(false, Ordering::SeqCst);
+    WEAK_PARTITIONED.store(false, Ordering::SeqCst);
     clear_worklist();
     clear_local_worklist();
     // The child has exactly one thread, so every inherited fiber range now
@@ -1967,10 +2491,16 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
             scan_suspended_stacks(addresses, &exclusions);
         }
     }
+    // `getweakrefs` pins the references it is about to return; keep them and
+    // their (native-only) children while the result list is being built.
+    mark_weak_pins(&heap.addresses);
     drain_worklist();
     let mark_time = mark_start.elapsed();
 
     // ---- sweep -----------------------------------------------------
+    // Clear weak targets that did not survive and drop entries whose
+    // reference object did not survive, before any white cell is released.
+    clear_weakrefs_local(heap);
     let sweep_start = Instant::now();
     let freed = sweep(heap);
     let sweep_time = sweep_start.elapsed();
@@ -2815,6 +3345,7 @@ fn spill_registers() -> [usize; 0] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exc;
     use crate::value::KIND_STR;
 
     /// Serialises the stats tests: they inspect process-wide counters, and
@@ -2875,15 +3406,215 @@ mod tests {
 
     /// Marks a registered cell black so the sweep keeps it.
     fn mark_survivor(value: i64) {
-        let obj = cell_address(value) as *mut HydroObj;
+        mark_cell(value, BLACK);
+    }
+
+    /// Forces a cell's colour (tests that inspect the weak pass directly must
+    /// not depend on a parallel collector's `MARKING` state).
+    fn mark_cell(value: i64, color: u8) {
         // SAFETY: the caller registered the object in its own heap.
-        unsafe { (*obj).marked.store(BLACK, Ordering::Release) };
+        unsafe {
+            object_at(cell_address(value))
+                .marked
+                .store(color, Ordering::Release)
+        };
     }
 
     /// Registers `label`'s string object in `heap` and returns its address.
     fn register_test_object(heap: &mut HeapState, label: &str) -> usize {
         let tagged = register_box(heap, KIND_STR, ObjData::Str(String::from(label)));
         cell_address(tagged)
+    }
+
+    /// Serialises and clears the process-wide weak table for one test.
+    fn weak_guard() -> MutexGuard<'static, ()> {
+        let guard = WEAK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        weakref_tests_clear();
+        guard
+    }
+
+    /// The colour of a registered cell.
+    fn color(value: i64) -> u8 {
+        // SAFETY: the caller registered the object in a live heap.
+        unsafe {
+            object_at(cell_address(value))
+                .marked
+                .load(Ordering::Acquire)
+        }
+    }
+
+    /// Registers a weakref directly in the side table as a private-heap entry,
+    /// independent of whether another test has switched the process to shared
+    /// mode or has a collection in flight.
+    fn register_local_weak(reference: i64, target: i64) -> bool {
+        let ref_addr = cell_address(reference);
+        let target_addr = cell_address(target);
+        if ref_addr == 0 || target_addr == 0 {
+            return false;
+        }
+        lock_weak().refs.insert(
+            ref_addr,
+            WeakEntry {
+                target: target_addr,
+                shared: false,
+            },
+        );
+        true
+    }
+
+    #[test]
+    fn weak_reference_does_not_trace_its_target() {
+        let _guard = weak_guard();
+        let mut heap = HeapState::new();
+        let target = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        let reference = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        assert!(register_local_weak(reference, target));
+        assert_eq!(weakref_target_raw(reference), Some(target));
+
+        // Tracing the reference must not reach the target through the side
+        // table: the weak edge is not part of the object graph.
+        mark_cell(target, WHITE);
+        mark_cell(reference, GREY);
+        // SAFETY: both cells were just registered in `heap` and the reference
+        // is grey; trace it directly (no worklist shared with a possibly
+        // concurrent collector).
+        unsafe { trace(cell_address(reference)) };
+        assert_eq!(color(reference), BLACK);
+        assert_eq!(color(target), WHITE);
+    }
+
+    #[test]
+    fn collecting_the_target_clears_the_reference() {
+        let _guard = weak_guard();
+        let mut heap = HeapState::new();
+        let target = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        let reference = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        assert!(register_local_weak(reference, target));
+        // Only the reference survives the mark phase.
+        mark_cell(target, WHITE);
+        mark_survivor(reference);
+
+        clear_weakrefs_local(&heap);
+        assert_eq!(weakref_target_raw(reference), Some(crate::value::NONE));
+        assert_eq!(sweep(&mut heap), 1);
+        // The reference object itself is still alive and resolves to None.
+        assert_eq!(weakref_target_raw(reference), Some(crate::value::NONE));
+        assert!(heap.addresses.contains(&cell_address(reference)));
+        assert!(!heap.addresses.contains(&cell_address(target)));
+    }
+
+    #[test]
+    fn weak_reference_to_a_live_target_resolves() {
+        let _guard = weak_guard();
+        let mut heap = HeapState::new();
+        let target = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        let reference = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        assert!(register_local_weak(reference, target));
+        mark_survivor(reference);
+        mark_survivor(target);
+
+        clear_weakrefs_local(&heap);
+        assert_eq!(sweep(&mut heap), 0);
+        assert_eq!(weakref_target_raw(reference), Some(target));
+        assert_eq!(weakref_count(target), 1);
+    }
+
+    #[test]
+    fn collected_reference_is_dropped_from_the_table() {
+        let _guard = weak_guard();
+        let mut heap = HeapState::new();
+        let target = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        let reference = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        assert!(register_local_weak(reference, target));
+        // The reference is white; the target survives.
+        mark_cell(reference, WHITE);
+        mark_survivor(target);
+
+        clear_weakrefs_local(&heap);
+        assert_eq!(weakref_target_raw(reference), None);
+        assert_eq!(sweep(&mut heap), 1);
+        assert_eq!(weakref_count(target), 0);
+    }
+
+    #[test]
+    fn weak_reference_in_a_cycle_does_not_pin_it() {
+        let _guard = weak_guard();
+        let mut heap = HeapState::new();
+        // Two lists pointing at each other form an unreachable cycle.
+        let first = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        let second = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(vec![first]),
+        );
+        if let Some(mut items) = crate::value::list_items_mut(first) {
+            items.push(second);
+        }
+        let reference = register_box(
+            &mut heap,
+            crate::value::KIND_LIST,
+            ObjData::List(Vec::new()),
+        );
+        assert!(register_local_weak(reference, first));
+        mark_cell(first, WHITE);
+        mark_cell(second, WHITE);
+        mark_survivor(reference);
+
+        clear_weakrefs_local(&heap);
+        assert_eq!(weakref_target_raw(reference), Some(crate::value::NONE));
+        // Both members of the cycle are collected; the weak reference and its
+        // non-owning edge do not retain either of them.
+        assert_eq!(sweep(&mut heap), 2);
+    }
+
+    #[test]
+    fn only_weakrefable_values_are_accepted() {
+        let _guard = weak_guard();
+        exc::init();
+        let class = crate::value::class_new(String::from("C"), crate::value::NONE, Vec::new());
+        let instance = crate::value::instance_new(class);
+        assert!(weakref_supported(instance));
+        assert!(!weakref_supported(crate::value::encode_int(1).unwrap()));
+        assert!(!weakref_supported(crate::value::list_new(Vec::new())));
+        assert!(!exc::pending());
     }
 
     #[test]

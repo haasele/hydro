@@ -4477,6 +4477,46 @@ pub(crate) fn clear_type_class_cache() {
     TYPE_CLASS_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
+/// Cached native class named `name`, created (and registered as a collector
+/// root) on first use.
+fn native_class(name: &str) -> i64 {
+    if let Some(class) = TYPE_CLASS_CACHE.with(|cache| cache.borrow().get(name).copied()) {
+        return class;
+    }
+    let class = class_new(name.to_string(), NONE, Vec::new());
+    crate::heap::add_thread_root(class);
+    TYPE_CLASS_CACHE.with(|cache| cache.borrow_mut().insert(name.to_string(), class));
+    class
+}
+
+/// Cached native `object` class: the root of Hydro's value hierarchy.
+///
+/// `isinstance(x, object_class())` is true for every Hydro value, and every
+/// class (including every built-in exception class) is a subclass of it.
+pub(crate) fn object_class() -> i64 {
+    native_class("object")
+}
+
+/// Whether `v` is the cached native `object` class.
+///
+/// Unlike [`object_class`] this never creates the class, so a side-effect-free
+/// check is available on hot paths.
+pub(crate) fn is_object_class(v: i64) -> bool {
+    TYPE_CLASS_CACHE.with(|cache| cache.borrow().get("object").copied() == Some(v))
+}
+
+/// Whether `v` is the cached native `type` class, i.e. the metaclass of every
+/// class value.
+pub(crate) fn is_type_class(v: i64) -> bool {
+    TYPE_CLASS_CACHE.with(|cache| cache.borrow().get("type").copied() == Some(v))
+}
+
+/// Whether `class` is one of the cached native classes created by `type()` for
+/// primitives (or the cached `object`/`type` classes).
+pub(crate) fn is_cached_type_class(class: i64) -> bool {
+    TYPE_CLASS_CACHE.with(|cache| cache.borrow().values().any(|cached| *cached == class))
+}
+
 /// `type(value)`: the class object for instances, otherwise a cached native
 /// class named after the value's runtime type. `type` itself maps to a cached
 /// class object named `type`.
@@ -4494,13 +4534,13 @@ pub(crate) fn type_class(v: i64) -> i64 {
     } else {
         type_name_of(v)
     };
-    if let Some(class) = TYPE_CLASS_CACHE.with(|cache| cache.borrow().get(&name).copied()) {
-        return class;
+    // Opaque runtime kinds report `object`; use the cached root class rather
+    // than creating a second class with the same name.
+    if name == "object" {
+        object_class()
+    } else {
+        native_class(&name)
     }
-    let class = class_new(name.clone(), NONE, Vec::new());
-    crate::heap::add_thread_root(class);
-    TYPE_CLASS_CACHE.with(|cache| cache.borrow_mut().insert(name, class));
-    class
 }
 
 /// Python-style type name that resolves class objects and instances to their

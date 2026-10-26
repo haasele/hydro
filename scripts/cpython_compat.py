@@ -21,7 +21,9 @@ silent fallback to another CPython.
 
 Source resolution: ``--source PATH``, else the auto-downloaded cache in
 ``.hydro/cpython/Python-3.14.9`` (downloaded once from python.org and hashed).
-``--gate`` and ``--check-manifest`` never touch the network.
+``--gate`` and ``--check-manifest`` never touch the network.  Hydro resolves
+the source tree's standard-library packages through ``HYDRO_STDLIB=<source>/Lib``;
+the CPython oracle gets the same directory on ``PYTHONPATH``.
 
 Oracle resolution: ``--cpython PATH``, else ``$HYDRO_CPYTHON``, else
 ``uv python find 3.14.9``.  If none is found the script fails with the
@@ -818,6 +820,10 @@ def main(argv: list[str] | None = None) -> int:
     cpython_env["PYTHONPATH"] = str(source / "Lib")
     hydro_env = dict(env)
     hydro_env.pop("PYTHONPATH", None)  # the oracle's path must not leak into Hydro
+    # Hydro resolves standard-library source packages (`test`, `test.support`)
+    # through its own search root. It is last on the search path, so project
+    # and site-packages modules keep precedence.
+    hydro_env["HYDRO_STDLIB"] = str(source / "Lib")
 
     test_dir = source / "Lib" / "test"
     paths, unknown = discover_tests(test_dir, args.only, args.limit)

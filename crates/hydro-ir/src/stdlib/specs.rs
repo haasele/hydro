@@ -398,6 +398,167 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("__stdin__", Type::Any),
         c("__stdout__", Type::Any),
         c("__stderr__", Type::Any),
+        // Runtime module registry. `path` is the search path reported to user
+        // code (observation only: there is no runtime importer that would
+        // consult mutations yet), `modules` maps every known module name to
+        // its module value, and `builtin_module_names` lists the native
+        // modules from `stdlib::MODULES`.
+        c("path", Type::List),
+        c("modules", Type::Dict),
+        c("builtin_module_names", Type::Tuple),
+        // Installation prefixes: `base_prefix`/`exec_prefix` describe the
+        // Hydro installation, `prefix` the active virtual environment.
+        c("prefix", Type::Str),
+        c("base_prefix", Type::Str),
+        c("exec_prefix", Type::Str),
+    ],
+};
+
+/// `builtins`: the module namespace mirroring interpreter builtins.
+///
+/// The table covers every name the compiler resolves through
+/// `hydro_ir::Builtin::from_name` plus the attribute-only entries
+/// (`object`, `setattr`, ...). Runtime dispatch for these functions and
+/// constants belongs to the builtins module implementation; this spec makes
+/// the names importable and gives native function values their arity.
+pub static BUILTINS: ModuleSpec = ModuleSpec {
+    name: "builtins",
+    functions: &[
+        // Names the compiler also makes available unqualified.
+        f("print", 0, usize::MAX, Type::None),
+        f("len", 1, 1, Type::Int),
+        f("str", 0, 3, Type::Str),
+        f("repr", 1, 1, Type::Str),
+        f("hash", 1, 1, Type::Int),
+        f("int", 0, 2, Type::Int),
+        f("float", 0, 1, Type::Float),
+        f("abs", 1, 1, Type::Any),
+        f("bool", 0, 1, Type::Bool),
+        f("type", 1, 3, Type::Any),
+        f("reversed", 1, 1, Type::Any),
+        f("__import__", 1, 5, Type::Any),
+        f("set", 0, 1, Type::Set),
+        f("range", 1, 3, Type::Range),
+        f("list", 0, 1, Type::List),
+        f("tuple", 0, 1, Type::Tuple),
+        f("dict", 0, usize::MAX, Type::Dict),
+        f("sum", 1, 2, Type::Any),
+        f("enumerate", 1, 2, Type::Any),
+        f("zip", 0, usize::MAX, Type::Any),
+        f("map", 2, usize::MAX, Type::Any),
+        f("filter", 2, 2, Type::Any),
+        f("bytes", 0, 3, Type::Bytes),
+        f("iter", 1, 2, Type::Any),
+        f("next", 1, 2, Type::Any),
+        f("frozenset", 0, 1, Type::Set),
+        f("getattr", 2, 3, Type::Any),
+        f("hasattr", 2, 2, Type::Bool),
+        f("max", 1, usize::MAX, Type::Any),
+        f("min", 1, usize::MAX, Type::Any),
+        f("sorted", 1, 1, Type::List),
+        f("round", 1, 2, Type::Any),
+        f("format", 2, 2, Type::Str),
+        f("isinstance", 2, 2, Type::Bool),
+        f("all", 1, 1, Type::Bool),
+        f("any", 1, 1, Type::Bool),
+        f("ord", 1, 1, Type::Int),
+        f("chr", 1, 1, Type::Str),
+        f("divmod", 2, 2, Type::Tuple),
+        f("callable", 1, 1, Type::Bool),
+        f("input", 0, 1, Type::Str),
+        f("get_ipython", 0, 0, Type::Any),
+        // Attribute-only names (not unqualified compiler builtins).
+        f("object", 0, 0, Type::Any),
+        f("setattr", 3, 3, Type::None),
+        f("delattr", 2, 2, Type::None),
+        f("id", 1, 1, Type::Int),
+        f("dir", 0, 1, Type::List),
+        f("vars", 0, 1, Type::Dict),
+        f("globals", 0, 0, Type::Dict),
+        f("locals", 0, 0, Type::Dict),
+        f("compile", 3, 6, Type::Any),
+        f("issubclass", 2, 2, Type::Bool),
+        f("open", 1, 5, Type::Any),
+    ],
+    constants: &[
+        // Every exception class the runtime taxonomy knows (plus the IOError
+        // alias of OSError). The names resolve to the cached native classes.
+        c("BaseException", Type::Any),
+        c("Exception", Type::Any),
+        c("ArithmeticError", Type::Any),
+        c("AssertionError", Type::Any),
+        c("AttributeError", Type::Any),
+        c("BaseExceptionGroup", Type::Any),
+        c("BlockingIOError", Type::Any),
+        c("BrokenPipeError", Type::Any),
+        c("BufferError", Type::Any),
+        c("BytesWarning", Type::Any),
+        c("CancelledError", Type::Any),
+        c("ChildProcessError", Type::Any),
+        c("ConnectionAbortedError", Type::Any),
+        c("ConnectionError", Type::Any),
+        c("ConnectionRefusedError", Type::Any),
+        c("ConnectionResetError", Type::Any),
+        c("DeprecationWarning", Type::Any),
+        c("EOFError", Type::Any),
+        c("ExceptionGroup", Type::Any),
+        c("FileExistsError", Type::Any),
+        c("FileNotFoundError", Type::Any),
+        c("FloatingPointError", Type::Any),
+        c("FutureWarning", Type::Any),
+        c("GeneratorExit", Type::Any),
+        c("ImportError", Type::Any),
+        c("ImportWarning", Type::Any),
+        c("IndentationError", Type::Any),
+        c("IndexError", Type::Any),
+        c("InterruptedError", Type::Any),
+        c("IOError", Type::Any),
+        c("IsADirectoryError", Type::Any),
+        c("KeyError", Type::Any),
+        c("KeyboardInterrupt", Type::Any),
+        c("LookupError", Type::Any),
+        c("MemoryError", Type::Any),
+        c("ModuleNotFoundError", Type::Any),
+        c("NameError", Type::Any),
+        c("NotADirectoryError", Type::Any),
+        c("NotImplementedError", Type::Any),
+        c("OSError", Type::Any),
+        c("OverflowError", Type::Any),
+        c("PendingDeprecationWarning", Type::Any),
+        c("PermissionError", Type::Any),
+        c("ProcessLookupError", Type::Any),
+        c("RecursionError", Type::Any),
+        c("ReferenceError", Type::Any),
+        c("ResourceWarning", Type::Any),
+        c("RuntimeError", Type::Any),
+        c("RuntimeWarning", Type::Any),
+        c("Skipped", Type::Any),
+        c("StopAsyncIteration", Type::Any),
+        c("StopIteration", Type::Any),
+        c("SyntaxError", Type::Any),
+        c("SyntaxWarning", Type::Any),
+        c("SystemError", Type::Any),
+        c("SystemExit", Type::Any),
+        c("TabError", Type::Any),
+        c("TimeoutError", Type::Any),
+        c("TypeError", Type::Any),
+        c("UnicodeDecodeError", Type::Any),
+        c("UnicodeEncodeError", Type::Any),
+        c("UnicodeError", Type::Any),
+        c("UnicodeTranslateError", Type::Any),
+        c("UnicodeWarning", Type::Any),
+        c("UserWarning", Type::Any),
+        c("ValueError", Type::Any),
+        c("Warning", Type::Any),
+        c("XFailed", Type::Any),
+        c("ZeroDivisionError", Type::Any),
+        // Singleton values.
+        c("None", Type::None),
+        c("True", Type::Bool),
+        c("False", Type::Bool),
+        c("Ellipsis", Type::Any),
+        c("NotImplemented", Type::Any),
+        c("__debug__", Type::Bool),
     ],
 };
 
@@ -1424,6 +1585,115 @@ pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
+/// `_collections`: accelerator alias table for `collections`. Only
+/// `defaultdict` is implemented; `deque` is deliberately absent instead of
+/// being faked.
+pub static _COLLECTIONS: ModuleSpec = ModuleSpec {
+    name: "_collections",
+    functions: &[kw("defaultdict", 1, 1, Type::Any, &["default_factory"])],
+    constants: &[],
+};
+
+/// `_codecs`: the UTF-8 codec plus the codec and error-handler registries.
+pub static _CODECS: ModuleSpec = ModuleSpec {
+    name: "_codecs",
+    functions: &[
+        f("encode", 1, 3, Type::Bytes),
+        f("decode", 1, 3, Type::Str),
+        f("utf_8_encode", 1, 1, Type::Tuple),
+        f("utf_8_decode", 1, 3, Type::Tuple),
+        f("escape_encode", 1, 2, Type::Tuple),
+        f("escape_decode", 1, 2, Type::Tuple),
+        f("lookup", 1, 1, Type::Any),
+        f("register", 1, 1, Type::None),
+        f("unregister", 1, 1, Type::None),
+        f("register_error", 2, 2, Type::None),
+        f("lookup_error", 1, 1, Type::Any),
+        // The handler functions returned by `lookup_error` for the built-in
+        // names; exposed so native function values stay dispatchable.
+        f("strict_errors", 1, 1, Type::Any),
+        f("ignore_errors", 1, 1, Type::Any),
+        f("replace_errors", 1, 1, Type::Any),
+    ],
+    constants: &[],
+};
+
+/// `_imp`: loader queries. All names are declared as functions; unsupported
+/// operations raise tagged exceptions at runtime.
+pub static _IMP: ModuleSpec = ModuleSpec {
+    name: "_imp",
+    functions: &[
+        f("acquire_lock", 0, 0, Type::None),
+        f("release_lock", 0, 0, Type::None),
+        f("is_builtin", 1, 1, Type::Bool),
+        f("is_frozen", 1, 1, Type::Bool),
+        f("is_frozen_package", 1, 1, Type::Bool),
+        f("extension_suffixes", 0, 0, Type::List),
+        f("create_builtin", 1, 1, Type::Any),
+        f("exec_builtin", 1, 1, Type::Any),
+        f("find_frozen", 1, 1, Type::Any),
+        f("get_frozen_object", 1, 2, Type::Any),
+        f("create_dynamic", 1, 1, Type::Any),
+        f("exec_dynamic", 1, 1, Type::Any),
+        f("_fix_co_filename", 2, 3, Type::None),
+        f("source_hash", 2, 2, Type::Int),
+    ],
+    constants: &[],
+};
+
+/// `_opcode`: only the two truthful specialization flags exist.
+pub static _OPCODE: ModuleSpec = ModuleSpec {
+    name: "_opcode",
+    functions: &[],
+    constants: &[
+        c("ENABLE_SPECIALIZATION", Type::Int),
+        c("ENABLE_SPECIALIZATION_FT", Type::Int),
+    ],
+};
+
+/// `_string`: the format-string parser used by `string.Formatter`.
+pub static _STRING: ModuleSpec = ModuleSpec {
+    name: "_string",
+    functions: &[
+        f("formatter_parser", 1, 1, Type::Any),
+        f("formatter_field_name_split", 1, 1, Type::Tuple),
+    ],
+    constants: &[],
+};
+
+/// `_weakref`: non-owning references. The pure-Python `weakref` module is not
+/// registered natively; it imports these names.
+pub static _WEAKREF: ModuleSpec = ModuleSpec {
+    name: "_weakref",
+    functions: &[
+        f("proxy", 1, 2, Type::Any),
+        f("getweakrefcount", 1, 1, Type::Int),
+        f("getweakrefs", 1, 1, Type::List),
+        f("_remove_dead_weakref", 2, 2, Type::None),
+        // Native method bodies installed on ReferenceType.
+        f("_weakref_ref_init", 2, 3, Type::None),
+        f("_weakref_ref_call", 1, 1, Type::Any),
+        f("_weakref_ref_eq", 2, 2, Type::Bool),
+        f("_weakref_ref_ne", 2, 2, Type::Bool),
+        f("_weakref_ref_hash", 1, 1, Type::Int),
+        f("_weakref_ref_repr", 1, 1, Type::Str),
+        // Native method bodies installed on ProxyType/CallableProxyType.
+        f("_weakref_proxy_init", 2, 3, Type::None),
+        f("_weakref_proxy_eq", 2, 2, Type::Bool),
+        f("_weakref_proxy_ne", 2, 2, Type::Bool),
+        f("_weakref_proxy_repr", 1, 1, Type::Str),
+        f("_weakref_proxy_call", 1, usize::MAX, Type::Any),
+    ],
+    constants: &[
+        // `ref` is the ReferenceType class value, not a function.
+        c("ref", Type::Any),
+        c("ReferenceType", Type::Any),
+        c("ProxyType", Type::Any),
+        c("CallableProxyType", Type::Any),
+        c("ProxyTypes", Type::Tuple),
+    ],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1691,5 +1961,41 @@ mod tests {
         let gcd = function("math", "gcd").expect("math.gcd");
         assert_eq!((gcd.min_args, gcd.max_args), (0, usize::MAX));
         assert_eq!(gcd.ret, Type::Int);
+    }
+
+    #[test]
+    fn sys_registry_and_builtins_specs_are_declared() {
+        for (name, ty) in [
+            ("path", Type::List),
+            ("modules", Type::Dict),
+            ("builtin_module_names", Type::Tuple),
+            ("prefix", Type::Str),
+            ("base_prefix", Type::Str),
+            ("exec_prefix", Type::Str),
+        ] {
+            assert_eq!(constant("sys", name).expect(name).ty, ty, "{name}");
+        }
+        assert_eq!(
+            crate::stdlib::module("builtins")
+                .expect("builtins spec")
+                .name,
+            "builtins"
+        );
+        for name in ["len", "print", "object", "setattr", "compile", "__import__"] {
+            assert!(function("builtins", name).is_some(), "{name}");
+        }
+        for name in [
+            "ValueError",
+            "ImportError",
+            "ModuleNotFoundError",
+            "None",
+            "True",
+            "False",
+            "Ellipsis",
+            "NotImplemented",
+            "__debug__",
+        ] {
+            assert!(constant("builtins", name).is_some(), "{name}");
+        }
     }
 }

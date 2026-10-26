@@ -7,12 +7,16 @@
 //! first-class function values for callables.
 //!
 //! Only the `ShimValue` types cross the boundary: scalars, bytes, strings,
-//! capsules and lists/tuples/dicts of them. Containers are copied recursively
-//! in both directions (depth-limited to [`MAX_CONVERSION_DEPTH`]); a cyclic
-//! Hydro container raises a `TypeError` instead of recursing. Capsules cross as
-//! an opaque pointer plus name, so passing one back to the extension returns
-//! the original pointer. User objects still raise a `TypeError` rather than
-//! being silently mangled.
+//! capsules, `NotImplemented` and lists/tuples/dicts of them. Containers are
+//! copied recursively in both directions (depth-limited to
+//! [`MAX_CONVERSION_DEPTH`]); a cyclic Hydro container raises a `TypeError`
+//! instead of recursing. Capsules cross as an opaque pointer plus name, so
+//! passing one back to the extension returns the original pointer. User
+//! objects still raise a `TypeError` rather than being silently mangled.
+//!
+//! Extension-created type handles have no Hydro value form: they are callable
+//! through [`call`] (`ext.Type(args...)`) but [`get`] reports them as a
+//! `TypeError` instead of inventing a value kind.
 //!
 //! All fallible paths report a pending exception and return the `None` dummy
 //! value; no user input can panic.
@@ -21,8 +25,20 @@ use std::path::Path;
 
 use crate::capi::{self, ShimAttr, ShimValue, MAX_CONVERSION_DEPTH};
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, INDEX_ERROR, KEY_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR,
-    STOP_ITERATION, TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
+    self, ARITHMETIC_ERROR, ASSERTION_ERROR, ATTRIBUTE_ERROR, BASE_EXCEPTION, BASE_EXCEPTION_GROUP,
+    BLOCKING_IO_ERROR, BROKEN_PIPE_ERROR, BUFFER_ERROR, BYTES_WARNING, CHILD_PROCESS_ERROR,
+    CONNECTION_ABORTED_ERROR, CONNECTION_ERROR, CONNECTION_REFUSED_ERROR, CONNECTION_RESET_ERROR,
+    DEPRECATION_WARNING, EOF_ERROR, EXCEPTION, FILE_EXISTS_ERROR, FILE_NOT_FOUND_ERROR,
+    FLOATING_POINT_ERROR, FUTURE_WARNING, GENERATOR_EXIT, IMPORT_ERROR, IMPORT_WARNING,
+    INDENTATION_ERROR, INDEX_ERROR, INTERRUPTED_ERROR, IS_A_DIRECTORY_ERROR, KEYBOARD_INTERRUPT,
+    KEY_ERROR, LOOKUP_ERROR, MEMORY_ERROR, MODULE_NOT_FOUND_ERROR, NAME_ERROR,
+    NOT_A_DIRECTORY_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR, OVERFLOW_ERROR,
+    PENDING_DEPRECATION_WARNING, PERMISSION_ERROR, PROCESS_LOOKUP_ERROR, RECURSION_ERROR,
+    REFERENCE_ERROR, RESOURCE_WARNING, RUNTIME_ERROR, RUNTIME_WARNING, STOP_ASYNC_ITERATION,
+    STOP_ITERATION, SYNTAX_ERROR, SYNTAX_WARNING, SYSTEM_ERROR, SYSTEM_EXIT, TAB_ERROR,
+    TIMEOUT_ERROR, TYPE_ERROR, UNICODE_DECODE_ERROR, UNICODE_ENCODE_ERROR, UNICODE_ERROR,
+    UNICODE_TRANSLATE_ERROR, UNICODE_WARNING, USER_WARNING, VALUE_ERROR, WARNING,
+    ZERO_DIVISION_ERROR,
 };
 use crate::value::{self, ExtFunctionState, NONE};
 
@@ -105,6 +121,9 @@ fn value_to_shim_at(
     }
     if value_arg == value::FALSE {
         return Ok(ShimValue::Bool(false));
+    }
+    if value_arg == value::NOT_IMPLEMENTED {
+        return Ok(ShimValue::NotImplemented);
     }
     if value::is_int(value_arg) {
         return Ok(ShimValue::Int(value_arg >> 3));
@@ -230,6 +249,12 @@ fn shim_to_value_at(shim: ShimValue, depth: usize) -> Result<i64, String> {
             }
             value::dict_new(converted)
         }
+        ShimValue::NotImplemented => value::NOT_IMPLEMENTED,
+        ShimValue::Ellipsis => {
+            return Err(
+                "extension returned the Ellipsis singleton, which has no Hydro value".to_string(),
+            )
+        }
     })
 }
 
@@ -264,6 +289,8 @@ fn shim_type_name(shim: &ShimValue) -> &'static str {
         ShimValue::Tuple(_) => "tuple",
         ShimValue::Dict(_) => "dict",
         ShimValue::Capsule { .. } => "PyCapsule",
+        ShimValue::NotImplemented => "NotImplementedType",
+        ShimValue::Ellipsis => "ellipsis",
     }
 }
 
@@ -277,36 +304,110 @@ fn not_callable(shim: &ShimValue) -> i64 {
 
 /// Selects the exception type for a message returned by the shim.
 ///
-/// The shim reports its own failure category in the text. `PyErr_SetString`
-/// emits exactly `"<Type>: <message>"` for the exported `PyExc_*` singletons,
-/// so the prefix selects the matching Hydro tag; anything else is an internal
-/// load/call failure and therefore a `RuntimeError`.
+/// The shim reports its own failure category in the text. The error setters in
+/// `capi` emit exactly `"<Type>: <message>"` for the exported `PyExc_*`
+/// singletons, so the prefix selects the matching Hydro tag; a message without
+/// a known prefix is an internal load/call failure, which falls back to
+/// `RuntimeError` (with a few historical heuristics for the loader's own
+/// diagnostics).
 fn raised_error(message: &str) -> i64 {
-    let (tag, text) = if let Some(rest) = message.strip_prefix("ValueError: ") {
-        (VALUE_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("TypeError: ") {
-        (TYPE_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("ZeroDivisionError: ") {
-        (ZERO_DIVISION_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("RuntimeError: ") {
-        (RUNTIME_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("OverflowError: ") {
-        (OVERFLOW_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("IndexError: ") {
-        (INDEX_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("KeyError: ") {
-        (KEY_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("StopIteration: ") {
-        (STOP_ITERATION, rest)
-    } else if let Some(rest) = message.strip_prefix("AttributeError: ") {
-        (ATTRIBUTE_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("OSError: ") {
-        (OS_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("BaseException: ") {
-        (RUNTIME_ERROR, rest)
-    } else if let Some(rest) = message.strip_prefix("Exception: ") {
-        (RUNTIME_ERROR, rest)
-    } else if message.contains("has no attribute")
+    let (tag, text) = match message.split_once(": ") {
+        Some((name, rest)) => match exception_tag(name) {
+            Some(tag) => (tag, rest),
+            None => fallback_error(message),
+        },
+        None => fallback_error(message),
+    };
+    exc::raise_with_message(tag, text)
+}
+
+/// Maps a CPython exception class name to its Hydro tag.
+///
+/// The names are the ones the exported `PyExc_*` symbols carry, plus the
+/// classes the shim itself names in its own diagnostics. Aliases without a
+/// dedicated Hydro tag resolve to the class they alias (`IOError`,
+/// `EnvironmentError` and `WindowsError` are `OSError`); subclasses without a
+/// tag resolve to their nearest tagged ancestor (`UnboundLocalError` is a
+/// `NameError`, `EncodingWarning` is a `Warning`).
+fn exception_tag(name: &str) -> Option<u32> {
+    Some(match name {
+        "ArithmeticError" => ARITHMETIC_ERROR,
+        "AssertionError" => ASSERTION_ERROR,
+        "AttributeError" => ATTRIBUTE_ERROR,
+        "BaseException" => BASE_EXCEPTION,
+        "BaseExceptionGroup" => BASE_EXCEPTION_GROUP,
+        "BlockingIOError" => BLOCKING_IO_ERROR,
+        "BrokenPipeError" => BROKEN_PIPE_ERROR,
+        "BufferError" => BUFFER_ERROR,
+        "BytesWarning" => BYTES_WARNING,
+        "ChildProcessError" => CHILD_PROCESS_ERROR,
+        "ConnectionAbortedError" => CONNECTION_ABORTED_ERROR,
+        "ConnectionError" => CONNECTION_ERROR,
+        "ConnectionRefusedError" => CONNECTION_REFUSED_ERROR,
+        "ConnectionResetError" => CONNECTION_RESET_ERROR,
+        "DeprecationWarning" => DEPRECATION_WARNING,
+        // `EncodingWarning` subclasses `Warning`; it has no tag of its own.
+        "EncodingWarning" => WARNING,
+        "EnvironmentError" | "IOError" | "WindowsError" | "OSError" => OS_ERROR,
+        "EOFError" => EOF_ERROR,
+        "Exception" => EXCEPTION,
+        "FileExistsError" => FILE_EXISTS_ERROR,
+        "FileNotFoundError" => FILE_NOT_FOUND_ERROR,
+        "FloatingPointError" => FLOATING_POINT_ERROR,
+        "FutureWarning" => FUTURE_WARNING,
+        "GeneratorExit" => GENERATOR_EXIT,
+        "ImportError" => IMPORT_ERROR,
+        "ImportWarning" => IMPORT_WARNING,
+        "IndentationError" => INDENTATION_ERROR,
+        "IndexError" => INDEX_ERROR,
+        "InterruptedError" => INTERRUPTED_ERROR,
+        "IsADirectoryError" => IS_A_DIRECTORY_ERROR,
+        "KeyboardInterrupt" => KEYBOARD_INTERRUPT,
+        "KeyError" => KEY_ERROR,
+        "LookupError" => LOOKUP_ERROR,
+        "MemoryError" => MEMORY_ERROR,
+        "ModuleNotFoundError" => MODULE_NOT_FOUND_ERROR,
+        "NameError" | "UnboundLocalError" => NAME_ERROR,
+        "NotADirectoryError" => NOT_A_DIRECTORY_ERROR,
+        "NotImplementedError" => NOT_IMPLEMENTED_ERROR,
+        "OverflowError" => OVERFLOW_ERROR,
+        "PendingDeprecationWarning" => PENDING_DEPRECATION_WARNING,
+        "PermissionError" => PERMISSION_ERROR,
+        "ProcessLookupError" => PROCESS_LOOKUP_ERROR,
+        "RecursionError" => RECURSION_ERROR,
+        "ReferenceError" => REFERENCE_ERROR,
+        "ResourceWarning" => RESOURCE_WARNING,
+        "RuntimeError" => RUNTIME_ERROR,
+        "RuntimeWarning" => RUNTIME_WARNING,
+        "StopAsyncIteration" => STOP_ASYNC_ITERATION,
+        "StopIteration" => STOP_ITERATION,
+        "SyntaxError" => SYNTAX_ERROR,
+        "SyntaxWarning" => SYNTAX_WARNING,
+        "SystemError" => SYSTEM_ERROR,
+        "SystemExit" => SYSTEM_EXIT,
+        "TabError" => TAB_ERROR,
+        "TimeoutError" => TIMEOUT_ERROR,
+        "TypeError" => TYPE_ERROR,
+        "UnicodeDecodeError" => UNICODE_DECODE_ERROR,
+        "UnicodeEncodeError" => UNICODE_ENCODE_ERROR,
+        "UnicodeError" => UNICODE_ERROR,
+        "UnicodeTranslateError" => UNICODE_TRANSLATE_ERROR,
+        "UnicodeWarning" => UNICODE_WARNING,
+        "UserWarning" => USER_WARNING,
+        "ValueError" => VALUE_ERROR,
+        "Warning" => WARNING,
+        "ZeroDivisionError" => ZERO_DIVISION_ERROR,
+        _ => return None,
+    })
+}
+
+/// Classifies a shim message that carries no recognisable exception prefix.
+///
+/// These are the loader's own diagnostics (`dlopen` failures, missing
+/// attributes, arity checks), so the historical text heuristics decide between
+/// `AttributeError`, `TypeError` and `RuntimeError`.
+fn fallback_error(message: &str) -> (u32, &str) {
+    if message.contains("has no attribute")
         || message.contains("attribute not found")
         || message.contains("AttributeError")
     {
@@ -318,8 +419,7 @@ fn raised_error(message: &str) -> i64 {
         (TYPE_ERROR, message)
     } else {
         (RUNTIME_ERROR, message)
-    };
-    exc::raise_with_message(tag, text)
+    }
 }
 
 /// Converts a successful shim result, reporting conversion failures.
@@ -382,6 +482,18 @@ pub(crate) fn call(
                 Err(message) => raised_error(&message),
             }
         }
+        ShimAttr::Type(address) => {
+            let args = match shim_arguments(argv) {
+                Ok(args) => args,
+                Err(value) => return value,
+            };
+            // Construction goes through the spec's `Py_tp_new`; a type without
+            // one reports a `TypeError` from `capi`.
+            match capi::call_type_object(address, &args) {
+                Ok(result) => result_value(result),
+                Err(message) => raised_error(&message),
+            }
+        }
         ShimAttr::Value(shim) => not_callable(&shim),
     }
 }
@@ -409,6 +521,13 @@ pub(crate) fn get(
         Ok(ShimAttr::Callable(callable)) => {
             value::ext_function_new(callable.module, callable.method, member.to_string())
         }
+        Ok(ShimAttr::Type(address)) => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "extension type '{}' has no Hydro value form; call it directly",
+                capi::type_display_name(address)
+            ),
+        ),
         Err(message) => raised_error(&message),
     }
 }
@@ -478,6 +597,29 @@ mod tests {
             ShimValue::Bytes(bytes) => assert_eq!(bytes, vec![0, 1, 255]),
             _ => panic!("bytes roundtrip changed type"),
         }
+    }
+
+    #[test]
+    fn singleton_constants_cross_the_boundary() {
+        // `NotImplemented` is a real Hydro value, so it round trips.
+        assert!(matches!(
+            roundtrip(ShimValue::NotImplemented),
+            ShimValue::NotImplemented
+        ));
+        assert!(matches!(
+            value_to_shim(value::NOT_IMPLEMENTED),
+            Ok(ShimValue::NotImplemented)
+        ));
+        assert_eq!(
+            shim_type_name(&ShimValue::NotImplemented),
+            "NotImplementedType"
+        );
+
+        // `Ellipsis` has no Hydro representation: it is a tagged error rather
+        // than an invented value.
+        let message = shim_to_value(ShimValue::Ellipsis).expect_err("Ellipsis is unsupported");
+        assert!(message.contains("Ellipsis"), "{message}");
+        assert_eq!(shim_type_name(&ShimValue::Ellipsis), "ellipsis");
     }
 
     #[test]
@@ -590,8 +732,52 @@ mod tests {
             ("StopIteration: done", i64::from(STOP_ITERATION)),
             ("AttributeError: bad", i64::from(ATTRIBUTE_ERROR)),
             ("OSError: bad", i64::from(OS_ERROR)),
-            ("BaseException: bad", i64::from(RUNTIME_ERROR)),
-            ("Exception: bad", i64::from(RUNTIME_ERROR)),
+            ("BaseException: bad", i64::from(BASE_EXCEPTION)),
+            ("Exception: bad", i64::from(EXCEPTION)),
+            ("ArithmeticError: bad", i64::from(ARITHMETIC_ERROR)),
+            ("AssertionError: bad", i64::from(ASSERTION_ERROR)),
+            ("BaseExceptionGroup: bad", i64::from(BASE_EXCEPTION_GROUP)),
+            ("BufferError: bad", i64::from(BUFFER_ERROR)),
+            ("EOFError: bad", i64::from(EOF_ERROR)),
+            ("FileExistsError: bad", i64::from(FILE_EXISTS_ERROR)),
+            ("FileNotFoundError: bad", i64::from(FILE_NOT_FOUND_ERROR)),
+            ("FloatingPointError: bad", i64::from(FLOATING_POINT_ERROR)),
+            ("GeneratorExit: bad", i64::from(GENERATOR_EXIT)),
+            ("ImportError: bad", i64::from(IMPORT_ERROR)),
+            ("IndentationError: bad", i64::from(INDENTATION_ERROR)),
+            ("KeyboardInterrupt: bad", i64::from(KEYBOARD_INTERRUPT)),
+            ("LookupError: bad", i64::from(LOOKUP_ERROR)),
+            ("MemoryError: bad", i64::from(MEMORY_ERROR)),
+            (
+                "ModuleNotFoundError: bad",
+                i64::from(MODULE_NOT_FOUND_ERROR),
+            ),
+            ("NameError: bad", i64::from(NAME_ERROR)),
+            ("NotImplementedError: bad", i64::from(NOT_IMPLEMENTED_ERROR)),
+            ("RecursionError: bad", i64::from(RECURSION_ERROR)),
+            ("ReferenceError: bad", i64::from(REFERENCE_ERROR)),
+            ("StopAsyncIteration: done", i64::from(STOP_ASYNC_ITERATION)),
+            ("SyntaxError: bad", i64::from(SYNTAX_ERROR)),
+            ("SystemError: bad", i64::from(SYSTEM_ERROR)),
+            ("SystemExit: bad", i64::from(SYSTEM_EXIT)),
+            ("TabError: bad", i64::from(TAB_ERROR)),
+            ("TimeoutError: bad", i64::from(TIMEOUT_ERROR)),
+            ("UnboundLocalError: bad", i64::from(NAME_ERROR)),
+            ("UnicodeDecodeError: bad", i64::from(UNICODE_DECODE_ERROR)),
+            ("UnicodeEncodeError: bad", i64::from(UNICODE_ENCODE_ERROR)),
+            (
+                "UnicodeTranslateError: bad",
+                i64::from(UNICODE_TRANSLATE_ERROR),
+            ),
+            ("UnicodeError: bad", i64::from(UNICODE_ERROR)),
+            ("UserWarning: bad", i64::from(USER_WARNING)),
+            ("Warning: bad", i64::from(WARNING)),
+            // Aliases without a dedicated tag resolve to their class.
+            ("IOError: bad", i64::from(OS_ERROR)),
+            ("EnvironmentError: bad", i64::from(OS_ERROR)),
+            ("WindowsError: bad", i64::from(OS_ERROR)),
+            // Warnings without a tag resolve to `Warning`.
+            ("EncodingWarning: bad", i64::from(WARNING)),
         ];
         exc::init();
         for (message, tag) in cases {

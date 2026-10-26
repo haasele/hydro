@@ -3,9 +3,10 @@
 //!
 //! Public contract (used by the Tea toolchain and tests):
 //! [`check_source`] returns either a fully typed [`Program`] or a non-empty list
-//! of [`Diagnostic`]s. [`check_file`] additionally resolves imports of user
-//! modules and packages (siblings, site-packages and `PYTHONPATH`) and links
-//! them into one program. Both must never panic on user input.
+//! [`Diagnostic`]s. [`check_file`] additionally resolves imports of user
+//! modules and packages (siblings, site-packages, `PYTHONPATH` and
+//! `HYDRO_STDLIB`) and links them into one program. Both must never panic on
+//! user input.
 //!
 //! [`session::SessionCompiler`] builds incremental REPL/interpreter fragments
 //! on top of the same parser, lowerer and type checker, preserving modules,
@@ -86,10 +87,14 @@ fn parse_module(source: &str, filename: &str) -> Result<ast::ModModule, Vec<Diag
 ///
 /// `import foo` / `from foo import f` are resolved as Python modules: first
 /// next to the importing file, then through `HYDRO_SITE_PACKAGES`, the
-/// `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages directories and `PYTHONPATH`.
-/// Both plain modules (`foo.py`) and packages (`foo/__init__.py`) are
-/// supported, including dotted names, submodules and relative imports. Every
-/// module is loaded once per canonical path; missing files and incompatible
+/// `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages directories, `PYTHONPATH` and
+/// finally `HYDRO_STDLIB` (the CPython `Lib` directory backing the standard
+/// library sources). Both plain modules (`foo.py`) and packages
+/// (`foo/__init__.py`) are supported, including dotted names, submodules and
+/// relative imports. A directory without `__init__.py` is a namespace-package
+/// segment: it is importable and acts as a search root for its submodules, but
+/// it has no module body and therefore no initializer. Every module is loaded
+/// once per canonical path; missing files and incompatible
 /// extensions are reported as diagnostics, as are import cycles made only of
 /// module-level imports. Imports nested inside functions, classes and compound
 /// statements only run when that code does: they are recorded but never
@@ -136,7 +141,7 @@ pub fn check_file(path: &Path) -> Result<Program, Vec<Diagnostic>> {
         )]);
     }
 
-    lower_modules(&loader.units)
+    lower_modules(&loader.units, &loader.namespaces)
 }
 
 /// Parse, lower and type-check a pytest test file together with every
@@ -216,7 +221,7 @@ pub fn check_pytest_file(path: &Path) -> Result<Program, Vec<Diagnostic>> {
             "cannot read module",
         )]);
     }
-    lower_modules(&loader.units)
+    lower_modules(&loader.units, &loader.namespaces)
 }
 
 /// A parsed module in dependency order (dependencies before importers).
@@ -282,6 +287,7 @@ impl ImportScan {
 
 /// One module file found by the search path.
 struct ResolvedModule {
+    /// Module file, or the package directory for a namespace package.
     path: PathBuf,
     /// Full dotted module name.
     name: String,
@@ -289,11 +295,17 @@ struct ResolvedModule {
     package: String,
     /// Search root the module chain was found in.
     root: PathBuf,
+    /// The segment is a namespace package: a directory without an
+    /// `__init__.py`. It has no unit and no initializer; it only contributes
+    /// its directory as a search root for submodules.
+    namespace: bool,
 }
 
 /// Outcome of resolving and loading one dotted module name.
 enum NamedLoad {
     /// Every loaded unit in the chain (package ancestors first, module last).
+    /// Empty when the name resolves to a namespace package: it exists, but it
+    /// has no body to initialize.
     Loaded(Vec<usize>),
     Missing,
     /// A diagnostic was already produced for the module (read/parse error).
@@ -323,6 +335,11 @@ struct ModuleLoader {
     /// the canonical path and the dotted name. Only module-level imports are
     /// linked, so every cycle this detects is a real cycle.
     stack: Vec<(PathBuf, String)>,
+    /// Namespace packages (directories without `__init__.py`) the search path
+    /// resolved while loading this program, in discovery order. They have no
+    /// unit; the lowerer exposes them as empty user modules so `import pkg`
+    /// and `from pkg import sub` bind like CPython.
+    namespaces: Vec<String>,
     diags: Vec<Diagnostic>,
 }
 
@@ -507,7 +524,15 @@ impl ModuleLoader {
 
         let mut loaded = Vec::with_capacity(chain.len());
         let total = chain.len();
+        let final_namespace = chain.last().is_some_and(|module| module.namespace);
         for (position, resolved) in chain.into_iter().enumerate() {
+            if resolved.namespace {
+                // Namespace package: importable, but it has no body to
+                // initialize. Its directory is already part of the search
+                // path, so submodules resolve on their own.
+                self.record_namespace(&resolved.name);
+                continue;
+            }
             let final_module = position + 1 == total;
             let key = fs::canonicalize(&resolved.path).unwrap_or_else(|_| resolved.path.clone());
             if let Some(&index) = self.by_name.get(&resolved.name) {
@@ -550,10 +575,20 @@ impl ModuleLoader {
             }
         }
 
-        if loaded.is_empty() {
+        if loaded.is_empty() && !final_namespace {
             NamedLoad::Missing
         } else {
+            // A final namespace package exists but contributes no unit, so
+            // `Loaded` may be empty: the import succeeds without an
+            // initializer.
             NamedLoad::Loaded(loaded)
+        }
+    }
+
+    /// Records a namespace package resolved by the search path.
+    fn record_namespace(&mut self, name: &str) {
+        if !self.namespaces.iter().any(|existing| existing == name) {
+            self.namespaces.push(name.to_string());
         }
     }
 
@@ -616,6 +651,10 @@ impl ModuleLoader {
         let Some(final_module) = chain.last() else {
             return false;
         };
+        // Namespace packages have no file to parse and no body to preload.
+        if final_module.namespace {
+            return false;
+        }
         let Ok(source) = fs::read_to_string(&final_module.path) else {
             return false;
         };
@@ -823,6 +862,10 @@ impl ModuleLoader {
         let Some(final_module) = chain.last() else {
             return false;
         };
+        // Namespace packages have no file to parse and no body to preload.
+        if final_module.namespace {
+            return false;
+        }
         let site_package = final_module.path.components().any(|component| {
             matches!(
                 component.as_os_str().to_str(),
@@ -865,6 +908,10 @@ impl ModuleLoader {
         let Some(final_module) = chain.last() else {
             return false;
         };
+        // Namespace packages have no file to parse and no body to preload.
+        if final_module.namespace {
+            return false;
+        }
         let site_package = final_module.path.components().any(|component| {
             matches!(
                 component.as_os_str().to_str(),
@@ -1386,10 +1433,16 @@ impl ModuleLoader {
 /// Directories searched for user modules, in order: the importing file's
 /// directory, the root of the current package chain (so `pkg.a` can import
 /// `pkg.b`), `HYDRO_SITE_PACKAGES`, the site-packages directories of
-/// `VIRTUAL_ENV`/`CONDA_PREFIX`, then `PYTHONPATH`.
+/// `VIRTUAL_ENV`/`CONDA_PREFIX`, `PYTHONPATH`, then `HYDRO_STDLIB`.
+///
+/// `HYDRO_STDLIB` is the CPython `Lib` directory that backs the standard
+/// library sources (`<cpython>/Lib`). It comes last so project modules,
+/// site-packages and user `PYTHONPATH` entries always win over the bundled
+/// stdlib source tree.
 fn module_search_roots(importer_dir: &Path, module_root: &Path) -> Vec<PathBuf> {
     let hydro_site_packages = std::env::var_os("HYDRO_SITE_PACKAGES");
     let pythonpath = std::env::var_os("PYTHONPATH");
+    let hydro_stdlib = std::env::var_os("HYDRO_STDLIB");
     let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
     let conda_prefix = std::env::var_os("CONDA_PREFIX").map(PathBuf::from);
     module_search_roots_from(
@@ -1397,12 +1450,19 @@ fn module_search_roots(importer_dir: &Path, module_root: &Path) -> Vec<PathBuf> 
         module_root,
         hydro_site_packages.as_deref(),
         pythonpath.as_deref(),
+        hydro_stdlib.as_deref(),
         virtual_env.as_deref(),
         conda_prefix.as_deref(),
     )
 }
 
 /// Builds the module search path from raw environment values.
+///
+/// Order: the importing directory and the current package root, then
+/// `HYDRO_SITE_PACKAGES`, the site-packages directories of `VIRTUAL_ENV` and
+/// `CONDA_PREFIX`, `PYTHONPATH`, and finally `HYDRO_STDLIB`. Every explicit
+/// user location therefore takes precedence over the standard library source
+/// tree, matching CPython's `sys.path` layout.
 ///
 /// Missing and non-directory entries are dropped and duplicates are searched
 /// only once. The importing file's directory always comes first.
@@ -1411,6 +1471,7 @@ fn module_search_roots_from(
     module_root: &Path,
     hydro_site_packages: Option<&std::ffi::OsStr>,
     pythonpath: Option<&std::ffi::OsStr>,
+    hydro_stdlib: Option<&std::ffi::OsStr>,
     virtual_env: Option<&Path>,
     conda_prefix: Option<&Path>,
 ) -> Vec<PathBuf> {
@@ -1421,7 +1482,7 @@ fn module_search_roots_from(
     for prefix in [virtual_env, conda_prefix].into_iter().flatten() {
         dirs.extend(lower::prefix_site_packages(prefix));
     }
-    if let Some(list) = pythonpath {
+    for list in [pythonpath, hydro_stdlib].into_iter().flatten() {
         dirs.extend(std::env::split_paths(list));
     }
 
@@ -1436,25 +1497,33 @@ fn module_search_roots_from(
     dirs
 }
 
-/// Resolves `name` in the first search root that contains it.
+/// Resolves `name` on the module search path.
 ///
 /// Returns the package ancestors and the module itself in order, so the loader
 /// can initialize parents first. Namespace packages (directories without
-/// `__init__.py`) are not supported.
+/// `__init__.py`) are valid package segments: a real module or package found
+/// later on the search path wins over a namespace portion, matching CPython's
+/// `PathFinder`.
 fn resolve_module(roots: &[PathBuf], name: &str) -> Option<Vec<ResolvedModule>> {
     if name.is_empty() || name.split('.').any(|part| part.is_empty()) {
         return None;
     }
     let parts: Vec<&str> = name.split('.').collect();
+    let mut namespace = None;
     for root in roots {
         if let Some(mut chain) = resolve_module_in(root, &parts) {
             for module in &mut chain {
                 module.root = root.clone();
             }
-            return Some(chain);
+            if chain.last().is_some_and(|module| module.namespace) {
+                // Keep looking for a real package/module in a later root.
+                namespace.get_or_insert(chain);
+            } else {
+                return Some(chain);
+            }
         }
     }
-    None
+    namespace
 }
 
 fn resolve_module_in(root: &Path, parts: &[&str]) -> Option<Vec<ResolvedModule>> {
@@ -1477,6 +1546,7 @@ fn resolve_module_in(root: &Path, parts: &[&str]) -> Option<Vec<ResolvedModule>>
                     name: name.clone(),
                     package: name,
                     root: PathBuf::new(),
+                    namespace: false,
                 });
                 return Some(chain);
             }
@@ -1490,19 +1560,51 @@ fn resolve_module_in(root: &Path, parts: &[&str]) -> Option<Vec<ResolvedModule>>
                     name,
                     package,
                     root: PathBuf::new(),
+                    namespace: false,
+                });
+                return Some(chain);
+            }
+            if package_dir.is_dir() {
+                // A namespace package: the directory is importable but has no
+                // `__init__.py` and therefore no module body.
+                chain.push(ResolvedModule {
+                    path: package_dir,
+                    name: name.clone(),
+                    package: name,
+                    root: PathBuf::new(),
+                    namespace: true,
                 });
                 return Some(chain);
             }
             return None;
         }
-        if !init.is_file() {
+        if init.is_file() {
+            chain.push(ResolvedModule {
+                path: init,
+                name: name.clone(),
+                package: name.clone(),
+                root: PathBuf::new(),
+                namespace: false,
+            });
+            dir = package_dir;
+            continue;
+        }
+        // A plain module cannot contain submodules: `pkg.sub` is unresolved
+        // even when `pkg.py` exists.
+        if module_file.is_file() {
             return None;
         }
+        if !package_dir.is_dir() {
+            return None;
+        }
+        // Intermediate namespace segment: continue the dotted chain inside
+        // the directory.
         chain.push(ResolvedModule {
-            path: init,
+            path: package_dir.clone(),
             name: name.clone(),
             package: name.clone(),
             root: PathBuf::new(),
+            namespace: true,
         });
         dir = package_dir;
     }
@@ -1512,8 +1614,13 @@ fn resolve_module_in(root: &Path, parts: &[&str]) -> Option<Vec<ResolvedModule>>
 /// Lowers every loaded module in dependency order and links the results.
 ///
 /// The module bodies of imported units become [`Program::initializers`] (in
-/// dependency order) and run before the entry module.
-fn lower_modules(units: &[LoadedModule]) -> Result<Program, Vec<Diagnostic>> {
+/// dependency order) and run before the entry module. Namespace packages in
+/// `namespaces` have no unit: they are exposed as empty user modules and never
+/// produce an initializer.
+fn lower_modules(
+    units: &[LoadedModule],
+    namespaces: &[String],
+) -> Result<Program, Vec<Diagnostic>> {
     let entry_index = units.len() - 1;
     let mut all_functions: Vec<hydro_ir::Function> = Vec::new();
     let mut exports: Vec<HashMap<String, lower::UserExport>> = vec![HashMap::new(); units.len()];
@@ -1561,8 +1668,20 @@ fn lower_modules(units: &[LoadedModule]) -> Result<Program, Vec<Diagnostic>> {
                 UserModule {
                     name: dep.name.clone(),
                     exports: exports[dep_index].clone(),
+                    all: lower::module_all_names(&dep.module.body),
                 },
             );
+        }
+        // Namespace packages resolved anywhere in this program are importable
+        // names with no body and no exports.
+        for namespace in namespaces {
+            user_modules
+                .entry(namespace.clone())
+                .or_insert_with(|| UserModule {
+                    name: namespace.clone(),
+                    exports: HashMap::new(),
+                    all: None,
+                });
         }
         lowerer.set_user_modules(user_modules);
         // Modules this unit imports but cannot link (an initializing ancestor
@@ -1597,7 +1716,11 @@ fn lower_modules(units: &[LoadedModule]) -> Result<Program, Vec<Diagnostic>> {
 
         exports[index] = exported;
         if index != entry_index {
-            for function in hir.functions.iter_mut().skip(1) {
+            // Imported units keep one identity per unit: the module body and
+            // every nested function are namespaced by the dotted module name,
+            // so the runtime can materialize `sys.modules` entries exactly and
+            // two modules with the same function name never collide.
+            for function in &mut hir.functions {
                 function.name = format!("{}.{}", unit.name, function.name);
             }
         }
@@ -1747,6 +1870,12 @@ mod tests {
             std::env::set_var(key, value);
             EnvVar { key, old }
         }
+
+        fn unset(key: &'static str) -> EnvVar {
+            let old = std::env::var_os(key);
+            std::env::remove_var(key);
+            EnvVar { key, old }
+        }
     }
 
     impl Drop for EnvVar {
@@ -1756,6 +1885,12 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    /// Serializes tests that mutate process-wide import environment variables.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn program(path: &Path) -> Program {
@@ -1973,7 +2108,16 @@ mod tests {
             .iter()
             .filter(|function| function.name == "<module>")
             .count();
-        assert_eq!(module_bodies, 4, "entry, left, right and the shared base");
+        assert_eq!(module_bodies, 1, "only the entry body keeps MODULE_NAME");
+        let imported_bodies = program
+            .functions
+            .iter()
+            .filter(|function| function.name.ends_with(".<module>"))
+            .count();
+        assert_eq!(
+            imported_bodies, 3,
+            "left, right and the shared base bodies are module-qualified"
+        );
         let base_values = program
             .functions
             .iter()
@@ -2039,7 +2183,7 @@ mod tests {
         // The imported module body mirrors both exported names.
         assert_eq!(program.initializers.len(), 1);
         let helper = &program.functions[program.initializers[0] as usize];
-        assert_eq!(helper.name, "<module>");
+        assert_eq!(helper.name, "helper.<module>");
         let mut class_mirrored = false;
         let mut value_mirrored = false;
         for stmt in &helper.body {
@@ -2129,7 +2273,10 @@ mod tests {
             initializer, program.main,
             "the entry body is not an initializer"
         );
-        assert_eq!(program.functions[initializer as usize].name, "<module>");
+        assert_eq!(
+            program.functions[initializer as usize].name,
+            "helper.<module>"
+        );
         use hydro_ir::{Callee, ExprKind, StmtKind};
         let side_effect = program.functions[initializer as usize]
             .body
@@ -2247,6 +2394,7 @@ mod tests {
 
     #[test]
     fn site_packages_root_resolves_modules_without_sibling_files() {
+        let _env = env_lock();
         let dir = TestDir::new("site-packages");
         let site = dir.path.join("site-packages");
         let project = dir.path.join("project");
@@ -2261,8 +2409,15 @@ mod tests {
         let main = project.join("main.py");
         fs::write(&main, "from pkg.mod import get\nprint(get())\n").expect("write entry");
 
-        let roots =
-            module_search_roots_from(&project, &project, Some(site.as_os_str()), None, None, None);
+        let roots = module_search_roots_from(
+            &project,
+            &project,
+            Some(site.as_os_str()),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(roots, vec![project.clone(), site.clone()]);
 
         let _guard = EnvVar::set("HYDRO_SITE_PACKAGES", site.as_os_str());
@@ -2273,6 +2428,253 @@ mod tests {
             program.initializers.len(),
             2,
             "pkg and pkg.mod bodies run before the entry"
+        );
+    }
+
+    #[test]
+    fn hydro_stdlib_search_root_follows_pythonpath_and_resolves_test_support() {
+        let _env = env_lock();
+        let dir = TestDir::new("hydro-stdlib");
+        let lib = dir.path.join("Lib");
+        let project = dir.path.join("project");
+        let pythonpath = dir.path.join("pythonpath");
+        fs::create_dir_all(lib.join("test").join("support")).expect("create test.support");
+        fs::create_dir_all(&project).expect("create project");
+        fs::create_dir_all(&pythonpath).expect("create pythonpath");
+        fs::write(lib.join("test").join("__init__.py"), "").expect("write test init");
+        fs::write(
+            lib.join("test").join("support").join("__init__.py"),
+            "VALUE = 41\n\ndef get():\n    return VALUE + 1\n",
+        )
+        .expect("write support init");
+        fs::write(
+            lib.join("test").join("support").join("helper.py"),
+            "def inc(value):\n    return value + 1\n",
+        )
+        .expect("write support helper");
+
+        let main = project.join("main.py");
+        fs::write(
+            &main,
+            "import test.support\nfrom test.support import get, VALUE\nfrom test.support.helper import inc\nprint(get(), VALUE, inc(1))\n",
+        )
+        .expect("write entry");
+
+        let roots = module_search_roots_from(
+            &project,
+            &project,
+            None,
+            Some(pythonpath.as_os_str()),
+            Some(lib.as_os_str()),
+            None,
+            None,
+        );
+        assert_eq!(
+            roots,
+            vec![project.clone(), pythonpath.clone(), lib.clone()],
+            "site/user modules keep precedence over HYDRO_STDLIB"
+        );
+
+        let _stdlib = EnvVar::set("HYDRO_STDLIB", lib.as_os_str());
+        let _pythonpath = EnvVar::unset("PYTHONPATH");
+        let program = program(&main);
+        let get = function_id(&program, "test.support.get");
+        let inc = function_id(&program, "test.support.helper.inc");
+        use hydro_ir::{Callee, ExprKind, StmtKind};
+        let entry = program.main_function();
+        let mut get_called = false;
+        let mut inc_called = false;
+        for stmt in &entry.body {
+            if let StmtKind::Expr(expr) = &stmt.kind {
+                if let ExprKind::Call { callee, args } = &expr.kind {
+                    if matches!(callee, Callee::Builtin(hydro_ir::Builtin::Print)) {
+                        for arg in args {
+                            get_called |= calls_function(arg, get);
+                            inc_called |= calls_function(arg, inc);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(get_called, "`get()` must link to test.support.get");
+        assert!(inc_called, "`inc(1)` must link to test.support.helper.inc");
+        // `test` and `test.support` are real packages: both bodies run once,
+        // in dependency order, before the entry.
+        assert_eq!(program.initializers.len(), 3, "{program:?}");
+        let body_names: Vec<&str> = program
+            .initializers
+            .iter()
+            .map(|id| program.functions[*id as usize].name.as_str())
+            .collect();
+        assert_eq!(
+            body_names,
+            vec![
+                "test.<module>",
+                "test.support.<module>",
+                "test.support.helper.<module>"
+            ]
+        );
+    }
+
+    #[test]
+    fn hydro_stdlib_missing_modules_keep_the_same_diagnostic_when_unset() {
+        let _env = env_lock();
+        let dir = TestDir::new("hydro-stdlib-missing");
+        let main = dir.write("main.py", "import nowhere\n");
+        let _stdlib = EnvVar::unset("HYDRO_STDLIB");
+        let _pythonpath = EnvVar::unset("PYTHONPATH");
+        let diags = check_file(&main).expect_err("missing module must fail");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(
+            diags[0].message,
+            "module 'nowhere' not found: not supported on the import search path"
+        );
+        assert_eq!(
+            diags[0].help.as_deref(),
+            Some("expected a module file on the import search path")
+        );
+    }
+
+    #[test]
+    fn namespace_package_segments_resolve_without_an_initializer() {
+        let dir = TestDir::new("namespace");
+        fs::create_dir_all(dir.path.join("ns_pkg")).expect("create namespace package");
+        fs::write(
+            dir.path.join("ns_pkg").join("mod.py"),
+            "def value():\n    return 3\n",
+        )
+        .expect("write module");
+        let main = dir.write("main.py", "from ns_pkg.mod import value\nprint(value())\n");
+        let namespace_program = program(&main);
+        let value = function_id(&namespace_program, "ns_pkg.mod.value");
+        assert_eq!(printed_call(&namespace_program), value);
+        assert_eq!(
+            namespace_program.initializers.len(),
+            1,
+            "only the real module body runs; the namespace package has none"
+        );
+        assert_eq!(
+            namespace_program.functions[namespace_program.initializers[0] as usize].name,
+            "ns_pkg.mod.<module>"
+        );
+        assert!(
+            !namespace_program
+                .functions
+                .iter()
+                .any(|function| function.name == "ns_pkg.<module>"),
+            "a namespace package must not emit an initializer"
+        );
+
+        // Importing the final namespace package itself succeeds and links
+        // nothing.
+        let main = dir.write("main_ns.py", "import ns_pkg\nprint(1)\n");
+        let namespace_program = program(&main);
+        assert!(
+            namespace_program.initializers.is_empty(),
+            "namespace packages have no body"
+        );
+    }
+
+    #[test]
+    fn native_star_import_binds_spec_functions_and_constants() {
+        let dir = TestDir::new("star-native");
+        let main = dir.write(
+            "main.py",
+            "from math import *\nx = sqrt(9)\ny = pi\nprint(x)\n",
+        );
+        let program = program(&main);
+        use hydro_ir::{ExprKind, StmtKind};
+        let entry = program.main_function();
+        let mut sqrt_bound = false;
+        let mut pi_bound = false;
+        for stmt in &entry.body {
+            let StmtKind::Assign { target, value } = &stmt.kind else {
+                continue;
+            };
+            match entry.local(*target).name.as_str() {
+                "x" => {
+                    sqrt_bound = matches!(
+                        &value.kind,
+                        ExprKind::ModuleCall { module, function, .. }
+                            if module == "math" && function == "sqrt"
+                    );
+                }
+                "y" => {
+                    pi_bound = matches!(
+                        &value.kind,
+                        ExprKind::ModuleAttr { module, name }
+                            if module == "math" && name == "pi"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(sqrt_bound, "`sqrt` must bind to math.sqrt");
+        assert!(pi_bound, "`pi` must bind to math.pi");
+    }
+
+    #[test]
+    fn user_star_import_binds_public_exports_only() {
+        let dir = TestDir::new("star-user");
+        dir.write(
+            "helper.py",
+            "VALUE = 7\n\ndef add(a, b):\n    return a + b\n\n_private = 1\n",
+        );
+        let main = dir.write("main.py", "from helper import *\nprint(add(1, 2), VALUE)\n");
+        let program = program(&main);
+        let add = function_id(&program, "helper.add");
+        use hydro_ir::{ExprKind, StmtKind};
+        let entry = program.main_function();
+        let mut add_called = false;
+        let mut reads_value = false;
+        for stmt in &entry.body {
+            let StmtKind::Expr(expr) = &stmt.kind else {
+                continue;
+            };
+            let ExprKind::Call {
+                callee: hydro_ir::Callee::Builtin(hydro_ir::Builtin::Print),
+                args,
+            } = &expr.kind
+            else {
+                continue;
+            };
+            for arg in args {
+                add_called |= calls_function(arg, add);
+                reads_value |= matches!(
+                    &arg.kind,
+                    ExprKind::GlobalGet { module, name }
+                        if module == "helper" && name == "VALUE"
+                );
+            }
+        }
+        assert!(add_called, "`add` must link to helper.add");
+        assert!(reads_value, "`VALUE` must read helper.VALUE");
+
+        // `_private` is not exported by a star import without `__all__`.
+        let bad = dir.write("bad.py", "from helper import *\nprint(_private)\n");
+        let diags = check_file(&bad).expect_err("private name must stay unbound");
+        assert!(
+            diags.iter().any(|diag| diag.message.contains("'_private'")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn user_star_import_honors_a_literal_all_in_order() {
+        let dir = TestDir::new("star-all");
+        dir.write(
+            "helper.py",
+            "__all__ = (\"keep\",)\n\ndef keep():\n    return 1\n\ndef drop():\n    return 2\n",
+        );
+        let good = dir.write("good.py", "from helper import *\nprint(keep())\n");
+        let program = program(&good);
+        assert_eq!(printed_call(&program), function_id(&program, "helper.keep"));
+
+        let bad = dir.write("bad.py", "from helper import *\nprint(drop())\n");
+        let diags = check_file(&bad).expect_err("names outside __all__ are filtered");
+        assert!(
+            diags.iter().any(|diag| diag.message.contains("'drop'")),
+            "{diags:?}"
         );
     }
 

@@ -6,6 +6,7 @@
 //! `KeyError`, matching CPython.
 
 use crate::container;
+use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, KEY_ERROR, TYPE_ERROR};
 use crate::value::{self, FunctionBody, NONE};
 
@@ -43,6 +44,22 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             &format!("module 'collections' has no attribute '{function}'"),
         ),
     }
+}
+
+/// Identity-stable `defaultdict` native function shared by `collections` and
+/// `_collections`.
+///
+/// `module_get_named` normally allocates a fresh native function per access;
+/// `collections.defaultdict is _collections.defaultdict` is observable, so the
+/// alias must be one value. The cache lives in the globals registry, which
+/// roots it for the collector.
+pub(crate) fn defaultdict_function() -> i64 {
+    if let Some(cached) = globals::registry_get("collections.defaultdict") {
+        return cached;
+    }
+    let function = value::native_function_new("collections", "defaultdict", 1);
+    globals::registry_set("collections.defaultdict", function);
+    function
 }
 
 /// Produces the value stored for a missing key. The caller checks that the

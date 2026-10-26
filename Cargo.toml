@@ -6,6 +6,7 @@ members = [
     "crates/hydro-runtime",
     "crates/hydro-interp",
     "crates/hydro-codegen",
+    "crates/hydro-python-parser",
 ]
 
 [workspace.package]
@@ -20,6 +21,7 @@ hydro-frontend = { path = "crates/hydro-frontend" }
 hydro-runtime = { path = "crates/hydro-runtime" }
 hydro-interp = { path = "crates/hydro-interp" }
 hydro-codegen = { path = "crates/hydro-codegen" }
+hydro-python-parser = { path = "crates/hydro-python-parser" }
 rustpython-parser = "0.4"
 cranelift-codegen = "0.120"
 cranelift-frontend = "0.120"

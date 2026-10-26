@@ -225,24 +225,14 @@ fn raises_exit(args: &[i64]) -> i64 {
     value::TRUE
 }
 
-/// Runtime exception tags that map onto the same CPython hierarchy.
+/// Whether a raised exception tag is caught by the expected handler tag.
+///
+/// The runtime owns the complete CPython parent chain, so this is the same
+/// relationship `except` uses: `pytest.raises(ArithmeticError)` accepts a
+/// `ZeroDivisionError`, `pytest.raises(ImportError)` accepts a
+/// `ModuleNotFoundError`, and so on.
 fn same_family(expected: u32, actual: u32) -> bool {
-    use crate::exc::{
-        BASE_EXCEPTION, CANCELLED_ERROR, EXCEPTION, FILE_NOT_FOUND_ERROR, GENERATOR_EXIT,
-        KEYBOARD_INTERRUPT, OS_ERROR,
-    };
-    if expected == actual {
-        return true;
-    }
-    match expected {
-        BASE_EXCEPTION => true,
-        EXCEPTION => !matches!(
-            actual,
-            KEYBOARD_INTERRUPT | GENERATOR_EXIT | CANCELLED_ERROR
-        ),
-        OS_ERROR => matches!(actual, OS_ERROR | FILE_NOT_FOUND_ERROR),
-        _ => false,
-    }
+    exc::tag_is_subclass(actual, expected)
 }
 
 fn actual_name(exc_value: i64) -> Option<String> {

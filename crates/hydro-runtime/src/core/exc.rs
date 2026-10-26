@@ -38,6 +38,12 @@ pub(crate) struct ExcData {
     /// Exit status of a `SystemExit` carrying an integer code. `None` means
     /// the payload is a message instead (`sys.exit("boom")`).
     pub(crate) exit_code: Option<i64>,
+    /// Python-visible `args` tuple, rendered as text. CPython stores the
+    /// original argument objects; Hydro stores their `str()` so the payload
+    /// stays plain Rust data and needs no additional collector edge.
+    /// Exceptions raised without arguments have an empty vector, so
+    /// `e.args == ()`.
+    pub(crate) args: Vec<String>,
 }
 
 // Exception tags, fixed by ARCHITECTURE §3.2.
@@ -85,6 +91,93 @@ pub(crate) const SKIPPED: u32 = 20;
 /// expected failure. Runtime-internal.
 pub(crate) const XFAILED: u32 = 21;
 
+// Tags appended for the CPython 3.14 taxonomy. Existing tags above are never
+// renumbered; `19..=21` stay reserved for the runtime-internal kinds.
+/// `SystemError`: an internal interpreter error.
+pub(crate) const SYSTEM_ERROR: u32 = 22;
+/// `MemoryError`: out of memory.
+pub(crate) const MEMORY_ERROR: u32 = 23;
+/// `RecursionError`: a `RuntimeError` subclass raised when the recursion
+/// limit would be exceeded.
+pub(crate) const RECURSION_ERROR: u32 = 24;
+/// `SyntaxError`: invalid syntax.
+pub(crate) const SYNTAX_ERROR: u32 = 25;
+/// `IndentationError`: a `SyntaxError` subclass.
+pub(crate) const INDENTATION_ERROR: u32 = 26;
+/// `TabError`: an `IndentationError` subclass.
+pub(crate) const TAB_ERROR: u32 = 27;
+/// `ArithmeticError`: base of [`ZERO_DIVISION_ERROR`], [`OVERFLOW_ERROR`]
+/// and [`FLOATING_POINT_ERROR`].
+pub(crate) const ARITHMETIC_ERROR: u32 = 28;
+/// `LookupError`: base of [`INDEX_ERROR`] and [`KEY_ERROR`].
+pub(crate) const LOOKUP_ERROR: u32 = 29;
+/// `ImportError`: a failed import.
+pub(crate) const IMPORT_ERROR: u32 = 30;
+/// `ModuleNotFoundError`: an `ImportError` subclass.
+pub(crate) const MODULE_NOT_FOUND_ERROR: u32 = 31;
+/// `NotImplementedError`: a `RuntimeError` subclass.
+pub(crate) const NOT_IMPLEMENTED_ERROR: u32 = 32;
+/// `EOFError`: end of file where input was expected.
+pub(crate) const EOF_ERROR: u32 = 33;
+/// `UnicodeError`: a `ValueError` subclass and the base of the three codec
+/// errors below.
+pub(crate) const UNICODE_ERROR: u32 = 34;
+pub(crate) const UNICODE_DECODE_ERROR: u32 = 35;
+pub(crate) const UNICODE_ENCODE_ERROR: u32 = 36;
+pub(crate) const UNICODE_TRANSLATE_ERROR: u32 = 37;
+/// `BufferError`: a buffer operation failed.
+pub(crate) const BUFFER_ERROR: u32 = 38;
+/// `ReferenceError`: a weak reference outlived its target.
+pub(crate) const REFERENCE_ERROR: u32 = 39;
+/// `ExceptionGroup`: also a [`BASE_EXCEPTION_GROUP`].
+pub(crate) const EXCEPTION_GROUP: u32 = 40;
+/// `BaseExceptionGroup`: also a `BaseException`.
+pub(crate) const BASE_EXCEPTION_GROUP: u32 = 41;
+/// `Warning`: base of every warning category below.
+pub(crate) const WARNING: u32 = 42;
+pub(crate) const USER_WARNING: u32 = 43;
+pub(crate) const DEPRECATION_WARNING: u32 = 44;
+pub(crate) const PENDING_DEPRECATION_WARNING: u32 = 45;
+pub(crate) const SYNTAX_WARNING: u32 = 46;
+pub(crate) const RUNTIME_WARNING: u32 = 47;
+pub(crate) const FUTURE_WARNING: u32 = 48;
+pub(crate) const IMPORT_WARNING: u32 = 49;
+pub(crate) const UNICODE_WARNING: u32 = 50;
+pub(crate) const BYTES_WARNING: u32 = 51;
+pub(crate) const RESOURCE_WARNING: u32 = 52;
+/// `FloatingPointError`: an `ArithmeticError` subclass.
+pub(crate) const FLOATING_POINT_ERROR: u32 = 53;
+/// `BlockingIOError`: an `OSError` subclass.
+pub(crate) const BLOCKING_IO_ERROR: u32 = 54;
+/// `ChildProcessError`: an `OSError` subclass.
+pub(crate) const CHILD_PROCESS_ERROR: u32 = 55;
+/// `ConnectionError`: an `OSError` subclass and the base of the four
+/// connection failures below.
+pub(crate) const CONNECTION_ERROR: u32 = 56;
+pub(crate) const BROKEN_PIPE_ERROR: u32 = 57;
+pub(crate) const CONNECTION_ABORTED_ERROR: u32 = 58;
+pub(crate) const CONNECTION_REFUSED_ERROR: u32 = 59;
+pub(crate) const CONNECTION_RESET_ERROR: u32 = 60;
+/// `FileExistsError`: an `OSError` subclass.
+pub(crate) const FILE_EXISTS_ERROR: u32 = 61;
+/// `InterruptedError`: an `OSError` subclass.
+pub(crate) const INTERRUPTED_ERROR: u32 = 62;
+/// `IsADirectoryError`: an `OSError` subclass.
+pub(crate) const IS_A_DIRECTORY_ERROR: u32 = 63;
+/// `NotADirectoryError`: an `OSError` subclass.
+pub(crate) const NOT_A_DIRECTORY_ERROR: u32 = 64;
+/// `PermissionError`: an `OSError` subclass.
+pub(crate) const PERMISSION_ERROR: u32 = 65;
+/// `ProcessLookupError`: an `OSError` subclass.
+pub(crate) const PROCESS_LOOKUP_ERROR: u32 = 66;
+/// `TimeoutError`: an `OSError` subclass (the builtin, not
+/// `asyncio.TimeoutError`).
+pub(crate) const TIMEOUT_ERROR: u32 = 67;
+
+// CPython's `IOError` and `EnvironmentError` are aliases of `OSError`, so they
+// have no separate tags; `hydro_ir::ExcKind::IOError` and
+// `hydro_ir::ExcKind::EnvironmentError` both resolve to [`OS_ERROR`].
+
 pub(crate) fn tag_name(tag: u32) -> &'static str {
     match tag {
         VALUE_ERROR => "ValueError",
@@ -109,6 +202,52 @@ pub(crate) fn tag_name(tag: u32) -> &'static str {
         CANCELLED_ERROR => "CancelledError",
         SKIPPED => "Skipped",
         XFAILED => "XFailed",
+        SYSTEM_ERROR => "SystemError",
+        MEMORY_ERROR => "MemoryError",
+        RECURSION_ERROR => "RecursionError",
+        SYNTAX_ERROR => "SyntaxError",
+        INDENTATION_ERROR => "IndentationError",
+        TAB_ERROR => "TabError",
+        ARITHMETIC_ERROR => "ArithmeticError",
+        LOOKUP_ERROR => "LookupError",
+        IMPORT_ERROR => "ImportError",
+        MODULE_NOT_FOUND_ERROR => "ModuleNotFoundError",
+        NOT_IMPLEMENTED_ERROR => "NotImplementedError",
+        EOF_ERROR => "EOFError",
+        UNICODE_ERROR => "UnicodeError",
+        UNICODE_DECODE_ERROR => "UnicodeDecodeError",
+        UNICODE_ENCODE_ERROR => "UnicodeEncodeError",
+        UNICODE_TRANSLATE_ERROR => "UnicodeTranslateError",
+        BUFFER_ERROR => "BufferError",
+        REFERENCE_ERROR => "ReferenceError",
+        EXCEPTION_GROUP => "ExceptionGroup",
+        BASE_EXCEPTION_GROUP => "BaseExceptionGroup",
+        WARNING => "Warning",
+        USER_WARNING => "UserWarning",
+        DEPRECATION_WARNING => "DeprecationWarning",
+        PENDING_DEPRECATION_WARNING => "PendingDeprecationWarning",
+        SYNTAX_WARNING => "SyntaxWarning",
+        RUNTIME_WARNING => "RuntimeWarning",
+        FUTURE_WARNING => "FutureWarning",
+        IMPORT_WARNING => "ImportWarning",
+        UNICODE_WARNING => "UnicodeWarning",
+        BYTES_WARNING => "BytesWarning",
+        RESOURCE_WARNING => "ResourceWarning",
+        FLOATING_POINT_ERROR => "FloatingPointError",
+        BLOCKING_IO_ERROR => "BlockingIOError",
+        CHILD_PROCESS_ERROR => "ChildProcessError",
+        CONNECTION_ERROR => "ConnectionError",
+        BROKEN_PIPE_ERROR => "BrokenPipeError",
+        CONNECTION_ABORTED_ERROR => "ConnectionAbortedError",
+        CONNECTION_REFUSED_ERROR => "ConnectionRefusedError",
+        CONNECTION_RESET_ERROR => "ConnectionResetError",
+        FILE_EXISTS_ERROR => "FileExistsError",
+        INTERRUPTED_ERROR => "InterruptedError",
+        IS_A_DIRECTORY_ERROR => "IsADirectoryError",
+        NOT_A_DIRECTORY_ERROR => "NotADirectoryError",
+        PERMISSION_ERROR => "PermissionError",
+        PROCESS_LOOKUP_ERROR => "ProcessLookupError",
+        TIMEOUT_ERROR => "TimeoutError",
         // Unknown tags are rendered as RuntimeError rather than panicking.
         _ => "RuntimeError",
     }
@@ -134,45 +273,127 @@ fn default_message(tag: u32) -> &'static str {
         // `Exception()` and `BaseException()` stringify to the empty string.
         EXCEPTION | BASE_EXCEPTION => "",
         ASSERTION_ERROR => "",
-        _ => "unknown error",
+        // CPython's `str(Exc())` is the empty string for every other class in
+        // the taxonomy; concrete failures pass their message explicitly.
+        _ => "",
+    }
+}
+
+/// Direct base classes of a concrete exception tag, matching CPython 3.14.
+///
+/// A tag can have more than one parent (`ExceptionGroup` derives from both
+/// `BaseExceptionGroup` and `Exception`); every other node has zero or one.
+/// Runtime-internal `Skipped`/`XFailed` are ordinary `Exception` children so
+/// they keep their historical catchability, while `CancelledError` is a
+/// `BaseException` like `asyncio.CancelledError`.
+pub(crate) fn parents(tag: u32) -> &'static [u32] {
+    match tag {
+        // Roots and the BaseException-only children.
+        BASE_EXCEPTION => &[],
+        SYSTEM_EXIT | KEYBOARD_INTERRUPT | GENERATOR_EXIT | CANCELLED_ERROR
+        | BASE_EXCEPTION_GROUP => &[BASE_EXCEPTION],
+        EXCEPTION_GROUP => &[BASE_EXCEPTION_GROUP, EXCEPTION],
+        EXCEPTION => &[BASE_EXCEPTION],
+        // Ordinary exceptions.
+        VALUE_ERROR | TYPE_ERROR | RUNTIME_ERROR | STOP_ITERATION | ATTRIBUTE_ERROR
+        | ASSERTION_ERROR | NAME_ERROR | STOP_ASYNC_ITERATION | SYSTEM_ERROR | MEMORY_ERROR
+        | EOF_ERROR | BUFFER_ERROR | REFERENCE_ERROR | ARITHMETIC_ERROR | LOOKUP_ERROR
+        | IMPORT_ERROR | SYNTAX_ERROR | WARNING | SKIPPED | XFAILED => &[EXCEPTION],
+        // ArithmeticError.
+        ZERO_DIVISION_ERROR | OVERFLOW_ERROR | FLOATING_POINT_ERROR => &[ARITHMETIC_ERROR],
+        // LookupError.
+        INDEX_ERROR | KEY_ERROR => &[LOOKUP_ERROR],
+        // ImportError.
+        MODULE_NOT_FOUND_ERROR => &[IMPORT_ERROR],
+        // RuntimeError.
+        RECURSION_ERROR | NOT_IMPLEMENTED_ERROR => &[RUNTIME_ERROR],
+        // ValueError -> UnicodeError.
+        UNICODE_ERROR => &[VALUE_ERROR],
+        UNICODE_DECODE_ERROR | UNICODE_ENCODE_ERROR | UNICODE_TRANSLATE_ERROR => &[UNICODE_ERROR],
+        // SyntaxError.
+        INDENTATION_ERROR => &[SYNTAX_ERROR],
+        TAB_ERROR => &[INDENTATION_ERROR],
+        // OSError and its subclasses.
+        OS_ERROR => &[EXCEPTION],
+        BLOCKING_IO_ERROR
+        | CHILD_PROCESS_ERROR
+        | FILE_EXISTS_ERROR
+        | FILE_NOT_FOUND_ERROR
+        | INTERRUPTED_ERROR
+        | IS_A_DIRECTORY_ERROR
+        | NOT_A_DIRECTORY_ERROR
+        | PERMISSION_ERROR
+        | PROCESS_LOOKUP_ERROR
+        | TIMEOUT_ERROR => &[OS_ERROR],
+        CONNECTION_ERROR => &[OS_ERROR],
+        BROKEN_PIPE_ERROR
+        | CONNECTION_ABORTED_ERROR
+        | CONNECTION_REFUSED_ERROR
+        | CONNECTION_RESET_ERROR => &[CONNECTION_ERROR],
+        // Warning family.
+        USER_WARNING
+        | DEPRECATION_WARNING
+        | PENDING_DEPRECATION_WARNING
+        | SYNTAX_WARNING
+        | RUNTIME_WARNING
+        | FUTURE_WARNING
+        | IMPORT_WARNING
+        | UNICODE_WARNING
+        | BYTES_WARNING
+        | RESOURCE_WARNING => &[WARNING],
+        // Unknown tags have no modelled ancestry.
+        _ => &[],
     }
 }
 
 /// True for every exception tag the runtime defines. Used to reject malformed
 /// values instead of caching a class under a bogus tag.
 fn known_tag(tag: u32) -> bool {
-    matches!(
-        tag,
-        VALUE_ERROR
-            | TYPE_ERROR
-            | ZERO_DIVISION_ERROR
-            | RUNTIME_ERROR
-            | OVERFLOW_ERROR
-            | KEYBOARD_INTERRUPT
-            | INDEX_ERROR
-            | KEY_ERROR
-            | STOP_ITERATION
-            | ATTRIBUTE_ERROR
-            | OS_ERROR
-            | GENERATOR_EXIT
-            | EXCEPTION
-            | BASE_EXCEPTION
-            | ASSERTION_ERROR
-            | FILE_NOT_FOUND_ERROR
-            | NAME_ERROR
-            | SYSTEM_EXIT
-            | STOP_ASYNC_ITERATION
-            | CANCELLED_ERROR
-            | SKIPPED
-            | XFAILED
-    )
+    tag == BASE_EXCEPTION || !parents(tag).is_empty()
+}
+
+/// Whether exception `tag` is `ancestor` or derives from it.
+///
+/// Unknown tags never match an arbitrary ancestor: both tags must be known
+/// (or be the same known tag), so a malformed tag cannot silently satisfy a
+/// concrete handler.
+pub(crate) fn tag_is_subclass(tag: u32, ancestor: u32) -> bool {
+    if tag == ancestor {
+        return known_tag(tag);
+    }
+    if !known_tag(tag) || !known_tag(ancestor) {
+        return false;
+    }
+    // Depth-first walk over the parent graph. It is tiny (one diamond at
+    // `ExceptionGroup`) and acyclic, so a stack with a visited check is enough.
+    let mut pending = vec![tag];
+    let mut visited = Vec::new();
+    while let Some(current) = pending.pop() {
+        if current == ancestor {
+            return true;
+        }
+        if visited.contains(&current) {
+            continue;
+        }
+        visited.push(current);
+        for &parent in parents(current) {
+            if parent == ancestor {
+                return true;
+            }
+            if !visited.contains(&parent) {
+                pending.push(parent);
+            }
+        }
+    }
+    false
 }
 
 /// Returns the cached native class object for the built-in exception `tag`,
 /// creating an empty class named after the tag on first use.
 ///
-/// The class is an ordinary `KIND_CLASS` object, so `Class.__name__`,
-/// inheritance and instantiation work like any class the user defines. The
+/// The class is an ordinary `KIND_CLASS` object whose base is the class of the
+/// tag's parent in [`parents`], so `Class.__name__`, inheritance,
+/// `issubclass` and instantiation work like any class the user defines. The
 /// cache is thread-local and the created class is registered as a collector
 /// root (the cache itself is Rust-side state the stack scan cannot see).
 /// [`init`] clears the cache before a new program run frees the heap.
@@ -185,7 +406,14 @@ pub(crate) fn exception_class(tag: u32) -> i64 {
     if !known_tag(tag) {
         return raise_with_message(RUNTIME_ERROR, &format!("unknown exception tag {tag}"));
     }
-    let class = value::class_new(tag_name(tag).to_string(), NONE, Vec::new());
+    // `ExceptionGroup` has two bases; a class object stores one, so use the
+    // first (`BaseExceptionGroup`) and leave the `Exception` edge to the tag
+    // hierarchy, which `isinstance`/`issubclass` consult.
+    let base = match parents(tag).first() {
+        Some(&parent) => exception_class(parent),
+        None => NONE,
+    };
+    let class = value::class_new(tag_name(tag).to_string(), base, Vec::new());
     // The cache is invisible to the conservative stack scan, so the class must
     // be an explicit root while it lives in the heap.
     crate::heap::add_thread_root(class);
@@ -210,7 +438,10 @@ pub(crate) fn exception_tag_of_class(class: i64) -> Option<u32> {
 
 /// Builds a plain built-in exception object `Tag(message)` without raising
 /// it. Used by the class-call path (`ValueError('x')`).
-pub(crate) fn exception_value(tag: u32, message: &str) -> i64 {
+///
+/// `args` are the already-rendered Python arguments (empty for `Tag()`);
+/// they become the `args` tuple exposed by [`exception_attr`].
+pub(crate) fn exception_value(tag: u32, message: &str, args: Vec<String>) -> i64 {
     value::exception_new(ExcData {
         tag,
         name: tag_name(tag),
@@ -222,6 +453,7 @@ pub(crate) fn exception_value(tag: u32, message: &str) -> i64 {
         context: None,
         suppress_context: false,
         exit_code: None,
+        args,
     })
 }
 
@@ -383,8 +615,27 @@ pub(crate) fn handled_values() -> Vec<i64> {
 
 /// Raises `tag` with `message`, capturing the current file/line/frame.
 /// Returns the ABI dummy value (`None`).
+///
+/// This is the internal raise path used by runtime failures: the rendered
+/// message is also the single `args` element, matching CPython's
+/// `ZeroDivisionError("division by zero")`.
 pub(crate) fn raise_with_message(tag: u32, message: &str) -> i64 {
-    raise_with_message_cause(tag, message, None, false)
+    let args = if message.is_empty() {
+        Vec::new()
+    } else {
+        vec![message.to_string()]
+    };
+    raise_with_message_cause(tag, message, args, None, false)
+}
+
+/// `args` of a raise whose source argument is the tagged value `msg`:
+/// `raise X()` has `args == ()`, `raise X(v)` stores `str(v)`.
+fn raise_args(msg: i64) -> Vec<String> {
+    if msg == value::NONE {
+        Vec::new()
+    } else {
+        vec![value::to_string(msg)]
+    }
 }
 
 /// [`raise_with_message`] with an explicit cause (`None` means "no cause")
@@ -393,6 +644,7 @@ pub(crate) fn raise_with_message(tag: u32, message: &str) -> i64 {
 fn raise_with_message_cause(
     tag: u32,
     message: &str,
+    args: Vec<String>,
     cause: Option<i64>,
     suppress_context: bool,
 ) -> i64 {
@@ -415,6 +667,7 @@ fn raise_with_message_cause(
         context: handled(),
         suppress_context,
         exit_code: None,
+        args,
     };
     publish(value::exception_new(data))
 }
@@ -427,14 +680,15 @@ fn raise_with_message_cause(
 /// rendered with `repr()`. The exception is an ordinary catchable
 /// `SystemExit`; only [`uncaught`] turns it into a process status.
 pub(crate) fn raise_exit(code: i64) -> i64 {
-    let (message, exit_code) = if code == value::NONE {
-        (String::new(), Some(0))
+    let (message, exit_code, args) = if code == value::NONE {
+        (String::new(), Some(0), Vec::new())
     } else if let Some(status) = value::as_integer(code) {
-        (status.to_string(), Some(status))
+        let text = status.to_string();
+        (text.clone(), Some(status), vec![text])
     } else if let Some(text) = value::as_str(code) {
-        (text.to_string(), None)
+        (text.to_string(), None, vec![text.to_string()])
     } else {
-        (value::repr(code), None)
+        (value::repr(code), None, vec![value::to_string(code)])
     };
     let (file, line, frame) = STATE.with(|s| {
         let st = s.borrow();
@@ -455,6 +709,7 @@ pub(crate) fn raise_exit(code: i64) -> i64 {
         context: handled(),
         suppress_context: true,
         exit_code,
+        args,
     };
     publish(value::exception_new(data))
 }
@@ -501,7 +756,8 @@ pub(crate) fn raise(tag: u32, msg: i64) -> i64 {
     if tag == SYSTEM_EXIT {
         return raise_exit(msg);
     }
-    raise_with_message(tag, &rendered_message(tag, msg))
+    let text = rendered_message(tag, msg);
+    raise_with_message_cause(tag, &text, raise_args(msg), None, false)
 }
 
 /// `hydro_raise_msg`: copies the message bytes before storing them.
@@ -544,7 +800,7 @@ pub(crate) fn raise_from(tag: u32, msg: i64, cause: i64) -> i64 {
         return raise_exit(msg);
     }
     let text = rendered_message(tag, msg);
-    raise_with_message_cause(tag, &text, cause_of(cause), true)
+    raise_with_message_cause(tag, &text, raise_args(msg), cause_of(cause), true)
 }
 
 /// `hydro_raise_value_from`: `raise value from cause` for an existing exception
@@ -571,31 +827,72 @@ pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
 /// `hydro_exc_matches`: whether the pending exception is caught by a handler for
 /// `handler_tag`.
 ///
-/// `BaseException` matches every tag, `Exception` matches everything except
-/// `KeyboardInterrupt`, the internal `GeneratorExit` and `SystemExit` (which
-/// derives from `BaseException` in CPython), `OSError` and
-/// `FileNotFoundError` match each other (the subclass relationship), and every
-/// other handler tag matches only an exception with the same tag. Without a
-/// pending exception nothing matches.
+/// Matching walks the CPython parent chain in [`parents`]: a handler catches
+/// its own class and every subclass, so `ArithmeticError` catches
+/// `ZeroDivisionError`, `LookupError` catches `IndexError`/`KeyError`,
+/// `ImportError` catches `ModuleNotFoundError`, `OSError` catches
+/// `FileNotFoundError` and every other `OSError` subclass, and `BaseException`
+/// catches all of them. `Exception` catches ordinary exceptions but not the
+/// `BaseException`-only children (`SystemExit`, `KeyboardInterrupt`,
+/// `GeneratorExit`, `CancelledError`, `BaseExceptionGroup`).
+///
+/// An unknown pending tag falls back to matching only `BaseException` and
+/// `Exception`; an unknown handler tag never matches. Without a pending
+/// exception nothing matches.
 pub(crate) fn matches_handler(handler_tag: u32) -> i32 {
     let pending = STATE.with(|s| s.borrow().pending);
     let Some(tag) = pending.and_then(|exc| value::exception_data(exc).map(|data| data.tag)) else {
         return 0;
     };
-    let matched = match handler_tag {
-        BASE_EXCEPTION => true,
-        EXCEPTION => {
-            tag != KEYBOARD_INTERRUPT
-                && tag != GENERATOR_EXIT
-                && tag != SYSTEM_EXIT
-                && tag != CANCELLED_ERROR
-        }
-        // `FileNotFoundError` is an `OSError` subclass: a handler for either
-        // kind catches both tags.
-        OS_ERROR | FILE_NOT_FOUND_ERROR => tag == OS_ERROR || tag == FILE_NOT_FOUND_ERROR,
-        _ => handler_tag == tag,
-    };
-    i32::from(matched)
+    if !known_tag(handler_tag) {
+        return 0;
+    }
+    if !known_tag(tag) {
+        // Historical safe fallback for a malformed tag: it is treated as an
+        // ordinary, unknown exception rather than matching a concrete
+        // handler.
+        return i32::from(handler_tag == BASE_EXCEPTION || handler_tag == EXCEPTION);
+    }
+    i32::from(tag_is_subclass(tag, handler_tag))
+}
+
+/// Exception attribute surface used by the stdlib: `args`, `__class__`,
+/// `__cause__`, `__context__`, `__suppress_context__` and `__traceback__`.
+///
+/// Returns `None` when `value` is not a built-in exception object or when the
+/// name is not an exception attribute, so the caller can raise
+/// `AttributeError`. `__cause__`/`__context__` are `None` when unset and
+/// `__traceback__` is always `None`: Hydro records the raise location in
+/// [`ExcData`] but has no traceback object.
+pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
+    let data = value::exception_data(object)?;
+    Some(match name {
+        "args" => args_tuple(&data.args),
+        "__class__" => value::type_class(object),
+        "__cause__" => data.cause.unwrap_or(NONE),
+        "__context__" => data.context.unwrap_or(NONE),
+        "__suppress_context__" => value::bool_value(data.suppress_context),
+        "__traceback__" => NONE,
+        _ => return None,
+    })
+}
+
+/// Builds the `args` tuple for [`exception_attr`].
+///
+/// Each element is allocated individually and registered as a collector root
+/// until the tuple owns it: allocation can trigger a collection, and the
+/// strings would otherwise be invisible to the stack scan.
+fn args_tuple(args: &[String]) -> i64 {
+    let start = crate::heap::root_values(&[]);
+    let mut items = Vec::with_capacity(args.len());
+    for text in args {
+        let item = value::str_from_bytes(text.as_bytes());
+        items.push(item);
+        crate::heap::root_values(&[item]);
+    }
+    let tuple = value::tuple_new(items);
+    crate::heap::release_roots(start);
+    tuple
 }
 
 // Uncaught traceback
@@ -629,6 +926,7 @@ pub(crate) fn uncaught() -> i64 {
         context: None,
         suppress_context: false,
         exit_code: None,
+        args: Vec::new(),
     });
 
     // `SystemExit` never renders a traceback. An integer code becomes the
@@ -757,7 +1055,11 @@ mod tests {
         assert_eq!(first, second, "the same tag reuses one class object");
         let state = value::as_class(first).expect("exception class object");
         assert_eq!(state.name, "ValueError");
-        assert_eq!(state.base, NONE);
+        assert_eq!(
+            state.base,
+            exception_class(EXCEPTION),
+            "the native class records its CPython base"
+        );
         assert!(state.methods.is_empty());
         assert!(state.attrs.is_empty());
         assert_eq!(value::class_display_name(first), Some("ValueError"));
@@ -765,6 +1067,17 @@ mod tests {
         let other = exception_class(OS_ERROR);
         assert_ne!(first, other);
         assert_eq!(value::class_display_name(other), Some("OSError"));
+        assert_eq!(
+            value::as_class(other).expect("OSError class").base,
+            exception_class(EXCEPTION)
+        );
+        assert_eq!(
+            value::as_class(exception_class(FILE_NOT_FOUND_ERROR))
+                .expect("FileNotFoundError class")
+                .base,
+            other,
+            "FileNotFoundError derives from OSError"
+        );
 
         // A user class derived from the native class keeps normal
         // inheritance semantics for instances.
@@ -773,6 +1086,11 @@ mod tests {
         assert_eq!(crate::builtins::isinstance(instance, user), value::TRUE);
         assert_eq!(crate::builtins::isinstance(instance, first), value::TRUE);
         assert_eq!(crate::builtins::isinstance(instance, other), value::FALSE);
+        // The base chain reaches the native `Exception` class.
+        assert_eq!(
+            crate::builtins::isinstance(instance, exception_class(EXCEPTION)),
+            value::TRUE
+        );
 
         // A fresh program run clears the cache before the heap is freed.
         init();
@@ -838,13 +1156,25 @@ mod tests {
         assert_eq!(value::to_string(exc), "division by zero");
         assert_eq!(value::type_name(exc), "ZeroDivisionError");
 
+        // `raise TypeError` stores no argument; CPython's `str(TypeError())`
+        // is the empty string.
         init();
         raise(TYPE_ERROR, NONE);
-        assert_eq!(value::to_string(pending_value()), "unknown error");
+        assert_eq!(value::to_string(pending_value()), "");
+        assert!(value::exception_data(pending_value())
+            .expect("exception object")
+            .args
+            .is_empty());
 
         init();
         raise_msg_ptr(VALUE_ERROR, b"bad".as_ptr(), 3);
         assert_eq!(value::to_string(pending_value()), "bad");
+        assert_eq!(
+            value::exception_data(pending_value())
+                .expect("exception object")
+                .args,
+            vec!["bad".to_string()]
+        );
     }
 
     #[test]
@@ -913,6 +1243,7 @@ mod tests {
             context: None,
             suppress_context: false,
             exit_code: None,
+            args: vec![msg.to_string()],
         }
     }
 
@@ -979,7 +1310,8 @@ mod tests {
             (KEYBOARD_INTERRUPT, [false, false, true, false, false, true]),
             (GENERATOR_EXIT, [false, false, false, true, false, true]),
             (EXCEPTION, [false, false, false, false, true, true]),
-            (BASE_EXCEPTION, [false, false, false, false, true, true]),
+            // `BaseException` itself is not an `Exception` in CPython.
+            (BASE_EXCEPTION, [false, false, false, false, false, true]),
         ];
 
         init();
@@ -999,6 +1331,261 @@ mod tests {
         for handler in handlers {
             assert_eq!(matches_handler(handler), 0);
         }
+        init();
+    }
+
+    #[test]
+    fn handler_matching_covers_the_cpython_branches() {
+        // (raised tag, handler tag, caught)
+        let cases: &[(u32, u32, bool)] = &[
+            // ArithmeticError.
+            (ZERO_DIVISION_ERROR, ARITHMETIC_ERROR, true),
+            (OVERFLOW_ERROR, ARITHMETIC_ERROR, true),
+            (FLOATING_POINT_ERROR, ARITHMETIC_ERROR, true),
+            (ARITHMETIC_ERROR, ZERO_DIVISION_ERROR, false),
+            (ZERO_DIVISION_ERROR, EXCEPTION, true),
+            // LookupError.
+            (INDEX_ERROR, LOOKUP_ERROR, true),
+            (KEY_ERROR, LOOKUP_ERROR, true),
+            (LOOKUP_ERROR, INDEX_ERROR, false),
+            // ImportError.
+            (MODULE_NOT_FOUND_ERROR, IMPORT_ERROR, true),
+            (IMPORT_ERROR, MODULE_NOT_FOUND_ERROR, false),
+            (MODULE_NOT_FOUND_ERROR, EXCEPTION, true),
+            // SyntaxError chain.
+            (SYNTAX_ERROR, SYNTAX_ERROR, true),
+            (INDENTATION_ERROR, SYNTAX_ERROR, true),
+            (TAB_ERROR, SYNTAX_ERROR, true),
+            (TAB_ERROR, INDENTATION_ERROR, true),
+            (SYNTAX_ERROR, TAB_ERROR, false),
+            (SYNTAX_ERROR, EXCEPTION, true),
+            // UnicodeError is a ValueError.
+            (UNICODE_DECODE_ERROR, UNICODE_ERROR, true),
+            (UNICODE_DECODE_ERROR, VALUE_ERROR, true),
+            (UNICODE_ENCODE_ERROR, UNICODE_ERROR, true),
+            (UNICODE_TRANSLATE_ERROR, UNICODE_ERROR, true),
+            (UNICODE_ERROR, EXCEPTION, true),
+            // RuntimeError branch.
+            (RECURSION_ERROR, RUNTIME_ERROR, true),
+            (NOT_IMPLEMENTED_ERROR, RUNTIME_ERROR, true),
+            (RUNTIME_ERROR, RECURSION_ERROR, false),
+            // OSError branch.
+            (FILE_NOT_FOUND_ERROR, OS_ERROR, true),
+            (OS_ERROR, FILE_NOT_FOUND_ERROR, false),
+            (PERMISSION_ERROR, OS_ERROR, true),
+            (TIMEOUT_ERROR, OS_ERROR, true),
+            (BROKEN_PIPE_ERROR, CONNECTION_ERROR, true),
+            (BROKEN_PIPE_ERROR, OS_ERROR, true),
+            (CONNECTION_REFUSED_ERROR, CONNECTION_ERROR, true),
+            (CONNECTION_ERROR, BROKEN_PIPE_ERROR, false),
+            // Warnings.
+            (USER_WARNING, WARNING, true),
+            (RESOURCE_WARNING, WARNING, true),
+            (WARNING, USER_WARNING, false),
+            // ExceptionGroup: both CPython bases.
+            (EXCEPTION_GROUP, BASE_EXCEPTION_GROUP, true),
+            (EXCEPTION_GROUP, EXCEPTION, true),
+            (EXCEPTION_GROUP, BASE_EXCEPTION, true),
+            (BASE_EXCEPTION_GROUP, EXCEPTION, false),
+            (BASE_EXCEPTION_GROUP, BASE_EXCEPTION, true),
+            // BaseException-only children.
+            (SYSTEM_EXIT, EXCEPTION, false),
+            (KEYBOARD_INTERRUPT, EXCEPTION, false),
+            (GENERATOR_EXIT, EXCEPTION, false),
+            (CANCELLED_ERROR, EXCEPTION, false),
+            (SYSTEM_EXIT, BASE_EXCEPTION, true),
+            // Runtime-internal tags keep their historical catchability.
+            (SKIPPED, EXCEPTION, true),
+            (XFAILED, EXCEPTION, true),
+            // Unrelated concrete classes.
+            (VALUE_ERROR, TYPE_ERROR, false),
+            (OS_ERROR, EXCEPTION, true),
+            (MEMORY_ERROR, EXCEPTION, true),
+            (SYSTEM_ERROR, EXCEPTION, true),
+            (EOF_ERROR, EXCEPTION, true),
+            (BUFFER_ERROR, EXCEPTION, true),
+            (REFERENCE_ERROR, EXCEPTION, true),
+            (MEMORY_ERROR, BASE_EXCEPTION, true),
+        ];
+
+        init();
+        for &(tag, handler, want) in cases {
+            raise_with_message(tag, "boom");
+            assert_eq!(
+                matches_handler(handler),
+                i32::from(want),
+                "tag {} against handler {}",
+                tag_name(tag),
+                tag_name(handler)
+            );
+        }
+        init();
+    }
+
+    #[test]
+    fn unknown_tags_use_the_safe_fallback() {
+        init();
+        // An unknown pending tag matches only the two documented roots and
+        // never a concrete handler.
+        let data = ExcData {
+            tag: 9_999,
+            name: tag_name(9_999),
+            msg: String::new(),
+            file: String::new(),
+            line: 0,
+            frame: String::new(),
+            cause: None,
+            context: None,
+            suppress_context: false,
+            exit_code: None,
+            args: Vec::new(),
+        };
+        publish(value::exception_new(data));
+        assert_eq!(matches_handler(EXCEPTION), 1);
+        assert_eq!(matches_handler(BASE_EXCEPTION), 1);
+        assert_eq!(matches_handler(OS_ERROR), 0);
+        assert_eq!(matches_handler(9_999), 0);
+
+        // A known pending tag never matches an unknown handler.
+        raise(VALUE_ERROR, NONE);
+        assert_eq!(matches_handler(9_999), 0);
+        init();
+    }
+
+    #[test]
+    fn tag_is_subclass_walks_every_branch() {
+        // Every runtime tag in the documented ranges is modelled: a missing
+        // `parents` arm would silently make `known_tag` false and break class
+        // creation and handler matching.
+        for tag in 0..=67u32 {
+            assert!(known_tag(tag), "tag {tag} is missing a parents arm");
+            assert!(tag_is_subclass(tag, tag), "{tag} should be reflexive");
+            assert!(
+                tag_is_subclass(tag, BASE_EXCEPTION),
+                "{tag} must derive from BaseException"
+            );
+        }
+
+        // The root of each branch is itself modelled.
+        assert_eq!(parents(EXCEPTION), &[BASE_EXCEPTION]);
+        assert_eq!(parents(OS_ERROR), &[EXCEPTION]);
+        assert_eq!(parents(WARNING), &[EXCEPTION]);
+        assert_eq!(parents(ARITHMETIC_ERROR), &[EXCEPTION]);
+        assert_eq!(parents(LOOKUP_ERROR), &[EXCEPTION]);
+        assert_eq!(parents(IMPORT_ERROR), &[EXCEPTION]);
+        assert_eq!(parents(SYNTAX_ERROR), &[EXCEPTION]);
+        assert_eq!(parents(EXCEPTION_GROUP), &[BASE_EXCEPTION_GROUP, EXCEPTION]);
+        assert_eq!(parents(BASE_EXCEPTION_GROUP), &[BASE_EXCEPTION]);
+        assert!(parents(BASE_EXCEPTION).is_empty());
+
+        assert!(tag_is_subclass(ZERO_DIVISION_ERROR, ARITHMETIC_ERROR));
+        assert!(tag_is_subclass(KEY_ERROR, LOOKUP_ERROR));
+        assert!(tag_is_subclass(MODULE_NOT_FOUND_ERROR, IMPORT_ERROR));
+        // CPython: TabError -> IndentationError -> SyntaxError -> Exception.
+        assert!(tag_is_subclass(TAB_ERROR, INDENTATION_ERROR));
+        assert!(tag_is_subclass(INDENTATION_ERROR, SYNTAX_ERROR));
+        assert!(tag_is_subclass(TAB_ERROR, SYNTAX_ERROR));
+        assert!(tag_is_subclass(TAB_ERROR, EXCEPTION));
+        assert!(tag_is_subclass(TAB_ERROR, BASE_EXCEPTION));
+        // A parent never matches one of its subclasses.
+        assert!(!tag_is_subclass(SYNTAX_ERROR, TAB_ERROR));
+        assert!(tag_is_subclass(UNICODE_ENCODE_ERROR, VALUE_ERROR));
+        assert!(tag_is_subclass(OS_ERROR, EXCEPTION));
+        assert!(tag_is_subclass(FILE_NOT_FOUND_ERROR, OS_ERROR));
+        assert!(tag_is_subclass(FILE_NOT_FOUND_ERROR, EXCEPTION));
+        assert!(tag_is_subclass(CONNECTION_RESET_ERROR, OS_ERROR));
+        assert!(tag_is_subclass(USER_WARNING, EXCEPTION));
+        assert!(tag_is_subclass(EXCEPTION_GROUP, EXCEPTION));
+        assert!(tag_is_subclass(EXCEPTION_GROUP, BASE_EXCEPTION_GROUP));
+        assert!(!tag_is_subclass(BASE_EXCEPTION, EXCEPTION));
+        // Unknown tags never satisfy an arbitrary ancestor.
+        assert!(!tag_is_subclass(9_999, EXCEPTION));
+        assert!(!tag_is_subclass(EXCEPTION, 9_999));
+        assert!(!tag_is_subclass(9_999, 9_999));
+    }
+
+    #[test]
+    fn exception_attributes_expose_stored_payload() {
+        init();
+        let cause = value::exception_new(test_data(VALUE_ERROR, "cause", 1, "f", None));
+        let context = value::exception_new(test_data(TYPE_ERROR, "context", 2, "f", None));
+        let mut data = test_data(RUNTIME_ERROR, "outer", 3, "f", Some(cause));
+        data.context = Some(context);
+        let exc = value::exception_new(data);
+
+        let args = exception_attr(exc, "args").expect("args");
+        let args = value::as_tuple(args).expect("args tuple");
+        assert_eq!(args.len(), 1);
+        assert_eq!(value::as_str(args[0]), Some("outer"));
+
+        assert_eq!(exception_attr(exc, "__cause__"), Some(cause));
+        assert_eq!(exception_attr(exc, "__context__"), Some(context));
+        assert_eq!(
+            exception_attr(exc, "__suppress_context__"),
+            Some(value::FALSE)
+        );
+        assert_eq!(exception_attr(exc, "__traceback__"), Some(NONE));
+        assert_eq!(
+            exception_attr(exc, "__class__"),
+            Some(exception_class(RUNTIME_ERROR))
+        );
+        assert_eq!(exception_attr(exc, "missing"), None);
+
+        // An exception raised without arguments has no cause, no context and
+        // an empty args tuple.
+        raise(VALUE_ERROR, NONE);
+        let plain = pending_value();
+        assert_eq!(exception_attr(plain, "__cause__"), Some(NONE));
+        assert_eq!(exception_attr(plain, "__context__"), Some(NONE));
+        assert_eq!(
+            exception_attr(plain, "__suppress_context__"),
+            Some(value::FALSE)
+        );
+        let empty = exception_attr(plain, "args").expect("args");
+        assert!(value::as_tuple(empty).expect("args tuple").is_empty());
+
+        // Non-exception values have no exception attributes.
+        assert_eq!(exception_attr(NONE, "args"), None);
+        assert_eq!(exception_attr(value::encode_int(1).unwrap(), "args"), None);
+        init();
+    }
+
+    #[test]
+    fn args_follow_the_raise_form() {
+        init();
+        // `raise ValueError('x')`: one argument, rendered with `str()`.
+        raise(VALUE_ERROR, value::str_from_bytes(b"x"));
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert_eq!(data.msg, "x");
+        assert_eq!(data.args, vec!["x".to_string()]);
+        clear();
+
+        // `raise ValueError`: no argument, so `args == ()` even though the
+        // exception carries a default message.
+        raise(VALUE_ERROR, NONE);
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert!(data.args.is_empty());
+        clear();
+
+        // `KeyError` renders its argument with `repr()` but keeps the raw
+        // argument in `args`.
+        raise(KEY_ERROR, value::str_from_bytes(b"k"));
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert_eq!(data.msg, "'k'");
+        assert_eq!(data.args, vec!["k".to_string()]);
+        clear();
+
+        // Runtime-generated messages are real arguments in CPython.
+        raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert_eq!(data.args, vec!["division by zero".to_string()]);
+        clear();
+
+        // `sys.exit(3)` stores the code and its textual argument.
+        raise_exit(value::encode_int(3).expect("representable"));
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert_eq!(data.exit_code, Some(3));
+        assert_eq!(data.args, vec!["3".to_string()]);
         init();
     }
 

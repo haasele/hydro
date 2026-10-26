@@ -301,13 +301,53 @@ Exception tags: `0 ValueError, 1 TypeError, 2 ZeroDivisionError,
 3 RuntimeError, 4 OverflowError, 5 KeyboardInterrupt, 6 IndexError,
 7 KeyError, 8 StopIteration, 9 AttributeError, 10 OSError, 11 GeneratorExit,
 12 Exception, 13 BaseException, 14 AssertionError, 15 FileNotFoundError,
-16 NameError, 17 SystemExit, 18 StopAsyncIteration, 19 CancelledError`.
-Names are 1:1 as in Python; `IOError` is an alias for `OSError`.
-`except Exception` matches every tag except 5/11/19; `except BaseException`
-matches every tag. `raise`/`except` resolve tags from names directly, while
-an unqualified exception name used as a value lowers to
-`hydro_exception_class(tag)`, which returns one cached empty class object per
-tag. Explicit causes are stored on the exception and traced by the GC.
+16 NameError, 17 SystemExit, 18 StopAsyncIteration, 19 CancelledError,
+20 Skipped, 21 XFailed, 22 SystemError, 23 MemoryError, 24 RecursionError,
+25 SyntaxError, 26 IndentationError, 27 TabError, 28 ArithmeticError,
+29 LookupError, 30 ImportError, 31 ModuleNotFoundError, 32 NotImplementedError,
+33 EOFError, 34 UnicodeError, 35 UnicodeDecodeError, 36 UnicodeEncodeError,
+37 UnicodeTranslateError, 38 BufferError, 39 ReferenceError,
+40 ExceptionGroup, 41 BaseExceptionGroup, 42 Warning, 43 UserWarning,
+44 DeprecationWarning, 45 PendingDeprecationWarning, 46 SyntaxWarning,
+47 RuntimeWarning, 48 FutureWarning, 49 ImportWarning, 50 UnicodeWarning,
+51 BytesWarning, 52 ResourceWarning, 53 FloatingPointError,
+54 BlockingIOError, 55 ChildProcessError, 56 ConnectionError,
+57 BrokenPipeError, 58 ConnectionAbortedError, 59 ConnectionRefusedError,
+60 ConnectionResetError, 61 FileExistsError, 62 InterruptedError,
+63 IsADirectoryError, 64 NotADirectoryError, 65 PermissionError,
+66 ProcessLookupError, 67 TimeoutError`.
+Tags `0..=18` are frozen by the ABI; `19..=21` are runtime-internal
+(`CancelledError`, `Skipped`, `XFailed`) and the CPython taxonomy was appended
+from `22` without renumbering. `IOError` and `EnvironmentError` are aliases of
+`OSError` (tag `10`, class name `OSError`), exactly as in CPython.
+
+`except` dispatch walks the CPython parent chain (`exc::parents` in the
+runtime): `ArithmeticError` catches `ZeroDivisionError`/`OverflowError`/
+`FloatingPointError`, `LookupError` catches `IndexError`/`KeyError`,
+`ImportError` catches `ModuleNotFoundError`, `SyntaxError` catches
+`IndentationError`, which catches `TabError`, `UnicodeError` derives from
+`ValueError`, every `OSError` subclass (`FileNotFoundError`,
+`PermissionError`, `TimeoutError`, `ConnectionError` and its four subclasses,
+...) is caught by `OSError`, the warning categories derive from `Warning`, and
+`ExceptionGroup` derives from both `BaseExceptionGroup` and `Exception`.
+`BaseException` catches every tag; `Exception` catches every tag except the
+`BaseException`-only children (`SystemExit`, `KeyboardInterrupt`,
+`GeneratorExit`, `CancelledError`, `BaseExceptionGroup`). An unknown pending
+tag matches only `BaseException`/`Exception`, and an unknown handler tag never
+matches. Both the interpreter and codegen delegate this decision to
+`hydro_exc_matches`; there is no second hierarchy table.
+
+`raise`/`except` resolve tags from names directly. An unqualified exception
+name used as a value lowers to `hydro_exception_class(tag)`, which returns one
+cached class object per tag; the class's base is the cached class of the tag's
+parent, so `issubclass(SyntaxError, Exception)` holds and `isinstance(e,
+OSError)` is true for a `FileNotFoundError` object. `issubclass` is a
+source-level two-argument builtin. `isinstance(x, object)` is true for every
+Hydro value. Explicit causes are stored on the exception and traced by the GC.
+An exception object exposes `args` (the rendered raise arguments),
+`__class__`, `__cause__`, `__context__`, `__suppress_context__` and
+`__traceback__` (always `None`: Hydro records the raise location but has no
+traceback object).
 
 **User exception classes are a documented limitation.** `class ReprError(
 Exception): ...` creates an ordinary class (its instances are class
@@ -454,7 +494,9 @@ built-in kinds), so the fallback never matches a user handler.
   `parent`, `path`), files (`name`, `mode`, `closed`, `encoding`),
   `threading.Thread` (`name`, `ident`, `daemon`) and
   `multiprocessing.Process` (`name`, `pid`, `exitcode`, `daemon`) provide
-  data attributes. For native objects, names without a call are data
+  data attributes. Built-in exception objects expose `args`, `__class__`,
+  `__cause__`, `__context__`, `__suppress_context__` and `__traceback__`
+  (always `None`). For native objects, names without a call are data
   attributes; methods must be called. Unknown names → `AttributeError`.
   `hydro_setattr` allows only instance attributes; classes are immutable.
 - **Method keywords** (`hydro_method_kw`): native methods with named
@@ -491,8 +533,8 @@ built-in kinds), so the fallback never matches a user handler.
   `next(it[, default])` work on it. `send(v)` resumes the generator and
   returns the next yielded value; `x = yield v` evaluates to the sent value
   (`None` for `next`). `throw(exc)` raises an exception *instance* at the
-  suspension point (Hydro has no exception class objects yet, so only the
-  one-argument, instance form is supported). `close()` injects
+  suspension point (the fiber ABI raises exactly the value it is given, so
+  only the one-argument, instance form is supported). `close()` injects
   `GeneratorExit`, so `finally` blocks run; a generator that yields during
   `close()` raises `RuntimeError("generator ignored GeneratorExit")`.
   Exhausted generators raise `StopIteration` from `send`/`throw`.
@@ -781,8 +823,8 @@ the hot-function map.
 Error-capable runtime calls set a **pending exception** on failure and
 return a dummy value. After *every* error-capable operation, codegen checks
 `hydro_exc_pending()` and jumps to the next handler (or to the uncaught path).
-An exception carries tag, message, function name and line at the time of the
-`raise`. User exception classes have no runtime tag: `raise UserClass(msg)`
+An exception carries tag, message, rendered `args`, function name and line at
+the time of the `raise`. User exception classes have no runtime tag: `raise UserClass(msg)`
 and `raise module.UserClass(msg)` lower to `RuntimeError` with a
 `"<class name>: <message>"` string, and handlers for those classes (by name
 or dotted name, including imported classes) match `RuntimeError`. This
@@ -958,7 +1000,7 @@ Set, Range, Function`.
 - `Set` is unparameterized; `In`/`NotIn` → Bool with the same rules as
   §3.3. `range()` → Range, `list()` → List, `dict()` → Dict, `sum()` → Int
   for Range, otherwise Any, `enumerate`/`zip`/`map`/`filter` → List,
-  `format()` → Str, `isinstance()` → Bool, `repr()` → Str,
+  `format()` → Str, `isinstance()`/`issubclass()` → Bool, `repr()` → Str,
   `hash()` → Int,
   `max`/`min`/`round` → Any. Bitwise `&`/`|`/`^`/`<<`/`>>` on
   `Int`/`Bool` operands → Int; other operand combinations stay `Any` and

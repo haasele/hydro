@@ -1762,9 +1762,9 @@ fn push_item(list: i64, item: i64) {
 /// `__init__` any positional argument is a `TypeError`; otherwise a raised
 /// exception propagates and no instance is returned.
 /// Instantiates a built-in exception class: `ValueError('x')` creates a
-/// plain exception object with the tag's class name and message. Extra
-/// positional arguments are rejected (Hydro stores one message, not an
-/// `args` tuple).
+/// plain exception object with the tag's class name, message and `args`
+/// tuple. Extra positional arguments are rejected (Hydro stores one message,
+/// not arbitrary argument objects).
 fn instantiate_exception(tag: u32, argc: usize, argv: *const i64) -> i64 {
     if argc > 1 {
         return exc::raise_with_message(
@@ -1776,13 +1776,22 @@ fn instantiate_exception(tag: u32, argc: usize, argv: *const i64) -> i64 {
             ),
         );
     }
-    let message = if argc == 1 && !argv.is_null() {
+    let (message, args) = if argc == 1 && !argv.is_null() {
         // SAFETY: ABI contract: `argv` points at one readable tagged value.
-        value::to_string(unsafe { *argv })
+        let argument = unsafe { *argv };
+        let text = value::to_string(argument);
+        // `KeyError` renders its argument with `repr()` in `str(exception)`
+        // while `args` keeps the argument itself (as text).
+        let message = if tag == exc::KEY_ERROR {
+            value::repr(argument)
+        } else {
+            text.clone()
+        };
+        (message, vec![text])
     } else {
-        String::new()
+        (String::new(), Vec::new())
     };
-    exc::exception_value(tag, &message)
+    exc::exception_value(tag, &message, args)
 }
 
 fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
@@ -1854,6 +1863,8 @@ fn getattr_builtin(object: i64, name: i64) -> i64 {
     if let Some(module) = value::as_module(object) {
         modules::module_get_by_name(module.name(), name)
     } else {
+        // `methods::getattr` also dispatches the exception attribute surface
+        // (`args`, `__cause__`, ...), so there is a single lookup path.
         methods::getattr(object, name.as_ptr(), name.len())
     }
 }
@@ -1875,9 +1886,9 @@ fn builtin_arity_error(name: &str, expected: &str, argc: usize) -> i64 {
 /// `iter` exactly one, `next` one or two, `max`/`min` at least one (their
 /// final argument is the key slot), `sorted` one to three
 /// `(iterable, key, reverse)`, `round` one or two, `format` two (or
-/// three for the internal conversion flag), `isinstance` exactly two,
-/// `all` exactly one, `ord`/`chr` exactly one, `divmod` exactly two,
-/// `callable` exactly one and the internal dict merge exactly two.
+/// three for the internal conversion flag), `isinstance` and `issubclass`
+/// exactly two, `all` exactly one, `ord`/`chr` exactly one, `divmod` exactly
+/// two, `callable` exactly one and the internal dict merge exactly two.
 pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -2068,6 +2079,10 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
         Builtin::Isinstance => match args {
             [object, target] => isinstance(*object, *target),
             _ => builtin_arity_error("isinstance", "exactly 2", argc),
+        },
+        Builtin::Issubclass => match args {
+            [subclass, class] => issubclass(*subclass, *class),
+            _ => builtin_arity_error("issubclass", "exactly 2", argc),
         },
         Builtin::All => match args {
             [iterable] => all(*iterable),
@@ -2785,6 +2800,11 @@ pub(crate) fn format_builtin(value: i64, spec: i64, conversion: u8) -> i64 {
 /// `isinstance(value, target)`: `target` is a native type (an `int`, `float`,
 /// `str`, ... builtin value), `None` for `NoneType`, a class, or a tuple of
 /// those. Anything else is a `TypeError`.
+///
+/// Built-in exception classes participate in the CPython hierarchy:
+/// `isinstance(ValueError(), Exception)` and
+/// `isinstance(FileNotFoundError(), OSError)` are true, and every Hydro value
+/// (including exception objects) is an instance of the cached `object` class.
 pub(crate) fn isinstance(value: i64, target: i64) -> i64 {
     match type_check(value, target) {
         Some(result) => value::bool_value(result),
@@ -2793,6 +2813,97 @@ pub(crate) fn isinstance(value: i64, target: i64) -> i64 {
             "isinstance() arg 2 must be a type or tuple of types",
         ),
     }
+}
+
+/// `issubclass(subclass, class)`: both arguments name classes (or `class` is
+/// a tuple of classes).
+///
+/// The check follows the CPython hierarchy for exception classes
+/// (`issubclass(SyntaxError, Exception)`), walks the base chain of
+/// user-defined classes, and treats every class as a subclass of the cached
+/// `object` class. Non-class arguments raise `TypeError`, matching CPython.
+pub(crate) fn issubclass(subclass: i64, class: i64) -> i64 {
+    match subclass_check(subclass, class) {
+        Ok(result) => value::bool_value(result),
+        Err(SubclassError::Subclass) => {
+            exc::raise_with_message(TYPE_ERROR, "issubclass() arg 1 must be a class")
+        }
+        Err(SubclassError::Class) => exc::raise_with_message(
+            TYPE_ERROR,
+            "issubclass() arg 2 must be a class or tuple of classes",
+        ),
+    }
+}
+
+/// Which `issubclass` argument was not a class.
+enum SubclassError {
+    Subclass,
+    Class,
+}
+
+/// Tri-state check for `issubclass`, with the offending argument on failure.
+fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
+    if let Some(types) = value::as_tuple(class) {
+        if value::as_class(subclass).is_none() {
+            return Err(SubclassError::Subclass);
+        }
+        for &candidate in types {
+            if value::as_class(candidate).is_none() {
+                return Err(SubclassError::Class);
+            }
+            if subclass_check(subclass, candidate)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    if value::as_class(subclass).is_none() {
+        return Err(SubclassError::Subclass);
+    }
+    if value::is_object_class(class) {
+        // Every class is a subclass of `object`.
+        return Ok(true);
+    }
+    if value::as_class(class).is_none() {
+        return Err(SubclassError::Class);
+    }
+    if subclass == class {
+        return Ok(true);
+    }
+    // Exception classes: the tag hierarchy knows about the classes without a
+    // dedicated class object for every parent edge (and models
+    // `ExceptionGroup`'s double base).
+    if let (Some(sub_tag), Some(class_tag)) = (
+        exc::exception_tag_of_class(subclass),
+        exc::exception_tag_of_class(class),
+    ) {
+        return Ok(exc::tag_is_subclass(sub_tag, class_tag));
+    }
+    // User classes: follow the single base chain, checking every native
+    // exception class on the way for the tag relationship (so
+    // `class E(ValueError)` is a subclass of `Exception`).
+    let class_tag = exc::exception_tag_of_class(class);
+    let mut current = subclass;
+    for _ in 0..1024 {
+        let Some(state) = value::as_class(current) else {
+            return Ok(false);
+        };
+        if state.base == NONE {
+            return Ok(false);
+        }
+        current = state.base;
+        if current == class {
+            return Ok(true);
+        }
+        if let Some(class_tag) = class_tag {
+            if let Some(current_tag) = exc::exception_tag_of_class(current) {
+                if exc::tag_is_subclass(current_tag, class_tag) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Tri-state check: `Some(true/false)` for a recognized type object, `None`
@@ -2883,26 +2994,67 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
 }
 
 /// Whether `value` is an instance of `class` (or one of its subclasses).
+///
+/// Besides the base chain of class instances this resolves the two runtime
+/// class families:
+/// - built-in exception classes use the tag hierarchy, so
+///   `isinstance(ValueError('x'), Exception)` holds without materialising a
+///   class object per parent edge;
+/// - the cached native classes created by `type()` for primitives match their
+///   value kind (`isinstance(3, type(3))`), `object` matches everything and
+///   `type` matches every class value.
 fn instance_of(value: i64, class: i64) -> bool {
+    if value::is_object_class(class) {
+        return true;
+    }
+    if value::is_type_class(class) {
+        return value::as_class(value).is_some();
+    }
     if is_protocol_class(class) {
         return protocol_instance_of(value, class);
     }
-    let Some(instance) = value::as_instance(value) else {
-        return false;
-    };
-    let mut current = instance.class;
-    for _ in 0..1024 {
-        if current == class {
-            return true;
-        }
-        let Some(base_state) = value::as_class(current) else {
-            // `instance.class` is always a class; defensive only.
-            return current == class;
+    // Built-in exception objects carry their tag, not a class instance.
+    if let Some(data) = value::exception_data(value) {
+        return match exc::exception_tag_of_class(class) {
+            Some(handler_tag) => exc::tag_is_subclass(data.tag, handler_tag),
+            None => false,
         };
-        if base_state.base == NONE {
-            return false;
+    }
+    if let Some(instance) = value::as_instance(value) {
+        let class_tag = exc::exception_tag_of_class(class);
+        let mut current = instance.class;
+        for _ in 0..1024 {
+            if current == class {
+                return true;
+            }
+            // A user class derived from a native exception class inherits its
+            // whole CPython ancestry (`class E(ValueError)` is an `Exception`).
+            if let Some(class_tag) = class_tag {
+                if let Some(current_tag) = exc::exception_tag_of_class(current) {
+                    if exc::tag_is_subclass(current_tag, class_tag) {
+                        return true;
+                    }
+                }
+            }
+            let Some(base_state) = value::as_class(current) else {
+                // `instance.class` is always a class; defensive only.
+                return false;
+            };
+            if base_state.base == NONE {
+                return false;
+            }
+            current = base_state.base;
         }
-        current = base_state.base;
+        return false;
+    }
+    // Non-instance values match only the cached native primitive classes
+    // (`type(x)`), which `named_type_check` resolves by name.
+    if value::is_cached_type_class(class) {
+        if let Some(name) = value::class_display_name(class) {
+            if let Some(result) = named_type_check(value, name) {
+                return result;
+            }
+        }
     }
     false
 }
@@ -3897,6 +4049,235 @@ mod tests {
         assert_eq!(isinstance(cat, derived), FALSE);
         assert_eq!(isinstance(cat, base), TRUE);
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn isinstance_uses_the_exception_hierarchy() {
+        exc::init();
+        let value_error = exc::exception_class(exc::VALUE_ERROR);
+        let exception = exc::exception_class(exc::EXCEPTION);
+        let base_exception = exc::exception_class(exc::BASE_EXCEPTION);
+        let arithmetic = exc::exception_class(exc::ARITHMETIC_ERROR);
+        let zero_division = exc::exception_class(exc::ZERO_DIVISION_ERROR);
+        let overflow = exc::exception_class(exc::OVERFLOW_ERROR);
+        let lookup = exc::exception_class(exc::LOOKUP_ERROR);
+        let key_error = exc::exception_class(exc::KEY_ERROR);
+        let import_error = exc::exception_class(exc::IMPORT_ERROR);
+        let missing_module = exc::exception_class(exc::MODULE_NOT_FOUND_ERROR);
+        let os_error = exc::exception_class(exc::OS_ERROR);
+        let file_not_found = exc::exception_class(exc::FILE_NOT_FOUND_ERROR);
+
+        let raised = exc::exception_value(exc::VALUE_ERROR, "boom", vec!["boom".to_string()]);
+        assert_eq!(isinstance(raised, value_error), TRUE);
+        assert_eq!(isinstance(raised, exception), TRUE);
+        assert_eq!(isinstance(raised, base_exception), TRUE);
+        assert_eq!(isinstance(raised, arithmetic), FALSE);
+        assert_eq!(isinstance(raised, os_error), FALSE);
+
+        // ArithmeticError catches its two concrete children.
+        let zero = exc::exception_value(exc::ZERO_DIVISION_ERROR, "", Vec::new());
+        assert_eq!(isinstance(zero, arithmetic), TRUE);
+        assert_eq!(isinstance(zero, zero_division), TRUE);
+        assert_eq!(isinstance(zero, overflow), FALSE);
+        assert_eq!(isinstance(zero, exception), TRUE);
+        let overflowed = exc::exception_value(exc::OVERFLOW_ERROR, "", Vec::new());
+        assert_eq!(isinstance(overflowed, arithmetic), TRUE);
+
+        // LookupError catches IndexError and KeyError.
+        let key = exc::exception_value(exc::KEY_ERROR, "'k'", vec!["k".to_string()]);
+        assert_eq!(isinstance(key, lookup), TRUE);
+        assert_eq!(isinstance(key, key_error), TRUE);
+
+        // ImportError catches ModuleNotFoundError.
+        let missing = exc::exception_value(exc::MODULE_NOT_FOUND_ERROR, "", Vec::new());
+        assert_eq!(isinstance(missing, import_error), TRUE);
+        assert_eq!(isinstance(missing, missing_module), TRUE);
+        assert_eq!(isinstance(missing, exception), TRUE);
+
+        // OSError catches FileNotFoundError.
+        let missing_file = exc::exception_value(exc::FILE_NOT_FOUND_ERROR, "", Vec::new());
+        assert_eq!(isinstance(missing_file, os_error), TRUE);
+        assert_eq!(isinstance(missing_file, file_not_found), TRUE);
+        assert_eq!(isinstance(missing_file, exception), TRUE);
+        assert_eq!(isinstance(missing_file, value_error), FALSE);
+
+        // A user class derived from a native exception class inherits the
+        // whole CPython ancestry for its instances.
+        let user = value::class_new("MyError".to_string(), value_error, Vec::new());
+        let instance = value::instance_new(user);
+        assert_eq!(isinstance(instance, user), TRUE);
+        assert_eq!(isinstance(instance, value_error), TRUE);
+        assert_eq!(isinstance(instance, exception), TRUE);
+        assert_eq!(isinstance(instance, base_exception), TRUE);
+        assert_eq!(isinstance(instance, arithmetic), FALSE);
+        assert!(!exc::pending());
+        exc::init();
+    }
+
+    #[test]
+    fn isinstance_matches_object_and_type_classes() {
+        exc::init();
+        let object = value::object_class();
+        let class = value::class_new("C".to_string(), NONE, Vec::new());
+        let raised = exc::exception_value(exc::VALUE_ERROR, "", Vec::new());
+
+        // `object` is the root of the hierarchy: everything is an instance.
+        assert_eq!(isinstance(int(1), object), TRUE);
+        assert_eq!(isinstance(TRUE, object), TRUE);
+        assert_eq!(isinstance(NONE, object), TRUE);
+        assert_eq!(isinstance(string("x"), object), TRUE);
+        assert_eq!(isinstance(raised, object), TRUE);
+        assert_eq!(isinstance(class, object), TRUE);
+
+        // `type(x)` of a class value is the cached `type` class.
+        let type_class = value::type_class(class);
+        assert_eq!(isinstance(class, type_class), TRUE);
+        assert_eq!(isinstance(int(1), type_class), FALSE);
+        assert_eq!(isinstance(raised, type_class), FALSE);
+
+        // `type(x)` of a primitive matches exactly that value kind.
+        let int_class = value::type_class(int(3));
+        assert_eq!(isinstance(int(3), int_class), TRUE);
+        assert_eq!(isinstance(string("x"), int_class), FALSE);
+        let none_class = value::type_class(NONE);
+        assert_eq!(isinstance(NONE, none_class), TRUE);
+        assert_eq!(isinstance(int(1), none_class), FALSE);
+        assert!(!exc::pending());
+        exc::init();
+    }
+
+    #[test]
+    fn issubclass_uses_the_exception_hierarchy() {
+        exc::init();
+        let syntax = exc::exception_class(exc::SYNTAX_ERROR);
+        let indentation = exc::exception_class(exc::INDENTATION_ERROR);
+        let exception = exc::exception_class(exc::EXCEPTION);
+        let base_exception = exc::exception_class(exc::BASE_EXCEPTION);
+        let arithmetic = exc::exception_class(exc::ARITHMETIC_ERROR);
+        let zero = exc::exception_class(exc::ZERO_DIVISION_ERROR);
+        let os_error = exc::exception_class(exc::OS_ERROR);
+        let file_not_found = exc::exception_class(exc::FILE_NOT_FOUND_ERROR);
+
+        assert_eq!(issubclass(syntax, exception), TRUE);
+        assert_eq!(issubclass(syntax, base_exception), TRUE);
+        assert_eq!(issubclass(indentation, syntax), TRUE);
+        assert_eq!(issubclass(syntax, indentation), FALSE);
+        assert_eq!(issubclass(zero, arithmetic), TRUE);
+        assert_eq!(issubclass(arithmetic, zero), FALSE);
+        assert_eq!(issubclass(file_not_found, os_error), TRUE);
+        assert_eq!(issubclass(os_error, file_not_found), FALSE);
+        assert_eq!(issubclass(zero, file_not_found), FALSE);
+        // A tuple of types succeeds when any candidate matches.
+        assert_eq!(
+            issubclass(zero, value::tuple_new(vec![syntax, arithmetic])),
+            TRUE
+        );
+        assert_eq!(
+            issubclass(zero, value::tuple_new(vec![syntax, os_error])),
+            FALSE
+        );
+
+        // User classes: the base chain plus the native tag ancestry.
+        let user = value::class_new("MyError".to_string(), zero, Vec::new());
+        assert_eq!(issubclass(user, zero), TRUE);
+        assert_eq!(issubclass(user, arithmetic), TRUE);
+        assert_eq!(issubclass(user, exception), TRUE);
+        assert_eq!(issubclass(user, base_exception), TRUE);
+        assert_eq!(issubclass(user, syntax), FALSE);
+
+        // Every class is a subclass of `object`.
+        let object = value::object_class();
+        assert_eq!(issubclass(user, object), TRUE);
+        assert_eq!(issubclass(syntax, object), TRUE);
+        assert_eq!(issubclass(value::type_class(int(1)), object), TRUE);
+        assert!(!exc::pending());
+
+        // Non-class arguments report the CPython TypeError messages.
+        assert_eq!(issubclass(int(1), exception), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "issubclass() arg 1 must be a class");
+        exc::init();
+
+        assert_eq!(issubclass(syntax, int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "issubclass() arg 2 must be a class or tuple of classes"
+        );
+        exc::init();
+
+        assert_eq!(issubclass(syntax, value::tuple_new(vec![int(1)])), NONE);
+        assert_eq!(
+            pending_message(),
+            "issubclass() arg 2 must be a class or tuple of classes"
+        );
+        exc::init();
+    }
+
+    #[test]
+    fn getattr_reads_exception_attributes() {
+        exc::init();
+        let raised = exc::exception_value(exc::VALUE_ERROR, "boom", vec!["boom".to_string()]);
+        assert_eq!(
+            rendered(getattr_builtin(raised, string("args"))),
+            "('boom',)"
+        );
+        assert_eq!(getattr_builtin(raised, string("__cause__")), NONE);
+        assert_eq!(getattr_builtin(raised, string("__context__")), NONE);
+        assert_eq!(
+            rendered(getattr_builtin(raised, string("__suppress_context__"))),
+            "False"
+        );
+        assert_eq!(getattr_builtin(raised, string("__traceback__")), NONE);
+        assert_eq!(
+            getattr_builtin(raised, string("__class__")),
+            exc::exception_class(exc::VALUE_ERROR)
+        );
+        assert!(!exc::pending());
+
+        // Unknown attributes still report AttributeError.
+        assert_eq!(getattr_builtin(raised, string("missing")), NONE);
+        assert_eq!(exc::pending_tag(), exc::ATTRIBUTE_ERROR as i64);
+        exc::init();
+    }
+
+    #[test]
+    fn exception_class_calls_store_args() {
+        exc::init();
+        let value_error = exc::exception_class(exc::VALUE_ERROR);
+        let one = [string("boom")];
+
+        let raised = call(value_error, 1, one.as_ptr());
+        assert!(!exc::pending());
+        assert_eq!(
+            rendered(getattr_builtin(raised, string("args"))),
+            "('boom',)"
+        );
+
+        // `ValueError()` has an empty args tuple.
+        let plain = call(value_error, 0, std::ptr::null());
+        assert!(!exc::pending());
+        assert_eq!(rendered(getattr_builtin(plain, string("args"))), "()");
+
+        // `KeyError('boom')` keeps the raw argument in `args` and renders it
+        // with `repr()` as the message.
+        let key_error = exc::exception_class(exc::KEY_ERROR);
+        let keyed = call(key_error, 1, one.as_ptr());
+        assert_eq!(rendered(keyed), "'boom'");
+        assert_eq!(
+            rendered(getattr_builtin(keyed, string("args"))),
+            "('boom',)"
+        );
+
+        // Multiple arguments are rejected explicitly rather than truncated.
+        let two = [string("a"), string("b")];
+        assert_eq!(call(value_error, 2, two.as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "ValueError() takes at most 1 argument (2 given)"
+        );
+        exc::init();
     }
 
     #[test]

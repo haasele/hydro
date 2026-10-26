@@ -378,12 +378,136 @@ fn imports_inside_blocks_bind_names() {
 }
 
 #[test]
-fn star_and_relative_imports_are_rejected() {
-    for source in ["from math import *\n", "from . import math\n"] {
-        let (_, _, diags) = lower_source(source, &parse(source));
-        assert_eq!(diags.len(), 1, "{source}: {diags:?}");
-        assert_eq!(diags[0].code, codes::UNSUPPORTED);
+fn relative_import_outside_a_package_is_rejected() {
+    let source = "from . import math\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{source}: {diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+}
+
+#[test]
+fn native_star_import_expands_spec_functions_and_constants() {
+    let source = "from math import *\nx = sqrt(9)\ny = pi\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "x").kind {
+        HExprKind::ModuleCall {
+            module, function, ..
+        } => assert_eq!((module.as_str(), function.as_str()), ("math", "sqrt")),
+        other => panic!("expected a direct module call, got {other:?}"),
     }
+    match &assigned(&hir, "y").kind {
+        HExprKind::ModuleAttr { module, name } => {
+            assert_eq!((module.as_str(), name.as_str()), ("math", "pi"))
+        }
+        other => panic!("expected a module attribute, got {other:?}"),
+    }
+}
+
+#[test]
+fn user_star_import_exports_public_names_only() {
+    let source = "from helper import *\nx = add(1, 2)\ny = VALUE\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "helper".to_string(),
+        UserModule {
+            name: "helper".to_string(),
+            exports: HashMap::from([
+                ("add".to_string(), UserExport::Function(1)),
+                ("VALUE".to_string(), UserExport::Global),
+                ("_private".to_string(), UserExport::Global),
+            ]),
+            all: None,
+        },
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "x").kind,
+        HExprKind::CallKw { callee, .. } | HExprKind::IndirectCall { callee, .. }
+            if matches!(&callee.kind, HExprKind::FunctionRef(1))
+    ));
+    assert!(matches!(
+        &assigned(&hir, "y").kind,
+        HExprKind::GlobalGet { module, name } if module == "helper" && name == "VALUE"
+    ));
+
+    // `_private` was not bound by the star import.
+    let source = "from helper import *\ny = _private\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "helper".to_string(),
+        UserModule {
+            name: "helper".to_string(),
+            exports: HashMap::from([("_private".to_string(), UserExport::Global)]),
+            all: None,
+        },
+    )]));
+    let _ = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(
+        diags
+            .iter()
+            .any(|diag| diag.code == codes::NAME && diag.message.contains("'_private'")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn user_star_import_honors_a_literal_all() {
+    let source = "from helper import *\nx = keep()\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "helper".to_string(),
+        UserModule {
+            name: "helper".to_string(),
+            exports: HashMap::from([
+                ("keep".to_string(), UserExport::Function(1)),
+                ("drop".to_string(), UserExport::Function(2)),
+            ]),
+            all: Some(vec!["keep".to_string()]),
+        },
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "x").kind,
+        HExprKind::CallKw { callee, .. } | HExprKind::IndirectCall { callee, .. }
+            if matches!(&callee.kind, HExprKind::FunctionRef(1))
+    ));
+
+    // A name defined by the module but absent from `__all__` is not bound.
+    let source = "from helper import *\nx = drop()\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "helper".to_string(),
+        UserModule {
+            name: "helper".to_string(),
+            exports: HashMap::from([
+                ("keep".to_string(), UserExport::Function(1)),
+                ("drop".to_string(), UserExport::Function(2)),
+            ]),
+            all: Some(vec!["keep".to_string()]),
+        },
+    )]));
+    let _ = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(
+        diags
+            .iter()
+            .any(|diag| diag.code == codes::NAME && diag.message.contains("'drop'")),
+        "{diags:?}"
+    );
 }
 
 #[test]
@@ -6164,6 +6288,7 @@ fn module_alias_still_rejects_user_module_values() {
         UserModule {
             name: "helper".to_string(),
             exports: HashMap::new(),
+            all: None,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));

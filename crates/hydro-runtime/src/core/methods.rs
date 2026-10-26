@@ -781,21 +781,30 @@ fn path_method_kw(obj: i64, method: &str, args: &mut Vec<i64>, keywords: &Keywor
 }
 
 /// Dispatches `obj.<name>` for data attributes of native objects, class
-/// instances and class objects.
+/// instances, class objects and built-in exception objects.
 ///
 /// Method attributes stay callable through [`call`] and remain an
 /// `AttributeError` when read without a call; a `@property` is a data
 /// attribute and calls its getter. Class instances resolve their own attribute
 /// table first, then `__class__`, properties and the frozen class attributes.
-/// Class objects expose their frozen attributes and `__name__`. Unknown names
-/// and receivers without attributes report a pending `AttributeError` and
-/// return `None`.
+/// Class objects expose their frozen attributes and `__name__`. Exception
+/// objects expose `args`, `__class__`, `__cause__`, `__context__`,
+/// `__suppress_context__` and `__traceback__` through
+/// [`crate::exc::exception_attr`]. Unknown names and receivers without
+/// attributes report a pending `AttributeError` and return `None`.
 pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
     if let Some(module) = value::as_module(obj) {
         return crate::modules::module_get_by_name(module.name(), &attr);
+    }
+    // Built-in exception objects expose `args`, `__class__`, `__cause__`,
+    // `__context__`, `__suppress_context__` and `__traceback__`. The check is
+    // before the instance/class branches because exception objects are not
+    // class instances.
+    if let Some(attribute) = exc::exception_attr(obj, &attr) {
+        return attribute;
     }
     if value::as_path(obj).is_some() {
         return path_attr(obj, &attr);
@@ -4878,6 +4887,38 @@ mod tests {
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
         crate::exc::clear();
         assert_eq!(getattr(class, b"limit".as_ptr(), 5), int(5));
+    }
+
+    #[test]
+    fn exception_attributes_resolve_through_getattr_and_hasattr() {
+        reset();
+        let raised =
+            crate::exc::exception_value(crate::exc::VALUE_ERROR, "boom", vec!["boom".to_string()]);
+
+        let args = getattr(raised, b"args".as_ptr(), 4);
+        assert_eq!(value::to_string(args), "('boom',)");
+        // Unset `__cause__`/`__context__` are `None`; there is no traceback
+        // object, so `__traceback__` is `None` too.
+        assert_eq!(getattr(raised, b"__cause__".as_ptr(), 9), NONE);
+        assert_eq!(getattr(raised, b"__context__".as_ptr(), 11), NONE);
+        assert_eq!(getattr(raised, b"__traceback__".as_ptr(), 13), NONE);
+        assert_eq!(getattr(raised, b"__suppress_context__".as_ptr(), 20), FALSE);
+        assert_eq!(
+            getattr(raised, b"__class__".as_ptr(), 9),
+            crate::exc::exception_class(crate::exc::VALUE_ERROR)
+        );
+        assert!(!crate::exc::pending());
+
+        // `hasattr` reports the surface without leaking an AttributeError.
+        assert_eq!(super::hasattr(raised, b"args".as_ptr(), 4), TRUE);
+        assert_eq!(super::hasattr(raised, b"__cause__".as_ptr(), 9), TRUE);
+        assert_eq!(super::hasattr(raised, b"missing".as_ptr(), 7), FALSE);
+        assert!(!crate::exc::pending());
+
+        // Reading an unknown name still raises AttributeError.
+        assert_eq!(getattr(raised, b"missing".as_ptr(), 7), NONE);
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        crate::exc::init();
     }
 
     #[test]

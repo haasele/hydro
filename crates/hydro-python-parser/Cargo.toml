@@ -1,0 +1,105 @@
+# Workspace-local fork of rustpython-parser 0.4.0.
+#
+# The crate is a copy of the published `rustpython-parser` 0.4.0 sources with a
+# minimal patch that adds CPython 3.14 syntax support:
+#   * PEP 701 f-strings (quote reuse, backslashes and comments in replacement
+#     fields, nested f-strings via normal parser recursion).
+#   * PEP 750 template strings (`t"..."`, `rt"..."`).
+# See PROVENANCE.md for the exact upstream revision and the list of changes.
+#
+# The upstream crate is MIT licensed; this fork keeps that license. It is a
+# private workspace crate and is never published.
+
+[package]
+name = "hydro-python-parser"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["RustPython Team", "hydro contributors"]
+description = "Fork of rustpython-parser 0.4.0 with CPython 3.14 f-string and template-string parsing."
+license = "MIT"
+publish = false
+build = "build.rs"
+autobins = false
+autoexamples = false
+autobenches = false
+
+[lib]
+name = "hydro_python_parser"
+path = "src/lib.rs"
+# Upstream doc examples reference the `rustpython_parser` crate name; doctests
+# are disabled rather than rewritten in the fork.
+doctest = false
+
+[dependencies.is-macro]
+version = "0.3.0"
+
+[dependencies.itertools]
+version = "0.11.0"
+
+[dependencies.lalrpop-util]
+version = "0.20.0"
+default-features = false
+
+[dependencies.log]
+version = "0.4.16"
+
+[dependencies.malachite-bigint]
+version = "0.2.0"
+optional = true
+
+[dependencies.num-bigint]
+version = "0.4.3"
+optional = true
+
+[dependencies.num-traits]
+version = "0.2"
+
+[dependencies.phf]
+version = "0.11.1"
+
+[dependencies.rustc-hash]
+version = "1.1.0"
+
+[dependencies.rustpython-ast]
+version = "0.4.0"
+default-features = false
+features = ["fold"]
+
+[dependencies.rustpython-parser-core]
+version = "0.4.0"
+features = []
+
+[dependencies.serde]
+version = "1.0.133"
+features = ["derive"]
+optional = true
+default-features = false
+
+[dependencies.unic-emoji-char]
+version = "0.9.0"
+
+[dependencies.unic-ucd-ident]
+version = "0.9.0"
+
+[dependencies.unicode_names2]
+version = "1.1.0"
+
+[build-dependencies.anyhow]
+version = "1.0.45"
+
+[build-dependencies.phf_codegen]
+version = "0.11.1"
+
+[build-dependencies.tiny-keccak]
+version = "2"
+features = ["sha3"]
+
+[features]
+default = ["location", "malachite-bigint"]
+all-nodes-with-ranges = ["rustpython-ast/all-nodes-with-ranges"]
+full-lexer = []
+location = ["rustpython-ast/location", "rustpython-parser-core/location"]
+malachite-bigint = ["dep:malachite-bigint", "rustpython-ast/malachite-bigint"]
+num-bigint = ["dep:num-bigint", "rustpython-ast/num-bigint"]
+serde = ["dep:serde", "rustpython-parser-core/serde"]

@@ -11,8 +11,9 @@
 //! value; no user input can panic.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ffi::CString;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CString, OsStr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -23,6 +24,8 @@ use hydro_ir::{PYTHON_VERSION, PYTHON_VERSION_STRING};
 use num_bigint::{BigInt, Sign};
 use num_traits::Signed;
 
+use crate::core::globals;
+
 pub(crate) mod abc;
 pub(crate) mod argparse;
 pub(crate) mod ast;
@@ -30,6 +33,8 @@ pub(crate) mod asyncio;
 pub(crate) mod base64;
 pub(crate) mod binascii;
 pub(crate) mod bisect;
+pub(crate) mod builtins;
+pub(crate) mod codecs;
 pub(crate) mod collections;
 pub(crate) mod colorsys;
 pub(crate) mod datetime;
@@ -41,10 +46,12 @@ pub(crate) mod fractions;
 pub(crate) mod future;
 pub(crate) mod getopt;
 pub(crate) mod heapq;
+pub(crate) mod imp;
 pub(crate) mod importlib;
 pub(crate) mod itertools;
 pub(crate) mod keyword;
 pub(crate) mod mimetypes;
+pub(crate) mod opcode;
 pub(crate) mod pytest;
 pub(crate) mod quopri;
 pub(crate) mod re;
@@ -52,6 +59,7 @@ pub(crate) mod select;
 pub(crate) mod shutil;
 pub(crate) mod socket;
 pub(crate) mod stat;
+pub(crate) mod string;
 pub(crate) mod subprocess;
 pub(crate) mod tempfile;
 pub(crate) mod textwrap;
@@ -59,8 +67,8 @@ pub(crate) mod timeit;
 pub(crate) mod types;
 pub(crate) mod typing;
 pub(crate) mod unittest;
+pub(crate) mod weakref;
 
-use crate::builtins;
 use crate::container;
 use crate::exc::{
     self, ATTRIBUTE_ERROR, INDEX_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR,
@@ -373,6 +381,11 @@ pub(crate) fn module_get_by_name(module: &str, name: &str) -> i64 {
 }
 
 fn module_get_named(module: &str, name: &str) -> i64 {
+    // Every module value knows its import name, including user modules that
+    // have no native spec.
+    if name == "__name__" {
+        return value::str_alloc(module.to_string());
+    }
     // `errno` attributes are platform-defined names resolved on demand; the
     // static spec table cannot enumerate them.
     if module == "errno" {
@@ -384,12 +397,27 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if module == "pytest" && name == "mark" {
         return pytest::marks();
     }
+    // `builtins.object` is CPython's universal base class, not a function.
+    if module == "builtins" && name == "object" {
+        return value::object_class();
+    }
+    // `_collections` is the accelerator alias of `collections`; both names
+    // must expose the same `defaultdict` object.
+    if matches!(module, "collections" | "_collections") && name == "defaultdict" {
+        return collections::defaultdict_function();
+    }
     if let Some(spec) = stdlib::function(module, name) {
         let module_name = stdlib::module(module).map(|m| m.name).unwrap_or("<module>");
         return value::native_function_new(module_name, spec.name, spec.max_args);
     }
     if stdlib::constant(module, name).is_some() {
         return constant_value(module, name);
+    }
+    // Compiled user modules keep their attributes in the globals side store.
+    // Native modules win above, so a user module named like a stdlib module
+    // cannot shadow native attributes.
+    if let Some(value) = globals::try_get(module, name) {
+        return value;
     }
     missing_attribute(module, name)
 }
@@ -571,6 +599,7 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
 
 fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
     match module {
+        "builtins" => builtins::call(function, args),
         "math" => math_call(function, args),
         "functools" | "_functools" => functools_call(function, args),
         "operator" | "_operator" => operator_call(function, args),
@@ -603,6 +632,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "platform" => platform_call(function),
         "statistics" => statistics_call(function, args),
         "argparse" => argparse::call(function, args),
+        "_collections" => collections::call(function, args),
         "collections" => collections::call(function, args),
         "re" => re::call(function, args),
         "socket" => socket::call(function, args),
@@ -629,8 +659,244 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "typing" => typing::call(function, args),
         "abc" => abc::call(function, args),
         "enum" => r#enum::call(function, args),
+        "_imp" => imp::call(function, args),
+        "_codecs" => codecs::call(function, args),
+        "_string" => string::call(function, args),
+        "_weakref" | "weakref" => weakref::call(function, args),
         _ => missing_attribute(module, function),
     }
+}
+
+// Runtime module registry
+//
+// `sys.modules` and `sys.path` are ordinary Hydro values, but repeated reads
+// must return the same object: libraries compare identities, and
+// `sys.modules[name] is imported_module` is observable. Both are cached in the
+// globals side store under the internal registry pseudo-module, so they are
+// traced while alive and `globals::reset()` drops them together with every
+// user module during `hydro_runtime_init`. No new ABI symbol is involved.
+
+/// Registry keys in the globals side store.
+const SYS_MODULES_CACHE: &str = "sys.modules";
+const SYS_PATH_CACHE: &str = "sys.path";
+
+/// `sys.modules`: native modules from [`stdlib::MODULES`] plus every compiled
+/// user module discovered in the globals store, in deterministic order.
+///
+/// The returned dict is cached for stable identity. Each read adds user
+/// modules that stored their first global after the previous read, so a
+/// module body executed later still appears without rebuilding the dict.
+fn sys_modules() -> i64 {
+    if let Some(cached) = globals::registry_get(SYS_MODULES_CACHE) {
+        sync_user_modules(cached);
+        return cached;
+    }
+    // Publish the empty dict before filling it: the registry entry is a root,
+    // so every key and module value stays reachable across allocations.
+    let modules = value::dict_new(Vec::new());
+    globals::registry_set(SYS_MODULES_CACHE, modules);
+    let mut seen: HashSet<&'static str> = HashSet::new();
+    for spec in stdlib::MODULES {
+        if !seen.insert(spec.name) {
+            continue;
+        }
+        let key = value::str_alloc(spec.name.to_string());
+        let roots = crate::heap::root_values(&[key]);
+        let module = value::module_value(spec.name.to_string());
+        container::dict_set(modules, key, module);
+        crate::heap::release_roots(roots);
+    }
+    sync_user_modules(modules);
+    modules
+}
+
+/// Inserts user modules discovered in the globals store into `modules`.
+///
+/// Native names win because they were inserted first; `module_names` is
+/// sorted, so new user entries are appended deterministically. Once a module
+/// is registered it stays for the rest of the run (like CPython's
+/// `sys.modules`); only [`globals::reset`] clears the registry.
+fn sync_user_modules(modules: i64) {
+    for name in globals::module_names() {
+        if registry_contains(modules, &name) {
+            continue;
+        }
+        let key = value::str_alloc(name.clone());
+        let roots = crate::heap::root_values(&[key]);
+        let module = value::module_value(name);
+        container::dict_set(modules, key, module);
+        crate::heap::release_roots(roots);
+    }
+}
+
+/// Whether the registry dict already maps `name`, without rebuilding it.
+fn registry_contains(modules: i64, name: &str) -> bool {
+    value::as_dict(modules).is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|(key, _)| value::as_str(*key) == Some(name))
+    })
+}
+
+/// Looks up a loaded module by name in the runtime registry.
+///
+/// Native modules and user modules discovered in the globals store both live
+/// in `sys.modules`, so importers and attribute access share one identity.
+pub(crate) fn registry_lookup(name: &str) -> Option<i64> {
+    let modules = sys_modules();
+    value::as_dict(modules)?
+        .iter()
+        .find_map(|(key, value)| (value::as_str(*key) == Some(name)).then_some(*value))
+}
+
+/// `sys.path`: the documented search path, as a cached `list[str]`.
+///
+/// Mutating the returned list is observation-only: no runtime importer
+/// consults it yet, so writes do not change module resolution.
+fn sys_path() -> i64 {
+    if let Some(cached) = globals::registry_get(SYS_PATH_CACHE) {
+        return cached;
+    }
+    // Publish the empty list before appending so the cache entry roots the
+    // elements allocated below.
+    let path = value::list_new(Vec::new());
+    globals::registry_set(SYS_PATH_CACHE, path);
+    for dir in search_path() {
+        let item = value::str_alloc(dir);
+        container::list_append(path, item);
+    }
+    path
+}
+
+/// Builds `sys.path` from the environment.
+///
+/// Order: `HYDRO_SITE_PACKAGES`, the site-packages directories of
+/// `VIRTUAL_ENV` then `CONDA_PREFIX`, `PYTHONPATH`, and finally
+/// `HYDRO_STDLIB`. Empty, missing and non-directory entries are dropped and
+/// duplicates are kept once, so the result is deterministic for a given
+/// environment.
+fn search_path() -> Vec<String> {
+    search_path_from(
+        std::env::var_os("HYDRO_SITE_PACKAGES").as_deref(),
+        std::env::var_os("PYTHONPATH").as_deref(),
+        std::env::var_os("VIRTUAL_ENV").as_deref(),
+        std::env::var_os("CONDA_PREFIX").as_deref(),
+        std::env::var_os("HYDRO_STDLIB").as_deref(),
+    )
+}
+
+/// [`search_path`] with explicit environment values, for tests.
+fn search_path_from(
+    hydro_site_packages: Option<&OsStr>,
+    pythonpath: Option<&OsStr>,
+    virtual_env: Option<&OsStr>,
+    conda_prefix: Option<&OsStr>,
+    hydro_stdlib: Option<&OsStr>,
+) -> Vec<String> {
+    let mut dirs = Vec::new();
+    if let Some(list) = hydro_site_packages {
+        dirs.extend(std::env::split_paths(list));
+    }
+    for prefix in [virtual_env, conda_prefix].into_iter().flatten() {
+        if !prefix.is_empty() {
+            dirs.extend(prefix_site_packages(Path::new(prefix)));
+        }
+    }
+    if let Some(list) = pythonpath {
+        dirs.extend(std::env::split_paths(list));
+    }
+    if let Some(stdlib) = hydro_stdlib {
+        dirs.push(PathBuf::from(stdlib));
+    }
+    let mut seen = HashSet::new();
+    dirs.into_iter()
+        .filter(|dir| {
+            if dir.as_os_str().is_empty() || !dir.is_dir() {
+                return false;
+            }
+            let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+            seen.insert(key)
+        })
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Site-packages directories of an environment prefix, in deterministic
+/// order: the Windows `<prefix>/Lib/site-packages` layout first, then every
+/// `<prefix>/lib/python*/site-packages` sorted lexicographically.
+fn prefix_site_packages(prefix: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let windows = prefix.join("Lib").join("site-packages");
+    if windows.is_dir() {
+        dirs.push(windows);
+    }
+    if let Ok(entries) = std::fs::read_dir(prefix.join("lib")) {
+        let mut posix: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("python"))
+            .map(|entry| entry.path().join("site-packages"))
+            .filter(|dir| dir.is_dir())
+            .collect();
+        posix.sort();
+        dirs.extend(posix);
+    }
+    dirs
+}
+
+/// `sys.base_prefix`: the Hydro installation prefix.
+///
+/// `HYDRO_STDLIB` names the bundled stdlib directory, so its parent is the
+/// installation root; without it the executable's directory is used. The
+/// result is always a string (possibly empty) rather than a failure.
+fn base_prefix() -> String {
+    let from_stdlib = std::env::var_os("HYDRO_STDLIB")
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    let prefix = from_stdlib.or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    });
+    prefix
+        .map(|prefix| prefix.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// `sys.prefix`: the active virtual environment, else the installation
+/// prefix.
+fn installation_prefix() -> String {
+    for variable in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
+        if let Some(prefix) = std::env::var_os(variable) {
+            if !prefix.is_empty() {
+                return PathBuf::from(prefix).to_string_lossy().into_owned();
+            }
+        }
+    }
+    base_prefix()
+}
+
+/// `sys.builtin_module_names`: the native module names, in table order.
+fn builtin_module_names() -> i64 {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    // Root each name until the tuple owns it: allocating the next name may
+    // trigger a collection.
+    let mut roots = Vec::new();
+    for spec in stdlib::MODULES {
+        if !seen.insert(spec.name) {
+            continue;
+        }
+        let name = value::str_alloc(spec.name.to_string());
+        roots.push(crate::heap::root_values(&[name]));
+        names.push(name);
+    }
+    let names = value::tuple_new(names);
+    for start in roots.into_iter().rev() {
+        crate::heap::release_roots(start);
+    }
+    names
 }
 
 // Constants
@@ -645,6 +911,16 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("math", "inf") => value::float_new(f64::INFINITY),
         ("math", "nan") => value::float_new(f64::NAN),
         ("sys", "argv") => argv_list(),
+        // Runtime module registry (identity-stable for repeated reads).
+        ("sys", "path") => sys_path(),
+        ("sys", "modules") => sys_modules(),
+        ("sys", "builtin_module_names") => builtin_module_names(),
+        // `prefix` follows the active virtual environment; `base_prefix` and
+        // `exec_prefix` describe the installation itself (they coincide here,
+        // as they do in an unmodified CPython installation).
+        ("sys", "prefix") => value::str_alloc(installation_prefix()),
+        ("sys", "base_prefix") => value::str_alloc(base_prefix()),
+        ("sys", "exec_prefix") => value::str_alloc(base_prefix()),
         ("sys", "executable") => value::str_alloc(
             std::env::current_exe()
                 .map(|path| path.to_string_lossy().into_owned())
@@ -750,6 +1026,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("typing", name) => typing::constant(name),
         ("abc", name) => abc::constant(name),
         ("enum", name) => r#enum::constant(name),
+        ("builtins", name) => builtins::constant(name),
+        ("_opcode", name) => opcode::constant(name),
+        ("_weakref" | "weakref", name) => weakref::constant(name),
         // The `@dataclass` decorator is expanded by the frontend; the runtime
         // value only has to exist for the import.
         ("dataclasses", "dataclass") => NONE,
@@ -1652,7 +1931,7 @@ fn reduce(args: &[i64]) -> i64 {
             break;
         }
         let call_args = [accumulator, item];
-        let next = builtins::call(function, 2, call_args.as_ptr());
+        let next = crate::builtins::call(function, 2, call_args.as_ptr());
         if failed() {
             return NONE;
         }
@@ -1931,7 +2210,7 @@ pub(crate) fn spawn_thread(
             let _exit = ThreadExit { finished };
             // SAFETY: `argv` outlives the call and `argc` matches its length; the callee
             // reads `argc` values (NULL for zero arguments, which it never dereferences).
-            let _ = builtins::call(function, argc, argv.as_ptr());
+            let _ = crate::builtins::call(function, argc, argv.as_ptr());
             // An exception cannot cross the thread boundary: report it like
             // an uncaught exception, as CPython's `_thread` does.
             if exc::pending() {
@@ -4083,6 +4362,28 @@ mod tests {
         NATIVE_CACHE.with(|cache| cache.borrow().hits)
     }
 
+    /// Creates a unique scratch directory for path tests.
+    fn temp_root(label: &str) -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("hydro-{label}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch directory");
+        dir
+    }
+
+    fn make_dir(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path).expect("create test directory");
+        path.to_path_buf()
+    }
+
+    /// Reads a string-keyed entry from a registry dict.
+    fn registry_value(dict: i64, name: &str) -> Option<i64> {
+        value::as_dict(dict)?
+            .iter()
+            .find_map(|(key, value)| (value::as_str(*key) == Some(name)).then_some(*value))
+    }
+
     #[test]
     fn math_constants_and_functions() {
         exc::init();
@@ -4522,6 +4823,15 @@ mod tests {
         assert_eq!(value::as_str(hydro_info[3]), Some("dev"));
         assert_eq!(as_int(hydro_info[4]), 0);
         assert_eq!(as_int(get("sys", "maxsize")), value::MAX_INT);
+        assert!(value::as_list(get("sys", "path")).is_some());
+        assert!(value::as_dict(get("sys", "modules")).is_some());
+        let builtin_names = value::as_tuple(get("sys", "builtin_module_names")).expect("tuple");
+        assert!(builtin_names
+            .iter()
+            .any(|name| value::as_str(*name) == Some("sys")));
+        for name in ["prefix", "base_prefix", "exec_prefix"] {
+            assert!(value::as_str(get("sys", name)).is_some(), "{name}");
+        }
         assert!(stdlib::function("sys", "exit").is_some());
         for name in [
             "stdin",
@@ -4544,6 +4854,158 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn sys_path_follows_documented_order() {
+        let root = temp_root("sys-path");
+        let site_a = make_dir(&root.join("site-a"));
+        let site_b = make_dir(&root.join("site-b"));
+        let missing = root.join("missing");
+        let venv = root.join("venv");
+        let venv_site = make_dir(&venv.join("lib").join("python3.14").join("site-packages"));
+        let conda = root.join("conda");
+        let conda_site = make_dir(&conda.join("Lib").join("site-packages"));
+        let py_a = make_dir(&root.join("py-a"));
+        let py_b = make_dir(&root.join("py-b"));
+        let stdlib = make_dir(&root.join("stdlib"));
+
+        let site_packages =
+            std::env::join_paths([site_a.as_path(), site_b.as_path(), missing.as_path()])
+                .expect("join site packages");
+        // The duplicate `site_b` and the empty component must both disappear.
+        let pythonpath = std::env::join_paths([py_a.as_path(), site_b.as_path(), py_b.as_path()])
+            .expect("join PYTHONPATH");
+
+        let path = search_path_from(
+            Some(site_packages.as_os_str()),
+            Some(pythonpath.as_os_str()),
+            Some(venv.as_os_str()),
+            Some(conda.as_os_str()),
+            Some(stdlib.as_os_str()),
+        );
+        let expected: Vec<String> = [
+            &site_a,
+            &site_b,
+            &venv_site,
+            &conda_site,
+            &py_a,
+            &py_b,
+            &stdlib,
+        ]
+        .into_iter()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(path, expected);
+
+        let empty = search_path_from(None, None, None, None, None);
+        assert!(empty.is_empty(), "a bare environment has no search dirs");
+        std::fs::remove_dir_all(&root).expect("remove scratch directory");
+    }
+
+    #[test]
+    fn sys_path_is_a_cached_list() {
+        globals::reset();
+        exc::init();
+        let first = get("sys", "path");
+        assert!(value::as_list(first).is_some(), "sys.path must be a list");
+        assert_eq!(first, get("sys", "path"), "reads must share identity");
+        // Mutating the list is observable on later reads (imports ignore it).
+        let sentinel = string("reset-sentinel");
+        crate::container::list_append(first, sentinel);
+        assert!(value::as_list(get("sys", "path"))
+            .expect("list")
+            .contains(&sentinel));
+        assert!(!exc::pending());
+
+        // `reset` is what a fresh program run uses; it must invalidate the
+        // cache so environment changes are observed.
+        globals::reset();
+        let second = get("sys", "path");
+        assert!(value::as_list(second).is_some());
+        assert!(
+            !value::as_list(second).expect("list").contains(&sentinel),
+            "reset must drop the cached list"
+        );
+    }
+
+    #[test]
+    fn sys_modules_membership_identity_and_module_names() {
+        globals::reset();
+        exc::init();
+        let first = get("sys", "modules");
+        assert_eq!(first, get("sys", "modules"), "reads must share identity");
+        let sys_module = registry_value(first, "sys").expect("sys is registered");
+        assert_eq!(
+            value::as_module(sys_module).map(|module| module.name()),
+            Some("sys")
+        );
+        assert_eq!(
+            registry_value(first, "sys"),
+            Some(sys_module),
+            "sys.modules['sys'] is stable"
+        );
+        assert_eq!(value::as_str(get("sys", "__name__")), Some("sys"));
+
+        // A user module becomes visible after its first global is stored,
+        // without rebuilding the cached dict.
+        globals::set("helper", "answer", int(42));
+        let modules = get("sys", "modules");
+        assert_eq!(modules, first);
+        let helper = registry_value(modules, "helper").expect("user module registered");
+        assert_eq!(
+            value::as_module(helper).map(|module| module.name()),
+            Some("helper")
+        );
+        assert_eq!(get("helper", "answer"), int(42));
+        assert_eq!(value::as_str(get("helper", "__name__")), Some("helper"));
+
+        // Unknown attributes still raise AttributeError, never a fake value.
+        exc::init();
+        assert_eq!(get("helper", "missing"), NONE);
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        assert_eq!(message(), "module 'helper' has no attribute 'missing'");
+    }
+
+    #[test]
+    fn builtins_module_materializes_native_functions() {
+        globals::reset();
+        exc::init();
+        assert!(stdlib::module("builtins").is_some());
+        assert_eq!(value::as_str(get("builtins", "__name__")), Some("builtins"));
+        for name in ["len", "print", "open", "setattr", "compile"] {
+            assert_eq!(
+                value::type_name(get("builtins", name)),
+                "function",
+                "{name} must materialize from the builtins spec"
+            );
+        }
+        // `object` is the cached universal base class, not a native function.
+        let object = get("builtins", "object");
+        assert_eq!(
+            value::class_display_name(object),
+            Some("object"),
+            "builtins.object must be a class"
+        );
+        assert_eq!(value::type_name(object), "type");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn reset_invalidates_module_registry() {
+        globals::reset();
+        exc::init();
+        globals::set("helper", "value", int(1));
+        let before = get("sys", "modules");
+        assert!(registry_value(before, "helper").is_some());
+
+        globals::reset();
+        let after = get("sys", "modules");
+        assert!(
+            registry_value(after, "helper").is_none(),
+            "user modules disappear with their globals"
+        );
+        assert!(registry_value(after, "sys").is_some());
     }
 
     #[test]

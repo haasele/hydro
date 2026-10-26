@@ -1,18 +1,22 @@
-//! `importlib.import_module`: dynamic imports for the native module table.
+//! `importlib.import_module`: dynamic imports backed by the module registry.
 //!
 //! Hydro resolves ordinary imports statically. `import_module` exists for code
-//! that selects a module name at runtime: a name registered in
-//! `hydro_ir::stdlib` yields the native module value, so attribute access goes
-//! through the usual dispatcher.
+//! that selects a module name at runtime: the runtime registry (`sys.modules`)
+//! knows every native module from `hydro_ir::stdlib` and every loaded user
+//! module discovered in the globals store, and import returns that exact
+//! module value so identity matches `sys.modules[name]`.
 //!
-//! Names outside that table yield a placeholder namespace whose `cell_table`
-//! attribute is an empty dict. Rich's Unicode width tables are loaded this way
-//! (`rich._unicode_data.unicodeX`); the empty table makes the cell-width lookup
-//! fall back to the default width instead of failing the import. This is a
-//! temporary shim: the real per-width tables are not bundled.
+//! Names outside the registry fail with `ModuleNotFoundError`. The only
+//! remaining placeholder is the generated Unicode width tables
+//! (`rich._unicode_data.unicodeX`): their synthesized `cell_table` reports a
+//! single default-width range for every codepoint instead of failing the
+//! import. The real per-width tables are not bundled.
 
-use crate::exc::{self, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{self, MODULE_NOT_FOUND_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value;
+
+/// Placeholder modules that are still synthesized on demand.
+const UNICODE_TABLE_PREFIX: &str = "rich._unicode_data";
 
 /// Dispatches a native `importlib` function. Arity is enforced by the central
 /// spec before this point.
@@ -40,13 +44,29 @@ fn import_module(name_arg: i64) -> i64 {
     if name.is_empty() {
         return exc::raise_with_message(VALUE_ERROR, "Empty module name");
     }
-    if hydro_ir::stdlib::module(name).is_some() {
-        return value::module_value(name.to_string());
+    if name.split('.').any(|part| part.is_empty()) {
+        return exc::raise_with_message(
+            MODULE_NOT_FOUND_ERROR,
+            &format!("No module named '{name}'"),
+        );
     }
-    // Placeholder for the generated Unicode tables (and any other module the
-    // runtime cannot import natively). The table exposes the `CellTable`
-    // fields as a namespace; one full-width range keeps the binary search in
-    // rich.cells valid and reports width 1 for every codepoint.
+    if let Some(module) = super::registry_lookup(name) {
+        return module;
+    }
+    if name == UNICODE_TABLE_PREFIX || name.starts_with("rich._unicode_data.") {
+        return unicode_table_placeholder();
+    }
+    // Unknown names never become a fake namespace: callers rely on the import
+    // failing so their fallback/probe logic runs.
+    exc::raise_with_message(MODULE_NOT_FOUND_ERROR, &format!("No module named '{name}'"))
+}
+
+/// Placeholder for the generated Unicode width tables.
+///
+/// The table exposes the `CellTable` fields as a namespace; one full-width
+/// range keeps the binary search in `rich.cells` valid and reports width 1
+/// for every codepoint.
+fn unicode_table_placeholder() -> i64 {
     let range = value::tuple_new(vec![
         crate::ops::int_result(0),
         crate::ops::int_result(0x10FFFF),
@@ -79,6 +99,42 @@ mod tests {
         let module = as_module(math).expect("module value");
         assert_eq!(module.name(), "math");
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn registered_modules_share_sys_modules_identity() {
+        exc::init();
+        let first = call("import_module", &[text("sys")]);
+        let second = call("import_module", &[text("sys")]);
+        assert_eq!(first, second);
+        assert_eq!(
+            Some(first),
+            crate::modules::registry_lookup("sys"),
+            "import_module must return the sys.modules entry"
+        );
+        assert_eq!(as_module(first).map(|module| module.name()), Some("sys"));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn unknown_modules_raise_module_not_found() {
+        exc::init();
+        let missing = call("import_module", &[text("definitely_not_a_module")]);
+        assert_eq!(
+            exc::pending_tag(),
+            i64::from(MODULE_NOT_FOUND_ERROR),
+            "unknown imports must fail instead of returning a namespace"
+        );
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "No module named 'definitely_not_a_module'"
+        );
+        assert!(as_namespace(missing).is_none());
+        assert!(as_module(missing).is_none());
+
+        exc::init();
+        call("import_module", &[text("rich.not_a_width_table")]);
+        assert_eq!(exc::pending_tag(), i64::from(MODULE_NOT_FOUND_ERROR));
     }
 
     #[test]

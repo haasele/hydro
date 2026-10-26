@@ -357,6 +357,10 @@ pub enum Builtin {
     Format,
     /// `isinstance(object, type)`.
     Isinstance,
+    /// `issubclass(class, class_or_tuple)`: whether the first class derives
+    /// from the second (or from any element of a tuple). Both arguments are
+    /// validated at runtime; non-classes raise `TypeError`.
+    Issubclass,
     /// `all(iterable)`: `True` when every element is truthy.
     All,
     AnyValue,
@@ -428,6 +432,7 @@ impl Builtin {
             Builtin::Round => "round",
             Builtin::Format => "format",
             Builtin::Isinstance => "isinstance",
+            Builtin::Issubclass => "issubclass",
             Builtin::All => "all",
             Builtin::AnyValue => "any",
             Builtin::Ord => "ord",
@@ -477,6 +482,7 @@ impl Builtin {
             "round" => Builtin::Round,
             "format" => Builtin::Format,
             "isinstance" => Builtin::Isinstance,
+            "issubclass" => Builtin::Issubclass,
             "all" => Builtin::All,
             "any" => Builtin::AnyValue,
             "ord" => Builtin::Ord,
@@ -517,14 +523,17 @@ pub enum ExcKind {
     /// module global.
     NameError,
     /// `SystemExit`: raised by `sys.exit()`. It is catchable like any other
-    /// exception (`except SystemExit`, `except Exception`); when it stays
-    /// uncaught the existing traceback path exits with status 1.
+    /// exception (`except SystemExit`, `except BaseException`), but not by
+    /// `except Exception` (it derives directly from `BaseException`). When it
+    /// stays uncaught the existing traceback path exits with the stored code.
     SystemExit,
     /// `GeneratorExit`: injected by `generator.close()`; it is also exposed
     /// as a first-class class value.
     GeneratorExit,
-    /// Base class matching every exception except `KeyboardInterrupt` and
-    /// `GeneratorExit` (Python's `Exception`).
+    /// Base class matching every tag whose parent chain reaches it (Python's
+    /// `Exception`), so not the `BaseException`-only children (`SystemExit`,
+    /// `KeyboardInterrupt`, `GeneratorExit`, `CancelledError` and
+    /// `BaseExceptionGroup`).
     Exception,
     /// Root exception class matching every exception (Python's
     /// `BaseException`).
@@ -532,96 +541,237 @@ pub enum ExcKind {
     /// `StopAsyncIteration`: the normal end of an asynchronous iterator,
     /// caught by `async for` lowering.
     StopAsyncIteration,
+    /// `SystemError`: an internal interpreter error.
+    SystemError,
+    /// `MemoryError`: out of memory.
+    MemoryError,
+    /// `RecursionError`: the recursion limit was exceeded (a `RuntimeError`
+    /// subclass).
+    RecursionError,
+    /// `SyntaxError`: invalid syntax; also the base of
+    /// [`ExcKind::IndentationError`].
+    SyntaxError,
+    /// `IndentationError`: bad indentation (a `SyntaxError` subclass).
+    IndentationError,
+    /// `TabError`: inconsistent tabs and spaces (an `IndentationError`).
+    TabError,
+    /// `ArithmeticError`: base of the arithmetic failures below.
+    ArithmeticError,
+    /// `LookupError`: base of [`ExcKind::IndexError`] and
+    /// [`ExcKind::KeyError`].
+    LookupError,
+    /// `ImportError`: a failed import.
+    ImportError,
+    /// `ModuleNotFoundError`: no such module (an `ImportError` subclass).
+    ModuleNotFoundError,
+    /// `NotImplementedError`: abstract method (a `RuntimeError` subclass).
+    NotImplementedError,
+    /// `EOFError`: end of file where input was expected.
+    EOFError,
+    /// `UnicodeError`: base of the Unicode codec errors (a `ValueError`).
+    UnicodeError,
+    UnicodeDecodeError,
+    UnicodeEncodeError,
+    UnicodeTranslateError,
+    /// `BufferError`: a buffer operation failed.
+    BufferError,
+    /// `ReferenceError`: a weak reference was used after its target died.
+    ReferenceError,
+    /// `ExceptionGroup`: a group of exceptions (also a `BaseExceptionGroup`).
+    ExceptionGroup,
+    /// `BaseExceptionGroup`: a group of exceptions, including the
+    /// `BaseException`-only ones.
+    BaseExceptionGroup,
+    /// `Warning`: base of every warning category.
+    Warning,
+    UserWarning,
+    DeprecationWarning,
+    PendingDeprecationWarning,
+    SyntaxWarning,
+    RuntimeWarning,
+    FutureWarning,
+    ImportWarning,
+    UnicodeWarning,
+    BytesWarning,
+    ResourceWarning,
+    /// `FloatingPointError`: a floating-point operation failed.
+    FloatingPointError,
+    /// `BlockingIOError`: an `OSError` subclass.
+    BlockingIOError,
+    /// `ChildProcessError`: an `OSError` subclass.
+    ChildProcessError,
+    /// `ConnectionError`: an `OSError` subclass and the base of the four
+    /// connection failures below.
+    ConnectionError,
+    BrokenPipeError,
+    ConnectionAbortedError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    /// `FileExistsError`: an `OSError` subclass.
+    FileExistsError,
+    /// `InterruptedError`: an `OSError` subclass.
+    InterruptedError,
+    /// `IsADirectoryError`: an `OSError` subclass.
+    IsADirectoryError,
+    /// `NotADirectoryError`: an `OSError` subclass.
+    NotADirectoryError,
+    /// `PermissionError`: an `OSError` subclass.
+    PermissionError,
+    /// `ProcessLookupError`: an `OSError` subclass.
+    ProcessLookupError,
+    /// `TimeoutError`: an `OSError` subclass.
+    TimeoutError,
+    /// Alias of [`ExcKind::OSError`]: `EnvironmentError is OSError` in
+    /// CPython, so it shares the `OSError` tag and class name.
+    EnvironmentError,
+    /// Alias of [`ExcKind::OSError`]: `IOError is OSError` in CPython, so it
+    /// shares the `OSError` tag and class name.
+    IOError,
 }
 
+/// Every exception kind with its stable runtime tag and CPython class name.
+///
+/// This is the single source of truth for [`ExcKind::tag`],
+/// [`ExcKind::name`], [`ExcKind::from_name`] and
+/// [`ExcKind::from_class_name`]. Tags `0..=21` are fixed by the runtime ABI
+/// (`OSError` subclasses and their siblings appended from `22`); the table is
+/// ordered by tag. `EnvironmentError` and `IOError` are CPython aliases of
+/// `OSError` and therefore share tag `10` and the name `"OSError"`; they are
+/// listed last so a name lookup finds the canonical `OSError` entry first.
+const EXCEPTION_ENTRIES: &[(ExcKind, u32, &str)] = &[
+    (ExcKind::ValueError, 0, "ValueError"),
+    (ExcKind::TypeError, 1, "TypeError"),
+    (ExcKind::ZeroDivisionError, 2, "ZeroDivisionError"),
+    (ExcKind::RuntimeError, 3, "RuntimeError"),
+    (ExcKind::OverflowError, 4, "OverflowError"),
+    (ExcKind::KeyboardInterrupt, 5, "KeyboardInterrupt"),
+    (ExcKind::IndexError, 6, "IndexError"),
+    (ExcKind::KeyError, 7, "KeyError"),
+    (ExcKind::StopIteration, 8, "StopIteration"),
+    (ExcKind::AttributeError, 9, "AttributeError"),
+    (ExcKind::OSError, 10, "OSError"),
+    (ExcKind::GeneratorExit, 11, "GeneratorExit"),
+    (ExcKind::Exception, 12, "Exception"),
+    (ExcKind::BaseException, 13, "BaseException"),
+    (ExcKind::AssertionError, 14, "AssertionError"),
+    (ExcKind::FileNotFoundError, 15, "FileNotFoundError"),
+    (ExcKind::NameError, 16, "NameError"),
+    (ExcKind::SystemExit, 17, "SystemExit"),
+    (ExcKind::StopAsyncIteration, 18, "StopAsyncIteration"),
+    (ExcKind::SystemError, 22, "SystemError"),
+    (ExcKind::MemoryError, 23, "MemoryError"),
+    (ExcKind::RecursionError, 24, "RecursionError"),
+    (ExcKind::SyntaxError, 25, "SyntaxError"),
+    (ExcKind::IndentationError, 26, "IndentationError"),
+    (ExcKind::TabError, 27, "TabError"),
+    (ExcKind::ArithmeticError, 28, "ArithmeticError"),
+    (ExcKind::LookupError, 29, "LookupError"),
+    (ExcKind::ImportError, 30, "ImportError"),
+    (ExcKind::ModuleNotFoundError, 31, "ModuleNotFoundError"),
+    (ExcKind::NotImplementedError, 32, "NotImplementedError"),
+    (ExcKind::EOFError, 33, "EOFError"),
+    (ExcKind::UnicodeError, 34, "UnicodeError"),
+    (ExcKind::UnicodeDecodeError, 35, "UnicodeDecodeError"),
+    (ExcKind::UnicodeEncodeError, 36, "UnicodeEncodeError"),
+    (ExcKind::UnicodeTranslateError, 37, "UnicodeTranslateError"),
+    (ExcKind::BufferError, 38, "BufferError"),
+    (ExcKind::ReferenceError, 39, "ReferenceError"),
+    (ExcKind::ExceptionGroup, 40, "ExceptionGroup"),
+    (ExcKind::BaseExceptionGroup, 41, "BaseExceptionGroup"),
+    (ExcKind::Warning, 42, "Warning"),
+    (ExcKind::UserWarning, 43, "UserWarning"),
+    (ExcKind::DeprecationWarning, 44, "DeprecationWarning"),
+    (
+        ExcKind::PendingDeprecationWarning,
+        45,
+        "PendingDeprecationWarning",
+    ),
+    (ExcKind::SyntaxWarning, 46, "SyntaxWarning"),
+    (ExcKind::RuntimeWarning, 47, "RuntimeWarning"),
+    (ExcKind::FutureWarning, 48, "FutureWarning"),
+    (ExcKind::ImportWarning, 49, "ImportWarning"),
+    (ExcKind::UnicodeWarning, 50, "UnicodeWarning"),
+    (ExcKind::BytesWarning, 51, "BytesWarning"),
+    (ExcKind::ResourceWarning, 52, "ResourceWarning"),
+    (ExcKind::FloatingPointError, 53, "FloatingPointError"),
+    (ExcKind::BlockingIOError, 54, "BlockingIOError"),
+    (ExcKind::ChildProcessError, 55, "ChildProcessError"),
+    (ExcKind::ConnectionError, 56, "ConnectionError"),
+    (ExcKind::BrokenPipeError, 57, "BrokenPipeError"),
+    (
+        ExcKind::ConnectionAbortedError,
+        58,
+        "ConnectionAbortedError",
+    ),
+    (
+        ExcKind::ConnectionRefusedError,
+        59,
+        "ConnectionRefusedError",
+    ),
+    (ExcKind::ConnectionResetError, 60, "ConnectionResetError"),
+    (ExcKind::FileExistsError, 61, "FileExistsError"),
+    (ExcKind::InterruptedError, 62, "InterruptedError"),
+    (ExcKind::IsADirectoryError, 63, "IsADirectoryError"),
+    (ExcKind::NotADirectoryError, 64, "NotADirectoryError"),
+    (ExcKind::PermissionError, 65, "PermissionError"),
+    (ExcKind::ProcessLookupError, 66, "ProcessLookupError"),
+    (ExcKind::TimeoutError, 67, "TimeoutError"),
+    // CPython aliases: `EnvironmentError is OSError` and `IOError is OSError`.
+    (ExcKind::EnvironmentError, 10, "OSError"),
+    (ExcKind::IOError, 10, "OSError"),
+];
+
 impl ExcKind {
+    /// Stable runtime tag. Legacy tags `0..=18` are never renumbered; new
+    /// kinds are appended from `22` (the runtime reserves `19..=21` for its
+    /// internal `CancelledError`, `Skipped` and `XFailed` tags).
     pub fn tag(self) -> u32 {
-        match self {
-            ExcKind::ValueError => 0,
-            ExcKind::TypeError => 1,
-            ExcKind::ZeroDivisionError => 2,
-            ExcKind::RuntimeError => 3,
-            ExcKind::OverflowError => 4,
-            ExcKind::KeyboardInterrupt => 5,
-            ExcKind::IndexError => 6,
-            ExcKind::KeyError => 7,
-            ExcKind::StopIteration => 8,
-            ExcKind::AttributeError => 9,
-            ExcKind::OSError => 10,
-            // `GeneratorExit`, injected by `generator.close()`.
-            ExcKind::GeneratorExit => 11,
-            ExcKind::Exception => 12,
-            ExcKind::BaseException => 13,
-            // `AssertionError`, raised by `assert` statements.
-            ExcKind::AssertionError => 14,
-            ExcKind::FileNotFoundError => 15,
-            ExcKind::NameError => 16,
-            ExcKind::SystemExit => 17,
-            // `StopAsyncIteration`, raised when an asynchronous iterator is
-            // exhausted.
-            ExcKind::StopAsyncIteration => 18,
-        }
+        self.entry().0
     }
 
+    /// CPython-visible class name (`type(exc).__name__`).
     pub fn name(self) -> &'static str {
-        match self {
-            ExcKind::ValueError => "ValueError",
-            ExcKind::TypeError => "TypeError",
-            ExcKind::ZeroDivisionError => "ZeroDivisionError",
-            ExcKind::RuntimeError => "RuntimeError",
-            ExcKind::OverflowError => "OverflowError",
-            ExcKind::KeyboardInterrupt => "KeyboardInterrupt",
-            ExcKind::IndexError => "IndexError",
-            ExcKind::KeyError => "KeyError",
-            ExcKind::StopIteration => "StopIteration",
-            ExcKind::AttributeError => "AttributeError",
-            ExcKind::OSError => "OSError",
-            ExcKind::FileNotFoundError => "FileNotFoundError",
-            ExcKind::AssertionError => "AssertionError",
-            ExcKind::NameError => "NameError",
-            ExcKind::SystemExit => "SystemExit",
-            ExcKind::StopAsyncIteration => "StopAsyncIteration",
-            ExcKind::GeneratorExit => "GeneratorExit",
-            ExcKind::Exception => "Exception",
-            ExcKind::BaseException => "BaseException",
-        }
+        self.entry().1
     }
 
-    /// Resolve a Python exception name used in `raise`/`except`.
+    fn entry(self) -> (u32, &'static str) {
+        for &(kind, tag, name) in EXCEPTION_ENTRIES {
+            if kind == self {
+                return (tag, name);
+            }
+        }
+        // Unreachable: every variant is listed in `EXCEPTION_ENTRIES`.
+        (12, "Exception")
+    }
+
+    /// Resolves a Python exception name used in `raise`/`except`.
+    ///
+    /// `IOError` and `EnvironmentError` resolve to [`ExcKind::OSError`]
+    /// because CPython defines them as aliases of `OSError`. `GeneratorExit`
+    /// is injected by the runtime (`generator.close()`), so it is not
+    /// resolvable from source; [`ExcKind::from_class_name`] exposes it as a
+    /// value.
     pub fn from_name(name: &str) -> Option<ExcKind> {
-        Some(match name {
-            "ValueError" => ExcKind::ValueError,
-            "TypeError" => ExcKind::TypeError,
-            "ZeroDivisionError" => ExcKind::ZeroDivisionError,
-            "RuntimeError" => ExcKind::RuntimeError,
-            "OverflowError" => ExcKind::OverflowError,
-            "KeyboardInterrupt" => ExcKind::KeyboardInterrupt,
-            "IndexError" => ExcKind::IndexError,
-            "KeyError" => ExcKind::KeyError,
-            "StopIteration" => ExcKind::StopIteration,
-            "AttributeError" => ExcKind::AttributeError,
-            "OSError" => ExcKind::OSError,
-            "FileNotFoundError" => ExcKind::FileNotFoundError,
-            "AssertionError" => ExcKind::AssertionError,
-            "NameError" => ExcKind::NameError,
-            "SystemExit" => ExcKind::SystemExit,
-            "StopAsyncIteration" => ExcKind::StopAsyncIteration,
-            "Exception" => ExcKind::Exception,
-            "BaseException" => ExcKind::BaseException,
-            "IOError" => ExcKind::OSError,
-            _ => return None,
-        })
+        match name {
+            "IOError" | "EnvironmentError" => return Some(ExcKind::OSError),
+            // Runtime-injected like the internal `CancelledError` tag; a
+            // source-level `except GeneratorExit` stays unsupported.
+            "GeneratorExit" => return None,
+            _ => {}
+        }
+        EXCEPTION_ENTRIES
+            .iter()
+            .find(|(_, _, entry_name)| *entry_name == name)
+            .map(|(kind, _, _)| *kind)
     }
 
     /// Resolves an unqualified built-in exception name used as a *value* in an
     /// expression (`x = ValueError`, `class E(Exception):`).
     ///
-    /// Unlike [`ExcKind::from_name`], which drives `raise`/`except` and stays
-    /// unchanged, this also exposes the hierarchy tags reachable only through
-    /// the runtime (`AssertionError` and `GeneratorExit`).
+    /// Unlike [`ExcKind::from_name`], which drives `raise`/`except`, this also
+    /// exposes `GeneratorExit`, which the runtime injects.
     pub fn from_class_name(name: &str) -> Option<ExcKind> {
         Some(match name {
-            "AssertionError" => ExcKind::AssertionError,
             "GeneratorExit" => ExcKind::GeneratorExit,
             other => return ExcKind::from_name(other),
         })
@@ -648,4 +798,193 @@ pub enum Callee {
         path: String,
         member: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_alias(kind: ExcKind) -> bool {
+        matches!(kind, ExcKind::EnvironmentError | ExcKind::IOError)
+    }
+
+    #[test]
+    fn legacy_tags_are_not_renumbered() {
+        // The runtime ABI fixes these; appending is allowed, renumbering is
+        // not.
+        assert_eq!(ExcKind::ValueError.tag(), 0);
+        assert_eq!(ExcKind::TypeError.tag(), 1);
+        assert_eq!(ExcKind::ZeroDivisionError.tag(), 2);
+        assert_eq!(ExcKind::RuntimeError.tag(), 3);
+        assert_eq!(ExcKind::OverflowError.tag(), 4);
+        assert_eq!(ExcKind::KeyboardInterrupt.tag(), 5);
+        assert_eq!(ExcKind::IndexError.tag(), 6);
+        assert_eq!(ExcKind::KeyError.tag(), 7);
+        assert_eq!(ExcKind::StopIteration.tag(), 8);
+        assert_eq!(ExcKind::AttributeError.tag(), 9);
+        assert_eq!(ExcKind::OSError.tag(), 10);
+        assert_eq!(ExcKind::GeneratorExit.tag(), 11);
+        assert_eq!(ExcKind::Exception.tag(), 12);
+        assert_eq!(ExcKind::BaseException.tag(), 13);
+        assert_eq!(ExcKind::AssertionError.tag(), 14);
+        assert_eq!(ExcKind::FileNotFoundError.tag(), 15);
+        assert_eq!(ExcKind::NameError.tag(), 16);
+        assert_eq!(ExcKind::SystemExit.tag(), 17);
+        assert_eq!(ExcKind::StopAsyncIteration.tag(), 18);
+    }
+
+    #[test]
+    fn taxonomy_covers_the_cpython_classes() {
+        let expected = [
+            (ExcKind::SystemError, 22u32, "SystemError"),
+            (ExcKind::MemoryError, 23, "MemoryError"),
+            (ExcKind::RecursionError, 24, "RecursionError"),
+            (ExcKind::SyntaxError, 25, "SyntaxError"),
+            (ExcKind::IndentationError, 26, "IndentationError"),
+            (ExcKind::TabError, 27, "TabError"),
+            (ExcKind::ArithmeticError, 28, "ArithmeticError"),
+            (ExcKind::LookupError, 29, "LookupError"),
+            (ExcKind::ImportError, 30, "ImportError"),
+            (ExcKind::ModuleNotFoundError, 31, "ModuleNotFoundError"),
+            (ExcKind::NotImplementedError, 32, "NotImplementedError"),
+            (ExcKind::EOFError, 33, "EOFError"),
+            (ExcKind::UnicodeError, 34, "UnicodeError"),
+            (ExcKind::UnicodeDecodeError, 35, "UnicodeDecodeError"),
+            (ExcKind::UnicodeEncodeError, 36, "UnicodeEncodeError"),
+            (ExcKind::UnicodeTranslateError, 37, "UnicodeTranslateError"),
+            (ExcKind::BufferError, 38, "BufferError"),
+            (ExcKind::ReferenceError, 39, "ReferenceError"),
+            (ExcKind::ExceptionGroup, 40, "ExceptionGroup"),
+            (ExcKind::BaseExceptionGroup, 41, "BaseExceptionGroup"),
+            (ExcKind::Warning, 42, "Warning"),
+            (ExcKind::UserWarning, 43, "UserWarning"),
+            (ExcKind::DeprecationWarning, 44, "DeprecationWarning"),
+            (
+                ExcKind::PendingDeprecationWarning,
+                45,
+                "PendingDeprecationWarning",
+            ),
+            (ExcKind::SyntaxWarning, 46, "SyntaxWarning"),
+            (ExcKind::RuntimeWarning, 47, "RuntimeWarning"),
+            (ExcKind::FutureWarning, 48, "FutureWarning"),
+            (ExcKind::ImportWarning, 49, "ImportWarning"),
+            (ExcKind::UnicodeWarning, 50, "UnicodeWarning"),
+            (ExcKind::BytesWarning, 51, "BytesWarning"),
+            (ExcKind::ResourceWarning, 52, "ResourceWarning"),
+            (ExcKind::FloatingPointError, 53, "FloatingPointError"),
+            (ExcKind::BlockingIOError, 54, "BlockingIOError"),
+            (ExcKind::ChildProcessError, 55, "ChildProcessError"),
+            (ExcKind::ConnectionError, 56, "ConnectionError"),
+            (ExcKind::BrokenPipeError, 57, "BrokenPipeError"),
+            (
+                ExcKind::ConnectionAbortedError,
+                58,
+                "ConnectionAbortedError",
+            ),
+            (
+                ExcKind::ConnectionRefusedError,
+                59,
+                "ConnectionRefusedError",
+            ),
+            (ExcKind::ConnectionResetError, 60, "ConnectionResetError"),
+            (ExcKind::FileExistsError, 61, "FileExistsError"),
+            (ExcKind::InterruptedError, 62, "InterruptedError"),
+            (ExcKind::IsADirectoryError, 63, "IsADirectoryError"),
+            (ExcKind::NotADirectoryError, 64, "NotADirectoryError"),
+            (ExcKind::PermissionError, 65, "PermissionError"),
+            (ExcKind::ProcessLookupError, 66, "ProcessLookupError"),
+            (ExcKind::TimeoutError, 67, "TimeoutError"),
+        ];
+        for (kind, tag, name) in expected {
+            assert_eq!(kind.tag(), tag, "{name} tag");
+            assert_eq!(kind.name(), name);
+            assert_eq!(ExcKind::from_name(name), Some(kind), "{name} from_name");
+            assert_eq!(
+                ExcKind::from_class_name(name),
+                Some(kind),
+                "{name} from_class_name"
+            );
+        }
+    }
+
+    #[test]
+    fn table_tags_are_unique_and_preserve_tag_order() {
+        let mut tags = Vec::new();
+        let mut names = Vec::new();
+        let mut last: i64 = -1;
+        for &(kind, tag, name) in EXCEPTION_ENTRIES {
+            assert_eq!(kind.tag(), tag);
+            assert_eq!(kind.name(), name);
+            assert!(
+                tag <= 18 || tag >= 22,
+                "tag {tag} collides with the runtime-internal 19..=21 range"
+            );
+            if is_alias(kind) {
+                assert_eq!(tag, ExcKind::OSError.tag());
+                assert_eq!(name, ExcKind::OSError.name());
+                continue;
+            }
+            assert!(!tags.contains(&tag), "duplicate tag {tag}");
+            assert!(!names.contains(&name), "duplicate name {name}");
+            assert!(
+                i64::from(tag) > last,
+                "entries must stay in ascending tag order (tag {tag})"
+            );
+            last = i64::from(tag);
+            tags.push(tag);
+            names.push(name);
+        }
+    }
+
+    #[test]
+    fn names_roundtrip_except_runtime_injected_generator_exit() {
+        for &(kind, _, name) in EXCEPTION_ENTRIES {
+            if is_alias(kind) {
+                continue;
+            }
+            if kind == ExcKind::GeneratorExit {
+                assert_eq!(ExcKind::from_name(name), None);
+                assert_eq!(ExcKind::from_class_name(name), Some(ExcKind::GeneratorExit));
+                continue;
+            }
+            assert_eq!(ExcKind::from_name(name), Some(kind), "{name}");
+            assert_eq!(ExcKind::from_class_name(name), Some(kind), "{name}");
+        }
+        assert_eq!(ExcKind::from_name("NoSuchError"), None);
+        assert_eq!(ExcKind::from_class_name("NoSuchError"), None);
+    }
+
+    #[test]
+    fn ioerror_and_environmenterror_are_oserror_aliases() {
+        assert_eq!(ExcKind::IOError.tag(), ExcKind::OSError.tag());
+        assert_eq!(ExcKind::EnvironmentError.tag(), ExcKind::OSError.tag());
+        assert_eq!(ExcKind::IOError.name(), "OSError");
+        assert_eq!(ExcKind::EnvironmentError.name(), "OSError");
+        assert_eq!(ExcKind::from_name("IOError"), Some(ExcKind::OSError));
+        assert_eq!(
+            ExcKind::from_name("EnvironmentError"),
+            Some(ExcKind::OSError)
+        );
+        assert_eq!(ExcKind::from_class_name("IOError"), Some(ExcKind::OSError));
+        assert_eq!(format!("{}", ExcKind::IOError), "OSError");
+    }
+
+    #[test]
+    fn display_and_debug_are_stable() {
+        assert_eq!(format!("{}", ExcKind::SyntaxError), "SyntaxError");
+        assert_eq!(
+            format!("{}", ExcKind::ModuleNotFoundError),
+            "ModuleNotFoundError"
+        );
+        assert_eq!(format!("{:?}", ExcKind::ValueError), "ValueError");
+    }
+
+    #[test]
+    fn issubclass_is_a_source_builtin() {
+        assert_eq!(Builtin::from_name("issubclass"), Some(Builtin::Issubclass));
+        assert_eq!(Builtin::Issubclass.name(), "issubclass");
+        // The name is distinct from `isinstance`: first-class values must
+        // dispatch to the right runtime entry point.
+        assert_ne!(Builtin::Issubclass.name(), Builtin::Isinstance.name());
+    }
 }

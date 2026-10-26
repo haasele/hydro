@@ -239,7 +239,6 @@ struct Runtime {
     gc_scope_push: FuncId,
     gc_scope_pop: FuncId,
     exc_pending: FuncId,
-    exc_tag: FuncId,
     exc_value: FuncId,
     exc_clear: FuncId,
     exc_handler_push: FuncId,
@@ -638,7 +637,6 @@ impl Runtime {
             gc_scope_push: declare_runtime(module, "hydro_gc_scope_push", &[ptr, ptr], Some(ptr))?,
             gc_scope_pop: declare_runtime(module, "hydro_gc_scope_pop", &[ptr], None)?,
             exc_pending: declare_runtime(module, "hydro_exc_pending", &[], Some(i64t))?,
-            exc_tag: declare_runtime(module, "hydro_exc_tag", &[], Some(i64t))?,
             exc_value: declare_runtime(module, "hydro_exc_value", &[], Some(i64t))?,
             exc_clear: declare_runtime(module, "hydro_exc_clear", &[], Some(i64t))?,
             exc_handler_push: declare_runtime(
@@ -3847,30 +3845,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         self.jump(handler_block);
                     }
                     Some(kind) => {
-                        let matches = match kind {
-                            // `Exception` matches every concrete kind except
-                            // `KeyboardInterrupt`/`GeneratorExit`, and
-                            // `BaseException` matches everything. `OSError`
-                            // and its `FileNotFoundError` subclass match each
-                            // other. The runtime owns that hierarchy so
-                            // codegen only asks it.
-                            ExcKind::Exception
-                            | ExcKind::BaseException
-                            | ExcKind::OSError
-                            | ExcKind::FileNotFoundError => {
-                                let tag = self.builder.ins().iconst(types::I32, kind.tag() as i64);
-                                let id = self.runtime.exc_matches;
-                                let caught = self.call_rt(id, &[tag])?;
-                                self.builder.ins().icmp_imm(IntCC::NotEqual, caught, 0)
-                            }
-                            _ => {
-                                let tag_id = self.runtime.exc_tag;
-                                let tag = self.call_rt(tag_id, &[])?;
-                                self.builder
-                                    .ins()
-                                    .icmp_imm(IntCC::Equal, tag, kind.tag() as i64)
-                            }
-                        };
+                        // The runtime owns the complete CPython parent
+                        // chain (`ArithmeticError` catches `ZeroDivisionError`,
+                        // `ImportError` catches `ModuleNotFoundError`,
+                        // `OSError` catches every OS subclass, ...), so every
+                        // handler tag — not a hand-picked subset — is resolved
+                        // there. `hydro_exc_matches` returns 0 when nothing is
+                        // pending, and tags are concrete `ExcKind::tag()`
+                        // values.
+                        let tag = self.builder.ins().iconst(types::I32, kind.tag() as i64);
+                        let id = self.runtime.exc_matches;
+                        let caught = self.call_rt(id, &[tag])?;
+                        let matches = self.builder.ins().icmp_imm(IntCC::NotEqual, caught, 0);
                         self.builder
                             .ins()
                             .brif(matches, handler_block, &[], next_handler, &[]);
@@ -6410,6 +6396,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     let actual = values.len();
                     return Err(CodegenError::new(format!(
                         "builtin isinstance expects 2 arguments, got {actual}"
+                    )));
+                }
+                self.lower_builtin_values(builtin, values)
+            }
+            Builtin::Issubclass => {
+                if values.len() != 2 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin issubclass expects 2 arguments, got {actual}"
                     )));
                 }
                 self.lower_builtin_values(builtin, values)

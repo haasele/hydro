@@ -1500,9 +1500,16 @@ pub extern "C" fn hydro_raise_value_from(value: i64, cause: i64) -> i64 {
 /// Handler dispatch: `1` when the pending exception is caught by a handler
 /// for `handler_tag`, `0` otherwise (and when nothing is pending).
 ///
-/// `BaseException` catches every exception, `Exception` catches everything
-/// except `KeyboardInterrupt` and the internal `GeneratorExit`, and other
-/// tags match by equality.
+/// Matching walks CPython's exception hierarchy instead of comparing tags for
+/// equality: every exception is a `BaseException`, an ordinary exception is
+/// also an `Exception`, and the modelled branches are honoured —
+/// `ArithmeticError`, `LookupError`, `ImportError`/`ModuleNotFoundError`,
+/// `OSError` and its subclasses, `SyntaxError`/`IndentationError`/`TabError`,
+/// the `UnicodeError` family and the `Warning` categories. That includes the
+/// diamond around `ExceptionGroup`, which is both an `Exception` and a
+/// `BaseExceptionGroup`; the runtime-internal tags keep their documented
+/// exclusions. An unknown pending tag matches only `BaseException` and
+/// `Exception`, and an unknown handler tag matches nothing.
 #[no_mangle]
 pub extern "C" fn hydro_exc_matches(handler_tag: u32) -> i32 {
     exc::matches_handler(handler_tag)
