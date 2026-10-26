@@ -795,7 +795,7 @@ def main(argv: list[str] | None = None) -> int:
         log("error: --gate and --update-manifest require a full run; drop --only/--limit")
         return 1
 
-    tea, hydro_error = resolve_hydro(args.hydro)
+    tea, hydro_error = resolve_hydro(args.tea)
     if tea is None:
         log(f"error: {hydro_error}")
         return 2
