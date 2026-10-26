@@ -129,6 +129,19 @@ The first vertical slice of option B is in `hydro-runtime` and verified by
   destructors, `Py_mod_create`, GIL/thread emulation, full 3.14 ABI
   (NumPy/pydantic-core).
 
+### 3.2 Full-ABI foundation (2026-10-26)
+
+The next layer is implemented but **not yet NumPy/pydantic compatible**:
+`PyObject_HEAD`/`PyVarObject` headers with real refcounts and immortal
+singletons, a 3.14 `PyTypeObject` layout with `PyType_FromSpec`/`GetSlot`,
+`PyType_GenericAlloc`/`PyObject_Init`, vectorcall and FASTCALL/KEYWORDS,
+`PyArg_ParseTupleAndKeywords`, the full buffer protocol (writable/strided/
+multi-D), GIL emulation around extension entry points, GC tracking, and the
+common `PyExc_*`/constant data symbols. Handles are self-contained; full
+`tp_traverse`/`tp_clear` integration and the unsupported type slots remain
+explicitly unimplemented. The gate is still a real NumPy 2.5 array smoke and
+pydantic-core model validation; neither is claimed here.
+
 ### Scope of "full stdlib"
 
 CPython 3.14 `sys.stdlib_module_names` contains **297** modules:

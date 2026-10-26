@@ -121,435 +121,437 @@ blocker.
 
 <!-- BEGIN GENERATED RESULTS -->
 
-Environment: CPython `3.14.9` (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` (`/mnt/Vault/GitHub/tea/target/release/tea`)
+Environment: CPython `3.14.9` (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` (`/mnt/Vault/GitHub/tea/target/debug/tea`)
 
-Source: `/mnt/Vault/GitHub/tea/.hydro/cpython/Python-3.14.9` · generated 2026-10-24T22:16:44Z
+Source: `/mnt/Vault/GitHub/hydro/.hydro/cpython/Python-3.14.9` · generated 2026-10-26T07:52:22Z
 
 ## Summary
 
 | Status | Tests |
 | --- | ---: |
-| hydro_pass | 1 |
-| hydro_fail | 334 |
+| hydro_pass | 3 |
+| hydro_fail | 332 |
 | cpython_fail | 0 |
 | expected_fail | 63 |
 | timeout | 0 |
 | **Total** | 398 |
 
-Passing: **1 / 398** (a pass requires Hydro and CPython 3.14.9 to both exit 0).
+Passing: **3 / 398** (a pass requires Hydro and CPython 3.14.9 to both exit 0).
 
 ## Passing tests
 
 - `test_errno.py`
+- `test_int_literal.py`
+- `test_perfmaps.py`
 
 ## Failure classes
 
 | Status | Tests |
 | --- | ---: |
-| hydro_fail | 334 |
+| hydro_fail | 332 |
 | expected_fail | 63 |
 
 ## Test results
 
 | Test | CPython 3.14.9 | Hydro | Status | First error |
 | --- | --- | --- | --- | --- |
-| `test___all__.py` | ok / 1902 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test__colorize.py` | ok / 117.7 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test__interpchannels.py` | ok / 794.9 ms | exit 1 / 7.1 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test__interpreters.py` | ok / 656.2 ms | exit 1 / 4.8 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test__locale.py` | ok / 56.6 ms | exit 1 / 3.5 ms | hydro_fail | error[HYD0002]: module '_locale' not found: not supported unless a sibling _locale.py exists |
-| `test__opcode.py` | ok / 53.6 ms | exit 1 / 2.9 ms | hydro_fail | error[HYD0002]: module 'dis' not found: not supported unless a sibling dis.py exists |
-| `test__osx_support.py` | ok / 55.8 ms | exit 1 / 3.2 ms | hydro_fail | error[HYD0002]: module 'stat' not found: not supported unless a sibling stat.py exists |
-| `test_abc.py` | ok / 50.5 ms | exit 1 / 3.5 ms | hydro_fail | error[HYD0002]: module 'abc' not found: not supported unless a sibling abc.py exists |
-| `test_abstract_numbers.py` | ok / 45.7 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'abc' not found: not supported unless a sibling abc.py exists |
-| `test_android.py` | exit 1 / 126 ms | exit 1 / 3.4 ms | expected_fail | error[HYD0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists |
-| `test_annotationlib.py` | ok / 77.3 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token "{a}" |
-| `test_apple.py` | exit 1 / 119.4 ms | exit 1 / 2.5 ms | expected_fail | error[HYD0002]: module '_apple_support' not found: not supported unless a sibling _apple_support.py exists |
-| `test_argparse.py` | ok / 1392.3 ms | exit 1 / 26.5 ms | hydro_fail | error[HYD0002]: module '_colorize' not found: not supported unless a sibling _colorize.py exists |
-| `test_array.py` | ok / 300.1 ms | exit 1 / 8.6 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'collections.abc' |
-| `test_asdl_parser.py` | exit 1 / 33.8 ms | exit 1 / 2.2 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'importlib.machinery' |
-| `test_asyncgen.py` | ok / 843.4 ms | exit 1 / 6.1 ms | hydro_fail | error[HYD0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists |
-| `test_atexit.py` | exit 1 / 114.2 ms | exit 1 / 2.4 ms | expected_fail | error[HYD0002]: module 'atexit' not found: not supported unless a sibling atexit.py exists |
-| `test_audit.py` | ok / 1663.8 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists |
-| `test_augassign.py` | ok / 45.6 ms | exit 1 / 3.7 ms | hydro_fail | error[HYD0002]: bitwise operators are not supported in Phase 1 |
-| `test_base64.py` | ok / 151.5 ms | exit 1 / 5.4 ms | hydro_fail | error[HYD0002]: module 'base64' not found: not supported unless a sibling base64.py exists |
-| `test_baseexception.py` | ok / 52 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists |
-| `test_bdb.py` | exit 1 / 72.6 ms | exit 1 / 6.1 ms | expected_fail | error[HYD0002]: module 'bdb' not found: not supported unless a sibling bdb.py exists |
-| `test_bigaddrspace.py` | ok / 44.1 ms | exit 1 / 1.8 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_bigmem.py` | ok / 62.6 ms | exit 1 / 6.4 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_binascii.py` | ok / 52.5 ms | exit 1 / 3.7 ms | hydro_fail | error[HYD0002]: module 'binascii' not found: not supported unless a sibling binascii.py exists |
-| `test_binop.py` | ok / 41.9 ms | exit 1 / 2.9 ms | hydro_fail | error[HYD0002]: module 'abc' not found: not supported unless a sibling abc.py exists |
-| `test_bisect.py` | ok / 56.5 ms | exit 1 / 3.6 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_bool.py` | ok / 53.3 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_buffer.py` | ok / 86.8 ms | exit 1 / 21.3 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_bufio.py` | ok / 150.3 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_build_details.py` | exit 1 / 119.5 ms | exit 1 / 2.9 ms | expected_fail | error[HYD0002]: module 'importlib' not found: not supported unless a sibling importlib.py exists |
-| `test_builtin.py` | ok / 377.4 ms | exit 1 / 15 ms | hydro_fail | error[HYD0002]: module 'ast' not found: not supported unless a sibling ast.py exists |
-| `test_bytes.py` | exit 1 / 98.8 ms | exit 1 / 15.3 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `test_bz2.py` | ok / 382.8 ms | exit 1 / 6 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_c_locale_coercion.py` | ok / 839.2 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'locale' not found: not supported unless a sibling locale.py exists |
-| `test_calendar.py` | ok / 1417.7 ms | exit 1 / 6.6 ms | hydro_fail | error[HYD0002]: module 'calendar' not found: not supported unless a sibling calendar.py exists |
-| `test_call.py` | exit 1 / 60.3 ms | exit 1 / 5.1 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_charmapcodec.py` | ok / 43.7 ms | exit 1 / 2.3 ms | hydro_fail | error[HYD0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists |
-| `test_class.py` | ok / 61.5 ms | exit 1 / 5.3 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_clinic.py` | ok / 235 ms | exit 1 / 14.8 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_cmath.py` | ok / 107.6 ms | exit 1 / 4.5 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_cmd.py` | ok / 211.5 ms | exit 1 / 2.3 ms | hydro_fail | error[HYD0002]: module 'cmd' not found: not supported unless a sibling cmd.py exists |
-| `test_cmd_line.py` | exit 1 / 1797.7 ms | exit 1 / 7 ms | expected_fail | error[HYD0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists |
-| `test_cmd_line_script.py` | exit 1 / 1445.4 ms | exit 1 / 5.2 ms | expected_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_code.py` | ok / 211 ms | exit 1 / 5.8 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_code_module.py` | ok / 135.1 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: module 'traceback' not found: not supported unless a sibling traceback.py exists |
-| `test_codeccallbacks.py` | ok / 62.3 ms | exit 1 / 5.7 ms | hydro_fail | error[HYD0002]: module '_codecs' not found: not supported unless a sibling _codecs.py exists |
-| `test_codecencodings_cn.py` | ok / 135.9 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecencodings_hk.py` | ok / 111.9 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecencodings_iso2022.py` | ok / 163.6 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecencodings_jp.py` | ok / 186.1 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecencodings_kr.py` | ok / 126.7 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecencodings_tw.py` | ok / 108.1 ms | exit 1 / 1.8 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecmaps_cn.py` | ok / 180.5 ms | exit 1 / 1.7 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecmaps_hk.py` | ok / 115.3 ms | exit 1 / 1.7 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecmaps_jp.py` | ok / 184.2 ms | exit 1 / 1.9 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecmaps_kr.py` | ok / 180.6 ms | exit 1 / 1.9 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecmaps_tw.py` | ok / 148.1 ms | exit 1 / 1.4 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_codecs.py` | ok / 336.9 ms | exit 1 / 16.3 ms | hydro_fail | error[HYD0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists |
-| `test_codeop.py` | ok / 55.4 ms | exit 1 / 2.9 ms | hydro_fail | error[HYD0002]: module 'warnings' not found: not supported unless a sibling warnings.py exists |
-| `test_collections.py` | ok / 1196.5 ms | exit 1 / 11.5 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `test_colorsys.py` | ok / 44.7 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'colorsys' not found: not supported unless a sibling colorsys.py exists |
-| `test_compare.py` | ok / 56.8 ms | exit 1 / 3.9 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_compile.py` | ok / 2200 ms | exit 1 / 11.6 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_compileall.py` | exit 1 / 66.1 ms | exit 1 / 6.2 ms | expected_fail | error[HYD0002]: module 'compileall' not found: not supported unless a sibling compileall.py exists |
-| `test_compiler_assemble.py` | ok / 37.8 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: module 'dis' not found: not supported unless a sibling dis.py exists |
-| `test_compiler_codegen.py` | ok / 37.9 ms | exit 1 / 2.6 ms | hydro_fail | error[HYD0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists |
-| `test_complex.py` | ok / 66.4 ms | exit 1 / 6.9 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_configparser.py` | ok / 413.7 ms | exit 1 / 9.6 ms | hydro_fail | error[HYD0002]: module 'configparser' not found: not supported unless a sibling configparser.py exists |
-| `test_contains.py` | ok / 52.4 ms | exit 1 / 1.9 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_context.py` | ok / 510.9 ms | exit 1 / 5.8 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'collections.abc' |
-| `test_contextlib.py` | ok / 71.2 ms | exit 1 / 6 ms | hydro_fail | error[HYD0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists |
-| `test_contextlib_async.py` | ok / 72.6 ms | exit 1 / 3.4 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_copy.py` | ok / 75.2 ms | exit 1 / 5.1 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_copyreg.py` | ok / 85.4 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'copyreg' not found: not supported unless a sibling copyreg.py exists |
-| `test_coroutines.py` | ok / 278.5 ms | exit 1 / 7.8 ms | hydro_fail | error[HYD0002]: module 'ast' not found: not supported unless a sibling ast.py exists |
-| `test_cprofile.py` | ok / 542.1 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: module 'cProfile' not found: not supported unless a sibling cProfile.py exists |
-| `test_crossinterp.py` | exit 1 / 59.1 ms | exit 1 / 6.7 ms | expected_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_csv.py` | ok / 248.8 ms | exit 1 / 9.3 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_curses.py` | ok / 305.9 ms | exit 1 / 10.3 ms | hydro_fail | error[HYD0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists |
-| `test_datetime.py` | ok / 19598.5 ms | exit 1 / 1.8 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support.import_helper' |
-| `test_dbm.py` | ok / 414.8 ms | exit 1 / 3.9 ms | hydro_fail | error[HYD0002]: module 'dbm' not found: not supported unless a sibling dbm.py exists |
-| `test_dbm_dumb.py` | ok / 75.7 ms | exit 1 / 3.2 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_dbm_gnu.py` | exit 1 / 51.1 ms | exit 1 / 2.4 ms | expected_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_dbm_ndbm.py` | ok / 111.4 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_dbm_sqlite3.py` | ok / 583.7 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: module 'stat' not found: not supported unless a sibling stat.py exists |
-| `test_decimal.py` | ok / 1911.3 ms | exit 1 / 24.4 ms | hydro_fail | error[HYD0002]: module 'logging' not found: not supported unless a sibling logging.py exists |
-| `test_decorators.py` | ok / 48.5 ms | exit 1 / 6.1 ms | hydro_fail | error[HYD0002]: **kwargs parameters are not supported in Phase 1 |
-| `test_defaultdict.py` | ok / 49.6 ms | exit 1 / 2.2 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_deque.py` | ok / 378.1 ms | exit 1 / 5.8 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_descr.py` | exit 1 / 310.6 ms | exit 1 / 21.9 ms | expected_fail | error[HYD0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists |
-| `test_descrtut.py` | ok / 137.3 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_devpoll.py` | exit 1 / 44.9 ms | exit 1 / 2.3 ms | expected_fail | error[HYD0002]: module 'select' not found: not supported unless a sibling select.py exists |
-| `test_dict.py` | ok / 321.3 ms | exit 1 / 8 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'collections.abc' |
-| `test_dictcomps.py` | ok / 47.7 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'traceback' not found: not supported unless a sibling traceback.py exists |
-| `test_dictviews.py` | ok / 133.6 ms | exit 1 / 4.1 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'collections.abc' |
-| `test_difflib.py` | ok / 239.9 ms | exit 1 / 4.3 ms | hydro_fail | error[HYD0002]: module 'difflib' not found: not supported unless a sibling difflib.py exists |
-| `test_dis.py` | ok / 216.6 ms | exit 1 / 11 ms | hydro_fail | error[HYD0002]: module 'ast' not found: not supported unless a sibling ast.py exists |
-| `test_docxmlrpc.py` | ok / 4196.7 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'xmlrpc.server' |
-| `test_dtrace.py` | exit 1 / 52.8 ms | exit 1 / 2.9 ms | expected_fail | error[HYD0002]: module 'dis' not found: not supported unless a sibling dis.py exists |
-| `test_dynamic.py` | ok / 48.1 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists |
-| `test_dynamicclassattribute.py` | ok / 44.8 ms | exit 1 / 3 ms | hydro_fail | error[HYD0002]: module 'abc' not found: not supported unless a sibling abc.py exists |
-| `test_eintr.py` | exit 1 / 102 ms | exit 1 / 2 ms | expected_fail | error[HYD0002]: module 'signal' not found: not supported unless a sibling signal.py exists |
-| `test_embed.py` | ok / 71.5 ms | exit 1 / 8.1 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_ensurepip.py` | ok / 161.3 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_enum.py` | exit 1 / 579.9 ms | exit 1 / 22.9 ms | expected_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_enumerate.py` | ok / 87.5 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: module 'gc' not found: not supported unless a sibling gc.py exists |
-| `test_eof.py` | ok / 294 ms | exit 1 / 2.3 ms | hydro_fail | error[HYD0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists |
-| `test_epoll.py` | ok / 153.7 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: module 'select' not found: not supported unless a sibling select.py exists |
-| `test_errno.py` | ok / 44 ms | ok / 12.1 ms | hydro_pass | - |
-| `test_except_star.py` | ok / 55.6 ms | exit 1 / 5.2 ms | hydro_fail | error[HYD0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists |
-| `test_exception_group.py` | ok / 270.5 ms | exit 1 / 5.7 ms | hydro_fail | error[HYD0002]: module 'types' not found: not supported unless a sibling types.py exists |
-| `test_exception_hierarchy.py` | ok / 61.4 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists |
-| `test_exception_variations.py` | ok / 49.3 ms | exit 1 / 6.1 ms | hydro_fail | error[HYD0002]: try/except* is not supported in Phase 1 |
-| `test_exceptions.py` | exit 1 / 959.1 ms | exit 1 / 9.1 ms | expected_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_extcall.py` | exit 1 / 150.3 ms | exit 1 / 1.7 ms | expected_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_external_inspection.py` | ok / 1436.7 ms | exit 1 / 6.3 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_faulthandler.py` | ok / 18665.4 ms | exit 1 / 4.2 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_fcntl.py` | ok / 208 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: module 'struct' not found: not supported unless a sibling struct.py exists |
-| `test_file.py` | ok / 82.3 ms | exit 1 / 3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `test_file_eintr.py` | ok / 1438.3 ms | exit 1 / 2.6 ms | hydro_fail | error[HYD0002]: module 'select' not found: not supported unless a sibling select.py exists |
-| `test_filecmp.py` | ok / 66.2 ms | exit 1 / 4.4 ms | hydro_fail | error[HYD0002]: module 'filecmp' not found: not supported unless a sibling filecmp.py exists |
-| `test_fileinput.py` | ok / 125.9 ms | exit 1 / 5 ms | hydro_fail | error[HYD0002]: module 'fileinput' not found: not supported unless a sibling fileinput.py exists |
-| `test_fileio.py` | ok / 530.9 ms | exit 1 / 4.7 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `test_fileutils.py` | ok / 132.9 ms | exit 1 / 1.5 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_finalization.py` | ok / 100 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_float.py` | ok / 87.2 ms | exit 1 / 9.5 ms | hydro_fail | error[HYD0002]: module 'fractions' not found: not supported unless a sibling fractions.py exists |
-| `test_flufl.py` | ok / 43 ms | exit 1 / 1.6 ms | hydro_fail | error[HYD0002]: module '__future__' not found: not supported unless a sibling __future__.py exists |
-| `test_fnmatch.py` | ok / 46.2 ms | exit 1 / 3.5 ms | hydro_fail | error[HYD0002]: module 'string' not found: not supported unless a sibling string.py exists |
-| `test_fork1.py` | ok / 5133 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: module '_imp' not found: not supported unless a sibling _imp.py exists |
-| `test_format.py` | ok / 56 ms | exit 1 / 4.2 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_fractions.py` | ok / 71.7 ms | exit 1 / 10.3 ms | hydro_fail | error[HYD0002]: module 'decimal' not found: not supported unless a sibling decimal.py exists |
-| `test_frame.py` | exit 1 / 941.6 ms | exit 1 / 4.2 ms | expected_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_frozen.py` | ok / 53.1 ms | exit 1 / 2.2 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'importlib.machinery' |
-| `test_fstring.py` | exit 1 / 403.5 ms | exit 1 / 5.4 ms | expected_fail | error[HYD0001]: invalid syntax: f-string: expecting '}' |
-| `test_ftplib.py` | ok / 7553.1 ms | exit 1 / 5.8 ms | hydro_fail | error[HYD0002]: module 'ftplib' not found: not supported unless a sibling ftplib.py exists |
-| `test_funcattrs.py` | ok / 54.1 ms | exit 1 / 3.8 ms | hydro_fail | error[HYD0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists |
-| `test_functools.py` | ok / 365.8 ms | exit 1 / 17.4 ms | hydro_fail | error[HYD0002]: module 'abc' not found: not supported unless a sibling abc.py exists |
-| `test_gc.py` | exit 1 / 1550.3 ms | exit 1 / 5.5 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'unittest.mock' |
-| `test_generated_cases.py` | ok / 127.4 ms | exit 1 / 4.1 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_generator_stop.py` | ok / 44.8 ms | exit 1 / 1.9 ms | hydro_fail | error[HYD0002]: module '__future__' not found: not supported unless a sibling __future__.py exists |
-| `test_generators.py` | ok / 192.8 ms | exit 1 / 6.2 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_genericalias.py` | ok / 175.6 ms | exit 1 / 5.2 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `test_genericclass.py` | ok / 57.5 ms | exit 1 / 3 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_genericpath.py` | ok / 56.8 ms | exit 1 / 4.6 ms | hydro_fail | error[HYD0002]: module 'genericpath' not found: not supported unless a sibling genericpath.py exists |
-| `test_genexps.py` | ok / 138.3 ms | exit 1 / 2.2 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_getopt.py` | ok / 171.1 ms | exit 1 / 3.8 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_getpass.py` | ok / 120.6 ms | exit 1 / 2.6 ms | hydro_fail | error[HYD0002]: module 'getpass' not found: not supported unless a sibling getpass.py exists |
-| `test_getpath.py` | ok / 42.3 ms | exit 1 / 5.2 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_gettext.py` | exit 1 / 171.3 ms | exit 1 / 6 ms | expected_fail | error[HYD0002]: module 'base64' not found: not supported unless a sibling base64.py exists |
-| `test_glob.py` | ok / 109.1 ms | exit 1 / 6.1 ms | hydro_fail | error[HYD0002]: module 'glob' not found: not supported unless a sibling glob.py exists |
-| `test_global.py` | ok / 53.2 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_grammar.py` | ok / 68.9 ms | exit 1 / 5.1 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token ',' |
-| `test_graphlib.py` | ok / 88 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'graphlib' not found: not supported unless a sibling graphlib.py exists |
-| `test_grp.py` | ok / 264.1 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: module 'string' not found: not supported unless a sibling string.py exists |
-| `test_gzip.py` | ok / 869.7 ms | exit 1 / 5.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `test_hash.py` | ok / 318.1 ms | exit 1 / 2.6 ms | hydro_fail | error[HYD0002]: module 'datetime' not found: not supported unless a sibling datetime.py exists |
-| `test_hashlib.py` | ok / 18764.3 ms | exit 1 / 7.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `test_heapq.py` | ok / 248.3 ms | exit 1 / 3.8 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_hmac.py` | ok / 177.5 ms | exit 1 / 6.1 ms | hydro_fail | error[HYD0002]: module 'binascii' not found: not supported unless a sibling binascii.py exists |
-| `test_html.py` | ok / 49 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'html' not found: not supported unless a sibling html.py exists |
-| `test_htmlparser.py` | ok / 456.7 ms | exit 1 / 6.8 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'html.parser' |
-| `test_http_cookiejar.py` | ok / 278.2 ms | exit 1 / 8 ms | hydro_fail | error[HYD0002]: module 'stat' not found: not supported unless a sibling stat.py exists |
-| `test_http_cookies.py` | ok / 557.7 ms | exit 1 / 4.6 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_httplib.py` | ok / 3656.8 ms | exit 1 / 11.1 ms | hydro_fail | error[HYD0002]: module 'enum' not found: not supported unless a sibling enum.py exists |
-| `test_httpservers.py` | ok / 4152.2 ms | exit 1 / 7.6 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'http.server' |
-| `test_idle.py` | ok / 9949.2 ms | exit 1 / 1.9 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support.import_helper' |
-| `test_imaplib.py` | timeout / 30005 ms | exit 1 / 10.3 ms | expected_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_index.py` | ok / 52.5 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_int.py` | ok / 22107 ms | exit 1 / 5.3 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_int_literal.py` | ok / 41 ms | exit 1 / 3 ms | hydro_fail | error[HYD0002]: integer literal is out of the i64 range |
-| `test_io.py` | exit 1 / 28258.1 ms | exit 1 / 20 ms | expected_fail | error[HYD0002]: module 'abc' not found: not supported unless a sibling abc.py exists |
-| `test_ioctl.py` | ok / 553.4 ms | exit 1 / 2.6 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `test_ipaddress.py` | ok / 89.7 ms | exit 1 / 11.6 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_isinstance.py` | ok / 830.8 ms | exit 1 / 3 ms | hydro_fail | error[HYD0002]: module 'typing' not found: not supported unless a sibling typing.py exists |
-| `test_iter.py` | ok / 63.5 ms | exit 1 / 6 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_iterlen.py` | ok / 42.5 ms | exit 1 / 2.2 ms | hydro_fail | error[HYD0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists |
-| `test_itertools.py` | ok / 788.5 ms | exit 1 / 16.8 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_keyword.py` | ok / 41.6 ms | exit 1 / 1.9 ms | hydro_fail | error[HYD0002]: module 'keyword' not found: not supported unless a sibling keyword.py exists |
-| `test_keywordonlyarg.py` | ok / 49.8 ms | exit 1 / 4.2 ms | hydro_fail | error[HYD0002]: *args parameters are not supported in Phase 1 |
-| `test_kqueue.py` | exit 1 / 42.1 ms | exit 1 / 3.1 ms | expected_fail | error[HYD0002]: module 'select' not found: not supported unless a sibling select.py exists |
-| `test_largefile.py` | ok / 796.9 ms | exit 1 / 4 ms | hydro_fail | error[HYD0002]: module 'shutil' not found: not supported unless a sibling shutil.py exists |
-| `test_launcher.py` | exit 1 / 55.4 ms | exit 1 / 5.9 ms | expected_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_linecache.py` | ok / 115.8 ms | exit 1 / 4 ms | hydro_fail | error[HYD0002]: module 'importlib' not found: not supported unless a sibling importlib.py exists |
-| `test_list.py` | ok / 399.4 ms | exit 1 / 3.7 ms | hydro_fail | error[HYD0002]: module 'signal' not found: not supported unless a sibling signal.py exists |
-| `test_listcomps.py` | ok / 162.3 ms | exit 1 / 4.3 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_lltrace.py` | ok / 49.8 ms | exit 1 / 2.2 ms | hydro_fail | error[HYD0002]: module 'dis' not found: not supported unless a sibling dis.py exists |
-| `test_locale.py` | ok / 141.7 ms | exit 1 / 3.8 ms | hydro_fail | error[HYD0002]: module 'decimal' not found: not supported unless a sibling decimal.py exists |
-| `test_logging.py` | ok / 20853.6 ms | exit 1 / 26.7 ms | hydro_fail | error[HYD0002]: module 'logging' not found: not supported unless a sibling logging.py exists |
-| `test_long.py` | ok / 515.2 ms | exit 1 / 8.2 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_longexp.py` | ok / 113.8 ms | exit 1 / 1.9 ms | hydro_fail | error[HYD0101]: name 'eval' is not defined |
-| `test_lzma.py` | ok / 167 ms | exit 1 / 8.6 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `test_mailbox.py` | ok / 1238.5 ms | exit 1 / 13.6 ms | hydro_fail | error[HYD0002]: module 'email' not found: not supported unless a sibling email.py exists |
-| `test_marshal.py` | ok / 226.4 ms | exit 1 / 5.2 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_math.py` | ok / 9599.1 ms | exit 1 / 15 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_math_property.py` | ok / 37.5 ms | exit 1 / 1.7 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_memoryio.py` | ok / 79.8 ms | exit 1 / 6.7 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_memoryview.py` | ok / 308.8 ms | exit 1 / 5.4 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_metaclass.py` | ok / 131.7 ms | exit 1 / 1.8 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_mimetypes.py` | ok / 449.9 ms | exit 1 / 4.9 ms | hydro_fail | error[HYD0002]: module 'mimetypes' not found: not supported unless a sibling mimetypes.py exists |
-| `test_minidom.py` | ok / 89.9 ms | exit 1 / 8.5 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_mmap.py` | ok / 117.5 ms | exit 1 / 7.3 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_modulefinder.py` | ok / 288.8 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'importlib.machinery' |
-| `test_monitoring.py` | ok / 60.5 ms | exit 1 / 9.1 ms | hydro_fail | error[HYD0002]: module 'dis' not found: not supported unless a sibling dis.py exists |
-| `test_msvcrt.py` | exit 1 / 36.6 ms | exit 1 / 2.6 ms | expected_fail | error[HYD0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists |
-| `test_multibytecodec.py` | ok / 233.5 ms | exit 1 / 4.2 ms | hydro_fail | error[HYD0002]: module '_multibytecodec' not found: not supported unless a sibling _multibytecodec.py exists |
-| `test_multiprocessing_main_handling.py` | exit 1 / 1358.9 ms | exit 1 / 3.1 ms | expected_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_named_expressions.py` | ok / 54.9 ms | exit 1 / 29.5 ms | hydro_fail | error[HYD0101]: name 'exec' is not defined |
-| `test_netrc.py` | ok / 54.7 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'netrc' not found: not supported unless a sibling netrc.py exists |
-| `test_ntpath.py` | ok / 292.8 ms | exit 1 / 9.5 ms | hydro_fail | error[HYD0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists |
-| `test_nturl2path.py` | ok / 69.9 ms | exit 1 / 3 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'urllib.parse' |
-| `test_numeric_tower.py` | ok / 84.2 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'decimal' not found: not supported unless a sibling decimal.py exists |
-| `test_opcache.py` | ok / 346.8 ms | exit 1 / 7.2 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_opcodes.py` | ok / 69.5 ms | exit 1 / 3 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_openpty.py` | ok / 46.8 ms | exit 1 / 1.8 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'openpty' |
-| `test_operator.py` | ok / 69.3 ms | exit 1 / 5.6 ms | hydro_fail | error[HYD0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists |
-| `test_optimizer.py` | ok / 55.2 ms | exit 1 / 2.2 ms | hydro_fail | error[HYD0002]: module 'types' not found: not supported unless a sibling types.py exists |
-| `test_optparse.py` | ok / 143.7 ms | exit 1 / 7 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_ordered_dict.py` | ok / 188.5 ms | exit 1 / 6.4 ms | hydro_fail | error[HYD0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists |
-| `test_os.py` | exit 1 / 12681.8 ms | exit 1 / 21.3 ms | expected_fail | error[HYD0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists |
-| `test_osx_env.py` | ok / 57.8 ms | exit 1 / 2 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support.os_helper' |
-| `test_patma.py` | exit 1 / 55.2 ms | exit 1 / 13.9 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
-| `test_pdb.py` | exit 1 / 19120.6 ms | exit 1 / 10.1 ms | expected_fail | error[HYD0002]: module '_colorize' not found: not supported unless a sibling _colorize.py exists |
-| `test_peepholer.py` | ok / 446.5 ms | exit 1 / 14 ms | hydro_fail | error[HYD0002]: module 'ast' not found: not supported unless a sibling ast.py exists |
-| `test_pep646_syntax.py` | ok / 270.4 ms | exit 1 / 1.8 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_perf_profiler.py` | ok / 402.9 ms | exit 1 / 4.3 ms | hydro_fail | error[HYD0002]: module 'string' not found: not supported unless a sibling string.py exists |
-| `test_perfmaps.py` | ok / 104 ms | exit 1 / 1.8 ms | hydro_fail | error[HYD0101]: name 'write_perf_map_entry' is not defined |
-| `test_pickle.py` | ok / 2155.6 ms | exit 1 / 6.1 ms | hydro_fail | error[HYD0002]: module '_compat_pickle' not found: not supported unless a sibling _compat_pickle.py exists |
-| `test_picklebuffer.py` | ok / 141.4 ms | exit 1 / 2.6 ms | hydro_fail | error[HYD0002]: module 'gc' not found: not supported unless a sibling gc.py exists |
-| `test_pickletools.py` | ok / 570.7 ms | exit 1 / 3.3 ms | hydro_fail | error[HYD0002]: module 'pickletools' not found: not supported unless a sibling pickletools.py exists |
-| `test_pkg.py` | ok / 122.1 ms | exit 1 / 2.9 ms | hydro_fail | error[HYD0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists |
-| `test_pkgutil.py` | exit 1 / 150.5 ms | exit 1 / 4.1 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support.import_helper' |
-| `test_platform.py` | ok / 421 ms | exit 1 / 4.8 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_plistlib.py` | ok / 264.9 ms | exit 1 / 5.7 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_poll.py` | ok / 11270.8 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists |
-| `test_popen.py` | ok / 171.2 ms | exit 1 / 2 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_poplib.py` | ok / 6533.7 ms | exit 1 / 3.7 ms | hydro_fail | error[HYD0002]: module 'poplib' not found: not supported unless a sibling poplib.py exists |
-| `test_positional_only_arg.py` | ok / 134.3 ms | exit 1 / 4 ms | hydro_fail | error[HYD0002]: module 'dis' not found: not supported unless a sibling dis.py exists |
-| `test_posix.py` | exit 1 / 881 ms | exit 1 / 11.7 ms | expected_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_posixpath.py` | ok / 333.4 ms | exit 1 / 6.3 ms | hydro_fail | error[HYD0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists |
-| `test_pow.py` | ok / 292.2 ms | exit 1 / 4.6 ms | hydro_fail | error[HYD0101]: name 'pow' is not defined |
-| `test_pprint.py` | ok / 172.5 ms | exit 1 / 5.3 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_print.py` | ok / 142.1 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_profile.py` | ok / 307.7 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: module 'pstats' not found: not supported unless a sibling pstats.py exists |
-| `test_property.py` | ok / 96.2 ms | exit 1 / 3.8 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_pstats.py` | ok / 164.5 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_pty.py` | ok / 113.8 ms | exit 1 / 4.3 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_pulldom.py` | ok / 177.3 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'xml.sax' |
-| `test_pwd.py` | ok / 101.3 ms | exit 1 / 2.3 ms | hydro_fail | error[HYD0002]: module 'string' not found: not supported unless a sibling string.py exists |
-| `test_py_compile.py` | ok / 348.6 ms | exit 1 / 3 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'importlib.util' |
-| `test_pyclbr.py` | exit 1 / 109.2 ms | exit 1 / 3.4 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'importlib.machinery' |
-| `test_pyexpat.py` | ok / 220.5 ms | exit 1 / 5.5 ms | hydro_fail | error[HYD0002]: module 'abc' not found: not supported unless a sibling abc.py exists |
-| `test_queue.py` | ok / 7733.3 ms | exit 1 / 4.9 ms | hydro_fail | error[HYD0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists |
-| `test_quopri.py` | ok / 137.2 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists |
-| `test_raise.py` | ok / 93.3 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_random.py` | ok / 808.3 ms | exit 1 / 6.9 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'unittest.mock' |
-| `test_range.py` | ok / 200.5 ms | exit 1 / 4.8 ms | hydro_fail | error[HYD0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists |
-| `test_re.py` | ok / 453.2 ms | exit 1 / 18.6 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_readline.py` | ok / 273.3 ms | exit 1 / 3.9 ms | hydro_fail | error[HYD0002]: module 'codecs' not found: not supported unless a sibling codecs.py exists |
-| `test_regrtest.py` | exit 1 / 1590.6 ms | exit 1 / 10.9 ms | expected_fail | error[HYD0002]: module '_colorize' not found: not supported unless a sibling _colorize.py exists |
-| `test_remote_pdb.py` | ok / 2447.6 ms | exit 1 / 7.1 ms | hydro_fail | error[HYD0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists |
-| `test_repl.py` | ok / 1024.7 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: module 'select' not found: not supported unless a sibling select.py exists |
-| `test_reprlib.py` | ok / 70.5 ms | exit 1 / 4.4 ms | hydro_fail | error[HYD0002]: module 'annotationlib' not found: not supported unless a sibling annotationlib.py exists |
-| `test_resource.py` | ok / 85.6 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_richcmp.py` | ok / 42.5 ms | exit 1 / 2.9 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_rlcompleter.py` | ok / 109.4 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'unittest.mock' |
-| `test_robotparser.py` | ok / 1150.1 ms | exit 1 / 3.4 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'urllib.robotparser' |
-| `test_runpy.py` | timeout / 30009.5 ms | exit 1 / 5.2 ms | expected_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_sax.py` | ok / 190.8 ms | exit 1 / 6.1 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'xml.sax' |
-| `test_sched.py` | ok / 585.3 ms | exit 1 / 3.6 ms | hydro_fail | error[HYD0002]: module 'sched' not found: not supported unless a sibling sched.py exists |
-| `test_scope.py` | ok / 51.5 ms | exit 1 / 3.5 ms | hydro_fail | error[HYD0002]: module 'weakref' not found: not supported unless a sibling weakref.py exists |
-| `test_script_helper.py` | ok / 190.2 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists |
-| `test_secrets.py` | ok / 39.8 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: module 'secrets' not found: not supported unless a sibling secrets.py exists |
-| `test_select.py` | ok / 1556.6 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: module 'select' not found: not supported unless a sibling select.py exists |
-| `test_selectors.py` | ok / 14735.2 ms | exit 1 / 4.8 ms | hydro_fail | error[HYD0002]: module 'selectors' not found: not supported unless a sibling selectors.py exists |
-| `test_set.py` | ok / 749.2 ms | exit 1 / 10.1 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'collections.abc' |
-| `test_setcomps.py` | ok / 129.5 ms | exit 1 / 2.6 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_shelve.py` | ok / 2552.9 ms | exit 1 / 2.6 ms | hydro_fail | error[HYD0002]: module 'dbm' not found: not supported unless a sibling dbm.py exists |
-| `test_shlex.py` | ok / 141.2 ms | exit 1 / 3.4 ms | hydro_fail | error[HYD0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists |
-| `test_shutil.py` | exit 1 / 488.1 ms | exit 1 / 16.2 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'unittest.mock' |
-| `test_signal.py` | timeout / 30018.8 ms | exit 1 / 5.4 ms | expected_fail | error[HYD0002]: module 'enum' not found: not supported unless a sibling enum.py exists |
-| `test_site.py` | ok / 2315.3 ms | exit 1 / 5.5 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_slice.py` | ok / 56.8 ms | exit 1 / 3.5 ms | hydro_fail | error[HYD0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists |
-| `test_smtplib.py` | ok / 1434.4 ms | exit 1 / 6.9 ms | hydro_fail | error[HYD0002]: module 'base64' not found: not supported unless a sibling base64.py exists |
-| `test_smtpnet.py` | ok / 10504.7 ms | exit 1 / 2.2 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_socket.py` | timeout / 30011.4 ms | exit 1 / 26.7 ms | expected_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_socketserver.py` | ok / 515.3 ms | exit 1 / 3.6 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_sort.py` | ok / 81.4 ms | exit 1 / 2.9 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_source_encoding.py` | ok / 13287.4 ms | exit 1 / 3.9 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_ssl.py` | ok / 21400.4 ms | exit 1 / 21.9 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_stable_abi_ctypes.py` | exit 1 / 120.5 ms | exit 1 / 2.7 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support.import_helper' |
-| `test_startfile.py` | exit 1 / 120.5 ms | exit 1 / 1.9 ms | expected_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_stat.py` | ok / 149.5 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_statistics.py` | ok / 9719.4 ms | exit 1 / 14.6 ms | hydro_fail | error[HYD0002]: module 'bisect' not found: not supported unless a sibling bisect.py exists |
-| `test_str.py` | ok / 1152 ms | exit 1 / 15.1 ms | hydro_fail | error[HYD0002]: module '_string' not found: not supported unless a sibling _string.py exists |
-| `test_strftime.py` | ok / 169.6 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0002]: module 'calendar' not found: not supported unless a sibling calendar.py exists |
-| `test_string_literals.py` | ok / 132 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: module 'shutil' not found: not supported unless a sibling shutil.py exists |
-| `test_stringprep.py` | ok / 116 ms | exit 1 / 1.7 ms | hydro_fail | error[HYD0002]: module 'stringprep' not found: not supported unless a sibling stringprep.py exists |
-| `test_strptime.py` | ok / 156 ms | exit 1 / 6 ms | hydro_fail | error[HYD0002]: module 'locale' not found: not supported unless a sibling locale.py exists |
-| `test_strtod.py` | ok / 236.6 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_struct.py` | ok / 397.1 ms | exit 1 / 6.5 ms | hydro_fail | error[HYD0002]: module 'itertools' not found: not supported unless a sibling itertools.py exists |
-| `test_structseq.py` | ok / 162 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_subclassinit.py` | ok / 118.6 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'types' not found: not supported unless a sibling types.py exists |
-| `test_subprocess.py` | exit 1 / 15509.9 ms | exit 1 / 14.1 ms | expected_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_sundry.py` | ok / 105.8 ms | exit 1 / 1.6 ms | hydro_fail | error[HYD0002]: module 'importlib' not found: not supported unless a sibling importlib.py exists |
-| `test_super.py` | ok / 231.5 ms | exit 1 / 3.2 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_support.py` | exit 1 / 4944.9 ms | exit 1 / 5.3 ms | expected_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_symtable.py` | ok / 61.9 ms | exit 1 / 3.4 ms | hydro_fail | error[HYD0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists |
-| `test_syntax.py` | ok / 188 ms | exit 1 / 4.7 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_sys.py` | exit 1 / 1245 ms | exit 1 / 9.4 ms | expected_fail | error[HYD0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists |
-| `test_sys_setprofile.py` | ok / 45.9 ms | exit 1 / 3.8 ms | hydro_fail | error[HYD0002]: module 'gc' not found: not supported unless a sibling gc.py exists |
-| `test_sys_settrace.py` | ok / 808.6 ms | exit 1 / 10.7 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_sysconfig.py` | exit 1 / 196.8 ms | exit 1 / 5.9 ms | expected_fail | error[HYD0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists |
-| `test_syslog.py` | ok / 187.8 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_tabnanny.py` | ok / 126.4 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: module 'tabnanny' not found: not supported unless a sibling tabnanny.py exists |
-| `test_tarfile.py` | exit 1 / 5601.9 ms | exit 1 / 19.6 ms | expected_fail | error[HYD0002]: module 'hashlib' not found: not supported unless a sibling hashlib.py exists |
-| `test_tcl.py` | ok / 121.6 ms | exit 1 / 5.5 ms | hydro_fail | error[HYD0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists |
-| `test_tempfile.py` | ok / 483.1 ms | exit 1 / 9.4 ms | hydro_fail | error[HYD0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists |
-| `test_termios.py` | ok / 577.1 ms | exit 1 / 3.2 ms | hydro_fail | error[HYD0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists |
-| `test_textwrap.py` | ok / 48.9 ms | exit 1 / 4.9 ms | hydro_fail | error[HYD0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists |
-| `test_thread.py` | ok / 1282 ms | exit 1 / 3.2 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_thread_local_bytecode.py` | ok / 55 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'textwrap' not found: not supported unless a sibling textwrap.py exists |
-| `test_threadedtempfile.py` | ok / 53.1 ms | exit 1 / 2.3 ms | hydro_fail | error[HYD0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists |
-| `test_threading.py` | exit 1 / 14090 ms | exit 1 / 6.7 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_threading_local.py` | ok / 298.2 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_threadsignals.py` | ok / 4897.5 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'signal' not found: not supported unless a sibling signal.py exists |
-| `test_time.py` | ok / 3080.5 ms | exit 1 / 5.3 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_timeit.py` | ok / 57.9 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'timeit' not found: not supported unless a sibling timeit.py exists |
-| `test_timeout.py` | ok / 9988.7 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_tokenize.py` | ok / 6487.7 ms | exit 1 / 8.4 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_trace.py` | ok / 976.2 ms | exit 1 / 3.9 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_traceback.py` | exit 1 / 2287.7 ms | exit 1 / 16.7 ms | expected_fail | error[HYD0002]: module 'linecache' not found: not supported unless a sibling linecache.py exists |
-| `test_tracemalloc.py` | ok / 682.4 ms | exit 1 / 5.9 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_tstring.py` | exit 1 / 282.4 ms | exit 1 / 1.7 ms | expected_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token "Hello" |
-| `test_ttk_textonly.py` | ok / 77.1 ms | exit 1 / 4 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_tty.py` | ok / 52.9 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support.import_helper' |
-| `test_tuple.py` | ok / 235.3 ms | exit 1 / 3.3 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_turtle.py` | ok / 202.5 ms | exit 1 / 4 ms | hydro_fail | error[HYD0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists |
-| `test_type_aliases.py` | ok / 56.6 ms | exit 1 / 4 ms | hydro_fail | error[HYD0002]: module 'types' not found: not supported unless a sibling types.py exists |
-| `test_type_annotations.py` | ok / 52.1 ms | exit 1 / 4.2 ms | hydro_fail | error[HYD0002]: module 'annotationlib' not found: not supported unless a sibling annotationlib.py exists |
-| `test_type_cache.py` | exit 1 / 48.9 ms | exit 1 / 2.6 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'collections.abc' |
-| `test_type_comments.py` | ok / 49.3 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'ast' not found: not supported unless a sibling ast.py exists |
-| `test_type_params.py` | ok / 56 ms | exit 1 / 4.8 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token '=' |
-| `test_typechecks.py` | ok / 44.4 ms | exit 1 / 2.4 ms | hydro_fail | error[HYD0002]: class keywords (metaclass, ...) are not supported yet |
-| `test_types.py` | ok / 238 ms | exit 1 / 12.1 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_typing.py` | ok / 399.9 ms | exit 1 / 39.2 ms | hydro_fail | error[HYD0002]: module 'annotationlib' not found: not supported unless a sibling annotationlib.py exists |
-| `test_ucn.py` | ok / 137 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: module 'ast' not found: not supported unless a sibling ast.py exists |
-| `test_unary.py` | ok / 46.4 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: complex literals are not supported in Phase 1 |
-| `test_unicode_file.py` | ok / 47.7 ms | exit 1 / 2 ms | hydro_fail | error[HYD0002]: module 'glob' not found: not supported unless a sibling glob.py exists |
-| `test_unicode_file_functions.py` | ok / 69.3 ms | exit 1 / 2.3 ms | hydro_fail | error[HYD0002]: module 'warnings' not found: not supported unless a sibling warnings.py exists |
-| `test_unicode_identifiers.py` | ok / 44.2 ms | exit 1 / 1.8 ms | hydro_fail | error[HYD0002]: nested class definitions are not supported yet |
-| `test_unicodedata.py` | ok / 4359.5 ms | exit 1 / 6.8 ms | hydro_fail | error[HYD0002]: module 'hashlib' not found: not supported unless a sibling hashlib.py exists |
-| `test_univnewlines.py` | ok / 62.6 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module '_pyio' not found: not supported unless a sibling _pyio.py exists |
-| `test_unpack.py` | exit 1 / 161.2 ms | exit 1 / 2.3 ms | expected_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_unpack_ex.py` | exit 1 / 156.6 ms | exit 1 / 1.7 ms | expected_fail | error[HYD0002]: module 'doctest' not found: not supported unless a sibling doctest.py exists |
-| `test_unparse.py` | ok / 7398.5 ms | exit 1 / 6 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_urllib.py` | ok / 505.4 ms | exit 1 / 7.3 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'urllib.parse' |
-| `test_urllib2.py` | ok / 2071.9 ms | exit 1 / 10.1 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_urllib2_localnet.py` | ok / 1975.7 ms | exit 1 / 4.1 ms | hydro_fail | error[HYD0002]: module 'base64' not found: not supported unless a sibling base64.py exists |
-| `test_urllib2net.py` | ok / 29492.2 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_urllib_response.py` | ok / 54.8 ms | exit 1 / 2.3 ms | hydro_fail | error[HYD0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists |
-| `test_urllibnet.py` | ok / 7514.1 ms | exit 1 / 2.3 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_urlparse.py` | ok / 145 ms | exit 1 / 10.3 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported unless a sibling unicodedata.py exists |
-| `test_userdict.py` | ok / 156.2 ms | exit 1 / 3.9 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_userlist.py` | ok / 169.9 ms | exit 1 / 3.1 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_userstring.py` | ok / 650.5 ms | exit 1 / 3 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_utf8_mode.py` | ok / 457.4 ms | exit 1 / 3.3 ms | hydro_fail | error[HYD0002]: module 'locale' not found: not supported unless a sibling locale.py exists |
-| `test_utf8source.py` | ok / 50.4 ms | exit 1 / 2.2 ms | hydro_fail | error[HYD0002]: imports are only supported at module level in Phase 2.10 |
-| `test_uuid.py` | ok / 284.5 ms | exit 1 / 8.1 ms | hydro_fail | error[HYD0002]: module 'builtins' not found: not supported unless a sibling builtins.py exists |
-| `test_venv.py` | exit 1 / 7650.2 ms | exit 1 / 6.6 ms | expected_fail | error[HYD0002]: module 'contextlib' not found: not supported unless a sibling contextlib.py exists |
-| `test_wait3.py` | ok / 5095.7 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: module 'subprocess' not found: not supported unless a sibling subprocess.py exists |
-| `test_wait4.py` | ok / 5057.6 ms | exit 1 / 2.1 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.fork_wait' |
-| `test_wave.py` | ok / 69.4 ms | exit 1 / 3.3 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_weakref.py` | exit 1 / 2571.3 ms | exit 1 / 8.8 ms | expected_fail | error[HYD0002]: module 'gc' not found: not supported unless a sibling gc.py exists |
-| `test_weakset.py` | ok / 69.5 ms | exit 1 / 4.1 ms | hydro_fail | error[HYD0002]: module 'weakref' not found: not supported unless a sibling weakref.py exists |
-| `test_webbrowser.py` | ok / 2173.1 ms | exit 1 / 4 ms | hydro_fail | error[HYD0002]: module 'shlex' not found: not supported unless a sibling shlex.py exists |
-| `test_winapi.py` | exit 1 / 52.8 ms | exit 1 / 2.5 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_winconsoleio.py` | exit 1 / 52.5 ms | exit 1 / 2.6 ms | expected_fail | error[HYD0002]: module 'tempfile' not found: not supported unless a sibling tempfile.py exists |
-| `test_winreg.py` | exit 1 / 58 ms | exit 1 / 3.5 ms | expected_fail | error[HYD0002]: module 'gc' not found: not supported unless a sibling gc.py exists |
-| `test_winsound.py` | exit 1 / 50.8 ms | exit 1 / 2.4 ms | expected_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_with.py` | ok / 46.9 ms | exit 1 / 3.9 ms | hydro_fail | error[HYD0002]: module 'traceback' not found: not supported unless a sibling traceback.py exists |
-| `test_wmi.py` | exit 1 / 47.5 ms | exit 1 / 2 ms | expected_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_wsgiref.py` | ok / 233.8 ms | exit 1 / 4.8 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_xml_dom_minicompat.py` | ok / 50.7 ms | exit 1 / 2.9 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_xml_dom_xmlbuilder.py` | ok / 182.1 ms | exit 1 / 2 ms | hydro_fail | error[HYD0002]: module 'http' not found: not supported unless a sibling http.py exists |
-| `test_xml_etree.py` | ok / 797.1 ms | exit 1 / 18.4 ms | hydro_fail | error[HYD0002]: module 'copy' not found: not supported unless a sibling copy.py exists |
-| `test_xml_etree_c.py` | ok / 520.4 ms | exit 1 / 3 ms | hydro_fail | error[HYD0002]: module 'struct' not found: not supported unless a sibling struct.py exists |
-| `test_xmlrpc.py` | ok / 27421.4 ms | exit 1 / 7.2 ms | hydro_fail | error[HYD0002]: module 'base64' not found: not supported unless a sibling base64.py exists |
-| `test_xpickle.py` | ok / 2387.7 ms | exit 1 / 2.7 ms | hydro_fail | error[HYD0002]: module 'struct' not found: not supported unless a sibling struct.py exists |
-| `test_xxlimited.py` | exit 1 / 51.4 ms | exit 1 / 1.9 ms | expected_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_xxtestfuzz.py` | ok / 55.5 ms | exit 1 / 2 ms | hydro_fail | error[HYD0002]: module 'faulthandler' not found: not supported unless a sibling faulthandler.py exists |
-| `test_yield_from.py` | ok / 59.1 ms | exit 1 / 5.6 ms | hydro_fail | error[HYD0002]: module 'inspect' not found: not supported unless a sibling inspect.py exists |
-| `test_zipapp.py` | ok / 150.9 ms | exit 1 / 3.5 ms | hydro_fail | error[HYD0002]: module 'stat' not found: not supported unless a sibling stat.py exists |
-| `test_zipfile64.py` | timeout / 30030.8 ms | exit 1 / 2.4 ms | expected_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_zipimport.py` | ok / 18396.4 ms | exit 1 / 6.9 ms | hydro_fail | error[HYD0002]: module 'marshal' not found: not supported unless a sibling marshal.py exists |
-| `test_zipimport_support.py` | ok / 495.1 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0002]: dotted imports are not supported for user modules: 'test.support' |
-| `test_zlib.py` | ok / 434.7 ms | exit 1 / 5.9 ms | hydro_fail | error[HYD0002]: module 'test' not found: not supported unless a sibling test.py exists |
-| `test_zstd.py` | ok / 359.9 ms | exit 1 / 11.8 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported unless a sibling array.py exists |
+| `test___all__.py` | ok / 1672.8 ms | exit 1 / 726.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test__colorize.py` | ok / 116.3 ms | exit 1 / 596 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test__interpchannels.py` | ok / 795.3 ms | exit 1 / 545.1 ms | hydro_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
+| `test__interpreters.py` | ok / 666.1 ms | exit 1 / 504 ms | hydro_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
+| `test__locale.py` | ok / 56 ms | exit 1 / 511.7 ms | hydro_fail | error[HYD0002]: module '_locale' not found: not supported on the import search path |
+| `test__opcode.py` | ok / 51.8 ms | exit 1 / 471.2 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
+| `test__osx_support.py` | ok / 55.6 ms | exit 1 / 749.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_abc.py` | ok / 52.7 ms | exit 1 / 598.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_abstract_numbers.py` | ok / 46.4 ms | exit 1 / 29.9 ms | hydro_fail | error[HYD0201]: module 'abc' has no attribute 'ABCMeta' |
+| `test_android.py` | exit 1 / 110.9 ms | exit 1 / 578.5 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_annotationlib.py` | ok / 76.4 ms | exit 1 / 808.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_apple.py` | exit 1 / 109.5 ms | exit 1 / 570.6 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_argparse.py` | ok / 1387.3 ms | exit 1 / 719.2 ms | hydro_fail | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
+| `test_array.py` | ok / 286.4 ms | exit 1 / 535.8 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_asdl_parser.py` | exit 1 / 33.8 ms | exit 1 / 641.5 ms | expected_fail | error[HYD0002]: decorators are not supported in Phase 1 |
+| `test_asyncgen.py` | ok / 849 ms | exit 1 / 771.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_atexit.py` | exit 1 / 142.3 ms | exit 1 / 788.1 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_audit.py` | ok / 1717 ms | exit 1 / 743.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_augassign.py` | ok / 43.5 ms | exit 1 / 19.1 ms | hydro_fail | error[HYD0101]: name 'compile' is not defined |
+| `test_base64.py` | ok / 143.9 ms | exit 1 / 496.2 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_baseexception.py` | ok / 49.8 ms | exit 1 / 19.1 ms | hydro_fail | error[HYD0101]: name 'object' is not defined |
+| `test_bdb.py` | exit 1 / 76.3 ms | exit 1 / 616.5 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_bigaddrspace.py` | ok / 45.9 ms | exit 1 / 713.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_bigmem.py` | ok / 63.3 ms | exit 1 / 816.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_binascii.py` | ok / 64.4 ms | exit 1 / 466.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_binop.py` | ok / 44 ms | exit 1 / 85.1 ms | hydro_fail | error[HYD0201]: module 'abc' has no attribute 'ABCMeta' |
+| `test_bisect.py` | ok / 61.2 ms | exit 1 / 785.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_bool.py` | ok / 49.8 ms | exit 1 / 769.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_buffer.py` | ok / 95 ms | exit 1 / 601.1 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_bufio.py` | ok / 147 ms | exit 1 / 796.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_build_details.py` | exit 1 / 131.3 ms | exit 1 / 555.3 ms | expected_fail | error[HYD0201]: module 'os.path' has no attribute 'realpath' |
+| `test_builtin.py` | ok / 377.3 ms | exit 1 / 780.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_bytes.py` | exit 1 / 92.7 ms | exit 1 / 707 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_bz2.py` | ok / 382.7 ms | exit 1 / 506.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_c_locale_coercion.py` | ok / 832.4 ms | exit 1 / 696.8 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_calendar.py` | ok / 1427.4 ms | exit 1 / 712.7 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_call.py` | exit 1 / 62.3 ms | exit 1 / 479.6 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_charmapcodec.py` | ok / 45.5 ms | exit 1 / 177.8 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_class.py` | ok / 65.3 ms | exit 1 / 491.1 ms | hydro_fail | error[HYD0002]: module '_testinternalcapi' not found: not supported on the import search path |
+| `test_clinic.py` | ok / 242.9 ms | exit 1 / 892.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_cmath.py` | ok / 92.2 ms | exit 1 / 597.2 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_cmd.py` | ok / 201.6 ms | exit 1 / 675.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_cmd_line.py` | exit 1 / 1783.6 ms | exit 1 / 610.3 ms | expected_fail | error[HYD0201]: module 'os.path' has no attribute 'realpath' |
+| `test_cmd_line_script.py` | exit 1 / 1456.8 ms | exit 1 / 498.7 ms | expected_fail | error[HYD0002]: module '_frozen_importlib_external' not found: not supported on the import search path |
+| `test_code.py` | ok / 213.5 ms | exit 1 / 745.3 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_code_module.py` | ok / 135.8 ms | exit 1 / 481.4 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
+| `test_codeccallbacks.py` | ok / 62.5 ms | exit 1 / 118 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
+| `test_codecencodings_cn.py` | ok / 128.2 ms | exit 1 / 787 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecencodings_hk.py` | ok / 96 ms | exit 1 / 779.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecencodings_iso2022.py` | ok / 144.3 ms | exit 1 / 823.7 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecencodings_jp.py` | ok / 183.9 ms | exit 1 / 854.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecencodings_kr.py` | ok / 110.9 ms | exit 1 / 784.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecencodings_tw.py` | ok / 104 ms | exit 1 / 768.9 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecmaps_cn.py` | ok / 182.9 ms | exit 1 / 800.2 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecmaps_hk.py` | ok / 116.9 ms | exit 1 / 796.4 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecmaps_jp.py` | ok / 174.5 ms | exit 1 / 795.1 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecmaps_kr.py` | ok / 169 ms | exit 1 / 813.7 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecmaps_tw.py` | ok / 143.1 ms | exit 1 / 786.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codecs.py` | ok / 340.9 ms | exit 1 / 747.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_codeop.py` | ok / 54.3 ms | exit 1 / 758.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_collections.py` | ok / 1143.3 ms | exit 1 / 749.6 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_colorsys.py` | ok / 46.1 ms | exit 1 / 315.7 ms | hydro_fail | AssertionError: 8 test(s) failed |
+| `test_compare.py` | ok / 61.2 ms | exit 1 / 746.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_compile.py` | ok / 2289 ms | exit 1 / 536.9 ms | hydro_fail | error[HYD0002]: module '_ast' not found: not supported on the import search path |
+| `test_compileall.py` | exit 1 / 66.1 ms | exit 1 / 548.9 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_compiler_assemble.py` | ok / 40.8 ms | exit 1 / 457.3 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
+| `test_compiler_codegen.py` | ok / 37.5 ms | exit 1 / 740.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_complex.py` | ok / 68.1 ms | exit 1 / 499.8 ms | hydro_fail | error[HYD0002]: module 'cmath' not found: not supported on the import search path |
+| `test_configparser.py` | ok / 415.2 ms | exit 1 / 1043.8 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
+| `test_contains.py` | ok / 57.6 ms | exit 1 / 768.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_context.py` | ok / 534.9 ms | exit 1 / 472.7 ms | hydro_fail | error[HYD0002]: module '_contextvars' not found: not supported on the import search path |
+| `test_contextlib.py` | ok / 71.2 ms | exit 1 / 507.2 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
+| `test_contextlib_async.py` | ok / 75.8 ms | exit 1 / 805.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_copy.py` | ok / 79.9 ms | exit 1 / 534.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_copyreg.py` | ok / 81.5 ms | exit 1 / 921.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_coroutines.py` | ok / 268.5 ms | exit 1 / 603.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_cprofile.py` | ok / 529.2 ms | exit 1 / 551.6 ms | hydro_fail | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
+| `test_crossinterp.py` | exit 1 / 55.1 ms | exit 1 / 480.5 ms | expected_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
+| `test_csv.py` | ok / 240.2 ms | exit 1 / 590.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_curses.py` | ok / 291 ms | exit 1 / 665.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_datetime.py` | ok / 18911.1 ms | exit 1 / 765.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_dbm.py` | ok / 386.7 ms | exit 1 / 463.2 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_dbm_dumb.py` | ok / 76.1 ms | exit 1 / 458.6 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_dbm_gnu.py` | exit 1 / 49.9 ms | exit 1 / 770.8 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_dbm_ndbm.py` | ok / 107.4 ms | exit 1 / 461.3 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_dbm_sqlite3.py` | ok / 589.4 ms | exit 1 / 477 ms | hydro_fail | error[HYD0002]: module '_sqlite3' not found: not supported on the import search path |
+| `test_decimal.py` | ok / 1939.5 ms | exit 1 / 721.9 ms | hydro_fail | error[HYD0002]: module '_contextvars' not found: not supported on the import search path |
+| `test_decorators.py` | ok / 45.2 ms | exit 1 / 39.2 ms | hydro_fail | error[HYD0101]: name 'compile' is not defined |
+| `test_defaultdict.py` | ok / 44.3 ms | exit 1 / 107.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_deque.py` | ok / 374.2 ms | exit 1 / 739.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_descr.py` | exit 1 / 336.3 ms | exit 1 / 633.7 ms | expected_fail | error[HYD0101]: name 'complex' is not defined |
+| `test_descrtut.py` | ok / 141.8 ms | exit 1 / 653.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_devpoll.py` | exit 1 / 39 ms | exit 1 / 743.1 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_dict.py` | ok / 304.5 ms | exit 1 / 567.3 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
+| `test_dictcomps.py` | ok / 48.6 ms | exit 1 / 469.2 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
+| `test_dictviews.py` | ok / 143 ms | exit 1 / 545 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_difflib.py` | ok / 238.7 ms | exit 1 / 702.3 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_dis.py` | ok / 225.5 ms | exit 1 / 568.4 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
+| `test_docxmlrpc.py` | ok / 4668.1 ms | exit 1 / 852.7 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_dtrace.py` | exit 1 / 55 ms | exit 1 / 477.9 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_dynamic.py` | ok / 50.3 ms | exit 1 / 754.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_dynamicclassattribute.py` | ok / 44.3 ms | exit 1 / 26.4 ms | hydro_fail | error[HYD0201]: module 'types' has no attribute 'DynamicClassAttribute' |
+| `test_eintr.py` | exit 1 / 99.5 ms | exit 1 / 468.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_embed.py` | ok / 63.9 ms | exit 1 / 833 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_ensurepip.py` | ok / 157.6 ms | exit 1 / 615.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_enum.py` | exit 1 / 579.6 ms | exit 1 / 1007.4 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_enumerate.py` | ok / 80.5 ms | exit 1 / 750.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_eof.py` | ok / 311.2 ms | exit 1 / 637.7 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_epoll.py` | ok / 153.6 ms | exit 1 / 726.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_errno.py` | ok / 42.8 ms | ok / 111.9 ms | hydro_pass | - |
+| `test_except_star.py` | ok / 56.3 ms | exit 1 / 754.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_exception_group.py` | ok / 262.1 ms | exit 1 / 756.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_exception_hierarchy.py` | ok / 47.1 ms | exit 1 / 24.5 ms | hydro_fail | error[HYD0201]: module 'errno' has no attribute 'EEXIST' |
+| `test_exception_variations.py` | ok / 44.8 ms | exit 1 / 553 ms | hydro_fail | AssertionError: 8 test(s) failed |
+| `test_exceptions.py` | exit 1 / 949.4 ms | exit 1 / 617.2 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_extcall.py` | exit 1 / 143.6 ms | exit 1 / 545.9 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_external_inspection.py` | ok / 1427.8 ms | exit 1 / 659.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_faulthandler.py` | ok / 18705.6 ms | exit 1 / 482.8 ms | hydro_fail | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
+| `test_fcntl.py` | ok / 200.8 ms | exit 1 / 490.4 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_file.py` | ok / 84.5 ms | exit 1 / 497.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_file_eintr.py` | ok / 1436.6 ms | exit 1 / 497 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_filecmp.py` | ok / 76.2 ms | exit 1 / 484.6 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
+| `test_fileinput.py` | ok / 129.7 ms | exit 1 / 537.5 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'fspath' |
+| `test_fileio.py` | ok / 530.9 ms | exit 1 / 558.6 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_fileutils.py` | ok / 125.8 ms | exit 1 / 756.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_finalization.py` | ok / 99.3 ms | exit 1 / 515.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_float.py` | ok / 95.7 ms | exit 1 / 514.9 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_flufl.py` | ok / 45.9 ms | exit 1 / 9.2 ms | hydro_fail | error[HYD0101]: name 'compile' is not defined |
+| `test_fnmatch.py` | ok / 52.9 ms | exit 1 / 49.6 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
+| `test_fork1.py` | ok / 5130.1 ms | exit 1 / 454.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_format.py` | ok / 54.7 ms | exit 1 / 829.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_fractions.py` | ok / 77 ms | exit 1 / 510.4 ms | hydro_fail | error[HYD0002]: 'from _decimal import *' is not supported for a module that is not loaded |
+| `test_frame.py` | exit 1 / 937.4 ms | exit 1 / 591.1 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_frozen.py` | ok / 53.2 ms | exit 1 / 994.8 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
+| `test_fstring.py` | exit 1 / 393.9 ms | exit 1 / 36.8 ms | expected_fail | error[HYD0001]: invalid syntax: f-string: expressions nested too deeply |
+| `test_ftplib.py` | ok / 7063.1 ms | exit 1 / 701.7 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute '_GLOBAL_DEFAULT_TIMEOUT' |
+| `test_funcattrs.py` | ok / 55.8 ms | exit 1 / 750.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_functools.py` | ok / 373.8 ms | exit 1 / 758.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_gc.py` | exit 1 / 1539.3 ms | exit 1 / 646.5 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_generated_cases.py` | ok / 120.7 ms | exit 1 / 757 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_generator_stop.py` | ok / 42.5 ms | exit 1 / 93.8 ms | hydro_fail | AssertionError: 2 test(s) failed |
+| `test_generators.py` | ok / 185.1 ms | exit 1 / 676.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_genericalias.py` | ok / 171.6 ms | exit 1 / 890.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_genericclass.py` | ok / 53.7 ms | exit 1 / 782.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_genericpath.py` | ok / 57 ms | exit 1 / 507.5 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
+| `test_genexps.py` | ok / 135.5 ms | exit 1 / 553.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_getopt.py` | ok / 165.4 ms | exit 1 / 722.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_getpass.py` | ok / 124.3 ms | exit 1 / 464 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'O_NOCTTY' |
+| `test_getpath.py` | ok / 47.6 ms | exit 1 / 590.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_gettext.py` | exit 1 / 163.7 ms | exit 1 / 625.5 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_glob.py` | ok / 106.8 ms | exit 1 / 569 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `test_global.py` | ok / 50.3 ms | exit 1 / 706.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_grammar.py` | ok / 69.2 ms | exit 1 / 39.2 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token ',' |
+| `test_graphlib.py` | ok / 92.8 ms | exit 1 / 504.1 ms | hydro_fail | error[HYD0103]: raise with a message requires exactly one argument |
+| `test_grp.py` | ok / 329.8 ms | exit 1 / 488.1 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
+| `test_gzip.py` | ok / 877 ms | exit 1 / 501.8 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_hash.py` | ok / 304.3 ms | exit 1 / 785.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_hashlib.py` | ok / 14294.1 ms | exit 1 / 704.4 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_heapq.py` | ok / 246.6 ms | exit 1 / 731.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_hmac.py` | ok / 169.9 ms | exit 1 / 651.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_html.py` | ok / 50.2 ms | exit 1 / 176.9 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_htmlparser.py` | ok / 459.9 ms | exit 1 / 683.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_http_cookiejar.py` | ok / 279.5 ms | exit 1 / 1146.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_http_cookies.py` | ok / 623.6 ms | exit 1 / 788.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_httplib.py` | ok / 3581.3 ms | exit 1 / 727.5 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_httpservers.py` | ok / 3937.1 ms | exit 1 / 803.8 ms | hydro_fail | error[HYD0201]: module 'enum' has no attribute 'StrEnum' |
+| `test_idle.py` | ok / 9791.9 ms | exit 1 / 713.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_imaplib.py` | timeout / 30004.1 ms | exit 1 / 949.6 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_index.py` | ok / 49.5 ms | exit 1 / 699.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_int.py` | ok / 20882.3 ms | exit 1 / 712.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_int_literal.py` | ok / 40.2 ms | ok / 200.5 ms | hydro_pass | - |
+| `test_io.py` | exit 1 / 28633.3 ms | exit 1 / 704.1 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_ioctl.py` | ok / 555.2 ms | exit 1 / 442.8 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_ipaddress.py` | ok / 92.4 ms | exit 1 / 606.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_isinstance.py` | ok / 810.5 ms | exit 1 / 702.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_iter.py` | ok / 65.4 ms | exit 1 / 724.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_iterlen.py` | ok / 43.4 ms | exit 1 / 24.4 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'deque' |
+| `test_itertools.py` | ok / 767.9 ms | exit 1 / 785.4 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_keyword.py` | ok / 42.1 ms | exit 1 / 6.4 ms | hydro_fail | error[HYD0101]: name 'setattr' is not defined |
+| `test_keywordonlyarg.py` | ok / 42.1 ms | exit 1 / 29.3 ms | hydro_fail | error[HYD0101]: name 'compile' is not defined |
+| `test_kqueue.py` | exit 1 / 38.9 ms | exit 1 / 698 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_largefile.py` | ok / 1319.6 ms | exit 1 / 783.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_launcher.py` | exit 1 / 66.2 ms | exit 1 / 451.2 ms | expected_fail | error[HYD0002]: module 'winreg' not found: not supported on the import search path |
+| `test_linecache.py` | ok / 122.6 ms | exit 1 / 556.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_list.py` | ok / 367.7 ms | exit 1 / 477.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_listcomps.py` | ok / 163.9 ms | exit 1 / 667.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_lltrace.py` | ok / 49 ms | exit 1 / 472.5 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
+| `test_locale.py` | ok / 148.1 ms | exit 1 / 499.5 ms | hydro_fail | error[HYD0002]: 'from _decimal import *' is not supported for a module that is not loaded |
+| `test_logging.py` | ok / 20489.5 ms | exit 1 / 1275.8 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_long.py` | ok / 486.1 ms | exit 1 / 465.7 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_longexp.py` | ok / 104.8 ms | exit 1 / 3.6 ms | hydro_fail | error[HYD0101]: name 'eval' is not defined |
+| `test_lzma.py` | ok / 174.1 ms | exit 1 / 484.2 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_mailbox.py` | ok / 1276.9 ms | exit 1 / 1665.9 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
+| `test_marshal.py` | ok / 223.2 ms | exit 1 / 454.5 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_math.py` | ok / 9054 ms | exit 1 / 523.3 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_math_property.py` | ok / 35.2 ms | exit 1 / 702.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_memoryio.py` | ok / 98.9 ms | exit 1 / 754.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_memoryview.py` | ok / 289.8 ms | exit 1 / 474 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_metaclass.py` | ok / 123 ms | exit 1 / 539.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_mimetypes.py` | ok / 426.2 ms | exit 1 / 626.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_minidom.py` | ok / 84.2 ms | exit 1 / 533.4 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_mmap.py` | ok / 109.3 ms | exit 1 / 752.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_modulefinder.py` | ok / 274.4 ms | exit 1 / 949.7 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
+| `test_monitoring.py` | ok / 61.6 ms | exit 1 / 534.3 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
+| `test_msvcrt.py` | exit 1 / 35.3 ms | exit 1 / 415 ms | expected_fail | error[HYD0002]: module '_winapi' not found: not supported on the import search path |
+| `test_multibytecodec.py` | ok / 217.5 ms | exit 1 / 427.2 ms | hydro_fail | error[HYD0002]: module '_multibytecodec' not found: not supported on the import search path |
+| `test_multiprocessing_main_handling.py` | exit 1 / 1271.2 ms | exit 1 / 740.3 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_named_expressions.py` | ok / 49.4 ms | exit 1 / 230.2 ms | hydro_fail | error[HYD0101]: name 'exec' is not defined |
+| `test_netrc.py` | ok / 51.7 ms | exit 1 / 443.2 ms | hydro_fail | error[HYD0201]: module 'os.path' has no attribute 'expanduser' |
+| `test_ntpath.py` | ok / 275.4 ms | exit 1 / 838.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_nturl2path.py` | ok / 55.5 ms | exit 1 / 1312.6 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
+| `test_numeric_tower.py` | ok / 65.7 ms | exit 1 / 10.9 ms | hydro_fail | error[HYD0002]: 'from _decimal import *' is not supported for a module that is not loaded |
+| `test_opcache.py` | ok / 282.3 ms | exit 1 / 552.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_opcodes.py` | ok / 47.1 ms | exit 1 / 697.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_openpty.py` | ok / 48.2 ms | exit 1 / 3.9 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'openpty' |
+| `test_operator.py` | ok / 81.3 ms | exit 1 / 759.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_optimizer.py` | ok / 45.7 ms | exit 1 / 716.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_optparse.py` | ok / 122.7 ms | exit 1 / 585 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_ordered_dict.py` | ok / 174.6 ms | exit 1 / 485.6 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_os.py` | exit 1 / 12665.7 ms | exit 1 / 674.2 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_osx_env.py` | ok / 44.6 ms | exit 1 / 693.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_patma.py` | exit 1 / 48.8 ms | exit 1 / 485.9 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_pdb.py` | exit 1 / 17418 ms | exit 1 / 978.3 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_peepholer.py` | ok / 355.5 ms | exit 1 / 519.9 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
+| `test_pep646_syntax.py` | ok / 219 ms | exit 1 / 548.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_perf_profiler.py` | ok / 394.5 ms | exit 1 / 465.7 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
+| `test_perfmaps.py` | ok / 104.6 ms | ok / 59.9 ms | hydro_pass | - |
+| `test_pickle.py` | ok / 2070.3 ms | exit 1 / 1083.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_picklebuffer.py` | ok / 128 ms | exit 1 / 535.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_pickletools.py` | ok / 528.9 ms | exit 1 / 1024.9 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_pkg.py` | ok / 118 ms | exit 1 / 29.6 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
+| `test_pkgutil.py` | exit 1 / 137.7 ms | exit 1 / 561.9 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_platform.py` | ok / 466.9 ms | exit 1 / 519.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_plistlib.py` | ok / 225.3 ms | exit 1 / 490.3 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_poll.py` | ok / 11275.2 ms | exit 1 / 706.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_popen.py` | ok / 165.4 ms | exit 1 / 705.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_poplib.py` | ok / 6006 ms | exit 1 / 515.5 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `test_positional_only_arg.py` | ok / 132.9 ms | exit 1 / 450.3 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
+| `test_posix.py` | exit 1 / 815 ms | exit 1 / 532.5 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_posixpath.py` | ok / 322.2 ms | exit 1 / 852.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_pow.py` | ok / 239 ms | exit 1 / 26.9 ms | hydro_fail | error[HYD0101]: name 'pow' is not defined |
+| `test_pprint.py` | ok / 170.4 ms | exit 1 / 621 ms | hydro_fail | error[HYD0201]: module 'io' has no attribute 'StringIO' |
+| `test_print.py` | ok / 119.6 ms | exit 1 / 687.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_profile.py` | ok / 370 ms | exit 1 / 626.9 ms | hydro_fail | error[HYD0201]: module 'enum' has no attribute 'StrEnum' |
+| `test_property.py` | ok / 88.2 ms | exit 1 / 727.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_pstats.py` | ok / 157.2 ms | exit 1 / 463.7 ms | hydro_fail | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
+| `test_pty.py` | ok / 103.4 ms | exit 1 / 447.8 ms | hydro_fail | error[HYD0002]: module 'termios' not found: not supported on the import search path |
+| `test_pulldom.py` | ok / 153 ms | exit 1 / 457.2 ms | hydro_fail | error[HYD0101]: unknown exception type 'exception' |
+| `test_pwd.py` | ok / 111 ms | exit 1 / 479.9 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
+| `test_py_compile.py` | ok / 340.8 ms | exit 1 / 927.9 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
+| `test_pyclbr.py` | exit 1 / 90.8 ms | exit 1 / 959.4 ms | expected_fail | error[HYD0002]: decorators are not supported in Phase 1 |
+| `test_pyexpat.py` | ok / 222.4 ms | exit 1 / 503.5 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_queue.py` | ok / 7829.5 ms | exit 1 / 509.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_quopri.py` | ok / 131.6 ms | exit 1 / 724.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_raise.py` | ok / 90.6 ms | exit 1 / 694.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_random.py` | ok / 719.5 ms | exit 1 / 589.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_range.py` | ok / 198.7 ms | exit 1 / 743.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_re.py` | ok / 426.8 ms | exit 1 / 868.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_readline.py` | ok / 240.9 ms | exit 1 / 645.8 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_regrtest.py` | exit 1 / 1495.5 ms | exit 1 / 876.2 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_remote_pdb.py` | ok / 2402.3 ms | exit 1 / 733.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_repl.py` | ok / 920.1 ms | exit 1 / 768.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_reprlib.py` | ok / 68 ms | exit 1 / 726.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_resource.py` | ok / 84.4 ms | exit 1 / 732.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_richcmp.py` | ok / 39.5 ms | exit 1 / 706.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_rlcompleter.py` | ok / 112.2 ms | exit 1 / 577 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_robotparser.py` | ok / 1359.3 ms | exit 1 / 737.7 ms | hydro_fail | error[HYD0101]: name 'super' is not defined |
+| `test_runpy.py` | timeout / 30010.9 ms | exit 1 / 482.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_sax.py` | ok / 177.1 ms | exit 1 / 721.7 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_sched.py` | ok / 587.9 ms | exit 1 / 437.9 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'namedtuple' |
+| `test_scope.py` | ok / 45.8 ms | exit 1 / 494.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_script_helper.py` | ok / 188.9 ms | exit 1 / 738.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_secrets.py` | ok / 39.5 ms | exit 1 / 35.5 ms | hydro_fail | error[HYD0201]: module '_operator' has no attribute '_compare_digest' |
+| `test_select.py` | ok / 1556.2 ms | exit 1 / 696.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_selectors.py` | ok / 14695.4 ms | exit 1 / 591 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_set.py` | ok / 713.1 ms | exit 1 / 547.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_setcomps.py` | ok / 120.3 ms | exit 1 / 614.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_shelve.py` | ok / 2580.9 ms | exit 1 / 539.3 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_shlex.py` | ok / 155.5 ms | exit 1 / 659.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_shutil.py` | exit 1 / 422.8 ms | exit 1 / 812.5 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_signal.py` | exit 1 / 15518.7 ms | exit 1 / 661.8 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_site.py` | ok / 2085.4 ms | exit 1 / 1164.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_slice.py` | ok / 62.1 ms | exit 1 / 540.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_smtplib.py` | ok / 1448 ms | exit 1 / 1024.4 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_smtpnet.py` | ok / 9206.5 ms | exit 1 / 1027.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_socket.py` | ok / 27916.4 ms | exit 1 / 698.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_socketserver.py` | ok / 483.4 ms | exit 1 / 471 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_sort.py` | ok / 77 ms | exit 1 / 738.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_source_encoding.py` | ok / 13358.7 ms | exit 1 / 782.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_ssl.py` | ok / 21594.4 ms | exit 1 / 1056.4 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_stable_abi_ctypes.py` | exit 1 / 130 ms | exit 1 / 785.3 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_startfile.py` | exit 1 / 116.2 ms | exit 1 / 758.6 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_stat.py` | ok / 146.2 ms | exit 1 / 761.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_statistics.py` | ok / 9563.6 ms | exit 1 / 842.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_str.py` | ok / 1132.3 ms | exit 1 / 642.8 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_strftime.py` | ok / 167 ms | exit 1 / 676.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_string_literals.py` | ok / 142.8 ms | exit 1 / 92.7 ms | hydro_fail | error[HYD0101]: name 'eval' is not defined |
+| `test_stringprep.py` | ok / 116.2 ms | exit 1 / 40.3 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
+| `test_strptime.py` | ok / 148.2 ms | exit 1 / 718.4 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_strtod.py` | ok / 244.4 ms | exit 1 / 749.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_struct.py` | ok / 393.9 ms | exit 1 / 534.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_structseq.py` | ok / 163.6 ms | exit 1 / 556.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_subclassinit.py` | ok / 125 ms | exit 1 / 21.2 ms | hydro_fail | error[HYD0002]: nested class definitions are not supported yet |
+| `test_subprocess.py` | exit 1 / 15700.5 ms | exit 1 / 574.4 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_sundry.py` | ok / 104.5 ms | exit 1 / 772.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_super.py` | ok / 214.2 ms | exit 1 / 643.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_support.py` | exit 1 / 4947.2 ms | exit 1 / 516.3 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_symtable.py` | ok / 63.8 ms | exit 1 / 480.5 ms | hydro_fail | error[HYD0002]: module '_symtable' not found: not supported on the import search path |
+| `test_syntax.py` | ok / 190.2 ms | exit 1 / 699 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_sys.py` | exit 1 / 1217.9 ms | exit 1 / 584.5 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_sys_setprofile.py` | ok / 47 ms | exit 1 / 196.7 ms | hydro_fail | error[HYD0201]: module 'io' has no attribute 'StringIO' |
+| `test_sys_settrace.py` | ok / 850.5 ms | exit 1 / 839.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_sysconfig.py` | exit 1 / 222 ms | exit 1 / 565.1 ms | expected_fail | error[HYD0002]: circular import: test.support.venv -> venv |
+| `test_syslog.py` | ok / 197.1 ms | exit 1 / 794.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_tabnanny.py` | ok / 120.4 ms | exit 1 / 631 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_tarfile.py` | exit 1 / 5640.1 ms | exit 1 / 834.9 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_tcl.py` | ok / 120.7 ms | exit 1 / 592.2 ms | hydro_fail | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `test_tempfile.py` | ok / 389.9 ms | exit 1 / 581.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_termios.py` | ok / 562.3 ms | exit 1 / 762.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_textwrap.py` | ok / 49.2 ms | exit 1 / 317.8 ms | hydro_fail | error[HYD0201]: module 'textwrap' has no attribute 'TextWrapper' |
+| `test_thread.py` | ok / 1285.4 ms | exit 1 / 787.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_thread_local_bytecode.py` | ok / 51.6 ms | exit 1 / 767 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_threadedtempfile.py` | ok / 55.5 ms | exit 1 / 740.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_threading.py` | exit 1 / 14139.9 ms | exit 1 / 580.9 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_threading_local.py` | ok / 345.4 ms | exit 1 / 686.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_threadsignals.py` | ok / 4961.8 ms | exit 1 / 437.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_time.py` | ok / 3084.4 ms | exit 1 / 748.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_timeit.py` | ok / 60.8 ms | exit 1 / 738.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_timeout.py` | ok / 10131.2 ms | exit 1 / 735.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_tokenize.py` | ok / 6422.8 ms | exit 1 / 550.7 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
+| `test_trace.py` | ok / 1010.5 ms | exit 1 / 797.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_traceback.py` | exit 1 / 2336.2 ms | exit 1 / 736.6 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_tracemalloc.py` | ok / 685.1 ms | exit 1 / 671.6 ms | hydro_fail | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
+| `test_tstring.py` | exit 1 / 293.2 ms | exit 1 / 784.6 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_ttk_textonly.py` | ok / 75.2 ms | exit 1 / 583.7 ms | hydro_fail | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `test_tty.py` | ok / 49 ms | exit 1 / 751.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_tuple.py` | ok / 223 ms | exit 1 / 765.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_turtle.py` | ok / 192.5 ms | exit 1 / 626.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_type_aliases.py` | ok / 55.9 ms | exit 1 / 715.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_type_annotations.py` | ok / 50.6 ms | exit 1 / 773.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_type_cache.py` | exit 1 / 47.7 ms | exit 1 / 483.8 ms | expected_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
+| `test_type_comments.py` | ok / 53.9 ms | exit 1 / 760.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_type_params.py` | ok / 59.1 ms | exit 1 / 36.6 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token '=' |
+| `test_typechecks.py` | ok / 44.7 ms | exit 1 / 230.2 ms | hydro_fail | AssertionError: 4 test(s) failed |
+| `test_types.py` | ok / 232.7 ms | exit 1 / 752.6 ms | hydro_fail | error[HYD0002]: module '_datetime' not found: not supported on the import search path |
+| `test_typing.py` | ok / 398.4 ms | exit 1 / 977 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_ucn.py` | ok / 148.7 ms | exit 1 / 639.7 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
+| `test_unary.py` | ok / 42.6 ms | exit 1 / 7.4 ms | hydro_fail | error[HYD0002]: complex literals are not supported in Phase 1 |
+| `test_unicode_file.py` | ok / 48.1 ms | exit 1 / 461.9 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
+| `test_unicode_file_functions.py` | ok / 75 ms | exit 1 / 446.7 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
+| `test_unicode_identifiers.py` | ok / 42.9 ms | exit 1 / 4.7 ms | hydro_fail | error[HYD0002]: nested class definitions are not supported yet |
+| `test_unicodedata.py` | ok / 4434.5 ms | exit 1 / 710.9 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
+| `test_univnewlines.py` | ok / 59.9 ms | exit 1 / 662.8 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_unpack.py` | exit 1 / 144.8 ms | exit 1 / 552.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_unpack_ex.py` | exit 1 / 150.7 ms | exit 1 / 532.4 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_unparse.py` | ok / 6225.2 ms | exit 1 / 766.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_urllib.py` | ok / 406.3 ms | exit 1 / 1601.8 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
+| `test_urllib2.py` | ok / 1500.5 ms | exit 1 / 839 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_urllib2_localnet.py` | ok / 2164.8 ms | exit 1 / 1671.7 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
+| `test_urllib2net.py` | timeout / 30003.5 ms | exit 1 / 839.8 ms | expected_fail | error[HYD0201]: module 'os.path' has no attribute 'realpath' |
+| `test_urllib_response.py` | ok / 53.7 ms | exit 1 / 448.3 ms | hydro_fail | error[HYD0101]: name 'super' is not defined |
+| `test_urllibnet.py` | ok / 7746.8 ms | exit 1 / 976.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_urlparse.py` | ok / 132.5 ms | exit 1 / 563.3 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
+| `test_userdict.py` | ok / 146.7 ms | exit 1 / 778.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_userlist.py` | ok / 136.8 ms | exit 1 / 780.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_userstring.py` | ok / 598.2 ms | exit 1 / 531.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_utf8_mode.py` | ok / 429.1 ms | exit 1 / 696.7 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
+| `test_utf8source.py` | ok / 43.4 ms | exit 1 / 5.1 ms | hydro_fail | error[HYD0101]: name 'compile' is not defined |
+| `test_uuid.py` | ok / 274.3 ms | exit 1 / 591.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_venv.py` | exit 1 / 6904.5 ms | exit 1 / 653.6 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_wait3.py` | ok / 5065.9 ms | exit 1 / 745.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_wait4.py` | ok / 5057.7 ms | exit 1 / 748 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_wave.py` | ok / 70.8 ms | exit 1 / 493.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_weakref.py` | exit 1 / 2509.3 ms | exit 1 / 797.7 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_weakset.py` | ok / 73.1 ms | exit 1 / 556 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_webbrowser.py` | ok / 2277.3 ms | exit 1 / 661.8 ms | hydro_fail | error[HYD0201]: module 'io' has no attribute 'StringIO' |
+| `test_winapi.py` | exit 1 / 63.8 ms | exit 1 / 924.1 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_winconsoleio.py` | exit 1 / 64.9 ms | exit 1 / 523.6 ms | expected_fail | error[HYD0002]: module '_testconsole' not found: not supported on the import search path |
+| `test_winreg.py` | exit 1 / 75.4 ms | exit 1 / 570.9 ms | expected_fail | error[HYD0002]: module 'winreg' not found: not supported on the import search path |
+| `test_winsound.py` | exit 1 / 57.5 ms | exit 1 / 902.2 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_with.py` | ok / 53.1 ms | exit 1 / 132.6 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
+| `test_wmi.py` | exit 1 / 50.9 ms | exit 1 / 757.8 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_wsgiref.py` | ok / 222.5 ms | exit 1 / 873.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_xml_dom_minicompat.py` | ok / 55.4 ms | exit 1 / 107.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_xml_dom_xmlbuilder.py` | ok / 172.7 ms | exit 1 / 807.2 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_xml_etree.py` | ok / 803.4 ms | exit 1 / 783.6 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_xml_etree_c.py` | ok / 516.8 ms | exit 1 / 473.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_xmlrpc.py` | ok / 27422.6 ms | exit 1 / 972.7 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_xpickle.py` | ok / 2241.4 ms | exit 1 / 903.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_xxlimited.py` | exit 1 / 51.5 ms | exit 1 / 817.7 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_xxtestfuzz.py` | ok / 55 ms | exit 1 / 455.8 ms | hydro_fail | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
+| `test_yield_from.py` | ok / 54 ms | exit 1 / 757.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_zipapp.py` | ok / 149.5 ms | exit 1 / 713 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_zipfile64.py` | timeout / 30029.6 ms | exit 1 / 547.4 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_zipimport.py` | ok / 18909.9 ms | exit 1 / 949.1 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_zipimport_support.py` | ok / 511.4 ms | exit 1 / 825.3 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `test_zlib.py` | ok / 419.9 ms | exit 1 / 801.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
+| `test_zstd.py` | ok / 375.7 ms | exit 1 / 550.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
 
 <!-- END GENERATED RESULTS -->

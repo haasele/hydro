@@ -8,6 +8,34 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-26 four-scope checkpoint
+
+- Import/module registry: `sys.path`/`sys.modules`/`sys.builtin_module_names`,
+  stable module values, namespace packages, `HYDRO_STDLIB`, star imports and
+  literal `__all__`; `importlib.import_module` consults the registry.
+- Full CPython 3.14 exception taxonomy with parent-chain matching,
+  exception attributes, `isinstance`/`issubclass`, and user-exception
+  instance identity (methods, attributes, re-raise).
+- Core shims: native `builtins`, `_imp`, `_opcode`, `_collections`,
+  `_codecs`, `_string`, `_weakref` (real callbacks), `warnings`, `marshal`,
+  `_tokenize`, `_collections_abc`, `gc`, `atexit`, `site`.
+- Vendored `hydro-python-parser` fork: PEP 701 f-strings and PEP 750
+  t-strings with real `Template`/`Interpolation` runtime values.
+- P4-02 surface: general decorators, positional-only parameters, combined
+  `*args`/`**kwargs`, `match`, `except*` syntax, classmethod/staticmethod/
+  property descriptors, bytearray/memoryview, live dict views, descriptors,
+  C3 multiple inheritance, metaclasses and general `super()`.
+- Full-ABI foundation: CPython-compatible object/type headers, refcounts,
+  vectorcall/FASTCALL, full buffer protocol, GIL emulation, GC tracking,
+  `PyArg_ParseTupleAndKeywords`, constants and exception symbols.
+- Tea `install` command with atomic wheel extraction, tag validation and
+  extension import through the existing loader.
+
+**Still open:** dynamic import of source, `compile`/`eval`/`globals`/`locals`/
+`vars`, class-body `del`, `builtins.__dict__`, `ast.parse/unparse`,
+`except*` grouping, NumPy/pydantic ABI compatibility, and full stdlib/
+ecosystem parity.
+
 As of 2026-10-26 the full suite is green (`scripts/verify.sh` ALL GREEN;
 current test count and breakdown in [`AGENTS.md`](AGENTS.md#current-state)).
 P2 is complete: precise shadow-stack roots, the size-classed payload

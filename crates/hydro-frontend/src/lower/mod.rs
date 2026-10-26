@@ -27,7 +27,7 @@ use crate::sema::{Infer, Ty};
 
 pub const MODULE_NAME: &str = "<module>";
 
-const BUILTIN_NAMES: [&str; 26] = [
+const BUILTIN_NAMES: [&str; 29] = [
     "print",
     "len",
     "str",
@@ -46,6 +46,9 @@ const BUILTIN_NAMES: [&str; 26] = [
     "bytes",
     "bytearray",
     "memoryview",
+    "classmethod",
+    "staticmethod",
+    "property",
     "iter",
     "next",
     "all",
@@ -4277,6 +4280,38 @@ impl<'a> Lowerer<'a> {
                         let (function, kind) = (*function, *kind);
                         methods.push((name, function, None, kind));
                         continue;
+                    }
+                }
+                // `name = classmethod(method)` / `staticmethod(...)` /
+                // `property(method)` over an earlier method of this class
+                // keeps the method's function id and only changes its binding
+                // kind. Any other argument (a class value such as
+                // `classmethod(GenericAlias)`, an imported callable, or a
+                // multi-argument property) stays a class attribute whose value
+                // the runtime wraps in the corresponding descriptor object.
+                if let ast::Expr::Call(call) = &*assign.value {
+                    if call.keywords.is_empty() && call.args.len() == 1 {
+                        if let (ast::Expr::Name(callee), ast::Expr::Name(argument)) =
+                            (&*call.func, &call.args[0])
+                        {
+                            let kind = match callee.id.as_str() {
+                                "classmethod" => Some(MethodKind::Classmethod),
+                                "staticmethod" => Some(MethodKind::Staticmethod),
+                                "property" => Some(MethodKind::Property),
+                                _ => None,
+                            };
+                            if let Some(kind) = kind {
+                                if let Some((_, function, _, _)) =
+                                    methods.iter().find(|(method, _, _, _)| {
+                                        method.as_str() == argument.id.as_str()
+                                    })
+                                {
+                                    let function = *function;
+                                    methods.push((name, function, None, kind));
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 }
                 attributes.push((name, idx));
@@ -12766,6 +12801,15 @@ impl<'a> Lowerer<'a> {
         if let Some(builtin) = builtin_by_name(name)
             .filter(|_| !(self.session_mode && self.global_names.contains(name)))
         {
+            // `print(*args, sep=, end=, file=, flush=)` is the one builtin
+            // whose keywords the runtime binder implements. Lower it through
+            // the keyword call ABI (the builtin function value), keeping the
+            // positional arguments first and the keyword values in source
+            // order. `*`/`**` shapes were intercepted by the dynamic branch
+            // above and use the same runtime path.
+            if builtin == Builtin::Print && !call.keywords.is_empty() {
+                return self.lower_print_keywords(call, fs, line, col);
+            }
             let Some(args) = self.builtin_call_arguments(builtin, call, fs, line, col) else {
                 return self.error_expr(call.range);
             };
@@ -13950,6 +13994,74 @@ impl<'a> Lowerer<'a> {
     /// `sorted` accepts `key=` and `reverse=`: the runtime expects
     /// `(iterable, key, reverse)` with the two optional slots materialised at
     /// their fixed positions.
+    /// Lower `print(args..., sep=, end=, file=, flush=)` to the runtime
+    /// keyword binder (`hydro_call_kw` on the `print` builtin value).
+    ///
+    /// Only the four CPython keywords are accepted; a duplicate or unknown
+    /// keyword is a compile-time diagnostic. `sep`/`end` may be `None` or a
+    /// string, `file` any object with `write` (validated at runtime), and
+    /// `flush` any truthy value.
+    fn lower_print_keywords(
+        &mut self,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let Some(args) = self.plain_call_args(call, fs) else {
+            return self.error_expr(call.range);
+        };
+        let mut keywords: Vec<(String, HExpr)> = Vec::with_capacity(call.keywords.len());
+        for keyword in &call.keywords {
+            let Some(name) = keyword.arg.as_ref() else {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    "print() does not accept **mapping arguments in this position",
+                );
+                continue;
+            };
+            match name.as_str() {
+                "sep" | "end" | "file" | "flush" => {}
+                other => {
+                    self.error_at_code(
+                        keyword.range,
+                        codes::CALL,
+                        format!("print() got an unexpected keyword argument '{other}'"),
+                    );
+                    continue;
+                }
+            }
+            if keywords
+                .iter()
+                .any(|(existing, _)| existing.as_str() == name.as_str())
+            {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!("print() got multiple values for keyword argument '{name}'"),
+                );
+                continue;
+            }
+            keywords.push((name.to_string(), self.expr(&keyword.value, fs)));
+        }
+        HExpr {
+            kind: HExprKind::CallKw {
+                callee: Box::new(HExpr {
+                    kind: HExprKind::BuiltinRef(Builtin::Print),
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                }),
+                args,
+                keywords,
+            },
+            ty: Ty::Concrete(Type::None),
+            line,
+            col,
+        }
+    }
+
     fn builtin_call_arguments(
         &mut self,
         builtin: Builtin,
@@ -13959,6 +14071,81 @@ impl<'a> Lowerer<'a> {
         col: u32,
     ) -> Option<Vec<HExpr>> {
         let mut args = self.plain_call_args(call, fs)?;
+        // `property(fget, fset, fdel, doc)`: the four components may also be
+        // passed by name, with gaps filled by `None`.
+        if builtin == Builtin::Property {
+            if args.len() > 4 {
+                self.error_at_code(
+                    call.range,
+                    codes::CALL,
+                    format!(
+                        "property() takes at most 4 arguments ({} given)",
+                        args.len()
+                    ),
+                );
+                return None;
+            }
+            let positional = args.len();
+            let mut slots: Vec<Option<HExpr>> = args.into_iter().map(Some).collect();
+            slots.resize(4, None);
+            let mut provided = positional;
+            for keyword in &call.keywords {
+                let Some(name) = keyword.arg.as_ref() else {
+                    self.error_at_code(
+                        keyword.range,
+                        codes::CALL,
+                        "**mapping arguments are not supported for property()",
+                    );
+                    return None;
+                };
+                let index = match name.as_str() {
+                    "fget" => 0,
+                    "fset" => 1,
+                    "fdel" => 2,
+                    "doc" => 3,
+                    _ => {
+                        self.error_at_code(
+                            keyword.range,
+                            codes::CALL,
+                            format!("property() got an unexpected keyword argument '{name}'"),
+                        );
+                        return None;
+                    }
+                };
+                if slots[index].is_some() {
+                    self.error_at_code(
+                        keyword.range,
+                        codes::CALL,
+                        format!("property() got multiple values for argument '{name}'"),
+                    );
+                    return None;
+                }
+                slots[index] = Some(self.expr(&keyword.value, fs));
+                provided = provided.max(index + 1);
+            }
+            if provided == 0 {
+                self.error_at_code(
+                    call.range,
+                    codes::CALL,
+                    "property() takes at least 1 argument",
+                );
+                return None;
+            }
+            return Some(
+                slots
+                    .into_iter()
+                    .take(provided)
+                    .map(|slot| {
+                        slot.unwrap_or(HExpr {
+                            kind: HExprKind::Const(Const::None),
+                            ty: Ty::Concrete(Type::None),
+                            line,
+                            col,
+                        })
+                    })
+                    .collect(),
+            );
+        }
         let accepts_key = matches!(builtin, Builtin::Max | Builtin::Min | Builtin::Sorted);
         let accepts_reverse = builtin == Builtin::Sorted;
         let none = || HExpr {

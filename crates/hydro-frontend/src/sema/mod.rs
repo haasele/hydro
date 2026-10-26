@@ -3259,6 +3259,33 @@ impl<'a> Checker<'a> {
                 // attribute access (`.__class__.__name__`).
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
             }
+            Builtin::Classmethod | Builtin::Staticmethod => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!(
+                            "{}() takes exactly 1 argument ({count} given)",
+                            builtin.name()
+                        ),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
+            Builtin::Property => {
+                if count == 0 || count > 4 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("property() takes 1 to 4 arguments ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
             Builtin::ByteArray | Builtin::MemoryView => {
                 // `bytearray()` takes 0 to 3 arguments; `memoryview()` takes
                 // exactly one. Values are dynamically typed byte containers.

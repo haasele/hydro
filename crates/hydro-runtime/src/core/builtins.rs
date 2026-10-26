@@ -50,6 +50,99 @@ pub(crate) fn print(argc: usize, argv: *const i64) -> i64 {
     NONE
 }
 
+/// `print(*args, sep=..., end=..., file=..., flush=...)`.
+///
+/// `sep`/`end` must be `str` or `None` (the defaults); `file` defaults to
+/// stdout and may be any file-like object reachable through its `write`
+/// method; `flush` calls `flush()` on the target after writing. Unknown
+/// keywords and invalid values report a tagged `TypeError` before any output
+/// is produced.
+pub(crate) fn print_with_keywords(
+    argc: usize,
+    argv: *const i64,
+    keywords: &[(String, i64)],
+) -> i64 {
+    let mut sep = String::from(" ");
+    let mut end = String::from("\n");
+    let mut file = NONE;
+    let mut flush = false;
+    for (name, argument) in keywords {
+        match name.as_str() {
+            "sep" | "end" => {
+                let slot = if name == "sep" { &mut sep } else { &mut end };
+                if *argument == NONE {
+                    *slot = if name == "sep" {
+                        String::from(" ")
+                    } else {
+                        String::from("\n")
+                    };
+                    continue;
+                }
+                let Some(text) = value::as_str(*argument) else {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!(
+                            "{name} must be None or a string, not {}",
+                            value::type_name(*argument)
+                        ),
+                    );
+                };
+                *slot = text.to_string();
+            }
+            "file" => file = *argument,
+            "flush" => flush = value::truthy(*argument),
+            _ => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("print() got an unexpected keyword argument '{name}'"),
+                )
+            }
+        }
+    }
+    let args: &[i64] = if argc == 0 || argv.is_null() {
+        &[]
+    } else {
+        // SAFETY: ABI contract: `argv` points at `argc` readable tagged values.
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    };
+    let mut text = String::new();
+    for (index, argument) in args.iter().enumerate() {
+        if index > 0 {
+            text.push_str(&sep);
+        }
+        text.push_str(&value::to_string(*argument));
+    }
+    text.push_str(&end);
+    if file == NONE {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        let _ = stdout.write_all(text.as_bytes());
+        // The existing positional `print` always flushes; keep that behaviour
+        // (and honour an explicit `flush=True`).
+        let _ = stdout.flush();
+        return NONE;
+    }
+    let written = value::str_alloc(text);
+    let arguments = [written];
+    let _ = crate::methods::call(
+        file,
+        b"write".as_ptr(),
+        5,
+        arguments.len(),
+        arguments.as_ptr(),
+    );
+    if exc::pending() {
+        return NONE;
+    }
+    if flush {
+        let _ = crate::methods::call(file, b"flush".as_ptr(), 5, 0, std::ptr::null());
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    NONE
+}
+
 /// `str(v)` as a fresh string object.
 pub(crate) fn to_str(v: i64) -> i64 {
     value::str_alloc(value::to_string(v))
@@ -1635,6 +1728,85 @@ pub(crate) fn call_kw(
                 kw_argv,
             );
         }
+        // `print(*args, sep=..., end=..., file=..., flush=...)` is the only
+        // builtin with runtime keyword parameters.
+        if matches!(&func.body, FunctionBody::Builtin(Builtin::Print)) {
+            let mut keywords: Vec<(String, i64)> = Vec::with_capacity(kwargc);
+            if kwargc > 0 {
+                if kw_argv.is_null() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "keyword arguments were passed without an argument buffer",
+                    );
+                }
+                // SAFETY: `kw_argv` holds `2 * kwargc` readable values.
+                let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+                for pair in pairs.as_chunks::<2>().0 {
+                    let Some(keyword) = value::as_str(pair[0]) else {
+                        return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                    };
+                    keywords.push((keyword.to_string(), pair[1]));
+                }
+            }
+            return print_with_keywords(argc, argv, &keywords);
+        }
+        // Partial application forwards keywords to the wrapped callable:
+        // `classmethod(f)` binds the class positionally and must still accept
+        // `C.f(k=1)`; the same path serves `functools.partial`.
+        if let FunctionBody::Partial {
+            function: inner,
+            args: bound_args,
+            keywords: bound_keywords,
+        } = &func.body
+        {
+            let inner = *inner;
+            let mut merged_args: Vec<i64> = bound_args.clone();
+            if argc > 0 {
+                // SAFETY: NULL checked at entry; `argv..argv+argc` is readable.
+                let supplied = unsafe { std::slice::from_raw_parts(argv, argc) };
+                merged_args.extend_from_slice(supplied);
+            }
+            let mut merged_keywords: Vec<(String, i64)> = bound_keywords.clone();
+            if kwargc > 0 {
+                // SAFETY: `kw_argv` holds `2 * kwargc` readable values.
+                let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+                for pair in pairs.as_chunks::<2>().0 {
+                    let Some(keyword) = value::as_str(pair[0]) else {
+                        return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                    };
+                    if merged_keywords
+                        .iter()
+                        .any(|(existing, _)| existing.as_str() == keyword)
+                    {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!(
+                                "{}() got multiple values for keyword argument '{keyword}'",
+                                func.name
+                            ),
+                        );
+                    }
+                    merged_keywords.push((keyword.to_string(), pair[1]));
+                }
+            }
+            let mut roots_source = merged_args.clone();
+            roots_source.extend(merged_keywords.iter().map(|(_, item)| *item));
+            let roots = crate::heap::root_values(&roots_source);
+            let mut pairs: Vec<i64> = Vec::with_capacity(merged_keywords.len() * 2);
+            for (keyword, item) in &merged_keywords {
+                pairs.push(value::str_alloc(keyword.clone()));
+                pairs.push(*item);
+            }
+            let result = call_kw(
+                inner,
+                merged_args.len(),
+                merged_args.as_ptr(),
+                merged_keywords.len(),
+                pairs.as_ptr(),
+            );
+            crate::heap::release_roots(roots);
+            return result;
+        }
     }
     let Some(func) = value::as_function(function) else {
         return exc::raise_with_message(
@@ -2247,6 +2419,23 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
         Builtin::Bytes => bytes_build(argc, argv),
         Builtin::ByteArray => bytearray_build(argc, argv),
         Builtin::MemoryView => memoryview_build(argc, argv),
+        Builtin::Classmethod => match args {
+            [target] => value::classmethod_new(*target),
+            _ => builtin_arity_error("classmethod", "exactly one", argc),
+        },
+        Builtin::Staticmethod => match args {
+            [target] => value::staticmethod_new(*target),
+            _ => builtin_arity_error("staticmethod", "exactly one", argc),
+        },
+        // `property(fget[, fset[, fdel[, doc]]])`. The doc argument is
+        // accepted and not stored (Hydro function values carry no docstring).
+        Builtin::Property => match args {
+            [getter] => value::property_new(*getter, NONE, NONE),
+            [getter, setter] => value::property_new(*getter, *setter, NONE),
+            [getter, setter, deleter] => value::property_new(*getter, *setter, *deleter),
+            [getter, setter, deleter, _doc] => value::property_new(*getter, *setter, *deleter),
+            _ => builtin_arity_error("property", "1 to 4", argc),
+        },
         Builtin::Zip => zip(argc, argv),
         Builtin::Set => match args {
             [] => container::set_new(0, std::ptr::null()),
@@ -5171,5 +5360,125 @@ mod tests {
         assert_eq!(heap_hash, hash(same));
         assert_eq!(rendered(hash(int(7))), rendered(hash(big("7"))));
         assert!(!exc::pending());
+    }
+
+    thread_local! {
+        static SINK: std::cell::RefCell<(String, usize)> =
+            const { std::cell::RefCell::new((String::new(), 0)) };
+    }
+
+    extern "C" fn sink_write(args: *const i64) -> i64 {
+        // SAFETY: called with `(self, text)`.
+        let values = unsafe { std::slice::from_raw_parts(args, 2) };
+        SINK.with(|sink| sink.borrow_mut().0.push_str(&value::to_string(values[1])));
+        NONE
+    }
+
+    extern "C" fn sink_flush(_args: *const i64) -> i64 {
+        SINK.with(|sink| sink.borrow_mut().1 += 1);
+        NONE
+    }
+
+    fn sink_instance() -> i64 {
+        let class = value::class_new_full(
+            "Sink".to_string(),
+            NONE,
+            vec![
+                (
+                    "write".to_string(),
+                    value::function_new(sink_write as *const () as usize, 2, "write".to_string()),
+                    MethodKind::Normal,
+                ),
+                (
+                    "flush".to_string(),
+                    value::function_new(sink_flush as *const () as usize, 1, "flush".to_string()),
+                    MethodKind::Normal,
+                ),
+            ],
+            Vec::new(),
+        );
+        value::instance_new(class)
+    }
+
+    #[test]
+    fn print_keywords_write_to_file_with_sep_end_and_flush() {
+        crate::exc::init();
+        SINK.with(|sink| *sink.borrow_mut() = (String::new(), 0));
+        let sink = sink_instance();
+        let print_function = value::builtin_function_new(Builtin::Print);
+        let args = [int(1), string("x")];
+
+        // sep/end/file/flush are honoured; the call returns None.
+        let keywords = [
+            string("sep"),
+            string("-"),
+            string("end"),
+            string("!"),
+            string("file"),
+            sink,
+            string("flush"),
+            TRUE,
+        ];
+        let result = call_kw(
+            print_function,
+            args.len(),
+            args.as_ptr(),
+            4,
+            keywords.as_ptr(),
+        );
+        assert_eq!(result, NONE);
+        assert!(!crate::exc::pending());
+        SINK.with(|sink| {
+            let state = sink.borrow();
+            assert_eq!(state.0, "1-x!");
+            assert_eq!(state.1, 1);
+        });
+
+        // `sep=None`/`end=None` mean the defaults.
+        SINK.with(|sink| *sink.borrow_mut() = (String::new(), 0));
+        let keywords = [
+            string("sep"),
+            NONE,
+            string("end"),
+            NONE,
+            string("file"),
+            sink,
+        ];
+        let _ = call_kw(
+            print_function,
+            args.len(),
+            args.as_ptr(),
+            3,
+            keywords.as_ptr(),
+        );
+        assert!(!crate::exc::pending());
+        SINK.with(|sink| assert_eq!(sink.borrow().0, "1 x\n"));
+
+        // Non-string sep is a tagged TypeError, before any output.
+        crate::exc::clear();
+        SINK.with(|sink| *sink.borrow_mut() = (String::new(), 0));
+        let keywords = [string("sep"), int(1), string("file"), sink];
+        let _ = call_kw(
+            print_function,
+            args.len(),
+            args.as_ptr(),
+            2,
+            keywords.as_ptr(),
+        );
+        assert_eq!(crate::exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        SINK.with(|sink| assert_eq!(sink.borrow().0, ""));
+        crate::exc::clear();
+
+        // Unknown keyword is a tagged TypeError.
+        let keywords = [string("bogus"), int(1)];
+        let _ = call_kw(
+            print_function,
+            args.len(),
+            args.as_ptr(),
+            1,
+            keywords.as_ptr(),
+        );
+        assert_eq!(crate::exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        crate::exc::clear();
     }
 }

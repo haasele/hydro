@@ -131,6 +131,9 @@ pub(crate) fn call(
     if value::as_super(obj).is_some() {
         return super_method(obj, &method, &args);
     }
+    if value::as_descriptor(obj).is_some() {
+        return descriptor_value_method(obj, &method, &args);
+    }
     if let Some(bytes) = value::as_bytes(obj) {
         // Same rule as for strings: copy the payload out first.
         return bytes_method(obj, bytes.to_vec(), &method, &args);
@@ -429,6 +432,11 @@ fn is_data_descriptor(entry: &value::ClassEntry) -> bool {
         value::ClassEntry::Method(MethodKind::Property, _) => true,
         value::ClassEntry::Method(_, _) => false,
         value::ClassEntry::Attr(value) => {
+            if let Some(state) = value::as_descriptor(*value) {
+                // Only `property` is a data descriptor; `classmethod` and
+                // `staticmethod` are non-data descriptors.
+                return state.kind == value::DescriptorKind::Property;
+            }
             descriptor_method(*value, "__set__").is_some()
                 || descriptor_method(*value, "__delete__").is_some()
         }
@@ -480,9 +488,89 @@ fn descriptor_method(value: i64, name: &str) -> Option<(i64, MethodKind, i64)> {
     }
 }
 
+/// Binds a built-in descriptor value for an instance/class access.
+///
+/// `classmethod` produces a partial applying the owner class, `staticmethod`
+/// returns its target unchanged, and `property` evaluates its getter for an
+/// instance (class access returns the property object itself).
+fn bind_builtin_descriptor(
+    descriptor: i64,
+    state: &value::DescriptorState,
+    instance: i64,
+    owner: i64,
+) -> i64 {
+    match state.kind {
+        value::DescriptorKind::Classmethod => value::partial_new(state.target, vec![owner]),
+        value::DescriptorKind::Staticmethod => state.target,
+        value::DescriptorKind::Property => {
+            if instance == NONE {
+                return descriptor;
+            }
+            call_receiver_callable(state.target, instance, owner, "property", &[])
+        }
+    }
+}
+
+/// Calls a callable with `receiver` bound as its first positional argument.
+///
+/// Generated functions bind through the keyword binder (so defaults and
+/// keyword-only slots apply); native callables and classes receive the
+/// receiver directly.
+fn call_receiver_callable(
+    target: i64,
+    receiver: i64,
+    owner: i64,
+    method: &str,
+    args: &[i64],
+) -> i64 {
+    if !value::function_signature(target).is_empty() && value::function_full_entry(target) != 0 {
+        return call_user_method_kw(
+            receiver,
+            owner,
+            MethodKind::Normal,
+            target,
+            method,
+            args,
+            &KeywordArgs { items: Vec::new() },
+        );
+    }
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.push(receiver);
+    call_args.extend_from_slice(args);
+    builtins::call(target, call_args.len(), call_args.as_ptr())
+}
+
+/// Methods of a built-in descriptor value: `property.getter/setter/deleter`.
+fn descriptor_value_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    let Some(state) = value::as_descriptor(obj) else {
+        return attribute_error(obj, method);
+    };
+    if state.kind != value::DescriptorKind::Property {
+        return attribute_error(obj, method);
+    }
+    match method {
+        "getter" | "setter" | "deleter" => {
+            if let Some(err) = check_arity("property", method, args.len(), 1, 1) {
+                return err;
+            }
+            match method {
+                "getter" => value::property_new(args[0], state.setter, state.deleter),
+                "setter" => value::property_new(state.target, args[0], state.deleter),
+                _ => value::property_new(state.target, state.setter, args[0]),
+            }
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
 /// Calls `value.__get__(instance, owner)` when the object implements the
 /// descriptor protocol. `None` means "not a descriptor".
 fn descriptor_get(value: i64, instance: i64, owner: i64) -> Option<i64> {
+    // Built-in `classmethod`/`staticmethod`/`property` values have their own
+    // binding rules.
+    if let Some(state) = value::as_descriptor(value) {
+        return Some(bind_builtin_descriptor(value, state, instance, owner));
+    }
     let (class, kind, function) = descriptor_method(value, "__get__")?;
     let args = [instance, owner];
     Some(call_descriptor(
@@ -1432,6 +1520,16 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         }
         return attribute_error(obj, &attr);
     }
+    if let Some(state) = value::as_descriptor(obj) {
+        // `property` exposes `getter`/`setter`/`deleter` returning new
+        // property objects; the other descriptor kinds have no methods.
+        return match attr.as_str() {
+            "getter" | "setter" | "deleter" if state.kind == value::DescriptorKind::Property => {
+                value::bound_method_new(obj, attr)
+            }
+            _ => attribute_error(obj, &attr),
+        };
+    }
     if value::as_bytearray(obj).is_some() {
         if matches!(
             attr.as_str(),
@@ -1543,6 +1641,24 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
                     );
                 }
                 value::ClassEntry::Attr(descriptor) => {
+                    if let Some(state) = value::as_descriptor(*descriptor) {
+                        if state.kind == value::DescriptorKind::Property {
+                            if state.setter == NONE {
+                                let name = value::instance_class_name(obj).unwrap_or("object");
+                                return exc::raise_with_message(
+                                    ATTRIBUTE_ERROR,
+                                    &format!("property '{attr}' of '{name}' object has no setter"),
+                                );
+                            }
+                            return call_receiver_callable(
+                                state.setter,
+                                obj,
+                                class,
+                                "property",
+                                &[new_value],
+                            );
+                        }
+                    }
                     if let Some(result) = descriptor_set(*descriptor, obj, class, new_value) {
                         return result;
                     }
@@ -1585,6 +1701,11 @@ pub(crate) fn delete_attr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     };
     if let Some(class) = value::instance_class_value(obj) {
         if let Some(value::ClassEntry::Attr(descriptor)) = value::class_lookup(class, &attr) {
+            if let Some(state) = value::as_descriptor(descriptor) {
+                if state.kind == value::DescriptorKind::Property && state.deleter != NONE {
+                    return call_receiver_callable(state.deleter, obj, class, "property", &[]);
+                }
+            }
             if descriptor_method(descriptor, "__delete__").is_some() {
                 if let Some(result) = descriptor_delete(descriptor, obj, class) {
                     return result;
@@ -6056,5 +6177,132 @@ mod tests {
         // Non-instance receivers report AttributeError.
         assert_eq!(delete_attr(int(1), "value".as_ptr(), 5), NONE);
         assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+    }
+
+    #[test]
+    fn builtin_descriptor_values_bind_like_python() {
+        reset();
+        let entry = |name: &str, arity: usize| {
+            value::function_new(
+                first_argument as *const () as usize,
+                arity,
+                name.to_string(),
+            )
+        };
+        let wrapped_class = value::class_new("Alias".to_string(), NONE, Vec::new());
+        let cm_target = entry("cm", 1);
+        let sm_target = entry("sm", 1);
+        let pr_get = entry("pr", 1);
+        let prw_get = entry("prw", 1);
+        let prw_set = entry("prw_set", 2);
+        assert_eq!(
+            value::type_name(value::classmethod_new(sm_target)),
+            "classmethod"
+        );
+        assert_eq!(
+            value::type_name(value::staticmethod_new(sm_target)),
+            "staticmethod"
+        );
+        assert_eq!(
+            value::to_string(value::property_new(pr_get, NONE, NONE)),
+            "<property object>"
+        );
+        let class = value::class_new_full(
+            "Descriptors".to_string(),
+            NONE,
+            Vec::new(),
+            vec![
+                ("cm".to_string(), value::classmethod_new(cm_target)),
+                ("sm".to_string(), value::staticmethod_new(sm_target)),
+                ("pr".to_string(), value::property_new(pr_get, NONE, NONE)),
+                (
+                    "prw".to_string(),
+                    value::property_new(prw_get, prw_set, NONE),
+                ),
+                (
+                    "__class_getitem__".to_string(),
+                    value::classmethod_new(wrapped_class),
+                ),
+            ],
+        );
+        let instance = value::instance_new(class);
+
+        // classmethod binds the owner class, through the instance and the class.
+        let bound = getattr(instance, b"cm".as_ptr(), 2);
+        assert_eq!(crate::builtins::call(bound, 0, std::ptr::null()), class);
+        let class_bound = getattr(class, b"cm".as_ptr(), 2);
+        assert_eq!(
+            crate::builtins::call(class_bound, 0, std::ptr::null()),
+            class
+        );
+
+        // staticmethod returns its target unchanged on both accesses.
+        assert_eq!(getattr(instance, b"sm".as_ptr(), 2), sm_target);
+        assert_eq!(getattr(class, b"sm".as_ptr(), 2), sm_target);
+
+        // property getter receives the instance; class access exposes the
+        // property object itself.
+        assert_eq!(getattr(instance, b"pr".as_ptr(), 2), instance);
+        assert_eq!(
+            value::to_string(getattr(class, b"pr".as_ptr(), 2)),
+            "<property object>"
+        );
+        super::setattr(instance, b"pr".as_ptr(), 2, int(1));
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        crate::exc::clear();
+
+        // A property with a setter forwards the assigned value.
+        assert_eq!(
+            super::setattr(instance, b"prw".as_ptr(), 3, int(7)),
+            instance
+        );
+        assert!(!crate::exc::pending());
+        assert_eq!(getattr(instance, b"prw".as_ptr(), 3), instance);
+
+        // `.getter/.setter/.deleter` derive new property objects.
+        let pr_object = getattr(class, b"pr".as_ptr(), 2);
+        let getter_arg = [pr_get];
+        let derived_getter = call(pr_object, b"getter".as_ptr(), 6, 1, getter_arg.as_ptr());
+        assert_eq!(value::type_name(derived_getter), "property");
+        let setter_arg = [prw_set];
+        let derived_setter = call(pr_object, b"setter".as_ptr(), 6, 1, setter_arg.as_ptr());
+        assert_eq!(value::type_name(derived_setter), "property");
+        assert!(value::class_set_attr(
+            class,
+            "derived".to_string(),
+            derived_setter
+        ));
+        assert_eq!(
+            super::setattr(instance, b"derived".as_ptr(), 7, int(3)),
+            instance
+        );
+        assert!(!crate::exc::pending());
+
+        // `classmethod(SomeClass)` (the `__class_getitem__ = classmethod(...)`
+        // shape) binds the owner class as the first forwarded argument.
+        let alias = getattr(
+            instance,
+            b"__class_getitem__".as_ptr(),
+            b"__class_getitem__".len(),
+        );
+        match value::as_function(alias).map(|function| &function.body) {
+            Some(value::FunctionBody::Partial { function, args, .. }) => {
+                assert_eq!(*function, wrapped_class);
+                assert_eq!(args.as_slice(), &[class]);
+            }
+            _ => panic!("classmethod(class) must produce a class-bound partial"),
+        }
+        // The binding helper relies on `partial_new` accepting a class target:
+        // assert that invariant directly so a future special case cannot route
+        // class targets away from the partial representation.
+        let direct = value::partial_new(wrapped_class, vec![class]);
+        match value::as_function(direct).map(|function| &function.body) {
+            Some(value::FunctionBody::Partial { function, args, .. }) => {
+                assert_eq!(*function, wrapped_class);
+                assert_eq!(args.as_slice(), &[class]);
+            }
+            _ => panic!("partial_new must keep a class target as a partial"),
+        }
+        assert!(!crate::exc::pending());
     }
 }

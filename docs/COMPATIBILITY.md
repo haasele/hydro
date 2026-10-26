@@ -30,23 +30,23 @@ Machine-readable results are written to `benchmarks/compat/latest.json`.
 
 <!-- BEGIN GENERATED TABLE -->
 
-Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` · binary `/mnt/Vault/GitHub/tea/target/release/tea`
+Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` · binary `/mnt/Vault/GitHub/tea/target/debug/tea`
 
 ## Summary
 
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
-| builtin/frozen | 52 | 13 | 39 |
-| pure | 174 | 45 | 129 |
+| builtin/frozen | 52 | 27 | 25 |
+| pure | 174 | 46 | 128 |
 | extension | 63 | 5 | 58 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 63 | 234 |
+| **Total** | 297 | 78 | 219 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:HYD0002 | 225 |
+| compile_error:HYD0002 | 210 |
 | cpython_failed | 9 |
 
 ## Modules by layer
@@ -57,52 +57,52 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | --- | --- | --- | --- | --- |
 | `_abc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_abc' not found: not supported on the import search path |
 | `_ast` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_ast' not found: not supported on the import search path |
-| `_codecs` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_codecs' not found: not supported on the import search path |
-| `_collections` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_collections' not found: not supported on the import search path |
-| `_collections_abc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_collections_abc' not found: not supported on the import search p… |
+| `_codecs` | ok | ok | ok | - |
+| `_collections` | ok | ok | ok | - |
+| `_collections_abc` | ok | ok | ok | - |
 | `_contextvars` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_contextvars' not found: not supported on the import search path |
 | `_datetime` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_datetime' not found: not supported on the import search path |
 | `_frozen_importlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_frozen_importlib' not found: not supported on the import search… |
 | `_frozen_importlib_external` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_frozen_importlib_external' not found: not supported on the impor… |
 | `_functools` | ok | ok | ok | - |
-| `_imp` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_imp' not found: not supported on the import search path |
+| `_imp` | ok | ok | ok | - |
 | `_io` | ok | ok | ok | - |
 | `_locale` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_locale' not found: not supported on the import search path |
-| `_opcode` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_opcode' not found: not supported on the import search path |
+| `_opcode` | ok | ok | ok | - |
 | `_operator` | ok | ok | ok | - |
 | `_signal` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_signal' not found: not supported on the import search path |
 | `_sitebuiltins` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sitebuiltins' not found: not supported on the import search path |
 | `_sre` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sre' not found: not supported on the import search path |
 | `_stat` | ok | ok | ok | - |
-| `_string` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_string' not found: not supported on the import search path |
+| `_string` | ok | ok | ok | - |
 | `_suggestions` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_suggestions' not found: not supported on the import search path |
 | `_symtable` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_symtable' not found: not supported on the import search path |
 | `_sysconfig` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sysconfig' not found: not supported on the import search path |
 | `_thread` | ok | ok | ok | - |
-| `_tokenize` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tokenize' not found: not supported on the import search path |
+| `_tokenize` | ok | ok | ok | - |
 | `_tracemalloc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
 | `_types` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_types' not found: not supported on the import search path |
 | `_typing` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_typing' not found: not supported on the import search path |
-| `_warnings` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_warnings' not found: not supported on the import search path |
-| `_weakref` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_weakref' not found: not supported on the import search path |
+| `_warnings` | ok | ok | ok | - |
+| `_weakref` | ok | ok | ok | - |
 | `abc` | ok | ok | ok | - |
-| `atexit` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'atexit' not found: not supported on the import search path |
-| `builtins` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'builtins' not found: not supported on the import search path |
+| `atexit` | ok | ok | ok | - |
+| `builtins` | ok | ok | ok | - |
 | `codecs` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'codecs' not found: not supported on the import search path |
 | `errno` | ok | ok | ok | - |
 | `faulthandler` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
-| `gc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'gc' not found: not supported on the import search path |
+| `gc` | ok | ok | ok | - |
 | `genericpath` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'genericpath' not found: not supported on the import search path |
 | `io` | ok | ok | ok | - |
 | `itertools` | ok | ok | ok | - |
-| `marshal` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'marshal' not found: not supported on the import search path |
+| `marshal` | ok | ok | ok | - |
 | `ntpath` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'ntpath' not found: not supported on the import search path |
 | `os` | ok | ok | ok | - |
 | `posix` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'posix' not found: not supported on the import search path |
 | `posixpath` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'posixpath' not found: not supported on the import search path |
 | `pwd` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pwd' not found: not supported on the import search path |
 | `runpy` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'runpy' not found: not supported on the import search path |
-| `site` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'site' not found: not supported on the import search path |
+| `site` | ok | ok | ok | - |
 | `stat` | ok | ok | ok | - |
 | `sys` | ok | ok | ok | - |
 | `time` | ok | ok | ok | - |
@@ -276,7 +276,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `urllib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'urllib' not found: not supported on the import search path |
 | `uuid` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'uuid' not found: not supported on the import search path |
 | `venv` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'venv' not found: not supported on the import search path |
-| `warnings` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'warnings' not found: not supported on the import search path |
+| `warnings` | ok | ok | ok | - |
 | `wave` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'wave' not found: not supported on the import search path |
 | `weakref` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'weakref' not found: not supported on the import search path |
 | `webbrowser` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'webbrowser' not found: not supported on the import search path |

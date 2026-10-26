@@ -1,13 +1,13 @@
 {
   "meta": {
-    "date": "2026-10-25T23:35:03Z",
+    "date": "2026-10-26T04:09:33Z",
     "python": "CPython 3.14.9",
     "python_version": "3.14.9",
     "python_executable": "/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14",
     "python_target": "3.14.9",
     "python_pinned": true,
     "tea": {
-      "path": "/mnt/Vault/GitHub/tea/target/release/tea",
+      "path": "/mnt/Vault/GitHub/tea/target/debug/tea",
       "version": "tea 0.1.0"
     },
     "options": {
@@ -16,27 +16,27 @@
       "only": null,
       "tests": null
     },
-    "cwd": "/mnt/Vault/GitHub/tea",
-    "elapsed_seconds": 4.6,
+    "cwd": "/mnt/Vault/GitHub/hydro",
+    "elapsed_seconds": 5.4,
     "counts": {
       "total": 297,
-      "ok": 63,
-      "failed": 234,
+      "ok": 78,
+      "failed": 219,
       "by_status": {
-        "compile_error:HYD0002": 225,
+        "compile_error:HYD0002": 210,
         "cpython_failed": 9,
-        "ok": 63
+        "ok": 78
       },
       "by_layer": {
         "builtin/frozen": {
           "total": 52,
-          "ok": 13,
-          "failed": 39
+          "ok": 27,
+          "failed": 25
         },
         "pure": {
           "total": 174,
-          "ok": 45,
-          "failed": 129
+          "ok": 46,
+          "failed": 128
         },
         "extension": {
           "total": 63,
@@ -59,13 +59,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 10.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.5,
+        "duration_ms": 11.4,
         "error": null
       },
       "status": "ok",
@@ -78,13 +78,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.5
+        "duration_ms": 9.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 2.9,
         "error": "error[HYD0002]: module '_abc' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -97,13 +97,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 23.9
+        "duration_ms": 11.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 3.0,
         "error": "error[HYD0002]: module '_aix_support' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -116,13 +116,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.7
+        "duration_ms": 12.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 3.0,
         "error": "error[HYD0002]: module '_android_support' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -135,13 +135,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 9.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_apple_support' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -154,13 +154,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.4
+        "duration_ms": 11.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module '_ast' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -173,13 +173,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.6
+        "duration_ms": 16.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module '_ast_unparse' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -192,13 +192,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 42.2
+        "duration_ms": 55.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.9,
         "error": "error[HYD0002]: module '_asyncio' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -217,7 +217,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 10.4,
         "error": null
       },
       "status": "ok",
@@ -230,13 +230,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 9.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_blake2' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -249,13 +249,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.4
+        "duration_ms": 8.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_bz2' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -268,17 +268,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 8.9
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
-        "error": "error[HYD0002]: module '_codecs' not found: not supported on the import search path"
+        "duration_ms": 10.5,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_codecs' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_codecs_cn",
@@ -287,13 +287,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module '_codecs_cn' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -306,13 +306,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 9.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_codecs_hk' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -325,13 +325,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_codecs_iso2022' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -344,13 +344,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.3
+        "duration_ms": 7.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module '_codecs_jp' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -363,13 +363,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 9.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_codecs_kr' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -382,13 +382,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 8.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module '_codecs_tw' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -401,17 +401,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 7.9
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.3,
-        "error": "error[HYD0002]: module '_collections' not found: not supported on the import search path"
+        "duration_ms": 9.8,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_collections' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_collections_abc",
@@ -420,17 +420,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 9.7
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.2,
-        "error": "error[HYD0002]: module '_collections_abc' not found: not supported on the import search path"
+        "duration_ms": 9.7,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_collections_abc' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_colorize",
@@ -439,13 +439,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 21.5
+        "duration_ms": 22.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_colorize' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -458,13 +458,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 8.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module '_compat_pickle' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -477,13 +477,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.5
+        "duration_ms": 8.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module '_contextvars' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -496,13 +496,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 9.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_csv' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -515,13 +515,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 3.2,
         "error": "error[HYD0002]: module '_ctypes' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -534,13 +534,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 60.0
+        "duration_ms": 8.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_curses' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -553,13 +553,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 9.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_curses_panel' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -572,13 +572,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 9.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module '_datetime' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -591,13 +591,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 12.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_dbm' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -610,13 +610,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.2
+        "duration_ms": 9.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module '_decimal' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -629,13 +629,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.0
+        "duration_ms": 16.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 3.2,
         "error": "error[HYD0002]: module '_elementtree' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -648,13 +648,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.1
+        "duration_ms": 9.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module '_frozen_importlib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -667,13 +667,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.1
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module '_frozen_importlib_external' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -686,13 +686,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 9.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 11.3,
         "error": null
       },
       "status": "ok",
@@ -705,13 +705,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 24.4
+        "duration_ms": 25.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_gdbm' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -724,13 +724,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.4
+        "duration_ms": 9.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_hashlib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -743,13 +743,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.5
+        "duration_ms": 7.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 9.5,
         "error": null
       },
       "status": "ok",
@@ -762,13 +762,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_hmac' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -781,17 +781,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 7.8
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.1,
-        "error": "error[HYD0002]: module '_imp' not found: not supported on the import search path"
+        "duration_ms": 8.8,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_imp' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_interpchannels",
@@ -800,13 +800,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 7.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module '_interpchannels' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -819,13 +819,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4
+        "duration_ms": 8.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module '_interpqueues' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -838,13 +838,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 9.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_interpreters' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -857,13 +857,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 10.4,
         "error": null
       },
       "status": "ok",
@@ -876,13 +876,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 33.2
+        "duration_ms": 34.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_ios_support' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -895,13 +895,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 8.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_json' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -914,13 +914,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.5
+        "duration_ms": 8.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 3.3,
         "error": "error[HYD0002]: module '_locale' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -933,13 +933,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 9.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 3.2,
         "error": "error[HYD0002]: module '_lsprof' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -952,13 +952,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 9.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module '_lzma' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -971,13 +971,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.3
+        "duration_ms": 13.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module '_markupbase' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -990,13 +990,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 8.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_md5' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1009,13 +1009,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module '_multibytecodec' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1028,13 +1028,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 10.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.9,
         "error": "error[HYD0002]: module '_multiprocessing' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1047,17 +1047,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 9.1
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.1,
-        "error": "error[HYD0002]: module '_opcode' not found: not supported on the import search path"
+        "duration_ms": 10.3,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_opcode' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_opcode_metadata",
@@ -1066,13 +1066,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 10.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module '_opcode_metadata' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1085,13 +1085,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 9.8,
         "error": null
       },
       "status": "ok",
@@ -1110,7 +1110,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_osx_support' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1123,13 +1123,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 26.2
+        "duration_ms": 26.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module '_overlapped' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -1142,13 +1142,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.8
+        "duration_ms": 10.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module '_pickle' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1161,13 +1161,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module '_posixshmem' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1180,13 +1180,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 7.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_posixsubprocess' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1199,13 +1199,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.6
+        "duration_ms": 9.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module '_py_abc' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1218,13 +1218,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.9
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module '_py_warnings' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1237,13 +1237,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.5
+        "duration_ms": 12.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_pydatetime' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1256,13 +1256,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.4
+        "duration_ms": 17.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_pydecimal' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1275,13 +1275,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 11.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.9,
         "error": "error[HYD0002]: module '_pyio' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1294,13 +1294,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.6
+        "duration_ms": 18.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 3.6,
         "error": "error[HYD0002]: module '_pylong' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1313,13 +1313,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.2
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module '_pyrepl' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1332,13 +1332,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 9.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module '_queue' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1351,13 +1351,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 9.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_random' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1370,13 +1370,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.8
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_remote_debugging' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1389,13 +1389,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 26.7
+        "duration_ms": 25.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_scproxy' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -1408,13 +1408,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module '_sha1' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1427,13 +1427,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.5
+        "duration_ms": 9.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module '_sha2' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1446,13 +1446,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 10.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_sha3' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1465,13 +1465,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 8.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module '_signal' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1484,13 +1484,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_sitebuiltins' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1503,13 +1503,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 8.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_socket' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1522,13 +1522,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.4
+        "duration_ms": 11.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module '_sqlite3' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1541,13 +1541,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 8.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module '_sre' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1560,13 +1560,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.5
+        "duration_ms": 9.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_ssl' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1579,13 +1579,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 10.9,
         "error": null
       },
       "status": "ok",
@@ -1598,13 +1598,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.9
+        "duration_ms": 8.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_statistics' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1617,17 +1617,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 8.5
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
-        "error": "error[HYD0002]: module '_string' not found: not supported on the import search path"
+        "duration_ms": 10.0,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_string' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_strptime",
@@ -1636,13 +1636,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 21.1
+        "duration_ms": 18.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_strptime' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1655,13 +1655,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 9.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module '_struct' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1674,13 +1674,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.6
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module '_suggestions' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1693,13 +1693,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 7.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module '_symtable' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1712,13 +1712,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.4
+        "duration_ms": 8.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_sysconfig' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1731,13 +1731,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 8.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 9.6,
         "error": null
       },
       "status": "ok",
@@ -1750,13 +1750,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.4
+        "duration_ms": 13.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_threading_local' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1769,13 +1769,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.7
+        "duration_ms": 18.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 3.0,
         "error": "error[HYD0002]: module '_tkinter' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1791,14 +1791,14 @@
         "duration_ms": 9.1
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.3,
-        "error": "error[HYD0002]: module '_tokenize' not found: not supported on the import search path"
+        "duration_ms": 10.2,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_tokenize' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_tracemalloc",
@@ -1807,13 +1807,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 8.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1826,13 +1826,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.3
+        "duration_ms": 8.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_types' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1845,13 +1845,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_typing' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1864,13 +1864,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_uuid' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1883,17 +1883,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.3
+        "duration_ms": 9.1
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.0,
-        "error": "error[HYD0002]: module '_warnings' not found: not supported on the import search path"
+        "duration_ms": 10.3,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_warnings' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_weakref",
@@ -1902,17 +1902,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.1
+        "duration_ms": 8.0
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.1,
-        "error": "error[HYD0002]: module '_weakref' not found: not supported on the import search path"
+        "duration_ms": 8.8,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_weakref' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_weakrefset",
@@ -1921,13 +1921,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.5
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module '_weakrefset' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1946,7 +1946,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module '_winapi' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -1959,13 +1959,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 24.1
+        "duration_ms": 26.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module '_wmi' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -1978,13 +1978,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.9
+        "duration_ms": 16.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_zoneinfo' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1997,13 +1997,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 7.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module '_zstd' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2022,7 +2022,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 10.0,
         "error": null
       },
       "status": "ok",
@@ -2035,13 +2035,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.6
+        "duration_ms": 11.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'annotationlib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2054,13 +2054,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 195.9
+        "duration_ms": 185.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'antigravity' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2073,13 +2073,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.7
+        "duration_ms": 14.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 10.7,
         "error": null
       },
       "status": "ok",
@@ -2092,13 +2092,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.2
+        "duration_ms": 11.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'array' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2111,13 +2111,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.4
+        "duration_ms": 10.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 11.5,
         "error": null
       },
       "status": "ok",
@@ -2130,13 +2130,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 48.4
+        "duration_ms": 45.9
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 10.0,
         "error": null
       },
       "status": "ok",
@@ -2149,17 +2149,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 8.4
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
-        "error": "error[HYD0002]: module 'atexit' not found: not supported on the import search path"
+        "duration_ms": 10.8,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module 'atexit' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "base64",
@@ -2168,13 +2168,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.2
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.8,
+        "duration_ms": 8.9,
         "error": null
       },
       "status": "ok",
@@ -2187,13 +2187,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 28.1
+        "duration_ms": 22.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'bdb' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2206,13 +2206,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 12.3,
         "error": null
       },
       "status": "ok",
@@ -2225,13 +2225,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 10.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 10.9,
         "error": null
       },
       "status": "ok",
@@ -2244,17 +2244,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 9.5
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.5,
-        "error": "error[HYD0002]: module 'builtins' not found: not supported on the import search path"
+        "duration_ms": 9.2,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module 'builtins' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "bz2",
@@ -2263,13 +2263,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.4
+        "duration_ms": 8.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'bz2' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2282,13 +2282,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.3
+        "duration_ms": 12.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'cProfile' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2301,13 +2301,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.3
+        "duration_ms": 13.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'calendar' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2320,13 +2320,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 10.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 3.3,
         "error": "error[HYD0002]: module 'cmath' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2339,13 +2339,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 11.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'cmd' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2358,13 +2358,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 27.7
+        "duration_ms": 28.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'code' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2377,13 +2377,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'codecs' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2396,13 +2396,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 8.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'codeop' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2415,13 +2415,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 10.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 10.2,
         "error": null
       },
       "status": "ok",
@@ -2434,13 +2434,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 9.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 9.6,
         "error": null
       },
       "status": "ok",
@@ -2453,13 +2453,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 31.6
+        "duration_ms": 31.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module 'compileall' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2472,13 +2472,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'compression' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2491,13 +2491,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 9.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 3.1,
         "error": "error[HYD0002]: module 'concurrent' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2510,13 +2510,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.3
+        "duration_ms": 16.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 3.0,
         "error": "error[HYD0002]: module 'configparser' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2529,13 +2529,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.5
+        "duration_ms": 11.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 10.8,
         "error": null
       },
       "status": "ok",
@@ -2548,13 +2548,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'contextvars' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2567,13 +2567,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 10.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 3.1,
         "error": "error[HYD0002]: module 'copy' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2586,13 +2586,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.5
+        "duration_ms": 8.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'copyreg' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2605,13 +2605,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.7
+        "duration_ms": 8.9
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 3.2,
+        "duration_ms": 10.0,
         "error": null
       },
       "status": "ok",
@@ -2624,13 +2624,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.6
+        "duration_ms": 10.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'ctypes' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2643,13 +2643,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.5
+        "duration_ms": 8.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'curses' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2662,13 +2662,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 22.4
+        "duration_ms": 19.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 10.9,
         "error": null
       },
       "status": "ok",
@@ -2681,13 +2681,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 9.0,
         "error": null
       },
       "status": "ok",
@@ -2700,13 +2700,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.5
+        "duration_ms": 10.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'dbm' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2719,13 +2719,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 10.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'decimal' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2738,13 +2738,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.0
+        "duration_ms": 12.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module 'difflib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2757,13 +2757,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 14.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 3.1,
         "error": "error[HYD0002]: module 'dis' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2776,13 +2776,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 68.8
+        "duration_ms": 78.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 3.4,
         "error": "error[HYD0002]: module 'doctest' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2795,13 +2795,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'email' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2814,13 +2814,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'encodings' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2833,13 +2833,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 35.3
+        "duration_ms": 32.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'ensurepip' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2852,13 +2852,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.2
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 10.9,
         "error": null
       },
       "status": "ok",
@@ -2871,13 +2871,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 8.7,
         "error": null
       },
       "status": "ok",
@@ -2890,13 +2890,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 8.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'faulthandler' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2909,13 +2909,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module 'fcntl' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2928,13 +2928,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module 'filecmp' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2947,13 +2947,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 12.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'fileinput' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2966,13 +2966,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.0
+        "duration_ms": 15.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 11.0,
         "error": null
       },
       "status": "ok",
@@ -2985,13 +2985,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.5
+        "duration_ms": 16.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 10.1,
         "error": null
       },
       "status": "ok",
@@ -3004,13 +3004,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.1
+        "duration_ms": 22.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 3.1,
         "error": "error[HYD0002]: module 'ftplib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3023,13 +3023,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.4
+        "duration_ms": 13.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 13.4,
         "error": null
       },
       "status": "ok",
@@ -3042,17 +3042,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 11.1
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.2,
-        "error": "error[HYD0002]: module 'gc' not found: not supported on the import search path"
+        "duration_ms": 11.9,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module 'gc' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "genericpath",
@@ -3061,13 +3061,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 9.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'genericpath' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3080,13 +3080,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.8
+        "duration_ms": 10.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 9.7,
         "error": null
       },
       "status": "ok",
@@ -3099,13 +3099,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.9
+        "duration_ms": 11.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'getpass' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3118,13 +3118,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.4
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'gettext' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3137,13 +3137,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.1
+        "duration_ms": 12.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module 'glob' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3156,13 +3156,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.5
+        "duration_ms": 9.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'graphlib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3175,13 +3175,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 8.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'grp' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3194,13 +3194,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.5
+        "duration_ms": 11.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'gzip' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3213,13 +3213,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.0
+        "duration_ms": 10.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'hashlib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3232,13 +3232,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 11.1,
         "error": null
       },
       "status": "ok",
@@ -3251,13 +3251,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.5
+        "duration_ms": 10.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'hmac' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3270,13 +3270,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.4
+        "duration_ms": 15.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 10.8,
         "error": null
       },
       "status": "ok",
@@ -3289,13 +3289,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.5
+        "duration_ms": 10.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'http' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3308,13 +3308,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.3
+        "duration_ms": 10.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module 'idlelib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3327,13 +3327,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 27.1
+        "duration_ms": 27.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'imaplib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3346,13 +3346,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 9.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 10.2,
         "error": null
       },
       "status": "ok",
@@ -3365,13 +3365,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 23.3
+        "duration_ms": 19.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'inspect' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3384,13 +3384,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.9
+        "duration_ms": 9.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 10.2,
         "error": null
       },
       "status": "ok",
@@ -3403,13 +3403,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.3
+        "duration_ms": 15.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 3.0,
         "error": "error[HYD0002]: module 'ipaddress' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3422,13 +3422,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 8.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 9.7,
         "error": null
       },
       "status": "ok",
@@ -3441,13 +3441,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.1
+        "duration_ms": 13.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 9.3,
         "error": null
       },
       "status": "ok",
@@ -3460,13 +3460,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 9.6,
         "error": null
       },
       "status": "ok",
@@ -3479,13 +3479,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.3
+        "duration_ms": 8.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module 'linecache' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3498,13 +3498,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.7
+        "duration_ms": 10.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'locale' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3517,13 +3517,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 26.5
+        "duration_ms": 27.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'logging' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3536,13 +3536,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 10.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 3.0,
         "error": "error[HYD0002]: module 'lzma' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3555,13 +3555,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 35.2
+        "duration_ms": 29.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'mailbox' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3574,17 +3574,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 8.1
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.5,
-        "error": "error[HYD0002]: module 'marshal' not found: not supported on the import search path"
+        "duration_ms": 9.5,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module 'marshal' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "math",
@@ -3593,13 +3593,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.8
+        "duration_ms": 7.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 9.6,
         "error": null
       },
       "status": "ok",
@@ -3612,13 +3612,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.0
+        "duration_ms": 9.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 16.8,
         "error": null
       },
       "status": "ok",
@@ -3631,7 +3631,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 7.7
       },
       "tea": {
         "exit": 1,
@@ -3650,13 +3650,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.5
+        "duration_ms": 11.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'modulefinder' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3669,13 +3669,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 31.3
+        "duration_ms": 24.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'msvcrt' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -3688,13 +3688,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.6
+        "duration_ms": 19.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 10.1,
         "error": null
       },
       "status": "ok",
@@ -3707,13 +3707,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.2
+        "duration_ms": 8.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'netrc' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3726,13 +3726,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 25.1
+        "duration_ms": 26.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'nt' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -3745,7 +3745,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 7.8
       },
       "tea": {
         "exit": 1,
@@ -3764,13 +3764,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.5
+        "duration_ms": 14.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'nturl2path' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3783,13 +3783,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.6
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module 'numbers' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3802,13 +3802,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.8
+        "duration_ms": 7.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'opcode' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3821,13 +3821,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.9
+        "duration_ms": 8.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 9.3,
         "error": null
       },
       "status": "ok",
@@ -3840,13 +3840,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.9
+        "duration_ms": 11.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'optparse' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3859,13 +3859,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 8.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 9.9,
         "error": null
       },
       "status": "ok",
@@ -3884,7 +3884,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 10.4,
         "error": null
       },
       "status": "ok",
@@ -3897,13 +3897,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 53.4
+        "duration_ms": 51.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 3.0,
         "error": "error[HYD0002]: module 'pdb' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3916,13 +3916,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.8
+        "duration_ms": 12.9
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 10.3,
         "error": null
       },
       "status": "ok",
@@ -3935,13 +3935,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.7
+        "duration_ms": 18.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'pickletools' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3954,13 +3954,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.8
+        "duration_ms": 12.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'pkgutil' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -3973,13 +3973,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.6
+        "duration_ms": 13.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 11.0,
         "error": null
       },
       "status": "ok",
@@ -3992,13 +3992,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.0
+        "duration_ms": 17.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'plistlib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4011,13 +4011,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 20.1
+        "duration_ms": 19.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'poplib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4030,13 +4030,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 9.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 2.8,
         "error": "error[HYD0002]: module 'posix' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4049,13 +4049,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'posixpath' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4068,13 +4068,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 10.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'pprint' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4087,13 +4087,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 9.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'profile' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4106,13 +4106,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 20.9
+        "duration_ms": 21.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'pstats' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4125,13 +4125,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 10.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'pty' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4144,13 +4144,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 7.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'pwd' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4163,13 +4163,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 24.6
+        "duration_ms": 26.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'py_compile' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4182,13 +4182,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 12.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'pyclbr' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4201,13 +4201,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 30.2
+        "duration_ms": 32.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 4.0,
         "error": "error[HYD0002]: module 'pydoc' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4220,13 +4220,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 10.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 3.8,
         "error": "error[HYD0002]: module 'pydoc_data' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4239,13 +4239,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'pyexpat' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4258,13 +4258,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.5
+        "duration_ms": 11.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 9.6,
         "error": null
       },
       "status": "ok",
@@ -4277,13 +4277,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.8
+        "duration_ms": 8.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 9.2,
         "error": null
       },
       "status": "ok",
@@ -4296,13 +4296,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 9.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 11.0,
         "error": null
       },
       "status": "ok",
@@ -4315,13 +4315,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.2
+        "duration_ms": 16.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.4,
+        "duration_ms": 10.6,
         "error": null
       },
       "status": "ok",
@@ -4340,7 +4340,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.9,
         "error": "error[HYD0002]: module 'readline' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4353,13 +4353,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.5
+        "duration_ms": 8.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'reprlib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4372,13 +4372,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 7.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'resource' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4391,13 +4391,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 21.1
+        "duration_ms": 23.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'rlcompleter' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4410,13 +4410,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.8
+        "duration_ms": 10.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'runpy' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4429,13 +4429,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.9
+        "duration_ms": 12.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'sched' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4448,13 +4448,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.7
+        "duration_ms": 11.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'secrets' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4467,13 +4467,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 7.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 10.0,
         "error": null
       },
       "status": "ok",
@@ -4486,13 +4486,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.1
+        "duration_ms": 10.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.4,
+        "duration_ms": 9.1,
         "error": null
       },
       "status": "ok",
@@ -4505,13 +4505,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.0
+        "duration_ms": 14.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.9,
         "error": "error[HYD0002]: module 'shelve' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4524,13 +4524,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.9
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'shlex' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4543,13 +4543,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.3
+        "duration_ms": 15.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 10.5,
         "error": null
       },
       "status": "ok",
@@ -4562,13 +4562,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.0
+        "duration_ms": 9.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module 'signal' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4581,17 +4581,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 7.6
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.1,
-        "error": "error[HYD0002]: module 'site' not found: not supported on the import search path"
+        "duration_ms": 9.5,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module 'site' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "smtplib",
@@ -4600,13 +4600,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 28.8
+        "duration_ms": 27.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 3.9,
         "error": "error[HYD0002]: module 'smtplib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4619,13 +4619,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.6
+        "duration_ms": 10.9
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 9.6,
         "error": null
       },
       "status": "ok",
@@ -4638,13 +4638,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.3
+        "duration_ms": 13.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'socketserver' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4657,13 +4657,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.1
+        "duration_ms": 12.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module 'sqlite3' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4676,13 +4676,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.3
+        "duration_ms": 17.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'sre_compile' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4695,13 +4695,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.6
+        "duration_ms": 15.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'sre_constants' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4714,13 +4714,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.6
+        "duration_ms": 14.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'sre_parse' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4733,13 +4733,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.4
+        "duration_ms": 15.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 10.9,
         "error": null
       },
       "status": "ok",
@@ -4752,13 +4752,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 9.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 10.3,
         "error": null
       },
       "status": "ok",
@@ -4771,13 +4771,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.2
+        "duration_ms": 20.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 9.8,
         "error": null
       },
       "status": "ok",
@@ -4790,13 +4790,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'string' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4809,13 +4809,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 7.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'stringprep' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4834,7 +4834,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'struct' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4847,13 +4847,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.6
+        "duration_ms": 15.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 10.1,
         "error": null
       },
       "status": "ok",
@@ -4866,13 +4866,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.8
+        "duration_ms": 11.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'symtable' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4885,13 +4885,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 7.9
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 9.6,
         "error": null
       },
       "status": "ok",
@@ -4904,13 +4904,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.1
+        "duration_ms": 9.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module 'sysconfig' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4929,7 +4929,7 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'syslog' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4942,13 +4942,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 16.1
+        "duration_ms": 17.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'tabnanny' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4961,13 +4961,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 21.8
+        "duration_ms": 17.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'tarfile' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4980,13 +4980,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 20.1
+        "duration_ms": 17.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 10.3,
         "error": null
       },
       "status": "ok",
@@ -4999,13 +4999,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 10.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 3.1,
         "error": "error[HYD0002]: module 'termios' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5018,13 +5018,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.5
+        "duration_ms": 14.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 10.5,
         "error": null
       },
       "status": "ok",
@@ -5037,13 +5037,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 9.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 3.0,
         "error": "error[HYD0002]: module 'this' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5056,13 +5056,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 10.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 10.4,
         "error": null
       },
       "status": "ok",
@@ -5075,13 +5075,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 9.0,
         "error": null
       },
       "status": "ok",
@@ -5094,13 +5094,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.5
+        "duration_ms": 12.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 11.2,
         "error": null
       },
       "status": "ok",
@@ -5113,13 +5113,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 18.3
+        "duration_ms": 17.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'tkinter' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5132,13 +5132,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'token' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5151,13 +5151,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.0
+        "duration_ms": 12.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module 'tokenize' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5170,13 +5170,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.5
+        "duration_ms": 14.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'tomllib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5189,13 +5189,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 23.5
+        "duration_ms": 21.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'trace' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5208,13 +5208,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 24.9
+        "duration_ms": 25.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module 'traceback' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5227,13 +5227,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.2
+        "duration_ms": 16.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 3.1,
         "error": "error[HYD0002]: module 'tracemalloc' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5246,13 +5246,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 10.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 3.5,
         "error": "error[HYD0002]: module 'tty' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5265,13 +5265,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 40.3
+        "duration_ms": 43.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 3.2,
         "error": "error[HYD0002]: module 'turtle' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5284,13 +5284,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.6
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module 'turtledemo' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5303,13 +5303,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.0
+        "duration_ms": 8.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.6,
+        "duration_ms": 11.2,
         "error": null
       },
       "status": "ok",
@@ -5322,13 +5322,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.7
+        "duration_ms": 13.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 9.8,
         "error": null
       },
       "status": "ok",
@@ -5341,13 +5341,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 8.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.5,
         "error": "error[HYD0002]: module 'unicodedata' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5360,13 +5360,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 28.9
+        "duration_ms": 28.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
+        "duration_ms": 10.6,
         "error": null
       },
       "status": "ok",
@@ -5379,13 +5379,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 9.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'urllib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5398,13 +5398,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.9
+        "duration_ms": 9.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'uuid' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5417,13 +5417,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 34.5
+        "duration_ms": 38.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'venv' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5436,17 +5436,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 8.7
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
-        "error": "error[HYD0002]: module 'warnings' not found: not supported on the import search path"
+        "duration_ms": 10.4,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module 'warnings' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "wave",
@@ -5455,13 +5455,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.1
+        "duration_ms": 12.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 3.0,
         "error": "error[HYD0002]: module 'wave' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5474,13 +5474,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.6,
         "error": "error[HYD0002]: module 'weakref' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5493,13 +5493,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 21.3
+        "duration_ms": 18.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'webbrowser' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5512,13 +5512,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 26.9
+        "duration_ms": 24.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 3.0,
         "error": "error[HYD0002]: module 'winreg' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -5531,13 +5531,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 25.5
+        "duration_ms": 24.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.4,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module 'winsound' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -5550,13 +5550,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.5,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module 'wsgiref' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5569,13 +5569,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 7.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.0,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module 'xml' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5588,13 +5588,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.5
+        "duration_ms": 7.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 1.8,
         "error": "error[HYD0002]: module 'xmlrpc' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5607,13 +5607,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 24.7
+        "duration_ms": 22.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.9,
         "error": "error[HYD0002]: module 'zipapp' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5626,13 +5626,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 18.8
+        "duration_ms": 20.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.3,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'zipfile' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5645,13 +5645,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 7.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.1,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module 'zipimport' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5664,13 +5664,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.2,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module 'zlib' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5683,13 +5683,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.8
+        "duration_ms": 11.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 0.9,
+        "duration_ms": 2.4,
         "error": "error[HYD0002]: module 'zoneinfo' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",

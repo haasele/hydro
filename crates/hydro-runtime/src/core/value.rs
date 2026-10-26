@@ -164,6 +164,10 @@ pub(crate) const KIND_SUPER: u32 = 44;
 /// the class value (identity for `type`/`isinstance`) and the native
 /// `ExcData` payload the exception machinery operates on.
 pub(crate) const KIND_EXC_INSTANCE: u32 = 45;
+/// `classmethod`/`staticmethod`/`property` descriptor value. Wraps any
+/// callable or class value; the wrapped value and the optional property
+/// setter/deleter are traced GC edges.
+pub(crate) const KIND_DESCRIPTOR: u32 = 46;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
 pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
@@ -1805,6 +1809,40 @@ impl ExcInstanceState {
     }
 }
 
+/// Binding kind of a [`DescriptorState`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DescriptorKind {
+    /// `classmethod(target)`: binds the owner class as the first argument.
+    Classmethod,
+    /// `staticmethod(target)`: returns the target unchanged.
+    Staticmethod,
+    /// `property(getter[, setter[, deleter]])`: calls the getter on access.
+    Property,
+}
+
+impl DescriptorKind {
+    /// Python-visible type name.
+    pub(crate) fn type_name(self) -> &'static str {
+        match self {
+            DescriptorKind::Classmethod => "classmethod",
+            DescriptorKind::Staticmethod => "staticmethod",
+            DescriptorKind::Property => "property",
+        }
+    }
+}
+
+/// Payload of a built-in descriptor value created by the `classmethod`,
+/// `staticmethod` or `property` builtins.
+///
+/// The target may be any callable or class value. `setter`/`deleter` are only
+/// meaningful for `property` and are `NONE` when absent.
+pub(crate) struct DescriptorState {
+    pub(crate) kind: DescriptorKind,
+    pub(crate) target: i64,
+    pub(crate) setter: i64,
+    pub(crate) deleter: i64,
+}
+
 /// State of a module value: its import name. The value holds no Hydro
 /// children; attribute access goes through `crate::modules`.
 pub(crate) struct ModuleState {
@@ -1895,6 +1933,8 @@ pub(crate) enum ObjData {
     Super(SuperState),
     /// User-defined exception instance ([`KIND_EXC_INSTANCE`]).
     ExcInstance(ExcInstanceState),
+    /// Built-in descriptor value ([`KIND_DESCRIPTOR`]).
+    Descriptor(DescriptorState),
     /// Insertion-ordered list elements.
     List(Vec<i64>),
     /// Insertion-ordered `(key, value)` pairs with a hash index over the
@@ -2018,6 +2058,7 @@ pub(crate) enum ObjDataRef<'a> {
     DictView(&'a DictViewState),
     Super(&'a SuperState),
     ExcInstance(&'a ExcInstanceState),
+    Descriptor(&'a DescriptorState),
     List(&'a Vec<i64>),
     Dict(&'a DictData),
     Iter(&'a Box<IterState>),
@@ -2079,6 +2120,7 @@ pub(crate) enum ObjDataMut<'a> {
     DictView(&'a mut DictViewState),
     Super(&'a mut SuperState),
     ExcInstance(&'a mut ExcInstanceState),
+    Descriptor(&'a mut DescriptorState),
     List(&'a mut Vec<i64>),
     Dict(&'a mut DictData),
     Iter(&'a mut Box<IterState>),
@@ -2148,6 +2190,7 @@ impl HydroObj {
                 KIND_EXC_INSTANCE => {
                     ObjDataRef::ExcInstance(&*(payload as *const ExcInstanceState))
                 }
+                KIND_DESCRIPTOR => ObjDataRef::Descriptor(&*(payload as *const DescriptorState)),
                 KIND_LIST => ObjDataRef::List(&*(payload as *const Vec<i64>)),
                 KIND_DICT => ObjDataRef::Dict(&*(payload as *const DictData)),
                 KIND_ITER => ObjDataRef::Iter(&*(payload as *const Box<IterState>)),
@@ -2244,6 +2287,7 @@ impl HydroObj {
                 KIND_EXC_INSTANCE => {
                     ObjDataMut::ExcInstance(&mut *(payload as *mut ExcInstanceState))
                 }
+                KIND_DESCRIPTOR => ObjDataMut::Descriptor(&mut *(payload as *mut DescriptorState)),
                 KIND_LIST => ObjDataMut::List(&mut *(payload as *mut Vec<i64>)),
                 KIND_DICT => ObjDataMut::Dict(&mut *(payload as *mut DictData)),
                 KIND_ITER => ObjDataMut::Iter(&mut *(payload as *mut Box<IterState>)),
@@ -2325,6 +2369,7 @@ macro_rules! for_each_payload_type {
         $m!(KIND_DICT_VIEW, DictView, DictViewState);
         $m!(KIND_SUPER, Super, SuperState);
         $m!(KIND_EXC_INSTANCE, ExcInstance, ExcInstanceState);
+        $m!(KIND_DESCRIPTOR, Descriptor, DescriptorState);
         $m!(KIND_LIST, List, Vec<i64>);
         $m!(KIND_DICT, Dict, DictData);
         $m!(KIND_ITER, Iter, Box<IterState>);
@@ -2434,6 +2479,7 @@ pub(crate) unsafe fn write_payload(kind: u32, data: ObjData, dst: *mut u8) {
         KIND_DICT_VIEW, DictView, DictViewState,
         KIND_SUPER, Super, SuperState,
         KIND_EXC_INSTANCE, ExcInstance, ExcInstanceState,
+        KIND_DESCRIPTOR, Descriptor, DescriptorState,
         KIND_LIST, List, Vec<i64>,
         KIND_DICT, Dict, DictData,
         KIND_ITER, Iter, Box<IterState>,
@@ -4419,6 +4465,50 @@ pub(crate) fn exc_instance_new(class: i64, data: ExcData) -> i64 {
     )
 }
 
+/// Allocates a built-in descriptor value.
+pub(crate) fn descriptor_new(kind: DescriptorKind, target: i64, setter: i64, deleter: i64) -> i64 {
+    alloc(
+        KIND_DESCRIPTOR,
+        ObjData::Descriptor(DescriptorState {
+            kind,
+            target,
+            setter,
+            deleter,
+        }),
+    )
+}
+
+/// `classmethod(target)`.
+pub(crate) fn classmethod_new(target: i64) -> i64 {
+    descriptor_new(DescriptorKind::Classmethod, target, NONE, NONE)
+}
+
+/// `staticmethod(target)`.
+pub(crate) fn staticmethod_new(target: i64) -> i64 {
+    descriptor_new(DescriptorKind::Staticmethod, target, NONE, NONE)
+}
+
+/// `property(getter[, setter[, deleter]])`.
+pub(crate) fn property_new(getter: i64, setter: i64, deleter: i64) -> i64 {
+    descriptor_new(DescriptorKind::Property, getter, setter, deleter)
+}
+
+/// Borrows a built-in descriptor payload.
+pub(crate) fn as_descriptor(v: i64) -> Option<&'static DescriptorState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_DESCRIPTOR {
+        return None;
+    }
+    match obj.data_ref() {
+        ObjDataRef::Descriptor(state) => Some(state),
+        _ => None,
+    }
+}
+
 /// Allocates a `random.Random` object. `seed == None` draws entropy.
 pub(crate) fn random_new(seed: Option<u64>) -> i64 {
     let state = match seed {
@@ -5425,6 +5515,11 @@ pub(crate) fn item_getter_new(keys: Vec<i64>) -> i64 {
 
 /// Allocates a `functools.partial` value binding `args` as leading positional
 /// arguments of `function`.
+///
+/// `function` may be any callable value, including a class: `classmethod`
+/// binding prepends the owner class to a class target (the
+/// `__class_getitem__ = classmethod(GenericAlias)` shape), and the result
+/// stays a partial function value so ordinary call/keyword dispatch applies.
 pub(crate) fn partial_new(function: i64, args: Vec<i64>) -> i64 {
     partial_new_with_keywords(function, args, Vec::new())
 }
@@ -5885,6 +5980,7 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             // A user-defined exception reports its nearest native ancestor
             // here; [`type_name_of`] resolves the Python class name.
             Some(ObjDataRef::ExcInstance(state)) => state.data.name,
+            Some(ObjDataRef::Descriptor(state)) => state.kind.type_name(),
             Some(ObjDataRef::Fiber(state)) => match state.kind {
                 crate::fiber::FiberKind::Generator => "generator",
                 crate::fiber::FiberKind::Coroutine => "coroutine",
@@ -6042,8 +6138,11 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjDataRef::DictView(state)) => as_dict(state.dict)
                 .map(|pairs| !pairs.is_empty())
                 .unwrap_or(false),
-            // `super` proxies and exception instances are always truthy.
-            Some(ObjDataRef::Super(_)) | Some(ObjDataRef::ExcInstance(_)) => true,
+            // `super` proxies, exception instances and descriptor values are
+            // always truthy.
+            Some(ObjDataRef::Super(_))
+            | Some(ObjDataRef::ExcInstance(_))
+            | Some(ObjDataRef::Descriptor(_)) => true,
             // Like CPython, a lock object is always truthy.
             Some(ObjDataRef::Lock(_)) => true,
             // Synchronisation objects are always truthy.
@@ -6175,6 +6274,21 @@ pub(crate) fn exc_instance_repr(state: &ExcInstanceState) -> String {
     out
 }
 
+/// `repr` of a built-in descriptor value.
+pub(crate) fn descriptor_repr(state: &DescriptorState) -> String {
+    if state.kind == DescriptorKind::Property {
+        return "<property object>".to_string();
+    }
+    let inner = if let Some(function) = as_function(state.target) {
+        format!("<function {}>", function.name)
+    } else if let Some(name) = class_display_name(state.target) {
+        format!("<class '{name}'>")
+    } else {
+        repr_depth(state.target, 0)
+    };
+    format!("<{}({})>", state.kind.type_name(), inner)
+}
+
 /// CPython-style identity rendering of a generator/coroutine object.
 fn fiber_repr(state: &crate::fiber::FiberState) -> String {
     let (kind, fallback) = match state.kind {
@@ -6231,6 +6345,7 @@ pub(crate) fn to_string(v: i64) -> String {
                 ObjDataRef::Super(state) => super_repr(state),
                 // `str(exception instance)` is its message.
                 ObjDataRef::ExcInstance(state) => state.data.msg.clone(),
+                ObjDataRef::Descriptor(state) => descriptor_repr(state),
                 ObjDataRef::Float(f) => format_float(f),
                 ObjDataRef::BigInt(n) => n.to_string(),
                 // `str(exception)` is its message (Python behaviour).
@@ -6448,6 +6563,9 @@ fn repr_depth(v: i64, depth: usize) -> String {
     }
     if let Some(state) = as_exc_instance(v) {
         return exc_instance_repr(state);
+    }
+    if let Some(state) = as_descriptor(v) {
+        return descriptor_repr(state);
     }
     if let Some((start, stop, step)) = as_range(v) {
         return range_repr(start, stop, step);

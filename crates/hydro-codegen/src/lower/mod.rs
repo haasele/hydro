@@ -6750,6 +6750,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             | Builtin::GetIpython
             | Builtin::ByteArray
             | Builtin::MemoryView
+            | Builtin::Classmethod
+            | Builtin::Staticmethod
+            | Builtin::Property
             | Builtin::AnyValue => self.lower_builtin_values(builtin, values),
             Builtin::Max | Builtin::Min => {
                 // The frontend always appends the key slot as the final

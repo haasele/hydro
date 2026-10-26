@@ -1256,8 +1256,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
   socket echo, pathlib, build cache, `tea gc` and uv passthrough.
-- Generated stdlib import matrix (2026-10-26): **63/297 importable** (13
-  builtin/frozen, 45 pure, 5 extension; report in
+- Generated stdlib import matrix (2026-10-26): **78/297 importable** (27
+  builtin/frozen, 46 pure, 5 extension; report in
   [`COMPATIBILITY.md`](COMPATIBILITY.md)). `benchmarks/bench_all.py --only hydro`
   runs at the default GC threshold; rich console/table/panel/rule rendering
   works and a native `rich.status.Status` shim covers `Console.status`.

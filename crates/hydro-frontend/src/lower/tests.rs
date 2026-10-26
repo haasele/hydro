@@ -8885,3 +8885,193 @@ second = mul(2, b=3)
     assert_eq!(keywords.len(), 1);
     assert_eq!(keywords[0].0, "b");
 }
+
+#[test]
+fn descriptor_wrappers_work_as_builtin_values_and_class_entries() {
+    let source = "\
+from types import GenericAlias
+class C:
+    def plain(self):
+        return 1
+    def getter(self):
+        return 2
+    cm = classmethod(plain)
+    sm = staticmethod(plain)
+    pr = property(getter)
+    __class_getitem__ = classmethod(GenericAlias)
+a = classmethod
+b = staticmethod
+c = property
+";
+    let hir = lower_ok(source);
+    let HStmtKind::ClassDef {
+        methods,
+        attributes,
+        ..
+    } = &hir.functions[0].body[0].kind
+    else {
+        panic!("expected class C");
+    };
+    let plain = methods
+        .iter()
+        .find(|(name, _, _)| name == "plain")
+        .map(|(_, function, _)| *function)
+        .expect("plain method");
+    let getter = methods
+        .iter()
+        .find(|(name, _, _)| name == "getter")
+        .map(|(_, function, _)| *function)
+        .expect("getter method");
+    let entry = |name: &str| {
+        methods
+            .iter()
+            .find(|(candidate, _, _)| candidate == name)
+            .map(|(_, function, kind)| (*function, *kind))
+            .unwrap_or_else(|| panic!("missing method entry {name}"))
+    };
+    assert_eq!(entry("cm"), (plain, MethodKind::Classmethod));
+    assert_eq!(entry("sm"), (plain, MethodKind::Staticmethod));
+    assert_eq!(entry("pr"), (getter, MethodKind::Property));
+    // A wrapped class value is not an earlier method, so it stays a class
+    // attribute holding the descriptor object built by the runtime.
+    let class_getitem = attributes
+        .iter()
+        .find(|(name, _)| name == "__class_getitem__")
+        .map(|(_, value)| value)
+        .expect("__class_getitem__ attribute");
+    assert!(
+        matches!(
+            &class_getitem.kind,
+            HExprKind::Call {
+                callee: Callee::Builtin(Builtin::Classmethod),
+                args,
+            } if args.len() == 1
+        ),
+        "{class_getitem:?}"
+    );
+    for (name, expected) in [
+        ("a", Builtin::Classmethod),
+        ("b", Builtin::Staticmethod),
+        ("c", Builtin::Property),
+    ] {
+        assert!(
+            matches!(&assigned(&hir, name).kind, HExprKind::BuiltinRef(actual) if *actual == expected),
+            "{name}: {:?}",
+            assigned(&hir, name).kind
+        );
+    }
+}
+
+#[test]
+fn property_accepts_named_components() {
+    let source = "\
+class C:
+    def getter(self):
+        return 1
+    def setter(self, value):
+        pass
+    value = property(fget=getter, fset=setter, doc='value')
+";
+    let hir = lower_ok(source);
+    let HStmtKind::ClassDef { attributes, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected class C");
+    };
+    let value = attributes
+        .iter()
+        .find(|(name, _)| name == "value")
+        .map(|(_, value)| value)
+        .expect("value attribute");
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::Property),
+        args,
+    } = &value.kind
+    else {
+        panic!("expected a property() call: {value:?}");
+    };
+    assert_eq!(args.len(), 4, "fget, fset, fdel=None, doc");
+    assert!(matches!(args[2].kind, HExprKind::Const(Const::None)));
+}
+
+#[test]
+fn descriptor_builtin_arity_is_checked() {
+    for source in [
+        "x = classmethod()\n",
+        "x = staticmethod(1, 2)\n",
+        "x = property()\n",
+        "x = property(1, 2, 3, 4, 5)\n",
+    ] {
+        let diags = crate::check_source(source, "test.py")
+            .expect_err("invalid descriptor call must be rejected");
+        assert!(!diags.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn print_accepts_its_cpython_keywords() {
+    let source = "\
+import sys
+f = sys.stdout
+print('x')
+print('x', file=f, end='', sep='-', flush=True)
+items = ['a', 'b']
+print(*items, sep=',')
+p = print
+p('y', file=f)
+";
+    let hir = lower_ok(source);
+    let exprs = module_exprs(&hir);
+    // `print('x')` stays the plain positional builtin call.
+    assert!(exprs.iter().any(|expr| matches!(
+        &expr.kind,
+        HExprKind::Call {
+            callee: Callee::Builtin(Builtin::Print),
+            ..
+        }
+    )));
+    // The keyword form goes through the runtime keyword binder with the
+    // keyword values in source order.
+    let keyworded = exprs
+        .iter()
+        .find(|expr| matches!(expr.kind, HExprKind::CallKw { .. }))
+        .expect("keyworded print");
+    let HExprKind::CallKw {
+        callee,
+        args,
+        keywords,
+    } = &keyworded.kind
+    else {
+        unreachable!()
+    };
+    assert!(matches!(callee.kind, HExprKind::BuiltinRef(Builtin::Print)));
+    assert_eq!(args.len(), 1);
+    let names: Vec<&str> = keywords.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["file", "end", "sep", "flush"]);
+    // A first-class `p = print; p(...)` call binds keywords through the value.
+    assert!(
+        exprs.iter().any(|expr| matches!(
+            &expr.kind,
+            HExprKind::CallKw { callee, .. }
+                if matches!(&callee.kind, HExprKind::Local(_))
+        )),
+        "first-class print keyword call"
+    );
+    // A starred positional operand with a keyword uses the general flattener.
+    assert!(exprs.iter().any(|expr| matches!(
+        &expr.kind,
+        HExprKind::CallFull { callee, .. }
+            if matches!(&callee.kind, HExprKind::BuiltinRef(Builtin::Print))
+    )));
+}
+
+#[test]
+fn print_rejects_unknown_keywords() {
+    let source = "print('x', bad=1)\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0]
+            .message
+            .contains("unexpected keyword argument 'bad'"),
+        "{diags:?}"
+    );
+}

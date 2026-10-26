@@ -331,6 +331,15 @@ pub enum Builtin {
     /// `memoryview(bytes_like)`: a view over a bytes-like value. The runtime
     /// owns the value kind (`KIND_MEMORYVIEW`).
     MemoryView,
+    /// `classmethod(function)`: a descriptor that binds the class as the
+    /// first argument when accessed through a class or instance.
+    Classmethod,
+    /// `staticmethod(function)`: a descriptor that returns the wrapped
+    /// callable unchanged.
+    Staticmethod,
+    /// `property(fget[, fset[, fdel[, doc]]])`: a data descriptor whose
+    /// `__get__` calls the getter with the instance.
+    Property,
     /// `iter(obj)`: the object's iterator (an iterator/generator is returned
     /// unchanged).
     Iter,
@@ -430,6 +439,9 @@ impl Builtin {
             Builtin::Bytes => "bytes",
             Builtin::ByteArray => "bytearray",
             Builtin::MemoryView => "memoryview",
+            Builtin::Classmethod => "classmethod",
+            Builtin::Staticmethod => "staticmethod",
+            Builtin::Property => "property",
             Builtin::Iter => "iter",
             Builtin::Next => "next",
             Builtin::Frozenset => "frozenset",
@@ -482,6 +494,9 @@ impl Builtin {
             "bytes" => Builtin::Bytes,
             "bytearray" => Builtin::ByteArray,
             "memoryview" => Builtin::MemoryView,
+            "classmethod" => Builtin::Classmethod,
+            "staticmethod" => Builtin::Staticmethod,
+            "property" => Builtin::Property,
             "iter" => Builtin::Iter,
             "next" => Builtin::Next,
             "frozenset" => Builtin::Frozenset,

@@ -7,7 +7,27 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-10-25 (latest):** CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN. The current test count and per-crate breakdown live in [`AGENTS.md`](../AGENTS.md#current-state).
+**As of 2026-10-26 (latest):** CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN. The current test count and per-crate breakdown live in [`AGENTS.md`](../AGENTS.md#current-state).
+
+**2026-10-26 four-scope checkpoint.** Delivered and tested: a runtime module
+registry (`sys.path`, `sys.modules`, module `__name__`, namespace packages,
+`from x import *`/`__all__`, `HYDRO_STDLIB`), the full 3.14 exception
+taxonomy + `isinstance`/`issubclass`/exception attributes, the core
+builtins/frozen shims (`builtins`, `_imp`, `_opcode`, `_collections`,
+`_codecs`, `_string`, `_weakref` with callbacks, `warnings`, `marshal`,
+`_tokenize`, `_collections_abc`, `gc`, `atexit`, `site`), a vendored
+`hydro-python-parser` with PEP 701 f-strings and PEP 750 t-strings
+end-to-end, the P4-02 lowering/runtime surface (decorators, positional-only,
+`*args`+`**kwargs`, `match`, `except*` syntax with explicit runtime gap,
+`classmethod`/`staticmethod`/`property`, bytearray/memoryview, dict views,
+descriptors, C3 multiple inheritance, metaclasses, `super()`), the next
+full-ABI layer (`PyObject_HEAD`/`PyTypeObject`, vectorcall, buffers, GIL,
+GC tracking, constants/keywords), and `tea install` for wheels with an
+abi3 smoke. **Still open and blocking full parity:** runtime dynamic
+imports/`compile`/`eval`/`globals`/`locals`/`vars`, class-body statements
+such as `del`, `builtins.__dict__`, `ast.parse/unparse`, `except*` grouping,
+and the NumPy/pydantic ABI gate; the official CPython baseline has not been
+regenerated after this slice. Full P7/P4-10 remains open.
 Phase 1 is complete; Phase 2 is complete. It includes lazy/async generators,
 coroutines and task groups, precise shadow-stack roots (strict mode
 `HYDRO_GC_PRECISE=1`), the size-classed payload allocator, argparse/pytest,
@@ -396,8 +416,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
       Manifest `tests/compat/cpython-3.14.9.json` records **1** pass
       (`test_errno.py`); it grows only from real `hydro_pass` results.
-      Stdlib import baseline 2026-10-26: **63/297 importable** (13
-      builtin/frozen, 45 pure, 5 extension; 9 `cpython_failed`). Batch A of
+      Stdlib import baseline 2026-10-26: **78/297 importable** (27
+      builtin/frozen, 46 pure, 5 extension; 9 `cpython_failed`). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
       `_operator`, `_functools`, `_io`), the Batch B native core
@@ -408,7 +428,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
       `__future__` modules are importable and API-tested.
       Official-suite
-      baseline 2026-10-25: **1/398 passing** (334 `hydro_fail`, 63
+      baseline 2026-10-26: **3/398 passing** (332 `hydro_fail`, 63
       `expected_fail` where CPython also fails; 0 timeouts). No test is marked
       passing unless CPython 3.14.9 and Hydro both exit 0.
       The harness runs a defined subset of CPython 3.14 `Lib/test` against
@@ -766,7 +786,7 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the Hydro runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-26: **63/297 modules importable**, **234 failed**
+from it). Status 2026-10-26: **78/297 modules importable**, **219 failed**
 (39 builtin/frozen, 129 pure Python, 58 extension, 8 unknown/platform),
 including 9 modules where CPython 3.14.9 itself fails on this host.
 
@@ -1026,7 +1046,7 @@ marks a module CPython ships only for a
 platform Hydro does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
-Current matrix: 63/297 importable, 234 failed (39 builtin/frozen, 129 pure,
+Current matrix: 78/297 importable, 219 failed (25 builtin/frozen, 128 pure,
 58 extension, 8 platform). The ledger is the work list for the failed entries;
 checked entries count as delivered slices, not as complete parity.
 

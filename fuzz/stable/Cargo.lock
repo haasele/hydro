@@ -398,7 +398,7 @@ name = "hydro-frontend"
 version = "0.1.0"
 dependencies = [
  "hydro-ir",
- "rustpython-parser",
+ "hydro-python-parser",
 ]
 
 [[package]]
@@ -413,6 +413,28 @@ dependencies = [
 [[package]]
 name = "hydro-ir"
 version = "0.1.0"
+
+[[package]]
+name = "hydro-python-parser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "is-macro",
+ "itertools",
+ "lalrpop-util",
+ "log",
+ "malachite-bigint",
+ "num-traits",
+ "phf",
+ "phf_codegen",
+ "rustc-hash 1.1.0",
+ "rustpython-ast",
+ "rustpython-parser-core",
+ "tiny-keccak",
+ "unic-emoji-char",
+ "unic-ucd-ident",
+ "unicode_names2",
+]
 
 [[package]]
 name = "hydro-runtime"
@@ -829,30 +851,6 @@ dependencies = [
  "malachite-bigint",
  "rustpython-parser-core",
  "static_assertions",
-]
-
-[[package]]
-name = "rustpython-parser"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "868f724daac0caf9bd36d38caf45819905193a901e8f1c983345a68e18fb2abb"
-dependencies = [
- "anyhow",
- "is-macro",
- "itertools",
- "lalrpop-util",
- "log",
- "malachite-bigint",
- "num-traits",
- "phf",
- "phf_codegen",
- "rustc-hash 1.1.0",
- "rustpython-ast",
- "rustpython-parser-core",
- "tiny-keccak",
- "unic-emoji-char",
- "unic-ucd-ident",
- "unicode_names2",
 ]
 
 [[package]]

@@ -3108,6 +3108,17 @@ unsafe fn trace(addr: usize) {
                     }
                     drop(attrs);
                 }
+                // Built-in descriptors wrap their target and, for
+                // `property`, the optional setter/deleter.
+                ObjDataRef::Descriptor(state) => {
+                    mark_value(state.target);
+                    if state.setter != crate::value::NONE {
+                        mark_value(state.setter);
+                    }
+                    if state.deleter != crate::value::NONE {
+                        mark_value(state.deleter);
+                    }
+                }
                 // A bytearray holds native bytes only.
                 ObjDataRef::ByteArray(_) => {}
                 ObjDataRef::Thread(thread) => {

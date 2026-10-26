@@ -31,29 +31,38 @@ and `docs/LAYOUT.md` (source tree).
 Official `Lib/test` runs are a release gate; the offline manifest check runs
 in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
+**2026-10-26 checkpoint:** the four open construction sites received a
+substantial implementation slice: import/module registry + `HYDRO_STDLIB`,
+the core builtin/frozen shims, PEP 701/750 parser and templates, the P4-02
+language/runtime surface, the next full-ABI layer and a working wheel
+installer. Full dynamic-import/introspection semantics, `except*` grouping
+and the NumPy/pydantic ABI gate remain open; the official CPython baseline
+was not regenerated after this slice.
+
 ### Test counts (canonical — update only here)
 
-`cargo test --workspace` on 2026-10-26: **1376 Hydro tests**:
+`cargo test --workspace` on 2026-10-26: **1542 Hydro tests**:
 
 | Suite | Tests |
 |---|---:|
-| runtime unit | 532 |
-| runtime integration | 278 |
-| frontend | 476 (incl. 4 fuzz smoke) |
+| runtime unit | 585 |
+| runtime integration | 322 |
+| frontend | 515 (incl. 6 fuzz smoke) |
 | codegen | 61 |
-| IR | 18 |
+| IR | 29 |
 | interpreter unit | 11 |
+| parser | 19 |
 
-Tea (separate repository) carries **325** CLI/E2E/AOT/pytest/REPL/PGO tests.
+Tea (separate repository) carries **339** CLI/E2E/AOT/pytest/REPL/PGO/wheel tests.
 Other docs must link here instead of repeating the total.
 
 ### Compatibility checkpoint (2026-10-25)
 
-- **Import matrix:** **63/297 modules importable** (13 builtin/frozen, 45 pure,
-  5 extension; 39/129/58 + 8 platform missing; 9 modules fail under CPython
+- **Import matrix:** **78/297 modules importable** (27 builtin/frozen, 46 pure,
+  5 extension; 25/128/58 + 8 platform missing; 9 modules fail under CPython
   3.14.9 itself). Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **Official suite:** **1/398 passing** (`test_errno.py`), 334 `hydro_fail`,
+- **Official suite:** **3/398 passing** (`test_errno.py`, `test_int_literal.py`, `test_perfmaps.py`), 332 `hydro_fail`,
   63 `expected_fail` (CPython also fails), 0 timeouts. Manifest
   `tests/compat/cpython-3.14.9.json` grows only from real `hydro_pass` runs.
 - **C-API:** the limited-API fixture `hydro_capi_probe` (scalars, strings, bytes,

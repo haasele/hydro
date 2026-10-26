@@ -4862,6 +4862,17 @@ mod tests {
         assert!(builtin_names
             .iter()
             .any(|name| value::as_str(*name) == Some("sys")));
+        // The constant is derived from the central module table, so every
+        // registered spec (including the shim modules) must be listed once.
+        for spec in stdlib::MODULES {
+            assert!(
+                builtin_names
+                    .iter()
+                    .any(|name| value::as_str(*name) == Some(spec.name)),
+                "{} missing from builtin_module_names",
+                spec.name
+            );
+        }
         for name in ["prefix", "base_prefix", "exec_prefix"] {
             assert!(value::as_str(get("sys", name)).is_some(), "{name}");
         }
@@ -5006,7 +5017,16 @@ mod tests {
         exc::init();
         assert!(stdlib::module("builtins").is_some());
         assert_eq!(value::as_str(get("builtins", "__name__")), Some("builtins"));
-        for name in ["len", "print", "open", "setattr", "compile"] {
+        for name in [
+            "len",
+            "print",
+            "open",
+            "setattr",
+            "compile",
+            "classmethod",
+            "staticmethod",
+            "property",
+        ] {
             assert_eq!(
                 value::type_name(get("builtins", name)),
                 "function",

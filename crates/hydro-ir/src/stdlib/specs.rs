@@ -465,6 +465,18 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("chr", 1, 1, Type::Str),
         f("divmod", 2, 2, Type::Tuple),
         f("callable", 1, 1, Type::Bool),
+        // Descriptor factories (unqualified compiler builtins). `property`
+        // keeps CPython's parameter names; the runtime accepts and does not
+        // store the `doc` argument.
+        f("classmethod", 1, 1, Type::Any),
+        f("staticmethod", 1, 1, Type::Any),
+        kw(
+            "property",
+            1,
+            4,
+            Type::Any,
+            &["fget", "fset", "fdel", "doc"],
+        ),
         f("input", 0, 1, Type::Str),
         f("get_ipython", 0, 0, Type::Any),
         // Attribute-only names (not unqualified compiler builtins).
@@ -2204,9 +2216,26 @@ mod tests {
                 .name,
             "builtins"
         );
-        for name in ["len", "print", "object", "setattr", "compile", "__import__"] {
+        for name in [
+            "len",
+            "print",
+            "object",
+            "setattr",
+            "compile",
+            "__import__",
+            "classmethod",
+            "staticmethod",
+            "property",
+        ] {
             assert!(function("builtins", name).is_some(), "{name}");
         }
+        let classmethod = function("builtins", "classmethod").unwrap();
+        assert_eq!((classmethod.min_args, classmethod.max_args), (1, 1));
+        let staticmethod = function("builtins", "staticmethod").unwrap();
+        assert_eq!((staticmethod.min_args, staticmethod.max_args), (1, 1));
+        let property = function("builtins", "property").unwrap();
+        assert_eq!((property.min_args, property.max_args), (1, 4));
+        assert_eq!(property.params, &["fget", "fset", "fdel", "doc"][..]);
         for name in [
             "ValueError",
             "ImportError",
