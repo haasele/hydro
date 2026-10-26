@@ -7110,9 +7110,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 Ok(result)
             }
             Builtin::Bytes => {
-                if values.len() > 2 {
+                if values.len() > 3 {
                     return Err(CodegenError::new(format!(
-                        "builtin bytes expects 0 to 2 arguments, got {}",
+                        "builtin bytes expects 0 to 3 arguments, got {}",
                         values.len()
                     )));
                 }
@@ -7129,18 +7129,22 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_exc_check()?;
                 Ok(result)
             }
-            Builtin::Iter => {
-                if values.len() != 1 {
-                    let actual = values.len();
-                    return Err(CodegenError::new(format!(
-                        "builtin iter expects 1 argument, got {actual}"
-                    )));
+            Builtin::Iter => match values {
+                [iterable] => {
+                    let id = self.runtime.iter_of;
+                    let result = self.call_rt(id, &[*iterable])?;
+                    self.emit_exc_check()?;
+                    Ok(result)
                 }
-                let id = self.runtime.iter_of;
-                let result = self.call_rt(id, &values[..1])?;
-                self.emit_exc_check()?;
-                Ok(result)
-            }
+                // `iter(callable, sentinel)` has no dedicated runtime entry
+                // point: dispatch through the first-class builtin, which
+                // validates that the first argument is callable.
+                [_, _] => self.lower_builtin_values(builtin, values),
+                actual => Err(CodegenError::new(format!(
+                    "builtin iter expects 1 or 2 arguments, got {}",
+                    actual.len()
+                ))),
+            },
             Builtin::Next => {
                 let (obj, default, has_default) = match values {
                     [obj] => (*obj, self.none(), 0i64),
@@ -7332,7 +7336,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_exc_check()?;
                 Ok(result)
             }
-            Builtin::Int if values.len() != 1 => self.lower_builtin_values(builtin, values),
+            Builtin::Int | Builtin::Str if values.len() != 1 => {
+                self.lower_builtin_values(builtin, values)
+            }
             Builtin::Len
             | Builtin::Str
             | Builtin::Repr
@@ -7593,7 +7599,7 @@ fn build_c_main<M: Module>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hydro_ir::{ClassMethod, LocalInfo, MethodKind, Param, StmtKind, Type};
+    use hydro_ir::{ClassAttr, ClassMethod, LocalInfo, MethodKind, Param, StmtKind, Type};
 
     /// A module body with one `bytes`-typed local `x` assigned `value`.
     fn program_assigning(value: Expr) -> Program {
@@ -7673,11 +7679,31 @@ mod tests {
     }
 
     #[test]
+    fn iter_callable_sentinel_lowers_through_the_value_path() {
+        let callable = Expr::new(ExprKind::BuiltinRef(Builtin::Abs), Type::Function, 1);
+        let sentinel = Expr::new(ExprKind::Const(Const::Bytes(Vec::new())), Type::Bytes, 1);
+        let mut program = program_assigning(Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::Iter),
+                args: vec![callable, sentinel],
+            },
+            Type::Any,
+            1,
+        ));
+        program.functions[0].locals[0].ty = Type::Any;
+        let object = crate::compile_object(&program).expect("iter(callable, sentinel) must lower");
+        // The two-argument form has no dedicated runtime entry point: the
+        // builtin value is materialised and invoked with two operands.
+        assert!(runtime_call_sites(&object, "hydro_builtin_function") > 0);
+        assert!(runtime_call_sites(&object, "hydro_call") > 0);
+    }
+
+    #[test]
     fn bytes_builtin_calls_lower_to_the_runtime_builder() {
         let int = |value| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
         let text =
             |value: &str| Expr::new(ExprKind::Const(Const::Str(value.to_string())), Type::Str, 1);
-        let programs: [Vec<Expr>; 4] = [
+        let programs: [Vec<Expr>; 5] = [
             Vec::new(),
             vec![int(3)],
             vec![Expr::new(
@@ -7686,6 +7712,7 @@ mod tests {
                 1,
             )],
             vec![text("x"), text("utf-8")],
+            vec![text("x"), text("utf-8"), text("strict")],
         ];
         for args in programs {
             let program = program_assigning(Expr::new(
@@ -7757,16 +7784,16 @@ mod tests {
         let program = program_assigning(Expr::new(
             ExprKind::Call {
                 callee: Callee::Builtin(Builtin::Bytes),
-                args: vec![arg(), arg(), arg()],
+                args: vec![arg(), arg(), arg(), arg()],
             },
             Type::Bytes,
             1,
         ));
-        let error = crate::compile_object(&program).expect_err("three arguments must fail");
+        let error = crate::compile_object(&program).expect_err("four arguments must fail");
         assert!(
             error
                 .message
-                .contains("builtin bytes expects 0 to 2 arguments"),
+                .contains("builtin bytes expects 0 to 3 arguments"),
             "{error}"
         );
     }
@@ -8016,6 +8043,293 @@ mod tests {
         let object = crate::compile_object(&program)
             .expect("class definition and attribute store must lower");
         assert!(!object.is_empty());
+    }
+
+    /// The decorated-method shape the frontend emits: `@logged @classmethod
+    /// def f(cls)` becomes the class attribute
+    /// `logged(classmethod(function))`, evaluated when the class statement
+    /// runs.
+    #[test]
+    fn decorated_classmethod_attribute_lowers_bottom_up() {
+        let method = Function {
+            name: "C.f".to_string(),
+            params: vec![Param {
+                local: 0,
+                name: "cls".to_string(),
+                ty: Type::Any,
+                default: None,
+                default_expr: None,
+                kind: ParamKind::Positional,
+            }],
+            capture_count: 0,
+            ret_ty: Type::Any,
+            locals: vec![LocalInfo {
+                name: "cls".to_string(),
+                ty: Type::Any,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Return(Some(Expr::new(ExprKind::Local(0), Type::Any, 1))),
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let decorator = Function {
+            name: "logged".to_string(),
+            params: vec![Param {
+                local: 0,
+                name: "fn".to_string(),
+                ty: Type::Any,
+                default: None,
+                default_expr: None,
+                kind: ParamKind::Positional,
+            }],
+            capture_count: 0,
+            ret_ty: Type::Any,
+            locals: vec![LocalInfo {
+                name: "fn".to_string(),
+                ty: Type::Any,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Return(Some(Expr::new(ExprKind::Local(0), Type::Any, 1))),
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let bound = Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::Classmethod),
+                args: vec![Expr::new(ExprKind::FunctionRef(1), Type::Function, 2)],
+            },
+            Type::Any,
+            2,
+        );
+        let decorated = Expr::new(
+            ExprKind::IndirectCall {
+                callee: Box::new(Expr::new(ExprKind::Local(0), Type::Any, 3)),
+                args: vec![bound],
+                star: None,
+            },
+            Type::Any,
+            3,
+        );
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![
+                LocalInfo {
+                    name: "logged".to_string(),
+                    ty: Type::Any,
+                },
+                LocalInfo {
+                    name: "C".to_string(),
+                    ty: Type::Any,
+                },
+            ],
+            body: vec![
+                Stmt::new(
+                    StmtKind::Assign {
+                        target: 0,
+                        value: Expr::new(ExprKind::FunctionRef(2), Type::Function, 1),
+                    },
+                    1,
+                ),
+                Stmt::new(
+                    StmtKind::ClassDef {
+                        target: 1,
+                        name: "C".to_string(),
+                        bases: Vec::new(),
+                        metaclass: None,
+                        methods: Vec::new(),
+                        attributes: vec![ClassAttr {
+                            name: "f".to_string(),
+                            value: decorated,
+                        }],
+                    },
+                    2,
+                ),
+            ],
+            is_async: false,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, method, decorator],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object =
+            crate::compile_object(&program).expect("a decorated classmethod attribute must lower");
+        assert!(runtime_call_sites(&object, "hydro_class_new") > 0);
+        assert!(runtime_call_sites(&object, "hydro_call") > 0);
+        assert!(runtime_call_sites(&object, "hydro_builtin_function") > 0);
+    }
+
+    /// `setattr`/`delattr` reach the runtime through the `builtins` module
+    /// dispatch, so the object file must import `hydro_module_call`.
+    #[test]
+    fn setattr_and_delattr_emit_a_builtins_module_call() {
+        let text =
+            |value: &str| Expr::new(ExprKind::Const(Const::Str(value.to_string())), Type::Str, 1);
+        let int = || Expr::new(ExprKind::Const(Const::Int(1)), Type::Int, 1);
+        for function in ["setattr", "delattr"] {
+            let args = if function == "setattr" {
+                vec![
+                    Expr::new(ExprKind::Local(0), Type::Any, 1),
+                    text("value"),
+                    int(),
+                ]
+            } else {
+                vec![Expr::new(ExprKind::Local(0), Type::Any, 1), text("value")]
+            };
+            let program = Program {
+                source_name: "test.py".to_string(),
+                functions: vec![Function {
+                    name: "<module>".to_string(),
+                    params: Vec::new(),
+                    capture_count: 0,
+                    ret_ty: Type::None,
+                    locals: vec![LocalInfo {
+                        name: "obj".to_string(),
+                        ty: Type::Any,
+                    }],
+                    body: vec![Stmt::new(
+                        StmtKind::Expr(Expr::new(
+                            ExprKind::ModuleCall {
+                                module: "builtins".to_string(),
+                                function: function.to_string(),
+                                args,
+                                keywords: Vec::new(),
+                            },
+                            Type::None,
+                            1,
+                        )),
+                        1,
+                    )],
+                    is_async: false,
+                    is_generator: false,
+                }],
+                main: 0,
+                initializers: Vec::new(),
+            };
+            let object = crate::compile_object(&program)
+                .unwrap_or_else(|_| panic!("{function}() must lower"));
+            assert!(
+                runtime_call_sites(&object, "hydro_module_call") > 0,
+                "{function} must dispatch through the builtins module"
+            );
+        }
+    }
+
+    /// A class method that closes over an enclosing local is stored as a
+    /// closure value in the class namespace (`Closure` + `ClassDef`).
+    #[test]
+    fn class_attribute_holding_a_closure_lowers() {
+        let method = Function {
+            name: "Inner.get".to_string(),
+            params: vec![
+                Param {
+                    local: 0,
+                    name: "base".to_string(),
+                    ty: Type::Any,
+                    default: None,
+                    default_expr: None,
+                    kind: ParamKind::Positional,
+                },
+                Param {
+                    local: 1,
+                    name: "self".to_string(),
+                    ty: Type::Any,
+                    default: None,
+                    default_expr: None,
+                    kind: ParamKind::Positional,
+                },
+            ],
+            capture_count: 1,
+            ret_ty: Type::Any,
+            locals: vec![
+                LocalInfo {
+                    name: "base".to_string(),
+                    ty: Type::Any,
+                },
+                LocalInfo {
+                    name: "self".to_string(),
+                    ty: Type::Any,
+                },
+            ],
+            body: vec![Stmt::new(
+                StmtKind::Return(Some(Expr::new(ExprKind::Local(0), Type::Any, 1))),
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![
+                LocalInfo {
+                    name: "base".to_string(),
+                    ty: Type::Any,
+                },
+                LocalInfo {
+                    name: "$method".to_string(),
+                    ty: Type::Any,
+                },
+                LocalInfo {
+                    name: "Inner".to_string(),
+                    ty: Type::Any,
+                },
+            ],
+            body: vec![
+                Stmt::new(
+                    StmtKind::Assign {
+                        target: 0,
+                        value: Expr::new(ExprKind::Const(Const::Int(1)), Type::Int, 1),
+                    },
+                    1,
+                ),
+                Stmt::new(
+                    StmtKind::Closure {
+                        target: 1,
+                        function: 1,
+                        captures: vec![0],
+                    },
+                    2,
+                ),
+                Stmt::new(
+                    StmtKind::ClassDef {
+                        target: 2,
+                        name: "Inner".to_string(),
+                        bases: Vec::new(),
+                        metaclass: None,
+                        methods: Vec::new(),
+                        attributes: vec![ClassAttr {
+                            name: "get".to_string(),
+                            value: Expr::new(ExprKind::Local(1), Type::Any, 3),
+                        }],
+                    },
+                    3,
+                ),
+            ],
+            is_async: false,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, method],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object =
+            crate::compile_object(&program).expect("a closure-valued class method must lower");
+        assert!(runtime_call_sites(&object, "hydro_closure_new") > 0);
+        assert!(runtime_call_sites(&object, "hydro_class_new") > 0);
     }
 
     #[test]

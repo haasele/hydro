@@ -226,9 +226,9 @@ fn unsupported_names_raise_tagged_errors() {
     let _ = module("builtins", "type", &[text("Made"), bases]);
     assert_error_tag(TYPE_ERROR);
 
-    // `iter(callable, sentinel)` is not supported.
+    // `iter(callable, sentinel)` requires a callable first argument.
     let _ = module("builtins", "iter", &[hydro_true(), hydro_true()]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    assert_error_tag(TYPE_ERROR);
 
     // `type(x)` still works for one argument.
     let class = module("builtins", "type", &[int(1)]);

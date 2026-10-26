@@ -90,7 +90,7 @@ pub extern "C" fn hydro_memoryview_new(value: i64) -> i64 {
     crate::value::memoryview_abi(value)
 }
 
-/// `bytes(...)`: the constructor (0, 1 or 2 arguments).
+/// `bytes(...)`: the constructor (0 to 3 arguments).
 #[no_mangle]
 pub extern "C" fn hydro_bytes_build(argc: usize, argv: *const i64) -> i64 {
     builtins::bytes_build(argc, argv)
@@ -1079,9 +1079,11 @@ pub extern "C" fn hydro_global_delete(
 
 /// `module.name` for a module-level global.
 ///
-/// A missing entry raises `RuntimeError` (`name '<name>' is not defined in
-/// module '<module>'`) with a pending exception and returns `None`. Invalid
-/// ABI buffers raise `TypeError` instead.
+/// Reads the runtime global store and then the module's cached `globals()`
+/// view, so names bound with `globals()[name] = value` resolve without an
+/// intervening `globals()` call. A missing entry raises CPython's `NameError`
+/// (`name '<name>' is not defined`) with a pending exception and returns
+/// `None`. Invalid ABI buffers raise `TypeError` instead.
 #[no_mangle]
 pub extern "C" fn hydro_global_get(
     module_ptr: *const c_uchar,
@@ -1740,6 +1742,11 @@ pub extern "C" fn hydro_gc_scope_pop(token: usize) {
 
 #[no_mangle]
 pub extern "C" fn hydro_runtime_init() {
+    // Unit tests run concurrently in one process, and this reset frees the
+    // whole heap; hold the same guard as the reset tests so a test that owns
+    // the heap for its whole body cannot see its objects freed mid-run.
+    #[cfg(test)]
+    let _reset_guard = crate::heap::heap_reset_test_guard();
     // Order matters: resetting the exception state drops the pending
     // tagged value before the collector frees the objects it may point
     // at, so no dangling root survives into the next program run.

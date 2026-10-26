@@ -114,9 +114,19 @@
 //! dictionaries/weak references, the async protocol suites and Python source
 //! evaluation are absent; the evaluation entry points fail with a tagged
 //! `RuntimeError` instead of resolving to nothing. `PyImport_ImportModule` and
-//! friends resolve modules already loaded into the extension registry and fail
-//! with a tagged `ImportError` for anything else, because this host has no
-//! Python-level module finder bridge.
+//! friends resolve extension modules loaded into the extension registry and
+//! Hydro native/user modules from the runtime registry; every other name
+//! fails with a tagged `ImportError`. Attribute access on a runtime-backed
+//! module resolves native functions and values; classes and other values with
+//! no C representation raise `AttributeError` instead of being fabricated.
+//!
+//! Integers are 64-bit in the C API: `PyLong_FromUnsignedLongLong`,
+//! `PyLong_FromNativeBytes` and `PyLong_AsNativeBytes` raise `OverflowError`
+//! when a value does not fit, instead of silently truncating. `PyUnicode_New`
+//! strings expose writable UCS storage through `PyUnicode_DATA` (1/2/4-byte
+//! code units, exactly as `PyUnicode_New` selects); unpaired surrogates are
+//! replaced when the string is read back as text. Traceback frames are never
+//! created, so `PyTraceBack_Print` only accepts `NULL`/`None`.
 //!
 //! # Exported data
 //!
@@ -190,6 +200,10 @@ const METH_O: c_int = 0x0008;
 /// `METH_FASTCALL` (stable ABI since 3.10) selects the
 /// `_PyCFunctionFast`/`_PyCFunctionFastWithKeywords` calling convention.
 const METH_FASTCALL: c_int = 0x0080;
+/// `METH_METHOD`: the function receives its defining class
+/// (`PyCMethod`). Creation is supported; invocation is reported as unsupported
+/// because this host has no `PyCMethod` call convention.
+const METH_METHOD: c_int = 0x0200;
 const METHOD_FLAGS: c_int = METH_VARARGS | METH_KEYWORDS | METH_NOARGS | METH_O | METH_FASTCALL;
 
 /// `Py_GetConstant` identifiers from CPython 3.13's `object.h`.
@@ -352,6 +366,18 @@ pub(crate) enum ShimAttr {
     Type(usize),
 }
 
+/// Mutable character storage behind a string created by `PyUnicode_New`.
+///
+/// `PyUnicode_DATA` hands the extension a pointer into `data`; the string's
+/// textual value is derived from it whenever the object is read. Code unit
+/// width follows CPython's kind selection (1/2/4 bytes, little endian), so an
+/// extension that writes UCS-1/2/4 data observes the documented layout.
+#[derive(Clone, Debug)]
+pub(crate) struct RawText {
+    pub(crate) width: u8,
+    pub(crate) data: Vec<u8>,
+}
+
 /// Maximum nesting depth accepted when converting containers in either
 /// direction.
 pub(crate) const MAX_CONVERSION_DEPTH: usize = 64;
@@ -365,14 +391,45 @@ enum ShimKind {
     Float(f64),
     /// `c_text` is the NUL-terminated form used by `PyArg_ParseTuple("s")` and
     /// `PyUnicode_AsUTF8`; absent when the string contains an embedded NUL.
+    /// `raw` is present for strings created by `PyUnicode_New`, whose storage
+    /// an extension may fill through `PyUnicode_DATA`; `text` and `c_text` are
+    /// refreshed from it on every read.
     Str {
         text: String,
         c_text: Option<CString>,
+        raw: Option<RawText>,
     },
     /// `data` is the bytes content; `c_data` is `data` plus a trailing NUL.
     Bytes {
         data: Vec<u8>,
         c_data: Vec<u8>,
+    },
+    /// Mutable byte buffer, `c_data` NUL-terminated as CPython's bytearray.
+    ByteArray {
+        data: Vec<u8>,
+        c_data: Vec<u8>,
+    },
+    /// Mutable set of object handles. Entries are unique by key equality.
+    Set(Vec<usize>),
+    /// Immutable set of object handles.
+    FrozenSet(Vec<usize>),
+    /// Complex number payload.
+    Complex {
+        real: f64,
+        imag: f64,
+    },
+    /// Exception instance: its class handle, positional arguments and the
+    /// `__cause__`/`__traceback__` slots (0 for "not set").
+    Exception {
+        exc_type: usize,
+        args: Vec<usize>,
+        cause: usize,
+        traceback: usize,
+    },
+    /// Native/user module function, dispatched through the runtime registry.
+    RuntimeFunction {
+        module: String,
+        name: String,
     },
     List(Vec<usize>),
     Tuple(Vec<usize>),
@@ -586,11 +643,18 @@ fn kind_type(kind: &ShimKind) -> *mut TypeObject {
         ShimKind::Float(_) => ptr::addr_of_mut!(types::FLOAT_TYPE),
         ShimKind::Str { .. } => ptr::addr_of_mut!(types::STR_TYPE),
         ShimKind::Bytes { .. } => ptr::addr_of_mut!(types::BYTES_TYPE),
+        ShimKind::ByteArray { .. } => ptr::addr_of_mut!(types::BYTEARRAY_TYPE),
+        ShimKind::Set(_) => ptr::addr_of_mut!(types::SET_TYPE),
+        ShimKind::FrozenSet(_) => ptr::addr_of_mut!(types::FROZENSET_TYPE),
+        ShimKind::Complex { .. } => ptr::addr_of_mut!(types::COMPLEX_TYPE),
         ShimKind::List(_) => ptr::addr_of_mut!(types::LIST_TYPE),
         ShimKind::Tuple(_) => ptr::addr_of_mut!(types::TUPLE_TYPE),
         ShimKind::Dict(_) => ptr::addr_of_mut!(types::DICT_TYPE),
         ShimKind::Capsule { .. } => ptr::addr_of_mut!(types::CAPSULE_TYPE),
         ShimKind::CFunction { .. } => ptr::addr_of_mut!(types::CFUNCTION_TYPE),
+        ShimKind::RuntimeFunction { .. } => ptr::addr_of_mut!(types::CFUNCTION_TYPE),
+        // An exception instance's `ob_type` is its exception class.
+        ShimKind::Exception { exc_type, .. } => *exc_type as *mut TypeObject,
         ShimKind::NotImplemented => ptr::addr_of_mut!(types::NOT_IMPLEMENTED_TYPE),
         ShimKind::Ellipsis => ptr::addr_of_mut!(types::ELLIPSIS_TYPE),
         ShimKind::Module(_) | ShimKind::ModuleDef { .. } => {
@@ -689,8 +753,82 @@ fn free_shim_object(object: *mut ShimObject) {
     // receive a valid (if dying) object, as in CPython.
     let mut boxed = unsafe { Box::from_raw(object) };
     let kind = std::mem::replace(&mut boxed.kind, ShimKind::None);
+    drop_buffer_cache_entry(object as usize);
     release_kind(kind, object);
     drop(boxed);
+}
+
+/// Side storage for the raw buffers handed to extensions.
+///
+/// `PyUnicode_DATA` and `PyUnicode_AsUTF8AndSize` must return pointers that
+/// stay valid while the string object lives, including strings whose payload
+/// cannot be expressed as a `CString` (embedded NULs, `PyUnicode_New` storage).
+/// Buffers are keyed by object address and removed when the object is freed.
+fn buffer_cache() -> MutexGuard<'static, HashMap<usize, Vec<u8>>> {
+    static CACHE: LazyLock<Mutex<HashMap<usize, Vec<u8>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    CACHE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn drop_buffer_cache_entry(address: usize) {
+    buffer_cache().remove(&address);
+}
+
+/// Returns a cached buffer for `object`, building it with `build` on first
+/// use. The vector is never mutated again, so the returned pointer is stable
+/// for the object's lifetime.
+fn cached_buffer(object: *mut ShimObject, build: impl FnOnce() -> Vec<u8>) -> *const u8 {
+    let mut cache = buffer_cache();
+    let entry = cache.entry(object as usize).or_insert_with(build);
+    entry.as_ptr()
+}
+
+/// Recomputes a `PyUnicode_New` string's text from the storage an extension
+/// may have written through `PyUnicode_DATA`.
+///
+/// # Safety
+/// `object` must be a live shim object; the caller holds the GIL, which is
+/// what serialises writes to the raw buffer.
+unsafe fn refresh_raw_unicode(object: *mut ShimObject) {
+    // SAFETY: the caller upholds the liveness contract.
+    let kind = unsafe { &mut (*object).kind };
+    let ShimKind::Str {
+        text,
+        c_text,
+        raw: Some(raw),
+    } = kind
+    else {
+        return;
+    };
+    let decoded = match raw.width {
+        1 => raw
+            .data
+            .iter()
+            .map(|&byte| byte as char)
+            .collect::<String>(),
+        2 => {
+            let (chunks, _) = raw.data.as_chunks::<2>();
+            let units: Vec<u16> = chunks
+                .iter()
+                .map(|&pair| u16::from_le_bytes(pair))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        4 => {
+            let mut decoded = String::with_capacity(raw.data.len() / 4);
+            let (chunks, _) = raw.data.as_chunks::<4>();
+            for chunk in chunks {
+                let code = u32::from_le_bytes(*chunk);
+                decoded.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
+            decoded
+        }
+        _ => return,
+    };
+    if *text != decoded {
+        *text = decoded;
+    }
+    *c_text = CString::new(text.as_bytes()).ok();
 }
 
 /// Drops one payload, decrementing owned children and running capsule
@@ -741,11 +879,39 @@ fn release_kind(kind: ShimKind, address: *mut ShimObject) {
                 dec_ref(module as *mut ShimObject);
             }
         }
+        ShimKind::Set(items) | ShimKind::FrozenSet(items) => {
+            for item in items {
+                if item != 0 {
+                    dec_ref(item as *mut ShimObject);
+                }
+            }
+        }
+        ShimKind::Exception {
+            exc_type: _,
+            args,
+            cause,
+            traceback,
+        } => {
+            for arg in args {
+                if arg != 0 {
+                    dec_ref(arg as *mut ShimObject);
+                }
+            }
+            if cause != 0 {
+                dec_ref(cause as *mut ShimObject);
+            }
+            if traceback != 0 {
+                dec_ref(traceback as *mut ShimObject);
+            }
+        }
         ShimKind::None
         | ShimKind::Bool(_)
         | ShimKind::Int(_)
         | ShimKind::Float(_)
         | ShimKind::Str { .. }
+        | ShimKind::ByteArray { .. }
+        | ShimKind::Complex { .. }
+        | ShimKind::RuntimeFunction { .. }
         | ShimKind::Bytes { .. }
         | ShimKind::NotImplemented
         | ShimKind::Ellipsis
@@ -899,6 +1065,7 @@ static INTERNED: LazyLock<InternedConstants> = LazyLock::new(|| {
     let empty_str = make_immortal(new_object(ShimKind::Str {
         text: String::new(),
         c_text: Some(CString::default()),
+        raw: None,
     })) as usize;
     let empty_bytes = make_immortal(new_object(ShimKind::Bytes {
         data: Vec::new(),
@@ -937,7 +1104,11 @@ fn new_str(text: String) -> *mut ShimObject {
     // A `CString` keeps the `const char *` handed out by
     // `PyArg_ParseTuple("s")` valid while the object lives.
     let c_text = CString::new(text.as_bytes()).ok();
-    new_object(ShimKind::Str { text, c_text })
+    new_object(ShimKind::Str {
+        text,
+        c_text,
+        raw: None,
+    })
 }
 
 fn new_bytes(data: Vec<u8>) -> *mut ShimObject {
@@ -1041,13 +1212,27 @@ macro_rules! exception_type_symbols {
                 ensure_builtin_types();
                 unsafe {
                     $(
-                        $symbol = types::allocate_named_type(
+                        $symbol = types::allocate_exception_type(
                             $name,
                             PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE,
                         ) as *mut ShimObject;
                     )+
                 }
+                link_exception_bases();
             });
+        }
+
+        /// Resolves an exported exception class by its short name.
+        fn exception_class_by_name(name: &str) -> *mut ShimObject {
+            initialize_exception_types();
+            unsafe {
+                $(
+                    if name == $name {
+                        return $symbol;
+                    }
+                )+
+            }
+            ptr::null_mut()
         }
 
         /// References every class so the staticlib linker keeps the data.
@@ -1132,6 +1317,101 @@ exception_type_symbols! {
     PyExc_ZeroDivisionError => "ZeroDivisionError",
 }
 
+/// Sets `tp_base` on one exception class so `is_subtype`/`PyErr_GivenExceptionMatches`
+/// see the documented CPython hierarchy.
+fn set_exception_base(child: *mut ShimObject, base: *mut ShimObject) {
+    if child.is_null() || base.is_null() || child == base {
+        return;
+    }
+    // SAFETY: both pointers are live exception classes created by
+    // `initialize_exception_types`; the metatype link is already patched.
+    unsafe {
+        (*(child as *mut TypeObject)).tp_base = base as *mut TypeObject;
+    }
+}
+
+macro_rules! exception_bases {
+    ($($child:ident => $base:ident),+ $(,)?) => {
+        /// Links every exception class to its CPython parent.
+        fn link_exception_bases() {
+            $(
+                set_exception_base(unsafe { $child }, unsafe { $base });
+            )+
+        }
+    };
+}
+
+exception_bases! {
+    PyExc_Exception => PyExc_BaseException,
+    PyExc_BaseExceptionGroup => PyExc_BaseException,
+    PyExc_GeneratorExit => PyExc_BaseException,
+    PyExc_KeyboardInterrupt => PyExc_BaseException,
+    PyExc_SystemExit => PyExc_BaseException,
+    PyExc_ArithmeticError => PyExc_Exception,
+    PyExc_AssertionError => PyExc_Exception,
+    PyExc_AttributeError => PyExc_Exception,
+    PyExc_BufferError => PyExc_Exception,
+    PyExc_EOFError => PyExc_Exception,
+    PyExc_ImportError => PyExc_Exception,
+    PyExc_LookupError => PyExc_Exception,
+    PyExc_MemoryError => PyExc_Exception,
+    PyExc_NameError => PyExc_Exception,
+    PyExc_OSError => PyExc_Exception,
+    PyExc_ReferenceError => PyExc_Exception,
+    PyExc_RuntimeError => PyExc_Exception,
+    PyExc_StopAsyncIteration => PyExc_Exception,
+    PyExc_StopIteration => PyExc_Exception,
+    PyExc_SyntaxError => PyExc_Exception,
+    PyExc_SystemError => PyExc_Exception,
+    PyExc_TypeError => PyExc_Exception,
+    PyExc_ValueError => PyExc_Exception,
+    PyExc_Warning => PyExc_Exception,
+    PyExc_ModuleNotFoundError => PyExc_ImportError,
+    PyExc_IndexError => PyExc_LookupError,
+    PyExc_KeyError => PyExc_LookupError,
+    PyExc_FloatingPointError => PyExc_ArithmeticError,
+    PyExc_OverflowError => PyExc_ArithmeticError,
+    PyExc_ZeroDivisionError => PyExc_ArithmeticError,
+    PyExc_BlockingIOError => PyExc_OSError,
+    PyExc_BrokenPipeError => PyExc_OSError,
+    PyExc_ChildProcessError => PyExc_OSError,
+    PyExc_ConnectionError => PyExc_OSError,
+    PyExc_FileExistsError => PyExc_OSError,
+    PyExc_FileNotFoundError => PyExc_OSError,
+    PyExc_InterruptedError => PyExc_OSError,
+    PyExc_IsADirectoryError => PyExc_OSError,
+    PyExc_NotADirectoryError => PyExc_OSError,
+    PyExc_PermissionError => PyExc_OSError,
+    PyExc_ProcessLookupError => PyExc_OSError,
+    PyExc_TimeoutError => PyExc_OSError,
+    PyExc_ConnectionAbortedError => PyExc_ConnectionError,
+    PyExc_ConnectionRefusedError => PyExc_ConnectionError,
+    PyExc_ConnectionResetError => PyExc_ConnectionError,
+    PyExc_UnboundLocalError => PyExc_NameError,
+    PyExc_IndentationError => PyExc_SyntaxError,
+    PyExc_TabError => PyExc_IndentationError,
+    PyExc_UnicodeError => PyExc_ValueError,
+    PyExc_UnicodeDecodeError => PyExc_UnicodeError,
+    PyExc_UnicodeEncodeError => PyExc_UnicodeError,
+    PyExc_UnicodeTranslateError => PyExc_UnicodeError,
+    PyExc_BytesWarning => PyExc_Warning,
+    PyExc_DeprecationWarning => PyExc_Warning,
+    PyExc_EncodingWarning => PyExc_Warning,
+    PyExc_FutureWarning => PyExc_Warning,
+    PyExc_ImportWarning => PyExc_Warning,
+    PyExc_PendingDeprecationWarning => PyExc_Warning,
+    PyExc_ResourceWarning => PyExc_Warning,
+    PyExc_RuntimeWarning => PyExc_Warning,
+    PyExc_SyntaxWarning => PyExc_Warning,
+    PyExc_UnicodeWarning => PyExc_Warning,
+    PyExc_UserWarning => PyExc_Warning,
+    // `EnvironmentError`, `IOError` and `WindowsError` are aliases of `OSError`
+    // in CPython 3; the exported symbols stay distinct but share the parent.
+    PyExc_EnvironmentError => PyExc_OSError,
+    PyExc_IOError => PyExc_OSError,
+    PyExc_WindowsError => PyExc_OSError,
+}
+
 /// Maps an exported exception class to the loader's message prefix.
 fn exception_prefix(exception: *mut ShimObject) -> String {
     ensure_builtin_types();
@@ -1141,6 +1421,8 @@ fn exception_prefix(exception: *mut ShimObject) -> String {
             if name != "type" {
                 return name;
             }
+        } else if let Some(ShimKind::Exception { exc_type, .. }) = kind_ref(exception) {
+            return types::type_name(*exc_type as *mut TypeObject);
         } else {
             let type_object = type_of(exception);
             if !type_object.is_null() {
@@ -1153,6 +1435,84 @@ fn exception_prefix(exception: *mut ShimObject) -> String {
         }
     }
     "RuntimeError".to_string()
+}
+
+/// Builds an exception instance of `exc_type` with positional `args`.
+fn new_exception_instance(exc_type: usize, args: Vec<*mut ShimObject>) -> *mut ShimObject {
+    for &arg in &args {
+        inc_ref(arg);
+    }
+    new_object(ShimKind::Exception {
+        exc_type,
+        args: args.into_iter().map(|arg| arg as usize).collect(),
+        cause: 0,
+        traceback: 0,
+    })
+}
+
+/// `str()` of an exception instance: `""`, `str(arg)` or `str(tuple(args))`.
+fn exception_text(kind: &ShimKind) -> String {
+    let ShimKind::Exception { args, .. } = kind else {
+        return String::new();
+    };
+    match args.len() {
+        0 => String::new(),
+        1 => value_text(args[0] as *mut ShimObject),
+        _ => {
+            let items: Vec<String> = args
+                .iter()
+                .map(|&arg| value_text(arg as *mut ShimObject))
+                .collect();
+            format!("({})", items.join(", "))
+        }
+    }
+}
+
+/// `repr()` of an exception instance: `Name(arg, ...)`.
+fn exception_repr(exc_type: usize, args: &[usize], depth: usize) -> String {
+    let name = types::type_name(exc_type as *mut TypeObject);
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|&arg| shim_repr_at(arg as *mut ShimObject, depth + 1))
+        .collect();
+    format!("{name}({})", rendered.join(", "))
+}
+
+/// `str()` of any handle: strings unquoted, everything else through `repr`.
+fn value_text(object: *mut ShimObject) -> String {
+    match kind_ref(object) {
+        Some(ShimKind::Str { text, .. }) => text.clone(),
+        _ => shim_repr(object),
+    }
+}
+
+/// Splits the loader spelling `"<Type>: <message>"` and materialises the
+/// exception instance it describes.
+fn exception_from_message(message: &str) -> *mut ShimObject {
+    let (name, text) = match message.split_once(": ") {
+        Some((name, text)) => (name, text),
+        None => ("RuntimeError", message),
+    };
+    let exc_type = {
+        let known = exception_class_by_name(name);
+        if known.is_null() {
+            unsafe { PyExc_RuntimeError }
+        } else {
+            known
+        }
+    };
+    let args = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![new_str(text.to_string())]
+    };
+    // The constructor takes ownership of a vector and keeps its own references,
+    // so pass a copy and release the caller's references below.
+    let instance = new_exception_instance(exc_type as usize, args.clone());
+    for arg in args {
+        dec_ref(arg);
+    }
+    instance
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,8 +1599,13 @@ pub(crate) fn kind_ref(object: *mut ShimObject) -> Option<&'static ShimKind> {
     if role != TypeRole::Shim {
         return None;
     }
-    // SAFETY: the payload follows the header for every shim object.
-    Some(unsafe { &(*object).kind })
+    // SAFETY: the payload follows the header for every shim object, and the
+    // GIL serialises the refresh against extension writes through
+    // `PyUnicode_DATA`.
+    unsafe {
+        refresh_raw_unicode(object);
+        Some(&(*object).kind)
+    }
 }
 
 /// Python type name of any handle.
@@ -1350,8 +1715,24 @@ fn object_to_value_at(
                     .map(|name| name.to_string_lossy().into_owned()),
             })
         }
-        ShimKind::CFunction { .. } => Err(
+        ShimKind::CFunction { .. } | ShimKind::RuntimeFunction { .. } => Err(
             "extension returned a C function object, which cannot be converted to a Hydro value"
+                .to_string(),
+        ),
+        ShimKind::ByteArray { .. } => Err(
+            "extension returned a bytearray object, which cannot be converted to a Hydro value"
+                .to_string(),
+        ),
+        ShimKind::Set(_) | ShimKind::FrozenSet(_) => Err(
+            "extension returned a set object, which cannot be converted to a Hydro value"
+                .to_string(),
+        ),
+        ShimKind::Complex { .. } => Err(
+            "extension returned a complex object, which cannot be converted to a Hydro value"
+                .to_string(),
+        ),
+        ShimKind::Exception { .. } => Err(
+            "extension returned an exception object, which cannot be converted to a Hydro value"
                 .to_string(),
         ),
         ShimKind::NotImplemented => Ok(ShimValue::NotImplemented),
@@ -1384,6 +1765,55 @@ fn begin_container(
     }
     path.push(address);
     Ok(())
+}
+
+/// Formats one component of a complex number the way `complex.__repr__` does:
+/// shortest round-tripping digits, with the trailing `.0` of integral values
+/// removed.
+fn complex_part(value: f64) -> String {
+    let text = crate::core::value::format_float(value);
+    if value.is_finite() && value.fract() == 0.0 {
+        text.strip_suffix(".0").map(str::to_string).unwrap_or(text)
+    } else {
+        text
+    }
+}
+
+/// `repr()` of a complex number: `<imag>j` when the real part is positive
+/// zero, otherwise `(<real><sign><imag>j)`.
+fn complex_repr(real: f64, imag: f64) -> String {
+    let imag_text = complex_part(imag.abs());
+    if real == 0.0 && !real.is_sign_negative() {
+        return format!(
+            "{}{}j",
+            if imag.is_sign_negative() { "-" } else { "" },
+            imag_text
+        );
+    }
+    format!(
+        "({}{}{}j)",
+        complex_part(real),
+        if imag.is_sign_negative() { "-" } else { "+" },
+        imag_text
+    )
+}
+
+/// `repr()` of a set or frozenset: `{...}`, `set()`/`frozenset()` when empty
+/// and `frozenset({...})` for the immutable form.
+fn set_repr(items: &[usize], frozen: bool, depth: usize) -> String {
+    if items.is_empty() {
+        return if frozen { "frozenset()" } else { "set()" }.to_string();
+    }
+    let rendered: Vec<String> = items
+        .iter()
+        .map(|item| shim_repr_at(*item as *mut ShimObject, depth + 1))
+        .collect();
+    let body = format!("{{{}}}", rendered.join(", "));
+    if frozen {
+        format!("frozenset({body})")
+    } else {
+        body
+    }
 }
 
 /// Renders a handle for `PyErr_SetObject`.
@@ -1425,6 +1855,25 @@ fn shim_repr_at(object: *mut ShimObject, depth: usize) -> String {
             }
             rendered.push('\'');
             rendered
+        }
+        ShimKind::ByteArray { data, .. } => {
+            let mut rendered = String::from("bytearray(b'");
+            for byte in data {
+                if byte.is_ascii_graphic() || *byte == b' ' {
+                    rendered.push(*byte as char);
+                } else {
+                    rendered.push_str(&format!("\\x{byte:02x}"));
+                }
+            }
+            rendered.push_str("')");
+            rendered
+        }
+        ShimKind::Set(items) => set_repr(items, false, depth),
+        ShimKind::FrozenSet(items) => set_repr(items, true, depth),
+        ShimKind::Complex { real, imag } => complex_repr(*real, *imag),
+        ShimKind::Exception { exc_type, args, .. } => exception_repr(*exc_type, args, depth),
+        ShimKind::RuntimeFunction { name, .. } => {
+            format!("<built-in function {name}>")
         }
         ShimKind::List(items) => {
             let items: Vec<String> = items
@@ -1485,13 +1934,46 @@ fn shim_repr_at(object: *mut ShimObject, depth: usize) -> String {
 
 std::thread_local! {
     /// Pending error set by an extension or by a failing conversion.
-    static CALL_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    ///
+    /// `message` keeps CPython's `"<Type>: <message>"` spelling so the loader
+    /// can map it back to a Hydro exception tag. `exception` holds an owning
+    /// reference to an exception instance when one was supplied through
+    /// `PyErr_SetRaisedException`; almost every setter stores only the message
+    /// and the instance is materialised on demand by
+    /// `PyErr_GetRaisedException`.
+    static CALL_ERROR: RefCell<RaisedError> = const { RefCell::new(RaisedError::EMPTY) };
+}
+
+/// Thread-local exception state shared by the error API.
+struct RaisedError {
+    message: Option<String>,
+    /// Owning reference, released when the state is replaced or cleared.
+    exception: Option<usize>,
+}
+
+impl RaisedError {
+    const EMPTY: Self = Self {
+        message: None,
+        exception: None,
+    };
+}
+
+/// Replaces the error state, releasing the previous exception reference.
+fn replace_error_state(message: Option<String>, exception: Option<usize>) {
+    let previous = CALL_ERROR.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let previous = std::mem::replace(&mut *state, RaisedError { message, exception });
+        previous.exception
+    });
+    if let Some(previous) = previous {
+        dec_ref(previous as *mut ShimObject);
+    }
 }
 
 /// Records a pending error, using CPython's `"<Type>: <message>"` spelling so
 /// the loader can map it back to a Hydro exception tag.
 pub(crate) fn set_error(message: impl Into<String>) {
-    CALL_ERROR.with(|slot| *slot.borrow_mut() = Some(message.into()));
+    replace_error_state(Some(message.into()), None);
 }
 
 fn set_type_error(message: impl Into<String>) {
@@ -1513,17 +1995,17 @@ pub extern "C" fn hydro_capi_set_type_error(message: *const c_char) {
 }
 
 fn clear_error() {
-    CALL_ERROR.with(|slot| {
-        slot.borrow_mut().take();
-    });
+    replace_error_state(None, None);
 }
 
 pub(crate) fn error_pending() -> bool {
-    CALL_ERROR.with(|slot| slot.borrow().is_some())
+    CALL_ERROR.with(|slot| slot.borrow().message.is_some())
 }
 
 pub(crate) fn take_error() -> Option<String> {
-    CALL_ERROR.with(|slot| slot.borrow_mut().take())
+    let message = CALL_ERROR.with(|slot| slot.borrow_mut().message.take());
+    replace_error_state(None, None);
+    message
 }
 
 // ---------------------------------------------------------------------------
@@ -1673,8 +2155,51 @@ fn key_equal(left: *mut ShimObject, right: *mut ShimObject) -> bool {
         }
         (ShimKind::Str { text: a, .. }, ShimKind::Str { text: b, .. }) => a == b,
         (ShimKind::Bytes { data: a, .. }, ShimKind::Bytes { data: b, .. }) => a == b,
+        (ShimKind::ByteArray { data: a, .. }, ShimKind::ByteArray { data: b, .. }) => a == b,
+        (ShimKind::Complex { real: ar, imag: ai }, ShimKind::Complex { real: br, imag: bi }) => {
+            ar == br && ai == bi
+        }
+        (ShimKind::Tuple(a), ShimKind::Tuple(b)) => sequence_equal(a, b),
+        (ShimKind::List(a), ShimKind::List(b)) => sequence_equal(a, b),
+        (ShimKind::Set(a), ShimKind::Set(b))
+        | (ShimKind::Set(a), ShimKind::FrozenSet(b))
+        | (ShimKind::FrozenSet(a), ShimKind::Set(b))
+        | (ShimKind::FrozenSet(a), ShimKind::FrozenSet(b)) => set_equal(a, b),
+        // Exceptions compare equal when they are the same object; CPython's
+        // default `BaseException` equality is identity, handled above.
         _ => false,
     }
+}
+
+/// Element-wise equality of two handle sequences.
+fn sequence_equal(left: &[usize], right: &[usize]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(&left, &right)| key_equal(left as *mut ShimObject, right as *mut ShimObject))
+}
+
+/// Set equality: same cardinality and every element of `left` in `right`.
+fn set_equal(left: &[usize], right: &[usize]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|&item| {
+            let item = item as *mut ShimObject;
+            right
+                .iter()
+                .any(|&other| key_equal(item, other as *mut ShimObject))
+        })
+}
+
+/// Whether a handle can be stored in a set or used as a dict key.
+fn hashable(object: *mut ShimObject) -> bool {
+    !matches!(
+        kind_ref(object),
+        Some(ShimKind::List(_))
+            | Some(ShimKind::Dict(_))
+            | Some(ShimKind::Set(_))
+            | Some(ShimKind::ByteArray { .. })
+    )
 }
 
 fn dict_position(pairs: &[(usize, usize)], key: *mut ShimObject) -> Option<usize> {
@@ -1786,6 +2311,9 @@ struct ModuleEntry {
     module_object: usize,
     attrs: HashMap<String, ShimAttr>,
     methods: Vec<MethodSpec>,
+    /// Name of the Hydro native/user module backing this object, when it was
+    /// resolved from the runtime registry instead of a loaded DSO.
+    runtime: Option<String>,
 }
 
 struct Registry {
@@ -1952,6 +2480,7 @@ fn create_module_from_definition(
             module_object: module_object as usize,
             attrs,
             methods,
+            runtime: None,
         },
     );
     Ok((id, module_object))
@@ -2365,6 +2894,92 @@ pub(crate) fn type_display_name(address: usize) -> String {
     }
 }
 
+/// Converts a pending Hydro exception into the shim's `"<Type>: <message>"`
+/// spelling and clears it.
+fn take_hydro_error(fallback: &str) -> String {
+    let pending = crate::exc::pending_value();
+    let message = crate::value::exception_data(pending)
+        .map(|data| format!("{}: {}", data.name, data.msg))
+        .unwrap_or_else(|| format!("RuntimeError: {fallback}"));
+    crate::exc::clear();
+    message
+}
+
+/// Calls a Hydro native/user module function with shim arguments.
+fn call_runtime_function(
+    module: &str,
+    function: &str,
+    values: &[*mut ShimObject],
+    keyword_count: usize,
+    positional_count: usize,
+) -> *mut ShimObject {
+    if keyword_count != 0 {
+        set_error(format!(
+            "TypeError: {module}.{function}() takes no keyword arguments through the C API"
+        ));
+        return ptr::null_mut();
+    }
+    debug_assert_eq!(positional_count, values.len());
+    let mut arguments = Vec::with_capacity(positional_count);
+    for &value in &values[..positional_count] {
+        let shim = match object_to_value(value) {
+            Ok(shim) => shim,
+            Err(error) => {
+                set_error(error);
+                return ptr::null_mut();
+            }
+        };
+        match crate::modules::extension::shim_to_value(shim) {
+            Ok(value) => arguments.push(value),
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                return ptr::null_mut();
+            }
+        }
+    }
+    let result = crate::modules::call_native(module, function, arguments.len(), arguments.as_ptr());
+    if crate::exc::pending() {
+        set_error(take_hydro_error(&format!(
+            "{module}.{function}() raised an exception"
+        )));
+        return ptr::null_mut();
+    }
+    match crate::modules::extension::value_to_shim(result) {
+        Ok(shim) => value_object(shim),
+        Err(error) => {
+            set_error(format!(
+                "TypeError: cannot convert the result of {module}.{function}(): {error}"
+            ));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Resolves one attribute of a runtime-backed module.
+fn runtime_module_attribute(module: &str, name: &str) -> Result<*mut ShimObject, String> {
+    // Native functions are addressable by name and dispatch through the
+    // module registry, so expose them as callable handles.
+    if hydro_ir::stdlib::function(module, name).is_some() {
+        return Ok(new_object(ShimKind::RuntimeFunction {
+            module: module.to_string(),
+            name: name.to_string(),
+        }));
+    }
+    let value = crate::modules::module_get_by_name(module, name);
+    if crate::exc::pending() {
+        return Err(take_hydro_error(&format!(
+            "module '{module}' has no attribute '{name}'"
+        )));
+    }
+    match crate::modules::extension::value_to_shim(value) {
+        Ok(shim) => Ok(value_object(shim)),
+        Err(error) => Err(format!(
+            "AttributeError: attribute '{name}' of module '{module}' has no C API \
+             representation ({error})"
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Exported module API
 // ---------------------------------------------------------------------------
@@ -2476,6 +3091,20 @@ pub extern "C" fn PyModule_AddObject(
 /// Creates a module object with no extension definition (used by the import
 /// registry). The module object is immortal, like the loader-created ones.
 fn create_named_module(name: String) -> Result<(u64, *mut ShimObject), String> {
+    create_module_entry(name, None)
+}
+
+/// Creates a module object that resolves its attributes through the Hydro
+/// runtime registry ([`crate::modules::registry_lookup`]).
+fn create_runtime_module(name: String) -> Result<(u64, *mut ShimObject), String> {
+    create_module_entry(name.clone(), Some(name))
+}
+
+/// Shared body of [`create_named_module`] and [`create_runtime_module`].
+fn create_module_entry(
+    name: String,
+    runtime: Option<String>,
+) -> Result<(u64, *mut ShimObject), String> {
     let id = allocate_module_id();
     let module_object = make_immortal(new_object(ShimKind::Module(id)));
     let c_name =
@@ -2509,6 +3138,7 @@ fn create_named_module(name: String) -> Result<(u64, *mut ShimObject), String> {
             module_object: module_object as usize,
             attrs,
             methods: Vec::new(),
+            runtime,
         },
     );
     Ok((id, module_object))
@@ -2818,21 +3448,27 @@ pub extern "C" fn PyState_FindModule(definition: *mut PyModuleDefMirror) -> *mut
 
 /// Looks up a loaded module by name and returns it with a new reference.
 fn import_loaded(name: &str) -> Result<*mut ShimObject, String> {
-    let registry = registry_lock();
-    let Some(id) = registry.by_name.get(name).copied() else {
-        return Err(format!(
-            "ImportError: No module named '{name}' (Hydro's embedded extension bridge only \
-             resolves extension modules already loaded by the interpreter)"
-        ));
-    };
-    let Some(entry) = registry.modules.get(&id) else {
-        return Err(format!(
-            "ImportError: dangling module registry entry for '{name}'"
-        ));
-    };
-    let module = entry.module_object as *mut ShimObject;
-    inc_ref(module);
-    Ok(module)
+    {
+        let registry = registry_lock();
+        if let Some(id) = registry.by_name.get(name).copied() {
+            let Some(entry) = registry.modules.get(&id) else {
+                return Err(format!(
+                    "ImportError: dangling module registry entry for '{name}'"
+                ));
+            };
+            let module = entry.module_object as *mut ShimObject;
+            inc_ref(module);
+            return Ok(module);
+        }
+    }
+    // Not a loaded DSO: fall back to the Hydro runtime registry, which holds
+    // every native stdlib module and every compiled user module.
+    if crate::modules::registry_lookup(name).is_some() {
+        let (_, module) = create_runtime_module(name.to_string())?;
+        inc_ref(module);
+        return Ok(module);
+    }
+    Err(format!("ImportError: No module named '{name}'"))
 }
 
 /// `PyImport_ImportModule`.
@@ -4759,6 +5395,13 @@ fn type_call(
     }
     let new_function = unsafe { (*type_object).tp_new };
     if new_function == 0 {
+        // Static exception classes have no `tp_new` here; calling them builds
+        // the documented instance holding the positional arguments.
+        initialize_exception_types();
+        let base = unsafe { PyExc_BaseException as *mut TypeObject };
+        if !base.is_null() && types::is_subtype(type_object, base) {
+            return exception_instance_from_arguments(type_object, args, kwds);
+        }
         set_error(format!(
             "TypeError: cannot create '{}' instances: the type has no Py_tp_new",
             types::type_name(type_object)
@@ -4811,6 +5454,81 @@ fn type_call(
         return ptr::null_mut();
     }
     result
+}
+
+/// Builds an exception instance from the call arguments of its class.
+///
+/// `BaseException` and its C subclasses take only positional arguments;
+/// keywords are rejected exactly like CPython's `BaseException_init`.
+fn exception_instance_from_arguments(
+    type_object: *mut TypeObject,
+    args: *mut ShimObject,
+    kwds: *mut ShimObject,
+) -> *mut ShimObject {
+    let name = types::type_name(type_object);
+    if !kwds.is_null() {
+        match kind_ref(kwds) {
+            Some(ShimKind::Dict(pairs)) if pairs.is_empty() => {}
+            _ => {
+                set_error(format!("TypeError: {name}() takes no keyword arguments"));
+                return ptr::null_mut();
+            }
+        }
+    }
+    let items = if args.is_null() {
+        &[][..]
+    } else {
+        match tuple_slots(args) {
+            Ok(items) => items,
+            Err(error) => {
+                set_error(error);
+                return ptr::null_mut();
+            }
+        }
+    };
+    if type_object as *mut ShimObject == unsafe { PyExc_UnicodeDecodeError } {
+        if let Err(error) = validate_unicode_decode_arguments(items) {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    }
+    let pointers: Vec<*mut ShimObject> =
+        items.iter().map(|&item| item as *mut ShimObject).collect();
+    new_exception_instance(type_object as usize, pointers)
+}
+
+/// Validates the five arguments of a `UnicodeDecodeError` instance.
+///
+/// CPython's `UnicodeDecodeError_init` parses `(encoding, object, start, end,
+/// reason)`, requires a bytes-like object and coerces the bounds to integers.
+fn validate_unicode_decode_arguments(items: &[usize]) -> Result<(), String> {
+    if items.len() != 5 {
+        return Err(format!(
+            "TypeError: function takes exactly 5 arguments ({} given)",
+            items.len()
+        ));
+    }
+    let encoding = items[0] as *mut ShimObject;
+    let object = items[1] as *mut ShimObject;
+    let start = items[2] as *mut ShimObject;
+    let end = items[3] as *mut ShimObject;
+    let reason = items[4] as *mut ShimObject;
+    if as_string(encoding).is_none() {
+        return Err("TypeError: argument 1 must be str".to_string());
+    }
+    if !matches!(kind_ref(object), Some(ShimKind::Bytes { .. })) {
+        return Err(format!(
+            "TypeError: a bytes-like object is required, not '{}'",
+            object_type_name(object)
+        ));
+    }
+    if as_int(start).is_err() || as_int(end).is_err() {
+        return Err("TypeError: start and end must be integers".to_string());
+    }
+    if as_string(reason).is_none() {
+        return Err("TypeError: argument 5 must be str".to_string());
+    }
+    Ok(())
 }
 
 /// `PyObject_Vectorcall`.
@@ -4909,6 +5627,11 @@ pub extern "C" fn PyObject_Vectorcall(
         };
         let self_object = self_object as *mut ShimObject;
         return invoke_method(function, flags, self_object, &name, values, kwnames);
+    }
+    if let Some(ShimKind::RuntimeFunction { module, name }) = kind_ref(callable) {
+        let module = module.clone();
+        let name = name.clone();
+        return call_runtime_function(&module, &name, values, keyword_count, positional_count);
     }
 
     let type_object = type_of(callable);
@@ -5293,41 +6016,54 @@ fn module_attribute(
         }
         return Some(Ok(dict));
     }
-    let registry = registry_lock();
-    let entry = registry.modules.get(&id);
-    let Some(entry) = entry else {
-        return Some(Err(format!("AttributeError: unknown module {id}")));
-    };
-    if entry.dict != 0 {
-        let key = new_str(name.to_string());
-        let value = PyDict_GetItem(entry.dict as *mut ShimObject, key);
-        dec_ref(key);
-        if !value.is_null() {
-            inc_ref(value);
-            return Some(Ok(value));
+    let (runtime, module_name, attribute, definition, module_object) = {
+        let registry = registry_lock();
+        let entry = registry.modules.get(&id);
+        let Some(entry) = entry else {
+            return Some(Err(format!("AttributeError: unknown module {id}")));
+        };
+        if entry.dict != 0 {
+            let key = new_str(name.to_string());
+            let value = PyDict_GetItem(entry.dict as *mut ShimObject, key);
+            dec_ref(key);
+            if !value.is_null() {
+                inc_ref(value);
+                return Some(Ok(value));
+            }
         }
-    }
-    match entry.attrs.get(name) {
-        Some(ShimAttr::Value(value)) => Some(Ok(value_object(value.clone()))),
-        Some(ShimAttr::Type(address)) => {
-            inc_ref(*address as *mut ShimObject);
-            Some(Ok(*address as *mut ShimObject))
-        }
-        Some(ShimAttr::Callable(callable)) => {
-            let definition = entry
+        let attribute = entry.attrs.get(name).cloned();
+        let definition = match &attribute {
+            Some(ShimAttr::Callable(callable)) => entry
                 .methods
                 .get(callable.method as usize)
                 .map(|spec| spec.definition)
-                .unwrap_or(0);
+                .unwrap_or(0),
+            _ => 0,
+        };
+        (
+            entry.runtime.clone(),
+            entry.name.clone(),
+            attribute,
+            definition,
+            entry.module_object,
+        )
+    };
+    match attribute {
+        Some(ShimAttr::Value(value)) => Some(Ok(value_object(value))),
+        Some(ShimAttr::Type(address)) => {
+            inc_ref(address as *mut ShimObject);
+            Some(Ok(address as *mut ShimObject))
+        }
+        Some(ShimAttr::Callable(_)) => {
             if definition == 0 {
                 return Some(Err(format!(
-                    "AttributeError: module '{}' has no method implementation for '{name}'",
-                    entry.name
+                    "AttributeError: module '{module_name}' has no method implementation \
+                     for '{name}'"
                 )));
             }
             let result = PyCFunction_NewEx(
                 definition as *mut PyMethodDefMirror,
-                entry.module_object as *mut ShimObject,
+                module_object as *mut ShimObject,
                 ptr::null_mut(),
             );
             if result.is_null() {
@@ -5337,10 +6073,12 @@ fn module_attribute(
             }
             Some(Ok(result))
         }
-        None => Some(Err(format!(
-            "AttributeError: module '{}' has no attribute '{name}'",
-            entry.name
-        ))),
+        None => match runtime {
+            Some(runtime) => Some(runtime_module_attribute(&runtime, name)),
+            None => Some(Err(format!(
+                "AttributeError: module '{module_name}' has no attribute '{name}'"
+            ))),
+        },
     }
 }
 
@@ -6066,6 +6804,2429 @@ pub extern "C" fn hydro_capi_parse_p(object: *mut ShimObject, out: *mut c_int) -
             0
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Raised exception state, exception classes and warning output
+// ---------------------------------------------------------------------------
+
+/// `PyErr_GetRaisedException`: new reference to the raised exception, or NULL
+/// with no exception set. Clears the error indicator.
+#[no_mangle]
+pub extern "C" fn PyErr_GetRaisedException() -> *mut ShimObject {
+    let (message, exception) = CALL_ERROR.with(|slot| {
+        let mut state = slot.borrow_mut();
+        (state.message.take(), state.exception.take())
+    });
+    match (message, exception) {
+        (None, None) => ptr::null_mut(),
+        // The state owned one reference; hand it to the caller.
+        (_, Some(exception)) => exception as *mut ShimObject,
+        (Some(message), None) => exception_from_message(&message),
+    }
+}
+
+/// `PyErr_SetRaisedException`: steals a reference to `exception` and installs
+/// it as the raised exception; a NULL argument clears the error.
+#[no_mangle]
+pub extern "C" fn PyErr_SetRaisedException(exception: *mut ShimObject) {
+    if exception.is_null() {
+        clear_error();
+        return;
+    }
+    let message = match kind_ref(exception) {
+        Some(kind @ ShimKind::Exception { .. }) => {
+            format!("{}: {}", exception_prefix(exception), exception_text(kind))
+        }
+        _ => format!("{}: {}", object_type_name(exception), shim_repr(exception)),
+    };
+    replace_error_state(Some(message), Some(exception as usize));
+}
+
+/// `PyErr_GivenExceptionMatches`.
+#[no_mangle]
+pub extern "C" fn PyErr_GivenExceptionMatches(
+    given: *mut ShimObject,
+    exception: *mut ShimObject,
+) -> c_int {
+    if given.is_null() || exception.is_null() {
+        return 0;
+    }
+    if let Some(ShimKind::Tuple(items)) = kind_ref(exception) {
+        return items
+            .iter()
+            .any(|&item| PyErr_GivenExceptionMatches(given, item as *mut ShimObject) != 0)
+            as c_int;
+    }
+    let given = exception_class_of(given);
+    let exception = exception_class_of(exception);
+    if types::is_type_pointer(given) && types::is_type_pointer(exception) {
+        let derived = types::is_subtype(given as *mut TypeObject, exception as *mut TypeObject);
+        return derived as c_int;
+    }
+    (given == exception) as c_int
+}
+
+/// The class of an exception class or instance, or the object itself.
+fn exception_class_of(object: *mut ShimObject) -> *mut ShimObject {
+    match kind_ref(object) {
+        Some(ShimKind::Exception { exc_type, .. }) => *exc_type as *mut ShimObject,
+        _ => object,
+    }
+}
+
+/// `PyErr_NewExceptionWithDoc`.
+#[no_mangle]
+pub extern "C" fn PyErr_NewExceptionWithDoc(
+    name: *const c_char,
+    doc: *const c_char,
+    base: *mut ShimObject,
+    dict: *mut ShimObject,
+) -> *mut ShimObject {
+    if name.is_null() {
+        PyErr_BadInternalCall();
+        return ptr::null_mut();
+    }
+    let full_name = read_c_string(name);
+    let Some((module, short)) = full_name.rsplit_once('.') else {
+        set_error("SystemError: PyErr_NewException: name must be module.class");
+        return ptr::null_mut();
+    };
+    if short.is_empty() || module.is_empty() {
+        set_error("SystemError: PyErr_NewException: name must be module.class");
+        return ptr::null_mut();
+    }
+    initialize_exception_types();
+    let base = if base.is_null() {
+        unsafe { PyExc_Exception }
+    } else {
+        base
+    };
+    if !types::is_type_pointer(base) {
+        set_error(format!(
+            "TypeError: PyErr_NewException: base must be an exception class, not '{}'",
+            object_type_name(base)
+        ));
+        return ptr::null_mut();
+    }
+    if !dict.is_null() && !matches!(kind_ref(dict), Some(ShimKind::Dict(_))) {
+        set_error("TypeError: PyErr_NewException: dict must be a dict");
+        return ptr::null_mut();
+    }
+    let type_object =
+        types::allocate_exception_type(&full_name, PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE);
+    if type_object.is_null() {
+        set_error("MemoryError: cannot allocate the exception class");
+        return ptr::null_mut();
+    }
+    // The class is a real member of the exception hierarchy, so
+    // `PyErr_GivenExceptionMatches` and `issubclass` see the relation.
+    set_exception_base(type_object as *mut ShimObject, base);
+    let doc_text = if !doc.is_null() {
+        Some(read_c_string(doc))
+    } else {
+        dict_doc(dict)
+    };
+    if let Some(doc_text) = doc_text {
+        if let Ok(doc_c) = CString::new(doc_text) {
+            // SAFETY: `type_object` is uniquely owned here; `tp_doc` is
+            // documented as an extension-lifetime string, so the copy leaks
+            // with the class exactly like CPython's static docstrings.
+            unsafe {
+                (*type_object).tp_doc = doc_c.into_raw() as *const c_char;
+            }
+        }
+    }
+    type_object as *mut ShimObject
+}
+
+/// Reads `__doc__` from a caller-supplied class dictionary, if present.
+fn dict_doc(dict: *mut ShimObject) -> Option<String> {
+    if dict.is_null() {
+        return None;
+    }
+    let key = new_str("__doc__".to_string());
+    let value = PyDict_GetItem(dict, key);
+    dec_ref(key);
+    as_string(value)
+}
+
+/// `PyErr_PrintEx`: prints the raised exception to stderr and clears it.
+#[no_mangle]
+pub extern "C" fn PyErr_PrintEx(_set_sys_last_vars: c_int) {
+    let exception = PyErr_GetRaisedException();
+    if exception.is_null() {
+        return;
+    }
+    let (name, text) = exception_display_parts(exception);
+    if let Some(ShimKind::Exception { traceback, .. }) = kind_ref(exception) {
+        if *traceback != 0 {
+            eprintln!("Traceback (most recent call last):");
+        }
+    }
+    if text.is_empty() {
+        eprintln!("{name}");
+    } else {
+        eprintln!("{name}: {text}");
+    }
+    dec_ref(exception);
+}
+
+/// Type name and message of a handle for the printing entry points.
+fn exception_display_parts(exception: *mut ShimObject) -> (String, String) {
+    match kind_ref(exception) {
+        Some(kind @ ShimKind::Exception { .. }) => {
+            let name = types::type_name(match kind {
+                ShimKind::Exception { exc_type, .. } => *exc_type as *mut TypeObject,
+                _ => unreachable!(),
+            });
+            (name, exception_text(kind))
+        }
+        _ => (object_type_name(exception), value_text(exception)),
+    }
+}
+
+/// `PyErr_WriteUnraisable`: reports an exception that cannot be raised, then
+/// clears it.
+#[no_mangle]
+pub extern "C" fn PyErr_WriteUnraisable(object: *mut ShimObject) {
+    let exception = PyErr_GetRaisedException();
+    if exception.is_null() {
+        return;
+    }
+    if !object.is_null() && object != ptr::addr_of_mut!(_Py_NoneStruct) {
+        eprintln!("Exception ignored in: {}", value_text(object));
+    }
+    let (name, text) = exception_display_parts(exception);
+    if text.is_empty() {
+        eprintln!("{name}");
+    } else {
+        eprintln!("{name}: {text}");
+    }
+    dec_ref(exception);
+}
+
+/// Tag of a warning category class, or `None` when it is not a warning.
+fn warning_category_tag(category: *mut ShimObject) -> Option<u32> {
+    if category.is_null() {
+        return Some(crate::exc::USER_WARNING);
+    }
+    if !types::is_type_pointer(category) {
+        return None;
+    }
+    let name = types::type_name(category as *mut TypeObject);
+    let short = name.rsplit('.').next().unwrap_or(&name);
+    crate::modules::extension::exception_tag(short)
+}
+
+/// `PyErr_WarnEx`: emits a warning through the runtime `warnings` module.
+#[no_mangle]
+pub extern "C" fn PyErr_WarnEx(
+    category: *mut ShimObject,
+    message: *const c_char,
+    stack_level: isize,
+) -> c_int {
+    if message.is_null() {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    let Some(tag) = warning_category_tag(category) else {
+        set_error("TypeError: category must be a Warning subclass");
+        return -1;
+    };
+    if !crate::exc::tag_is_subclass(tag, crate::exc::WARNING) {
+        set_error("TypeError: category must be a Warning subclass");
+        return -1;
+    }
+    let text = read_c_string(message);
+    let message_value = crate::value::str_alloc(text);
+    let category_value = if category.is_null() {
+        crate::value::NONE
+    } else {
+        crate::exc::exception_class(tag)
+    };
+    let stack_value = crate::ops::int_result(stack_level as i64);
+    let result =
+        crate::modules::warnings::call("warn", &[message_value, category_value, stack_value]);
+    if crate::exc::pending() {
+        set_error(take_hydro_error("warning could not be emitted"));
+        return -1;
+    }
+    debug_assert_eq!(result, crate::value::NONE);
+    0
+}
+
+/// `PyException_GetCause`: new reference to `__cause__`, or NULL.
+#[no_mangle]
+pub extern "C" fn PyException_GetCause(exception: *mut ShimObject) -> *mut ShimObject {
+    match kind_ref(exception) {
+        Some(ShimKind::Exception { cause, .. }) if *cause != 0 => {
+            let cause = *cause as *mut ShimObject;
+            inc_ref(cause);
+            cause
+        }
+        Some(ShimKind::Exception { .. }) => ptr::null_mut(),
+        _ => {
+            set_error("SystemError: PyException_GetCause: not an exception instance");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyException_SetCause`: steals a reference to `cause`.
+#[no_mangle]
+pub extern "C" fn PyException_SetCause(exception: *mut ShimObject, cause: *mut ShimObject) {
+    if exception.is_null() {
+        set_error("SystemError: PyException_SetCause: not an exception instance");
+        return;
+    }
+    // SAFETY: the object is live, the GIL is held and only the cause slot is
+    // written while this frame owns the exclusive borrow.
+    let ShimKind::Exception { cause: slot, .. } = (unsafe { &mut (*exception).kind }) else {
+        set_error("SystemError: PyException_SetCause: not an exception instance");
+        return;
+    };
+    let previous = std::mem::replace(slot, cause as usize);
+    if previous != 0 && previous != cause as usize {
+        dec_ref(previous as *mut ShimObject);
+    }
+    // CPython also sets `__suppress_context__ = True`, which this host does not
+    // expose as an attribute slot.
+}
+
+/// `PyException_GetTraceback`: new reference to `__traceback__`, or NULL.
+#[no_mangle]
+pub extern "C" fn PyException_GetTraceback(exception: *mut ShimObject) -> *mut ShimObject {
+    match kind_ref(exception) {
+        Some(ShimKind::Exception { traceback, .. }) if *traceback != 0 => {
+            let traceback = *traceback as *mut ShimObject;
+            inc_ref(traceback);
+            traceback
+        }
+        Some(ShimKind::Exception { .. }) => ptr::null_mut(),
+        _ => {
+            set_error("SystemError: PyException_GetTraceback: not an exception instance");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyException_SetTraceback`: stores `traceback` (or `None`), returning 0 on
+/// success and -1 with a `TypeError` for a non-traceback value.
+#[no_mangle]
+pub extern "C" fn PyException_SetTraceback(
+    exception: *mut ShimObject,
+    traceback: *mut ShimObject,
+) -> c_int {
+    if !traceback.is_null()
+        && traceback != ptr::addr_of_mut!(_Py_NoneStruct)
+        && type_of(traceback) != ptr::addr_of_mut!(types::TRACEBACK_TYPE)
+    {
+        set_error("TypeError: __traceback__ must be a traceback or None");
+        return -1;
+    }
+    let Some(kind) = kind_ref(exception) else {
+        set_error("SystemError: PyException_SetTraceback: not an exception instance");
+        return -1;
+    };
+    if !matches!(kind, ShimKind::Exception { .. }) {
+        set_error("SystemError: PyException_SetTraceback: not an exception instance");
+        return -1;
+    }
+    let stored = if traceback.is_null() || traceback == ptr::addr_of_mut!(_Py_NoneStruct) {
+        0
+    } else {
+        traceback as usize
+    };
+    // SAFETY: see `PyException_SetCause`; the kind was just validated.
+    let ShimKind::Exception {
+        traceback: slot, ..
+    } = (unsafe { &mut (*exception).kind })
+    else {
+        unreachable!("kind validated above")
+    };
+    let previous = std::mem::replace(slot, stored);
+    if previous != 0 && previous != stored {
+        dec_ref(previous as *mut ShimObject);
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Dictionary, set, mapping, list and iterator API
+// ---------------------------------------------------------------------------
+
+/// Reports `PyErr_BadInternalCall` for a wrong or NULL container argument.
+fn bad_internal_call() {
+    set_error("SystemError: bad argument to internal function");
+}
+
+/// `PyDict_Clear`.
+#[no_mangle]
+pub extern "C" fn PyDict_Clear(object: *mut ShimObject) {
+    if object.is_null() || !matches!(kind_ref(object), Some(ShimKind::Dict(_))) {
+        bad_internal_call();
+        return;
+    }
+    let removed = match dict_slots_mut(object) {
+        Ok(pairs) => std::mem::take(pairs),
+        Err(error) => {
+            set_error(error);
+            return;
+        }
+    };
+    for (key, value) in removed {
+        dec_ref(key as *mut ShimObject);
+        dec_ref(value as *mut ShimObject);
+    }
+}
+
+/// `PyDict_Contains`: 1 present, 0 absent, -1 error.
+#[no_mangle]
+pub extern "C" fn PyDict_Contains(object: *mut ShimObject, key: *mut ShimObject) -> c_int {
+    if key.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    if !hashable(key) {
+        set_error(format!(
+            "TypeError: unhashable type: '{}'",
+            object_type_name(key)
+        ));
+        return -1;
+    }
+    if object.is_null() || !matches!(kind_ref(object), Some(ShimKind::Dict(_))) {
+        bad_internal_call();
+        return -1;
+    }
+    let pairs = match dict_slots(object) {
+        Ok(pairs) => pairs,
+        Err(error) => {
+            set_error(error);
+            return -1;
+        }
+    };
+    dict_position(pairs, key).is_some() as c_int
+}
+
+/// `PyDict_Copy`: a shallow copy, or NULL with an exception.
+#[no_mangle]
+pub extern "C" fn PyDict_Copy(object: *mut ShimObject) -> *mut ShimObject {
+    if object.is_null() || !matches!(kind_ref(object), Some(ShimKind::Dict(_))) {
+        bad_internal_call();
+        return ptr::null_mut();
+    }
+    let pairs = match dict_slots(object) {
+        Ok(pairs) => pairs,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    for &(key, value) in pairs {
+        inc_ref(key as *mut ShimObject);
+        inc_ref(value as *mut ShimObject);
+    }
+    new_object(ShimKind::Dict(pairs.to_vec()))
+}
+
+/// `PyDict_DelItem`.
+#[no_mangle]
+pub extern "C" fn PyDict_DelItem(object: *mut ShimObject, key: *mut ShimObject) -> c_int {
+    if key.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    if !hashable(key) {
+        set_error(format!(
+            "TypeError: unhashable type: '{}'",
+            object_type_name(key)
+        ));
+        return -1;
+    }
+    if object.is_null() || !matches!(kind_ref(object), Some(ShimKind::Dict(_))) {
+        bad_internal_call();
+        return -1;
+    }
+    let position = {
+        let pairs = match dict_slots(object) {
+            Ok(pairs) => pairs,
+            Err(error) => {
+                set_error(error);
+                return -1;
+            }
+        };
+        dict_position(pairs, key)
+    };
+    let Some(position) = position else {
+        set_error(format!("KeyError: {}", shim_repr(key)));
+        return -1;
+    };
+    let removed = {
+        let pairs = match dict_slots_mut(object) {
+            Ok(pairs) => pairs,
+            Err(error) => {
+                set_error(error);
+                return -1;
+            }
+        };
+        pairs.remove(position)
+    };
+    dec_ref(removed.0 as *mut ShimObject);
+    dec_ref(removed.1 as *mut ShimObject);
+    0
+}
+
+/// `PyDict_GetItemRef`: 1 with a new reference in `*result`, 0 when missing,
+/// -1 with an exception.
+#[no_mangle]
+pub extern "C" fn PyDict_GetItemRef(
+    object: *mut ShimObject,
+    key: *mut ShimObject,
+    result: *mut *mut ShimObject,
+) -> c_int {
+    if result.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    // SAFETY: the caller passed a writable slot for the borrowed result.
+    unsafe { *result = ptr::null_mut() };
+    if key.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    if !hashable(key) {
+        set_error(format!(
+            "TypeError: unhashable type: '{}'",
+            object_type_name(key)
+        ));
+        return -1;
+    }
+    if object.is_null() || !matches!(kind_ref(object), Some(ShimKind::Dict(_))) {
+        bad_internal_call();
+        return -1;
+    }
+    let pairs = match dict_slots(object) {
+        Ok(pairs) => pairs,
+        Err(error) => {
+            set_error(error);
+            return -1;
+        }
+    };
+    match dict_position(pairs, key) {
+        Some(position) => {
+            let value = pairs[position].1 as *mut ShimObject;
+            inc_ref(value);
+            // SAFETY: validated above.
+            unsafe { *result = value };
+            1
+        }
+        None => 0,
+    }
+}
+
+/// `PyDict_Keys`: a new list of the keys, or NULL with an exception.
+#[no_mangle]
+pub extern "C" fn PyDict_Keys(object: *mut ShimObject) -> *mut ShimObject {
+    if object.is_null() || !matches!(kind_ref(object), Some(ShimKind::Dict(_))) {
+        bad_internal_call();
+        return ptr::null_mut();
+    }
+    let pairs = match dict_slots(object) {
+        Ok(pairs) => pairs,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    for &(key, _) in pairs {
+        inc_ref(key as *mut ShimObject);
+    }
+    new_object(ShimKind::List(pairs.iter().map(|&(key, _)| key).collect()))
+}
+
+/// `PyDict_Next`: iterates with a caller-held position. Returns 0 at the end
+/// (also for a non-dict, as CPython's `_PyDict_Next` does).
+#[no_mangle]
+pub extern "C" fn PyDict_Next(
+    object: *mut ShimObject,
+    position: *mut isize,
+    key: *mut *mut ShimObject,
+    value: *mut *mut ShimObject,
+) -> c_int {
+    if position.is_null() {
+        bad_internal_call();
+        return 0;
+    }
+    let pairs = match kind_ref(object) {
+        Some(ShimKind::Dict(pairs)) => pairs,
+        _ => return 0,
+    };
+    // SAFETY: the caller passed a writable position slot.
+    let index = unsafe { *position };
+    let Ok(index) = usize::try_from(index) else {
+        return 0;
+    };
+    let Some(&(entry_key, entry_value)) = pairs.get(index) else {
+        return 0;
+    };
+    // SAFETY: `key`/`value` are either NULL or writable slots.
+    unsafe {
+        if !key.is_null() {
+            *key = entry_key as *mut ShimObject;
+        }
+        if !value.is_null() {
+            *value = entry_value as *mut ShimObject;
+        }
+        *position = index as isize + 1;
+    }
+    1
+}
+
+/// `PyDict_Update`: merges a dict or mapping into `object`.
+#[no_mangle]
+pub extern "C" fn PyDict_Update(object: *mut ShimObject, other: *mut ShimObject) -> c_int {
+    if object.is_null() || other.is_null() || !matches!(kind_ref(object), Some(ShimKind::Dict(_))) {
+        bad_internal_call();
+        return -1;
+    }
+    if matches!(kind_ref(other), Some(ShimKind::Dict(_))) {
+        let pairs = match dict_slots(other) {
+            Ok(pairs) => pairs,
+            Err(error) => {
+                set_error(error);
+                return -1;
+            }
+        };
+        for &(key, value) in pairs {
+            if let Err(error) = dict_set(object, key as *mut ShimObject, value as *mut ShimObject) {
+                set_error(error);
+                return -1;
+            }
+        }
+        return 0;
+    }
+    // Not a dict: require the mapping protocol (`keys()` plus item access).
+    let keys = match attribute_lookup(other, "keys") {
+        Ok(keys) => keys,
+        Err(error) => {
+            set_error(error);
+            return -1;
+        }
+    };
+    let keys = {
+        let result = PyObject_CallNoArgs(keys);
+        dec_ref(keys);
+        result
+    };
+    if keys.is_null() {
+        return -1;
+    }
+    let entries = match iterable_elements(keys) {
+        Ok(entries) => entries,
+        Err(error) => {
+            dec_ref(keys);
+            set_error(error);
+            return -1;
+        }
+    };
+    dec_ref(keys);
+    for &key in &entries {
+        let value = types::PyObject_GetItem(other, key as *mut ShimObject);
+        if value.is_null() {
+            let error = take_error()
+                .unwrap_or_else(|| "TypeError: cannot read the mapping value".to_string());
+            release_elements(&entries);
+            set_error(error);
+            return -1;
+        }
+        let status = dict_set(object, key as *mut ShimObject, value);
+        dec_ref(value);
+        if let Err(error) = status {
+            release_elements(&entries);
+            set_error(error);
+            return -1;
+        }
+    }
+    release_elements(&entries);
+    0
+}
+
+/// `PyMapping_Items`: a list of `(key, value)` tuples.
+#[no_mangle]
+pub extern "C" fn PyMapping_Items(object: *mut ShimObject) -> *mut ShimObject {
+    if object.is_null() {
+        bad_internal_call();
+        return ptr::null_mut();
+    }
+    let pairs: Vec<(usize, usize)> = if let Some(ShimKind::Dict(pairs)) = kind_ref(object) {
+        pairs.clone()
+    } else {
+        let items = match attribute_lookup(object, "items") {
+            Ok(items) => items,
+            Err(_) => {
+                set_error(format!(
+                    "TypeError: argument of type '{}' is not a mapping",
+                    object_type_name(object)
+                ));
+                return ptr::null_mut();
+            }
+        };
+        let result = PyObject_CallNoArgs(items);
+        dec_ref(items);
+        if result.is_null() {
+            return ptr::null_mut();
+        }
+        let entries = match iterable_elements(result) {
+            Ok(entries) => entries,
+            Err(error) => {
+                dec_ref(result);
+                set_error(error);
+                return ptr::null_mut();
+            }
+        };
+        let collected: Result<Vec<(usize, usize)>, String> = entries
+            .iter()
+            .map(|&entry| {
+                let pair = iterable_elements(entry as *mut ShimObject)?;
+                if pair.len() != 2 {
+                    release_elements(&pair);
+                    return Err(format!(
+                        "TypeError: mapping items must be (key, value) pairs, got {} elements",
+                        pair.len()
+                    ));
+                }
+                let pair = (pair[0], pair[1]);
+                inc_ref(pair.0 as *mut ShimObject);
+                inc_ref(pair.1 as *mut ShimObject);
+                Ok(pair)
+            })
+            .collect();
+        release_elements(&entries);
+        dec_ref(result);
+        match collected {
+            Ok(pairs) => pairs,
+            Err(error) => {
+                set_error(error);
+                return ptr::null_mut();
+            }
+        }
+    };
+    let mut list = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        let tuple = PyTuple_New(2);
+        if tuple.is_null() {
+            release_elements(&list);
+            return ptr::null_mut();
+        }
+        inc_ref(key as *mut ShimObject);
+        inc_ref(value as *mut ShimObject);
+        if PyTuple_SetItem(tuple, 0, key as *mut ShimObject) != 0
+            || PyTuple_SetItem(tuple, 1, value as *mut ShimObject) != 0
+        {
+            let error = take_error()
+                .unwrap_or_else(|| "TypeError: cannot build a mapping item".to_string());
+            dec_ref(tuple);
+            release_elements(&list);
+            set_error(error);
+            return ptr::null_mut();
+        }
+        list.push(tuple as usize);
+    }
+    new_object(ShimKind::List(list))
+}
+
+/// Releases handles returned by [`iterable_elements`].
+fn release_elements(elements: &[usize]) {
+    for &element in elements {
+        dec_ref(element as *mut ShimObject);
+    }
+}
+
+/// Collects the elements of an iterable as new references.
+///
+/// Shim containers are enumerated directly; extension iterators are driven
+/// through `PyObject_GetIter`/`PyIter_NextItem`.
+fn iterable_elements(object: *mut ShimObject) -> Result<Vec<usize>, String> {
+    if object.is_null() {
+        return Err("TypeError: cannot iterate a NULL object".to_string());
+    }
+    match kind_ref(object) {
+        Some(ShimKind::List(items))
+        | Some(ShimKind::Tuple(items))
+        | Some(ShimKind::Set(items))
+        | Some(ShimKind::FrozenSet(items)) => {
+            for &item in items {
+                inc_ref(item as *mut ShimObject);
+            }
+            Ok(items.clone())
+        }
+        Some(ShimKind::Dict(pairs)) => {
+            let keys: Vec<usize> = pairs.iter().map(|&(key, _)| key).collect();
+            for &key in &keys {
+                inc_ref(key as *mut ShimObject);
+            }
+            Ok(keys)
+        }
+        Some(ShimKind::Str { text, .. }) => Ok(text
+            .chars()
+            .map(|character| new_str(character.to_string()) as usize)
+            .collect()),
+        Some(ShimKind::Bytes { data, .. }) => Ok(data
+            .iter()
+            .map(|&byte| new_int(byte as i64) as usize)
+            .collect()),
+        _ => {
+            let iterator = types::PyObject_GetIter(object);
+            if iterator.is_null() {
+                return Err(take_error().unwrap_or_else(|| {
+                    format!(
+                        "TypeError: '{}' object is not iterable",
+                        object_type_name(object)
+                    )
+                }));
+            }
+            let mut elements = Vec::new();
+            loop {
+                let mut item: *mut ShimObject = ptr::null_mut();
+                match PyIter_NextItem(iterator, &mut item) {
+                    1 => elements.push(item as usize),
+                    0 => break,
+                    _ => {
+                        let error = take_error().unwrap_or_else(|| {
+                            "TypeError: iterator raised an exception".to_string()
+                        });
+                        release_elements(&elements);
+                        dec_ref(iterator);
+                        return Err(error);
+                    }
+                }
+            }
+            dec_ref(iterator);
+            Ok(elements)
+        }
+    }
+}
+
+/// Builds a set/frozenset from an optional iterable.
+fn new_set(object: *mut ShimObject, frozen: bool) -> *mut ShimObject {
+    let mut items: Vec<usize> = Vec::new();
+    if !object.is_null() {
+        let elements = match iterable_elements(object) {
+            Ok(elements) => elements,
+            Err(error) => {
+                set_error(error);
+                return ptr::null_mut();
+            }
+        };
+        for element in elements {
+            let element_ref = element as *mut ShimObject;
+            if !hashable(element_ref) {
+                set_error(format!(
+                    "TypeError: unhashable type: '{}'",
+                    object_type_name(element_ref)
+                ));
+                dec_ref(element_ref);
+                release_elements(&items);
+                return ptr::null_mut();
+            }
+            if !items
+                .iter()
+                .any(|&existing| key_equal(existing as *mut ShimObject, element_ref))
+            {
+                items.push(element);
+            } else {
+                dec_ref(element_ref);
+            }
+        }
+    }
+    new_object(if frozen {
+        ShimKind::FrozenSet(items)
+    } else {
+        ShimKind::Set(items)
+    })
+}
+
+/// `PySet_New`.
+#[no_mangle]
+pub extern "C" fn PySet_New(iterable: *mut ShimObject) -> *mut ShimObject {
+    new_set(iterable, false)
+}
+
+/// `PyFrozenSet_New`.
+#[no_mangle]
+pub extern "C" fn PyFrozenSet_New(iterable: *mut ShimObject) -> *mut ShimObject {
+    new_set(iterable, true)
+}
+
+/// Mutable element storage of a set handle.
+fn set_slots_mut(object: *mut ShimObject) -> Option<&'static mut Vec<usize>> {
+    if object.is_null() {
+        return None;
+    }
+    // SAFETY: the handle is live and the GIL forbids concurrent mutation.
+    unsafe {
+        match &mut (*object).kind {
+            ShimKind::Set(items) => Some(items),
+            _ => None,
+        }
+    }
+}
+
+/// Records CPython's error for mutating an immutable `frozenset`.
+fn set_not_mutable() -> c_int {
+    set_error("SystemError: <class 'frozenset'> is not mutable");
+    -1
+}
+
+/// `PySet_Add`.
+#[no_mangle]
+pub extern "C" fn PySet_Add(object: *mut ShimObject, key: *mut ShimObject) -> c_int {
+    if key.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    match kind_ref(object) {
+        Some(ShimKind::Set(_)) => {}
+        Some(ShimKind::FrozenSet(_)) => return set_not_mutable(),
+        _ => {
+            bad_internal_call();
+            return -1;
+        }
+    }
+    if !hashable(key) {
+        set_error(format!(
+            "TypeError: unhashable type: '{}'",
+            object_type_name(key)
+        ));
+        return -1;
+    }
+    let Some(items) = set_slots_mut(object) else {
+        bad_internal_call();
+        return -1;
+    };
+    if items
+        .iter()
+        .any(|&existing| key_equal(existing as *mut ShimObject, key))
+    {
+        return 0;
+    }
+    inc_ref(key);
+    items.push(key as usize);
+    0
+}
+
+/// `PySet_Contains`: 1 present, 0 absent, -1 error.
+#[no_mangle]
+pub extern "C" fn PySet_Contains(object: *mut ShimObject, key: *mut ShimObject) -> c_int {
+    if key.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    let items = match kind_ref(object) {
+        Some(ShimKind::Set(items)) | Some(ShimKind::FrozenSet(items)) => items,
+        _ => {
+            bad_internal_call();
+            return -1;
+        }
+    };
+    if !hashable(key) {
+        set_error(format!(
+            "TypeError: unhashable type: '{}'",
+            object_type_name(key)
+        ));
+        return -1;
+    }
+    items
+        .iter()
+        .any(|&existing| key_equal(existing as *mut ShimObject, key)) as c_int
+}
+
+/// `PySet_Size`.
+#[no_mangle]
+pub extern "C" fn PySet_Size(object: *mut ShimObject) -> isize {
+    match kind_ref(object) {
+        Some(ShimKind::Set(items)) | Some(ShimKind::FrozenSet(items)) => py_ssize_of(items.len()),
+        _ => {
+            bad_internal_call();
+            -1
+        }
+    }
+}
+
+/// `PyList_AsTuple`.
+#[no_mangle]
+pub extern "C" fn PyList_AsTuple(object: *mut ShimObject) -> *mut ShimObject {
+    if object.is_null() || !matches!(kind_ref(object), Some(ShimKind::List(_))) {
+        bad_internal_call();
+        return ptr::null_mut();
+    }
+    let items = match list_slots(object) {
+        Ok(items) => items,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    if items.is_empty() {
+        return empty_tuple();
+    }
+    for &item in items {
+        if item == 0 {
+            set_error("SystemError: list contains an uninitialized item");
+            return ptr::null_mut();
+        }
+        inc_ref(item as *mut ShimObject);
+    }
+    new_object(ShimKind::Tuple(items.to_vec()))
+}
+
+/// `PyList_GetSlice`: a new list for the clamped `[low, high)` range.
+#[no_mangle]
+pub extern "C" fn PyList_GetSlice(
+    object: *mut ShimObject,
+    low: isize,
+    high: isize,
+) -> *mut ShimObject {
+    if object.is_null() || !matches!(kind_ref(object), Some(ShimKind::List(_))) {
+        bad_internal_call();
+        return ptr::null_mut();
+    }
+    let items = match list_slots(object) {
+        Ok(items) => items,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let length = py_ssize_of(items.len());
+    let low = low.max(0).min(length);
+    let high = high.max(low).min(length);
+    let slice = &items[low as usize..high as usize];
+    for &item in slice {
+        if item == 0 {
+            set_error("SystemError: list contains an uninitialized item");
+            return ptr::null_mut();
+        }
+        inc_ref(item as *mut ShimObject);
+    }
+    new_object(ShimKind::List(slice.to_vec()))
+}
+
+/// `PyIter_NextItem`: 1 with a new reference in `*item`, 0 when exhausted
+/// (clearing `StopIteration`), -1 with an exception.
+#[no_mangle]
+pub extern "C" fn PyIter_NextItem(iterator: *mut ShimObject, item: *mut *mut ShimObject) -> c_int {
+    if item.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    // SAFETY: the caller passed a writable slot.
+    unsafe { *item = ptr::null_mut() };
+    if iterator.is_null() {
+        set_error("TypeError: expected an iterator, got 'NULL'");
+        return -1;
+    }
+    let type_object = type_of(iterator);
+    // SAFETY: live type object.
+    let next = unsafe { (*type_object).tp_iternext };
+    if next == 0 {
+        set_error(format!(
+            "TypeError: expected an iterator, got '{}'",
+            object_type_name(iterator)
+        ));
+        return -1;
+    }
+    // SAFETY: `iternextfunc` has this signature.
+    let next: unsafe extern "C" fn(*mut ShimObject) -> *mut ShimObject =
+        unsafe { std::mem::transmute(next as *const c_void) };
+    let _gripper = GilGuard::new();
+    let result = unsafe { next(iterator) };
+    if !result.is_null() {
+        // SAFETY: validated slot.
+        unsafe { *item = result };
+        return 1;
+    }
+    if !error_pending() {
+        return 0;
+    }
+    if pending_error_matches(unsafe { PyExc_StopIteration }) {
+        clear_error();
+        return 0;
+    }
+    -1
+}
+
+/// True when the pending error's class matches `class` (a type handle).
+fn pending_error_matches(class: *mut ShimObject) -> bool {
+    let Some(message) = CALL_ERROR.with(|slot| slot.borrow().message.clone()) else {
+        return false;
+    };
+    let name = message
+        .split_once(": ")
+        .map(|(name, _)| name)
+        .unwrap_or(&message);
+    let pending = {
+        let known = exception_class_by_name(name);
+        if known.is_null() {
+            // Module-qualified custom classes: match on the short name.
+            let short = name.rsplit('.').next().unwrap_or(name);
+            exception_class_by_name(short)
+        } else {
+            known
+        }
+    };
+    if pending.is_null() || class.is_null() {
+        return false;
+    }
+    let other = exception_class_of(class);
+    types::is_type_pointer(pending)
+        && types::is_type_pointer(other)
+        && types::is_subtype(pending as *mut TypeObject, other as *mut TypeObject)
+}
+
+/// `PyByteArray_FromStringAndSize`.
+#[no_mangle]
+pub extern "C" fn PyByteArray_FromStringAndSize(
+    value: *const c_char,
+    length: isize,
+) -> *mut ShimObject {
+    if length < 0 {
+        set_error("SystemError: Negative size passed to PyByteArray_FromStringAndSize");
+        return ptr::null_mut();
+    }
+    let Ok(length) = usize::try_from(length) else {
+        set_error("MemoryError: bytearray is too large");
+        return ptr::null_mut();
+    };
+    if value.is_null() && length != 0 {
+        set_error("SystemError: NULL bytearray buffer with a positive size");
+        return ptr::null_mut();
+    }
+    let data = if length == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the caller passes `length` readable bytes.
+        unsafe { std::slice::from_raw_parts(value as *const u8, length).to_vec() }
+    };
+    let mut c_data = data.clone();
+    c_data.push(0);
+    new_object(ShimKind::ByteArray { data, c_data })
+}
+
+/// `PyByteArray_Size`.
+#[no_mangle]
+pub extern "C" fn PyByteArray_Size(object: *mut ShimObject) -> isize {
+    match kind_ref(object) {
+        Some(ShimKind::ByteArray { data, .. }) => py_ssize_of(data.len()),
+        _ => {
+            bad_internal_call();
+            -1
+        }
+    }
+}
+
+/// `PyByteArray_AsString`: the NUL-terminated mutable buffer.
+#[no_mangle]
+pub extern "C" fn PyByteArray_AsString(object: *mut ShimObject) -> *mut c_char {
+    match kind_ref(object) {
+        Some(ShimKind::ByteArray { c_data, .. }) => c_data.as_ptr() as *mut c_char,
+        _ => {
+            bad_internal_call();
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyComplex_FromDoubles`.
+#[no_mangle]
+pub extern "C" fn PyComplex_FromDoubles(real: f64, imag: f64) -> *mut ShimObject {
+    new_object(ShimKind::Complex { real, imag })
+}
+
+/// `PyComplex_RealAsDouble`.
+#[no_mangle]
+pub extern "C" fn PyComplex_RealAsDouble(object: *mut ShimObject) -> f64 {
+    match kind_ref(object) {
+        Some(ShimKind::Complex { real, .. }) => *real,
+        _ => match as_float(object) {
+            Ok(value) => value,
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                -1.0
+            }
+        },
+    }
+}
+
+/// `PyComplex_ImagAsDouble`.
+#[no_mangle]
+pub extern "C" fn PyComplex_ImagAsDouble(object: *mut ShimObject) -> f64 {
+    match kind_ref(object) {
+        Some(ShimKind::Complex { imag, .. }) => *imag,
+        _ => match as_float(object) {
+            Ok(_) => 0.0,
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                -1.0
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Long (native bytes and export) API
+// ---------------------------------------------------------------------------
+
+/// CPython's digit width on 64-bit platforms.
+const PYLONG_SHIFT: u32 = 30;
+/// Largest magnitude held in a single CPython digit.
+const PYLONG_COMPACT_LIMIT: i64 = 1 << PYLONG_SHIFT;
+
+/// `PyLongLayout` mirrored for `PyLong_GetNativeLayout`.
+#[repr(C)]
+pub struct PyLongLayoutMirror {
+    pub bits_per_digit: u8,
+    pub digit_size: u8,
+    pub digits_order: i8,
+    pub digit_endianness: i8,
+}
+
+/// `PyLongExport` mirrored for `PyLong_Export`/`PyLong_FreeExport`.
+#[repr(C)]
+pub struct PyLongExportMirror {
+    pub value: i64,
+    pub negative: u8,
+    pub ndigits: isize,
+    pub digits: *const c_void,
+    pub reserved: usize,
+}
+
+/// `PyLong_GetNativeLayout`.
+#[no_mangle]
+pub extern "C" fn PyLong_GetNativeLayout() -> *const PyLongLayoutMirror {
+    static LAYOUT: PyLongLayoutMirror = PyLongLayoutMirror {
+        bits_per_digit: PYLONG_SHIFT as u8,
+        // `digit` is `uint32_t` on every supported target.
+        digit_size: 4,
+        // -1: least significant digit first.
+        digits_order: -1,
+        // -1 on little-endian hosts, 1 on big-endian ones.
+        digit_endianness: if cfg!(target_endian = "little") {
+            -1
+        } else {
+            1
+        },
+    };
+    &LAYOUT
+}
+
+/// `PyLong_Export`: fills `export_data` with a compact value when possible.
+#[no_mangle]
+pub extern "C" fn PyLong_Export(
+    object: *mut ShimObject,
+    export_data: *mut PyLongExportMirror,
+) -> c_int {
+    if export_data.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    // SAFETY: the caller passed a writable PyLongExport slot.
+    unsafe { ptr::write_bytes(export_data, 0, 1) };
+    let value = match kind_ref(object) {
+        Some(ShimKind::Int(number)) => *number,
+        Some(ShimKind::Bool(flag)) => *flag as i64,
+        _ => {
+            if object.is_null() {
+                set_error("TypeError: expect int, got NULL");
+            } else {
+                set_error(format!(
+                    "TypeError: expect int, got {}",
+                    object_type_name(object)
+                ));
+            }
+            return -1;
+        }
+    };
+    // Every int this host can hold fits into `int64_t`, so the fast path from
+    // CPython's `PyLong_Export` always applies and no digit array is exposed.
+    // SAFETY: validated above.
+    unsafe {
+        (*export_data).value = value;
+        (*export_data).negative = 0;
+        (*export_data).ndigits = 0;
+        (*export_data).digits = ptr::null();
+        (*export_data).reserved = 0;
+    }
+    0
+}
+
+/// `PyLong_FreeExport`: releases the reference a non-compact export pinned.
+#[no_mangle]
+pub extern "C" fn PyLong_FreeExport(export_data: *mut PyLongExportMirror) {
+    if export_data.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes its PyLongExport slot.
+    let reserved = unsafe { (*export_data).reserved };
+    if reserved != 0 {
+        unsafe {
+            (*export_data).reserved = 0;
+        }
+        dec_ref(reserved as *mut ShimObject);
+    }
+}
+
+/// `PyLong_AsNativeBytes` endianness resolution.
+fn resolve_native_endianness(flags: c_int) -> bool {
+    // `-1` (all bits) and the native-endian bit select the host order.
+    if flags == -1 || (flags & 2) != 0 {
+        cfg!(target_endian = "little")
+    } else {
+        (flags & 1) != 0
+    }
+}
+
+/// Whether `value` fits in `bits` two's-complement bits.
+fn fits_in_n_bits(value: i64, bits: i64) -> bool {
+    if bits >= 64 {
+        return true;
+    }
+    let extended = value >> (bits - 1) as u32;
+    extended == 0 || extended == -1
+}
+
+/// Writes the low `n` bytes of `value`'s two's complement, sign extended.
+fn write_twos_complement(value: i64, buffer: *mut u8, n: usize, little_endian: bool) {
+    for index in 0..n {
+        let shift = if little_endian { index } else { n - 1 - index };
+        let byte = if shift >= 8 {
+            if value < 0 {
+                0xFF
+            } else {
+                0x00
+            }
+        } else {
+            ((value as u64) >> (shift * 8)) as u8
+        };
+        // SAFETY: the caller provides `n` writable bytes.
+        unsafe { *buffer.add(index) = byte };
+    }
+}
+
+/// Reads `n` bytes as a two's-complement (or unsigned) integer.
+fn read_native_bytes(
+    buffer: *const u8,
+    n: usize,
+    little_endian: bool,
+    signed: bool,
+) -> Result<i64, String> {
+    if n == 0 {
+        return Ok(0);
+    }
+    // Bytes beyond the first 16 must be pure sign extension to fit an i128.
+    let mut accumulator: i128 = 0;
+    for index in 0..n {
+        let shift = if little_endian { index } else { n - 1 - index };
+        // SAFETY: the caller provides `n` readable bytes.
+        let byte = unsafe { *buffer.add(index) };
+        if shift < 16 {
+            accumulator |= (byte as i128) << (shift * 8);
+        } else {
+            let fill: u8 = if signed && accumulator < 0 {
+                0xFF
+            } else {
+                0x00
+            };
+            if byte != fill {
+                return Err(
+                    "OverflowError: integer does not fit this host's 64-bit int model".to_string(),
+                );
+            }
+        }
+    }
+    if signed && n < 16 {
+        let sign_bit = 1i128 << (n * 8 - 1);
+        if accumulator & sign_bit != 0 {
+            accumulator |= -1i128 << (n * 8);
+        }
+    }
+    let converted: Result<i64, _> = i64::try_from(accumulator);
+    converted
+        .map_err(|_| "OverflowError: integer does not fit this host's 64-bit int model".to_string())
+}
+
+/// `PyLong_FromNativeBytes`.
+#[no_mangle]
+pub extern "C" fn PyLong_FromNativeBytes(
+    buffer: *const c_void,
+    n_bytes: usize,
+    flags: c_int,
+) -> *mut ShimObject {
+    if buffer.is_null() {
+        bad_internal_call();
+        return ptr::null_mut();
+    }
+    let little_endian = resolve_native_endianness(flags);
+    let signed = flags == -1 || (flags & 4) == 0;
+    match read_native_bytes(buffer as *const u8, n_bytes, little_endian, signed) {
+        Ok(value) => new_int(value),
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyLong_AsNativeBytes`.
+#[no_mangle]
+pub extern "C" fn PyLong_AsNativeBytes(
+    object: *mut ShimObject,
+    buffer: *mut c_void,
+    n_bytes: isize,
+    flags: c_int,
+) -> isize {
+    if object.is_null() || n_bytes < 0 {
+        bad_internal_call();
+        return -1;
+    }
+    let little_endian = resolve_native_endianness(flags);
+    let value = match kind_ref(object) {
+        Some(ShimKind::Int(number)) => *number,
+        Some(ShimKind::Bool(flag)) => *flag as i64,
+        _ => {
+            set_error(format!(
+                "TypeError: expect int, got {}",
+                object_type_name(object)
+            ));
+            return -1;
+        }
+    };
+    if flags != -1 && (flags & 8) != 0 && value < 0 {
+        set_error("ValueError: Cannot convert negative int");
+        return -1;
+    }
+    let n = n_bytes as usize;
+    if n == 0 {
+        // The caller only asked for the required size.
+        return if (-PYLONG_COMPACT_LIMIT..PYLONG_COMPACT_LIMIT).contains(&value) {
+            std::mem::size_of::<isize>() as isize
+        } else {
+            magnitude_bytes(value) as isize
+        };
+    }
+    if buffer.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    let unsigned_buffer = flags == -1 || (flags & 4) != 0;
+    if (-PYLONG_COMPACT_LIMIT..PYLONG_COMPACT_LIMIT).contains(&value) {
+        // Compact path: a full native word is copied (and truncated) exactly as
+        // CPython does.
+        let word_size = std::mem::size_of::<isize>();
+        let mut word = [0u8; std::mem::size_of::<isize>()];
+        word.copy_from_slice(&(value as isize).to_ne_bytes());
+        if n <= word_size {
+            for index in 0..n {
+                let source = if little_endian == cfg!(target_endian = "little") {
+                    index
+                } else {
+                    word_size - 1 - index
+                };
+                // SAFETY: `buffer` has `n` writable bytes.
+                unsafe { *((buffer as *mut u8).add(index)) = word[source] };
+            }
+            let mut required = word_size;
+            if fits_in_n_bits(value, (n * 8) as i64) {
+                required = n;
+            } else if value > 0 && fits_in_n_bits(value, n as i64 * 8 + 1) {
+                required = if unsigned_buffer { n } else { n + 1 };
+            }
+            return required as isize;
+        }
+        write_twos_complement(value, buffer as *mut u8, n, little_endian);
+        return word_size as isize;
+    }
+    // Non-compact path: write the truncated two's complement and report the
+    // magnitude's byte count plus the sign bit, with CPython's two edge cases.
+    write_twos_complement(value, buffer as *mut u8, n, little_endian);
+    let magnitude_bits = magnitude_bits(value);
+    let mut required = magnitude_bits as usize / 8 + 1;
+    if required == n + 1 && magnitude_bits.is_multiple_of(8) {
+        let bytes = buffer as *const u8;
+        if value < 0 {
+            // 0x80..00 negative values use every buffer bit for the sign.
+            let mut edge = true;
+            for index in 0..n {
+                // SAFETY: `buffer` has `n` readable bytes.
+                let byte = unsafe { *bytes.add(index) };
+                let expected = if index == 0 {
+                    if little_endian {
+                        0x00
+                    } else {
+                        0x80
+                    }
+                } else if index < n - 1 {
+                    0x00
+                } else if little_endian {
+                    0x80
+                } else {
+                    0x00
+                };
+                if byte != expected {
+                    edge = false;
+                    break;
+                }
+            }
+            if edge {
+                required = n;
+            }
+        } else {
+            // SAFETY: `buffer` has `n` readable bytes.
+            let msb = unsafe { *bytes.add(if little_endian { n - 1 } else { 0 }) };
+            if msb & 0x80 != 0 {
+                required = if unsigned_buffer { n } else { n + 1 };
+            }
+        }
+    }
+    required as isize
+}
+
+/// Number of bytes needed to hold the magnitude of a non-compact value.
+fn magnitude_bytes(value: i64) -> usize {
+    (magnitude_bits(value) as usize) / 8 + 1
+}
+
+/// Bit length of `value`'s magnitude.
+fn magnitude_bits(value: i64) -> u32 {
+    let magnitude = value.unsigned_abs();
+    64 - magnitude.leading_zeros()
+}
+
+/// `PyLong_AsUnsignedLongLong`.
+#[no_mangle]
+pub extern "C" fn PyLong_AsUnsignedLongLong(object: *mut ShimObject) -> u64 {
+    if object.is_null() {
+        bad_internal_call();
+        return u64::MAX;
+    }
+    let value = match kind_ref(object) {
+        Some(ShimKind::Int(number)) => *number,
+        Some(ShimKind::Bool(flag)) => *flag as i64,
+        _ => {
+            set_error("TypeError: an integer is required");
+            return u64::MAX;
+        }
+    };
+    if value < 0 {
+        set_error("OverflowError: can't convert negative int to unsigned");
+        return u64::MAX;
+    }
+    value as u64
+}
+
+/// `PyLong_FromSsize_t`.
+#[no_mangle]
+pub extern "C" fn PyLong_FromSsize_t(value: isize) -> *mut ShimObject {
+    new_int(value as i64)
+}
+
+/// `PyLong_FromUnsignedLongLong`.
+#[no_mangle]
+pub extern "C" fn PyLong_FromUnsignedLongLong(value: u64) -> *mut ShimObject {
+    match i64::try_from(value) {
+        Ok(value) => new_int(value),
+        Err(_) => {
+            set_error(format!(
+                "OverflowError: integer {value} does not fit this host's 64-bit int model"
+            ));
+            ptr::null_mut()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unicode API
+// ---------------------------------------------------------------------------
+
+/// Interned strings, shared by `PyUnicode_InternInPlace`.
+fn intern_table() -> MutexGuard<'static, HashMap<String, usize>> {
+    static TABLE: LazyLock<Mutex<HashMap<String, usize>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    TABLE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `PyUnicode_FromStringAndSize`: decodes UTF-8 into a new string.
+#[no_mangle]
+pub extern "C" fn PyUnicode_FromStringAndSize(
+    value: *const c_char,
+    length: isize,
+) -> *mut ShimObject {
+    if length < 0 {
+        set_error("SystemError: Negative size passed to PyUnicode_FromStringAndSize");
+        return ptr::null_mut();
+    }
+    if value.is_null() {
+        if length > 0 {
+            set_error(
+                "SystemError: NULL string with positive size passed to \
+                 PyUnicode_FromStringAndSize",
+            );
+            return ptr::null_mut();
+        }
+        return interned().empty_str as *mut ShimObject;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        set_error("MemoryError: string is too large");
+        return ptr::null_mut();
+    };
+    // SAFETY: the caller passes `length` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(value as *const u8, length) };
+    match std::str::from_utf8(bytes) {
+        Ok(text) => new_str(text.to_string()),
+        Err(error) => {
+            let position = error.valid_up_to();
+            let reason = match error.error_len() {
+                Some(_) => "invalid start byte",
+                None => "unexpected end of data",
+            };
+            set_error(format!(
+                "UnicodeDecodeError: 'utf-8' codec can't decode byte 0x{:02x} in position \
+                 {position}: {reason}",
+                bytes.get(position).copied().unwrap_or(0)
+            ));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Code unit width CPython would choose for `text`.
+fn unicode_kind_width(text: &str) -> u8 {
+    let max = text
+        .chars()
+        .map(|character| character as u32)
+        .max()
+        .unwrap_or(0);
+    if max < 0x100 {
+        1
+    } else if max < 0x10000 {
+        2
+    } else {
+        4
+    }
+}
+
+/// Encodes `text` in the UCS storage layout `PyUnicode_DATA` exposes: 1, 2 or
+/// 4 bytes per code point, little endian, with a trailing NUL unit.
+fn unicode_data_buffer(text: &str) -> Vec<u8> {
+    let width = unicode_kind_width(text) as usize;
+    let mut buffer = Vec::with_capacity((text.chars().count() + 1) * width);
+    for character in text.chars() {
+        let code = character as u32;
+        match width {
+            1 => buffer.push(code as u8),
+            2 => buffer.extend_from_slice(&(code as u16).to_le_bytes()),
+            _ => buffer.extend_from_slice(&code.to_le_bytes()),
+        }
+    }
+    buffer.resize(buffer.len() + width, 0);
+    buffer
+}
+
+/// `PyUnicode_New`: a string of `size` code points backed by writable UCS
+/// storage of the kind selected by `maxchar`.
+#[no_mangle]
+pub extern "C" fn PyUnicode_New(size: isize, maxchar: c_uint) -> *mut ShimObject {
+    if size < 0 {
+        set_error("SystemError: Negative size passed to PyUnicode_New");
+        return ptr::null_mut();
+    }
+    if maxchar > 0x10FFFF {
+        set_error("SystemError: invalid maximum character passed to PyUnicode_New");
+        return ptr::null_mut();
+    }
+    if size == 0 {
+        return interned().empty_str as *mut ShimObject;
+    }
+    let Ok(size) = usize::try_from(size) else {
+        set_error("MemoryError: string is too large");
+        return ptr::null_mut();
+    };
+    let width: u8 = if maxchar < 0x100 {
+        1
+    } else if maxchar < 0x10000 {
+        2
+    } else {
+        4
+    };
+    let Some(bytes) = size.checked_mul(width as usize) else {
+        set_error("MemoryError: string is too large");
+        return ptr::null_mut();
+    };
+    let mut data = Vec::new();
+    if data.try_reserve_exact(bytes).is_err() {
+        set_error("MemoryError: cannot allocate the string buffer");
+        return ptr::null_mut();
+    }
+    data.resize(bytes, 0);
+    new_object(ShimKind::Str {
+        text: "\0".repeat(size),
+        c_text: None,
+        raw: Some(RawText { width, data }),
+    })
+}
+
+/// `PyUnicode_DATA`: the string's UCS storage.
+///
+/// For strings created by `PyUnicode_New` this is the buffer the extension may
+/// fill. Ordinary strings get a cached, correctly encoded buffer.
+#[no_mangle]
+pub extern "C" fn PyUnicode_DATA(object: *mut ShimObject) -> *mut c_void {
+    match kind_ref(object) {
+        Some(ShimKind::Str { raw: Some(raw), .. }) => raw.data.as_ptr() as *mut c_void,
+        Some(ShimKind::Str { text, .. }) => {
+            let text = text.clone();
+            cached_buffer(object, || unicode_data_buffer(&text)) as *mut c_void
+        }
+        _ => {
+            set_error("SystemError: PyUnicode_DATA requires a str object");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyUnicode_AsUTF8AndSize`: NUL-terminated UTF-8 bytes plus their length.
+#[no_mangle]
+pub extern "C" fn PyUnicode_AsUTF8AndSize(
+    object: *mut ShimObject,
+    size: *mut isize,
+) -> *const c_char {
+    if !size.is_null() {
+        // SAFETY: the caller passed a writable length slot.
+        unsafe { *size = -1 };
+    }
+    let text = match kind_ref(object) {
+        Some(ShimKind::Str { text, .. }) => text.clone(),
+        _ => {
+            // CPython's `PyErr_BadArgument`.
+            set_error("TypeError: bad argument to internal function");
+            return ptr::null();
+        }
+    };
+    let length = text.len();
+    let buffer = cached_buffer(object, || {
+        let mut bytes = Vec::with_capacity(length + 1);
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.push(0);
+        bytes
+    });
+    if !size.is_null() {
+        // SAFETY: validated above.
+        unsafe { *size = length as isize };
+    }
+    buffer as *const c_char
+}
+
+/// Validates an error handler name for `PyUnicode_AsEncodedString`.
+fn unicode_error_handler(errors: &str) -> Result<&str, String> {
+    match errors {
+        "strict" | "ignore" | "replace" => Ok(errors),
+        other => Err(format!("LookupError: unknown error handler name '{other}'")),
+    }
+}
+
+/// Normalizes an encoding name the way CPython's shortcuts do.
+fn normalize_encoding(encoding: &str) -> String {
+    let name = encoding.trim().to_ascii_lowercase().replace('-', "_");
+    match name.as_str() {
+        "utf" | "utf8" | "u8" | "utf_8" => "utf_8".to_string(),
+        "ascii" | "us_ascii" | "646" => "ascii".to_string(),
+        "latin" | "latin1" | "latin_1" | "iso_8859_1" | "iso8859_1" | "8859" | "l1" => {
+            "latin_1".to_string()
+        }
+        "utf16" | "utf_16" | "u16" => "utf_16".to_string(),
+        "utf16le" | "utf_16le" | "utf_16_le" => "utf_16_le".to_string(),
+        "utf16be" | "utf_16be" | "utf_16_be" => "utf_16_be".to_string(),
+        "utf32" | "utf_32" | "u32" => "utf_32".to_string(),
+        "utf32le" | "utf_32le" | "utf_32_le" => "utf_32_le".to_string(),
+        "utf32be" | "utf_32be" | "utf_32_be" => "utf_32_be".to_string(),
+        _ => name,
+    }
+}
+
+/// Encodes `text` with `encoding`, applying `errors` for unencodable code
+/// points.
+fn encode_unicode_text(text: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, String> {
+    if encoding == "utf_16" {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        return Ok(bytes);
+    }
+    if encoding == "utf_16_le" || encoding == "utf_16_be" {
+        let little = encoding == "utf_16_le";
+        let mut bytes = Vec::with_capacity(text.len() * 2);
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        return Ok(bytes);
+    }
+    if encoding == "utf_32" {
+        let mut bytes = vec![0xFF, 0xFE, 0x00, 0x00];
+        for character in text.chars() {
+            bytes.extend_from_slice(&(character as u32).to_le_bytes());
+        }
+        return Ok(bytes);
+    }
+    if encoding == "utf_32_le" || encoding == "utf_32_be" {
+        let little = encoding == "utf_32_le";
+        let mut bytes = Vec::with_capacity(text.len() * 4);
+        for character in text.chars() {
+            let code = character as u32;
+            bytes.extend_from_slice(&if little {
+                code.to_le_bytes()
+            } else {
+                code.to_be_bytes()
+            });
+        }
+        return Ok(bytes);
+    }
+    match encoding {
+        "utf_8" => Ok(text.as_bytes().to_vec()),
+        "ascii" | "latin_1" => {
+            let limit = if encoding == "ascii" { 0x7F } else { 0xFF };
+            let mut bytes = Vec::with_capacity(text.len());
+            for (position, character) in text.chars().enumerate() {
+                let code = character as u32;
+                if code <= limit {
+                    bytes.push(code as u8);
+                    continue;
+                }
+                match errors {
+                    "ignore" => {}
+                    "replace" => bytes.push(b'?'),
+                    _ => {
+                        return Err(format!(
+                            "UnicodeEncodeError: '{}' codec can't encode character \
+                             '\\u{code:04x}' in position {position}: ordinal not in range({})",
+                            if encoding == "ascii" {
+                                "ascii"
+                            } else {
+                                "latin-1"
+                            },
+                            limit + 1
+                        ))
+                    }
+                }
+            }
+            Ok(bytes)
+        }
+        other => Err(format!("LookupError: unknown encoding: {other}")),
+    }
+}
+
+/// `PyUnicode_AsEncodedString`.
+#[no_mangle]
+pub extern "C" fn PyUnicode_AsEncodedString(
+    object: *mut ShimObject,
+    encoding: *const c_char,
+    errors: *const c_char,
+) -> *mut ShimObject {
+    let text = match kind_ref(object) {
+        Some(ShimKind::Str { text, .. }) => text.clone(),
+        _ => {
+            set_error("TypeError: bad argument to internal function");
+            return ptr::null_mut();
+        }
+    };
+    let errors = if errors.is_null() {
+        "strict".to_string()
+    } else {
+        read_c_string(errors)
+    };
+    let normalized_errors = match unicode_error_handler(&errors) {
+        Ok(errors) => errors.to_string(),
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let encoding = if encoding.is_null() {
+        "utf_8".to_string()
+    } else {
+        normalize_encoding(&read_c_string(encoding))
+    };
+    match encode_unicode_text(&text, &encoding, &normalized_errors) {
+        Ok(bytes) => new_bytes(bytes),
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyUnicode_EqualToUTF8AndSize`: 1 when equal, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn PyUnicode_EqualToUTF8AndSize(
+    object: *mut ShimObject,
+    value: *const c_char,
+    size: isize,
+) -> c_int {
+    if value.is_null() || size < 0 {
+        return 0;
+    }
+    let Some(ShimKind::Str { text, .. }) = kind_ref(object) else {
+        return 0;
+    };
+    let Ok(size) = usize::try_from(size) else {
+        return 0;
+    };
+    // SAFETY: the caller provides `size` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(value as *const u8, size) };
+    (text.as_bytes() == bytes) as c_int
+}
+
+/// `PyUnicode_InternInPlace`: replaces the string with the interned instance.
+#[no_mangle]
+pub extern "C" fn PyUnicode_InternInPlace(object: *mut *mut ShimObject) {
+    if object.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes a writable `PyObject *` slot.
+    let current = unsafe { *object };
+    let Some(ShimKind::Str { text, .. }) = kind_ref(current) else {
+        return;
+    };
+    let text = text.clone();
+    let mut table = intern_table();
+    if let Some(&interned) = table.get(&text) {
+        if interned != current as usize {
+            inc_ref(interned as *mut ShimObject);
+            dec_ref(current);
+            // SAFETY: validated slot.
+            unsafe { *object = interned as *mut ShimObject };
+        }
+        return;
+    }
+    table.insert(text, current as usize);
+    // Interned strings live for the process lifetime, like CPython's immortal
+    // interned objects; this also keeps the table entry valid.
+    make_immortal(current);
+}
+
+/// `PyUnicodeDecodeError_Create`: a `UnicodeDecodeError` instance.
+#[no_mangle]
+pub extern "C" fn PyUnicodeDecodeError_Create(
+    encoding: *const c_char,
+    object: *const c_char,
+    length: isize,
+    start: isize,
+    end: isize,
+    reason: *const c_char,
+) -> *mut ShimObject {
+    if encoding.is_null() || object.is_null() || reason.is_null() {
+        bad_internal_call();
+        return ptr::null_mut();
+    }
+    if length < 0 {
+        set_error("SystemError: Negative size passed to PyUnicodeDecodeError_Create");
+        return ptr::null_mut();
+    }
+    let Ok(length) = usize::try_from(length) else {
+        set_error("MemoryError: error object is too large");
+        return ptr::null_mut();
+    };
+    // SAFETY: the caller provides `length` readable bytes.
+    let data = unsafe { std::slice::from_raw_parts(object as *const u8, length) }.to_vec();
+    let encoding_value = new_str(read_c_string(encoding));
+    let object_value = new_bytes(data);
+    let start_value = new_int(start as i64);
+    let end_value = new_int(end as i64);
+    let reason_value = new_str(read_c_string(reason));
+    let instance = new_exception_instance(
+        unsafe { PyExc_UnicodeDecodeError } as usize,
+        vec![
+            encoding_value,
+            object_value,
+            start_value,
+            end_value,
+            reason_value,
+        ],
+    );
+    for value in [
+        encoding_value,
+        object_value,
+        start_value,
+        end_value,
+        reason_value,
+    ] {
+        dec_ref(value);
+    }
+    instance
+}
+
+// ---------------------------------------------------------------------------
+// Object protocol, interpreter state and deallocation
+// ---------------------------------------------------------------------------
+
+/// Opaque `PyInterpreterState` handle for `PyInterpreterState_Get`.
+#[repr(C)]
+pub struct PyInterpreterState {
+    _private: [u8; 0],
+}
+
+/// The single interpreter this host runs, with CPython's main-interpreter id 0.
+static MAIN_INTERPRETER: u8 = 0;
+
+/// `PyInterpreterState_Get`.
+#[no_mangle]
+pub extern "C" fn PyInterpreterState_Get() -> *mut PyInterpreterState {
+    ptr::addr_of!(MAIN_INTERPRETER) as *mut PyInterpreterState
+}
+
+/// `PyInterpreterState_GetID`.
+#[no_mangle]
+pub extern "C" fn PyInterpreterState_GetID(interpreter: *mut PyInterpreterState) -> i64 {
+    if interpreter.is_null() {
+        set_error("ValueError: interpreter state is NULL");
+        return -1;
+    }
+    if interpreter as *const u8 != ptr::addr_of!(MAIN_INTERPRETER) {
+        set_error("ValueError: invalid interpreter state");
+        return -1;
+    }
+    0
+}
+
+/// `Py_IsInitialized`: this host has no finalization entry point, so the
+/// embedded interpreter is initialised for the lifetime of the process.
+#[no_mangle]
+pub extern "C" fn Py_IsInitialized() -> c_int {
+    1
+}
+
+/// `Py_IsFinalizing`.
+#[no_mangle]
+pub extern "C" fn Py_IsFinalizing() -> c_int {
+    0
+}
+
+/// `_Py_Dealloc`: releases a handle whose reference count already reached zero.
+#[no_mangle]
+pub extern "C" fn _Py_Dealloc(object: *mut ShimObject) {
+    if object.is_null() {
+        return;
+    }
+    ensure_builtin_types();
+    // SAFETY: every handle starts with the CPython header.
+    let counter = unsafe { &(*object).head.ob_refcnt };
+    if counter.load(Ordering::Relaxed) == IMMORTAL_REFCNT {
+        return;
+    }
+    counter.store(0, Ordering::Release);
+    free_object(object);
+}
+
+/// `PyCMethod_New`.
+#[no_mangle]
+pub extern "C" fn PyCMethod_New(
+    method: *mut PyMethodDefMirror,
+    self_object: *mut ShimObject,
+    module: *mut ShimObject,
+    class: *mut PyTypeObject,
+) -> *mut ShimObject {
+    if method.is_null() {
+        set_error("SystemError: PyCMethod_New: PyMethodDef is NULL");
+        return ptr::null_mut();
+    }
+    // SAFETY: the extension owns the live method definition.
+    let (name, flags) = unsafe { ((*method).ml_name, (*method).ml_flags) };
+    let method_name = read_c_string(name);
+    if flags & METH_METHOD != 0 {
+        if class.is_null() {
+            set_error(
+                "SystemError: attempting to create PyCMethod with a METH_METHOD flag but \
+                 no class",
+            );
+            return ptr::null_mut();
+        }
+    } else if !class.is_null() {
+        set_error(
+            "SystemError: attempting to create PyCFunction with class but no METH_METHOD \
+             flag",
+        );
+        return ptr::null_mut();
+    }
+    let signature =
+        flags & (METH_VARARGS | METH_FASTCALL | METH_NOARGS | METH_O | METH_KEYWORDS | METH_METHOD);
+    let supported = signature == METH_VARARGS
+        || signature == (METH_VARARGS | METH_KEYWORDS)
+        || signature == METH_FASTCALL
+        || signature == (METH_FASTCALL | METH_KEYWORDS)
+        || signature == METH_NOARGS
+        || signature == METH_O
+        || signature == (METH_METHOD | METH_FASTCALL | METH_KEYWORDS);
+    if !supported {
+        set_error(format!(
+            "SystemError: {method_name}() method: bad call flags"
+        ));
+        return ptr::null_mut();
+    }
+    PyCFunction_NewEx(method, self_object, module)
+}
+
+/// `PyObject_CallNoArgs`.
+#[no_mangle]
+pub extern "C" fn PyObject_CallNoArgs(callable: *mut ShimObject) -> *mut ShimObject {
+    if callable.is_null() {
+        set_error("SystemError: null argument to internal routine");
+        return ptr::null_mut();
+    }
+    PyObject_Vectorcall(callable, ptr::null(), 0, ptr::null_mut())
+}
+
+/// `PyObject_CallOneArg`.
+#[no_mangle]
+pub extern "C" fn PyObject_CallOneArg(
+    callable: *mut ShimObject,
+    argument: *mut ShimObject,
+) -> *mut ShimObject {
+    if callable.is_null() || argument.is_null() {
+        set_error("SystemError: null argument to internal routine");
+        return ptr::null_mut();
+    }
+    let arguments = [argument];
+    PyObject_Vectorcall(callable, arguments.as_ptr(), 1, ptr::null_mut())
+}
+
+/// `PyObject_GenericGetDict`.
+#[no_mangle]
+pub extern "C" fn PyObject_GenericGetDict(
+    object: *mut ShimObject,
+    _context: *mut c_void,
+) -> *mut ShimObject {
+    if object.is_null() {
+        bad_internal_call();
+        return ptr::null_mut();
+    }
+    if matches!(kind_ref(object), Some(ShimKind::Module(_))) {
+        let dict = PyModule_GetDict(object);
+        if !dict.is_null() {
+            inc_ref(dict);
+        }
+        return dict;
+    }
+    set_error("AttributeError: __dict__");
+    ptr::null_mut()
+}
+
+/// `PyObject_GenericSetDict`.
+#[no_mangle]
+pub extern "C" fn PyObject_GenericSetDict(
+    object: *mut ShimObject,
+    value: *mut ShimObject,
+    _context: *mut c_void,
+) -> c_int {
+    if value.is_null() {
+        set_error("TypeError: cannot delete __dict__");
+        return -1;
+    }
+    if !matches!(kind_ref(value), Some(ShimKind::Dict(_))) {
+        set_error(format!(
+            "TypeError: __dict__ must be set to a dictionary, not a '{}'",
+            object_type_name(value)
+        ));
+        return -1;
+    }
+    if !matches!(kind_ref(object), Some(ShimKind::Module(_))) {
+        set_error("AttributeError: __dict__");
+        return -1;
+    }
+    PyDict_Clear(PyModule_GetDict(object));
+    PyDict_Update(PyModule_GetDict(object), value)
+}
+
+/// `PyObject_HasAttrWithError`: 1 present, 0 absent, -1 error.
+#[no_mangle]
+pub extern "C" fn PyObject_HasAttrWithError(
+    object: *mut ShimObject,
+    name: *mut ShimObject,
+) -> c_int {
+    if object.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    let Some(name) = as_string(name) else {
+        set_error("TypeError: attribute name must be string");
+        return -1;
+    };
+    match attribute_lookup(object, &name) {
+        Ok(value) => {
+            dec_ref(value);
+            1
+        }
+        Err(error) => {
+            if error.starts_with("AttributeError") {
+                0
+            } else {
+                set_error(error);
+                -1
+            }
+        }
+    }
+}
+
+/// `PyObject_IsInstance`.
+#[no_mangle]
+pub extern "C" fn PyObject_IsInstance(instance: *mut ShimObject, class: *mut ShimObject) -> c_int {
+    if instance.is_null() || class.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    if let Some(ShimKind::Tuple(classes)) = kind_ref(class) {
+        for &candidate in classes {
+            match PyObject_IsInstance(instance, candidate as *mut ShimObject) {
+                result if result != 0 => return result,
+                _ if error_pending() => return -1,
+                _ => {}
+            }
+        }
+        return 0;
+    }
+    if !types::is_type_pointer(class) {
+        set_error("TypeError: isinstance() arg 2 must be a type, a tuple of types, or a union");
+        return -1;
+    }
+    let instance_type = type_of(instance);
+    if instance_type.is_null() {
+        return 0;
+    }
+    types::is_subtype(instance_type, class as *mut TypeObject) as c_int
+}
+
+/// `PyObject_IsSubclass`.
+#[no_mangle]
+pub extern "C" fn PyObject_IsSubclass(derived: *mut ShimObject, class: *mut ShimObject) -> c_int {
+    if derived.is_null() || class.is_null() {
+        bad_internal_call();
+        return -1;
+    }
+    if let Some(ShimKind::Tuple(classes)) = kind_ref(class) {
+        for &candidate in classes {
+            match PyObject_IsSubclass(derived, candidate as *mut ShimObject) {
+                result if result != 0 => return result,
+                _ if error_pending() => return -1,
+                _ => {}
+            }
+        }
+        return 0;
+    }
+    if !types::is_type_pointer(derived) {
+        set_error("TypeError: issubclass() arg 1 must be a class");
+        return -1;
+    }
+    if !types::is_type_pointer(class) {
+        set_error("TypeError: issubclass() arg 2 must be a class, a tuple of classes, or a union");
+        return -1;
+    }
+    types::is_subtype(derived as *mut TypeObject, class as *mut TypeObject) as c_int
+}
+
+/// `PyObject_LengthHint`: `len(obj)`, then `__length_hint__`, then `default`.
+#[no_mangle]
+pub extern "C" fn PyObject_LengthHint(object: *mut ShimObject, default_value: isize) -> isize {
+    if object.is_null() {
+        return default_value;
+    }
+    let length = types::object_length(object);
+    if !error_pending() {
+        return length;
+    }
+    let error = take_error().unwrap_or_default();
+    if !error.starts_with("TypeError") {
+        set_error(error);
+        return -1;
+    }
+    let hint = match attribute_lookup(object, "__length_hint__") {
+        Ok(hint) => hint,
+        Err(_) => return default_value,
+    };
+    let result = PyObject_CallNoArgs(hint);
+    dec_ref(hint);
+    if result.is_null() {
+        if error_pending() {
+            let error = take_error().unwrap_or_default();
+            if error.starts_with("TypeError") {
+                return default_value;
+            }
+            set_error(error);
+        }
+        return -1;
+    }
+    if result == ptr::addr_of_mut!(_Py_NotImplementedStruct) {
+        dec_ref(result);
+        return default_value;
+    }
+    let value = match as_int(result) {
+        Ok(value) => value,
+        Err(_) => {
+            set_error(format!(
+                "TypeError: __length_hint__ must be an integer, not '{}'",
+                object_type_name(result)
+            ));
+            dec_ref(result);
+            return -1;
+        }
+    };
+    dec_ref(result);
+    if value < 0 {
+        set_error("ValueError: __length_hint__() should return >= 0");
+        return -1;
+    }
+    isize::try_from(value).unwrap_or(isize::MAX)
+}
+
+/// `PyObject_Dir`.
+#[no_mangle]
+pub extern "C" fn PyObject_Dir(object: *mut ShimObject) -> *mut ShimObject {
+    if object.is_null() {
+        // There is no executing frame to take locals from.
+        return new_object(ShimKind::List(Vec::new()));
+    }
+    let mut names: Vec<String> = Vec::new();
+    if let Some(ShimKind::Module(_)) = kind_ref(object) {
+        let dict = PyModule_GetDict(object);
+        if !dict.is_null() {
+            if let Ok(pairs) = dict_slots(dict) {
+                for &(key, _) in pairs {
+                    if let Some(name) = as_string(key as *mut ShimObject) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names.push("__dict__".to_string());
+    } else if types::is_type_pointer(object) {
+        for name in [
+            "__name__",
+            "__qualname__",
+            "__module__",
+            "__doc__",
+            "__flags__",
+            "__basicsize__",
+            "__itemsize__",
+            "__dictoffset__",
+            "__weakrefoffset__",
+            "__vectorcalloffset__",
+            "__base__",
+            "__bases__",
+            "__mro__",
+        ] {
+            names.push(name.to_string());
+        }
+        let type_object = object as *mut TypeObject;
+        // SAFETY: validated type pointer.
+        let methods = unsafe { (*type_object).tp_methods };
+        if !methods.is_null() {
+            if let Ok(table) = read_method_table(methods, "type") {
+                names.extend(table.into_iter().map(|spec| spec.name));
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    let mut items = Vec::with_capacity(names.len());
+    for name in names {
+        items.push(new_str(name) as usize);
+    }
+    new_object(ShimKind::List(items))
+}
+
+/// `PyTraceBack_Print`.
+///
+/// This host never builds traceback frames, so only `NULL` and `None` are
+/// meaningful inputs; a real traceback object is rejected instead of being
+/// silently ignored.
+#[no_mangle]
+pub extern "C" fn PyTraceBack_Print(traceback: *mut ShimObject, _file: *mut ShimObject) -> c_int {
+    if traceback.is_null() || traceback == ptr::addr_of_mut!(_Py_NoneStruct) {
+        return 0;
+    }
+    set_error("TypeError: traceback object is required");
+    -1
+}
+
+/// `PyCapsule_Import`: resolves a dotted `module.attr...` name, verifies the
+/// capsule's own name and returns its pointer.
+#[no_mangle]
+pub extern "C" fn PyCapsule_Import(name: *const c_char, _no_block: c_int) -> *mut c_void {
+    if name.is_null() {
+        bad_internal_call();
+        return ptr::null_mut();
+    }
+    let full_name = read_c_string(name);
+    let segments: Vec<&str> = full_name.split('.').collect();
+    if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
+        set_error(format!(
+            "AttributeError: PyCapsule_Import \"{full_name}\" is not valid"
+        ));
+        return ptr::null_mut();
+    }
+    let module_name = match CString::new(segments[0]) {
+        Ok(module_name) => module_name,
+        Err(_) => {
+            bad_internal_call();
+            return ptr::null_mut();
+        }
+    };
+    let mut object = PyImport_ImportModule(module_name.as_ptr());
+    if object.is_null() {
+        let _ = take_error();
+        set_error(format!(
+            "ImportError: PyCapsule_Import could not import module \"{}\"",
+            segments[0]
+        ));
+        return ptr::null_mut();
+    }
+    for segment in &segments[1..] {
+        let attribute = match CString::new(*segment) {
+            Ok(attribute) => attribute,
+            Err(_) => {
+                dec_ref(object);
+                bad_internal_call();
+                return ptr::null_mut();
+            }
+        };
+        let next = PyObject_GetAttrString(object, attribute.as_ptr());
+        dec_ref(object);
+        if next.is_null() {
+            // CPython keeps the attribute error from the lookup.
+            return ptr::null_mut();
+        }
+        object = next;
+    }
+    let capsule_name = match CString::new(full_name.as_str()) {
+        Ok(capsule_name) => capsule_name,
+        Err(_) => {
+            dec_ref(object);
+            bad_internal_call();
+            return ptr::null_mut();
+        }
+    };
+    let pointer = PyCapsule_GetPointer(object, capsule_name.as_ptr());
+    dec_ref(object);
+    if pointer.is_null() {
+        let _ = take_error();
+        set_error(format!(
+            "AttributeError: PyCapsule_Import \"{full_name}\" is not valid"
+        ));
+    }
+    pointer
 }
 
 // ---------------------------------------------------------------------------
@@ -8663,4 +11824,605 @@ long hydro_fixture_next_calls(void) { return next_calls; }
 long hydro_fixture_item_index(void) { return item_index; }
 long hydro_fixture_last_op(void) { return last_op; }
 "#;
+
+    // -- CPython 3.14 entry points ---------------------------------------
+
+    #[test]
+    fn raised_exception_state_round_trips() {
+        anchor();
+        clear_error();
+        assert!(PyErr_GetRaisedException().is_null());
+
+        PyErr_SetString(unsafe { PyExc_ValueError }, c"bad".as_ptr());
+        assert!(!PyErr_Occurred().is_null());
+        assert_eq!(
+            PyErr_GivenExceptionMatches(unsafe { PyExc_ValueError }, unsafe { PyExc_Exception }),
+            1
+        );
+        assert_eq!(
+            PyErr_GivenExceptionMatches(unsafe { PyExc_TypeError }, unsafe { PyExc_ValueError }),
+            0
+        );
+        assert_eq!(
+            PyErr_GivenExceptionMatches(unsafe { PyExc_ValueError }, unsafe { PyExc_ValueError }),
+            1
+        );
+
+        let exception = PyErr_GetRaisedException();
+        assert!(!exception.is_null(), "no exception materialised");
+        assert!(!error_pending());
+        match kind_ref(exception) {
+            Some(ShimKind::Exception { exc_type, args, .. }) => {
+                assert_eq!(types::type_name(*exc_type as *mut TypeObject), "ValueError");
+                assert_eq!(args.len(), 1);
+                assert_eq!(
+                    as_string(args[0] as *mut ShimObject).as_deref(),
+                    Some("bad")
+                );
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        assert!(PyException_GetCause(exception).is_null());
+        let cause = new_exception_instance(unsafe { PyExc_KeyError } as usize, Vec::new());
+        PyException_SetCause(exception, cause);
+        let observed = PyException_GetCause(exception);
+        assert_eq!(observed, cause);
+        dec_ref(observed);
+
+        assert!(PyException_GetTraceback(exception).is_null());
+        let not_a_traceback = new_int(1);
+        assert_eq!(PyException_SetTraceback(exception, not_a_traceback), -1);
+        assert!(take_error().unwrap_or_default().starts_with("TypeError"));
+        assert_eq!(
+            PyException_SetTraceback(exception, ptr::addr_of_mut!(_Py_NoneStruct)),
+            0
+        );
+        dec_ref(not_a_traceback);
+
+        PyErr_SetRaisedException(exception);
+        assert!(error_pending());
+        assert_eq!(take_error().as_deref(), Some("ValueError: bad"));
+    }
+
+    #[test]
+    fn new_exception_classes_join_the_hierarchy() {
+        anchor();
+        clear_error();
+        let class = PyErr_NewExceptionWithDoc(
+            c"mymod.MyError".as_ptr(),
+            c"module doc".as_ptr(),
+            unsafe { PyExc_Exception },
+            ptr::null_mut(),
+        );
+        assert!(!class.is_null(), "{:?}", take_error());
+        assert_eq!(types::type_name(class as *mut TypeObject), "mymod.MyError");
+        assert_eq!(PyObject_IsSubclass(class, unsafe { PyExc_Exception }), 1);
+        assert_eq!(
+            PyErr_GivenExceptionMatches(class, unsafe { PyExc_Exception }),
+            1
+        );
+        let doc = PyObject_GetAttrString(class, c"__doc__".as_ptr());
+        assert_eq!(as_string(doc).as_deref(), Some("module doc"));
+        dec_ref(doc);
+
+        let message = new_str("boom".to_string());
+        let instance = PyObject_CallOneArg(class, message);
+        dec_ref(message);
+        assert!(!instance.is_null(), "{:?}", take_error());
+        assert_eq!(exception_prefix(instance), "mymod.MyError");
+        dec_ref(instance);
+
+        let missing_dot = PyErr_NewExceptionWithDoc(
+            c"NoModule".as_ptr(),
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        assert!(missing_dot.is_null());
+        assert!(take_error().unwrap_or_default().starts_with("SystemError"));
+    }
+
+    #[test]
+    fn dict_api_operates_on_shim_dicts() {
+        anchor();
+        clear_error();
+        let dict = PyDict_New();
+        let key = new_str("a".to_string());
+        let value = new_int(1);
+        assert_eq!(PyDict_SetItem(dict, key, value), 0);
+        assert_eq!(PyDict_Contains(dict, key), 1);
+
+        let mut found: *mut ShimObject = ptr::null_mut();
+        assert_eq!(PyDict_GetItemRef(dict, key, &mut found), 1);
+        assert_eq!(found, value);
+        dec_ref(found);
+        let missing = new_str("zzz".to_string());
+        found = new_int(9);
+        assert_eq!(PyDict_GetItemRef(dict, missing, &mut found), 0);
+        assert!(found.is_null());
+
+        let copy = PyDict_Copy(dict);
+        assert_eq!(PyDict_Contains(copy, key), 1);
+        let keys = PyDict_Keys(dict);
+        assert_eq!(PyList_Size(keys), 1);
+        assert_eq!(PyList_GetItem(keys, 0), key);
+
+        let mut position: isize = 0;
+        let (mut iter_key, mut iter_value) = (ptr::null_mut(), ptr::null_mut());
+        assert_eq!(
+            PyDict_Next(dict, &mut position, &mut iter_key, &mut iter_value),
+            1
+        );
+        assert_eq!((iter_key, iter_value), (key, value));
+        assert_eq!(
+            PyDict_Next(dict, &mut position, &mut iter_key, &mut iter_value),
+            0
+        );
+
+        let extra_key = new_str("b".to_string());
+        let extra_value = new_int(2);
+        assert_eq!(PyDict_SetItem(copy, extra_key, extra_value), 0);
+        assert_eq!(PyDict_Update(dict, copy), 0);
+        assert_eq!(PyDict_Contains(dict, extra_key), 1);
+        assert_eq!(PyDict_DelItem(dict, extra_key), 0);
+        assert_eq!(PyDict_DelItem(dict, extra_key), -1);
+        assert!(take_error().unwrap_or_default().starts_with("KeyError"));
+
+        let unhashable = PyList_New(0);
+        assert_eq!(PyDict_Contains(dict, unhashable), -1);
+        assert!(take_error().unwrap_or_default().starts_with("TypeError"));
+
+        let items = PyMapping_Items(dict);
+        assert_eq!(PyList_Size(items), 1);
+
+        PyDict_Clear(dict);
+        assert_eq!(PyList_Size(PyDict_Keys(dict)), 0);
+
+        for object in [
+            dict,
+            copy,
+            keys,
+            items,
+            key,
+            value,
+            extra_key,
+            extra_value,
+            missing,
+            unhashable,
+        ] {
+            dec_ref(object);
+        }
+    }
+
+    #[test]
+    fn set_list_and_complex_helpers() {
+        anchor();
+        clear_error();
+        let list = PyList_New(0);
+        for value in 1..=3 {
+            let item = new_int(value);
+            assert_eq!(PyList_Append(list, item), 0);
+            dec_ref(item);
+        }
+        let tuple = PyList_AsTuple(list);
+        assert_eq!(PyTuple_Size(tuple), 3);
+        let slice = PyList_GetSlice(list, 1, 2);
+        assert_eq!(PyList_Size(slice), 1);
+        assert_eq!(as_int(PyList_GetItem(slice, 0)).unwrap(), 2);
+
+        let set = PySet_New(list);
+        assert_eq!(PySet_Size(set), 3);
+        let two = new_int(2);
+        assert_eq!(PySet_Contains(set, two), 1);
+        let four = new_int(4);
+        assert_eq!(PySet_Add(set, four), 0);
+        assert_eq!(PySet_Size(set), 4);
+        assert_eq!(PySet_Contains(set, four), 1);
+        let five = new_int(5);
+        assert_eq!(PySet_Contains(set, five), 0);
+
+        let frozen = PyFrozenSet_New(list);
+        assert_eq!(PySet_Size(frozen), 3);
+        assert_eq!(PySet_Add(frozen, five), -1);
+        assert_eq!(
+            take_error().unwrap_or_default(),
+            "SystemError: <class 'frozenset'> is not mutable"
+        );
+        assert_eq!(PySet_Size(frozen), 3);
+        assert_eq!(PySet_Contains(frozen, five), 0);
+
+        let complex = PyComplex_FromDoubles(1.5, -2.5);
+        assert_eq!(PyComplex_RealAsDouble(complex), 1.5);
+        assert_eq!(PyComplex_ImagAsDouble(complex), -2.5);
+        let integer = new_int(7);
+        assert_eq!(PyComplex_RealAsDouble(integer), 7.0);
+        assert_eq!(PyComplex_ImagAsDouble(integer), 0.0);
+
+        let bytes = PyByteArray_FromStringAndSize(c"abc".as_ptr(), 3);
+        assert_eq!(PyByteArray_Size(bytes), 3);
+        let buffer = PyByteArray_AsString(bytes);
+        // SAFETY: bytearray storage is NUL terminated.
+        assert_eq!(unsafe { CStr::from_ptr(buffer) }.to_str().unwrap(), "abc");
+        // SAFETY: three data bytes plus the terminator are live.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(buffer as *const u8, 4) },
+            &b"abc\0"[..]
+        );
+
+        for object in [
+            list, tuple, slice, set, frozen, complex, integer, bytes, two, four, five,
+        ] {
+            dec_ref(object);
+        }
+    }
+
+    #[test]
+    fn long_native_bytes_and_export() {
+        anchor();
+        clear_error();
+        let layout = unsafe { &*PyLong_GetNativeLayout() };
+        assert_eq!(layout.bits_per_digit, 30);
+        assert_eq!(layout.digit_size, 4);
+        assert_eq!(layout.digits_order, -1);
+        assert_eq!(
+            layout.digit_endianness,
+            if cfg!(target_endian = "little") {
+                -1
+            } else {
+                1
+            }
+        );
+
+        let number = new_int(300);
+        let mut exported = PyLongExportMirror {
+            value: 0,
+            negative: 1,
+            ndigits: 5,
+            digits: ptr::null(),
+            reserved: 0,
+        };
+        assert_eq!(PyLong_Export(number, &mut exported), 0);
+        assert_eq!(exported.value, 300);
+        assert_eq!((exported.negative, exported.ndigits), (0, 0));
+        assert!(exported.digits.is_null());
+        PyLong_FreeExport(&mut exported);
+
+        let mut buffer = [0u8; 8];
+        assert_eq!(
+            PyLong_AsNativeBytes(number, buffer.as_mut_ptr() as *mut c_void, 1, -1),
+            8
+        );
+        assert_eq!(buffer[0], 0x2c);
+        assert_eq!(
+            PyLong_AsNativeBytes(number, buffer.as_mut_ptr() as *mut c_void, 2, -1),
+            2
+        );
+        assert_eq!(buffer[..2].to_vec(), vec![0x2c, 0x01]);
+
+        let little = PyLong_FromNativeBytes(buffer.as_ptr() as *const c_void, 2, 1);
+        assert_eq!(as_int(little).unwrap(), 300);
+        dec_ref(little);
+        let negative = [0xffu8];
+        let minus_one = PyLong_FromNativeBytes(negative.as_ptr() as *const c_void, 1, 1);
+        assert_eq!(as_int(minus_one).unwrap(), -1);
+        dec_ref(minus_one);
+
+        let big = new_int(1 << 40);
+        assert_eq!(
+            PyLong_AsNativeBytes(big, ptr::null_mut(), 0, -1),
+            6,
+            "required size of a two-digit value"
+        );
+        dec_ref(big);
+
+        let negative_number = new_int(-1);
+        assert_eq!(PyLong_AsUnsignedLongLong(negative_number), u64::MAX);
+        assert!(take_error().unwrap_or_default().contains("negative"));
+        dec_ref(negative_number);
+
+        assert!(PyLong_FromUnsignedLongLong(u64::MAX).is_null());
+        assert!(take_error()
+            .unwrap_or_default()
+            .starts_with("OverflowError"));
+        let fits = PyLong_FromUnsignedLongLong(7);
+        assert_eq!(as_int(fits).unwrap(), 7);
+        dec_ref(fits);
+        let ssize = PyLong_FromSsize_t(-9);
+        assert_eq!(as_int(ssize).unwrap(), -9);
+
+        let not_int = new_str("x".to_string());
+        assert_eq!(PyLong_Export(not_int, &mut exported), -1);
+        assert!(take_error().unwrap_or_default().starts_with("TypeError"));
+
+        for object in [number, ssize, not_int] {
+            dec_ref(object);
+        }
+    }
+
+    #[test]
+    fn unicode_storage_encoding_and_interning() {
+        anchor();
+        clear_error();
+        let source = "héllo".as_bytes();
+        let text = PyUnicode_FromStringAndSize(source.as_ptr() as *const c_char, 6);
+        assert!(!text.is_null(), "{:?}", take_error());
+        let mut length: isize = 0;
+        let utf8 = PyUnicode_AsUTF8AndSize(text, &mut length);
+        assert_eq!(length, 6);
+        // SAFETY: the returned buffer holds `length` bytes plus a NUL.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(utf8 as *const u8, length as usize) },
+            source
+        );
+        assert_eq!(
+            PyUnicode_EqualToUTF8AndSize(text, source.as_ptr() as *const c_char, 6),
+            1
+        );
+        assert_eq!(PyUnicode_EqualToUTF8AndSize(text, c"hallo".as_ptr(), 5), 0);
+
+        let latin = PyUnicode_AsEncodedString(text, c"latin-1".as_ptr(), ptr::null());
+        assert!(!latin.is_null(), "{:?}", take_error());
+        assert_eq!(bytes_data(latin).unwrap(), &b"h\xe9llo"[..]);
+        dec_ref(latin);
+
+        let ascii = PyUnicode_AsEncodedString(text, c"ascii".as_ptr(), ptr::null());
+        assert!(ascii.is_null());
+        assert!(take_error()
+            .unwrap_or_default()
+            .starts_with("UnicodeEncodeError"));
+
+        let utf16 = PyUnicode_AsEncodedString(text, c"utf-16".as_ptr(), c"replace".as_ptr());
+        assert_eq!(bytes_data(utf16).unwrap()[..2].to_vec(), vec![0xFF, 0xFE]);
+        dec_ref(utf16);
+
+        // `PyUnicode_New` exposes writable UCS-2 storage.
+        let fresh = PyUnicode_New(3, 0xFFFF);
+        assert!(!fresh.is_null(), "{:?}", take_error());
+        let data = PyUnicode_DATA(fresh) as *mut u16;
+        for (index, unit) in [b'h' as u16, b'e' as u16, b'y' as u16]
+            .into_iter()
+            .enumerate()
+        {
+            // SAFETY: three UCS-2 units were allocated.
+            unsafe { *data.add(index) = unit };
+        }
+        let mut fresh_length: isize = 0;
+        let fresh_utf8 = PyUnicode_AsUTF8AndSize(fresh, &mut fresh_length);
+        assert_eq!(fresh_length, 3);
+        // SAFETY: the UTF-8 buffer holds the three bytes plus a NUL.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(fresh_utf8 as *const u8, 3) },
+            b"hey"
+        );
+
+        let first = new_str("intern-me".to_string());
+        let second = new_str("intern-me".to_string());
+        let mut first_slot = first;
+        let mut second_slot = second;
+        PyUnicode_InternInPlace(&mut first_slot);
+        PyUnicode_InternInPlace(&mut second_slot);
+        assert_eq!(first_slot, second_slot);
+
+        let error = PyUnicodeDecodeError_Create(
+            c"utf-8".as_ptr(),
+            b"\xff".as_ptr() as *const c_char,
+            1,
+            0,
+            1,
+            c"invalid start byte".as_ptr(),
+        );
+        assert!(!error.is_null(), "{:?}", take_error());
+        match kind_ref(error) {
+            Some(ShimKind::Exception { exc_type, args, .. }) => {
+                assert_eq!(
+                    types::type_name(*exc_type as *mut TypeObject),
+                    "UnicodeDecodeError"
+                );
+                assert_eq!(args.len(), 5);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        let invalid = PyUnicode_FromStringAndSize(b"\xff".as_ptr() as *const c_char, 1);
+        assert!(invalid.is_null());
+        assert!(take_error()
+            .unwrap_or_default()
+            .starts_with("UnicodeDecodeError"));
+
+        for object in [text, fresh, error] {
+            dec_ref(object);
+        }
+    }
+
+    #[test]
+    fn capsule_import_resolves_loaded_module_attributes() {
+        anchor();
+        clear_error();
+        let (_, module) = create_named_module("hydro_capsule_test".to_string()).expect("module");
+        add_attribute(
+            module,
+            "pointer".to_string(),
+            ShimAttr::Value(ShimValue::Capsule {
+                ptr: 0x1234,
+                name: Some("hydro_capsule_test.pointer".to_string()),
+            }),
+        )
+        .expect("attribute");
+
+        let pointer = PyCapsule_Import(c"hydro_capsule_test.pointer".as_ptr(), 0);
+        assert_eq!(pointer as usize, 0x1234, "{:?}", take_error());
+
+        let wrong_name = PyCapsule_Import(c"hydro_capsule_test.missing".as_ptr(), 0);
+        assert!(wrong_name.is_null());
+        assert_eq!(
+            take_error().as_deref(),
+            Some("AttributeError: module 'hydro_capsule_test' has no attribute 'missing'")
+        );
+
+        let unknown_module = PyCapsule_Import(c"hydro_no_such_module.ptr".as_ptr(), 0);
+        assert!(unknown_module.is_null());
+        assert_eq!(
+            take_error().as_deref(),
+            Some("ImportError: PyCapsule_Import could not import module \"hydro_no_such_module\"")
+        );
+    }
+
+    #[test]
+    fn import_module_resolves_runtime_modules_and_calls_them() {
+        anchor();
+        clear_error();
+        assert!(crate::modules::registry_lookup("math").is_some());
+        let module = PyImport_ImportModule(c"math".as_ptr());
+        assert!(!module.is_null(), "{:?}", take_error());
+        let gcd = PyObject_GetAttrString(module, c"gcd".as_ptr());
+        assert!(!gcd.is_null(), "{:?}", take_error());
+        assert!(matches!(
+            kind_ref(gcd),
+            Some(ShimKind::RuntimeFunction { .. })
+        ));
+
+        let arguments = [new_int(12), new_int(18)];
+        let result = PyObject_Vectorcall(gcd, arguments.as_ptr(), 2, ptr::null_mut());
+        assert!(!result.is_null(), "{:?}", take_error());
+        assert_eq!(as_int(result).unwrap(), 6);
+        dec_ref(result);
+        for argument in arguments {
+            dec_ref(argument);
+        }
+
+        let missing = PyImport_ImportModule(c"hydro_no_such_module".as_ptr());
+        assert!(missing.is_null());
+        assert_eq!(
+            take_error().as_deref(),
+            Some("ImportError: No module named 'hydro_no_such_module'")
+        );
+
+        dec_ref(gcd);
+        dec_ref(module);
+    }
+
+    #[test]
+    fn object_protocol_helpers() {
+        anchor();
+        clear_error();
+        let instance =
+            new_exception_instance(unsafe { PyExc_FileNotFoundError } as usize, Vec::new());
+        assert_eq!(PyObject_IsInstance(instance, unsafe { PyExc_OSError }), 1);
+        assert_eq!(
+            PyObject_IsInstance(instance, unsafe { PyExc_ValueError }),
+            0
+        );
+        assert_eq!(
+            PyObject_IsSubclass(unsafe { PyExc_FileNotFoundError }, unsafe { PyExc_OSError }),
+            1
+        );
+        let tuple_of_classes = PyTuple_New(2);
+        inc_ref(unsafe { PyExc_ValueError });
+        assert_eq!(
+            PyTuple_SetItem(tuple_of_classes, 0, unsafe { PyExc_ValueError },),
+            0
+        );
+        inc_ref(unsafe { PyExc_OSError });
+        assert_eq!(
+            PyTuple_SetItem(tuple_of_classes, 1, unsafe { PyExc_OSError }),
+            0
+        );
+        assert_eq!(PyObject_IsInstance(instance, tuple_of_classes), 1);
+        dec_ref(tuple_of_classes);
+
+        let list = PyList_New(0);
+        assert_eq!(PyObject_LengthHint(list, 9), 0);
+        for value in 1..=3 {
+            let item = new_int(value);
+            PyList_Append(list, item);
+            dec_ref(item);
+        }
+        assert_eq!(PyObject_LengthHint(list, 9), 3);
+        assert_eq!(PyObject_LengthHint(ptr::addr_of_mut!(_Py_NoneStruct), 9), 9);
+
+        let mut item: *mut ShimObject = ptr::null_mut();
+        assert_eq!(PyIter_NextItem(list, &mut item), -1);
+        assert!(item.is_null());
+        assert!(take_error().unwrap_or_default().starts_with("TypeError"));
+
+        let (_, module) = create_named_module("hydro_dir_test".to_string()).expect("module");
+        assert_eq!(
+            PyObject_HasAttrWithError(module, new_str("__name__".to_string())),
+            1
+        );
+        assert_eq!(
+            PyObject_HasAttrWithError(module, new_str("absent".to_string())),
+            0
+        );
+        let names = PyObject_Dir(module);
+        assert!(PyList_Size(names) >= 1);
+        let dict = PyObject_GenericGetDict(module, ptr::null_mut());
+        assert!(!dict.is_null());
+        assert_eq!(
+            PyObject_GenericSetDict(module, ptr::addr_of_mut!(_Py_NoneStruct), ptr::null_mut()),
+            -1
+        );
+        assert!(take_error().unwrap_or_default().starts_with("TypeError"));
+
+        assert_eq!(PyTraceBack_Print(ptr::null_mut(), ptr::null_mut()), 0);
+        assert_eq!(Py_IsInitialized(), 1);
+        assert_eq!(Py_IsFinalizing(), 0);
+        let interpreter = PyInterpreterState_Get();
+        assert!(!interpreter.is_null());
+        assert_eq!(PyInterpreterState_GetID(interpreter), 0);
+        assert_eq!(PyInterpreterState_GetID(ptr::null_mut()), -1);
+        assert!(take_error().unwrap_or_default().starts_with("ValueError"));
+
+        // `_Py_Dealloc` releases a uniquely owned handle.
+        let doomed = new_int(123_456);
+        _Py_Dealloc(doomed);
+
+        for object in [instance, list, names, dict] {
+            dec_ref(object);
+        }
+    }
+
+    #[test]
+    fn cmethod_new_validates_flags_and_class() {
+        anchor();
+        clear_error();
+        extern "C" fn noop(_self: *mut ShimObject, _args: *mut ShimObject) -> *mut ShimObject {
+            ptr::addr_of_mut!(_Py_NoneStruct)
+        }
+        let mut definition = PyMethodDefMirror {
+            ml_name: c"noop".as_ptr(),
+            ml_meth: noop as *const () as *mut c_void,
+            ml_flags: METH_NOARGS,
+            ml_doc: ptr::null(),
+        };
+        // Exception classes are real type objects; `PyCMethod_New` needs the
+        // type handle, not the class instance pointer.
+        let class = unsafe { PyExc_ValueError } as *mut PyTypeObject;
+        assert!(!class.is_null());
+        assert!(PyCMethod_New(&mut definition, ptr::null_mut(), ptr::null_mut(), class).is_null());
+        assert!(take_error().unwrap_or_default().starts_with("SystemError"));
+
+        let function = PyCMethod_New(
+            &mut definition,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        assert!(!function.is_null(), "{:?}", take_error());
+        dec_ref(function);
+
+        definition.ml_flags = METH_METHOD | METH_FASTCALL | METH_KEYWORDS;
+        assert!(PyCMethod_New(
+            &mut definition,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut()
+        )
+        .is_null());
+        assert!(take_error().unwrap_or_default().starts_with("SystemError"));
+        let method = PyCMethod_New(&mut definition, ptr::null_mut(), ptr::null_mut(), class);
+        assert!(!method.is_null(), "{:?}", take_error());
+        dec_ref(method);
+    }
 }

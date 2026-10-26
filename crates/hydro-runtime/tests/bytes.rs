@@ -8,6 +8,9 @@ use hydro_runtime::abi::*;
 const VALUE_ERROR: i64 = 0;
 const TYPE_ERROR: i64 = 1;
 const INDEX_ERROR: i64 = 6;
+const LOOKUP_ERROR: i64 = 29;
+const UNICODE_DECODE_ERROR: i64 = 35;
+const UNICODE_ENCODE_ERROR: i64 = 36;
 
 // `hydro_binop` op codes (see `ops.rs`).
 const OP_ADD: u32 = 0;
@@ -199,20 +202,43 @@ fn constructor_with_encoding() {
     hydro_runtime_init();
     assert_bytes(build(&[text("h\u{e9}"), text("utf-8")]), "hé".as_bytes());
     assert_bytes(build(&[text("hi"), text("UTF8")]), b"hi");
+    // ASCII and Latin-1 are real codecs, including their aliases.
+    assert_bytes(build(&[text("hi"), text("ascii")]), b"hi");
+    assert_bytes(build(&[text("hi"), text("us-ascii")]), b"hi");
+    assert_bytes(build(&[text("h\u{e9}"), text("latin-1")]), b"h\xe9");
+    assert_bytes(build(&[text("h\u{e9}"), text("iso-8859-1")]), b"h\xe9");
+    // Unrepresentable characters follow the error handler.
+    build(&[text("\u{e9}"), text("ascii")]);
+    expect_error(UNICODE_ENCODE_ERROR);
+    assert_bytes(
+        build(&[text("\u{e9}"), text("ascii"), text("replace")]),
+        b"?",
+    );
+    assert_bytes(build(&[text("\u{e9}"), text("ascii"), text("ignore")]), b"");
+    assert_bytes(
+        build(&[text("\u{20ac}"), text("latin-1"), text("replace")]),
+        b"?",
+    );
     // A str without an encoding is an error.
     build(&[text("hi")]);
     expect_error(TYPE_ERROR);
     // Unknown encodings are rejected.
-    build(&[text("hi"), text("latin-1")]);
-    expect_error(VALUE_ERROR);
+    build(&[text("hi"), text("cp1252")]);
+    expect_error(LOOKUP_ERROR);
     // Encoding without a string.
     build(&[int(3), text("utf-8")]);
     expect_error(TYPE_ERROR);
     // Non-str encoding argument.
     build(&[text("hi"), int(1)]);
     expect_error(TYPE_ERROR);
+    // Non-str errors argument.
+    build(&[text("hi"), text("utf-8"), int(1)]);
+    expect_error(TYPE_ERROR);
+    // Unknown error handler.
+    build(&[text("hi"), text("utf-8"), text("bogus")]);
+    expect_error(LOOKUP_ERROR);
     // Too many arguments.
-    build(&[text("hi"), text("utf-8"), text("strict")]);
+    build(&[text("hi"), text("utf-8"), text("strict"), text("extra")]);
     expect_error(TYPE_ERROR);
     // Unsupported source type.
     build(&[hydro_none()]);
@@ -362,7 +388,7 @@ fn decode_and_encode() {
 
     let invalid = [0x66, 0xff, 0x6f];
     hydro_method(bytes(&invalid), "decode".as_ptr(), 6, 0, std::ptr::null());
-    expect_error(VALUE_ERROR);
+    expect_error(UNICODE_DECODE_ERROR);
     assert_str(
         method(bytes(&invalid), "decode", &[text("utf-8"), text("ignore")]),
         "fo",
@@ -371,15 +397,31 @@ fn decode_and_encode() {
         method(bytes(&invalid), "decode", &[text("utf-8"), text("replace")]),
         "f\u{fffd}o",
     );
-    // Unknown encoding / error handler.
+    // ASCII and Latin-1 are real codecs.
+    assert_str(method(bytes(b"x"), "decode", &[text("latin-1")]), "x");
+    assert_str(method(bytes(&[0xff]), "decode", &[text("iso-8859-1")]), "ÿ");
+    assert_str(method(bytes(b"x"), "decode", &[text("us-ascii")]), "x");
+    hydro_method(
+        bytes(&invalid),
+        "decode".as_ptr(),
+        6,
+        1,
+        [text("ascii")].as_ptr(),
+    );
+    expect_error(UNICODE_DECODE_ERROR);
+    assert_str(
+        method(bytes(&invalid), "decode", &[text("ascii"), text("replace")]),
+        "f\u{fffd}o",
+    );
+    // Unknown encoding.
     hydro_method(
         bytes(b"x"),
         "decode".as_ptr(),
         6,
         1,
-        [text("latin-1")].as_ptr(),
+        [text("cp1252")].as_ptr(),
     );
-    expect_error(VALUE_ERROR);
+    expect_error(LOOKUP_ERROR);
     // Unknown error handler.
     hydro_method(
         bytes(b"\xff"),
@@ -388,7 +430,7 @@ fn decode_and_encode() {
         2,
         [text("utf-8"), text("bogus")].as_ptr(),
     );
-    expect_error(VALUE_ERROR);
+    expect_error(LOOKUP_ERROR);
     assert_str(
         method(bytes(b"x"), "decode", &[text("utf-8"), text("strict")]),
         "x",
@@ -400,14 +442,23 @@ fn decode_and_encode() {
     let encoded = method(text("hé"), "encode", &[]);
     assert_bytes(encoded, "hé".as_bytes());
     assert_bytes(method(text("hi"), "encode", &[text("utf-8")]), b"hi");
+    assert_bytes(method(text("hi"), "encode", &[text("latin-1")]), b"hi");
+    assert_bytes(method(text("é"), "encode", &[text("latin-1")]), &[0xe9]);
+    assert_bytes(method(text("hi"), "encode", &[text("ascii")]), b"hi");
+    let _ = method(text("é"), "encode", &[text("ascii")]);
+    expect_error(UNICODE_ENCODE_ERROR);
+    assert_bytes(
+        method(text("é"), "encode", &[text("ascii"), text("replace")]),
+        b"?",
+    );
     hydro_method(
         text("hi"),
         "encode".as_ptr(),
         6,
         1,
-        [text("latin-1")].as_ptr(),
+        [text("cp1252")].as_ptr(),
     );
-    expect_error(VALUE_ERROR);
+    expect_error(LOOKUP_ERROR);
 }
 
 #[test]

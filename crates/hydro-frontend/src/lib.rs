@@ -1261,7 +1261,29 @@ impl ModuleLoader {
                             // the surrounding `except ImportError` handles.
                             for alias in &s.names {
                                 if alias.name.as_str() == "*" {
-                                    scan.record_deferred(&module_name, None);
+                                    // A wildcard import needs the module's
+                                    // exports. A package that compiles is
+                                    // linked like an eager import, so the
+                                    // lowerer can bind its public names; an
+                                    // absent or unloadable one stays deferred
+                                    // and reports its runtime import error.
+                                    // `from . import *` names this package
+                                    // itself, which the lowerer expands from
+                                    // the unit's own signatures.
+                                    if module_name != current
+                                        && self.optional_import(
+                                            &module_name,
+                                            importer_dir,
+                                            root,
+                                            scan,
+                                        )
+                                    {
+                                        if !scan.star_imports.contains(&module_name) {
+                                            scan.star_imports.push(module_name.clone());
+                                        }
+                                    } else {
+                                        scan.record_deferred(&module_name, None);
+                                    }
                                     continue;
                                 }
                                 let full = format!("{module_name}.{}", alias.name);
@@ -3191,6 +3213,22 @@ mod tests {
             diags.iter().any(|diag| diag.message.contains("'drop'")),
             "{diags:?}"
         );
+    }
+
+    #[test]
+    fn optional_try_star_import_links_a_present_module() {
+        // A module-level `try` body runs in normal execution order: when the
+        // star-imported module compiles, its exports are linked eagerly, so a
+        // `from helper import *` inside `try` is a real import rather than a
+        // runtime error.
+        let dir = TestDir::new("star-optional");
+        dir.write("helper.py", "def add(a, b):\n    return a + b\n");
+        let main = dir.write(
+            "main.py",
+            "try:\n    from helper import *\nexcept ImportError:\n    pass\n\nprint(add(1, 2))\n",
+        );
+        let program = program(&main);
+        assert_eq!(printed_call(&program), function_id(&program, "helper.add"));
     }
 
     #[test]

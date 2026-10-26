@@ -122,6 +122,14 @@ const NODE_SPECS: &[NodeSpec] = &[
         fields: &["arg", "value"],
         init: init_keyword,
     },
+    // `ast.arg(arg, annotation, type_comment)`: `inspect.parse_name` builds
+    // this node for a name it cannot match against the parameters.
+    NodeSpec {
+        name: "arg",
+        base: "AST",
+        fields: &["arg", "annotation", "type_comment"],
+        init: init_arg,
+    },
     NodeSpec {
         name: "Tuple",
         base: "expr",
@@ -241,6 +249,7 @@ node_init!(init_Attribute, ["value", "attr", "ctx"]);
 node_init!(init_Subscript, ["value", "slice", "ctx"]);
 node_init!(init_Call, ["func", "args", "keywords"]);
 node_init!(init_keyword, ["arg", "value"]);
+node_init!(init_arg, ["arg", "annotation", "type_comment"]);
 node_init!(init_Tuple, ["elts", "ctx"]);
 node_init!(init_List, ["elts", "ctx"]);
 node_init!(init_Set, ["elts"]);
@@ -2484,5 +2493,41 @@ mod tests {
         call("literal_eval", &[number]);
         assert!(exc::pending());
         exc::clear();
+    }
+
+    #[test]
+    fn arg_node_is_a_constructible_ast_class() {
+        exc::init();
+        let class = class_value("ast", "arg").expect("ast.arg class");
+        assert_eq!(value::class_display_name(class), Some("arg"));
+
+        let node = call_kw(
+            "arg",
+            &[],
+            &[
+                ("arg".to_string(), text("value")),
+                ("annotation".to_string(), NONE),
+            ],
+        );
+        assert!(!exc::pending());
+        assert_eq!(value::instance_class_value(node), Some(class));
+        assert_eq!(
+            value::instance_attr(node, "arg").and_then(value::as_str),
+            Some("value")
+        );
+        assert_eq!(value::instance_attr(node, "annotation"), Some(NONE));
+        assert_eq!(value::instance_attr(node, "type_comment"), Some(NONE));
+
+        // Positional construction stores the fields in CPython order.
+        let positional = call("arg", &[text("item"), NONE, text("int")]);
+        assert_eq!(
+            value::instance_attr(positional, "arg").and_then(value::as_str),
+            Some("item")
+        );
+        assert_eq!(
+            value::instance_attr(positional, "type_comment").and_then(value::as_str),
+            Some("int")
+        );
+        assert!(!exc::pending());
     }
 }

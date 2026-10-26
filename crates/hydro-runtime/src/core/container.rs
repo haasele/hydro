@@ -1115,6 +1115,20 @@ pub(crate) fn subscript_set(obj: i64, index: i64, new_value: i64) -> i64 {
     if value::as_defaultdict(obj).is_some() {
         return crate::modules::collections::setitem(obj, index, new_value);
     }
+    if value::as_instance(obj).is_some() {
+        let entry = value::as_instance(obj)
+            .and_then(|state| value::class_lookup(state.class, "__setitem__"));
+        if matches!(entry, Some(value::ClassEntry::Method(_, _))) {
+            let args = [index, new_value];
+            return crate::core::methods::call(
+                obj,
+                b"__setitem__".as_ptr(),
+                12,
+                args.len(),
+                args.as_ptr(),
+            );
+        }
+    }
     type_error(format!(
         "'{}' object does not support item assignment",
         value::type_name(obj)
@@ -1186,6 +1200,20 @@ pub(crate) fn delete_subscript(obj: i64, index: i64) -> i64 {
     }
     if value::as_defaultdict(obj).is_some() {
         return crate::modules::collections::delitem(obj, index);
+    }
+    if value::as_instance(obj).is_some() {
+        let entry = value::as_instance(obj)
+            .and_then(|state| value::class_lookup(state.class, "__delitem__"));
+        if matches!(entry, Some(value::ClassEntry::Method(_, _))) {
+            let args = [index];
+            return crate::core::methods::call(
+                obj,
+                b"__delitem__".as_ptr(),
+                11,
+                args.len(),
+                args.as_ptr(),
+            );
+        }
     }
     type_error(format!(
         "'{}' object does not support item deletion",

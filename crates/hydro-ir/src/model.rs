@@ -328,7 +328,10 @@ pub enum Builtin {
     Super,
     /// `reversed(iterable)`.
     Reversed,
-    /// `__import__(name, ...)`: dynamic imports are not supported at runtime.
+    /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`:
+    /// resolves an already-registered module from the runtime registry (see
+    /// `modules::builtins::import_from_core`). Every parameter may be passed
+    /// by keyword; relative imports are rejected.
     Import,
     /// `set()` / `set(iterable)`.
     Set,

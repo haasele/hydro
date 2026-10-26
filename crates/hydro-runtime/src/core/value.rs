@@ -210,11 +210,21 @@ pub(crate) struct HydroObj {
     pub(crate) data: *mut u8,
 }
 
-/// Mutable state of a runtime iterator. `target` is the tagged iterable and
-/// `index` is the next position to yield; it belongs to one `for` loop.
+/// Mutable state of a runtime iterator.
+///
+/// For an ordinary iterator `target` is the tagged iterable and `index` is the
+/// next position to yield; it belongs to one `for` loop. A callable iterator
+/// (`iter(callable, sentinel)`) instead stores the `(callable, sentinel)`
+/// tuple in `target`, so the collector reaches both values through the normal
+/// iterator edge, and sets `from_callable`.
 pub(crate) struct IterState {
     pub(crate) target: i64,
     pub(crate) index: usize,
+    /// True for `iter(callable, sentinel)`.
+    pub(crate) from_callable: bool,
+    /// Set once a callable iterator produced the sentinel; later `next` calls
+    /// report exhaustion without invoking the callable again.
+    pub(crate) exhausted: bool,
 }
 
 /// What a function value refers to.
@@ -5171,8 +5181,33 @@ pub(crate) fn range_new(start: i64, stop: i64, step: i64) -> i64 {
 pub(crate) fn iter_new(target: i64) -> i64 {
     alloc(
         KIND_ITER,
-        ObjData::Iter(Box::new(IterState { target, index: 0 })),
+        ObjData::Iter(Box::new(IterState {
+            target,
+            index: 0,
+            from_callable: false,
+            exhausted: false,
+        })),
     )
+}
+
+/// Creates the callable iterator returned by `iter(callable, sentinel)`.
+///
+/// The pair is stored as the iterator's target so both values are traced by
+/// the collector; nothing is called until the first `next`.
+pub(crate) fn iter_callable_new(callable: i64, sentinel: i64) -> i64 {
+    let pair = tuple_new(vec![callable, sentinel]);
+    let roots = crate::gc::heap::root_values(&[pair]);
+    let result = alloc(
+        KIND_ITER,
+        ObjData::Iter(Box::new(IterState {
+            target: pair,
+            index: 0,
+            from_callable: true,
+            exhausted: false,
+        })),
+    );
+    crate::gc::heap::release_roots(roots);
+    result
 }
 
 /// Allocates a closure cell holding `value`.
@@ -6185,6 +6220,24 @@ pub(crate) fn truthy(v: i64) -> bool {
     false
 }
 
+/// Calls a class-level dunder found by [`class_lookup`] with `instance` bound
+/// to the method's first parameter.
+///
+/// The shared binder is required for every method that carries parameter
+/// metadata: native methods created with `function_set_signature` +
+/// `function_set_full_entry` (for example `functools._PlaceholderType.__repr__`)
+/// have no module spec, so calling them as plain functions would route through
+/// `modules::call_native` and raise `AttributeError`. The binder fills the
+/// receiver slot, applies declared defaults and runs the full-entry trampoline.
+/// Entries created from a raw pointer (`function_new`) have no metadata and
+/// keep the direct positional call.
+fn call_instance_dunder(instance: i64, function: i64) -> i64 {
+    if function_signature(function).is_empty() || function_full_entry(function) == 0 {
+        return crate::core::builtins::call(function, 1, [instance].as_ptr());
+    }
+    crate::core::builtins::call_kw(function, 1, [instance].as_ptr(), 0, std::ptr::null())
+}
+
 /// Deterministic default rendering of an instance: `<ClassName object>`.
 /// The heap address is deliberately omitted so output is reproducible.
 fn instance_default_repr(state: &InstanceState) -> String {
@@ -6424,7 +6477,7 @@ pub(crate) fn to_string(v: i64) -> String {
                     if let Some(ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
                         class_lookup(class, "__str__")
                     {
-                        let result = crate::core::builtins::call(function, 1, [v].as_ptr());
+                        let result = call_instance_dunder(v, function);
                         if !crate::exc::pending() {
                             if let Some(text) = as_str(result) {
                                 return text.to_string();
@@ -6591,12 +6644,16 @@ fn repr_depth(v: i64, depth: usize) -> String {
         if let Some(ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
             class_lookup(class, "__repr__")
         {
-            let result = crate::core::builtins::call(function, 1, [v].as_ptr());
+            let result = call_instance_dunder(v, function);
             if !crate::exc::pending() {
                 if let Some(text) = as_str(result) {
                     return text.to_string();
                 }
             }
+            // A raising (or non-str) `__repr__` keeps its exception pending:
+            // this renderer returns a `String`, so the caller surfaces the
+            // exception at its next check. Clearing it here would hide a real
+            // user error; the default rendering below is only a fallback.
         }
         return instance_default_repr(state);
     }
@@ -7143,5 +7200,85 @@ mod tests {
         crate::exc::clear();
         assert_eq!(bigint_from_ptr(std::ptr::null(), 0), NONE);
         assert_eq!(crate::exc::pending_tag(), crate::exc::VALUE_ERROR as i64);
+    }
+
+    extern "C" fn tagged_repr_entry(_argv: *const i64) -> i64 {
+        str_alloc("Tagged()".to_string())
+    }
+
+    extern "C" fn tagged_str_entry(_argv: *const i64) -> i64 {
+        str_alloc("tagged".to_string())
+    }
+
+    /// A native class method declared with a signature and a full-entry
+    /// trampoline (the shape used by `functools._PlaceholderType.__repr__`) is
+    /// only reachable through the shared binder: its qualified name has no
+    /// module spec, so a plain positional call would raise `AttributeError`
+    /// and render the default instance repr instead.
+    #[test]
+    fn instance_dunders_dispatch_through_declared_signatures() {
+        crate::exc::init();
+        let self_parameter = || ParamMeta {
+            name: "self".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        };
+        let repr_method = native_function_new("value_tests", "_tagged_repr", usize::MAX);
+        function_set_signature(repr_method, vec![self_parameter()]);
+        function_set_full_entry(repr_method, tagged_repr_entry as *const () as usize);
+        let str_method = native_function_new("value_tests", "_tagged_str", usize::MAX);
+        function_set_signature(str_method, vec![self_parameter()]);
+        function_set_full_entry(str_method, tagged_str_entry as *const () as usize);
+        let class = class_new(
+            "Tagged".to_string(),
+            NONE,
+            vec![
+                ("__repr__".to_string(), repr_method),
+                ("__str__".to_string(), str_method),
+            ],
+        );
+        let instance = instance_new(class);
+
+        assert_eq!(repr(instance), "Tagged()");
+        assert_eq!(to_string(instance), "tagged");
+        assert!(!crate::exc::pending(), "dunder dispatch raised");
+
+        // Without class metadata the default instance rendering is unchanged.
+        let bare = instance_new(class_new("Bare".to_string(), NONE, Vec::new()));
+        assert_eq!(repr(bare), "<Bare object>");
+        assert_eq!(to_string(bare), "<Bare object>");
+        assert!(!crate::exc::pending());
+    }
+
+    extern "C" fn raising_repr_entry(_argv: *const i64) -> i64 {
+        crate::exc::raise_with_message(crate::exc::TYPE_ERROR, "boom")
+    }
+
+    /// A raising `__repr__` is not silently cleared: the renderer returns its
+    /// fallback text but leaves the exception pending so the caller reports it.
+    #[test]
+    fn instance_repr_keeps_a_raising_dunder_pending() {
+        crate::exc::init();
+        let repr_method = native_function_new("value_tests", "_raising_repr", usize::MAX);
+        function_set_signature(
+            repr_method,
+            vec![ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            }],
+        );
+        function_set_full_entry(repr_method, raising_repr_entry as *const () as usize);
+        let class = class_new(
+            "Raising".to_string(),
+            NONE,
+            vec![("__repr__".to_string(), repr_method)],
+        );
+        let instance = instance_new(class);
+
+        assert_eq!(repr(instance), "<Raising object>");
+        assert_eq!(crate::exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        crate::exc::clear();
+        assert!(!crate::exc::pending());
     }
 }

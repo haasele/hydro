@@ -329,7 +329,7 @@ fn raised_error(message: &str) -> i64 {
 /// `EnvironmentError` and `WindowsError` are `OSError`); subclasses without a
 /// tag resolve to their nearest tagged ancestor (`UnboundLocalError` is a
 /// `NameError`, `EncodingWarning` is a `Warning`).
-fn exception_tag(name: &str) -> Option<u32> {
+pub(crate) fn exception_tag(name: &str) -> Option<u32> {
     Some(match name {
         "ArithmeticError" => ARITHMETIC_ERROR,
         "AssertionError" => ASSERTION_ERROR,

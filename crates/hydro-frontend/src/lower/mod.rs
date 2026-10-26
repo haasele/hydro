@@ -135,8 +135,8 @@ pub enum HUnpackTarget {
     },
     Nested(Vec<HUnpackTarget>),
     /// `*name = element`: `element` is the fresh list of the elements no
-    /// plain target consumed. At most one starred target may appear in one
-    /// sequence, and it never nests inside a container target.
+    /// plain target consumed. At most one starred target may appear at each
+    /// sequence level; a nested container may own its own star.
     Star(Box<HUnpackTarget>),
 }
 
@@ -296,6 +296,8 @@ pub enum HStmtKind {
         value: Option<HExpr>,
     },
     Raise {
+        /// Exception tag. `None` with a `msg` is `raise <value>` (the value
+        /// is the exception object); `None` without one is a bare re-raise.
         exc: Option<ExcKind>,
         msg: Option<HExpr>,
         /// `raise ... from cause`; `None` for no explicit cause.
@@ -764,6 +766,36 @@ struct DataclassField<'a> {
     default: FieldDefault<'a>,
 }
 
+/// One method planned for a class body.
+///
+/// `decorators` holds the decorator expressions that must be evaluated and
+/// applied at runtime, outermost first. It is empty when the method's binding
+/// is fully described by `kind` (a single `@property`/`@classmethod`/
+/// `@staticmethod`, or no decorator at all); any other decorator shape makes
+/// the class body execute at runtime so the decorated value can be built in
+/// CPython order.
+#[derive(Clone, Debug)]
+struct PlannedMethod {
+    name: String,
+    function: FunctionId,
+    /// Source start of the `FunctionDef`; `None` for a synthesized method (the
+    /// dataclass/NamedTuple `__init__`), which has no source body.
+    start: Option<u32>,
+    kind: MethodKind,
+    decorators: Vec<ast::Expr>,
+}
+
+/// Classification of one method's decorator list.
+#[derive(Clone, Debug)]
+struct MethodDecorators {
+    /// Binding kind selected by `@property`/`@classmethod`/`@staticmethod`
+    /// (the innermost such decorator, matching the previous behaviour).
+    kind: MethodKind,
+    /// Decorator expressions applied at runtime, outermost first. Empty when
+    /// `kind` alone describes the binding.
+    runtime: Vec<ast::Expr>,
+}
+
 /// A class header/body registered before any function body is lowered.
 #[derive(Clone, Debug)]
 struct ClassPlan {
@@ -771,15 +803,21 @@ struct ClassPlan {
     bases: Vec<usize>,
     /// Index of the `metaclass=` keyword expression, if present.
     metaclass: Option<usize>,
+    /// Indices of every other named class-header keyword, in source order.
+    /// Their values are evaluated when the class statement runs (CPython
+    /// order: bases, then keyword values), but they are not forwarded: Hydro's
+    /// class-creation protocol has no `__init_subclass__` keyword channel and
+    /// its metaclass hooks receive only `(name, bases, namespace)`. A class
+    /// that pairs a metaclass with extra keywords is rejected at compile time
+    /// instead of silently dropping the keywords.
+    keywords: Vec<usize>,
     /// Indices of the decorator expressions that are applied at runtime,
     /// bottom-up after the class object is created.
     decorators: Vec<usize>,
-    /// Method name, function id, the source range start of its
-    /// `FunctionDef` and its binding kind. Methods are lowered after their
-    /// signatures are registered. A synthesized method (the
-    /// dataclass/NamedTuple `__init__`) has no source body and therefore
-    /// stores `None`; the runtime module `None` index denotes that case.
-    methods: Vec<(String, FunctionId, Option<u32>, MethodKind)>,
+    /// The class-body methods. Methods are lowered after their signatures are
+    /// registered; a synthesized method (the dataclass/NamedTuple `__init__`)
+    /// has no source body.
+    methods: Vec<PlannedMethod>,
     /// Class attribute name and the index of its assignment in the class
     /// body. Values are lowered when the class statement itself is lowered.
     /// Only the static path collects attributes.
@@ -825,6 +863,16 @@ struct CellPlan {
     aliases: HashSet<String>,
 }
 
+/// One method binding a dynamic class body stores in its namespace: the
+/// compiled function, its binding kind and the decorators applied at runtime
+/// (outermost first; empty when the binding kind alone describes it).
+#[derive(Clone, Debug)]
+struct ClassMethodBinding {
+    function: FunctionId,
+    kind: MethodKind,
+    decorators: Vec<ast::Expr>,
+}
+
 /// Active class-body namespace while lowering a dynamic class body.
 ///
 /// A class body that executes statements keeps CPython's class namespace in a
@@ -838,9 +886,9 @@ struct ClassNs {
     /// Names bound anywhere in the class body (methods, assignments, loop and
     /// handler targets).
     bindings: HashSet<String>,
-    /// Method bodies by definition span start: the function id and binding
-    /// kind the class namespace must receive.
-    methods: HashMap<u32, (FunctionId, MethodKind)>,
+    /// Method bodies by definition span start: the binding the class
+    /// namespace must receive.
+    methods: HashMap<u32, ClassMethodBinding>,
 }
 
 struct FuncState {
@@ -1437,6 +1485,46 @@ struct DeferredImport {
     member: Option<String>,
 }
 
+/// One name bound by a module-level `from <module> import *` statement.
+///
+/// A star import binds exactly the names CPython would copy into the module
+/// namespace, so the binding is a compile-time value, never a runtime copy of
+/// the module dictionary. An imported unit (and a REPL fragment) mirrors each
+/// binding into its own runtime global table, which is what makes the name a
+/// real module attribute for later fragments and for importers that read it
+/// through the module value.
+#[derive(Clone)]
+enum StarBinding {
+    /// A public function of a native module.
+    NativeFunction {
+        module: &'static ModuleSpec,
+        function: &'static FunctionSpec,
+    },
+    /// A public constant of a native module.
+    NativeConstant {
+        module: &'static ModuleSpec,
+        constant: &'static ConstantSpec,
+    },
+    /// A function defined by a compiled unit.
+    UserFunction { name: String, function: FunctionId },
+    /// A module-level value of a compiled unit, read from its global table.
+    UserGlobal { name: String, module: String },
+    /// A direct submodule of a package (`from pkg import *` binds it too).
+    Module { name: String, module: String },
+}
+
+/// Lexical scope an import statement is collected from.
+///
+/// CPython allows `from <module> import *` only at module level: a
+/// module-level `if`/`try`/loop body still runs at module level, while a
+/// function or class body may not use the wildcard form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImportScope {
+    Module,
+    Class,
+    Function,
+}
+
 pub struct Lowerer<'a> {
     source: &'a str,
     filename: &'a str,
@@ -1467,11 +1555,15 @@ pub struct Lowerer<'a> {
     /// `from . import name` bindings inside a package `__init__.py` that refer
     /// to this unit's own functions; resolved after signatures are registered.
     pending_self_imports: Vec<(String, String, TextRange)>,
-    /// `from . import *` inside a package `__init__.py`: expanded after the
-    /// unit's own functions and globals are known.
-    pending_self_stars: Vec<TextRange>,
+    /// `from . import *` statement starts inside a package `__init__.py`:
+    /// expanded after the unit's own functions and globals are known.
+    pending_self_stars: Vec<usize>,
     /// Literal `__all__` of this unit, used by a pending self star import.
     module_all: Option<Vec<String>>,
+    /// Values bound by module-level star imports, keyed by the statement's
+    /// source start. Imported units and session fragments mirror them into the
+    /// runtime global table so the bound names survive as module attributes.
+    star_bindings: HashMap<usize, Vec<StarBinding>>,
     /// Names defined by module-level `def`/`async def` in this unit. Used to
     /// keep a star import from a compiled extension from shadowing a local
     /// definition of the same name.
@@ -1533,6 +1625,12 @@ pub struct Lowerer<'a> {
     /// [`Self::global_names`] but tracked separately so a session-global read
     /// can be distinguished from a name this fragment binds itself.
     session_globals: HashSet<String>,
+    /// The module body manipulates its namespace through `globals()`/`vars()`
+    /// (directly or through an alias), so names it installs are invisible to
+    /// the static binding scan. An otherwise unresolved module-level read then
+    /// lowers to a [`HExprKind::GlobalGet`]: the value may exist when the read
+    /// runs, and a missing one raises at runtime exactly like CPython.
+    dynamic_module_globals: bool,
     /// `from X import f [as g]` bindings: name -> (module, function spec).
     imported_functions: HashMap<String, (&'static ModuleSpec, &'static FunctionSpec)>,
     /// `from X import c [as d]` bindings: name -> (module, constant spec).
@@ -1610,6 +1708,14 @@ pub struct Lowerer<'a> {
     /// Class attributes visible while evaluating a class body's attribute
     /// values; the innermost scope is last.
     class_attr_scopes: Vec<HashMap<String, HExpr>>,
+    /// Enclosing function locals visible to the methods of a class that is
+    /// registered while lowering a nested `class` statement (name -> the local
+    /// currently holds a closure cell). Such methods become closures over the
+    /// enclosing scope, exactly like nested functions.
+    method_capture_scope: Option<HashMap<String, bool>>,
+    /// Capture names of methods created with a capture scope, in closure
+    /// order. The nested-class lowering turns these into closure values.
+    method_captures: HashMap<FunctionId, Vec<String>>,
     /// Resolve otherwise-unknown module-level names to `GlobalGet` while
     /// lowering a parameter default expression.
     in_default_expr: bool,
@@ -1648,6 +1754,7 @@ impl<'a> Lowerer<'a> {
             pending_self_imports: Vec::new(),
             pending_self_stars: Vec::new(),
             module_all: None,
+            star_bindings: HashMap::new(),
             module_def_names: HashSet::new(),
             extension_stars: Vec::new(),
             extension_star_bindings: Vec::new(),
@@ -1663,6 +1770,7 @@ impl<'a> Lowerer<'a> {
             mirror_all_globals: false,
             session_mode: false,
             session_globals: HashSet::new(),
+            dynamic_module_globals: false,
             imported_functions: HashMap::new(),
             imported_constants: HashMap::new(),
             unpack_counter: 0,
@@ -1689,6 +1797,8 @@ impl<'a> Lowerer<'a> {
             class_methods: HashMap::new(),
             current_class_method: None,
             class_attr_scopes: Vec::new(),
+            method_capture_scope: None,
+            method_captures: HashMap::new(),
             in_default_expr: false,
             diags: Vec::new(),
         }
@@ -1911,7 +2021,19 @@ impl<'a> Lowerer<'a> {
             self.used_globals.insert(name);
         }
         self.collect_top_imports(&module.body);
-        self.collect_nested_imports(&module.body, true);
+        self.collect_nested_imports(&module.body, true, ImportScope::Module);
+
+        // A module that writes its own namespace through `globals()`/`vars()`
+        // (inspect.py builds its `CO_*` constants that way) installs names the
+        // static binding scan cannot see. Record it before any body is
+        // lowered so unknown module-level reads inside functions become
+        // runtime global lookups instead of compile-time errors. A module-level
+        // binding of `globals`/`vars` shadows the builtin, so only unshadowed
+        // references count.
+        let mut module_bound = self.global_names.clone();
+        module_bound.extend(self.module_def_names.iter().cloned());
+        module_bound.extend(self.top_level_imports.iter().cloned());
+        self.dynamic_module_globals = module_uses_dynamic_globals(&module.body, &module_bound);
 
         // 2. Signatures next: forward calls and recursion are both legal.
         //    Class methods are registered here too, but only by qualified
@@ -2164,7 +2286,7 @@ impl<'a> Lowerer<'a> {
         self.fn_ids.remove(&name);
         self.global_names.insert(name.clone());
         let start = u32::from(decl.range.start()) as usize;
-        let id = self.create_function_with_captures(&decl, name, false, &[], &[], None)?;
+        let id = self.create_function_with_captures(&decl, name, false, &[], &[])?;
         self.conditional_defs.insert(start, id);
         Some(id)
     }
@@ -2201,16 +2323,16 @@ impl<'a> Lowerer<'a> {
                 ast::Stmt::ClassDef(c) => {
                     if let Some(plan) = self.class_defs.get(&start).cloned() {
                         let bodies = class_method_bodies(&c.body);
-                        for (_, fid, method_start, _) in plan.methods {
+                        for method in plan.methods {
                             // Synthesized methods already carry their body.
-                            let Some(method_start) = method_start else {
+                            let Some(method_start) = method.start else {
                                 continue;
                             };
                             let Some(method_body) = bodies.get(&method_start) else {
                                 continue;
                             };
-                            let lowered = self.lower_function_body(fid, method_body);
-                            self.functions[fid as usize].body = lowered;
+                            let lowered = self.lower_function_body(method.function, method_body);
+                            self.functions[method.function as usize].body = lowered;
                         }
                     }
                     // Nested classes are separate `ClassDef` statements inside
@@ -3139,7 +3261,12 @@ impl<'a> Lowerer<'a> {
     /// handled by [`Self::collect_top_imports`]; an import this pass reaches
     /// is nested (a function/class body, or a `try` part), and its binding is
     /// skipped when the top-level pass already claimed the name.
-    fn collect_nested_imports(&mut self, stmts: &[ast::Stmt], root: bool) {
+    ///
+    /// `scope` tracks whether the statement still runs at module level. A
+    /// wildcard import inside a function or class body is a Python syntax
+    /// error; it is reported here and binds nothing, before any module lookup
+    /// could produce a misleading diagnostic.
+    fn collect_nested_imports(&mut self, stmts: &[ast::Stmt], root: bool, scope: ImportScope) {
         for stmt in stmts {
             match stmt {
                 ast::Stmt::Import(s) => {
@@ -3151,46 +3278,70 @@ impl<'a> Lowerer<'a> {
                 }
                 ast::Stmt::ImportFrom(s) => {
                     if !root {
+                        if scope != ImportScope::Module
+                            && s.names.iter().any(|alias| alias.name.as_str() == "*")
+                        {
+                            // CPython rejects the whole statement before any
+                            // name is bound, inside a function or a class body.
+                            let range = s
+                                .names
+                                .iter()
+                                .find(|alias| alias.name.as_str() == "*")
+                                .map(|alias| alias.range)
+                                .unwrap_or(s.range);
+                            self.error_at_code(
+                                range,
+                                codes::SYNTAX,
+                                "import * only allowed at module level",
+                            );
+                            continue;
+                        }
                         self.collect_import_from(s, true);
                     }
                 }
-                ast::Stmt::FunctionDef(s) => self.collect_nested_imports(&s.body, false),
-                ast::Stmt::AsyncFunctionDef(s) => self.collect_nested_imports(&s.body, false),
-                ast::Stmt::ClassDef(s) => self.collect_nested_imports(&s.body, false),
+                ast::Stmt::FunctionDef(s) => {
+                    self.collect_nested_imports(&s.body, false, ImportScope::Function)
+                }
+                ast::Stmt::AsyncFunctionDef(s) => {
+                    self.collect_nested_imports(&s.body, false, ImportScope::Function)
+                }
+                ast::Stmt::ClassDef(s) => {
+                    self.collect_nested_imports(&s.body, false, ImportScope::Class)
+                }
                 ast::Stmt::If(s) => {
                     let branch = static_if_branch(&s.test, &self.dunder_name);
                     match branch {
-                        Some(true) => self.collect_nested_imports(&s.body, false),
-                        Some(false) => self.collect_nested_imports(&s.orelse, false),
+                        Some(true) => self.collect_nested_imports(&s.body, false, scope),
+                        Some(false) => self.collect_nested_imports(&s.orelse, false, scope),
                         None => {
-                            self.collect_nested_imports(&s.body, false);
-                            self.collect_nested_imports(&s.orelse, false);
+                            self.collect_nested_imports(&s.body, false, scope);
+                            self.collect_nested_imports(&s.orelse, false, scope);
                         }
                     }
                 }
                 ast::Stmt::For(s) => {
-                    self.collect_nested_imports(&s.body, false);
-                    self.collect_nested_imports(&s.orelse, false);
+                    self.collect_nested_imports(&s.body, false, scope);
+                    self.collect_nested_imports(&s.orelse, false, scope);
                 }
                 ast::Stmt::AsyncFor(s) => {
-                    self.collect_nested_imports(&s.body, false);
-                    self.collect_nested_imports(&s.orelse, false);
+                    self.collect_nested_imports(&s.body, false, scope);
+                    self.collect_nested_imports(&s.orelse, false, scope);
                 }
                 ast::Stmt::While(s) => {
-                    self.collect_nested_imports(&s.body, false);
-                    self.collect_nested_imports(&s.orelse, false);
+                    self.collect_nested_imports(&s.body, false, scope);
+                    self.collect_nested_imports(&s.orelse, false, scope);
                 }
                 ast::Stmt::Try(s) => {
-                    self.collect_nested_imports(&s.body, false);
+                    self.collect_nested_imports(&s.body, false, scope);
                     for handler in &s.handlers {
                         let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                        self.collect_nested_imports(&handler.body, false);
+                        self.collect_nested_imports(&handler.body, false, scope);
                     }
-                    self.collect_nested_imports(&s.orelse, false);
-                    self.collect_nested_imports(&s.finalbody, false);
+                    self.collect_nested_imports(&s.orelse, false, scope);
+                    self.collect_nested_imports(&s.finalbody, false, scope);
                 }
-                ast::Stmt::With(s) => self.collect_nested_imports(&s.body, false),
-                ast::Stmt::AsyncWith(s) => self.collect_nested_imports(&s.body, false),
+                ast::Stmt::With(s) => self.collect_nested_imports(&s.body, false, scope),
+                ast::Stmt::AsyncWith(s) => self.collect_nested_imports(&s.body, false, scope),
                 _ => {}
             }
         }
@@ -3234,7 +3385,15 @@ impl<'a> Lowerer<'a> {
             Some(_) => imported,
             None => binding,
         };
-        if let Some(spec) = stdlib::module(imported) {
+        // A native module binds the *top-level* spec for the unaliased form:
+        // `import os.path` binds `os`, and `os.path` then resolves through the
+        // module chain. Binding the leaf under the package name would make
+        // `os.getcwd()` unreachable.
+        let spec_name = match &alias.asname {
+            Some(_) => imported,
+            None => binding,
+        };
+        if let Some(spec) = stdlib::module(spec_name) {
             self.module_aliases.insert(binding.to_string(), spec);
             return;
         }
@@ -3311,6 +3470,8 @@ impl<'a> Lowerer<'a> {
             }
         };
         let imported = module_name.as_str();
+        // Mirroring is keyed by the statement that performs the star import.
+        let statement = u32::from(s.range.start()) as usize;
 
         // `from __future__ import annotations` (and every other future
         // feature) changes no semantics in this frontend: annotations are
@@ -3323,7 +3484,7 @@ impl<'a> Lowerer<'a> {
             for alias in &s.names {
                 let member = alias.name.as_str();
                 if member == "*" {
-                    self.import_native_star(module, nested);
+                    self.import_native_star(module, nested, statement);
                     continue;
                 }
                 let binding = match &alias.asname {
@@ -3363,9 +3524,9 @@ impl<'a> Lowerer<'a> {
                     if self_package {
                         // The package's own exports are only complete after
                         // its signatures are registered.
-                        self.pending_self_stars.push(alias.range);
+                        self.pending_self_stars.push(statement);
                     } else if let Some(module) = &base {
-                        self.import_user_star(imported, module, nested);
+                        self.import_user_star(imported, module, nested, statement);
                     } else {
                         self.error_at_code(
                             alias.range,
@@ -3519,7 +3680,7 @@ impl<'a> Lowerer<'a> {
         match self.find_extension(imported) {
             ExtensionLookup::Found(path) => {
                 let path = path.to_string_lossy().into_owned();
-                self.collect_extension_members(s, imported, &path, nested);
+                self.collect_extension_members(s, &path, nested);
             }
             ExtensionLookup::Incompatible { path, reason }
                 if self.may_defer_at(imported, nested) =>
@@ -3585,7 +3746,12 @@ impl<'a> Lowerer<'a> {
     /// Expands `from <native module> import *` into the spec's public
     /// functions and constants. Underscore-prefixed spec entries are internal,
     /// exactly like CPython without `__all__`.
-    fn import_native_star(&mut self, module: &'static ModuleSpec, nested: bool) {
+    ///
+    /// The bound values are compile-time references to the native entry
+    /// (`ModuleAttr`/`ModuleCall`); nothing copies the module namespace at
+    /// runtime. `statement` keys the mirror list for an imported unit or a
+    /// session fragment.
+    fn import_native_star(&mut self, module: &'static ModuleSpec, nested: bool, statement: usize) {
         for function in module.functions {
             if function.name.starts_with('_') {
                 continue;
@@ -3595,6 +3761,10 @@ impl<'a> Lowerer<'a> {
             }
             self.imported_functions
                 .insert(function.name.to_string(), (module, function));
+            self.star_bindings
+                .entry(statement)
+                .or_default()
+                .push(StarBinding::NativeFunction { module, function });
         }
         for constant in module.constants {
             if constant.name.starts_with('_') {
@@ -3605,6 +3775,10 @@ impl<'a> Lowerer<'a> {
             }
             self.imported_constants
                 .insert(constant.name.to_string(), (module, constant));
+            self.star_bindings
+                .entry(statement)
+                .or_default()
+                .push(StarBinding::NativeConstant { module, constant });
         }
     }
 
@@ -3614,7 +3788,13 @@ impl<'a> Lowerer<'a> {
     /// compilation can actually resolve (an exported function/global or a
     /// visible submodule). Without `__all__`, every non-underscore export and
     /// direct submodule is bound in stable sorted order.
-    fn import_user_star(&mut self, module_name: &str, module: &UserModule, nested: bool) {
+    fn import_user_star(
+        &mut self,
+        module_name: &str,
+        module: &UserModule,
+        nested: bool,
+        statement: usize,
+    ) {
         let names: Vec<String> = match &module.all {
             Some(all) => {
                 let mut names = Vec::with_capacity(all.len());
@@ -3655,16 +3835,34 @@ impl<'a> Lowerer<'a> {
             }
             let submodule = format!("{module_name}.{name}");
             if self.user_modules.contains_key(&submodule) {
-                self.user_module_aliases.insert(name, submodule);
+                self.user_module_aliases
+                    .insert(name.clone(), submodule.clone());
+                self.star_bindings
+                    .entry(statement)
+                    .or_default()
+                    .push(StarBinding::Module {
+                        name,
+                        module: submodule,
+                    });
                 continue;
             }
             match module.exports.get(&name).copied() {
                 Some(UserExport::Function(id)) => {
-                    self.imported_user_functions.insert(name, id);
+                    self.imported_user_functions.insert(name.clone(), id);
+                    self.star_bindings
+                        .entry(statement)
+                        .or_default()
+                        .push(StarBinding::UserFunction { name, function: id });
                 }
                 Some(UserExport::Global) => {
                     self.imported_user_globals
-                        .insert(name.clone(), (module_name.to_string(), name));
+                        .insert(name.clone(), (module_name.to_string(), name.clone()));
+                    self.star_bindings.entry(statement).or_default().push(
+                        StarBinding::UserGlobal {
+                            name,
+                            module: module_name.to_string(),
+                        },
+                    );
                 }
                 // Filtered by the `__all__` check above; anonymous
                 // (`__all__` absent) names are all exports.
@@ -3675,8 +3873,8 @@ impl<'a> Lowerer<'a> {
 
     /// Expands `from . import *` once this unit's own signatures are known.
     fn resolve_self_stars(&mut self) {
-        let ranges = std::mem::take(&mut self.pending_self_stars);
-        for _range in ranges {
+        let statements = std::mem::take(&mut self.pending_self_stars);
+        for statement in statements {
             let names: Vec<String> = match &self.module_all {
                 Some(all) => all.clone(),
                 None => {
@@ -3698,11 +3896,21 @@ impl<'a> Lowerer<'a> {
                 }
                 match self.self_export(&name) {
                     Some(UserExport::Function(id)) => {
-                        self.imported_user_functions.insert(name, id);
+                        self.imported_user_functions.insert(name.clone(), id);
+                        self.star_bindings
+                            .entry(statement)
+                            .or_default()
+                            .push(StarBinding::UserFunction { name, function: id });
                     }
                     Some(UserExport::Global) => {
                         self.imported_user_globals
-                            .insert(name.clone(), (self.dunder_name.clone(), name));
+                            .insert(name.clone(), (self.dunder_name.clone(), name.clone()));
+                        self.star_bindings.entry(statement).or_default().push(
+                            StarBinding::UserGlobal {
+                                name,
+                                module: self.dunder_name.clone(),
+                            },
+                        );
                     }
                     None => {}
                 }
@@ -3786,15 +3994,12 @@ impl<'a> Lowerer<'a> {
         );
     }
 
-    /// Records `from ext import member [as x]` bindings. Star imports are
-    /// rejected: an extension's members are not knowable statically.
-    fn collect_extension_members(
-        &mut self,
-        s: &ast::StmtImportFrom,
-        module: &str,
-        path: &str,
-        nested: bool,
-    ) {
+    /// Records `from ext import member [as x]` bindings.
+    ///
+    /// A star import cannot be enumerated statically: the importing unit's
+    /// literal `__all__` names the attributes it re-exports, everything else
+    /// stays a lazy member read.
+    fn collect_extension_members(&mut self, s: &ast::StmtImportFrom, path: &str, nested: bool) {
         for alias in &s.names {
             let member = alias.name.as_str();
             if member == "*" {
@@ -3805,16 +4010,8 @@ impl<'a> Lowerer<'a> {
                 // stores them) and imports of this module keep working. Reads
                 // of any other name fall back to a lazy member lookup, so the
                 // whole extension surface stays reachable without inventing
-                // names. A star import nested in a function is a Python syntax
-                // error and stays rejected.
-                if nested {
-                    self.error_at_code(
-                        alias.range,
-                        codes::UNSUPPORTED,
-                        format!("'from {module} import *' is not supported for extension modules"),
-                    );
-                    continue;
-                }
+                // names. A star import inside a function or class body was
+                // already rejected during import collection.
                 if !self.extension_stars.iter().any(|existing| existing == path) {
                     self.extension_stars.push(path.to_string());
                 }
@@ -3881,7 +4078,8 @@ impl<'a> Lowerer<'a> {
 
     /// Mirrors the bindings of a module-level `from ... import ...` statement
     /// into the runtime global table of this unit (see
-    /// [`Self::lower_session_import`]).
+    /// [`Self::lower_session_import`]), including every name resolved by a
+    /// wildcard import.
     fn lower_session_import_from(
         &mut self,
         s: &ast::StmtImportFrom,
@@ -3891,6 +4089,17 @@ impl<'a> Lowerer<'a> {
         let mut stores = Vec::new();
         for alias in &s.names {
             if alias.name.as_str() == "*" {
+                // A star import binds real module attributes: an imported
+                // unit (or a session fragment) mirrors each resolved binding
+                // into its runtime global table, so importers and later
+                // fragments read them like any other import binding.
+                let statement = u32::from(s.range.start()) as usize;
+                if let Some(bindings) = self.star_bindings.get(&statement).cloned() {
+                    for binding in &bindings {
+                        let (name, value) = self.star_binding_value(binding, line, col);
+                        stores.push(self.session_global_store(&name, value, line, col));
+                    }
+                }
                 // `from <extension> import *`: the statically known names (the
                 // unit's literal `__all__`) are stored into the runtime global
                 // table here, exactly like `from ... import name` bindings.
@@ -3982,6 +4191,62 @@ impl<'a> Lowerer<'a> {
             ty: Ty::Concrete(Type::Any),
             line,
             col,
+        }
+    }
+
+    /// Runtime value of one name bound by `from <module> import *`, together
+    /// with its binding name. Used when an imported unit or a session fragment
+    /// mirrors the star import into its runtime global table.
+    fn star_binding_value(&self, binding: &StarBinding, line: u32, col: u32) -> (String, HExpr) {
+        match binding {
+            StarBinding::NativeFunction { module, function } => (
+                function.name.to_string(),
+                HExpr {
+                    kind: HExprKind::ModuleAttr {
+                        module: module.name.to_string(),
+                        name: function.name.to_string(),
+                    },
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                },
+            ),
+            StarBinding::NativeConstant { module, constant } => (
+                constant.name.to_string(),
+                HExpr {
+                    kind: HExprKind::ModuleAttr {
+                        module: module.name.to_string(),
+                        name: constant.name.to_string(),
+                    },
+                    ty: Ty::Concrete(constant.ty),
+                    line,
+                    col,
+                },
+            ),
+            StarBinding::UserFunction { name, function } => (
+                name.clone(),
+                HExpr {
+                    kind: HExprKind::FunctionRef(*function),
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                },
+            ),
+            StarBinding::UserGlobal { name, module } => (
+                name.clone(),
+                HExpr {
+                    kind: HExprKind::GlobalGet {
+                        module: module.clone(),
+                        name: name.clone(),
+                    },
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                },
+            ),
+            StarBinding::Module { name, module } => {
+                (name.clone(), self.module_ref_expr(module, line, col))
+            }
         }
     }
 
@@ -4099,11 +4364,11 @@ impl<'a> Lowerer<'a> {
             }
             ast::Expr::Attribute(attr) => {
                 let base = self.resolve_module_chain(&attr.value, fs)?;
-                if base.name == "os" && attr.attr.as_str() == "path" {
-                    stdlib::module("os.path")
-                } else {
-                    None
-                }
+                // A native submodule (`os.path`, `collections.abc`, ...) is a
+                // module in its own right; resolve it generically so every
+                // dotted native import works, not just the hard-coded ones.
+                let full = format!("{}.{}", base.name, attr.attr);
+                stdlib::module(&full)
             }
             _ => None,
         }
@@ -4452,55 +4717,99 @@ impl<'a> Lowerer<'a> {
         // A user function may shadow a builtin (`def print(...)`): name
         // resolution prefers `fn_ids` over the builtin table.
 
-        self.create_function_named(&decl, name, global, None)
+        self.create_function_named(&decl, name, global)
     }
 
     /// Register a method as a plain function named `Class.method`.
     ///
     /// Methods never enter [`Lowerer::fn_ids`]: a bare `method` name is not
     /// callable, and different classes may define the same method name.
-    /// `@property`, `@classmethod` and `@staticmethod` are recorded as the
-    /// method's binding kind; known no-op decorators are ignored.
+    /// `@property`, `@classmethod` and `@staticmethod` select the binding
+    /// kind; known no-op decorators are ignored and any other decorator is
+    /// recorded for runtime application. When a nested class is registered
+    /// from inside a function, the method becomes a closure over the enclosing
+    /// locals it reads.
     fn create_method_function(
         &mut self,
         f: &ast::StmtFunctionDef,
         class: &str,
-    ) -> Option<(FunctionId, MethodKind)> {
-        let kind = self.method_decorator_kind(&f.decorator_list);
+    ) -> Option<(FunctionId, MethodDecorators)> {
+        let decoration = self.method_decorator_plan(&f.decorator_list);
+        let decl = FnDecl::from_def(f);
+        let captures = self.method_capture_plan(&decl);
         let name = format!("{class}.{}", f.name);
-        self.create_function_named(&FnDecl::from_def(f), name, false, Some(kind))
-            .map(|id| (id, kind))
+        let id = self.create_method_function_from(&decl, name, &captures)?;
+        Some((id, decoration))
     }
 
     fn create_async_method_function(
         &mut self,
         f: &ast::StmtAsyncFunctionDef,
         class: &str,
-    ) -> Option<(FunctionId, MethodKind)> {
-        let kind = self.method_decorator_kind(&f.decorator_list);
+    ) -> Option<(FunctionId, MethodDecorators)> {
+        let decoration = self.method_decorator_plan(&f.decorator_list);
+        let decl = FnDecl::from_async_def(f);
+        let captures = self.method_capture_plan(&decl);
         let name = format!("{class}.{}", f.name);
-        self.create_function_named(&FnDecl::from_async_def(f), name, false, Some(kind))
-            .map(|id| (id, kind))
+        let id = self.create_method_function_from(&decl, name, &captures)?;
+        Some((id, decoration))
+    }
+
+    /// Shared method signature registration. `captures` lists the enclosing
+    /// locals the method body reads, in first-use order, with their cell flag.
+    fn create_method_function_from(
+        &mut self,
+        decl: &FnDecl<'_>,
+        name: String,
+        captures: &[(String, bool)],
+    ) -> Option<FunctionId> {
+        let capture_names: Vec<String> = captures.iter().map(|(name, _)| name.clone()).collect();
+        let capture_cells: Vec<bool> = captures.iter().map(|(_, cell)| *cell).collect();
+        let id =
+            self.create_function_with_captures(decl, name, false, &capture_names, &capture_cells)?;
+        if !capture_names.is_empty() {
+            self.method_captures.insert(id, capture_names);
+        }
+        Some(id)
+    }
+
+    /// Captures a method of a class registered inside a function takes from
+    /// the enclosing scope: every name its body reads that the enclosing
+    /// function binds, in first-use order.
+    fn method_capture_plan(&self, decl: &FnDecl<'_>) -> Vec<(String, bool)> {
+        let Some(scope) = &self.method_capture_scope else {
+            return Vec::new();
+        };
+        let mut plan = Vec::new();
+        for name in function_free_names(decl.body, decl.args) {
+            if let Some(cell) = scope.get(&name) {
+                plan.push((name, *cell));
+            }
+        }
+        plan
     }
 
     /// Shared signature lowering. `global` controls the module-level checks
     /// (duplicate definitions, builtin shadowing) that do not apply to
-    /// methods. `decorator_kind` is `Some` for class methods, whose decorators
-    /// were already classified and diagnosed by the caller.
+    /// methods.
     fn create_function_named(
         &mut self,
         decl: &FnDecl<'_>,
         name: String,
         global: bool,
-        decorator_kind: Option<MethodKind>,
     ) -> Option<FunctionId> {
-        self.create_function_with_captures(decl, name, global, &[], &[], decorator_kind)
+        self.create_function_with_captures(decl, name, global, &[], &[])
     }
 
     /// Lower a function signature with optional leading closure-capture
     /// parameters. Captures are typed `Any` and become locals too, so the
     /// body resolves their names exactly like parameters. `capture_cells`
     /// marks the captures whose enclosing local is a cell.
+    ///
+    /// Every function decorator is applied at runtime, exactly like CPython.
+    /// `@property`/`@classmethod`/`@staticmethod` are ordinary callables, so
+    /// they are valid on a plain function too (typing_extensions applies
+    /// `@classmethod` to a module-level helper).
     fn create_function_with_captures(
         &mut self,
         decl: &FnDecl<'_>,
@@ -4508,15 +4817,7 @@ impl<'a> Lowerer<'a> {
         global: bool,
         captures: &[String],
         capture_cells: &[bool],
-        decorator_kind: Option<MethodKind>,
     ) -> Option<FunctionId> {
-        // Method decorators were classified by `create_method_function`, which
-        // also reported the unsupported ones. Function decorators are applied
-        // at runtime (see [`Self::lower_decorators`]); only the shapes this
-        // frontend cannot apply are diagnosed here.
-        if decorator_kind.is_none() {
-            self.validate_function_decorators(decl.decorators);
-        }
         if !decl.type_params.is_empty() {
             self.error_at(decl.range, "type parameters are not supported in Phase 1");
         }
@@ -4693,64 +4994,44 @@ impl<'a> Lowerer<'a> {
         Some(id)
     }
 
-    /// Diagnose decorator shapes the frontend cannot apply to a plain
-    /// function.
-    ///
-    /// Every other decorator is applied at runtime, bottom-up, exactly like
-    /// CPython: the decorator expressions are evaluated top-down when the
-    /// `def` statement runs, the function value is created, and each
-    /// decorator is called with the value produced by the one below it. The
-    /// pytest markers are compile-time directives consumed by the pytest
-    /// synthesis pass, and `@overload` declares a type-only stub that never
-    /// produces a function value.
-    fn validate_function_decorators(&mut self, decorators: &[ast::Expr]) {
-        for decorator in decorators {
-            let name = decorator_final_name(decorator);
-            if matches!(
-                name.as_deref(),
-                Some("property" | "classmethod" | "staticmethod")
-            ) {
-                self.error_at_code(
-                    decorator.range(),
-                    codes::UNSUPPORTED,
-                    format!(
-                        "'@{}' is only supported on class methods",
-                        name.unwrap_or_default()
-                    ),
-                );
-            }
-        }
-    }
-
     /// Classify a method's decorators.
     ///
-    /// `@property`, `@classmethod` and `@staticmethod` select the binding
-    /// kind; the no-op decorators this gate accepts are ignored without
-    /// evaluating their arguments (so `@lru_cache(maxsize=1024)` needs no
-    /// runtime support). Any other decorator keeps the existing diagnostic
-    /// and leaves the method an ordinary one.
-    fn method_decorator_kind(&mut self, decorators: &[ast::Expr]) -> MethodKind {
-        let mut kind = MethodKind::Normal;
-        for decorator in decorators {
-            match decorator_final_name(decorator).as_deref() {
-                Some("property") => kind = MethodKind::Property,
-                Some("classmethod") => kind = MethodKind::Classmethod,
-                Some("staticmethod") => kind = MethodKind::Staticmethod,
-                _ if is_ignored_function_decorator(decorator) => {}
-                _ => self.error_at(decorator.range(), "decorators are not supported in Phase 1"),
+    /// A single `@property`, `@classmethod` or `@staticmethod` selects the
+    /// binding kind and needs no runtime evaluation. Any other shape —
+    /// a generic decorator, or several decorators on the same method — is
+    /// evaluated and applied at runtime, bottom-up, exactly like CPython. The
+    /// known no-op decorators (`@lru_cache(maxsize=…)`, `@abstractmethod`,
+    /// pytest markers, ...) are still ignored without evaluating arguments,
+    /// which keeps them free of runtime support.
+    fn method_decorator_plan(&self, decorators: &[ast::Expr]) -> MethodDecorators {
+        let (kind, applied) = classify_method_decorators(decorators);
+        let runtime = if applied.len() == 1 {
+            match decorator_binding_kind(applied[0]) {
+                Some(_) => Vec::new(),
+                None => applied
+                    .iter()
+                    .map(|decorator| (*decorator).clone())
+                    .collect(),
             }
-        }
-        kind
+        } else {
+            applied
+                .iter()
+                .map(|decorator| (*decorator).clone())
+                .collect()
+        };
+        MethodDecorators { kind, runtime }
     }
 
     /// Validate a class header/body and register every method signature.
     ///
-    /// The class body may contain method definitions, class attributes
+    /// The static class body may contain method definitions, class attributes
     /// (`name = value`, `name: type = value`), dataclass/NamedTuple field
     /// declarations (`name: type` without a value), `pass` and a docstring;
-    /// everything else (nested classes, `if` blocks, ...) is rejected with a
-    /// diagnostic. The returned plan is used to lower the class statement and
-    /// its method bodies later.
+    /// anything else (control flow, calls, nested classes, ...) makes the body
+    /// execute at runtime against a namespace dict. A body registered inside a
+    /// function or with a runtime method decorator always takes that runtime
+    /// path. The returned plan is used to lower the class statement and its
+    /// method bodies later.
     fn register_class<'s>(&mut self, s: &'s ast::StmtClassDef) -> ClassPlan {
         let class = s.name.to_string();
         self.class_names.insert(class.clone());
@@ -4787,30 +5068,44 @@ impl<'a> Lowerer<'a> {
             self.error_at(s.range, "type parameters are not supported yet");
         }
         let mut metaclass = None;
-        for keyword in &s.keywords {
+        let mut keywords = Vec::new();
+        for (index, keyword) in s.keywords.iter().enumerate() {
             match keyword.arg.as_ref().map(|name| name.as_str()) {
                 Some("metaclass") if metaclass.is_none() => {
-                    metaclass = Some(
-                        s.keywords
-                            .iter()
-                            .position(|candidate| std::ptr::eq(candidate, keyword))
-                            .unwrap_or(0),
-                    );
+                    metaclass = Some(index);
                 }
-                Some("metaclass") => self.error_at_code(
-                    keyword.range,
-                    codes::CALL,
-                    "duplicate metaclass keyword",
-                ),
-                other => self.error_at_code(
+                Some("metaclass") => {
+                    self.error_at_code(keyword.range, codes::CALL, "duplicate metaclass keyword")
+                }
+                Some(_) => keywords.push(index),
+                // `class C(**mapping)`: the mapping cannot be validated or
+                // forwarded without a keyword channel to the metaclass /
+                // `__init_subclass__`, so keep the precise diagnostic instead
+                // of evaluating it and dropping the bindings.
+                None => self.error_at_code(
                     keyword.range,
                     codes::UNSUPPORTED,
-                    format!(
-                        "class keyword '{}' is not supported; only metaclass= is valid in a class header",
-                        other.unwrap_or("**")
-                    ),
+                    "class keyword '**' is not supported; pass keywords by name in a class header",
                 ),
             }
+        }
+        if let (Some(_), Some(first)) = (metaclass, keywords.first()) {
+            // Hydro's metaclass hooks receive only `(name, bases, namespace)`,
+            // so extra keywords would be silently dropped if the class had a
+            // metaclass that consumes them. Report instead of losing them.
+            self.error_at_code(
+                s.keywords[*first].range,
+                codes::UNSUPPORTED,
+                format!(
+                    "class keyword '{}' cannot be forwarded together with metaclass=; \
+                     Hydro's metaclass hooks receive only (name, bases, namespace)",
+                    s.keywords[*first]
+                        .arg
+                        .as_ref()
+                        .map(|name| name.as_str())
+                        .unwrap_or("**")
+                ),
+            );
         }
 
         // Every base expression is evaluated in source order and passed to the
@@ -4823,11 +5118,17 @@ impl<'a> Lowerer<'a> {
             .first()
             .is_some_and(|base| self.is_typing_namedtuple(base));
 
-        let mut methods: Vec<(String, FunctionId, Option<u32>, MethodKind)> = Vec::new();
+        let mut methods: Vec<PlannedMethod> = Vec::new();
         let mut fields: Vec<DataclassField<'s>> = Vec::new();
         let mut attributes: Vec<(String, usize)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        let dynamic = class_body_needs_namespace(&s.body);
+        // A class registered from inside a function or a class method carries
+        // captures, and a method with a generic decorator needs its decorated
+        // value built at runtime: both shapes execute the class body through
+        // the namespace-dict path, exactly like CPython's `__build_class__`.
+        let dynamic = class_body_needs_namespace(&s.body)
+            || self.method_capture_scope.is_some()
+            || class_body_has_runtime_method_decorators(&s.body);
         for (idx, stmt) in s.body.iter().enumerate() {
             if dynamic {
                 // A dynamic body only needs its annotated fields here; every
@@ -4927,12 +5228,18 @@ impl<'a> Lowerer<'a> {
                 // (receiver binding included), so it becomes another entry in
                 // the method table instead of a frozen attribute value.
                 if let ast::Expr::Name(value) = &*assign.value {
-                    if let Some((_, function, _, kind)) = methods
+                    if let Some(method) = methods
                         .iter()
-                        .find(|(method, _, _, _)| method.as_str() == value.id.as_str())
+                        .find(|method| method.name.as_str() == value.id.as_str())
+                        .cloned()
                     {
-                        let (function, kind) = (*function, *kind);
-                        methods.push((name, function, None, kind));
+                        methods.push(PlannedMethod {
+                            name,
+                            function: method.function,
+                            start: None,
+                            kind: method.kind,
+                            decorators: method.decorators,
+                        });
                         continue;
                     }
                 }
@@ -4955,13 +5262,18 @@ impl<'a> Lowerer<'a> {
                                 _ => None,
                             };
                             if let Some(kind) = kind {
-                                if let Some((_, function, _, _)) =
-                                    methods.iter().find(|(method, _, _, _)| {
-                                        method.as_str() == argument.id.as_str()
-                                    })
+                                if let Some(method) = methods
+                                    .iter()
+                                    .find(|method| method.name.as_str() == argument.id.as_str())
+                                    .cloned()
                                 {
-                                    let function = *function;
-                                    methods.push((name, function, None, kind));
+                                    methods.push(PlannedMethod {
+                                        name,
+                                        function: method.function,
+                                        start: None,
+                                        kind,
+                                        decorators: method.decorators,
+                                    });
                                     continue;
                                 }
                             }
@@ -5013,10 +5325,18 @@ impl<'a> Lowerer<'a> {
                 ast::Stmt::AsyncFunctionDef(f) => self.create_async_method_function(f, &class),
                 _ => unreachable!("method statement matched above"),
             };
-            if let Some((id, kind)) = registered {
-                self.class_methods
-                    .insert(id, (class.clone(), kind, first_param_name(self, id)));
-                methods.push((method, id, Some(u32::from(range.start())), kind));
+            if let Some((id, decoration)) = registered {
+                self.class_methods.insert(
+                    id,
+                    (class.clone(), decoration.kind, first_param_name(self, id)),
+                );
+                methods.push(PlannedMethod {
+                    name: method,
+                    function: id,
+                    start: Some(u32::from(range.start())),
+                    kind: decoration.kind,
+                    decorators: decoration.runtime,
+                });
             }
         }
 
@@ -5047,21 +5367,34 @@ impl<'a> Lowerer<'a> {
         if (is_dataclass || is_namedtuple)
             && !methods
                 .iter()
-                .any(|(name, _, _, _)| name.as_str() == "__init__")
+                .any(|method| method.name.as_str() == "__init__")
         {
             let (line, col) = self.span(s.range);
             let id = self.create_dataclass_init(&class, &fields, line, col);
-            methods.push(("__init__".to_string(), id, None, MethodKind::Normal));
+            methods.push(PlannedMethod {
+                name: "__init__".to_string(),
+                function: id,
+                start: None,
+                kind: MethodKind::Normal,
+                decorators: Vec::new(),
+            });
         }
 
         // Constructor calls of this unit bind keywords and omitted defaults
         // against the registered `__init__` signature. `fid_base` is added so
         // `call_signature` resolves the id in multi-module programs too.
-        if let Some((_, id, _, _)) = methods
+        // A decorated or capturing `__init__` cannot be called directly: its
+        // value is built when the class body runs, so the constructor call
+        // goes through the runtime class object instead.
+        if let Some(init) = methods
             .iter()
-            .find(|(name, _, _, _)| name.as_str() == "__init__")
+            .find(|method| method.name.as_str() == "__init__")
+            .filter(|method| {
+                method.decorators.is_empty() && !self.method_captures.contains_key(&method.function)
+            })
+            .map(|method| method.function)
         {
-            let init = self.fid_base + *id;
+            let init = self.fid_base + init;
             self.class_inits.insert(class.clone(), init);
             if let Some(signature) = self.call_signature(init) {
                 self.class_signatures
@@ -5072,6 +5405,7 @@ impl<'a> Lowerer<'a> {
         ClassPlan {
             bases,
             metaclass,
+            keywords,
             decorators,
             methods,
             attributes,
@@ -5117,7 +5451,7 @@ impl<'a> Lowerer<'a> {
         &mut self,
         class: &str,
         body: &[ast::Stmt],
-        methods: &mut Vec<(String, FunctionId, Option<u32>, MethodKind)>,
+        methods: &mut Vec<PlannedMethod>,
     ) {
         for stmt in body {
             match stmt {
@@ -5128,15 +5462,22 @@ impl<'a> Lowerer<'a> {
                     {
                         continue;
                     }
-                    if let Some((id, kind)) = self.create_method_function(f, class) {
-                        self.class_methods
-                            .insert(id, (class.to_string(), kind, first_param_name(self, id)));
-                        methods.push((
-                            f.name.to_string(),
+                    if let Some((id, decoration)) = self.create_method_function(f, class) {
+                        self.class_methods.insert(
                             id,
-                            Some(u32::from(f.range.start())),
-                            kind,
-                        ));
+                            (
+                                class.to_string(),
+                                decoration.kind,
+                                first_param_name(self, id),
+                            ),
+                        );
+                        methods.push(PlannedMethod {
+                            name: f.name.to_string(),
+                            function: id,
+                            start: Some(u32::from(f.range.start())),
+                            kind: decoration.kind,
+                            decorators: decoration.runtime,
+                        });
                     }
                 }
                 ast::Stmt::AsyncFunctionDef(f) => {
@@ -5146,15 +5487,22 @@ impl<'a> Lowerer<'a> {
                     {
                         continue;
                     }
-                    if let Some((id, kind)) = self.create_async_method_function(f, class) {
-                        self.class_methods
-                            .insert(id, (class.to_string(), kind, first_param_name(self, id)));
-                        methods.push((
-                            f.name.to_string(),
+                    if let Some((id, decoration)) = self.create_async_method_function(f, class) {
+                        self.class_methods.insert(
                             id,
-                            Some(u32::from(f.range.start())),
-                            kind,
-                        ));
+                            (
+                                class.to_string(),
+                                decoration.kind,
+                                first_param_name(self, id),
+                            ),
+                        );
+                        methods.push(PlannedMethod {
+                            name: f.name.to_string(),
+                            function: id,
+                            start: Some(u32::from(f.range.start())),
+                            kind: decoration.kind,
+                            decorators: decoration.runtime,
+                        });
                     }
                 }
                 ast::Stmt::ClassDef(_) => {}
@@ -5919,7 +6267,6 @@ impl<'a> Lowerer<'a> {
             false,
             &capture_names,
             &capture_cells,
-            None,
         )?;
         let body = self.lower_function_body(fid, decl.body);
         self.functions[fid as usize].body = body;
@@ -6017,11 +6364,13 @@ impl<'a> Lowerer<'a> {
         fs: &FuncState,
         out: &mut Vec<HStmt>,
     ) {
-        let target = if fs.is_module {
-            global_assignment_target(stmt, &h)
+        let targets = if fs.is_module {
+            global_assignment_targets(stmt, &h)
+                .into_iter()
                 .filter(|(name, _)| self.mirror_all_globals || self.used_globals.contains(name))
+                .collect::<Vec<_>>()
         } else {
-            None
+            Vec::new()
         };
         let (line, col) = (h.line, h.col);
         let class_global = match &h.kind {
@@ -6056,31 +6405,30 @@ impl<'a> Lowerer<'a> {
                 col,
             });
         }
-        let Some((name, local)) = target else {
-            return;
-        };
-        let ty = match self
-            .functions
-            .get(fs.fid as usize)
-            .and_then(|function| function.locals.get(local as usize))
-        {
-            Some(local) => local.ty,
-            None => Ty::Concrete(Type::Any),
-        };
-        out.push(HStmt {
-            kind: HStmtKind::GlobalSet {
-                module: self.dunder_name.clone(),
-                name,
-                value: HExpr {
-                    kind: HExprKind::Local(local),
-                    ty,
-                    line,
-                    col,
+        for (name, local) in targets {
+            let ty = match self
+                .functions
+                .get(fs.fid as usize)
+                .and_then(|function| function.locals.get(local as usize))
+            {
+                Some(local) => local.ty,
+                None => Ty::Concrete(Type::Any),
+            };
+            out.push(HStmt {
+                kind: HStmtKind::GlobalSet {
+                    module: self.dunder_name.clone(),
+                    name,
+                    value: HExpr {
+                        kind: HExprKind::Local(local),
+                        ty,
+                        line,
+                        col,
+                    },
                 },
-            },
-            line,
-            col,
-        });
+                line,
+                col,
+            });
+        }
     }
 
     fn lower_stmt(&mut self, stmt: &ast::Stmt, fs: &mut FuncState) -> Option<HStmt> {
@@ -7843,16 +8191,28 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> HExpr {
+        // `super()` binds the method's first parameter as the receiver, even
+        // when it is not named `self`/`cls` (CPython uses the code object's
+        // first argument). `__new__(type, ...)` is the common such method.
+        let method_first = self
+            .current_class_method
+            .as_ref()
+            .map(|(_, _, first)| first.clone());
         let receiver_name = if fs.lookup("self").is_some() {
             "self"
-        } else {
+        } else if fs.lookup("cls").is_some() {
             "cls"
+        } else {
+            method_first
+                .as_deref()
+                .filter(|first| !first.is_empty() && fs.lookup(first).is_some())
+                .unwrap_or("self")
         };
         let Some(receiver_local) = fs.lookup(receiver_name) else {
             self.error_at_code(
                 range,
                 codes::NAME,
-                "zero-argument super() is only supported inside a method with a 'self' receiver",
+                "zero-argument super() is only supported inside a method with a receiver parameter",
             );
             return self.error_expr(range);
         };
@@ -7917,7 +8277,7 @@ impl<'a> Lowerer<'a> {
             col,
         } = emission;
         let mut statements = Vec::new();
-        // Bases, in source order, then the metaclass keyword.
+        // Bases, in source order, then every keyword value in source order.
         let mut base_refs = Vec::new();
         for index in &plan.bases {
             let Some(base) = s.bases.get(*index) else {
@@ -7935,10 +8295,52 @@ impl<'a> Lowerer<'a> {
             });
             base_refs.push(temp_ref);
         }
-        let metaclass = match plan.metaclass.and_then(|index| s.keywords.get(index)) {
-            Some(keyword) => {
+        let metaclass = if plan.keywords.is_empty() {
+            // Only `metaclass=` can be present; keep its dedicated temp.
+            match plan.metaclass.and_then(|index| s.keywords.get(index)) {
+                Some(keyword) => {
+                    let value = self.expr(&keyword.value, fs);
+                    let (temp, temp_ref) = self.hidden_temp(fs, "$classmeta", Type::Any);
+                    statements.push(HStmt {
+                        kind: HStmtKind::Assign {
+                            target: temp,
+                            value,
+                        },
+                        line,
+                        col,
+                    });
+                    temp_ref
+                }
+                None => HExpr {
+                    kind: HExprKind::Const(Const::None),
+                    ty: Ty::Concrete(Type::None),
+                    line,
+                    col,
+                },
+            }
+        } else {
+            // CPython evaluates keyword values in source order, including the
+            // metaclass value. Extra keywords (TypedDict's `total=False`,
+            // typing's `_root=True`, ...) are evaluated for their side
+            // effects; Hydro's class protocol has no `__init_subclass__`
+            // keyword channel, and `register_class` rejects the combination
+            // with an explicit metaclass.
+            let mut metaclass = None;
+            for (index, keyword) in s.keywords.iter().enumerate() {
+                let is_metaclass = plan.metaclass == Some(index);
+                if !is_metaclass && !plan.keywords.contains(&index) {
+                    continue;
+                }
+                if keyword.arg.is_none() {
+                    continue;
+                }
                 let value = self.expr(&keyword.value, fs);
-                let (temp, temp_ref) = self.hidden_temp(fs, "$classmeta", Type::Any);
+                let prefix = if is_metaclass {
+                    "$classmeta"
+                } else {
+                    "$classkw"
+                };
+                let (temp, temp_ref) = self.hidden_temp(fs, prefix, Type::Any);
                 statements.push(HStmt {
                     kind: HStmtKind::Assign {
                         target: temp,
@@ -7947,14 +8349,16 @@ impl<'a> Lowerer<'a> {
                     line,
                     col,
                 });
-                temp_ref
+                if is_metaclass {
+                    metaclass = Some(temp_ref);
+                }
             }
-            None => HExpr {
+            metaclass.unwrap_or(HExpr {
                 kind: HExprKind::Const(Const::None),
                 ty: Ty::Concrete(Type::None),
                 line,
                 col,
-            },
+            })
         };
         // The class namespace itself.
         let (ns, ns_ref) = self.hidden_temp(fs, "$classns", Type::Dict);
@@ -7998,16 +8402,16 @@ impl<'a> Lowerer<'a> {
         }
         // Synthesized methods (the dataclass `__init__`) exist before the
         // body runs, so a body definition can still replace them.
-        for (method, fid, method_start, kind) in &plan.methods {
-            if method_start.is_some() {
+        for method in &plan.methods {
+            if method.start.is_some() {
                 continue;
             }
-            let value = self.class_method_binding_value(*fid, *kind, line, col);
+            let value = self.class_method_binding_value(method.function, method.kind, line, col);
             statements.push(HStmt {
                 kind: HStmtKind::SetSubscript {
                     object: ns_ref.clone(),
                     index: HExpr {
-                        kind: HExprKind::Const(Const::Str(method.clone())),
+                        kind: HExprKind::Const(Const::Str(method.name.clone())),
                         ty: Ty::Concrete(Type::Str),
                         line,
                         col,
@@ -8021,8 +8425,17 @@ impl<'a> Lowerer<'a> {
         let methods = plan
             .methods
             .iter()
-            .filter_map(|(_, fid, method_start, kind)| {
-                method_start.as_ref().map(|start| (*start, (*fid, *kind)))
+            .filter_map(|method| {
+                method.start.map(|start| {
+                    (
+                        start,
+                        ClassMethodBinding {
+                            function: method.function,
+                            kind: method.kind,
+                            decorators: method.decorators.clone(),
+                        },
+                    )
+                })
             })
             .collect();
         let previous = fs.class_ns.take();
@@ -8134,6 +8547,13 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Bind one class-body method definition into the runtime namespace.
+    ///
+    /// The stored value is the method's function object (a closure when the
+    /// class was registered inside a function) with every runtime decorator
+    /// applied bottom-up. A single `@property`/`@classmethod`/`@staticmethod`
+    /// is applied as its descriptor factory, exactly like CPython's decorator
+    /// call would; any other decorator expression is evaluated in the class
+    /// namespace and called with the value produced below it.
     fn lower_class_body_function(
         &mut self,
         name: &str,
@@ -8145,12 +8565,14 @@ impl<'a> Lowerer<'a> {
         let (ns, entry) = fs
             .class_ns
             .as_ref()
-            .map(|state| (state.ns, state.methods.get(&definition_start).copied()))?;
+            .map(|state| (state.ns, state.methods.get(&definition_start).cloned()))?;
         // `@overload` stubs and property accessors are type-only markers and
         // bind nothing (the static path skips them the same way).
-        let (fid, kind) = entry?;
-        let value = self.class_method_binding_value(fid, kind, line, col);
-        Some(HStmt {
+        let entry = entry?;
+        let mut statements = Vec::new();
+        let value =
+            self.class_method_value(&entry, fs, &mut statements, definition_start, line, col)?;
+        statements.push(HStmt {
             kind: HStmtKind::SetSubscript {
                 object: HExpr {
                     kind: HExprKind::Local(ns),
@@ -8168,7 +8590,135 @@ impl<'a> Lowerer<'a> {
             },
             line,
             col,
-        })
+        });
+        Some(class_namespace_block(statements, line, col))
+    }
+
+    /// Build the value a class namespace receives for one method: its function
+    /// (or closure) with the runtime decorators applied bottom-up.
+    ///
+    /// CPython evaluates the decorator expressions top-down when the `def`
+    /// executes, before the function object exists, then applies the resulting
+    /// callables bottom-up (`@a @b def f` is `a(b(f))`). A
+    /// `@property`/`@classmethod`/`@staticmethod` is a descriptor factory the
+    /// compiler calls directly, so it needs no runtime lookup; every other
+    /// decorator expression is evaluated now and parked in a hidden local.
+    fn class_method_value(
+        &mut self,
+        binding: &ClassMethodBinding,
+        fs: &mut FuncState,
+        out: &mut Vec<HStmt>,
+        definition_start: u32,
+        line: u32,
+        col: u32,
+    ) -> Option<HExpr> {
+        // Resolve the closure captures first: a missing name aborts before any
+        // decorator statement is emitted.
+        let captures = self.method_captures.get(&binding.function).cloned();
+        let mut capture_locals = Vec::new();
+        if let Some(captures) = &captures {
+            capture_locals.reserve(captures.len());
+            for capture in captures {
+                let Some(local) = fs.lookup(capture) else {
+                    self.error_at_code(
+                        TextRange::empty(definition_start.into()),
+                        codes::NAME,
+                        format!("name '{capture}' is not defined"),
+                    );
+                    return None;
+                };
+                capture_locals.push(local);
+            }
+        }
+        // CPython evaluates the decorator expressions top-down, before the
+        // function object exists.
+        let mut evaluated: Vec<Option<LocalId>> = Vec::with_capacity(binding.decorators.len());
+        for decorator in &binding.decorators {
+            if decorator_binding_kind(decorator).is_some() {
+                evaluated.push(None);
+                continue;
+            }
+            let (decorator_line, decorator_col) = self.span(decorator.range());
+            let callee = self.decorator_expr(decorator, fs);
+            let (temp, _) = self.hidden_temp(fs, "$decor", Type::Any);
+            out.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: temp,
+                    value: callee,
+                },
+                line: decorator_line,
+                col: decorator_col,
+            });
+            evaluated.push(Some(temp));
+        }
+        let mut value = if captures.is_some() {
+            let (temp, temp_ref) = self.hidden_temp(fs, "$method", Type::Any);
+            out.push(HStmt {
+                kind: HStmtKind::Closure {
+                    target: temp,
+                    function: self.fid_base + binding.function,
+                    captures: capture_locals,
+                },
+                line,
+                col,
+            });
+            temp_ref
+        } else {
+            HExpr {
+                kind: HExprKind::FunctionRef(self.fid_base + binding.function),
+                ty: Ty::Concrete(Type::Function),
+                line,
+                col,
+            }
+        };
+        if binding.decorators.is_empty() {
+            return Some(self.apply_binding_kind(value, binding.kind, line, col));
+        }
+        for (decorator, temp) in binding.decorators.iter().zip(evaluated).rev() {
+            value = match decorator_binding_kind(decorator) {
+                Some(kind) => self.apply_binding_kind(value, kind, line, col),
+                None => {
+                    let callee = HExpr {
+                        kind: HExprKind::Local(
+                            temp.expect("non-binding decorators are evaluated first"),
+                        ),
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    };
+                    HExpr {
+                        kind: HExprKind::IndirectCall {
+                            callee: Box::new(callee),
+                            args: vec![value],
+                            star: None,
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
+                }
+            };
+        }
+        Some(value)
+    }
+
+    /// Wrap `value` in the descriptor factory selected by a binding decorator.
+    fn apply_binding_kind(&mut self, value: HExpr, kind: MethodKind, line: u32, col: u32) -> HExpr {
+        let builtin = match kind {
+            MethodKind::Normal => return value,
+            MethodKind::Classmethod => Builtin::Classmethod,
+            MethodKind::Staticmethod => Builtin::Staticmethod,
+            MethodKind::Property => Builtin::Property,
+        };
+        HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Builtin(builtin),
+                args: vec![value],
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        }
     }
 
     /// Bind `import ...` names into the class namespace.
@@ -8216,11 +8766,9 @@ impl<'a> Lowerer<'a> {
         let mut ok = true;
         for alias in &s.names {
             if alias.name.as_str() == "*" {
-                self.error_at_code(
-                    alias.range,
-                    codes::UNSUPPORTED,
-                    "'import *' inside a class body is not supported",
-                );
+                // Rejected during import collection: `import *` is only
+                // allowed at module level, and a class body is not module
+                // level. Do not report a second diagnostic here.
                 ok = false;
                 continue;
             }
@@ -8328,9 +8876,11 @@ impl<'a> Lowerer<'a> {
     /// Lower a `class` statement: bases and `metaclass=` in source order,
     /// then the method functions and class attribute values of the body.
     ///
-    /// Runtime decorators are applied by [`Self::lower_class_definition`],
-    /// which wraps this statement; a class with only compile-time decorators
-    /// (or none) lowers directly to [`HStmtKind::ClassDef`].
+    /// A class directly in the module body was registered by
+    /// [`Self::register_module_definitions`]. A class inside a function (or a
+    /// method) is registered here, when its statement runs, because its
+    /// methods may close over the enclosing locals. A class inside another
+    /// class body is stored in that body's namespace.
     fn lower_class_stmt(
         &mut self,
         s: &ast::StmtClassDef,
@@ -8338,23 +8888,24 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
-        let Some(plan) = self
-            .class_defs
-            .get(&(u32::from(s.range.start()) as usize))
-            .cloned()
-        else {
-            self.error_at(
-                s.range,
-                "class definitions are only supported directly at module level",
-            );
-            return None;
+        let start = u32::from(s.range.start()) as usize;
+        let plan = match self.class_defs.get(&start).cloned() {
+            Some(plan) => plan,
+            None if fs.class_ns.is_none() && !fs.is_module => {
+                let plan = self.register_nested_class_in_function(s, fs);
+                self.class_defs.insert(start, plan.clone());
+                plan
+            }
+            None => {
+                self.error_at(
+                    s.range,
+                    "class definitions are only supported directly at module level",
+                );
+                return None;
+            }
         };
         if fs.class_ns.is_some() {
             return self.lower_class_in_class_body(s, &plan, fs, line, col);
-        }
-        if !fs.is_module {
-            self.error_at(s.range, "nested class definitions are not supported yet");
-            return None;
         }
         let name = s.name.to_string();
         let Some(target) = fs.lookup(&name) else {
@@ -8366,21 +8917,120 @@ impl<'a> Lowerer<'a> {
             );
             return None;
         };
-        if plan.dynamic {
-            return self.lower_dynamic_class_stmt(s, &plan, fs, line, col);
+        if fs.is_module {
+            if plan.dynamic {
+                return self.lower_dynamic_class_stmt(s, &plan, fs, line, col);
+            }
+            return self.lower_static_class_def(
+                fs,
+                ClassEmission {
+                    class: s,
+                    plan: &plan,
+                    name: &name,
+                    target,
+                    mirror_globals: false,
+                    line,
+                    col,
+                },
+            );
         }
-        self.lower_static_class_def(
+        self.lower_nested_class_stmt(s, &plan, fs, target, line, col)
+    }
+
+    /// Register a class statement that appears inside a function or a method.
+    ///
+    /// The enclosing scope's locals become the capture scope of the class
+    /// methods, and the body always executes through the runtime namespace
+    /// path: that is what lets a method close over an enclosing local and lets
+    /// the runtime build a decorated method value in CPython order. The method
+    /// bodies are lowered here because
+    /// [`Self::lower_definition_bodies`] only walks module-level definitions.
+    fn register_nested_class_in_function(
+        &mut self,
+        s: &ast::StmtClassDef,
+        fs: &FuncState,
+    ) -> ClassPlan {
+        let scope: HashMap<String, bool> = fs
+            .locals
+            .iter()
+            .map(|(name, local)| (name.clone(), fs.is_cell(*local)))
+            .collect();
+        let saved_scope = self.method_capture_scope.replace(scope);
+        let plan = self.register_class(s);
+        self.method_capture_scope = saved_scope;
+        // Lower the method bodies of this class and of any class nested in its
+        // body now; the module-level pass never reaches them.
+        self.lower_definition_bodies(&s.body, &HashMap::new());
+        plan
+    }
+
+    /// Lower a class statement that runs inside a function or a method.
+    ///
+    /// The class object is built in the statement's local slot, then the class
+    /// decorators are applied bottom-up. A class bound to a closure cell is
+    /// stored through the cell, like any other assignment in that scope.
+    fn lower_nested_class_stmt(
+        &mut self,
+        s: &ast::StmtClassDef,
+        plan: &ClassPlan,
+        fs: &mut FuncState,
+        target: LocalId,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let name = s.name.to_string();
+        let cell_bound = fs.is_cell(target);
+        let bind_target = if cell_bound {
+            self.hidden_temp(fs, "$class", Type::Any).0
+        } else {
+            target
+        };
+        let mut statements = self.lower_dynamic_class_value(
             fs,
             ClassEmission {
                 class: s,
-                plan: &plan,
+                plan,
                 name: &name,
-                target,
+                target: bind_target,
                 mirror_globals: false,
                 line,
                 col,
             },
-        )
+        );
+        let decorators: Vec<&ast::Expr> = plan
+            .decorators
+            .iter()
+            .filter_map(|index| s.decorator_list.get(*index))
+            .collect();
+        if !decorators.is_empty() {
+            let temps = self.lower_decorator_temps(&decorators, fs, &mut statements);
+            self.apply_decorator_temps(&temps, bind_target, fs, &mut statements, line, col);
+        }
+        if cell_bound {
+            let ty = Ty::Concrete(Type::Any);
+            statements.push(HStmt {
+                kind: HStmtKind::CellAssign {
+                    target,
+                    value: HExpr {
+                        kind: HExprKind::Local(bind_target),
+                        ty,
+                        line,
+                        col,
+                    },
+                },
+                line,
+                col,
+            });
+        }
+        Some(HStmt {
+            kind: HStmtKind::If {
+                cond: self.bool_const(true, line, col),
+                then_body: statements,
+                else_body: Vec::new(),
+            },
+            line,
+            col,
+        })
     }
 
     /// Build the static `ClassDef` statement for a class whose body is fully
@@ -8405,14 +9055,20 @@ impl<'a> Lowerer<'a> {
             .filter_map(|index| s.bases.get(*index))
             .map(|base| self.expr(base, fs))
             .collect();
-        let metaclass = plan
+        let mut metaclass_expr = plan
             .metaclass
             .and_then(|index| s.keywords.get(index))
             .map(|keyword| self.expr(&keyword.value, fs));
         let methods: Vec<(String, FunctionId, MethodKind)> = plan
             .methods
             .iter()
-            .map(|(name, function, _, kind)| (name.clone(), self.fid_base + *function, *kind))
+            .map(|method| {
+                (
+                    method.name.clone(),
+                    self.fid_base + method.function,
+                    method.kind,
+                )
+            })
             .collect();
         let attributes = {
             self.class_attr_scopes.push(HashMap::new());
@@ -8453,18 +9109,110 @@ impl<'a> Lowerer<'a> {
             self.class_attr_scopes.pop();
             attributes
         };
-        Some(HStmt {
+        if plan.keywords.is_empty() {
+            return Some(HStmt {
+                kind: HStmtKind::ClassDef {
+                    target,
+                    name: name.to_string(),
+                    bases,
+                    metaclass: metaclass_expr,
+                    methods,
+                    attributes,
+                },
+                line,
+                col,
+            });
+        }
+        // A header with extra keywords runs through a statement block so the
+        // operand evaluation order is CPython's: every base expression, then
+        // every keyword value in source order. The class object is built from
+        // the parked values afterwards (attributes still evaluate inside the
+        // class statement, after the header). The wrapper keeps the sequence a
+        // single HIR statement.
+        let mut statements = Vec::new();
+        let mut base_refs = Vec::with_capacity(bases.len());
+        for value in bases {
+            let (temp, temp_ref) = self.hidden_temp(fs, "$classbase", Type::Any);
+            statements.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: temp,
+                    value,
+                },
+                line,
+                col,
+            });
+            base_refs.push(temp_ref);
+        }
+        let mut metaclass = None;
+        for (index, keyword) in s.keywords.iter().enumerate() {
+            let is_metaclass = plan.metaclass == Some(index);
+            if !is_metaclass && !plan.keywords.contains(&index) {
+                continue;
+            }
+            if keyword.arg.is_none() {
+                continue;
+            }
+            let value = if is_metaclass {
+                metaclass_expr
+                    .take()
+                    .unwrap_or_else(|| self.error_expr(keyword.range))
+            } else {
+                self.expr(&keyword.value, fs)
+            };
+            let prefix = if is_metaclass {
+                "$classmeta"
+            } else {
+                "$classkw"
+            };
+            let (temp, temp_ref) = self.hidden_temp(fs, prefix, Type::Any);
+            statements.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: temp,
+                    value,
+                },
+                line,
+                col,
+            });
+            if is_metaclass {
+                metaclass = Some(temp_ref);
+            }
+        }
+        statements.push(HStmt {
             kind: HStmtKind::ClassDef {
                 target,
                 name: name.to_string(),
-                bases,
+                bases: base_refs,
                 metaclass,
                 methods,
                 attributes,
             },
             line,
             col,
-        })
+        });
+        // `push_lowered_stmt` mirrors a bare `ClassDef`; the wrapper hides it,
+        // so a module-level class mirrors its own binding here.
+        if fs.is_module && (self.mirror_all_globals || self.used_globals.contains(name)) {
+            let ty = self.functions[fs.fid as usize]
+                .locals
+                .get(target as usize)
+                .map(|local| local.ty)
+                .unwrap_or(Ty::Concrete(Type::Any));
+            statements.push(HStmt {
+                kind: HStmtKind::GlobalSet {
+                    module: self.dunder_name.clone(),
+                    name: name.to_string(),
+                    value: HExpr {
+                        kind: HExprKind::Local(target),
+                        ty,
+                        line,
+                        col,
+                    },
+                },
+                line,
+                col,
+            });
+        }
+        Some(if_true_block(statements, line, col))
     }
 
     /// Lower a class definition nested inside another class body.
@@ -8929,38 +9677,47 @@ impl<'a> Lowerer<'a> {
         });
         for target in &s.targets {
             let kind = self.lower_store(target, temp_ref.clone(), fs)?;
-            then_body.push(HStmt { kind, line, col });
             // Module-level names are mirrored into the global table after
             // their local assignment, exactly like a single-target `Assign`
             // (see `push_lowered_stmt`); importers read them from there.
-            if !fs.is_module {
-                continue;
-            }
-            let ast::Expr::Name(name) = target else {
-                continue;
-            };
-            let name_text = name.id.as_str();
-            if !self.mirror_all_globals && !self.used_globals.contains(name_text) {
-                continue;
-            }
-            let Some(local) = fs.lookup(name_text) else {
-                continue;
-            };
-            let ty = self.functions[fs.fid as usize].locals[local as usize].ty;
-            then_body.push(HStmt {
-                kind: HStmtKind::GlobalSet {
-                    module: self.dunder_name.clone(),
-                    name: name_text.to_string(),
-                    value: HExpr {
-                        kind: HExprKind::Local(local),
-                        ty,
-                        line,
-                        col,
+            // Tuple/list unpacking targets bind several names at once.
+            let stores = if fs.is_module {
+                match &kind {
+                    HStmtKind::Assign { target: local, .. } => match target {
+                        ast::Expr::Name(name) => vec![(name.id.to_string(), *local)],
+                        _ => Vec::new(),
                     },
-                },
-                line,
-                col,
-            });
+                    HStmtKind::Unpack { targets, .. } => {
+                        let mut bound = Vec::new();
+                        collect_unpack_binding_names(target, targets, &mut bound);
+                        bound
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            then_body.push(HStmt { kind, line, col });
+            for (name, local) in stores {
+                if !self.mirror_all_globals && !self.used_globals.contains(&name) {
+                    continue;
+                }
+                let ty = self.functions[fs.fid as usize].locals[local as usize].ty;
+                then_body.push(HStmt {
+                    kind: HStmtKind::GlobalSet {
+                        module: self.dunder_name.clone(),
+                        name,
+                        value: HExpr {
+                            kind: HExprKind::Local(local),
+                            ty,
+                            line,
+                            col,
+                        },
+                    },
+                    line,
+                    col,
+                });
+            }
         }
         Some(HStmt {
             kind: HStmtKind::If {
@@ -8982,9 +9739,9 @@ impl<'a> Lowerer<'a> {
     ///
     /// Nested containers recurse, and attribute/subscript elements lower their
     /// receiver expressions here but evaluate them at binding time in codegen.
-    /// One starred name/attribute/subscript element (`a, *rest = value`) is
-    /// allowed at this level; it receives a fresh list of the remaining
-    /// elements. Starred elements are rejected inside a nested container.
+    /// Each sequence level allows one starred name/attribute/subscript element
+    /// (`a, *rest = value`, `(a, *b), c = value`); it receives a fresh list of
+    /// the elements the plain targets at that level did not consume.
     fn unpack_targets(
         &mut self,
         target: &ast::Expr,
@@ -8998,27 +9755,20 @@ impl<'a> Lowerer<'a> {
                 return None;
             }
         };
-        self.unpack_elements(elems, fs, true)
+        self.unpack_elements(elems, fs)
     }
 
     fn unpack_elements(
         &mut self,
         elems: &[ast::Expr],
         fs: &mut FuncState,
-        allow_star: bool,
     ) -> Option<Vec<HUnpackTarget>> {
         let mut targets = Vec::with_capacity(elems.len());
         let mut ok = true;
         let mut starred = false;
         for elem in elems {
             if let ast::Expr::Starred(starred_elem) = elem {
-                if !allow_star {
-                    self.error_at(
-                        starred_elem.range,
-                        "starred unpacking cannot appear inside a nested target",
-                    );
-                    ok = false;
-                } else if starred {
+                if starred {
                     self.error_at(
                         starred_elem.range,
                         "multiple starred unpacking targets are not allowed",
@@ -9040,7 +9790,7 @@ impl<'a> Lowerer<'a> {
                         ast::Expr::List(l) => &l.elts,
                         _ => unreachable!("container checked above"),
                     };
-                    match self.unpack_elements(nested, fs, false) {
+                    match self.unpack_elements(nested, fs) {
                         Some(nested) => targets.push(HUnpackTarget::Nested(nested)),
                         None => ok = false,
                     }
@@ -9176,6 +9926,39 @@ impl<'a> Lowerer<'a> {
         !self.runtime_function_decorators(decorators).is_empty()
     }
 
+    /// Evaluate a decorator expression to its callable value.
+    ///
+    /// A bare name that is a statically linked module function resolves to its
+    /// function value. In the module body an ordinary name read would lower to
+    /// a local slot, and function definitions never assign that slot (they are
+    /// declarations), so `@register` would otherwise read an uninitialised
+    /// local. Locals and class-namespace bindings still shadow the function,
+    /// matching Python's lookup order.
+    fn decorator_expr(&mut self, decorator: &ast::Expr, fs: &mut FuncState) -> HExpr {
+        if let ast::Expr::Name(name) = decorator {
+            let text = name.id.as_str();
+            let bound_in_class = fs
+                .class_ns
+                .as_ref()
+                .is_some_and(|state| state.bindings.contains(text));
+            let shadowed = (!fs.is_module && fs.lookup(text).is_some())
+                || fs.is_global(text)
+                || self.decorated_functions.contains_key(text);
+            if !bound_in_class && !shadowed {
+                if let Some(&id) = self.fn_ids.get(text) {
+                    let (line, col) = self.span(name.range);
+                    return HExpr {
+                        kind: HExprKind::FunctionRef(id),
+                        ty: Ty::Concrete(Type::Function),
+                        line,
+                        col,
+                    };
+                }
+            }
+        }
+        self.expr(decorator, fs)
+    }
+
     /// Evaluate the decorator expressions top-down, storing each callable in a
     /// hidden local. CPython evaluates them before the function/class object
     /// is created.
@@ -9189,7 +9972,7 @@ impl<'a> Lowerer<'a> {
         for decorator in decorators {
             let (line, col) = self.span(decorator.range());
             let (local, _) = self.hidden_temp(fs, "$decor", Type::Any);
-            let value = self.expr(decorator, fs);
+            let value = self.decorator_expr(decorator, fs);
             out.push(HStmt {
                 kind: HStmtKind::Assign {
                     target: local,
@@ -9783,6 +10566,7 @@ impl<'a> Lowerer<'a> {
             _ => return false,
         };
         let mut ok = true;
+        let mut starred = false;
         for elem in elems {
             match elem {
                 ast::Expr::Name(_) | ast::Expr::Attribute(_) => {}
@@ -9802,7 +10586,15 @@ impl<'a> Lowerer<'a> {
                     }
                 }
                 ast::Expr::Starred(s) => {
-                    // One trailing star is allowed, as in normal unpacking.
+                    // One star per sequence level, as in normal unpacking.
+                    if starred {
+                        self.error_at(
+                            s.range,
+                            "multiple starred unpacking targets are not allowed",
+                        );
+                        ok = false;
+                    }
+                    starred = true;
                     if !matches!(
                         &*s.value,
                         ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Subscript(_)
@@ -10910,12 +11702,18 @@ impl<'a> Lowerer<'a> {
         self.class_names.contains(name) || self.imported_user_globals.contains_key(name)
     }
 
-    /// Lowers `raise`, `raise X(...)`, `raise ... from cause`.
+    /// Lowers `raise`, `raise X(...)`, `raise <expr>`, `raise ... from cause`.
     ///
     /// Built-in exception kinds keep their tag-based lowering. A user or
-    /// imported exception class has no runtime tag, so it lowers to
-    /// `RuntimeError` with message `"<Name>: <message>"`; class identity is
-    /// lost, so handlers are approximate. The `from` cause is kept.
+    /// imported exception class has no runtime tag, so the class-only and
+    /// one-message forms lower to `RuntimeError` with message
+    /// `"<Name>: <message>"`; class identity is lost there, so handlers are
+    /// approximate. Every other expression — the caught exception value of
+    /// `raise e`, a constructor call with several positional arguments, a
+    /// keyword constructor, an arbitrary instance — is evaluated normally and
+    /// raised as a value, preserving the exception object. A bare `raise`
+    /// re-raises the pending exception, and the `from` cause is always
+    /// evaluated after the raised value.
     fn lower_raise(
         &mut self,
         s: &ast::StmtRaise,
@@ -10933,6 +11731,7 @@ impl<'a> Lowerer<'a> {
         }
 
         let (exc, msg) = match &s.exc {
+            // Bare `raise`: re-raise the pending exception unchanged.
             None => (None, None),
             Some(exc_expr) => match &**exc_expr {
                 ast::Expr::Name(n) => match ExcKind::from_name(n.id.as_str()) {
@@ -10941,13 +11740,16 @@ impl<'a> Lowerer<'a> {
                         Some(ExcKind::RuntimeError),
                         Some(self.user_exception_message(n.id.as_str(), None, line, col)),
                     ),
+                    // Any other name denotes an exception value (`raise e` in
+                    // an `except` handler): raise the object it evaluates to.
                     None => {
-                        self.error_at_code(
-                            n.range,
-                            codes::NAME,
-                            format!("unknown exception type '{}'", n.id),
-                        );
-                        return None;
+                        return Some(self.raise_value_stmt(
+                            exc_expr,
+                            s.cause.as_deref(),
+                            fs,
+                            line,
+                            col,
+                        ));
                     }
                 },
                 // `raise module.Class`: a class imported from another user
@@ -10955,11 +11757,15 @@ impl<'a> Lowerer<'a> {
                 // `RuntimeError` fallback carries the dotted name.
                 ast::Expr::Attribute(_) => {
                     let Some(name) = dotted_expr_name(exc_expr) else {
-                        self.error_at(
-                            exc_expr.range(),
-                            "raise only supports exception names and classes",
-                        );
-                        return None;
+                        // A non-constant attribute (`raise self.err`) is an
+                        // exception value, not a dotted class name.
+                        return Some(self.raise_value_stmt(
+                            exc_expr,
+                            s.cause.as_deref(),
+                            fs,
+                            line,
+                            col,
+                        ));
                     };
                     match ExcKind::from_name(&name) {
                         Some(kind) => (Some(kind), None),
@@ -10976,27 +11782,71 @@ impl<'a> Lowerer<'a> {
                         // exception object through the real constructor and
                         // raise that value. The runtime validates the keyword
                         // set (unsupported names raise `TypeError`).
-                        return self.lower_raise_call_with_keywords(
-                            call,
+                        let value = self.raise_constructor_value(call, fs, line, col);
+                        return Some(self.raise_value_expr(
+                            value,
                             s.cause.as_deref(),
                             fs,
                             line,
                             col,
-                        );
+                        ));
                     }
-                    if call.args.len() != 1 {
-                        self.error_at_code(
-                            call.range,
-                            codes::CALL,
-                            "raise with a message requires exactly one argument",
-                        );
-                        return None;
+                    if call.args.len() > 1 || call_has_dynamic_arguments(call) {
+                        // A constructor with several positional arguments (or
+                        // a starred one) has no tag-only form: run the real
+                        // constructor so the exception object keeps all of its
+                        // arguments.
+                        let value = self.raise_constructor_value(call, fs, line, col);
+                        return Some(self.raise_value_expr(
+                            value,
+                            s.cause.as_deref(),
+                            fs,
+                            line,
+                            col,
+                        ));
                     }
-                    let message = self.expr(&call.args[0], fs);
-                    match &*call.func {
-                        ast::Expr::Name(n) => match ExcKind::from_name(n.id.as_str()) {
-                            Some(kind) => (Some(kind), Some(message)),
-                            None if self.is_user_exception_name(n.id.as_str()) => (
+                    if call.args.is_empty() {
+                        // `raise ValueError()`: a built-in class with no
+                        // message keeps its tag; any other constructor builds
+                        // an exception value.
+                        let kind = match &*call.func {
+                            ast::Expr::Name(n) => ExcKind::from_name(n.id.as_str()),
+                            ast::Expr::Attribute(_) => dotted_expr_name(&call.func)
+                                .and_then(|name| ExcKind::from_name(&name)),
+                            _ => None,
+                        };
+                        if let Some(kind) = kind {
+                            let cause = s.cause.as_ref().map(|c| self.expr(c, fs));
+                            return Some(HStmt {
+                                kind: HStmtKind::Raise {
+                                    exc: Some(kind),
+                                    msg: None,
+                                    cause,
+                                },
+                                line,
+                                col,
+                            });
+                        }
+                        let value = self.raise_constructor_value(call, fs, line, col);
+                        return Some(self.raise_value_expr(
+                            value,
+                            s.cause.as_deref(),
+                            fs,
+                            line,
+                            col,
+                        ));
+                    }
+                    // Exactly one positional message: the tag-only form for a
+                    // built-in class and the documented fallback for a user or
+                    // imported class. Any other callee is an arbitrary
+                    // exception constructor, so the value form is used.
+                    if let ast::Expr::Name(n) = &*call.func {
+                        if let Some(kind) = ExcKind::from_name(n.id.as_str()) {
+                            let message = self.expr(&call.args[0], fs);
+                            (Some(kind), Some(message))
+                        } else if self.is_user_exception_name(n.id.as_str()) {
+                            let message = self.expr(&call.args[0], fs);
+                            (
                                 Some(ExcKind::RuntimeError),
                                 Some(self.user_exception_message(
                                     n.id.as_str(),
@@ -11004,52 +11854,53 @@ impl<'a> Lowerer<'a> {
                                     line,
                                     col,
                                 )),
+                            )
+                        } else {
+                            let value = self.raise_constructor_value(call, fs, line, col);
+                            return Some(self.raise_value_expr(
+                                value,
+                                s.cause.as_deref(),
+                                fs,
+                                line,
+                                col,
+                            ));
+                        }
+                    } else if let ast::Expr::Attribute(_) = &*call.func {
+                        let Some(name) = dotted_expr_name(&call.func) else {
+                            // `raise err.args[0](...)`-style dynamic callee:
+                            // run the call and raise its result.
+                            let value = self.raise_constructor_value(call, fs, line, col);
+                            return Some(self.raise_value_expr(
+                                value,
+                                s.cause.as_deref(),
+                                fs,
+                                line,
+                                col,
+                            ));
+                        };
+                        let message = self.expr(&call.args[0], fs);
+                        match ExcKind::from_name(&name) {
+                            Some(kind) => (Some(kind), Some(message)),
+                            None => (
+                                Some(ExcKind::RuntimeError),
+                                Some(self.user_exception_message(&name, Some(message), line, col)),
                             ),
-                            None => {
-                                self.error_at_code(
-                                    n.range,
-                                    codes::NAME,
-                                    format!("unknown exception type '{}'", n.id),
-                                );
-                                return None;
-                            }
-                        },
-                        ast::Expr::Attribute(_) => {
-                            let Some(name) = dotted_expr_name(&call.func) else {
-                                self.error_at(
-                                    call.func.range(),
-                                    "raise only supports exception names and classes",
-                                );
-                                return None;
-                            };
-                            match ExcKind::from_name(&name) {
-                                Some(kind) => (Some(kind), Some(message)),
-                                None => (
-                                    Some(ExcKind::RuntimeError),
-                                    Some(self.user_exception_message(
-                                        &name,
-                                        Some(message),
-                                        line,
-                                        col,
-                                    )),
-                                ),
-                            }
                         }
-                        _ => {
-                            self.error_at(
-                                call.func.range(),
-                                "raise only supports exception names and classes",
-                            );
-                            return None;
-                        }
+                    } else {
+                        let value = self.raise_constructor_value(call, fs, line, col);
+                        return Some(self.raise_value_expr(
+                            value,
+                            s.cause.as_deref(),
+                            fs,
+                            line,
+                            col,
+                        ));
                     }
                 }
+                // `raise <arbitrary expression>`: a subscript, a conditional
+                // that yields an exception, and so on.
                 other => {
-                    self.error_at(
-                        other.range(),
-                        "raise only supports exception names and classes",
-                    );
-                    return None;
+                    return Some(self.raise_value_stmt(other, s.cause.as_deref(), fs, line, col));
                 }
             },
         };
@@ -11063,64 +11914,45 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Lowers `raise ExcKind(args..., keyword=value, ...)` and
-    /// `raise UserError(args..., keyword=value, ...)`.
+    /// Lowers `raise <constructor>(...)` to the exception value it builds.
     ///
-    /// The exception constructor runs as a normal call so argument and
-    /// keyword operands keep Python's evaluation order; the constructed value
-    /// is then raised through the `raise value` form. Built-in exception
-    /// classes route through [`Self::exception_class_call`], whose runtime
-    /// constructor accepts only the class's documented keywords.
-    fn lower_raise_call_with_keywords(
+    /// The constructor runs as a normal call so positional, keyword and
+    /// starred arguments keep Python's evaluation order and the resulting
+    /// object keeps its Python class identity and every argument. Built-in
+    /// exception classes route through [`Self::exception_class_call`], whose
+    /// runtime constructor accepts only the class's documented keywords.
+    fn raise_constructor_value(
         &mut self,
         call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let kind = match &*call.func {
+            ast::Expr::Name(n) => ExcKind::from_class_name(n.id.as_str()),
+            ast::Expr::Attribute(_) => {
+                dotted_expr_name(&call.func).and_then(|name| ExcKind::from_name(&name))
+            }
+            _ => None,
+        };
+        match kind {
+            Some(kind) => self.exception_class_call(kind, call, fs, line, col),
+            None => self.call_expr(call, fs, line, col),
+        }
+    }
+
+    /// Builds `raise <value> from <cause>` for an already-evaluated exception
+    /// value; Python evaluates the value before the explicit cause.
+    fn raise_value_expr(
+        &mut self,
+        value: HExpr,
         cause: Option<&ast::Expr>,
         fs: &mut FuncState,
         line: u32,
         col: u32,
-    ) -> Option<HStmt> {
-        let value = match &*call.func {
-            ast::Expr::Name(n) => {
-                if let Some(kind) = ExcKind::from_class_name(n.id.as_str()) {
-                    self.exception_class_call(kind, call, fs, line, col)
-                } else if self.is_user_exception_name(n.id.as_str()) {
-                    self.call_expr(call, fs, line, col)
-                } else {
-                    self.error_at_code(
-                        n.range,
-                        codes::NAME,
-                        format!("unknown exception type '{}'", n.id),
-                    );
-                    return None;
-                }
-            }
-            ast::Expr::Attribute(_) => {
-                let Some(name) = dotted_expr_name(&call.func) else {
-                    self.error_at(
-                        call.func.range(),
-                        "raise only supports exception names and classes",
-                    );
-                    return None;
-                };
-                match ExcKind::from_name(&name) {
-                    Some(kind) => self.exception_class_call(kind, call, fs, line, col),
-                    // An imported exception class keeps its Python class
-                    // identity through the ordinary call path, including its
-                    // keyword arguments.
-                    None => self.call_expr(call, fs, line, col),
-                }
-            }
-            _ => {
-                self.error_at(
-                    call.func.range(),
-                    "raise only supports exception names and classes",
-                );
-                return None;
-            }
-        };
-        // Python evaluates the raised exception before the explicit cause.
+    ) -> HStmt {
         let cause = cause.map(|c| self.expr(c, fs));
-        Some(HStmt {
+        HStmt {
             kind: HStmtKind::Raise {
                 exc: None,
                 msg: Some(value),
@@ -11128,7 +11960,21 @@ impl<'a> Lowerer<'a> {
             },
             line,
             col,
-        })
+        }
+    }
+
+    /// Lowers `raise <expr>` for an arbitrary expression that yields the
+    /// exception object.
+    fn raise_value_stmt(
+        &mut self,
+        expr: &ast::Expr,
+        cause: Option<&ast::Expr>,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HStmt {
+        let value = self.expr(expr, fs);
+        self.raise_value_expr(value, cause, fs, line, col)
     }
 
     /// Builds the documented fallback message of `raise <user class>(message)`:
@@ -12193,6 +13039,19 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
+                } else if is_attribute_only_builtin(name) {
+                    // `setattr`/`delattr` live in the `builtins` module table
+                    // (the runtime implements them there) but are also
+                    // available unqualified, like every other builtin.
+                    HExpr {
+                        kind: HExprKind::ModuleAttr {
+                            module: "builtins".to_string(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Function),
+                        line,
+                        col,
+                    }
                 } else if self.global_names.contains(name) {
                     // Module-level value read from a function. The module body
                     // mirrors every assignment into the runtime global table,
@@ -12280,6 +13139,27 @@ impl<'a> Lowerer<'a> {
                     HExpr {
                         kind: HExprKind::ModuleAttr {
                             module: "builtins".to_string(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
+                } else if self.dynamic_module_globals
+                    && (fs.is_module || !self.module_local_names.contains(name))
+                {
+                    // This module writes its namespace at runtime through
+                    // `globals()`/`vars()`, so the name may exist even though
+                    // no static binding defines it. Read it from the module's
+                    // global table; a missing value raises at runtime, exactly
+                    // like CPython. A module local a function cannot see stays
+                    // a compile-time scope error (the check above), and a
+                    // module that never manipulates its namespace keeps
+                    // diagnosing typos.
+                    self.used_globals.insert(name.to_string());
+                    HExpr {
+                        kind: HExprKind::GlobalGet {
+                            module: self.dunder_name.clone(),
                             name: name.to_string(),
                         },
                         ty: Ty::Concrete(Type::Any),
@@ -12596,6 +13476,9 @@ impl<'a> Lowerer<'a> {
                 self.error_expr(e.range())
             }
             ast::Expr::Tuple(t) => {
+                if t.elts.iter().any(|e| matches!(e, ast::Expr::Starred(_))) {
+                    return self.tuple_with_star(&t.elts, fs, line, col);
+                }
                 let mut elems = Vec::with_capacity(t.elts.len());
                 for elem in &t.elts {
                     elems.push(self.expr(elem, fs));
@@ -12624,6 +13507,9 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Expr::Set(s) => {
+                if s.elts.iter().any(|e| matches!(e, ast::Expr::Starred(_))) {
+                    return self.set_with_star(&s.elts, fs, line, col);
+                }
                 let mut elems = Vec::with_capacity(s.elts.len());
                 for elem in &s.elts {
                     elems.push(self.expr(elem, fs));
@@ -13393,6 +14279,157 @@ impl<'a> Lowerer<'a> {
                 rhs: Box::new(right),
             },
             ty: Ty::Concrete(Type::List),
+            line,
+            col,
+        }
+    }
+
+    /// Lowers `(a, *xs, b)` into left-to-right tuple concatenations: each
+    /// plain run is a tuple literal and each starred operand a `+` operand.
+    /// A display accepts any iterable after `*`, so the operand is copied
+    /// through `tuple(...)`; tuple concatenation only accepts tuples. A
+    /// leading `*` starts from an empty tuple, copying the operand.
+    fn tuple_with_star(
+        &mut self,
+        elts: &[ast::Expr],
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let mut result: Option<HExpr> = None;
+        let mut pending: Vec<HExpr> = Vec::new();
+        for elem in elts {
+            if let ast::Expr::Starred(starred) = elem {
+                self.flush_tuple_chunk(&mut result, &mut pending, line, col);
+                let value = self.expr(&starred.value, fs);
+                let (value_line, value_col) = self.span(starred.range);
+                let value = self.expr_to_tuple(value, value_line, value_col);
+                result = Some(self.concat_tuples(result, value, value_line, value_col));
+                continue;
+            }
+            pending.push(self.expr(elem, fs));
+        }
+        self.flush_tuple_chunk(&mut result, &mut pending, line, col);
+        result.unwrap_or_else(|| HExpr {
+            kind: HExprKind::Tuple(Vec::new()),
+            ty: Ty::Concrete(Type::Tuple),
+            line,
+            col,
+        })
+    }
+
+    /// Append the pending plain tuple elements to `result` as one tuple
+    /// literal.
+    fn flush_tuple_chunk(
+        &mut self,
+        result: &mut Option<HExpr>,
+        pending: &mut Vec<HExpr>,
+        line: u32,
+        col: u32,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let chunk = HExpr {
+            kind: HExprKind::Tuple(std::mem::take(pending)),
+            ty: Ty::Concrete(Type::Tuple),
+            line,
+            col,
+        };
+        let merged = self.concat_tuples(result.take(), chunk, line, col);
+        *result = Some(merged);
+    }
+
+    /// `left + right` with a tuple result, starting from an empty tuple when
+    /// `left` is absent.
+    fn concat_tuples(&mut self, left: Option<HExpr>, right: HExpr, line: u32, col: u32) -> HExpr {
+        let left = left.unwrap_or_else(|| HExpr {
+            kind: HExprKind::Tuple(Vec::new()),
+            ty: Ty::Concrete(Type::Tuple),
+            line,
+            col,
+        });
+        HExpr {
+            kind: HExprKind::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(left),
+                rhs: Box::new(right),
+            },
+            ty: Ty::Concrete(Type::Tuple),
+            line,
+            col,
+        }
+    }
+
+    /// Lowers `{a, *xs, b}` into left-to-right set unions: each plain run is a
+    /// set literal and each starred operand a `|` operand. The operand is
+    /// materialised through `list(...)` and copied through `set(...)`, which
+    /// accepts any iterable and yields a fresh set (a leading `*` therefore
+    /// needs no empty-set seed).
+    fn set_with_star(
+        &mut self,
+        elts: &[ast::Expr],
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let mut result: Option<HExpr> = None;
+        let mut pending: Vec<HExpr> = Vec::new();
+        for elem in elts {
+            if let ast::Expr::Starred(starred) = elem {
+                self.flush_set_chunk(&mut result, &mut pending, line, col);
+                let value = self.expr(&starred.value, fs);
+                let (value_line, value_col) = self.span(starred.range);
+                let value = self.expr_to_set(value, value_line, value_col);
+                result = Some(match result.take() {
+                    Some(left) => self.union_sets(left, value, value_line, value_col),
+                    None => value,
+                });
+                continue;
+            }
+            pending.push(self.expr(elem, fs));
+        }
+        self.flush_set_chunk(&mut result, &mut pending, line, col);
+        result.unwrap_or_else(|| HExpr {
+            kind: HExprKind::Set(Vec::new()),
+            ty: Ty::Concrete(Type::Set),
+            line,
+            col,
+        })
+    }
+
+    /// Append the pending plain set elements to `result` as one set literal.
+    fn flush_set_chunk(
+        &mut self,
+        result: &mut Option<HExpr>,
+        pending: &mut Vec<HExpr>,
+        line: u32,
+        col: u32,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let chunk = HExpr {
+            kind: HExprKind::Set(std::mem::take(pending)),
+            ty: Ty::Concrete(Type::Set),
+            line,
+            col,
+        };
+        *result = Some(match result.take() {
+            Some(left) => self.union_sets(left, chunk, line, col),
+            None => chunk,
+        });
+    }
+
+    /// `left | right` with a set result.
+    fn union_sets(&mut self, left: HExpr, right: HExpr, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::Bin {
+                op: BinOp::BitOr,
+                lhs: Box::new(left),
+                rhs: Box::new(right),
+            },
+            ty: Ty::Concrete(Type::Set),
             line,
             col,
         }
@@ -14684,6 +15721,32 @@ impl<'a> Lowerer<'a> {
             };
         }
 
+        // `setattr`/`delattr` are served by the `builtins` module dispatch, so
+        // the call goes through the module ABI (which also validates arity).
+        if is_attribute_only_builtin(name)
+            && !(self.session_mode && self.global_names.contains(name))
+        {
+            if call_has_dynamic_arguments(call) {
+                return self.lower_dynamic_call(call, fs, line, col);
+            }
+            let spec = stdlib::function("builtins", name)
+                .expect("setattr/delattr are declared in the builtins table");
+            let Some((args, keywords)) = self.module_arguments(call, fs, spec, line, col) else {
+                return self.error_expr(call.range);
+            };
+            return HExpr {
+                kind: HExprKind::ModuleCall {
+                    module: "builtins".to_string(),
+                    function: name.to_string(),
+                    args,
+                    keywords,
+                },
+                ty: self.infer.fresh(),
+                line,
+                col,
+            };
+        }
+
         // A builtin call binds the few keywords it supports (`max(key=...)`,
         // `min(key=...)`) and rejects the rest.
         if let Some(builtin) = builtin_by_name(name)
@@ -14704,6 +15767,12 @@ impl<'a> Lowerer<'a> {
             // builtin function value as the callee.
             if builtin == Builtin::Zip && !call.keywords.is_empty() {
                 return self.lower_zip_keywords(call, fs, line, col);
+            }
+            // `__import__(name, globals=, locals=, fromlist=, level=)`: CPython
+            // 3.14 names all five parameters, so the call goes through the
+            // runtime keyword binder (which also rejects duplicate names).
+            if builtin == Builtin::Import && !call.keywords.is_empty() {
+                return self.lower_import_keywords(call, fs, line, col);
             }
             // `max(iterable, default=...)`: CPython 3.14's keyword-only
             // `default` only exists for the single-iterable form, so the call
@@ -14897,6 +15966,44 @@ impl<'a> Lowerer<'a> {
             for arg in &call.args {
                 args.push(self.expr(arg, fs));
             }
+            return HExpr {
+                kind: HExprKind::IndirectCall {
+                    callee: Box::new(callee),
+                    args,
+                    star: None,
+                },
+                ty: self.infer.fresh(),
+                line,
+                col,
+            };
+        }
+
+        if self.dynamic_module_globals && (fs.is_module || !self.module_local_names.contains(name))
+        {
+            // The callee may have been installed through `globals()`/`vars()`;
+            // resolve it from the module table so a missing value raises at
+            // runtime instead of failing the compile. A module local a
+            // function cannot see stays a compile-time scope error below.
+            self.used_globals.insert(name.to_string());
+            let (callee_line, callee_col) = self.span(name_expr.range);
+            let callee = HExpr {
+                kind: HExprKind::GlobalGet {
+                    module: self.dunder_name.clone(),
+                    name: name.to_string(),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line: callee_line,
+                col: callee_col,
+            };
+            if !call.keywords.is_empty() {
+                let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                    return self.error_expr(call.range);
+                };
+                return result;
+            }
+            let Some(args) = self.plain_call_args(call, fs) else {
+                return self.error_expr(call.range);
+            };
             return HExpr {
                 kind: HExprKind::IndirectCall {
                     callee: Box::new(callee),
@@ -15928,6 +17035,46 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Wrap `value` in `tuple(value)` so a starred display operand accepts any
+    /// iterable and yields a tuple for concatenation.
+    fn expr_to_tuple(&mut self, value: HExpr, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Builtin(Builtin::Tuple),
+                args: vec![value],
+            },
+            ty: Ty::Concrete(Type::Tuple),
+            line,
+            col,
+        }
+    }
+
+    /// Wrap `value` in `set(list(value))`: `list(...)` consumes any iterable
+    /// through the runtime iterator protocol, and `set(...)` deduplicates the
+    /// materialised elements into a fresh set. The intermediate list is what
+    /// lets `{*generator}` and `{*range(...)}` work with the container
+    /// constructor, which only accepts sequences and mappings.
+    fn expr_to_set(&mut self, value: HExpr, line: u32, col: u32) -> HExpr {
+        let items = HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Builtin(Builtin::List),
+                args: vec![value],
+            },
+            ty: Ty::Concrete(Type::List),
+            line,
+            col,
+        };
+        HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Builtin(Builtin::Set),
+                args: vec![items],
+            },
+            ty: Ty::Concrete(Type::Set),
+            line,
+            col,
+        }
+    }
+
     /// Lower a direct builtin call, binding the keywords the builtin supports.
     ///
     /// `max`/`min` accept `key=`: the runtime expects the key slot as the
@@ -16056,6 +17203,72 @@ impl<'a> Lowerer<'a> {
             kind: HExprKind::CallKw {
                 callee: Box::new(HExpr {
                     kind: HExprKind::BuiltinRef(Builtin::Zip),
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                }),
+                args,
+                keywords,
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
+    /// Lower `__import__(name, globals=..., locals=..., fromlist=..., level=...)`
+    /// to the runtime keyword binder (`hydro_call_kw` on the builtin value).
+    ///
+    /// All five CPython 3.14 parameters are accepted by name. The names are
+    /// checked here for the diagnostics and forwarded in source order; the
+    /// runtime binder merges them with the positional prefix and rejects
+    /// duplicates, so nothing is dropped.
+    fn lower_import_keywords(
+        &mut self,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        const PARAMS: [&str; 5] = ["name", "globals", "locals", "fromlist", "level"];
+        let Some(args) = self.plain_call_args(call, fs) else {
+            return self.error_expr(call.range);
+        };
+        let mut keywords: Vec<(String, HExpr)> = Vec::with_capacity(call.keywords.len());
+        for keyword in &call.keywords {
+            let Some(name) = keyword.arg.as_ref() else {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    "__import__() does not accept **mapping arguments",
+                );
+                continue;
+            };
+            if !PARAMS.contains(&name.as_str()) {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!("__import__() got an unexpected keyword argument '{name}'"),
+                );
+                continue;
+            }
+            if keywords
+                .iter()
+                .any(|(existing, _)| existing.as_str() == name.as_str())
+            {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!("__import__() got multiple values for keyword argument '{name}'"),
+                );
+                continue;
+            }
+            keywords.push((name.to_string(), self.expr(&keyword.value, fs)));
+        }
+        HExpr {
+            kind: HExprKind::CallKw {
+                callee: Box::new(HExpr {
+                    kind: HExprKind::BuiltinRef(Builtin::Import),
                     ty: Ty::Concrete(Type::Function),
                     line,
                     col,
@@ -16534,11 +17747,20 @@ fn builtin_by_name(name: &str) -> Option<Builtin> {
     Builtin::from_name(name)
 }
 
+/// Builtins that have no `hydro_ir::Builtin` variant of their own and are
+/// served by the `builtins` module dispatch: the runtime implements the
+/// attribute mutation of instances and classes there.
+fn is_attribute_only_builtin(name: &str) -> bool {
+    matches!(name, "setattr" | "delattr")
+}
+
 /// Whether `name` resolves to an unqualified builtin value: a compiler
 /// builtin (`len`, `zip`, ...) or a `builtins` module constant (`object`,
 /// `Ellipsis`, ...). Lambdas may read both without a capture.
 fn is_builtin_value_name(name: &str) -> bool {
-    builtin_by_name(name).is_some() || stdlib::constant("builtins", name).is_some()
+    builtin_by_name(name).is_some()
+        || is_attribute_only_builtin(name)
+        || stdlib::constant("builtins", name).is_some()
 }
 
 /// One `namespace[name] = value` store used while building a dynamic class
@@ -16652,6 +17874,41 @@ fn class_body_needs_namespace(body: &[ast::Stmt]) -> bool {
         ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => false,
         _ => true,
     })
+}
+
+/// Whether a class body defines a method whose decorated value must be built
+/// at runtime (any decorator other than a lone binding decorator, ignoring the
+/// known no-op markers). Such a class body executes through the namespace
+/// path so the decorators run in CPython order.
+fn class_body_has_runtime_method_decorators(body: &[ast::Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        ast::Stmt::FunctionDef(f) => method_has_runtime_decorators(&f.decorator_list),
+        ast::Stmt::AsyncFunctionDef(f) => method_has_runtime_decorators(&f.decorator_list),
+        other => class_body_blocks(other)
+            .into_iter()
+            .any(class_body_has_runtime_method_decorators),
+    })
+}
+
+/// Whether a method's decorator list produces a runtime decorator expression.
+/// Stub/accessor definitions are skipped before registration, so they do not
+/// force the runtime path.
+fn method_has_runtime_decorators(decorators: &[ast::Expr]) -> bool {
+    if decorators
+        .iter()
+        .any(|d| is_overload_decorator(d) || is_property_accessor_decorator(d))
+    {
+        return false;
+    }
+    let (_, applied) = classify_method_decorators(decorators);
+    // A lone binding decorator (`@property`, `@classmethod`,
+    // `@staticmethod`) is fully described by the method's binding kind and
+    // stays on the static class path. Anything else needs the runtime
+    // namespace so the value is built in CPython order.
+    match applied.as_slice() {
+        [single] => decorator_binding_kind(single).is_none(),
+        _ => !applied.is_empty(),
+    }
 }
 
 /// Bodies of every method definition reachable from `body` (including those
@@ -16913,6 +18170,37 @@ fn is_ignored_function_decorator(expr: &ast::Expr) -> bool {
         decorator_final_name(expr).as_deref(),
         Some("lru_cache" | "cache" | "wraps" | "abstractmethod" | "overload" | "runtime_checkable")
     ) || is_pytest_decorator(expr)
+}
+
+/// The binding kind a descriptor-factory decorator selects, if any.
+fn decorator_binding_kind(expr: &ast::Expr) -> Option<MethodKind> {
+    match decorator_final_name(expr).as_deref() {
+        Some("property") => Some(MethodKind::Property),
+        Some("classmethod") => Some(MethodKind::Classmethod),
+        Some("staticmethod") => Some(MethodKind::Staticmethod),
+        _ => None,
+    }
+}
+
+/// Classify a method's decorators into the binding kind and the decorators
+/// that must be applied at runtime.
+///
+/// The binding kind is the innermost `@property`/`@classmethod`/
+/// `@staticmethod` (the previous single-decorator behaviour). `applied` lists
+/// every decorator that is not a known no-op, in source order.
+fn classify_method_decorators(decorators: &[ast::Expr]) -> (MethodKind, Vec<&ast::Expr>) {
+    let mut kind = MethodKind::Normal;
+    let mut applied = Vec::new();
+    for decorator in decorators {
+        if is_ignored_function_decorator(decorator) {
+            continue;
+        }
+        if let Some(binding) = decorator_binding_kind(decorator) {
+            kind = binding;
+        }
+        applied.push(decorator);
+    }
+    (kind, applied)
 }
 
 /// Dotted names of a decorator expression (`pytest.mark.parametrize` ->
@@ -17513,28 +18801,28 @@ fn collect_module_def_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
 /// class bodies are not entered; assignments and class definitions inside
 /// module-level compound statements are, because those statements execute at
 /// module level.
+///
+/// Tuple/list unpacking targets are included at every nesting level (starred
+/// targets too): `a, (b, *c) = value` binds three module globals, and
+/// functions of the unit read them through the runtime global table exactly
+/// like a plain `a = value`.
 fn collect_global_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     for stmt in stmts {
         match stmt {
             ast::Stmt::Assign(s) => {
-                // Chained assignment binds every simple-name target
-                // (`a = b = value`), so all of them are exported globals.
+                // Chained assignment binds every target
+                // (`a = b = value`), including unpacking targets
+                // (`a, b = c = value`), so all of them are exported globals.
                 for target in &s.targets {
-                    if let ast::Expr::Name(name) = target {
-                        out.insert(name.id.to_string());
-                    }
+                    collect_target_bound_names(target, out);
                 }
             }
             ast::Stmt::AugAssign(s) => {
-                if let ast::Expr::Name(name) = &*s.target {
-                    out.insert(name.id.to_string());
-                }
+                collect_target_bound_names(&s.target, out);
             }
             ast::Stmt::AnnAssign(s) => {
                 if s.value.is_some() {
-                    if let ast::Expr::Name(name) = &*s.target {
-                        out.insert(name.id.to_string());
-                    }
+                    collect_target_bound_names(&s.target, out);
                 }
             }
             ast::Stmt::ClassDef(s) => {
@@ -17801,12 +19089,14 @@ fn call_has_dynamic_arguments(call: &ast::ExprCall) -> bool {
         || call.keywords.iter().any(|keyword| keyword.arg.is_none())
 }
 
-/// Name of a function's first declared parameter, used for classmethod `cls`.
+/// Name of a function's first declared user parameter (capture parameters are
+/// prefixed and do not count), used for classmethod `cls` and `super()`
+/// receiver resolution.
 fn first_param_name(lowerer: &Lowerer<'_>, id: FunctionId) -> String {
     lowerer
         .functions
         .get(id as usize)
-        .and_then(|function| function.params.first())
+        .and_then(|function| function.params.get(function.capture_count))
         .map(|param| param.name.clone())
         .unwrap_or_default()
 }
@@ -18049,9 +19339,10 @@ fn collect_nested_function_ranges(stmts: &[ast::Stmt], out: &mut Vec<TextRange>)
     }
 }
 
-/// Names needed by nested named functions (captures), including names their
-/// descendants read. `for`/`while`/`try`/`with` bodies are searched; nested
-/// function bodies are summarised by `function_free_names`.
+/// Names needed by nested named functions and nested classes (captures),
+/// including names their descendants read. `for`/`while`/`try`/`with` bodies
+/// are searched; nested function bodies are summarised by
+/// `function_free_names` and class bodies by `class_free_names`.
 fn collect_nested_needed(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     for stmt in stmts {
         match stmt {
@@ -18060,6 +19351,9 @@ fn collect_nested_needed(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
             }
             ast::Stmt::AsyncFunctionDef(f) => {
                 out.extend(function_free_names(&f.body, f.args.as_ref()));
+            }
+            ast::Stmt::ClassDef(c) => {
+                out.extend(class_free_names(c));
             }
             ast::Stmt::If(s) => {
                 collect_nested_needed(&s.body, out);
@@ -18105,6 +19399,7 @@ fn collect_nested_nonlocals(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
         match stmt {
             ast::Stmt::FunctionDef(f) => collect_all_nonlocals(&f.body, out),
             ast::Stmt::AsyncFunctionDef(f) => collect_all_nonlocals(&f.body, out),
+            ast::Stmt::ClassDef(c) => collect_all_nonlocals(&c.body, out),
             ast::Stmt::If(s) => {
                 collect_nested_nonlocals(&s.body, out);
                 collect_nested_nonlocals(&s.orelse, out);
@@ -18241,27 +19536,81 @@ fn collect_declared_globals(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     }
 }
 
-/// The `(name, local)` pair mirrored by a module-body simple-name
-/// `Assign`/`AnnAssign`/`AugAssign`.
+/// Simple-name locals a module-body statement binds, for mirroring their
+/// values into the runtime global table.
+///
+/// Chained assignments are lowered into an `if True:` body and mirror their
+/// own targets, so only a single-target `Assign`/`AnnAssign`/`AugAssign` and
+/// its tuple/list-unpacking variant matter here.
 ///
 /// Class definitions are mirrored by `push_lowered_stmt` itself, because the
 /// class object is created by the statement rather than by a simple-name
 /// store.
-fn global_assignment_target(stmt: &ast::Stmt, h: &HStmt) -> Option<(String, LocalId)> {
+fn global_assignment_targets(stmt: &ast::Stmt, h: &HStmt) -> Vec<(String, LocalId)> {
     match (stmt, &h.kind) {
         (ast::Stmt::Assign(s), HStmtKind::Assign { target, .. }) => match s.targets.as_slice() {
-            [ast::Expr::Name(name)] => Some((name.id.to_string(), *target)),
-            _ => None,
+            [ast::Expr::Name(name)] => vec![(name.id.to_string(), *target)],
+            _ => Vec::new(),
         },
+        (ast::Stmt::Assign(s), HStmtKind::Unpack { targets, .. }) => {
+            let [target] = s.targets.as_slice() else {
+                return Vec::new();
+            };
+            let mut bound = Vec::new();
+            collect_unpack_binding_names(target, targets, &mut bound);
+            bound
+        }
         (ast::Stmt::AnnAssign(s), HStmtKind::Assign { target, .. }) => match &*s.target {
-            ast::Expr::Name(name) => Some((name.id.to_string(), *target)),
-            _ => None,
+            ast::Expr::Name(name) => vec![(name.id.to_string(), *target)],
+            _ => Vec::new(),
         },
         (ast::Stmt::AugAssign(s), HStmtKind::AugAssign { target, .. }) => match &*s.target {
-            ast::Expr::Name(name) => Some((name.id.to_string(), *target)),
-            _ => None,
+            ast::Expr::Name(name) => vec![(name.id.to_string(), *target)],
+            _ => Vec::new(),
         },
-        _ => None,
+        _ => Vec::new(),
+    }
+}
+
+/// Pairs each simple-name target of an unpacking assignment with the local
+/// slot its lowered `HUnpackTarget` stores it in. Nested containers and
+/// starred elements recurse; attribute/subscript targets bind no local.
+fn collect_unpack_binding_names(
+    source: &ast::Expr,
+    targets: &[HUnpackTarget],
+    out: &mut Vec<(String, LocalId)>,
+) {
+    let elements = match source {
+        ast::Expr::Tuple(tuple) => tuple.elts.as_slice(),
+        ast::Expr::List(list) => list.elts.as_slice(),
+        _ => return,
+    };
+    for (element, target) in elements.iter().zip(targets) {
+        collect_unpack_binding_name(element, target, out);
+    }
+}
+
+/// Pairs one unpacking target with the source expression that binds it.
+///
+/// A starred element binds the name under the `Star` wrapper, so the star
+/// itself has to be unwrapped before the name matches; nested containers
+/// recurse into their own element list.
+fn collect_unpack_binding_name(
+    source: &ast::Expr,
+    target: &HUnpackTarget,
+    out: &mut Vec<(String, LocalId)>,
+) {
+    match (source, target) {
+        (ast::Expr::Name(name), HUnpackTarget::Name(local)) => {
+            out.push((name.id.to_string(), *local));
+        }
+        (ast::Expr::Starred(star), HUnpackTarget::Star(inner)) => {
+            collect_unpack_binding_name(&star.value, inner, out);
+        }
+        (_, HUnpackTarget::Nested(nested)) => {
+            collect_unpack_binding_names(source, nested, out);
+        }
+        _ => {}
     }
 }
 
@@ -18702,11 +20051,66 @@ fn walk_free_stmts(
                     record_name_load(&name, shadowed, out, seen);
                 }
             }
-            // Class bodies and lambdas create their own scope and are not
-            // closure-converted here.
+            // A class body is its own namespace, but its bases, decorators,
+            // body expressions and method bodies resolve names from the
+            // enclosing scope. `class_free_names` already removes the names the
+            // class body binds itself for its own expression lookups.
+            ast::Stmt::ClassDef(c) => {
+                for name in class_free_names(c) {
+                    record_name_load(&name, shadowed, out, seen);
+                }
+            }
+            // Lambdas create their own scope and are not closure-converted
+            // here.
             _ => {}
         }
     }
+}
+
+/// Free names of a class statement: names its header, body expressions and
+/// method bodies read from the enclosing scope.
+///
+/// The class namespace is not a closure: a name the class body binds shadows it
+/// only for later class-body expressions, while method bodies resolve it in
+/// the enclosing scope. Both groups are included (the extra names only widen
+/// the cell set of the enclosing function, never change its semantics).
+fn class_free_names(c: &ast::StmtClassDef) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let empty = HashSet::new();
+    for base in &c.bases {
+        walk_free_expr(base, &empty, &mut out, &mut seen);
+    }
+    for keyword in &c.keywords {
+        walk_free_expr(&keyword.value, &empty, &mut out, &mut seen);
+    }
+    for decorator in &c.decorator_list {
+        walk_free_expr(decorator, &empty, &mut out, &mut seen);
+    }
+    let mut names = Vec::new();
+    collect_names(&c.body, &mut names, true);
+    let bound: HashSet<String> = names.into_iter().collect();
+    for stmt in &c.body {
+        match stmt {
+            ast::Stmt::FunctionDef(f) => {
+                for name in function_free_names(&f.body, f.args.as_ref()) {
+                    record_name_load(&name, &empty, &mut out, &mut seen);
+                }
+            }
+            ast::Stmt::AsyncFunctionDef(f) => {
+                for name in function_free_names(&f.body, f.args.as_ref()) {
+                    record_name_load(&name, &empty, &mut out, &mut seen);
+                }
+            }
+            ast::Stmt::ClassDef(inner) => {
+                for name in class_free_names(inner) {
+                    record_name_load(&name, &empty, &mut out, &mut seen);
+                }
+            }
+            other => walk_free_stmts(std::slice::from_ref(other), &bound, &mut out, &mut seen),
+        }
+    }
+    out
 }
 
 /// Free names of one function body: ordered loads made by the body and by
@@ -18932,6 +20336,200 @@ fn walk_free_comp(
     for element in elements {
         walk_free_expr(element, &bound, out, seen);
     }
+}
+
+/// Whether module-level code can install names into the module namespace
+/// through `globals()`/`vars()`, directly or through an alias.
+///
+/// `shadowed` is the set of names bound at module level: a module that binds
+/// `globals`/`vars` itself uses that binding, not the builtin, so those names
+/// are ignored. Function and lambda bodies are separate scopes and are
+/// skipped; a function that mutates the namespace only matters when module
+/// code can reach it through an alias, and the alias assignment is itself a
+/// module-level use. Class bodies run while the module initializes, so they
+/// are scanned too; their methods are not.
+fn module_uses_dynamic_globals(stmts: &[ast::Stmt], shadowed: &HashSet<String>) -> bool {
+    stmts
+        .iter()
+        .any(|stmt| stmt_uses_dynamic_globals(stmt, shadowed))
+}
+
+fn stmt_uses_dynamic_globals(stmt: &ast::Stmt, shadowed: &HashSet<String>) -> bool {
+    match stmt {
+        ast::Stmt::Expr(s) => expr_mentions_dynamic_globals(&s.value, shadowed),
+        ast::Stmt::Assign(s) => {
+            s.targets
+                .iter()
+                .any(|target| target_mentions_dynamic_globals(target, shadowed))
+                || expr_mentions_dynamic_globals(&s.value, shadowed)
+        }
+        ast::Stmt::AnnAssign(s) => {
+            target_mentions_dynamic_globals(&s.target, shadowed)
+                || expr_mentions_dynamic_globals(&s.annotation, shadowed)
+                || s.value
+                    .as_deref()
+                    .is_some_and(|value| expr_mentions_dynamic_globals(value, shadowed))
+        }
+        ast::Stmt::AugAssign(s) => {
+            target_mentions_dynamic_globals(&s.target, shadowed)
+                || expr_mentions_dynamic_globals(&s.value, shadowed)
+        }
+        ast::Stmt::Return(s) => s
+            .value
+            .as_deref()
+            .is_some_and(|value| expr_mentions_dynamic_globals(value, shadowed)),
+        ast::Stmt::Delete(s) => s
+            .targets
+            .iter()
+            .any(|target| target_mentions_dynamic_globals(target, shadowed)),
+        ast::Stmt::Raise(s) => {
+            s.exc
+                .as_deref()
+                .is_some_and(|exc| expr_mentions_dynamic_globals(exc, shadowed))
+                || s.cause
+                    .as_deref()
+                    .is_some_and(|cause| expr_mentions_dynamic_globals(cause, shadowed))
+        }
+        ast::Stmt::Assert(s) => {
+            expr_mentions_dynamic_globals(&s.test, shadowed)
+                || s.msg
+                    .as_deref()
+                    .is_some_and(|msg| expr_mentions_dynamic_globals(msg, shadowed))
+        }
+        ast::Stmt::If(s) => {
+            expr_mentions_dynamic_globals(&s.test, shadowed)
+                || module_uses_dynamic_globals(&s.body, shadowed)
+                || module_uses_dynamic_globals(&s.orelse, shadowed)
+        }
+        ast::Stmt::While(s) => {
+            expr_mentions_dynamic_globals(&s.test, shadowed)
+                || module_uses_dynamic_globals(&s.body, shadowed)
+                || module_uses_dynamic_globals(&s.orelse, shadowed)
+        }
+        ast::Stmt::For(s) => {
+            expr_mentions_dynamic_globals(&s.iter, shadowed)
+                || module_uses_dynamic_globals(&s.body, shadowed)
+                || module_uses_dynamic_globals(&s.orelse, shadowed)
+        }
+        ast::Stmt::AsyncFor(s) => {
+            expr_mentions_dynamic_globals(&s.iter, shadowed)
+                || module_uses_dynamic_globals(&s.body, shadowed)
+                || module_uses_dynamic_globals(&s.orelse, shadowed)
+        }
+        ast::Stmt::With(s) => {
+            s.items.iter().any(|item| {
+                expr_mentions_dynamic_globals(&item.context_expr, shadowed)
+                    || item
+                        .optional_vars
+                        .as_deref()
+                        .is_some_and(|target| target_mentions_dynamic_globals(target, shadowed))
+            }) || module_uses_dynamic_globals(&s.body, shadowed)
+        }
+        ast::Stmt::AsyncWith(s) => {
+            s.items.iter().any(|item| {
+                expr_mentions_dynamic_globals(&item.context_expr, shadowed)
+                    || item
+                        .optional_vars
+                        .as_deref()
+                        .is_some_and(|target| target_mentions_dynamic_globals(target, shadowed))
+            }) || module_uses_dynamic_globals(&s.body, shadowed)
+        }
+        ast::Stmt::Try(s) => {
+            module_uses_dynamic_globals(&s.body, shadowed)
+                || s.handlers.iter().any(|handler| {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    module_uses_dynamic_globals(&handler.body, shadowed)
+                })
+                || module_uses_dynamic_globals(&s.orelse, shadowed)
+                || module_uses_dynamic_globals(&s.finalbody, shadowed)
+        }
+        ast::Stmt::TryStar(s) => {
+            module_uses_dynamic_globals(&s.body, shadowed)
+                || s.handlers.iter().any(|handler| {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    module_uses_dynamic_globals(&handler.body, shadowed)
+                })
+                || module_uses_dynamic_globals(&s.orelse, shadowed)
+                || module_uses_dynamic_globals(&s.finalbody, shadowed)
+        }
+        ast::Stmt::Match(s) => {
+            expr_mentions_dynamic_globals(&s.subject, shadowed)
+                || s.cases.iter().any(|case| {
+                    case.guard
+                        .as_deref()
+                        .is_some_and(|guard| expr_mentions_dynamic_globals(guard, shadowed))
+                        || module_uses_dynamic_globals(&case.body, shadowed)
+                })
+        }
+        // A function definition executes its decorators and default values at
+        // module scope; the body runs later, in its own scope.
+        ast::Stmt::FunctionDef(s) => {
+            s.decorator_list
+                .iter()
+                .any(|decorator| expr_mentions_dynamic_globals(decorator, shadowed))
+                || function_defaults_use_dynamic_globals(&s.args, shadowed)
+        }
+        ast::Stmt::AsyncFunctionDef(s) => {
+            s.decorator_list
+                .iter()
+                .any(|decorator| expr_mentions_dynamic_globals(decorator, shadowed))
+                || function_defaults_use_dynamic_globals(&s.args, shadowed)
+        }
+        // A class statement evaluates its bases, keywords and decorators at
+        // module scope, and its body statements run at module scope too.
+        ast::Stmt::ClassDef(s) => {
+            s.bases
+                .iter()
+                .any(|base| expr_mentions_dynamic_globals(base, shadowed))
+                || s.keywords
+                    .iter()
+                    .any(|keyword| expr_mentions_dynamic_globals(&keyword.value, shadowed))
+                || s.decorator_list
+                    .iter()
+                    .any(|decorator| expr_mentions_dynamic_globals(decorator, shadowed))
+                || module_uses_dynamic_globals(&s.body, shadowed)
+        }
+        ast::Stmt::TypeAlias(s) => expr_mentions_dynamic_globals(&s.value, shadowed),
+        _ => false,
+    }
+}
+
+fn target_mentions_dynamic_globals(target: &ast::Expr, shadowed: &HashSet<String>) -> bool {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    walk_free_target(target, shadowed, &mut names, &mut seen);
+    names.iter().any(|name| is_dynamic_globals_name(name))
+}
+
+fn expr_mentions_dynamic_globals(expr: &ast::Expr, shadowed: &HashSet<String>) -> bool {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    walk_free_expr(expr, shadowed, &mut names, &mut seen);
+    names.iter().any(|name| is_dynamic_globals_name(name))
+}
+
+/// Whether a function definition's default values run `globals()`/`vars()`.
+///
+/// Defaults are evaluated while the enclosing (module) scope executes, unlike
+/// the function body itself.
+fn function_defaults_use_dynamic_globals(
+    args: &ast::Arguments,
+    shadowed: &HashSet<String>,
+) -> bool {
+    args.posonlyargs
+        .iter()
+        .chain(args.args.iter())
+        .chain(args.kwonlyargs.iter())
+        .any(|argument| {
+            argument
+                .default
+                .as_deref()
+                .is_some_and(|default| expr_mentions_dynamic_globals(default, shadowed))
+        })
+}
+
+fn is_dynamic_globals_name(name: &str) -> bool {
+    name == "globals" || name == "vars"
 }
 
 /// Wrap a lowered statement sequence in an always-true `if`.

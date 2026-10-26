@@ -11,7 +11,7 @@
 //! value; no user input can panic.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use hydro_ir::stdlib;
 use hydro_ir::{PYTHON_VERSION, PYTHON_VERSION_STRING};
 use num_bigint::{BigInt, Sign};
-use num_traits::Signed;
+use num_traits::{Signed, ToPrimitive};
 
 use crate::core::globals;
 
@@ -48,12 +48,18 @@ pub(crate) mod errno;
 pub(crate) mod extension;
 pub(crate) mod fnmatch;
 pub(crate) mod fractions;
+pub(crate) mod functools;
 pub(crate) mod future;
 pub(crate) mod gc;
 pub(crate) mod getopt;
 pub(crate) mod heapq;
 pub(crate) mod imp;
 pub(crate) mod importlib;
+pub(crate) mod importlib_machinery;
+pub(crate) mod importlib_metadata;
+pub(crate) mod importlib_resources;
+pub(crate) mod importlib_util;
+pub(crate) mod inspect;
 pub(crate) mod itertools;
 pub(crate) mod keyword;
 pub(crate) mod locale;
@@ -88,8 +94,8 @@ pub(crate) mod zoneinfo;
 
 use crate::container;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, INDEX_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR,
-    VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, INDEX_ERROR, OS_ERROR, OVERFLOW_ERROR, RECURSION_ERROR, RUNTIME_ERROR,
+    TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::iter;
@@ -201,6 +207,24 @@ impl NativeCache {
         if self.next == NATIVE_CACHE_SIZE {
             self.next = 0;
         }
+    }
+}
+
+/// Arity-only spec for a native method value (`OrderedDict.move_to_end`,
+/// `_singledispatchmethod_get.__init__`) that is not a Python-visible module
+/// function but whose `FunctionBody::Native` name must resolve.
+const fn native_member(
+    name: &'static str,
+    min_args: usize,
+    max_args: usize,
+) -> stdlib::FunctionSpec {
+    stdlib::FunctionSpec {
+        name,
+        min_args,
+        max_args,
+        ret: hydro_ir::Type::Any,
+        params: &[],
+        dynamic_keywords: false,
     }
 }
 
@@ -651,6 +675,303 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
             dynamic_keywords: false,
         },
     ),
+    // Native methods of `io.TextIOWrapper`. The wrapper is a class instance,
+    // so its method values dispatch through this table like the in-memory
+    // stream methods above.
+    (
+        "io.TextIOWrapper.read",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.read",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Str,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.readline",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.readline",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Str,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.readlines",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.readlines",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::List,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.write",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.write",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::Int,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.writelines",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.writelines",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::None,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.close",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.close",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::None,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.flush",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.flush",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::None,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.seek",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.seek",
+            min_args: 2,
+            max_args: 3,
+            ret: hydro_ir::Type::Int,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.tell",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.tell",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Int,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.readable",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.readable",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.writable",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.writable",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.seekable",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.seekable",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.isatty",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.isatty",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.detach",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.detach",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Any,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.__enter__",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.__enter__",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Any,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.__exit__",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.__exit__",
+            min_args: 4,
+            max_args: 4,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.__iter__",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.__iter__",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Any,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.TextIOWrapper.__next__",
+        stdlib::FunctionSpec {
+            name: "TextIOWrapper.__next__",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Str,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    // Native methods of `collections.OrderedDict`. The values carry
+    // `FunctionBody::Native` names like `OrderedDict.move_to_end`, so this
+    // table must resolve them even though they are not module functions.
+    (
+        "collections.OrderedDict.__init__",
+        native_member("OrderedDict.__init__", 1, usize::MAX),
+    ),
+    (
+        "collections.OrderedDict.fromkeys",
+        native_member("OrderedDict.fromkeys", 2, 3),
+    ),
+    (
+        "collections.OrderedDict.__getitem__",
+        native_member("OrderedDict.__getitem__", 2, 2),
+    ),
+    (
+        "collections.OrderedDict.__setitem__",
+        native_member("OrderedDict.__setitem__", 3, 3),
+    ),
+    (
+        "collections.OrderedDict.__delitem__",
+        native_member("OrderedDict.__delitem__", 2, 2),
+    ),
+    (
+        "collections.OrderedDict.__iter__",
+        native_member("OrderedDict.__iter__", 1, 1),
+    ),
+    (
+        "collections.OrderedDict.__len__",
+        native_member("OrderedDict.__len__", 1, 1),
+    ),
+    (
+        "collections.OrderedDict.__contains__",
+        native_member("OrderedDict.__contains__", 2, 2),
+    ),
+    (
+        "collections.OrderedDict.__eq__",
+        native_member("OrderedDict.__eq__", 2, 2),
+    ),
+    (
+        "collections.OrderedDict.__repr__",
+        native_member("OrderedDict.__repr__", 1, 1),
+    ),
+    (
+        "collections.OrderedDict.get",
+        native_member("OrderedDict.get", 2, 3),
+    ),
+    (
+        "collections.OrderedDict.keys",
+        native_member("OrderedDict.keys", 1, 1),
+    ),
+    (
+        "collections.OrderedDict.values",
+        native_member("OrderedDict.values", 1, 1),
+    ),
+    (
+        "collections.OrderedDict.items",
+        native_member("OrderedDict.items", 1, 1),
+    ),
+    (
+        "collections.OrderedDict.move_to_end",
+        native_member("OrderedDict.move_to_end", 2, 3),
+    ),
+    (
+        "collections.OrderedDict.popitem",
+        native_member("OrderedDict.popitem", 1, 2),
+    ),
+    (
+        "collections.OrderedDict.pop",
+        native_member("OrderedDict.pop", 2, 3),
+    ),
+    (
+        "collections.OrderedDict.update",
+        native_member("OrderedDict.update", 1, 2),
+    ),
+    (
+        "collections.OrderedDict.setdefault",
+        native_member("OrderedDict.setdefault", 2, 3),
+    ),
+    (
+        "collections.OrderedDict.copy",
+        native_member("OrderedDict.copy", 1, 1),
+    ),
+    (
+        "collections.OrderedDict.clear",
+        native_member("OrderedDict.clear", 1, 1),
+    ),
+    // Native methods of the `functools._singledispatchmethod_get` class.
+    (
+        "functools._singledispatchmethod_get.__init__",
+        native_member("_singledispatchmethod_get.__init__", 4, usize::MAX),
+    ),
+    (
+        "functools._singledispatchmethod_get.__repr__",
+        native_member("_singledispatchmethod_get.__repr__", 1, 1),
+    ),
 ];
 
 /// Resolves a [`SUPPLEMENTAL_FUNCTIONS`] entry by module and member name.
@@ -675,6 +996,13 @@ fn resolve_native(
     let module_name = stdlib::module(module)?.name;
     if let Some(spec) = supplemental_function(module, function) {
         return Some((module_name, spec.name, spec));
+    }
+    // The native `inspect` classes expose methods whose qualified names are
+    // not module functions; the module owns their specs.
+    if module == "inspect" {
+        if let Some(spec) = inspect::function_spec(function) {
+            return Some((module_name, spec.name, spec));
+        }
     }
     let spec = stdlib::function(module, function)?;
     Some((module_name, spec.name, spec))
@@ -873,6 +1201,17 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if name == "__dict__" {
         return module_dict(module);
     }
+    // Native modules have no Python source, but they still expose a spec, a
+    // loader and a package name. The spec is cached so repeated reads share
+    // identity, matching `module.__spec__` in CPython.
+    if stdlib::module(module).is_some() {
+        match name {
+            "__package__" => return value::str_alloc(native_package(module)),
+            "__spec__" => return native_module_spec(module),
+            "__loader__" => return importlib_machinery::builtin_importer_class(),
+            _ => {}
+        }
+    }
     // `errno` attributes are platform-defined names resolved on demand; the
     // static spec table cannot enumerate them.
     if module == "errno" {
@@ -896,13 +1235,32 @@ fn module_get_named(module: &str, name: &str) -> i64 {
         match name {
             "StringIO" => return string_io_class(),
             "BytesIO" => return bytes_io_class(),
+            "TextIOWrapper" => return text_io_wrapper_class(),
             _ => {}
         }
     }
     // `_collections` is the accelerator alias of `collections`; both names
-    // must expose the same `defaultdict` object.
-    if matches!(module, "collections" | "_collections") && name == "defaultdict" {
-        return collections::defaultdict_function();
+    // must expose the same `defaultdict`/`OrderedDict` objects.
+    if matches!(module, "collections" | "_collections") {
+        match name {
+            "defaultdict" => return collections::defaultdict_function(),
+            // Declared as a function so calls lower as module calls, but the
+            // value is the cached class: `isinstance` and method binding need
+            // a class, exactly like `io.StringIO`.
+            "OrderedDict" => return collections::ordereddict_class(),
+            _ => {}
+        }
+    }
+    // `functools._singledispatchmethod_get` is a class value because
+    // `inspect.isroutine` uses it as an `isinstance` target.
+    if module == "functools" && name == "_singledispatchmethod_get" {
+        return functools::singledispatchmethod_get_class();
+    }
+    // `functools.partialmethod` is declared as a function so calls lower as
+    // module calls, but the value itself is the real descriptor class:
+    // `isinstance(pm, functools.partialmethod)` and descriptor access need it.
+    if module == "functools" && name == "partialmethod" {
+        return functools::partialmethod_class();
     }
     // AST node/operator names are declared as functions so `ast.Name(...)`
     // lowers as a module call, but the value itself is a real class:
@@ -912,6 +1270,12 @@ fn module_get_named(module: &str, name: &str) -> i64 {
         return class;
     }
     if let Some(class) = typing::class_value(module, name) {
+        return class;
+    }
+    if let Some(class) = types::class_value(module, name) {
+        return class;
+    }
+    if let Some(class) = inspect::class_value(module, name) {
         return class;
     }
     // `_struct.Struct` and `_struct.error` are declared as functions/constants
@@ -949,6 +1313,34 @@ fn module_get_named(module: &str, name: &str) -> i64 {
         return value;
     }
     missing_attribute(module, name)
+}
+
+/// `module.__package__` for a native module: a module with registered
+/// submodules is a package (its own package), otherwise it lives in its parent
+/// and a top-level module reports `""`, like CPython.
+fn native_package(module: &str) -> String {
+    let prefix = format!("{module}.");
+    if stdlib::MODULES
+        .iter()
+        .any(|spec| spec.name.starts_with(&prefix))
+    {
+        return module.to_string();
+    }
+    match module.rsplit_once('.') {
+        Some((parent, _)) => parent.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Cached `ModuleSpec` of a native module.
+fn native_module_spec(module: &str) -> i64 {
+    let key = format!("module.spec:{module}");
+    if let Some(spec) = globals::registry_get(&key) {
+        return spec;
+    }
+    let spec = importlib_util::native_spec(module);
+    globals::registry_set(&key, spec);
+    spec
 }
 
 /// Values of the runtime-only module members. `builtins.eval`/`exec` are the
@@ -1181,6 +1573,7 @@ fn call_native_kw_at(
 fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
     match module {
         "functools" | "_functools" => functools_call_kw(function, args, keywords),
+        "collections" | "_collections" => collections::call_kw(function, args, &keywords),
         "dataclasses" => dataclasses_call_kw(function, args, keywords),
         "argparse" => argparse::call_kw(function, args, &keywords),
         "socket" => socket::call_kw(function, args, keywords),
@@ -1189,12 +1582,287 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "pytest" => pytest::call_kw(function, args, keywords),
         "warnings" | "_warnings" => warnings::call_kw(function, args, &keywords),
         "typing" => typing::call_kw(function, args, &keywords),
+        "inspect" => inspect::call_kw(function, args, &keywords),
         "ast" => ast::call_kw(function, args, &keywords),
+        "types" => types::call_kw(function, args, &keywords),
+        "os.path" => os_path_call_kw(function, args, &keywords),
+        "itertools" => itertools_call_kw(function, args, keywords),
+        "importlib.metadata" => importlib_metadata::call_kw(function, args, &keywords),
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("{module}.{function}() does not accept keyword arguments"),
         ),
     }
+}
+
+/// Materialises an iterable into a list, keeping the growing list rooted so
+/// elements stay traceable while later steps allocate.
+fn itertools_collect(iterable: i64) -> Result<i64, i64> {
+    let iterator = iter::iter_of(iterable);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    let result = value::list_new(Vec::new());
+    let roots = heap::root_values(&[result]);
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            heap::release_roots(roots);
+            return Err(NONE);
+        }
+        if status == 0 {
+            break;
+        }
+        container::list_append(result, item);
+        if exc::pending() {
+            heap::release_roots(roots);
+            return Err(NONE);
+        }
+    }
+    heap::release_roots(roots);
+    Ok(result)
+}
+
+fn itertools_call(function: &str, args: &[i64]) -> i64 {
+    match function {
+        "permutations" => itertools_permutations(args),
+        "product" => itertools_product(args, 1),
+        "takewhile" => itertools_takewhile(args),
+        _ => itertools::call(function, args),
+    }
+}
+
+/// Keyword-aware `itertools` dispatch: `product` is the only combinator with
+/// a keyword-only parameter (`repeat`).
+fn itertools_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    if function != "product" {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("itertools.{function}() does not accept keyword arguments"),
+        );
+    }
+    let mut repeat = 1i64;
+    for (name, argument) in keywords {
+        if name != "repeat" {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("product() got an unexpected keyword argument '{name}'"),
+            );
+        }
+        match value::as_integer(argument) {
+            Some(value) => repeat = value,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "integer argument expected, got {}",
+                        value::type_name(argument)
+                    ),
+                )
+            }
+        }
+    }
+    itertools_product(args, repeat)
+}
+
+/// `permutations(iterable, r=None)`: every length-`r` arrangement of the input
+/// positions, in the lexicographic order `itertools.permutations` yields.
+///
+/// The index/cycle scheme is CPython's documented recipe: `indices` always
+/// holds `n` positions ordered by their current selection priority, so the
+/// first `r` entries are the emitted selection, and `cycles` counts how many
+/// swaps remain for each of those slots. Rotating the tail reselects a fresh
+/// combination once a slot is exhausted, which is what keeps `r < n` results
+/// lexicographic instead of cycling through the initial `r` positions only.
+fn itertools_permutations(args: &[i64]) -> i64 {
+    let source = match itertools_collect(args[0]) {
+        Ok(source) => source,
+        Err(error) => return error,
+    };
+    let roots = heap::root_values(&[source]);
+    let items: Vec<i64> = value::as_list(source)
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    let n = items.len();
+    let r = match args.get(1).copied() {
+        None | Some(NONE) => n,
+        Some(argument) => match value::as_integer(argument) {
+            Some(r) if r >= 0 => usize::try_from(r).unwrap_or(usize::MAX),
+            Some(_) => {
+                heap::release_roots(roots);
+                return exc::raise_with_message(VALUE_ERROR, "r must be non-negative");
+            }
+            None => {
+                heap::release_roots(roots);
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "integer argument expected, got {}",
+                        value::type_name(argument)
+                    ),
+                );
+            }
+        },
+    };
+    let result = value::list_new(Vec::new());
+    if r > n {
+        // CPython yields nothing when `r` exceeds the pool; no tuple is built.
+        heap::release_roots(roots);
+        return result;
+    }
+    let result_roots = heap::root_values(&[result]);
+    // `indices` holds every pool position, so a slot that runs out of swaps can
+    // be refilled from the tail; only its first `r` entries are emitted.
+    let mut indices: Vec<usize> = (0..n).collect();
+    let mut cycles: Vec<usize> = (0..r).map(|offset| n - offset).collect();
+    loop {
+        let tuple = value::tuple_new(
+            indices[..r]
+                .iter()
+                .map(|index| items[*index])
+                .collect::<Vec<i64>>(),
+        );
+        container::list_append(result, tuple);
+        // Advance to the next arrangement. Exhausting the leftmost slot ends
+        // the sequence; `r == 0` emits the single empty tuple above and then
+        // finds no slot to advance.
+        let mut advanced = false;
+        for slot in (0..r).rev() {
+            cycles[slot] -= 1;
+            if cycles[slot] == 0 {
+                // Every rotation of this slot is used up: rotate the tail so
+                // the slot's position takes the next pool value.
+                indices[slot..].rotate_left(1);
+                cycles[slot] = n - slot;
+            } else {
+                let swap = n - cycles[slot];
+                indices.swap(slot, swap);
+                advanced = true;
+                break;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    heap::release_roots(result_roots);
+    heap::release_roots(roots);
+    result
+}
+
+/// `product(*iterables, repeat=1)`: the Cartesian product, with the rightmost
+/// pool varying fastest (the order `itertools.product` yields).
+fn itertools_product(args: &[i64], repeat: i64) -> i64 {
+    if repeat < 0 {
+        return exc::raise_with_message(VALUE_ERROR, "repeat argument cannot be negative");
+    }
+    let repeat = usize::try_from(repeat).unwrap_or(usize::MAX);
+    let mut sources = Vec::with_capacity(args.len());
+    let mut source_roots = Vec::with_capacity(args.len());
+    for &argument in args {
+        match itertools_collect(argument) {
+            Ok(source) => {
+                // Each source must stay reachable while the next iterable is
+                // materialised (which allocates and may collect).
+                source_roots.push(heap::root_values(&[source]));
+                sources.push(source);
+            }
+            Err(error) => {
+                for start in source_roots.into_iter().rev() {
+                    heap::release_roots(start);
+                }
+                return error;
+            }
+        }
+    }
+    let pools: Vec<Vec<i64>> = sources
+        .iter()
+        .map(|&source| {
+            value::as_list(source)
+                .map(|items| items.to_vec())
+                .unwrap_or_default()
+        })
+        .collect();
+    let result = value::list_new(Vec::new());
+    let result_roots = heap::root_values(&[result]);
+    let count = pools.len().saturating_mul(repeat);
+    let empty_pool = pools.iter().any(|pool| pool.is_empty());
+    if count == 0 {
+        // `product()` and `product(..., repeat=0)` both yield one empty tuple.
+        let tuple = value::tuple_new(Vec::new());
+        container::list_append(result, tuple);
+    } else if !empty_pool {
+        let mut indices = vec![0usize; count];
+        loop {
+            let tuple = value::tuple_new(
+                indices
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, index)| {
+                        let pool = &pools[slot % pools.len()];
+                        pool[*index]
+                    })
+                    .collect(),
+            );
+            container::list_append(result, tuple);
+            let mut slot = count;
+            let mut done = false;
+            while slot > 0 {
+                slot -= 1;
+                let length = pools[slot % pools.len()].len();
+                indices[slot] += 1;
+                if indices[slot] < length {
+                    break;
+                }
+                indices[slot] = 0;
+                if slot == 0 {
+                    done = true;
+                }
+            }
+            if done {
+                break;
+            }
+        }
+    }
+    heap::release_roots(result_roots);
+    for start in source_roots.into_iter().rev() {
+        heap::release_roots(start);
+    }
+    result
+}
+
+/// `takewhile(predicate, iterable)`: the longest prefix the predicate accepts.
+fn itertools_takewhile(args: &[i64]) -> i64 {
+    let predicate = args[0];
+    let iterator = iter::iter_of(args[1]);
+    if exc::pending() {
+        return NONE;
+    }
+    let result = value::list_new(Vec::new());
+    let roots = heap::root_values(&[result]);
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            heap::release_roots(roots);
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        let keep = crate::builtins::call(predicate, 1, [item].as_ptr());
+        if exc::pending() {
+            heap::release_roots(roots);
+            return keep;
+        }
+        if !value::truthy(keep) {
+            break;
+        }
+        container::list_append(result, item);
+    }
+    heap::release_roots(roots);
+    result
 }
 
 fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
@@ -1203,11 +1871,16 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "math" => math_call(function, args),
         "functools" | "_functools" => functools_call(function, args),
         "operator" | "_operator" => operator_call(function, args),
-        "itertools" => itertools::call(function, args),
+        "itertools" => itertools_call(function, args),
         "ast" => ast::call(function, args),
         "fractions" => fractions::call(function, args),
         "importlib" => importlib::call(function, args),
+        "importlib.util" => importlib_util::call(function, args),
+        "importlib.machinery" => importlib_machinery::call(function, args),
+        "importlib.metadata" => importlib_metadata::call(function, args),
+        "importlib.resources" => importlib_resources::call(function, args),
         "types" => types::call(function, args),
+        "inspect" => inspect::call(function, args),
         "bisect" | "_bisect" => bisect::call(function, args),
         "heapq" | "_heapq" => heapq::call(function, args),
         "colorsys" => colorsys::call(function, args),
@@ -1264,11 +1937,13 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "enum" => r#enum::call(function, args),
         "_imp" => imp::call(function, args),
         "_codecs" => codecs::call(function, args),
+        "codecs" => codecs::call(function, args),
         "_string" => string::call(function, args),
         "_weakref" | "weakref" => weakref::call(function, args),
         "warnings" | "_warnings" => warnings::call(function, args),
         "marshal" => marshal::call(function, args),
         "_tokenize" => tokenize::call(function, args),
+        "token" => tokenize::token_call(function, args),
         "_collections_abc" | "collections.abc" => collections_abc::call(function, args),
         "gc" => gc::call(function, args),
         "atexit" => atexit::call(function, args),
@@ -1297,6 +1972,8 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
 /// Registry keys in the globals side store.
 const SYS_MODULES_CACHE: &str = "sys.modules";
 const SYS_PATH_CACHE: &str = "sys.path";
+/// `sys.path_importer_cache`: a real dict, cached for stable identity.
+const SYS_PATH_IMPORTER_CACHE: &str = "sys.path_importer_cache";
 
 /// `sys.modules`: native modules from [`stdlib::MODULES`] plus every compiled
 /// user module discovered in the globals store, in deterministic order.
@@ -1394,6 +2071,22 @@ fn sys_path() -> i64 {
     path
 }
 
+/// `sys.path_importer_cache`: the process-wide finder cache.
+///
+/// CPython populates this dict with the finder for every `sys.path` entry; this
+/// runtime has no per-entry finder objects, so native modules and path entries
+/// stay absent and user code reading the mapping sees an empty (but real and
+/// mutable) dict. The dict is cached in the globals side store, so repeated
+/// reads return the same object until `globals::reset()` clears the run.
+fn sys_path_importer_cache() -> i64 {
+    if let Some(cached) = globals::registry_get(SYS_PATH_IMPORTER_CACHE) {
+        return cached;
+    }
+    let cache = value::dict_new(Vec::new());
+    globals::registry_set(SYS_PATH_IMPORTER_CACHE, cache);
+    cache
+}
+
 /// Builds `sys.path` from the environment.
 ///
 /// Order: `HYDRO_SITE_PACKAGES`, the site-packages directories of
@@ -1401,7 +2094,7 @@ fn sys_path() -> i64 {
 /// `HYDRO_STDLIB`. Empty, missing and non-directory entries are dropped and
 /// duplicates are kept once, so the result is deterministic for a given
 /// environment.
-fn search_path() -> Vec<String> {
+pub(crate) fn search_path() -> Vec<String> {
     search_path_from(
         std::env::var_os("HYDRO_SITE_PACKAGES").as_deref(),
         std::env::var_os("PYTHONPATH").as_deref(),
@@ -1530,7 +2223,27 @@ fn builtin_module_names() -> i64 {
 fn constant_value(module: &str, name: &str) -> i64 {
     match (module, name) {
         ("__future__", name) => future::constant(name),
+        ("token", name) => match tokenize::token_constant(name) {
+            Some(constant) => constant,
+            None => missing_attribute("token", name),
+        },
+        // The real CPython byte-order marks. `BOM_LE`/`BOM_BE` are the UTF-16
+        // marks and `BOM` follows the target endianness, like `Lib/codecs.py`.
+        ("codecs", "BOM_UTF8") => value::bytes_new(vec![0xEF, 0xBB, 0xBF]),
+        ("codecs", "BOM_UTF16_LE") | ("codecs", "BOM_LE") => value::bytes_new(vec![0xFF, 0xFE]),
+        ("codecs", "BOM_UTF16_BE") | ("codecs", "BOM_BE") => value::bytes_new(vec![0xFE, 0xFF]),
+        ("codecs", "BOM_UTF32_LE") => value::bytes_new(vec![0xFF, 0xFE, 0x00, 0x00]),
+        ("codecs", "BOM_UTF32_BE") => value::bytes_new(vec![0x00, 0x00, 0xFE, 0xFF]),
+        ("codecs", "BOM") => {
+            if cfg!(target_endian = "little") {
+                value::bytes_new(vec![0xFF, 0xFE])
+            } else {
+                value::bytes_new(vec![0xFE, 0xFF])
+            }
+        }
         ("types", name) => types::constant(name),
+        ("functools" | "_functools", name) => functools::constant(name),
+        ("inspect", name) => inspect::constant(name),
         ("math", "pi") => value::float_new(std::f64::consts::PI),
         ("math", "e") => value::float_new(std::f64::consts::E),
         ("math", "tau") => value::float_new(std::f64::consts::TAU),
@@ -1539,6 +2252,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("sys", "argv") => argv_list(),
         // Runtime module registry (identity-stable for repeated reads).
         ("sys", "path") => sys_path(),
+        ("sys", "path_importer_cache") => sys_path_importer_cache(),
         ("sys", "modules") => sys_modules(),
         ("sys", "builtin_module_names") => builtin_module_names(),
         // `prefix` follows the active virtual environment; `base_prefix` and
@@ -1674,6 +2388,16 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("_weakref" | "weakref", name) => weakref::constant(name),
         ("warnings" | "_warnings", name) => warnings::constant(name),
         ("marshal", name) => marshal::constant(name),
+        // `importlib`'s nested modules are real native modules; expose the
+        // exact `sys.modules` entry so identity holds.
+        ("importlib", "util" | "machinery" | "metadata" | "resources") => {
+            registry_lookup(&format!("importlib.{name}"))
+                .unwrap_or_else(|| value::module_value(format!("importlib.{name}")))
+        }
+        ("importlib.util", name) => importlib_util::constant(name),
+        ("importlib.machinery", name) => importlib_machinery::constant(name),
+        ("importlib.metadata", name) => importlib_metadata::constant(name),
+        ("importlib.resources", name) => importlib_resources::constant(name),
         // `collections.abc` is a nested module. These constants expose the
         // module value so `collections.abc.Mapping` resolves through the
         // runtime module (the frontend does not model general nested-module
@@ -2534,6 +3258,9 @@ pub(crate) fn floor_sqrt_int(v: i64) -> i64 {
 /// them happens when the partial is called (see
 /// `value::partial_new_with_keywords`).
 fn functools_call(function: &str, args: &[i64]) -> i64 {
+    if let Some(result) = functools::call(function, args) {
+        return result;
+    }
     match function {
         "reduce" => reduce(args),
         // `@cache` is an identity decorator: the function itself is returned.
@@ -2549,6 +3276,7 @@ fn functools_call(function: &str, args: &[i64]) -> i64 {
 fn functools_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
     match function {
         "partial" => value::partial_new_with_keywords(args[0], args[1..].to_vec(), keywords),
+        "partialmethod" => functools::new_partialmethod(args, &keywords),
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("functools.{function}() does not accept keyword arguments"),
@@ -3440,7 +4168,7 @@ fn json_parse_error(message: &str) -> i64 {
     exc::raise_with_message(VALUE_ERROR, message)
 }
 
-fn json_call(function: &str, args: &[i64]) -> i64 {
+pub(crate) fn json_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "dumps" => json_dumps(args),
         "loads" => json_loads(args[0]),
@@ -4286,6 +5014,19 @@ fn os_path_predicate(function: &str, value: i64, accept: fn(&std::fs::Metadata) 
     }
 }
 
+/// `os.path.isabs(path)`: whether the path is absolute under POSIX rules
+/// (a leading separator). A `TypeError` is pending for non-path arguments.
+fn os_path_isabs(value: i64) -> i64 {
+    let Some(path) = os_path_arg("isabs", value) else {
+        return NONE;
+    };
+    if std::path::Path::new(path).is_absolute() {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
 fn os_path_abspath(value: i64) -> i64 {
     let Some(path) = os_path_arg("abspath", value) else {
         return NONE;
@@ -4324,6 +5065,186 @@ fn os_path_splitext_pair(value: i64) -> i64 {
     value::tuple_new(vec![root, extension])
 }
 
+/// `os.path.normcase(path)`: on POSIX this is the identity (CPython's
+/// `posixpath.normcase` returns the path unchanged).
+fn os_path_normcase(value: i64) -> i64 {
+    match os_path_arg("normcase", value) {
+        Some(path) => value::str_alloc(path.to_string()),
+        None => NONE,
+    }
+}
+
+/// One component while resolving symlinks.
+enum RealpathStep {
+    Root,
+    Parent,
+    Normal(std::ffi::OsString),
+}
+
+/// Resolves `path` component by component, following symlinks. Returns the
+/// resolved path plus whether a symlink loop (or over-deep expansion) was
+/// detected; the non-strict caller keeps the partial result in that case.
+fn resolve_symlinks(path: &Path) -> (PathBuf, bool) {
+    let mut resolved = PathBuf::new();
+    let mut steps: VecDeque<RealpathStep> = VecDeque::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                steps.push_back(RealpathStep::Normal(prefix.as_os_str().to_owned()))
+            }
+            std::path::Component::RootDir => steps.push_back(RealpathStep::Root),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => steps.push_back(RealpathStep::Parent),
+            std::path::Component::Normal(part) => {
+                steps.push_back(RealpathStep::Normal(part.to_owned()))
+            }
+        }
+    }
+    let mut hops = 0usize;
+    while let Some(step) = steps.pop_front() {
+        match step {
+            RealpathStep::Root => {
+                resolved.clear();
+                resolved.push(std::path::MAIN_SEPARATOR.to_string());
+            }
+            RealpathStep::Parent => {
+                resolved.pop();
+            }
+            RealpathStep::Normal(name) => {
+                let candidate = resolved.join(&name);
+                match std::fs::read_link(&candidate) {
+                    Ok(target) => {
+                        hops += 1;
+                        if hops > 40 {
+                            // Non-strict callers keep the resolved prefix;
+                            // adding the loop component keeps the spelling
+                            // deterministic.
+                            resolved.push(name);
+                            return (resolved, true);
+                        }
+                        let mut substituted: VecDeque<RealpathStep> = VecDeque::new();
+                        if target.is_absolute() {
+                            resolved.clear();
+                            resolved.push(std::path::MAIN_SEPARATOR.to_string());
+                        }
+                        for component in target.components() {
+                            match component {
+                                std::path::Component::Prefix(prefix) => substituted
+                                    .push_back(RealpathStep::Normal(prefix.as_os_str().to_owned())),
+                                std::path::Component::RootDir => {
+                                    substituted.push_back(RealpathStep::Root)
+                                }
+                                std::path::Component::CurDir => {}
+                                std::path::Component::ParentDir => {
+                                    substituted.push_back(RealpathStep::Parent)
+                                }
+                                std::path::Component::Normal(part) => {
+                                    substituted.push_back(RealpathStep::Normal(part.to_owned()))
+                                }
+                            }
+                        }
+                        while let Some(step) = steps.pop_front() {
+                            substituted.push_back(step);
+                        }
+                        steps = substituted;
+                    }
+                    Err(_) => resolved.push(name),
+                }
+            }
+        }
+    }
+    (resolved, false)
+}
+
+/// `os.path.realpath(filename, *, strict=False)`: resolves symlinks and
+/// normalises the result. A missing path is returned as an absolute path when
+/// `strict` is false, and raises `OSError` when it is true, like CPython.
+fn os_path_realpath(value: i64, strict: bool) -> i64 {
+    let Some(path) = os_path_arg("realpath", value) else {
+        return NONE;
+    };
+    let path = Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) if path.as_os_str().is_empty() => cwd,
+            Ok(cwd) => cwd.join(path),
+            Err(error) => {
+                return exc::raise_with_message(OS_ERROR, &format!("realpath: {error}"));
+            }
+        }
+    };
+    let (resolved, looped) = resolve_symlinks(&absolute);
+    let resolved = normalize_path(&resolved);
+    if strict {
+        if looped {
+            return exc::raise_with_message(
+                OS_ERROR,
+                "realpath: too many levels of symbolic links",
+            );
+        }
+        if !resolved.exists() {
+            return exc::raise_with_message(
+                OS_ERROR,
+                &format!(
+                    "realpath: no such file or directory: {}",
+                    resolved.to_string_lossy()
+                ),
+            );
+        }
+    }
+    value::str_alloc(resolved.to_string_lossy().into_owned())
+}
+
+/// Keyword-aware `os.path` dispatch: `realpath` binds `strict`.
+fn os_path_call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if function != "realpath" {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("os.path.{function}() does not accept keyword arguments"),
+        );
+    }
+    let mut filename = args.first().copied();
+    let mut strict = false;
+    if args.len() > 1 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "realpath() takes at most 2 arguments ({} given)",
+                args.len()
+            ),
+        );
+    }
+    for (name, item) in keywords {
+        match name.as_str() {
+            "filename" => {
+                if filename.is_some() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "realpath() got multiple values for argument 'filename'",
+                    );
+                }
+                filename = Some(*item);
+            }
+            "strict" => strict = value::truthy(*item),
+            other => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("realpath() got an unexpected keyword argument '{other}'"),
+                )
+            }
+        }
+    }
+    match filename {
+        Some(value_arg) => os_path_realpath(value_arg, strict),
+        None => exc::raise_with_message(
+            TYPE_ERROR,
+            "realpath() missing required argument 'filename'",
+        ),
+    }
+}
+
 /// `os.path`: pure string manipulation plus filesystem predicates.
 fn os_path_call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -4339,14 +5260,189 @@ fn os_path_call(function: &str, args: &[i64]) -> i64 {
         "exists" => os_path_predicate("exists", args[0], |_| true),
         "isfile" => os_path_predicate("isfile", args[0], |metadata| metadata.is_file()),
         "isdir" => os_path_predicate("isdir", args[0], |metadata| metadata.is_dir()),
+        "isabs" => os_path_isabs(args[0]),
         "abspath" => os_path_abspath(args[0]),
         "splitext" => os_path_splitext_pair(args[0]),
         "split" => os_path_split_pair(args[0]),
+        "normcase" => os_path_normcase(args[0]),
+        "realpath" => os_path_realpath(args[0], args.get(1).is_some_and(|v| value::truthy(*v))),
         _ => missing_attribute("os.path", function),
     }
 }
 
 // os
+
+/// `os.stat(path, *, dir_fd=None, follow_symlinks=True)`: the metadata of
+/// `path` as an `os.stat_result`-shaped namespace.
+///
+/// The frontend reorders keyword spellings into the positional slots (padding
+/// omitted ones with `None`), so `args` may hold up to three entries. The
+/// default follows symlinks (`std::fs::metadata`); `follow_symlinks` false
+/// inspects the link itself. `dir_fd` has no runtime representation, so only
+/// `None` is accepted. Failures raise the CPython OSError subclass matching the
+/// `io::ErrorKind`, worded as `[Errno N] message: 'path'`.
+fn os_stat(args: &[i64]) -> i64 {
+    let Some(path_value) = args.first().copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "stat() missing required argument 'path' (pos 1)",
+        );
+    };
+    if let Some(dir_fd) = args.get(1).copied() {
+        if dir_fd != NONE {
+            return exc::raise_with_message(
+                exc::NOT_IMPLEMENTED_ERROR,
+                "os.stat: dir_fd is not supported",
+            );
+        }
+    }
+    let follow_symlinks = match args.get(2).copied() {
+        None | Some(NONE) => true,
+        Some(flag) => value::truthy(flag),
+    };
+    let Some(path) = value::as_path_like(path_value) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "stat() argument must be a path string, not {}",
+                value::type_name(path_value)
+            ),
+        );
+    };
+    let result = if follow_symlinks {
+        std::fs::metadata(path)
+    } else {
+        std::fs::symlink_metadata(path)
+    };
+    match result {
+        Ok(metadata) => stat_result(&metadata),
+        Err(error) => os_stat_error(error, path),
+    }
+}
+
+/// Appends one `os.stat_result` field to `namespace`.
+///
+/// The field value is rooted across the mutation so a collection triggered
+/// while the container lock is held cannot free it; the namespace itself is
+/// rooted by the caller until every field is stored.
+fn stat_field(namespace: i64, name: &str, field: i64) {
+    let roots = crate::heap::root_values(&[field]);
+    if let Some(mut state) = value::namespace_pairs_mut(namespace) {
+        state.pairs.push((name.to_string(), field));
+    }
+    crate::heap::write_barrier_edge(namespace, field);
+    crate::heap::release_roots(roots);
+}
+
+/// Encodes a metadata integer, promoting past the tagged-integer range.
+fn stat_int(number: i128) -> i64 {
+    match i64::try_from(number) {
+        Ok(small) => {
+            value::encode_int(small).unwrap_or_else(|| value::bigint_new(BigInt::from(small)))
+        }
+        Err(_) => value::bigint_new(BigInt::from(number)),
+    }
+}
+
+/// Builds the `os.stat_result` namespace. The `st_*_ns` names are the exact
+/// integer aliases of the float second fields, like CPython's `stat_result`.
+#[cfg(unix)]
+fn stat_result(metadata: &std::fs::Metadata) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let atime_ns = i128::from(metadata.atime()) * 1_000_000_000 + i128::from(metadata.atime_nsec());
+    let mtime_ns = i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+    let ctime_ns = i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec());
+    let seconds = |nanos: i128| value::float_new(nanos as f64 / 1_000_000_000.0);
+    let namespace = value::namespace_new(Vec::new());
+    let roots = crate::heap::root_values(&[namespace]);
+    stat_field(namespace, "st_mode", stat_int(i128::from(metadata.mode())));
+    stat_field(namespace, "st_ino", stat_int(i128::from(metadata.ino())));
+    stat_field(namespace, "st_dev", stat_int(i128::from(metadata.dev())));
+    stat_field(
+        namespace,
+        "st_nlink",
+        stat_int(i128::from(metadata.nlink())),
+    );
+    stat_field(namespace, "st_uid", stat_int(i128::from(metadata.uid())));
+    stat_field(namespace, "st_gid", stat_int(i128::from(metadata.gid())));
+    stat_field(namespace, "st_size", stat_int(i128::from(metadata.size())));
+    stat_field(namespace, "st_atime", seconds(atime_ns));
+    stat_field(namespace, "st_mtime", seconds(mtime_ns));
+    stat_field(namespace, "st_ctime", seconds(ctime_ns));
+    stat_field(namespace, "st_atime_ns", stat_int(atime_ns));
+    stat_field(namespace, "st_mtime_ns", stat_int(mtime_ns));
+    stat_field(namespace, "st_ctime_ns", stat_int(ctime_ns));
+    stat_field(namespace, "st_rdev", stat_int(i128::from(metadata.rdev())));
+    stat_field(
+        namespace,
+        "st_blksize",
+        stat_int(i128::from(metadata.blksize())),
+    );
+    stat_field(
+        namespace,
+        "st_blocks",
+        stat_int(i128::from(metadata.blocks())),
+    );
+    crate::heap::release_roots(roots);
+    namespace
+}
+
+/// Non-Unix `os.stat_result`: the portable metadata fields, with zero for the
+/// POSIX-only identities.
+#[cfg(not(unix))]
+fn stat_result(metadata: &std::fs::Metadata) -> i64 {
+    use std::time::UNIX_EPOCH;
+    let seconds = |time: std::io::Result<SystemTime>| {
+        time.ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0.0, |duration| duration.as_secs_f64())
+    };
+    let atime = seconds(metadata.accessed());
+    let mtime = seconds(metadata.modified());
+    let ctime = seconds(metadata.created());
+    let mode = if metadata.is_dir() {
+        0o040755
+    } else {
+        0o100644
+    };
+    let nanos = |seconds: f64| stat_int((seconds * 1_000_000_000.0) as i128);
+    let namespace = value::namespace_new(Vec::new());
+    let roots = crate::heap::root_values(&[namespace]);
+    stat_field(namespace, "st_mode", encode_int(mode));
+    stat_field(namespace, "st_ino", encode_int(0));
+    stat_field(namespace, "st_dev", encode_int(0));
+    stat_field(namespace, "st_nlink", encode_int(1));
+    stat_field(namespace, "st_uid", encode_int(0));
+    stat_field(namespace, "st_gid", encode_int(0));
+    stat_field(namespace, "st_size", stat_int(i128::from(metadata.len())));
+    stat_field(namespace, "st_atime", value::float_new(atime));
+    stat_field(namespace, "st_mtime", value::float_new(mtime));
+    stat_field(namespace, "st_ctime", value::float_new(ctime));
+    stat_field(namespace, "st_atime_ns", nanos(atime));
+    stat_field(namespace, "st_mtime_ns", nanos(mtime));
+    stat_field(namespace, "st_ctime_ns", nanos(ctime));
+    stat_field(namespace, "st_rdev", encode_int(0));
+    stat_field(namespace, "st_blksize", encode_int(4096));
+    stat_field(namespace, "st_blocks", encode_int(0));
+    crate::heap::release_roots(roots);
+    namespace
+}
+
+/// Raises the OSError subclass matching `error` with CPython's
+/// `[Errno N] message: 'path'` wording.
+fn os_stat_error(error: std::io::Error, path: &str) -> i64 {
+    let tag = match error.kind() {
+        std::io::ErrorKind::NotFound => exc::FILE_NOT_FOUND_ERROR,
+        std::io::ErrorKind::PermissionDenied => exc::PERMISSION_ERROR,
+        _ => OS_ERROR,
+    };
+    let text = error.to_string();
+    let detail = text.split(" (os error").next().unwrap_or(text.as_str());
+    match error.raw_os_error() {
+        Some(code) => exc::raise_with_message(tag, &format!("[Errno {code}] {detail}: '{path}'")),
+        None => exc::raise_with_message(tag, &format!("{detail}: '{path}'")),
+    }
+}
 
 fn os_call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -4447,6 +5543,7 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
             }
         }
         "access" => os_access(args),
+        "stat" => os_stat(args),
         "sysconf" => os_sysconf(args),
         "getloadavg" => os_getloadavg(),
         "uname" => os_uname(),
@@ -4834,8 +5931,81 @@ fn os_access(args: &[i64]) -> i64 {
 fn sys_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "exit" => sys_exit(args),
+        "exc_info" => exc::exc_info(),
+        "excepthook" => sys_excepthook(args),
+        "getrecursionlimit" => sys_getrecursionlimit(),
+        "setrecursionlimit" => sys_setrecursionlimit(args),
         _ => missing_attribute("sys", function),
     }
+}
+
+/// CPython's default recursion limit.
+const DEFAULT_RECURSION_LIMIT: usize = 1000;
+
+/// Process-wide recursion limit, read by `sys.getrecursionlimit` and written
+/// by `sys.setrecursionlimit`. It is a real process-global setting (repeated
+/// calls observe the stored value), matching CPython's model where every
+/// thread shares one limit.
+static RECURSION_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_RECURSION_LIMIT);
+
+/// The current process-wide recursion limit.
+pub(crate) fn recursion_limit() -> usize {
+    RECURSION_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Encodes a `usize` limit as a Python integer (tagged when it fits, a bigint
+/// otherwise).
+fn recursion_limit_value(limit: usize) -> i64 {
+    match i64::try_from(limit).ok().map(encode_int) {
+        Some(value) => value,
+        None => value::bigint_new(BigInt::from(limit)),
+    }
+}
+
+fn sys_getrecursionlimit() -> i64 {
+    recursion_limit_value(recursion_limit())
+}
+
+/// `sys.setrecursionlimit(limit)`: validates the new limit like CPython and
+/// stores it for the process. The limit must be an integer greater than zero
+/// (and above the current recursion depth, which is 0 here).
+fn sys_setrecursionlimit(args: &[i64]) -> i64 {
+    let limit = args.first().copied().unwrap_or(NONE);
+    let Some(limit_value) = value::to_bigint(limit) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(limit)
+            ),
+        );
+    };
+    let Some(limit) = limit_value.to_usize() else {
+        return exc::raise_with_message(
+            RECURSION_ERROR,
+            &format!(
+                "cannot set the recursion limit to {limit_value} at the recursion depth 0: \
+                 the limit is too low"
+            ),
+        );
+    };
+    if limit == 0 {
+        return exc::raise_with_message(
+            RECURSION_ERROR,
+            "cannot set the recursion limit to 0 at the recursion depth 0: the limit is too low",
+        );
+    }
+    RECURSION_LIMIT.store(limit, Ordering::Relaxed);
+    NONE
+}
+
+/// `sys.excepthook(type, value, traceback)`: prints the exception's traceback
+/// to stderr and returns `None`; `type=None` prints nothing.
+fn sys_excepthook(args: &[i64]) -> i64 {
+    let exc_type = args.first().copied().unwrap_or(NONE);
+    let value = args.get(1).copied().unwrap_or(NONE);
+    let traceback = args.get(2).copied().unwrap_or(NONE);
+    exc::excepthook(exc_type, value, traceback)
 }
 
 /// `sys.exit(code=None)`: raises `SystemExit`, which `try/except
@@ -4864,10 +6034,14 @@ fn io_call(function: &str, args: &[i64]) -> i64 {
     if let Some(method) = function.strip_prefix("BytesIO.") {
         return bytes_io_method(method, args);
     }
+    if let Some(method) = function.strip_prefix("TextIOWrapper.") {
+        return text_io_wrapper_method(method, args);
+    }
     match function {
         "open" => io_open(args),
         "StringIO" => string_io_new(args),
         "BytesIO" => bytes_io_new(args),
+        "TextIOWrapper" => text_io_wrapper_new(args),
         _ => missing_attribute("io", function),
     }
 }
@@ -5417,6 +6591,760 @@ fn bytes_io_method(method: &str, args: &[i64]) -> i64 {
     }
 }
 
+const TW_BUFFER: &str = "_hydro_tw_buffer";
+const TW_ERRORS: &str = "_hydro_tw_errors";
+const TW_NEWLINE: &str = "_hydro_tw_newline";
+const TW_SEEN: &str = "_hydro_tw_seen";
+
+/// The cached `io.TextIOWrapper` class. Instances are ordinary native class
+/// instances; the wrapped file object lives in an instance attribute, so the
+/// wrapper's lifetime keeps the buffer reachable.
+fn text_io_wrapper_class() -> i64 {
+    let native = |name: &'static str, arity: usize| value::native_function_new("io", name, arity);
+    in_memory_class(
+        "TextIOWrapper",
+        vec![
+            ("read".to_string(), native("TextIOWrapper.read", 2)),
+            ("readline".to_string(), native("TextIOWrapper.readline", 2)),
+            (
+                "readlines".to_string(),
+                native("TextIOWrapper.readlines", 2),
+            ),
+            ("write".to_string(), native("TextIOWrapper.write", 2)),
+            (
+                "writelines".to_string(),
+                native("TextIOWrapper.writelines", 2),
+            ),
+            ("close".to_string(), native("TextIOWrapper.close", 1)),
+            ("flush".to_string(), native("TextIOWrapper.flush", 1)),
+            ("seek".to_string(), native("TextIOWrapper.seek", 3)),
+            ("tell".to_string(), native("TextIOWrapper.tell", 1)),
+            ("readable".to_string(), native("TextIOWrapper.readable", 1)),
+            ("writable".to_string(), native("TextIOWrapper.writable", 1)),
+            ("seekable".to_string(), native("TextIOWrapper.seekable", 1)),
+            ("isatty".to_string(), native("TextIOWrapper.isatty", 1)),
+            ("detach".to_string(), native("TextIOWrapper.detach", 1)),
+            (
+                "__enter__".to_string(),
+                native("TextIOWrapper.__enter__", 1),
+            ),
+            ("__exit__".to_string(), native("TextIOWrapper.__exit__", 4)),
+            ("__iter__".to_string(), native("TextIOWrapper.__iter__", 1)),
+            ("__next__".to_string(), native("TextIOWrapper.__next__", 1)),
+        ],
+    )
+}
+
+/// Snapshot of the remaining buffer content and the position it started at.
+struct TwRead {
+    /// Decoded text (never newline-translated).
+    text: String,
+    /// Character position the read started at (bytes for a binary buffer).
+    start: usize,
+    /// Byte length of `text` in the buffer encoding (binary buffers only).
+    bytes: usize,
+    /// True when the wrapped object stores raw bytes.
+    binary: bool,
+}
+
+fn tw_buffer(instance: i64) -> Option<i64> {
+    value::instance_attr(instance, TW_BUFFER).filter(|buffer| *buffer != NONE)
+}
+
+fn tw_file(instance: i64) -> Option<&'static value::FileState> {
+    value::as_file(tw_buffer(instance)?)
+}
+
+fn tw_newline(instance: i64) -> Option<String> {
+    match value::instance_attr(instance, TW_NEWLINE) {
+        Some(value) if value != NONE => value::as_str(value).map(str::to_string),
+        _ => None,
+    }
+}
+
+fn tw_errors(instance: i64) -> i64 {
+    value::instance_attr(instance, TW_ERRORS).unwrap_or(NONE)
+}
+
+/// Raises `ValueError` when the wrapper or its buffer is closed.
+fn tw_check_open(instance: i64) -> Option<i64> {
+    let closed = value::instance_attr(instance, "closed") == Some(TRUE);
+    let buffer = tw_buffer(instance);
+    let buffer_closed = match buffer.and_then(value::as_file) {
+        Some(file) => file.closed(),
+        None => true,
+    };
+    if closed || buffer_closed {
+        return Some(exc::raise_with_message(
+            VALUE_ERROR,
+            "I/O operation on closed file.",
+        ));
+    }
+    None
+}
+
+/// `io.TextIOWrapper(buffer, encoding=None, errors=None, newline=None,
+/// line_buffering=False, write_through=False)`.
+fn text_io_wrapper_new(args: &[i64]) -> i64 {
+    let Some(&buffer) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "TextIOWrapper() missing buffer argument");
+    };
+    let Some(file) = value::as_file(buffer) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "TextIOWrapper() buffer must be a file object, not {}",
+                value::type_name(buffer)
+            ),
+        );
+    };
+    let encoding = match args.get(1).copied() {
+        None | Some(NONE) => "utf-8".to_string(),
+        Some(value) => {
+            let Some(name) = value::as_str(value) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "TextIOWrapper() encoding must be str or None, not {}",
+                        value::type_name(value)
+                    ),
+                );
+            };
+            let normalized = name.to_ascii_lowercase();
+            if normalized != "utf-8" && normalized != "utf8" {
+                return exc::raise_with_message(
+                    VALUE_ERROR,
+                    &format!("unsupported encoding: '{name}'"),
+                );
+            }
+            "utf-8".to_string()
+        }
+    };
+    let errors = match args.get(2).copied() {
+        None | Some(NONE) => value::str_from_bytes(b"strict"),
+        Some(value) => match value::as_str(value) {
+            Some(_) => value,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "TextIOWrapper() errors must be str or None, not {}",
+                        value::type_name(value)
+                    ),
+                )
+            }
+        },
+    };
+    let newline = match args.get(3).copied() {
+        None | Some(NONE) => NONE,
+        Some(value) => {
+            let Some(text) = value::as_str(value) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "TextIOWrapper() newline must be str or None, not {}",
+                        value::type_name(value)
+                    ),
+                );
+            };
+            match text {
+                "" | "\n" | "\r" | "\r\n" => value,
+                _ => {
+                    return exc::raise_with_message(
+                        VALUE_ERROR,
+                        &format!("illegal newline value: {text}"),
+                    )
+                }
+            }
+        }
+    };
+    let line_buffering = args.get(4).copied().is_some_and(value::truthy);
+    let write_through = args.get(5).copied().is_some_and(value::truthy);
+    // Snapshot the buffer's metadata before allocating the instance.
+    let name = file.path().to_string();
+    let mode = file.mode();
+    let binary = file.binary();
+    let instance = value::instance_new(text_io_wrapper_class());
+    let roots = heap::root_values(&[instance, buffer]);
+    io_store(instance, TW_BUFFER, buffer);
+    io_store(instance, "buffer", buffer);
+    io_store(instance, TW_ERRORS, errors);
+    io_store(instance, TW_NEWLINE, newline);
+    io_store(instance, TW_SEEN, encode_int(0));
+    io_store(instance, "closed", FALSE);
+    io_store(instance, "name", value::str_from_bytes(name.as_bytes()));
+    io_store(
+        instance,
+        "mode",
+        value::str_alloc(format!("{mode}{}", if binary { "b" } else { "" })),
+    );
+    io_store(
+        instance,
+        "encoding",
+        value::str_from_bytes(encoding.as_bytes()),
+    );
+    io_store(instance, "errors", errors);
+    io_store(instance, "newlines", NONE);
+    io_store(
+        instance,
+        "line_buffering",
+        value::bool_value(line_buffering),
+    );
+    io_store(instance, "write_through", value::bool_value(write_through));
+    heap::release_roots(roots);
+    instance
+}
+
+/// Decodes raw buffer bytes through the existing native UTF-8 codec so the
+/// `strict`/`ignore`/`replace` (and registered) error handlers are the ones
+/// `codecs` already implements.
+fn tw_decode(data: &[u8], errors: i64) -> Result<String, i64> {
+    let bytes = value::bytes_new(data.to_vec());
+    let args = [bytes, errors, TRUE];
+    let decoded = codecs::call("utf_8_decode", &args);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    let Some(items) = value::as_tuple(decoded) else {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            "UTF-8 decoder returned a non-tuple",
+        ));
+    };
+    match items.first().copied().and_then(value::as_str) {
+        Some(text) => Ok(text.to_string()),
+        None => Err(exc::raise_with_message(
+            TYPE_ERROR,
+            "UTF-8 decoder returned a non-string",
+        )),
+    }
+}
+
+/// Reads the rest of the buffer from the current position. The cursor is left
+/// at end-of-file; callers reposition it once they know the consumed prefix.
+fn tw_read_remaining(instance: i64) -> Result<TwRead, i64> {
+    if let Some(error) = tw_check_open(instance) {
+        return Err(error);
+    }
+    let Some(file) = tw_file(instance) else {
+        return Err(exc::raise_with_message(
+            VALUE_ERROR,
+            "I/O operation on closed file.",
+        ));
+    };
+    let start = match file.tell() {
+        Ok(position) => position,
+        Err(error) => return Err(value::raise_file_error(error)),
+    };
+    let binary = file.binary();
+    if binary {
+        let data = match file.read_bytes(None) {
+            Ok(data) => data,
+            Err(error) => return Err(value::raise_file_error(error)),
+        };
+        let bytes = data.len();
+        let text = tw_decode(&data, tw_errors(instance))?;
+        Ok(TwRead {
+            text,
+            start,
+            bytes,
+            binary,
+        })
+    } else {
+        match file.read(None) {
+            Ok(text) => Ok(TwRead {
+                text,
+                start,
+                bytes: 0,
+                binary,
+            }),
+            Err(error) => Err(value::raise_file_error(error)),
+        }
+    }
+}
+
+/// Repositions the buffer to `start + consumed` so an under-read does not
+/// discard unread data.
+fn tw_reposition(instance: i64, start: usize, consumed: usize) -> Option<i64> {
+    let file = tw_file(instance)?;
+    let target = i64::try_from(start.saturating_add(consumed)).unwrap_or(value::MAX_INT);
+    match file.seek(target, 0) {
+        Ok(()) => None,
+        Err(error) => Some(value::raise_file_error(error)),
+    }
+}
+
+fn tw_consumed(read: &TwRead, prefix: &str, chars: usize) -> usize {
+    if !read.binary {
+        return chars;
+    }
+    if chars == read.text.chars().count() {
+        read.bytes
+    } else {
+        // The buffer encoding is UTF-8, so re-encoding the consumed prefix
+        // yields its byte length for valid input.
+        prefix.len()
+    }
+}
+
+/// Translates universal-newline input for the text layer: `newline=None`
+/// folds `\r\n` and `\r` to `\n`, while `newline=''` and an explicit newline
+/// leave the data untouched (CPython returns it untranslated too).
+fn tw_translate_read(text: &str, newline: Option<&str>) -> String {
+    if newline.is_some() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+/// Applies the write-side newline translation: `None` uses the platform line
+/// separator, `''`/`'\n'` keep `\n`, and explicit `'\r'`/`'\r\n'` replace it.
+fn tw_translate_write(text: &str, newline: Option<&str>) -> String {
+    let replacement = match newline {
+        None => {
+            if cfg!(windows) {
+                "\r\n"
+            } else {
+                "\n"
+            }
+        }
+        Some("") | Some("\n") => "\n",
+        Some("\r") => "\r",
+        Some("\r\n") => "\r\n",
+        // Validated by the constructor.
+        Some(_) => "\n",
+    };
+    text.replace('\n', replacement)
+}
+
+/// Index one past the last character of the first line in `chars`.
+fn tw_line_end(chars: &[char], newline: Option<&str>) -> usize {
+    match newline {
+        None | Some("") => {
+            for (index, character) in chars.iter().enumerate() {
+                if *character == '\n' {
+                    return index + 1;
+                }
+                if *character == '\r' {
+                    return if chars.get(index + 1) == Some(&'\n') {
+                        index + 2
+                    } else {
+                        index + 1
+                    };
+                }
+            }
+            chars.len()
+        }
+        Some(separator) => {
+            let target: Vec<char> = separator.chars().collect();
+            if target.is_empty() {
+                return chars.len();
+            }
+            for index in 0..chars.len() {
+                if index + target.len() <= chars.len()
+                    && &chars[index..index + target.len()] == target.as_slice()
+                {
+                    return index + target.len();
+                }
+            }
+            chars.len()
+        }
+    }
+}
+
+/// Updates the `newlines` attribute with the newline kinds observed so far.
+fn tw_record_newlines(instance: i64, text: &str) {
+    // CPython tracks the observed line endings only in universal-newline
+    // modes (`newline=None` or `newline=''`); with an explicit terminator the
+    // attribute stays `None`.
+    if let Some(separator) = tw_newline(instance) {
+        if !separator.is_empty() {
+            return;
+        }
+    }
+    let mut seen = value::instance_attr(instance, TW_SEEN)
+        .and_then(value::as_integer)
+        .unwrap_or(0);
+    let before = seen;
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '\r' => {
+                if chars.get(index + 1) == Some(&'\n') {
+                    seen |= 4;
+                    index += 1;
+                } else {
+                    seen |= 2;
+                }
+            }
+            '\n' => seen |= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    if seen == before {
+        return;
+    }
+    let mut names: Vec<&str> = Vec::new();
+    if seen & 4 != 0 {
+        names.push("\r\n");
+    }
+    if seen & 2 != 0 {
+        names.push("\r");
+    }
+    if seen & 1 != 0 {
+        names.push("\n");
+    }
+    let newlines = match names.as_slice() {
+        [] => NONE,
+        [only] => value::str_from_bytes(only.as_bytes()),
+        names => value::tuple_new(
+            names
+                .iter()
+                .map(|name| value::str_from_bytes(name.as_bytes()))
+                .collect(),
+        ),
+    };
+    io_store(instance, TW_SEEN, encode_int(seen));
+    io_store(instance, "newlines", newlines);
+}
+
+fn tw_limit(args: &[i64], index: usize) -> Result<i64, i64> {
+    match args.get(index).copied() {
+        None | Some(NONE) => Ok(-1),
+        Some(value) => match value::as_integer(value) {
+            Some(limit) => Ok(limit),
+            None => Err(exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "argument should be integer or None, not {}",
+                    value::type_name(value)
+                ),
+            )),
+        },
+    }
+}
+
+/// `TextIOWrapper.read(size=-1)`.
+fn tw_read(instance: i64, limit: i64) -> i64 {
+    let read = match tw_read_remaining(instance) {
+        Ok(read) => read,
+        Err(error) => return error,
+    };
+    let total = read.text.chars().count();
+    let take = if limit < 0 {
+        total
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX).min(total)
+    };
+    let prefix: String = read.text.chars().take(take).collect();
+    let consumed = tw_consumed(&read, &prefix, take);
+    if let Some(error) = tw_reposition(instance, read.start, consumed) {
+        return error;
+    }
+    tw_record_newlines(instance, &prefix);
+    let newline = tw_newline(instance);
+    value::str_alloc(tw_translate_read(&prefix, newline.as_deref()))
+}
+
+/// `TextIOWrapper.readline(size=-1)`.
+fn tw_readline(instance: i64, limit: i64) -> i64 {
+    let read = match tw_read_remaining(instance) {
+        Ok(read) => read,
+        Err(error) => return error,
+    };
+    let total = read.text.chars().count();
+    let cap = if limit < 0 {
+        total
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX).min(total)
+    };
+    let chars: Vec<char> = read.text.chars().take(cap).collect();
+    let newline = tw_newline(instance);
+    let end = tw_line_end(&chars, newline.as_deref());
+    let prefix: String = chars[..end].iter().collect();
+    let consumed = tw_consumed(&read, &prefix, end);
+    if let Some(error) = tw_reposition(instance, read.start, consumed) {
+        return error;
+    }
+    tw_record_newlines(instance, &prefix);
+    value::str_alloc(tw_translate_read(&prefix, newline.as_deref()))
+}
+
+/// `TextIOWrapper.readlines(hint=-1)`.
+fn tw_readlines(instance: i64, hint: i64) -> i64 {
+    let result = value::list_new(Vec::new());
+    let roots = heap::root_values(&[result]);
+    let mut total = 0usize;
+    loop {
+        let line = tw_readline(instance, -1);
+        if exc::pending() {
+            heap::release_roots(roots);
+            return NONE;
+        }
+        let Some(text) = value::as_str(line) else {
+            heap::release_roots(roots);
+            return NONE;
+        };
+        if text.is_empty() {
+            break;
+        }
+        total = total.saturating_add(text.chars().count());
+        container::list_append(result, line);
+        if hint > 0 && total >= usize::try_from(hint).unwrap_or(usize::MAX) {
+            break;
+        }
+    }
+    heap::release_roots(roots);
+    result
+}
+
+/// `TextIOWrapper.write(text)`.
+fn tw_write(instance: i64, argument: i64) -> i64 {
+    if let Some(error) = tw_check_open(instance) {
+        return error;
+    }
+    let Some(text) = value::as_str(argument) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "write() argument must be str, not {}",
+                value::type_name(argument)
+            ),
+        );
+    };
+    let text = text.to_string();
+    let newline = tw_newline(instance);
+    let translated = tw_translate_write(&text, newline.as_deref());
+    let Some(file) = tw_file(instance) else {
+        return exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file.");
+    };
+    let written = if file.binary() {
+        file.write_bytes(translated.as_bytes())
+    } else {
+        file.write(&translated)
+    };
+    match written {
+        Ok(_) => encode_int(text.chars().count() as i64),
+        Err(error) => value::raise_file_error(error),
+    }
+}
+
+/// `TextIOWrapper.writelines(lines)`.
+fn tw_writelines(instance: i64, argument: i64) -> i64 {
+    let items = value::as_list(argument)
+        .or_else(|| value::as_tuple(argument))
+        .or_else(|| value::as_set(argument));
+    let Some(items) = items else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "writelines() argument must be an iterable of strings, not {}",
+                value::type_name(argument)
+            ),
+        );
+    };
+    let items = items.to_vec();
+    for item in items {
+        let result = tw_write(instance, item);
+        if exc::pending() {
+            return result;
+        }
+    }
+    NONE
+}
+
+fn tw_close(instance: i64) -> i64 {
+    if value::instance_attr(instance, "closed") == Some(TRUE) {
+        return NONE;
+    }
+    if let Some(file) = tw_file(instance) {
+        file.close();
+    }
+    io_store(instance, "closed", TRUE);
+    NONE
+}
+
+/// Dispatches `io.TextIOWrapper.<method>`; the receiver is `args[0]`.
+fn text_io_wrapper_method(method: &str, args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("TextIOWrapper.{method}() missing self"),
+        );
+    };
+    match method {
+        "read" => {
+            let limit = match tw_limit(args, 1) {
+                Ok(limit) => limit,
+                Err(error) => return error,
+            };
+            tw_read(instance, limit)
+        }
+        "readline" => {
+            let limit = match tw_limit(args, 1) {
+                Ok(limit) => limit,
+                Err(error) => return error,
+            };
+            tw_readline(instance, limit)
+        }
+        "readlines" => {
+            let hint = match tw_limit(args, 1) {
+                Ok(hint) => hint,
+                Err(error) => return error,
+            };
+            tw_readlines(instance, hint)
+        }
+        "write" => {
+            let Some(argument) = args.get(1).copied() else {
+                return exc::raise_with_message(TYPE_ERROR, "write() missing required argument");
+            };
+            tw_write(instance, argument)
+        }
+        "writelines" => {
+            let Some(argument) = args.get(1).copied() else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "writelines() missing required argument",
+                );
+            };
+            tw_writelines(instance, argument)
+        }
+        "close" => tw_close(instance),
+        "flush" => {
+            if let Some(error) = tw_check_open(instance) {
+                return error;
+            }
+            match tw_file(instance).map(|file| file.flush()) {
+                Some(Ok(())) => NONE,
+                Some(Err(error)) => value::raise_file_error(error),
+                None => exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file."),
+            }
+        }
+        "seek" => {
+            if let Some(error) = tw_check_open(instance) {
+                return error;
+            }
+            let Some(&offset) = args.get(1) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "seek() missing required argument 'pos'",
+                );
+            };
+            let Some(offset) = value::as_integer(offset) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "integer argument expected, got {}",
+                        value::type_name(offset)
+                    ),
+                );
+            };
+            let whence = match args.get(2).copied() {
+                None | Some(NONE) => 0,
+                Some(value) => match value::as_integer(value) {
+                    Some(whence) => whence,
+                    None => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("integer argument expected, got {}", value::type_name(value)),
+                        )
+                    }
+                },
+            };
+            let Some(file) = tw_file(instance) else {
+                return exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file.");
+            };
+            match file.seek(offset, whence) {
+                Ok(()) => match file.tell() {
+                    Ok(position) => encode_int(i64::try_from(position).unwrap_or(value::MAX_INT)),
+                    Err(error) => value::raise_file_error(error),
+                },
+                Err(error) => value::raise_file_error(error),
+            }
+        }
+        "tell" => {
+            if let Some(error) = tw_check_open(instance) {
+                return error;
+            }
+            match tw_file(instance).map(|file| file.tell()) {
+                Some(Ok(position)) => encode_int(i64::try_from(position).unwrap_or(value::MAX_INT)),
+                Some(Err(error)) => value::raise_file_error(error),
+                None => exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file."),
+            }
+        }
+        "readable" | "writable" | "seekable" => {
+            if let Some(error) = tw_check_open(instance) {
+                return error;
+            }
+            let Some(file) = tw_file(instance) else {
+                return exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file.");
+            };
+            let mode = file.mode();
+            value::bool_value(match method {
+                "readable" => mode == 'r',
+                "writable" => mode != 'r',
+                _ => true,
+            })
+        }
+        "isatty" => {
+            if let Some(error) = tw_check_open(instance) {
+                return error;
+            }
+            FALSE
+        }
+        "detach" => {
+            let Some(buffer) = tw_buffer(instance) else {
+                return exc::raise_with_message(VALUE_ERROR, "underlying buffer has been detached");
+            };
+            io_store(instance, TW_BUFFER, NONE);
+            io_store(instance, "buffer", NONE);
+            io_store(instance, "closed", TRUE);
+            buffer
+        }
+        "__enter__" => {
+            if let Some(error) = tw_check_open(instance) {
+                return error;
+            }
+            instance
+        }
+        "__exit__" => {
+            tw_close(instance);
+            FALSE
+        }
+        "__iter__" => {
+            if let Some(error) = tw_check_open(instance) {
+                return error;
+            }
+            instance
+        }
+        "__next__" => {
+            let line = tw_readline(instance, -1);
+            if exc::pending() {
+                return line;
+            }
+            match value::as_str(line) {
+                Some("") => exc::raise_with_message(exc::STOP_ITERATION, ""),
+                _ => line,
+            }
+        }
+        _ => missing_attribute("io", method),
+    }
+}
+
 pub(crate) fn io_open(args: &[i64]) -> i64 {
     let Some(path) = value::as_str(args[0]) else {
         return exc::raise_with_message(
@@ -5637,7 +7565,7 @@ fn getenv(args: &[i64]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exc::{ATTRIBUTE_ERROR, TYPE_ERROR, VALUE_ERROR};
+    use crate::exc::{ATTRIBUTE_ERROR, IMPORT_ERROR, TYPE_ERROR, VALUE_ERROR};
     use crate::value::{encode_int, FALSE, TRUE};
 
     fn int(n: i64) -> i64 {
@@ -5708,6 +7636,40 @@ mod tests {
         value::as_dict(dict)?
             .iter()
             .find_map(|(key, value)| (value::as_str(*key) == Some(name)).then_some(*value))
+    }
+
+    /// Reads a string-keyed entry from a namespace value.
+    fn namespace_value(namespace: i64, name: &str) -> Option<i64> {
+        value::as_namespace(namespace)?
+            .iter()
+            .find_map(|(key, item)| (key.as_str() == name).then_some(*item))
+    }
+
+    /// Calls `obj.name(args...)` through the native method dispatcher.
+    fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
+        crate::core::methods::call(obj, name.as_ptr(), name.len(), args.len(), args.as_ptr())
+    }
+
+    /// Reads `obj.name` through the native attribute dispatcher.
+    fn attribute(obj: i64, name: &str) -> i64 {
+        crate::core::methods::getattr(obj, name.as_ptr(), name.len())
+    }
+
+    /// Serialises tests that depend on the process-wide site-packages setting.
+    static IMPORTLIB_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A usable installed-wheel root, configuring `HYDRO_SITE_PACKAGES` when
+    /// the test binary was started without it.
+    fn ensure_site_packages() -> Option<PathBuf> {
+        if let Some(raw) = std::env::var_os("HYDRO_SITE_PACKAGES") {
+            return std::env::split_paths(&raw).find(|path| path.is_dir());
+        }
+        let fallback = PathBuf::from("/tmp/pkgs");
+        if !fallback.is_dir() {
+            return None;
+        }
+        std::env::set_var("HYDRO_SITE_PACKAGES", &fallback);
+        Some(fallback)
     }
 
     #[test]
@@ -6197,6 +8159,69 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn sys_exception_functions_follow_handled_stack() {
+        exc::init();
+        // Outside `except` handling the triple is all `None`.
+        let outside = call("sys", "exc_info", &[]);
+        assert_eq!(value::as_tuple(outside), Some(&[NONE, NONE, NONE][..]));
+
+        // The spec and a first-class read yield the same callable behaviour.
+        assert!(stdlib::function("sys", "exc_info").is_some());
+        assert!(stdlib::function("sys", "excepthook").is_some());
+        assert_eq!(value::type_name(get("sys", "exc_info")), "function");
+        assert_eq!(value::type_name(get("sys", "excepthook")), "function");
+        let exc_info_fn = get("sys", "exc_info");
+        assert_eq!(
+            value::as_tuple(call_value(exc_info_fn, &[])),
+            Some(&[NONE, NONE, NONE][..])
+        );
+
+        // Inside a handler the triple is `(type(value), value, None)`.
+        let error = exc::exception_value(VALUE_ERROR, "boom", vec!["boom".to_string()]);
+        exc::handler_push(error);
+        let items = value::as_tuple(call("sys", "exc_info", &[])).expect("tuple");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], value::type_class(error));
+        assert_eq!(items[1], error);
+        assert_eq!(items[2], NONE);
+        // A `finally` marker above the handler does not shadow it.
+        exc::handler_push(NONE);
+        let items = value::as_tuple(call_value(exc_info_fn, &[])).expect("tuple");
+        assert_eq!(items[1], error);
+        exc::handler_pop();
+        exc::handler_pop();
+        assert_eq!(
+            value::as_tuple(call("sys", "exc_info", &[])),
+            Some(&[NONE, NONE, NONE][..])
+        );
+
+        // The hook returns `None`; `type=None` prints nothing. First-class
+        // access and the module-call path behave alike.
+        let hook = get("sys", "excepthook");
+        assert_eq!(call("sys", "excepthook", &[NONE, NONE, NONE]), NONE);
+        assert_eq!(call_value(hook, &[NONE, NONE, NONE]), NONE);
+        // A real exception is rendered to stderr, still returning `None`.
+        assert_eq!(
+            call(
+                "sys",
+                "excepthook",
+                &[value::type_class(error), error, NONE]
+            ),
+            NONE
+        );
+        assert!(!exc::pending());
+
+        // The declared arity is enforced for the module-call and the
+        // first-class entry point alike.
+        call("sys", "excepthook", &[NONE]);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+        call_value(hook, &[NONE]);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
     }
 
     #[test]
@@ -7328,8 +9353,23 @@ mod tests {
         assert!(!exc::pending());
     }
 
-    fn text(v: i64) -> String {
-        value::as_str(v).expect("string result").to_string()
+    /// Extracts a `str` result, naming the surface that produced it when the
+    /// call returned something else (or failed with a pending exception).
+    fn text_at(surface: &str, v: i64) -> String {
+        match value::as_str(v) {
+            Some(text) => text.to_string(),
+            None => {
+                let detail = if exc::pending() {
+                    value::to_string(exc::pending_value())
+                } else {
+                    "no pending exception".to_string()
+                };
+                panic!(
+                    "{surface} returned {} ({detail}), not str",
+                    value::type_name(v)
+                )
+            }
+        }
     }
 
     #[test]
@@ -7344,7 +9384,7 @@ mod tests {
             "_datetime_strftime",
             &[singleton, string("%Y%m%d")],
         );
-        let rendered = text(rendered);
+        let rendered = text_at("datetime._datetime_strftime", rendered);
         assert_eq!(rendered.len(), 8);
         assert!(rendered.bytes().all(|byte| byte.is_ascii_digit()));
     }
@@ -7432,23 +9472,35 @@ mod tests {
         exc::init();
         let object = value::dict_new(vec![(string("b"), int(1)), (string("a"), int(2))]);
         assert_eq!(
-            text(call("json", "dumps", &[object, int(2)])),
+            text_at("json.dumps", call("json", "dumps", &[object, int(2)])),
             "{\n  \"b\": 1,\n  \"a\": 2\n}"
         );
         // Trailing `None` keyword slots keep the defaults.
         assert_eq!(
-            text(call("json", "dumps", &[object, NONE, NONE, NONE, TRUE])),
+            text_at(
+                "json.dumps",
+                call("json", "dumps", &[object, NONE, NONE, NONE, TRUE]),
+            ),
             "{\"a\": 2, \"b\": 1}"
         );
         assert_eq!(
-            text(call("json", "dumps", &[string("ä"), NONE, FALSE])),
+            text_at(
+                "json.dumps",
+                call("json", "dumps", &[string("ä"), NONE, FALSE]),
+            ),
             "\"ä\""
         );
-        assert_eq!(text(call("json", "dumps", &[string("ä")])), "\"\\u00e4\"");
+        assert_eq!(
+            text_at("json.dumps", call("json", "dumps", &[string("ä")])),
+            "\"\\u00e4\""
+        );
         let separators = value::tuple_new(vec![string(","), string(":")]);
         let list = value::list_new(vec![int(1), int(2)]);
         assert_eq!(
-            text(call("json", "dumps", &[list, NONE, NONE, separators, NONE])),
+            text_at(
+                "json.dumps",
+                call("json", "dumps", &[list, NONE, NONE, separators, NONE]),
+            ),
             "[1,2]"
         );
 
@@ -7520,6 +9572,128 @@ mod tests {
         // Arity still comes from the central spec.
         assert_eq!(call("typing", "cast", &[NONE]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn new_stdlib_surfaces_resolve_through_the_module_api() {
+        // Nothing may reset the heap while this test resolves classes and
+        // instances: the values it compares are owned by that heap.
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        // Module-level caches are process-global: the `globals` registry holds
+        // the cached classes/instances and each module's native class
+        // registry compares against the heap generation, so a concurrent
+        // `globals::reset()` (and the heap reset behind it) can invalidate a
+        // cached value between two calls here. This broad smoke test therefore
+        // only checks that the module API yields usable values (a class value,
+        // an instance, a constant); pinning exact class identity or comparing
+        // pointers to independently cached values is left to each module's own
+        // tests, which resolve the class and the instance under one lock.
+        //
+        // `functools.Placeholder` is a public value (the singleton instance of
+        // its type); the repeat read shows the cache returns one value.
+        let placeholder = get("functools", "Placeholder");
+        assert_eq!(placeholder, get("functools", "Placeholder"));
+        assert!(
+            value::as_instance(placeholder).is_some(),
+            "functools.Placeholder is not an instance"
+        );
+
+        // `functools.partialmethod` is a class value and a constructor.
+        let pm_class = get("functools", "partialmethod");
+        assert!(value::as_class(pm_class).is_some());
+        let pm = call(
+            "functools",
+            "partialmethod",
+            &[get("functools", "reduce"), int(0)],
+        );
+        assert!(
+            value::as_instance(pm).is_some(),
+            "functools.partialmethod(...) returned no instance"
+        );
+
+        // `enum.IntFlag` and `ast.arg`.
+        assert_eq!(
+            value::as_class(get("enum", "IntFlag")).map(|class| class.name.as_str()),
+            Some("IntFlag")
+        );
+        // `ast.arg` may be built against a class registry rebuilt by another
+        // test's reset, so only the shape of the result is checked here;
+        // `ast`'s own tests assert the exact `arg` class of the node.
+        let arg = call("ast", "arg", &[string("x")]);
+        assert!(
+            value::as_instance(arg).is_some(),
+            "ast.arg(...) returned no instance"
+        );
+
+        // `types.DynamicClassAttribute` is a class value and a constructor.
+        let dca_class = get("types", "DynamicClassAttribute");
+        assert!(value::as_class(dca_class).is_some());
+        let dca = call("types", "DynamicClassAttribute", &[]);
+        assert!(
+            value::as_instance(dca).is_some(),
+            "types.DynamicClassAttribute(...) returned no instance"
+        );
+
+        // `sys` recursion limit is a real process-wide setting.
+        let limit = as_int(call("sys", "getrecursionlimit", &[]));
+        assert!(limit > 0);
+        assert_eq!(call("sys", "setrecursionlimit", &[int(limit)]), NONE);
+        assert_eq!(as_int(call("sys", "getrecursionlimit", &[])), limit);
+        assert_eq!(call("sys", "setrecursionlimit", &[int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), RECURSION_ERROR as i64);
+        exc::init();
+
+        // `os.path.normcase` is the POSIX identity.
+        assert_eq!(
+            text_at(
+                "os.path.normcase",
+                call("os.path", "normcase", &[string("/tmp/Mixed/Case")]),
+            ),
+            "/tmp/Mixed/Case"
+        );
+
+        // `os.path.realpath` resolves a symlinked directory.
+        let root = temp_root("realpath");
+        let dir = make_dir(&root.join("dir"));
+        std::fs::write(dir.join("file.txt"), b"x").expect("write file");
+        let link = root.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&dir, &link).expect("create symlink");
+        let resolved = text_at(
+            "os.path.realpath",
+            call(
+                "os.path",
+                "realpath",
+                &[value::str_alloc(link.to_string_lossy().into_owned())],
+            ),
+        );
+        assert!(resolved.ends_with("/dir"), "{resolved}");
+        assert!(!resolved.contains("/link"), "{resolved}");
+
+        // Non-strict keeps a missing path absolute; strict raises OSError.
+        let missing = root.join("absent");
+        let lenient = text_at(
+            "os.path.realpath",
+            call(
+                "os.path",
+                "realpath",
+                &[value::str_alloc(missing.to_string_lossy().into_owned())],
+            ),
+        );
+        assert!(Path::new(&lenient).is_absolute());
+        exc::init();
+        call(
+            "os.path",
+            "realpath",
+            &[
+                value::str_alloc(missing.to_string_lossy().into_owned()),
+                TRUE,
+            ],
+        );
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+        exc::init();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -7704,5 +9878,908 @@ mod tests {
             Some(0.25)
         );
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn importlib_submodules_resolve_to_native_modules() {
+        globals::reset();
+        exc::init();
+        for name in [
+            "importlib.util",
+            "importlib.machinery",
+            "importlib.metadata",
+            "importlib.resources",
+        ] {
+            let module = call("importlib", "import_module", &[string(name)]);
+            assert_eq!(
+                value::as_module(module).map(|module| module.name()),
+                Some(name),
+                "{name}"
+            );
+            // Importing the CPython package would surface its files as origin.
+            let spec = get(name, "__spec__");
+            assert_eq!(
+                value::instance_attr(spec, "origin"),
+                Some(NONE),
+                "{name} must be native, not a package file"
+            );
+            assert_eq!(value::as_str(get(name, "__name__")), Some(name));
+            assert_eq!(
+                get(name, "__loader__"),
+                get("importlib.machinery", "BuiltinImporter")
+            );
+            assert!(!exc::pending(), "{name}");
+        }
+
+        // `importlib.util` and friends are attributes of the parent module.
+        for short in ["util", "machinery", "metadata", "resources"] {
+            let expected = format!("importlib.{short}");
+            let module = get("importlib", short);
+            assert_eq!(
+                value::as_module(module).map(|module| module.name()),
+                Some(expected.as_str()),
+                "{expected}"
+            );
+            assert_eq!(Some(module), crate::modules::registry_lookup(&expected));
+        }
+        assert_eq!(
+            value::as_str(get("importlib", "__package__")),
+            Some("importlib")
+        );
+        assert_eq!(
+            value::as_str(get("importlib.util", "__package__")),
+            Some("importlib")
+        );
+    }
+
+    #[test]
+    fn recomputed_spec_and_cache_functions_report_real_state() {
+        globals::reset();
+        exc::init();
+        let spec = call(
+            "importlib.util",
+            "find_spec",
+            &[string("importlib.metadata")],
+        );
+        assert!(
+            value::instance_class_value(spec).is_some(),
+            "ModuleSpec instance"
+        );
+        assert_eq!(
+            value::instance_attr(spec, "name").and_then(value::as_str),
+            Some("importlib.metadata")
+        );
+        assert_eq!(value::instance_attr(spec, "origin"), Some(NONE));
+        let loader = value::instance_attr(spec, "loader").expect("loader");
+        assert_eq!(
+            value::class_display_name(loader),
+            Some("BuiltinImporter"),
+            "native modules use BuiltinImporter"
+        );
+        assert_eq!(call("importlib", "invalidate_caches", &[]), NONE);
+        assert!(!exc::pending());
+
+        // `reload` re-imports built-ins (a no-op) but refuses to fake
+        // re-execution of a compiled Python module.
+        let math = call("importlib", "import_module", &[string("math")]);
+        assert_eq!(call("importlib", "reload", &[math]), math);
+        globals::reset();
+        exc::init();
+        globals::set("reload_target", "__name__", string("reload_target"));
+        let target = call("importlib", "import_module", &[string("reload_target")]);
+        exc::clear();
+        call("importlib", "reload", &[target]);
+        assert_eq!(exc::pending_tag(), i64::from(IMPORT_ERROR));
+        assert!(
+            message().contains("no runtime execution engine"),
+            "{}",
+            message()
+        );
+    }
+
+    #[test]
+    fn metadata_versions_come_from_installed_dist_info() {
+        let _guard = IMPORTLIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(_site) = ensure_site_packages() else {
+            return;
+        };
+        globals::reset();
+        exc::init();
+        for (name, expected) in [
+            ("numpy", "2.5.0"),
+            ("pandas", "3.1.0"),
+            ("pydantic", "2.14.1"),
+        ] {
+            let version = call("importlib.metadata", "version", &[string(name)]);
+            assert_eq!(
+                value::as_str(version),
+                Some(expected),
+                "importlib.metadata.version({name:?})"
+            );
+            assert!(!exc::pending());
+        }
+
+        let package_metadata = call("importlib.metadata", "metadata", &[string("numpy")]);
+        assert_eq!(
+            registry_value(package_metadata, "Name").and_then(value::as_str),
+            Some("numpy")
+        );
+        assert_eq!(
+            registry_value(package_metadata, "Version").and_then(value::as_str),
+            Some("2.5.0")
+        );
+
+        let dist = call("importlib.metadata", "distribution", &[string("numpy")]);
+        assert_eq!(
+            value::instance_attr(dist, "version").and_then(value::as_str),
+            Some("2.5.0")
+        );
+        assert_eq!(
+            value::instance_attr(dist, "name").and_then(value::as_str),
+            Some("numpy")
+        );
+        let entries = value::instance_attr(dist, "entry_points").expect("entry_points");
+        let entries = value::as_list(entries).expect("entry list");
+        assert!(!entries.is_empty(), "numpy installs console entry points");
+        let console = entries
+            .iter()
+            .find(|entry| {
+                value::instance_attr(**entry, "group").and_then(value::as_str) == Some("pkg_config")
+            })
+            .expect("numpy pkg_config entry point");
+        assert_eq!(
+            value::instance_attr(*console, "name").and_then(value::as_str),
+            Some("numpy")
+        );
+        assert_eq!(
+            value::instance_attr(*console, "module").and_then(value::as_str),
+            Some("numpy._core.lib.pkgconfig")
+        );
+
+        // Metadata is read from the real file, not synthesized.
+        let dist_metadata = method(dist, "read_text", &[string("METADATA")]);
+        assert!(
+            value::as_str(dist_metadata).is_some_and(|text| text.contains("Name: numpy")),
+            "distribution.read_text('METADATA')"
+        );
+        // `entry_points()` parses the same `entry_points.txt`.
+        let all = call("importlib.metadata", "entry_points", &[]);
+        let all = value::as_list(all).expect("entry point list");
+        assert!(
+            all.iter().any(|entry| {
+                value::instance_attr(*entry, "module").and_then(value::as_str)
+                    == Some("numpy.f2py.f2py2e")
+            }),
+            "entry_points() must include numpy's f2py console script"
+        );
+        // The distribution names the .dist-info directory it was parsed from.
+        let metadata_path = value::instance_attr(dist, "_path")
+            .and_then(value::as_str)
+            .expect("dist-info path");
+        assert!(Path::new(metadata_path).is_dir(), "{metadata_path}");
+        assert_eq!(
+            Path::new(metadata_path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("numpy-2.5.0.dist-info")
+        );
+
+        assert_eq!(call("importlib", "invalidate_caches", &[]), NONE);
+    }
+
+    #[test]
+    fn metadata_missing_package_raises_package_not_found() {
+        let _guard = IMPORTLIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ensure_site_packages().is_none() {
+            return;
+        }
+        globals::reset();
+        exc::init();
+        call(
+            "importlib.metadata",
+            "version",
+            &[string("hydro-metadata-missing")],
+        );
+        // The class is the native `PackageNotFoundError` (a
+        // `ModuleNotFoundError` subclass); handler matching uses Hydro's
+        // `RuntimeError` approximation for non-builtin exception classes.
+        assert_eq!(exc::pending_tag(), i64::from(crate::exc::RUNTIME_ERROR));
+        let raised = exc::pending_value();
+        let class = value::instance_class_value(raised).expect("exception instance");
+        assert_eq!(
+            value::class_display_name(class),
+            Some("PackageNotFoundError")
+        );
+        assert_eq!(
+            value::to_string(raised),
+            "No package metadata was found for hydro-metadata-missing"
+        );
+    }
+
+    #[test]
+    fn util_file_specs_build_module_metadata_and_refuse_execution() {
+        let _guard = IMPORTLIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(site) = ensure_site_packages() else {
+            return;
+        };
+        let six = site.join("six.py");
+        if !six.is_file() {
+            return;
+        }
+        globals::reset();
+        exc::init();
+        let six_text = six.to_string_lossy().into_owned();
+        let spec = call(
+            "importlib.util",
+            "spec_from_file_location",
+            &[string("six"), string(&six_text)],
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::instance_class_value(spec).is_some());
+        assert_eq!(
+            value::instance_attr(spec, "name").and_then(value::as_str),
+            Some("six")
+        );
+        assert_eq!(
+            value::instance_attr(spec, "origin").and_then(value::as_str),
+            Some(six_text.as_str())
+        );
+        assert_eq!(value::instance_attr(spec, "has_location"), Some(TRUE));
+        assert_eq!(
+            value::instance_attr(spec, "submodule_search_locations"),
+            Some(NONE),
+            "six is a module, not a package"
+        );
+        let loader = value::instance_attr(spec, "loader").expect("loader");
+        assert_eq!(
+            value::instance_attr(loader, "path").and_then(value::as_str),
+            Some(six_text.as_str())
+        );
+
+        let module = call("importlib.util", "module_from_spec", &[spec]);
+        assert_eq!(
+            namespace_value(module, "__name__").and_then(value::as_str),
+            Some("six")
+        );
+        assert_eq!(
+            namespace_value(module, "__file__").and_then(value::as_str),
+            Some(six_text.as_str())
+        );
+        assert_eq!(
+            namespace_value(module, "__loader__"),
+            value::instance_attr(spec, "loader")
+        );
+
+        // The source is not compiled into this program, so executing it must
+        // fail with a precise error instead of an empty module.
+        exc::init();
+        method(loader, "exec_module", &[module]);
+        assert_eq!(exc::pending_tag(), i64::from(IMPORT_ERROR));
+        assert!(
+            message().contains("no runtime Python compiler"),
+            "{}",
+            message()
+        );
+
+        // An installed package spec carries its search directory.
+        exc::init();
+        let package_spec = call("importlib.util", "find_spec", &[string("pydantic")]);
+        let locations = value::instance_attr(package_spec, "submodule_search_locations")
+            .expect("submodule_search_locations");
+        let locations = value::as_list(locations).expect("search location list");
+        assert!(locations
+            .iter()
+            .filter_map(|dir| value::as_str(*dir))
+            .map(Path::new)
+            .any(|dir| dir.is_dir() && dir.ends_with("pydantic")));
+        let package_module = call("importlib.util", "module_from_spec", &[package_spec]);
+        let package_path = namespace_value(package_module, "__path__").expect("__path__");
+        assert_eq!(value::as_list(package_path).map(<[i64]>::len), Some(1));
+    }
+
+    #[test]
+    fn resources_files_reads_real_files() {
+        let _guard = IMPORTLIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(site) = ensure_site_packages() else {
+            return;
+        };
+        if !site.join("pydantic/version.py").is_file() {
+            return;
+        }
+        globals::reset();
+        exc::init();
+        let root = call("importlib.resources", "files", &[string("pydantic")]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            value::class_display_name(value::instance_class_value(root).expect("instance")),
+            Some("Traversable")
+        );
+        assert_eq!(value::as_str(attribute(root, "name")), Some("pydantic"));
+        let root_path = method(root, "__fspath__", &[]);
+        let root_path = value::as_str(root_path).expect("__fspath__");
+        assert!(Path::new(root_path).is_dir(), "{root_path}");
+        assert_eq!(
+            Path::new(root_path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("pydantic")
+        );
+        assert_eq!(method(root, "is_dir", &[]), TRUE);
+        assert_eq!(method(root, "is_file", &[]), FALSE);
+
+        let file = method(root, "joinpath", &[string("version.py")]);
+        assert_eq!(value::as_str(attribute(file, "name")), Some("version.py"));
+        assert_eq!(method(file, "is_file", &[]), TRUE);
+        assert_eq!(method(file, "is_dir", &[]), FALSE);
+        let text = method(file, "read_text", &[]);
+        assert!(
+            value::as_str(text).is_some_and(|text| text.contains("VERSION = '2.14.1'")),
+            "read_text must return the real file contents"
+        );
+        let bytes = method(file, "read_bytes", &[]);
+        assert_eq!(
+            value::as_bytes(bytes).map(|bytes| &bytes[..3]),
+            Some(b"\"\"\"" as &[u8])
+        );
+
+        let children = method(root, "iterdir", &[]);
+        let children = value::as_list(children).expect("list of children");
+        assert!(children
+            .iter()
+            .any(|child| value::as_str(attribute(*child, "name")) == Some("version.py")));
+        let missing = method(root, "joinpath", &[string("missing.py")]);
+        assert_eq!(
+            value::as_str(attribute(missing, "name")),
+            Some("missing.py")
+        );
+    }
+
+    #[test]
+    fn os_stat_reports_real_metadata() {
+        exc::init();
+        let root = temp_root("stat");
+        let path = root.join("data.txt");
+        std::fs::write(&path, b"hello").expect("write stat fixture");
+        let stat = call("os", "stat", &[string(&path.to_string_lossy())]);
+        assert!(!exc::pending(), "{}", message());
+
+        assert_eq!(
+            as_int(namespace_value(stat, "st_size").expect("st_size")),
+            5
+        );
+        let mode = as_int(namespace_value(stat, "st_mode").expect("st_mode"));
+        assert_eq!(mode & 0o170000, 0o100000, "regular file mode");
+        assert!(
+            as_int(namespace_value(stat, "st_nlink").expect("st_nlink")) >= 1,
+            "st_nlink must be at least one"
+        );
+        for name in ["st_ino", "st_dev", "st_uid", "st_gid"] {
+            let field = namespace_value(stat, name).unwrap_or_else(|| panic!("{name}"));
+            assert!(
+                as_big(field) >= BigInt::from(0),
+                "{name} must be a non-negative integer"
+            );
+        }
+        let mtime = as_float(namespace_value(stat, "st_mtime").expect("st_mtime"));
+        assert!(mtime > 0.0);
+        assert!(as_float(namespace_value(stat, "st_atime").expect("st_atime")) > 0.0);
+        assert!(as_float(namespace_value(stat, "st_ctime").expect("st_ctime")) > 0.0);
+        // Nanosecond aliases are exact integers; 2026 timestamps already
+        // exceed the tagged range, so they arrive as BigInts.
+        let mtime_ns = as_big(namespace_value(stat, "st_mtime_ns").expect("st_mtime_ns"));
+        let approx = value::bigint_to_f64(&mtime_ns).expect("ns fits f64") / 1e9;
+        assert!((approx - mtime).abs() < 1e-3);
+        assert!(
+            as_big(namespace_value(stat, "st_atime_ns").expect("st_atime_ns")) >= BigInt::from(0)
+        );
+
+        // Directories keep their file-type bits too.
+        let dir_stat = call("os", "stat", &[string(&root.to_string_lossy())]);
+        assert!(!exc::pending(), "{}", message());
+        let dir_mode = as_int(namespace_value(dir_stat, "st_mode").expect("st_mode"));
+        assert_eq!(dir_mode & 0o170000, 0o040000, "directory mode");
+    }
+
+    #[test]
+    fn os_stat_missing_path_raises_file_not_found() {
+        exc::init();
+        let missing = "/nonexistent/hydro-stat-missing";
+        assert_eq!(call("os", "stat", &[string(missing)]), NONE);
+        assert_eq!(
+            exc::pending_tag(),
+            i64::from(crate::exc::FILE_NOT_FOUND_ERROR)
+        );
+        let text = message();
+        assert!(
+            text.contains("[Errno 2]")
+                && text.contains("No such file or directory")
+                && text.contains(missing),
+            "{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_stat_follow_symlinks_flag_selects_link_or_target() {
+        exc::init();
+        let root = temp_root("stat-link");
+        let target = root.join("target.txt");
+        std::fs::write(&target, b"1234567").expect("write link target");
+        let link = root.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let link_value = string(&link.to_string_lossy());
+        let followed = call("os", "stat", &[link_value]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            as_int(namespace_value(followed, "st_size").expect("st_size")),
+            7
+        );
+
+        // Keyword calls arrive with the omitted `dir_fd` padded to `None`.
+        let link_stat = call("os", "stat", &[link_value, NONE, FALSE]);
+        assert!(!exc::pending(), "{}", message());
+        let link_mode = as_int(namespace_value(link_stat, "st_mode").expect("st_mode"));
+        assert_eq!(link_mode & 0o170000, 0o120000, "symbolic link mode");
+        assert_ne!(
+            as_int(namespace_value(link_stat, "st_size").expect("st_size")),
+            7
+        );
+    }
+
+    #[test]
+    fn os_path_isabs_classifies_absolute_paths() {
+        exc::init();
+        assert_eq!(call("os.path", "isabs", &[string("/tmp/x")]), TRUE);
+        assert_eq!(call("os.path", "isabs", &[string("/")]), TRUE);
+        assert_eq!(call("os.path", "isabs", &[string("tmp/x")]), FALSE);
+        assert_eq!(call("os.path", "isabs", &[string("")]), FALSE);
+        assert!(!exc::pending());
+
+        assert_eq!(call("os.path", "isabs", &[int(3)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "isabs() argument must be a path string, not int");
+    }
+
+    #[test]
+    fn sys_path_importer_cache_is_a_stable_mutable_dict() {
+        exc::init();
+        let cache = get("sys", "path_importer_cache");
+        assert_eq!(get("sys", "path_importer_cache"), cache);
+        assert!(value::as_dict(cache).is_some(), "must be a real dict");
+
+        let key = string("hydro-cache-probe");
+        let item = int(1);
+        let roots = crate::heap::root_values(&[key, item]);
+        crate::container::dict_set(cache, key, item);
+        crate::heap::release_roots(roots);
+        assert_eq!(
+            registry_value(get("sys", "path_importer_cache"), "hydro-cache-probe"),
+            Some(int(1))
+        );
+    }
+
+    #[test]
+    fn importlib_decode_source_honours_bom_cookies_and_errors() {
+        exc::init();
+        let bytes = |data: &[u8]| value::bytes_new(data.to_vec());
+
+        let plain = call("importlib.util", "decode_source", &[bytes(b"x = 1\n")]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(value::as_str(plain), Some("x = 1\n"));
+
+        // A UTF-8 BOM is stripped before decoding.
+        let bom = call(
+            "importlib.util",
+            "decode_source",
+            &[bytes(b"\xef\xbb\xbfx = 1\n")],
+        );
+        assert_eq!(value::as_str(bom), Some("x = 1\n"));
+
+        // Universal newlines are translated.
+        let newlines = call("importlib.util", "decode_source", &[bytes(b"a\r\nb\rc\n")]);
+        assert_eq!(value::as_str(newlines), Some("a\nb\nc\n"));
+
+        // A coding cookie on the first or second line selects the codec.
+        let latin1 = call(
+            "importlib.util",
+            "decode_source",
+            &[bytes(b"# -*- coding: latin-1 -*-\nname = '\xe9'\n")],
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            value::as_str(latin1),
+            Some("# -*- coding: latin-1 -*-\nname = '\u{e9}'\n")
+        );
+        let second_line = call(
+            "importlib.util",
+            "decode_source",
+            &[bytes(b"# comment\n# coding: iso-8859-1\nname = '\xe9'\n")],
+        );
+        assert!(
+            value::as_str(second_line).is_some_and(|text| text.ends_with("'\u{e9}'\n")),
+            "{second_line:?}"
+        );
+
+        // Unknown codecs are a SyntaxError; bad data is a UnicodeDecodeError.
+        assert_eq!(
+            call(
+                "importlib.util",
+                "decode_source",
+                &[bytes(b"# coding: klingon\n")]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), i64::from(crate::exc::SYNTAX_ERROR));
+        assert_eq!(message(), "unknown encoding: klingon");
+
+        // A BOM contradicting the cookie is rejected, like tokenize.
+        exc::init();
+        assert_eq!(
+            call(
+                "importlib.util",
+                "decode_source",
+                &[bytes(b"\xef\xbb\xbf# coding: latin-1\n")]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), i64::from(crate::exc::SYNTAX_ERROR));
+        assert_eq!(message(), "encoding problem: utf-8");
+
+        // Invalid UTF-8 data raises the codec error.
+        exc::init();
+        assert_eq!(
+            call("importlib.util", "decode_source", &[bytes(b"\xff")]),
+            NONE
+        );
+        assert_eq!(
+            exc::pending_tag(),
+            i64::from(crate::exc::UNICODE_DECODE_ERROR)
+        );
+
+        // A decodable cookie line followed by invalid UTF-8 propagates the
+        // codec error.
+        exc::init();
+        assert_eq!(
+            call(
+                "importlib.util",
+                "decode_source",
+                &[bytes(b"# coding: utf-8\n\xff\n")]
+            ),
+            NONE
+        );
+        assert_eq!(
+            exc::pending_tag(),
+            i64::from(crate::exc::UNICODE_DECODE_ERROR)
+        );
+        assert!(
+            message().contains("'utf-8' codec can't decode byte 0xff"),
+            "{}",
+            message()
+        );
+    }
+
+    #[test]
+    fn token_module_exposes_cpython_tables() {
+        exc::init();
+        assert_eq!(as_int(get("token", "ENDMARKER")), 0);
+        assert_eq!(as_int(get("token", "OP")), 55);
+        assert_eq!(as_int(get("token", "ENCODING")), 68);
+        assert_eq!(as_int(get("token", "N_TOKENS")), 69);
+        assert_eq!(as_int(get("token", "NT_OFFSET")), 256);
+
+        let names = get("token", "tok_name");
+        let entries = value::as_dict(names).expect("tok_name is a dict");
+        let op_name = entries.iter().find_map(|(key, item)| {
+            (value::as_integer(*key) == Some(55))
+                .then(|| value::as_str(*item))
+                .flatten()
+        });
+        assert_eq!(op_name, Some("OP"));
+
+        let exact = get("token", "EXACT_TOKEN_TYPES");
+        let entries = value::as_dict(exact).expect("EXACT_TOKEN_TYPES is a dict");
+        let at_token = entries.iter().find_map(|(key, item)| {
+            (value::as_str(*key) == Some("@"))
+                .then(|| value::as_integer(*item))
+                .flatten()
+        });
+        assert_eq!(at_token, Some(49));
+
+        assert!(!value::as_list(get("token", "__all__"))
+            .expect("__all__ is a list")
+            .is_empty());
+        assert_eq!(call("token", "ISTERMINAL", &[int(55)]), TRUE);
+        assert_eq!(call("token", "ISTERMINAL", &[int(256)]), FALSE);
+        assert_eq!(call("token", "ISNONTERMINAL", &[int(256)]), TRUE);
+        assert_eq!(call("token", "ISEOF", &[int(0)]), TRUE);
+        assert_eq!(call("token", "ISEOF", &[int(68)]), FALSE);
+    }
+
+    #[test]
+    fn codecs_lookup_and_byte_order_marks_are_real() {
+        exc::init();
+        let info = call("codecs", "lookup", &[string("ascii")]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(value::as_tuple(info).expect("CodecInfo tuple").len(), 4);
+
+        assert_eq!(
+            value::as_bytes(get("codecs", "BOM_UTF8")).unwrap(),
+            &[0xEF, 0xBB, 0xBF]
+        );
+        assert_eq!(
+            value::as_bytes(get("codecs", "BOM_UTF16_LE")).unwrap(),
+            &[0xFF, 0xFE]
+        );
+        assert_eq!(
+            value::as_bytes(get("codecs", "BOM_UTF16_BE")).unwrap(),
+            &[0xFE, 0xFF]
+        );
+        assert_eq!(
+            value::as_bytes(get("codecs", "BOM_UTF32_LE")).unwrap(),
+            &[0xFF, 0xFE, 0x00, 0x00]
+        );
+        assert_eq!(
+            value::as_bytes(get("codecs", "BOM_UTF32_BE")).unwrap(),
+            &[0x00, 0x00, 0xFE, 0xFF]
+        );
+        assert_eq!(
+            value::as_bytes(get("codecs", "BOM_LE")).unwrap(),
+            value::as_bytes(get("codecs", "BOM_UTF16_LE")).unwrap()
+        );
+        assert_eq!(
+            value::as_bytes(get("codecs", "BOM_BE")).unwrap(),
+            value::as_bytes(get("codecs", "BOM_UTF16_BE")).unwrap()
+        );
+    }
+
+    #[test]
+    fn text_io_wrapper_reads_and_writes_file_objects() {
+        exc::init();
+        let dir = temp_root("textio");
+        let path = dir.join("data.txt");
+        std::fs::write(&path, b"hello\nworld\n").unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+
+        let file = call("io", "open", &[string(&path_text), string("rb")]);
+        assert!(!exc::pending(), "{}", message());
+        let wrapper = call("io", "TextIOWrapper", &[file]);
+        assert!(!exc::pending(), "{}", message());
+        // The wrapper is an instance of the native `io.TextIOWrapper` class:
+        // `type(wrapper)` is that class and its `__name__` is what the runtime
+        // reports on the resolving paths. `value::type_name` is the static
+        // fallback (it answers "instance" for every class instance by design).
+        let wrapper_class = value::type_class(wrapper);
+        assert_eq!(
+            value::class_display_name(wrapper_class),
+            Some("TextIOWrapper")
+        );
+        assert_eq!(
+            wrapper_class,
+            get("io", "TextIOWrapper"),
+            "type(wrapper) must be the module's TextIOWrapper class"
+        );
+        assert_eq!(attribute(wrapper, "__class__"), wrapper_class);
+        assert_eq!(
+            value::as_str(attribute(wrapper_class, "__name__")),
+            Some("TextIOWrapper")
+        );
+        assert_eq!(value::type_name_of(wrapper), "TextIOWrapper");
+        assert_eq!(value::as_str(attribute(wrapper, "encoding")), Some("utf-8"));
+        assert_eq!(
+            value::as_str(attribute(wrapper, "name")),
+            Some(path_text.as_str())
+        );
+        assert_eq!(value::as_str(attribute(wrapper, "mode")), Some("rb"));
+        assert_eq!(value::as_str(attribute(wrapper, "errors")), Some("strict"));
+        assert_eq!(attribute(wrapper, "closed"), FALSE);
+        assert_eq!(attribute(wrapper, "line_buffering"), FALSE);
+        assert_eq!(attribute(wrapper, "write_through"), FALSE);
+
+        let line = method(wrapper, "readline", &[]);
+        assert_eq!(value::as_str(line), Some("hello\n"));
+        assert_eq!(value::as_str(attribute(wrapper, "newlines")), Some("\n"));
+        let rest = method(wrapper, "read", &[]);
+        assert_eq!(value::as_str(rest), Some("world\n"));
+        let eof = method(wrapper, "readline", &[]);
+        assert_eq!(value::as_str(eof), Some(""));
+        method(wrapper, "close", &[]);
+        assert_eq!(attribute(wrapper, "closed"), TRUE);
+
+        // Writes go to the wrapped binary file, with the text layer encoding.
+        let out = dir.join("out.txt");
+        let out_text = out.to_string_lossy().into_owned();
+        let file = call("io", "open", &[string(&out_text), string("wb")]);
+        assert!(!exc::pending(), "{}", message());
+        let wrapper = call("io", "TextIOWrapper", &[file]);
+        assert!(!exc::pending(), "{}", message());
+        let written = method(wrapper, "write", &[string("a\nb")]);
+        assert_eq!(as_int(written), 3);
+        method(wrapper, "flush", &[]);
+        method(wrapper, "close", &[]);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "a\nb");
+    }
+
+    fn tuple_ints(list: i64) -> Vec<Vec<i64>> {
+        value::as_list(list)
+            .unwrap_or_default()
+            .iter()
+            .map(|item| {
+                value::as_tuple(*item)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|value| value::as_integer(*value).unwrap_or(i64::MIN))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn itertools_permutations_product_and_takewhile_are_correct() {
+        exc::init();
+        let input = value::list_new(vec![int(1), int(2), int(3)]);
+        let permutations = call("itertools", "permutations", &[input]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            tuple_ints(permutations),
+            vec![
+                vec![1, 2, 3],
+                vec![1, 3, 2],
+                vec![2, 1, 3],
+                vec![2, 3, 1],
+                vec![3, 1, 2],
+                vec![3, 2, 1],
+            ]
+        );
+
+        // `r` shorter than the input and `r > len(iterable)`.
+        let pairs = call("itertools", "permutations", &[input, int(2)]);
+        assert_eq!(
+            tuple_ints(pairs),
+            vec![
+                vec![1, 2],
+                vec![1, 3],
+                vec![2, 1],
+                vec![2, 3],
+                vec![3, 1],
+                vec![3, 2],
+            ]
+        );
+        let none = call("itertools", "permutations", &[input, int(5)]);
+        assert!(tuple_ints(none).is_empty());
+        assert!(!exc::pending(), "{}", message());
+
+        // `r = 0` yields exactly one empty tuple, and the empty pool does too.
+        let zero = call("itertools", "permutations", &[input, int(0)]);
+        assert!(!exc::pending(), "{}", message());
+        let zero_rows = value::as_list(zero).unwrap_or_default();
+        assert_eq!(zero_rows.len(), 1);
+        assert_eq!(value::as_tuple(zero_rows[0]).map(|row| row.len()), Some(0));
+        assert_eq!(tuple_ints(zero), vec![Vec::<i64>::new()]);
+        let empty_pool = value::list_new(Vec::new());
+        let empty = call("itertools", "permutations", &[empty_pool]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(tuple_ints(empty), vec![Vec::<i64>::new()]);
+
+        // Repeated values are permuted by position: duplicates are emitted and
+        // the rows still come out in non-decreasing lexicographic order.
+        let duplicates = value::list_new(vec![int(1), int(1), int(2)]);
+        let duplicated = call("itertools", "permutations", &[duplicates]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            tuple_ints(duplicated),
+            vec![
+                vec![1, 1, 2],
+                vec![1, 2, 1],
+                vec![1, 1, 2],
+                vec![1, 2, 1],
+                vec![2, 1, 1],
+                vec![2, 1, 1],
+            ]
+        );
+
+        // Every row is a fresh tuple (no row aliases another or the input),
+        // and the input list is never reordered by the combinator.
+        let rows = value::as_list(permutations).unwrap_or_default();
+        assert_eq!(rows.len(), 6);
+        for (offset, row) in rows.iter().enumerate() {
+            assert!(
+                value::as_tuple(*row).is_some(),
+                "row {offset} is not a tuple"
+            );
+            for (other, peer) in rows.iter().enumerate().skip(offset + 1) {
+                assert_ne!(*row, *peer, "rows {offset} and {other} alias");
+            }
+        }
+        let remaining: Vec<i64> = value::as_list(input)
+            .unwrap_or_default()
+            .iter()
+            .map(|item| value::as_integer(*item).unwrap_or(i64::MIN))
+            .collect();
+        assert_eq!(remaining, vec![1, 2, 3]);
+
+        let left = value::list_new(vec![int(1), int(2)]);
+        let right = value::list_new(vec![int(3), int(4)]);
+        let product = call("itertools", "product", &[left, right]);
+        assert_eq!(
+            tuple_ints(product),
+            vec![vec![1, 3], vec![1, 4], vec![2, 3], vec![2, 4],]
+        );
+
+        // `repeat` is keyword-only.
+        let argv = [left];
+        let keyword_name = string("repeat");
+        let keyword_value = int(2);
+        let keywords = [keyword_name, keyword_value];
+        let repeated = module_call_kw(
+            "itertools".as_ptr(),
+            "itertools".len(),
+            "product".as_ptr(),
+            "product".len(),
+            1,
+            argv.as_ptr(),
+            1,
+            keywords.as_ptr(),
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            tuple_ints(repeated),
+            vec![vec![1, 1], vec![1, 2], vec![2, 1], vec![2, 2]]
+        );
+
+        // `repeat=0` is the one empty tuple; an empty pool short-circuits the
+        // whole product; a negative repeat raises `ValueError`.
+        let zero_keywords = [string("repeat"), int(0)];
+        let collapsed = module_call_kw(
+            "itertools".as_ptr(),
+            "itertools".len(),
+            "product".as_ptr(),
+            "product".len(),
+            1,
+            argv.as_ptr(),
+            1,
+            zero_keywords.as_ptr(),
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(tuple_ints(collapsed), vec![Vec::<i64>::new()]);
+
+        let no_items = value::list_new(Vec::new());
+        let empty_product = call("itertools", "product", &[no_items, left]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(tuple_ints(empty_product).is_empty());
+
+        let negative_keywords = [string("repeat"), int(-1)];
+        let _ = module_call_kw(
+            "itertools".as_ptr(),
+            "itertools".len(),
+            "product".as_ptr(),
+            "product".len(),
+            1,
+            argv.as_ptr(),
+            1,
+            negative_keywords.as_ptr(),
+        );
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        assert_eq!(message(), "repeat argument cannot be negative");
+        exc::clear();
+
+        let predicate = get("operator", "truth");
+        let values = value::list_new(vec![int(1), int(2), int(0), int(4)]);
+        let prefix = call("itertools", "takewhile", &[predicate, values]);
+        assert!(!exc::pending(), "{}", message());
+        let prefix: Vec<i64> = value::as_list(prefix)
+            .unwrap_or_default()
+            .iter()
+            .map(|item| value::as_integer(*item).unwrap_or(i64::MIN))
+            .collect();
+        assert_eq!(prefix, vec![1, 2]);
     }
 }

@@ -417,8 +417,10 @@ built-in kinds), so the fallback never matches a user handler.
   `(1, 'a')`, singleton `(1,)`, empty `()`. Tuples of hashable elements are
   allowed as dict keys. Unpacking (`a, b = pair`) accepts lists/tuples with
   exact length; `dict.items()` returns a list of `(key, value)` tuples
-  (documented deviation from the view). Nested/starred unpacking is a
-  diagnostic.
+  (documented deviation from the view). Nested targets are supported and
+  each sequence level may carry one starred target (`a, *rest, b = value`).
+  Tuple, list and set displays expand a starred iterable operand
+  (`(a, *xs)`, `[a, *xs]`, `{a, *xs}`) in source order.
 - `in`/`not in`: `list`/`tuple` via Python equality, `dict` over keys,
   `str` as substring (the left operand must be `str`), `set` over elements;
   other right operands → TypeError. `set` literals deduplicate but preserve
@@ -694,8 +696,11 @@ Central specification in `hydro_ir::stdlib` (`MODULES` in
   escapes, surrogates, error classes, depth/cycle guards) as well as `dump`/`load`
   on file objects; the parser builds containers incrementally in a GC-safe way.
 - `os`: `getpid`/`getppid`/`cpu_count`/`getcwd`/`getenv`, `name`/`sep`,
-  `remove`/`rename`, `fork`/`waitpid`/`_exit`. `os.path`: `join`, `basename`,
-  `dirname`, `exists`, `isfile`, `isdir`, `abspath`, `splitext`, `split`.
+  `remove`/`rename`/`access`, `stat` (an `os.stat_result`-shaped namespace
+  with the `st_*` fields and `st_*_ns` integer aliases),
+  `sysconf`/`getloadavg`/`uname`/`get_terminal_size`/`open`/`dup2`,
+  `fork`/`waitpid`/`_exit`. `os.path`: `join`, `basename`, `dirname`,
+  `exists`, `isfile`, `isdir`, `isabs`, `abspath`, `splitext`, `split`.
 - `io`/`open`: UTF-8 text (`r/w/a/x`) and bytes (`rb/wb/ab/xb`); no
   `+` mode. `read`/`readline`/`readlines`/`write`/`writelines`/`flush`/
   `tell`/`seek`/`close`/line iteration; errors `OSError`, closed file
@@ -950,7 +955,7 @@ it. The cache is not a shared artifact store.
   `hasattr(obj, name)` runs the attribute lookup, swallowing only
   `AttributeError`. Starred unpack targets (`a, *rest, b = value`) bind a
   fresh list of the middle elements through `hydro_unpack_star`; one star is
-  allowed and it may not nest inside another container target.
+  allowed per sequence level, including inside a nested container target.
 - `functools.partial(func, *args, **kwargs)` keeps keyword names: the
   frontend forwards them through `hydro_module_call_kw`, the runtime stores
   `(name, value)` pairs in the partial and applies them at call time using

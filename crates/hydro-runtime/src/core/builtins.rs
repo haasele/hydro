@@ -151,6 +151,66 @@ pub(crate) fn to_str(v: i64) -> i64 {
     value::str_alloc(value::to_string(v))
 }
 
+/// `str(bytes_like, encoding[, errors])`: decodes through `_codecs.decode`.
+///
+/// The object is checked before the codec arguments, matching CPython:
+/// a `str` object reports `decoding str is not supported` and any other
+/// non-bytes value reports `decoding to str: need a bytes-like object`.
+/// `bytes`/`bytearray` are passed through to the codec, a `memoryview` is
+/// materialized as `bytes` first. Encoding lookup and decode failures come
+/// from the codec, so unknown names stay `LookupError` and malformed input
+/// raises `UnicodeDecodeError` from the chosen error handler.
+fn str_decode(args: &[i64]) -> i64 {
+    if value::as_str(args[0]).is_some() {
+        return exc::raise_with_message(TYPE_ERROR, "decoding str is not supported");
+    }
+    let mut source = args[0];
+    // A `bytearray` payload must not be aliased across the decode: a custom
+    // error handler runs Python code that can resize it. Copy to `bytes`.
+    if let Some(data) = value::as_bytearray(source) {
+        source = value::bytes_new(data.clone());
+    } else if value::as_bytes(source).is_none() {
+        let Some(view) = value::as_memoryview(source) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "decoding to str: need a bytes-like object, {} found",
+                    value::type_name(source)
+                ),
+            );
+        };
+        match value::memoryview_bytes(view) {
+            Ok(bytes) => source = value::bytes_new(bytes),
+            Err(message) => return exc::raise_with_message(VALUE_ERROR, message),
+        }
+    }
+    let mut call_args = vec![source];
+    for (name, argument) in [
+        ("encoding", args.get(1).copied()),
+        ("errors", args.get(2).copied()),
+    ] {
+        let Some(argument) = argument else {
+            continue;
+        };
+        if value::as_str(argument).is_none() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "str() argument '{name}' must be str, not {}",
+                    value::type_name(argument)
+                ),
+            );
+        }
+        call_args.push(argument);
+    }
+    // The decoded object (and the codec arguments) must survive a custom
+    // error handler that runs Python code and may trigger a collection.
+    let roots = crate::heap::root_values(&call_args);
+    let result = modules::codecs::call("decode", &call_args);
+    crate::heap::release_roots(roots);
+    result
+}
+
 /// `repr(v)` as a fresh string object.
 pub(crate) fn to_repr(v: i64) -> i64 {
     value::str_alloc(value::repr(v))
@@ -699,16 +759,7 @@ pub(crate) fn range_new(start: i64, stop: i64, step: i64) -> i64 {
 /// Upper bound for a `bytes` allocation requested by user input (zero-fill
 /// and sequence conversion). Keeps `bytes(n)` from aborting the process on an
 /// impossible allocation.
-const MAX_BYTES_ALLOC: usize = 64 * 1024 * 1024;
-
-/// Truthy for the UTF-8 encoding spellings the runtime accepts. The runtime
-/// only implements UTF-8, so every other name is a decode/encode error.
-pub(crate) fn is_utf8_encoding(name: &str) -> bool {
-    name.eq_ignore_ascii_case("utf-8")
-        || name.eq_ignore_ascii_case("utf8")
-        || name.eq_ignore_ascii_case("utf_8")
-        || name.eq_ignore_ascii_case("u8")
-}
+pub(crate) const MAX_BYTES_ALLOC: usize = 64 * 1024 * 1024;
 
 /// `bytes(...)`: the constructor behind [`crate::abi::hydro_bytes_build`].
 ///
@@ -717,14 +768,14 @@ pub(crate) fn is_utf8_encoding(name: &str) -> bool {
 /// - `bytes(bytes)` -> copy
 /// - `bytes(int)` -> that many zero bytes
 /// - `bytes(list|tuple|set)` -> one integer per element (`0..=255`)
-/// - `bytes(str, encoding)` -> UTF-8 bytes (only UTF-8 is supported)
+/// - `bytes(str, encoding[, errors])` -> encoded bytes through `_codecs`
 ///
 /// Every other form reports a pending exception and returns `None`.
 pub(crate) fn bytes_build(argc: usize, argv: *const i64) -> i64 {
-    if argc > 2 {
+    if argc > 3 {
         return exc::raise_with_message(
             TYPE_ERROR,
-            &format!("bytes() takes at most 2 arguments ({argc} given)"),
+            &format!("bytes() takes at most 3 arguments ({argc} given)"),
         );
     }
     if argc == 0 {
@@ -738,20 +789,27 @@ pub(crate) fn bytes_build(argc: usize, argv: *const i64) -> i64 {
     }
     // SAFETY: ABI contract: `argv` points at `argc` readable values; length checked above.
     let args = unsafe { std::slice::from_raw_parts(argv, argc) };
-    if argc == 2 {
-        let Some(text) = value::as_str(args[0]) else {
+    if argc >= 2 {
+        if value::as_str(args[0]).is_none() {
             return exc::raise_with_message(TYPE_ERROR, "encoding without a string argument");
-        };
-        let Some(encoding) = value::as_str(args[1]) else {
+        }
+        if value::as_str(args[1]).is_none() {
             return exc::raise_with_message(
                 TYPE_ERROR,
                 &format!("encoding must be str, not {}", value::type_name(args[1])),
             );
-        };
-        if !is_utf8_encoding(encoding) {
-            return exc::raise_with_message(VALUE_ERROR, &format!("unknown encoding: {encoding}"));
         }
-        return value::bytes_new(text.as_bytes().to_vec());
+        if argc == 3 && value::as_str(args[2]).is_none() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("errors must be str, not {}", value::type_name(args[2])),
+            );
+        }
+        // The codec module owns encoding names, aliases and error handlers.
+        let roots = crate::heap::root_values(args);
+        let result = modules::codecs::call("encode", args);
+        crate::heap::release_roots(roots);
+        return result;
     }
     if let Some(bytes) = value::as_bytes(args[0]) {
         return value::bytes_from_slice(bytes);
@@ -820,9 +878,9 @@ pub(crate) fn bytes_build(argc: usize, argv: *const i64) -> i64 {
 
 /// `bytearray(...)`: the mutable byte-sequence constructor.
 ///
-/// The 0/1/2-argument forms share [`bytes_build`] and wrap its result in a
-/// fresh `bytearray`; the 3-argument form (`str`, encoding, errors) validates
-/// the encoding and error handler itself. A failing conversion keeps the
+/// The 0/1/2/3-argument forms share [`bytes_build`] and wrap its result in a
+/// fresh `bytearray`, so `bytearray(str, encoding[, errors])` uses the same
+/// codecs and error handlers as `bytes`. A failing conversion keeps the
 /// pending exception and returns `None`.
 pub(crate) fn bytearray_build(argc: usize, argv: *const i64) -> i64 {
     if argc > 3 {
@@ -836,39 +894,6 @@ pub(crate) fn bytearray_build(argc: usize, argv: *const i64) -> i64 {
             TYPE_ERROR,
             "bytearray() received arguments without an argument buffer",
         );
-    }
-    // SAFETY: ABI contract: `argv` points at `argc` readable values.
-    let args: &[i64] = if argc == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(argv, argc) }
-    };
-    if argc == 3 {
-        let Some(text) = value::as_str(args[0]) else {
-            return exc::raise_with_message(TYPE_ERROR, "encoding without a string argument");
-        };
-        let Some(encoding) = value::as_str(args[1]) else {
-            return exc::raise_with_message(
-                TYPE_ERROR,
-                &format!("encoding must be str, not {}", value::type_name(args[1])),
-            );
-        };
-        let Some(errors) = value::as_str(args[2]) else {
-            return exc::raise_with_message(
-                TYPE_ERROR,
-                &format!("errors must be str, not {}", value::type_name(args[2])),
-            );
-        };
-        if !is_utf8_encoding(encoding) {
-            return exc::raise_with_message(VALUE_ERROR, &format!("unknown encoding: {encoding}"));
-        }
-        if !matches!(errors, "strict" | "ignore" | "replace") {
-            return exc::raise_with_message(
-                VALUE_ERROR,
-                &format!("unknown error handler name '{errors}'"),
-            );
-        }
-        return value::bytearray_new(text.as_bytes().to_vec());
     }
     let converted = bytes_build(argc, argv);
     if exc::pending() {
@@ -1839,8 +1864,10 @@ pub(crate) fn call_star_kw(
 /// `fn(args..., name=value...)`: runtime keyword binding for a function value.
 ///
 /// Generated functions carry their full parameter metadata and a uniform
-/// full-argv trampoline. Native/builtin values validate their own positional
-/// arity and reject keywords here.
+/// full-argv trampoline. Builtins with named parameters (`print`, `zip`,
+/// `max`/`min`, `eval`/`exec` and `__import__`) bind their keywords here;
+/// every other native/builtin value validates its own positional arity and
+/// rejects keywords.
 pub(crate) fn call_kw(
     function: i64,
     argc: usize,
@@ -1981,8 +2008,8 @@ pub(crate) fn call_kw(
             }
             return zip_strict(argc, argv, strict);
         }
-        // `print(*args, sep=..., end=..., file=..., flush=...)` is the only
-        // builtin with runtime keyword parameters.
+        // `print(*args, sep=..., end=..., file=..., flush=...)` is one of the
+        // builtins with runtime keyword parameters.
         if matches!(&func.body, FunctionBody::Builtin(Builtin::Print)) {
             let mut keywords: Vec<(String, i64)> = Vec::with_capacity(kwargc);
             if kwargc > 0 {
@@ -2002,6 +2029,64 @@ pub(crate) fn call_kw(
                 }
             }
             return print_with_keywords(argc, argv, &keywords);
+        }
+        // `__import__(name, globals=None, locals=None, fromlist=(), level=0)`:
+        // CPython 3.14 accepts every parameter by name. Merge the positional
+        // prefix with the keyword pairs into the five-slot positional vector
+        // the module entry point reads, padding omitted slots with `None`.
+        // Unknown and duplicate names are rejected instead of being dropped.
+        if matches!(&func.body, FunctionBody::Builtin(Builtin::Import)) {
+            const PARAMS: [&str; 5] = ["name", "globals", "locals", "fromlist", "level"];
+            if argc > PARAMS.len() {
+                return builtin_arity_error("__import__", "1 to 5", argc);
+            }
+            let mut slots: Vec<Option<i64>> = vec![None; PARAMS.len()];
+            if argc > 0 {
+                // SAFETY: NULL with argc > 0 was rejected at entry.
+                let positional = unsafe { std::slice::from_raw_parts(argv, argc) };
+                for (index, argument) in positional.iter().enumerate() {
+                    slots[index] = Some(*argument);
+                }
+            }
+            if kwargc > 0 {
+                if kw_argv.is_null() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "keyword arguments were passed without an argument buffer",
+                    );
+                }
+                // SAFETY: `kw_argv` holds `2 * kwargc` readable values.
+                let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+                for pair in pairs.as_chunks::<2>().0 {
+                    let Some(keyword) = value::as_str(pair[0]) else {
+                        return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                    };
+                    let Some(index) = PARAMS.iter().position(|param| *param == keyword) else {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("__import__() got an unexpected keyword argument '{keyword}'"),
+                        );
+                    };
+                    if slots[index].is_some() {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("__import__() got multiple values for argument '{keyword}'"),
+                        );
+                    }
+                    slots[index] = Some(pair[1]);
+                }
+            }
+            if slots[0].is_none() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "__import__() missing required argument 'name' (pos 1)",
+                );
+            }
+            let bound: Vec<i64> = slots.into_iter().map(|slot| slot.unwrap_or(NONE)).collect();
+            let roots = crate::heap::root_values(&bound);
+            let result = crate::modules::builtins::import_from_core(&bound);
+            crate::heap::release_roots(roots);
+            return result;
         }
         // Partial application forwards keywords to the wrapped callable:
         // `classmethod(f)` binds the class positionally and must still accept
@@ -2138,6 +2223,81 @@ pub(crate) fn call_kw(
         // direct lowering path appends the key slot instead.
         if matches!(builtin, Builtin::Max | Builtin::Min) {
             return extremum_keywords(*builtin, argc, argv, kwargc, kw_argv);
+        }
+        // `str(object='', encoding=..., errors=...)`: every parameter is
+        // accepted by name. An omitted object yields `""` even when
+        // `encoding`/`errors` are given (matching CPython), but those
+        // arguments are still parsed as `str`.
+        if matches!(builtin, Builtin::Str) {
+            const PARAMS: [&str; 3] = ["object", "encoding", "errors"];
+            if argc > PARAMS.len() {
+                return builtin_arity_error("str", "at most 3", argc);
+            }
+            let mut slots: [Option<i64>; 3] = [None; 3];
+            if argc > 0 {
+                // SAFETY: a NULL buffer with argc > 0 was rejected at entry.
+                let positional = unsafe { std::slice::from_raw_parts(argv, argc) };
+                for (index, argument) in positional.iter().enumerate() {
+                    slots[index] = Some(*argument);
+                }
+            }
+            if kwargc > 0 {
+                if kw_argv.is_null() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "keyword arguments were passed without an argument buffer",
+                    );
+                }
+                // SAFETY: `kw_argv` holds `2 * kwargc` readable values.
+                let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+                for pair in pairs.as_chunks::<2>().0 {
+                    let Some(keyword) = value::as_str(pair[0]) else {
+                        return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                    };
+                    let Some(index) = PARAMS.iter().position(|param| *param == keyword) else {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("str() got an unexpected keyword argument '{keyword}'"),
+                        );
+                    };
+                    if slots[index].is_some() {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("str() got multiple values for argument '{keyword}'"),
+                        );
+                    }
+                    slots[index] = Some(pair[1]);
+                }
+            }
+            let Some(object) = slots[0] else {
+                for (index, name) in [(1usize, "encoding"), (2, "errors")] {
+                    let Some(argument) = slots[index] else {
+                        continue;
+                    };
+                    if value::as_str(argument).is_none() {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!(
+                                "str() argument '{name}' must be str, not {}",
+                                value::type_name(argument)
+                            ),
+                        );
+                    }
+                }
+                return value::str_alloc(String::new());
+            };
+            if slots[1].is_none() && slots[2].is_none() {
+                return call_builtin(Builtin::Str, 1, &object);
+            }
+            if slots[1].is_none() {
+                // `errors=` without `encoding=` decodes as UTF-8.
+                slots[1] = Some(value::str_alloc("utf-8".to_string()));
+            }
+            let bound: Vec<i64> = slots.into_iter().flatten().collect();
+            let roots = crate::heap::root_values(&bound);
+            let result = call_builtin(Builtin::Str, bound.len(), bound.as_ptr());
+            crate::heap::release_roots(roots);
+            return result;
         }
     }
     let signature = value::function_signature(function);
@@ -3994,17 +4154,18 @@ fn builtin_arity_error(name: &str, expected: &str, argc: usize) -> i64 {
 /// Calls a builtin referenced as a first-class value (`f = int; f("42")`).
 ///
 /// Arity and semantics match the direct builtin calls lowered by codegen:
-/// `print` is variadic, `str`/`repr`/`int`/`float`/`abs`/`len` take one
-/// argument,
+/// `print` is variadic, `str` takes zero to three
+/// (the `str(bytes, encoding[, errors])` decoding form), `repr`/`int`/`float`/`abs`/`len` take one
 /// `set`/`list`/`dict` accept zero or one, `sum`/`enumerate` one or two,
 /// `range` one to three, `bytes` zero to two, `map`/`filter` exactly two,
-/// `iter` exactly one, `next` one or two, `max`/`min` at least one (their
+/// `iter` one or two, `next` one or two, `max`/`min` at least one (their
 /// final argument is the key slot), `sorted` one to three
 /// `(iterable, key, reverse)`, `round` one or two, `format` two (or
 /// three for the internal conversion flag), `isinstance` and `issubclass`
 /// exactly two, `all` exactly one, `ord`/`chr`/`hex`/`bin`/`oct` exactly one,
-/// `divmod` exactly two, `callable` exactly one, `id` exactly one and the
-/// internal dict merge exactly two.
+/// `divmod` exactly two, `callable` exactly one, `id` exactly one, the
+/// internal dict merge exactly two and `__import__` one to five (the five-slot
+/// vector `name, globals, locals, fromlist, level`).
 pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -4126,7 +4287,8 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
         },
         Builtin::Iter => match args {
             [obj] => iter::iter_of(*obj),
-            _ => builtin_arity_error("iter", "exactly 1", argc),
+            [callable, sentinel] => iter::iter_callable(*callable, *sentinel),
+            _ => builtin_arity_error("iter", "1 or 2", argc),
         },
         Builtin::Next => match args {
             [obj] => iter::next_value(*obj, NONE, false),
@@ -4138,8 +4300,11 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             _ => builtin_arity_error("len", "exactly 1", argc),
         },
         Builtin::Str => match args {
+            [] => value::str_alloc(String::new()),
             [value] => to_str(*value),
-            _ => builtin_arity_error("str", "exactly 1", argc),
+            [value, encoding] => str_decode(&[*value, *encoding]),
+            [value, encoding, errors] => str_decode(&[*value, *encoding, *errors]),
+            _ => builtin_arity_error("str", "at most 3", argc),
         },
         Builtin::Repr => match args {
             [value] => to_repr(*value),
@@ -4191,10 +4356,12 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [value] => reversed(*value),
             _ => builtin_arity_error("reversed", "exactly 1", argc),
         },
-        Builtin::Import => exc::raise_with_message(
-            RUNTIME_ERROR,
-            "dynamic imports are not supported at runtime",
-        ),
+        Builtin::Import => {
+            if args.len() > 5 {
+                return builtin_arity_error("__import__", "1 to 5", argc);
+            }
+            crate::modules::builtins::import_from_core(args)
+        }
         Builtin::Input => match args {
             [] => input_value(None),
             [prompt] => input_value(Some(*prompt)),
@@ -6574,7 +6741,69 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
             pending_message(),
-            "iter() takes exactly 1 argument(s) (0 given)"
+            "iter() takes 1 or 2 argument(s) (0 given)"
+        );
+    }
+
+    static ITER_SOURCE_CALLS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    /// Zero-argument callable yielding `0`, `1`, then `None` (the sentinel).
+    extern "C" fn counted_callable(_argv: *const i64) -> i64 {
+        let call = ITER_SOURCE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call < 2 {
+            int(call)
+        } else {
+            NONE
+        }
+    }
+
+    #[test]
+    fn iter_callable_as_first_class_values() {
+        exc::init();
+        ITER_SOURCE_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let source = value::function_new(
+            counted_callable as *const () as usize,
+            0,
+            "source".to_string(),
+        );
+        let iter_fn = value::builtin_function_new(Builtin::Iter);
+        let next_fn = value::builtin_function_new(Builtin::Next);
+
+        let args = [source, NONE];
+        let iterator = call(iter_fn, 2, args.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::type_name(iterator), "iterator");
+
+        assert_eq!(call(next_fn, 1, [iterator].as_ptr()), int(0));
+        assert_eq!(call(next_fn, 1, [iterator].as_ptr()), int(1));
+        assert_eq!(call(next_fn, 1, [iterator].as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), exc::STOP_ITERATION as i64);
+        // Three calls produced the values and the sentinel; nothing ran again.
+        assert_eq!(
+            ITER_SOURCE_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        exc::clear();
+        assert_eq!(call(next_fn, 2, [iterator, int(-1)].as_ptr()), int(-1));
+        assert_eq!(
+            ITER_SOURCE_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+
+        // The callable is validated eagerly.
+        exc::init();
+        let bogus = [int(1), NONE];
+        assert_eq!(call(iter_fn, 2, bogus.as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "iter(v, w): v must be callable");
+
+        exc::init();
+        let too_many = [int(1), int(2), int(3)];
+        assert_eq!(call(iter_fn, 3, too_many.as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "iter() takes 1 or 2 argument(s) (3 given)"
         );
     }
 

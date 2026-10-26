@@ -22,6 +22,14 @@
 //! Generator objects expose `send`, `throw` and `close`. `throw` accepts an
 //! exception *instance* only (Hydro has no exception class objects) and supports
 //! just the single-argument form.
+//!
+//! `int` is a builtin function value at runtime rather than a class object, so
+//! its class-level methods are dispatched from the same entry points:
+//! `int.from_bytes(data, byteorder='big', *, signed=False)` on the type value
+//! (also callable unbound) and `int.to_bytes(length=1, byteorder='big', *,
+//! signed=False)`/`int.bit_length()` as instance methods. They follow CPython's
+//! `byteorder`, sign-extension and overflow rules; `from_bytes` keeps arbitrary
+//! precision through the heap `BigInt` path.
 
 use std::io::{BufRead as _, IsTerminal, Read as _, Write as _};
 use std::sync::atomic::Ordering;
@@ -39,6 +47,7 @@ use crate::pool;
 use crate::process;
 use crate::value::{self, NONE};
 use hydro_ir::{MethodKind, ParamKind};
+use num_bigint::{BigInt, Sign};
 
 /// Dispatches `obj.<name>(args...)`.
 pub(crate) fn call(
@@ -200,6 +209,14 @@ pub(crate) fn call(
     }
     if value::as_socket(obj).is_some() {
         return crate::modules::socket::method(obj, &method, &args);
+    }
+    // The `int` builtin type value is a function object at runtime, so
+    // `int.from_bytes(...)` arrives here with the type value as the receiver.
+    if is_builtin_int_type(obj) {
+        return int_class_method(obj, &method, &args, &[]);
+    }
+    if is_integer_value(obj) {
+        return int_method(obj, &method, &args, &[]);
     }
     attribute_error(obj, &method)
 }
@@ -1184,6 +1201,14 @@ pub(crate) fn call_kw(
         // methods only support positional arguments.
         return keywords.reject(&value::type_name_of(obj), &method);
     }
+    // `int.from_bytes` binds `byteorder` and the keyword-only `signed`;
+    // `to_bytes`/`bit_length` do the same for integer receivers.
+    if is_builtin_int_type(obj) {
+        return int_class_method(obj, &method, &args, &keywords.items);
+    }
+    if is_integer_value(obj) {
+        return int_method(obj, &method, &args, &keywords.items);
+    }
     // Native objects whose methods take no keyword parameters (and every
     // other receiver kind) reject the keywords explicitly.
     keywords.reject(value::type_name(obj), &method)
@@ -1369,6 +1394,39 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     // so `f.__name__`/`f.__qualname__` report it and `__doc__` stays `None`
     // (Hydro keeps no docstring payload on function values).
     if let Some(function) = value::as_function(obj) {
+        // The `int` builtin type value exposes its class-level methods as
+        // callable attributes, like CPython's type objects.
+        if matches!(
+            &function.body,
+            value::FunctionBody::Builtin(hydro_ir::Builtin::Int)
+        ) && matches!(attr.as_str(), "from_bytes" | "to_bytes" | "bit_length")
+        {
+            return value::bound_method_new(obj, attr);
+        }
+        if let value::FunctionBody::Partial {
+            function: target,
+            args,
+            keywords,
+        } = &function.body
+        {
+            // CPython's `functools.partial` exposes the wrapped callable, the
+            // bound positional arguments and the bound keywords.
+            match attr.as_str() {
+                "func" => return *target,
+                "args" => return value::tuple_new(args.clone()),
+                "keywords" => {
+                    let mark = crate::heap::root_values(&[]);
+                    let pairs: Vec<(i64, i64)> = keywords
+                        .iter()
+                        .map(|(name, item)| (value::str_alloc(name.clone()), *item))
+                        .collect();
+                    let result = value::dict_new(pairs);
+                    crate::heap::release_roots(mark);
+                    return result;
+                }
+                _ => {}
+            }
+        }
         return match attr.as_str() {
             "__name__" | "__qualname__" => value::str_alloc(function.name.clone()),
             "__doc__" => NONE,
@@ -1662,6 +1720,11 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             }
             _ => attribute_error(obj, &attr),
         };
+    }
+    // Integer values expose their bytes-conversion and bit-length methods as
+    // bound-method values (`f = (255).to_bytes`).
+    if is_integer_value(obj) && matches!(attr.as_str(), "to_bytes" | "bit_length") {
+        return value::bound_method_new(obj, attr);
     }
     attribute_error(obj, &attr)
 }
@@ -1992,6 +2055,305 @@ fn int_arg(v: i64) -> Result<i64, i64> {
     })
 }
 
+// int
+
+/// Whether `obj` is the `int` builtin *type* value.
+///
+/// Builtin types are plain builtin function values at runtime (`int` is the
+/// `Builtin::Int` function), so `int.from_bytes(...)` reaches [`call`] with a
+/// function receiver instead of a class object. Only `int` has a class-level
+/// method table here; every other builtin function value keeps the plain
+/// function attribute surface.
+fn is_builtin_int_type(obj: i64) -> bool {
+    let Some(function) = value::as_function(obj) else {
+        return false;
+    };
+    matches!(
+        &function.body,
+        value::FunctionBody::Builtin(hydro_ir::Builtin::Int)
+    )
+}
+
+/// Whether `obj` is an integer value (`int`, `bool` or a heap `BigInt`).
+fn is_integer_value(obj: i64) -> bool {
+    value::as_integer(obj).is_some() || value::is_bigint(obj)
+}
+
+/// CPython's accepted `byteorder` spellings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ByteOrder {
+    Big,
+    Little,
+}
+
+/// Validates the `byteorder` argument shared by `int.from_bytes` and
+/// `int.to_bytes`. A missing argument defaults to `'big'`; a non-string is a
+/// `TypeError`, an unknown spelling a `ValueError`, exactly like CPython.
+fn byte_order(method: &str, argument: Option<i64>) -> Result<ByteOrder, i64> {
+    let Some(argument) = argument else {
+        return Ok(ByteOrder::Big);
+    };
+    let Some(text) = value::as_str(argument) else {
+        return Err(type_error(format!(
+            "{method}() argument 'byteorder' must be str, not {}",
+            value::type_name(argument)
+        )));
+    };
+    match text {
+        "big" => Ok(ByteOrder::Big),
+        "little" => Ok(ByteOrder::Little),
+        _ => Err(exc::raise_with_message(
+            VALUE_ERROR,
+            "byteorder must be either 'little' or 'big'",
+        )),
+    }
+}
+
+/// Binds the positional-or-keyword prefix (`params`) and the keyword-only
+/// `signed` flag shared by `int.from_bytes` and `int.to_bytes`.
+///
+/// Returns the slots in parameter order (missing slots stay `None`) and the
+/// truthiness of `signed`.
+fn int_bytes_arguments(
+    method: &str,
+    params: &[&str],
+    args: &[i64],
+    keywords: &[(String, i64)],
+) -> Result<(Vec<Option<i64>>, bool), i64> {
+    if args.len() > params.len() {
+        return Err(type_error(format!(
+            "{method}() takes at most {} positional {} ({} given)",
+            params.len(),
+            plural(params.len()),
+            args.len()
+        )));
+    }
+    let mut slots = vec![None; params.len()];
+    for (index, argument) in args.iter().enumerate() {
+        slots[index] = Some(*argument);
+    }
+    let mut signed = None;
+    for (name, argument) in keywords {
+        if name.as_str() == "signed" {
+            if signed.is_some() {
+                return Err(type_error(format!(
+                    "{method}() got multiple values for argument 'signed'"
+                )));
+            }
+            signed = Some(*argument);
+            continue;
+        }
+        let Some(index) = params.iter().position(|param| *param == name.as_str()) else {
+            return Err(type_error(format!(
+                "{method}() got an unexpected keyword argument '{name}'"
+            )));
+        };
+        if slots[index].is_some() {
+            return Err(type_error(format!(
+                "{method}() got multiple values for argument '{name}'"
+            )));
+        }
+        slots[index] = Some(*argument);
+    }
+    Ok((slots, signed.is_some_and(value::truthy)))
+}
+
+/// Copies the payload of a buffer-protocol argument (`bytes`, `bytearray` or
+/// `memoryview`) for `int.from_bytes`.
+fn buffer_bytes(object: i64) -> Result<Vec<u8>, i64> {
+    if let Some(bytes) = value::as_bytes(object) {
+        return Ok(bytes.to_vec());
+    }
+    if let Some(view) = value::as_memoryview(object) {
+        return value::memoryview_bytes(view)
+            .map_err(|message| exc::raise_with_message(VALUE_ERROR, message));
+    }
+    Err(type_error(format!(
+        "cannot convert '{}' object to bytes",
+        value::type_name(object)
+    )))
+}
+
+/// `int.from_bytes(bytes, byteorder='big', *, signed=False)`.
+///
+/// The result keeps Python's arbitrary precision: the bytes are decoded as a
+/// `BigInt` and allocated through [`value::bigint_new`], which tags the value
+/// when it fits. `signed` selects two's-complement sign extension.
+fn int_from_bytes(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let (slots, signed) =
+        match int_bytes_arguments("from_bytes", &["bytes", "byteorder"], args, keywords) {
+            Ok(bound) => bound,
+            Err(err) => return err,
+        };
+    let Some(data) = slots[0] else {
+        return type_error("from_bytes() missing required argument 'bytes' (pos 1)".to_string());
+    };
+    let order = match byte_order("from_bytes", slots[1]) {
+        Ok(order) => order,
+        Err(err) => return err,
+    };
+    let data = match buffer_bytes(data) {
+        Ok(data) => data,
+        Err(err) => return err,
+    };
+    let number = match (order, signed) {
+        (ByteOrder::Big, false) => BigInt::from_bytes_be(Sign::Plus, &data),
+        (ByteOrder::Little, false) => BigInt::from_bytes_le(Sign::Plus, &data),
+        (ByteOrder::Big, true) => BigInt::from_signed_bytes_be(&data),
+        (ByteOrder::Little, true) => BigInt::from_signed_bytes_le(&data),
+    };
+    value::bigint_new(number)
+}
+
+/// `int.to_bytes(length=1, byteorder='big', *, signed=False)`.
+///
+/// The magnitude is encoded big-endian, two's-complemented for negative
+/// numbers and reversed for `'little'`. Values that do not fit `length` bytes
+/// report `OverflowError`, matching CPython's range rules.
+fn int_to_bytes(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let (slots, signed) =
+        match int_bytes_arguments("to_bytes", &["length", "byteorder"], args, keywords) {
+            Ok(bound) => bound,
+            Err(err) => return err,
+        };
+    let length = match slots[0] {
+        None => 1,
+        Some(argument) => match value::to_bigint(argument) {
+            Some(number) => match i64::try_from(&number) {
+                Ok(length) => length,
+                Err(_) => {
+                    return exc::raise_with_message(
+                        OVERFLOW_ERROR,
+                        "Python int too large to convert to C ssize_t",
+                    )
+                }
+            },
+            None => {
+                return type_error(format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    value::type_name(argument)
+                ))
+            }
+        },
+    };
+    if length < 0 {
+        return exc::raise_with_message(VALUE_ERROR, "length argument must be non-negative");
+    }
+    if length > builtins::MAX_BYTES_ALLOC as i64 {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "bytes length exceeds the runtime allocation limit",
+        );
+    }
+    let length = length as usize;
+    let order = match byte_order("to_bytes", slots[1]) {
+        Ok(order) => order,
+        Err(err) => return err,
+    };
+    let Some(number) = value::to_bigint(obj) else {
+        return type_error("descriptor 'to_bytes' requires an 'int' object".to_string());
+    };
+    let sign = number.sign();
+    // `BigUint::to_bytes_be` pads zero to `[0]`; an empty magnitude is the
+    // correct starting point for the zero value.
+    let magnitude = if sign == Sign::NoSign {
+        Vec::new()
+    } else {
+        number.magnitude().to_bytes_be()
+    };
+    let top = magnitude.first().copied().unwrap_or(0);
+    // Zero fits every length, including zero.
+    if sign != Sign::NoSign {
+        if signed {
+            let fits = if sign == Sign::Minus {
+                // The most negative representable value is `-2^(8*length-1)`,
+                // whose magnitude is `0x80` followed by zeros.
+                magnitude.len() < length
+                    || (magnitude.len() == length
+                        && (top < 0x80
+                            || (top == 0x80 && magnitude[1..].iter().all(|&byte| byte == 0))))
+            } else {
+                magnitude.len() < length || (magnitude.len() == length && top < 0x80)
+            };
+            if !fits {
+                return exc::raise_with_message(OVERFLOW_ERROR, "int too big to convert");
+            }
+        } else if sign == Sign::Minus {
+            return exc::raise_with_message(
+                OVERFLOW_ERROR,
+                "can't convert negative int to unsigned",
+            );
+        } else if magnitude.len() > length {
+            return exc::raise_with_message(OVERFLOW_ERROR, "int too big to convert");
+        }
+    }
+    let mut encoded = vec![0u8; length];
+    let pad = length - magnitude.len();
+    encoded[pad..].copy_from_slice(&magnitude);
+    if sign == Sign::Minus {
+        // Two's complement of the zero-padded magnitude: `0xFF` padding above
+        // the magnitude becomes the sign extension.
+        for byte in encoded.iter_mut() {
+            *byte = !*byte;
+        }
+        let mut carry = true;
+        for byte in encoded.iter_mut().rev() {
+            if !carry {
+                break;
+            }
+            let (sum, overflow) = byte.overflowing_add(1);
+            *byte = sum;
+            carry = overflow;
+        }
+    }
+    if order == ByteOrder::Little {
+        encoded.reverse();
+    }
+    value::bytes_new(encoded)
+}
+
+/// `(n).bit_length()`: the number of bits needed for the absolute value; `0`
+/// for zero. Works for tagged integers, `bool` and heap `BigInt` values.
+fn int_bit_length(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if let Some(err) = check_arity("int", "bit_length", args.len(), 0, 0) {
+        return err;
+    }
+    if !keywords.is_empty() {
+        return type_error("bit_length() takes no keyword arguments".to_string());
+    }
+    match value::to_bigint(obj) {
+        Some(number) => ops::int_result(number.bits() as i64),
+        None => type_error("descriptor 'bit_length' requires an 'int' object".to_string()),
+    }
+}
+
+/// Class-level methods reached through the `int` builtin type value.
+///
+/// `from_bytes` is the classmethod CPython exposes on the type; `to_bytes` and
+/// `bit_length` are additionally callable unbound (`int.to_bytes(n, ...)`), so
+/// the first positional argument supplies the receiver.
+fn int_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match method {
+        "from_bytes" => int_from_bytes(args, keywords),
+        "to_bytes" | "bit_length" => {
+            let Some((receiver, rest)) = args.split_first() else {
+                return type_error(format!("unbound method int.{method}() needs an argument"));
+            };
+            int_method(*receiver, method, rest, keywords)
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
+/// Instance methods of integer values.
+fn int_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match method {
+        "to_bytes" => int_to_bytes(obj, args, keywords),
+        "bit_length" => int_bit_length(obj, args, keywords),
+        _ => attribute_error(obj, method),
+    }
+}
+
 // str
 
 fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
@@ -2313,34 +2675,27 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_arity("str", method, args.len(), 0, 2) {
                 return err;
             }
-            let encoding = if args.is_empty() {
-                "utf-8".to_string()
-            } else {
-                match str_arg(method, 1, args[0]) {
-                    Ok(name) => name,
-                    Err(err) => return err,
+            // Route through the codec module so encoding names, aliases and
+            // error handlers behave exactly like `str.encode` in CPython.
+            let mut call_args = Vec::with_capacity(1 + args.len());
+            call_args.push(obj);
+            for (position, argument) in args.iter().enumerate() {
+                if value::as_str(*argument).is_none() {
+                    return type_error(format!(
+                        "{method}() argument {} must be str, not {}",
+                        position + 1,
+                        value::type_name(*argument)
+                    ));
                 }
-            };
-            if !crate::builtins::is_utf8_encoding(&encoding) {
-                return exc::raise_with_message(
-                    VALUE_ERROR,
-                    &format!("unknown encoding: {encoding}"),
-                );
+                call_args.push(*argument);
             }
-            if args.len() == 2 {
-                let errors = match str_arg(method, 2, args[1]) {
-                    Ok(name) => name,
-                    Err(err) => return err,
-                };
-                if !matches!(errors.as_str(), "strict" | "ignore" | "replace") {
-                    return exc::raise_with_message(
-                        VALUE_ERROR,
-                        &format!("unknown error handler name '{errors}'"),
-                    );
-                }
-            }
-            // Python strings are already valid UTF-8; errors never apply.
-            value::bytes_new(s.into_bytes())
+            // A registered error handler runs Python code and may trigger a
+            // collection, so the receiver and the codec arguments must
+            // survive the call.
+            let roots = crate::heap::root_values(&call_args);
+            let result = crate::modules::codecs::call("encode", &call_args);
+            crate::heap::release_roots(roots);
+            result
         }
         "format" => match crate::format::call_format(&s, args) {
             Ok(text) => value::str_alloc(text),
@@ -2357,6 +2712,14 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
                 "isalnum" => matches(char::is_alphanumeric),
                 _ => matches(char::is_whitespace),
             })
+        }
+        "isascii" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
+                return err;
+            }
+            // CPython semantics: every character is at most U+007F. The empty
+            // string is ASCII.
+            value::bool_value(s.is_ascii())
         }
         // CPython semantics: at least one cased character, and no character
         // of the opposite case. Uncased characters (digits, punctuation) are
@@ -2486,55 +2849,6 @@ fn count_sub(haystack: &[u8], needle: &[u8]) -> usize {
     count
 }
 
-/// Decodes UTF-8, skipping invalid sequences (`errors="ignore"`).
-fn decode_ignore(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len());
-    let mut rest = data;
-    loop {
-        match std::str::from_utf8(rest) {
-            Ok(valid) => {
-                out.push_str(valid);
-                break;
-            }
-            Err(err) => {
-                let valid_up_to = err.valid_up_to();
-                if let Ok(valid) = std::str::from_utf8(&rest[..valid_up_to]) {
-                    out.push_str(valid);
-                }
-                match err.error_len() {
-                    Some(len) => rest = &rest[valid_up_to + len..],
-                    // Truncated sequence at the end: nothing left to keep.
-                    None => break,
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Strict UTF-8 decoding with a CPython-like `UnicodeDecodeError` message.
-fn decode_strict(data: &[u8]) -> Result<String, i64> {
-    match std::str::from_utf8(data) {
-        Ok(text) => Ok(text.to_string()),
-        Err(err) => {
-            let position = err.valid_up_to();
-            let byte = data.get(position).copied().unwrap_or(0);
-            let reason = match err.error_len() {
-                Some(1) => "invalid start byte",
-                Some(_) => "invalid continuation byte",
-                None => "unexpected end of data",
-            };
-            Err(exc::raise_with_message(
-                VALUE_ERROR,
-                &format!(
-                    "'utf-8' codec can't decode byte 0x{:02x} in position {}: {}",
-                    byte, position, reason
-                ),
-            ))
-        }
-    }
-}
-
 fn hex_bytes(data: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(data.len() * 2);
@@ -2626,41 +2940,25 @@ fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_arity("bytes", method, args.len(), 0, 2) {
                 return err;
             }
-            if !args.is_empty() {
-                let encoding = match str_arg(method, 1, args[0]) {
-                    Ok(name) => name,
-                    Err(err) => return err,
-                };
-                if !crate::builtins::is_utf8_encoding(&encoding) {
-                    return exc::raise_with_message(
-                        VALUE_ERROR,
-                        &format!("unknown encoding: {encoding}"),
-                    );
+            // Decode a private copy: a registered error handler can resize or
+            // mutate the original bytearray while this call is in progress.
+            let source = value::bytes_new(data);
+            let mut call_args = Vec::with_capacity(1 + args.len());
+            call_args.push(source);
+            for (position, argument) in args.iter().enumerate() {
+                if value::as_str(*argument).is_none() {
+                    return type_error(format!(
+                        "{method}() argument {} must be str, not {}",
+                        position + 1,
+                        value::type_name(*argument)
+                    ));
                 }
+                call_args.push(*argument);
             }
-            let errors = if args.len() == 2 {
-                match str_arg(method, 2, args[1]) {
-                    Ok(name) => name,
-                    Err(err) => return err,
-                }
-            } else {
-                "strict".to_string()
-            };
-            let text = match errors.as_str() {
-                "strict" => match decode_strict(&data) {
-                    Ok(text) => text,
-                    Err(err) => return err,
-                },
-                "ignore" => decode_ignore(&data),
-                "replace" => String::from_utf8_lossy(&data).into_owned(),
-                _ => {
-                    return exc::raise_with_message(
-                        VALUE_ERROR,
-                        &format!("unknown error handler name '{errors}'"),
-                    )
-                }
-            };
-            value::str_alloc(text)
+            let roots = crate::heap::root_values(&call_args);
+            let result = crate::modules::codecs::call("decode", &call_args);
+            crate::heap::release_roots(roots);
+            result
         }
         "hex" => {
             if let Some(err) = check_arity("bytes", method, args.len(), 0, 0) {
@@ -5450,6 +5748,10 @@ mod tests {
     }
 
     fn reset() {
+        // A reset frees every object in the process-wide heap, so it must not
+        // overlap another test that is resetting (or a test that holds the
+        // heap for its whole body, e.g. the stdlib surface test).
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         crate::exc::init();
         crate::heap::reset();
     }
@@ -5623,6 +5925,22 @@ mod tests {
         for method in ["isdigit", "isalpha", "isalnum", "isspace"] {
             assert_eq!(invoke(string(""), method, &[]), FALSE);
         }
+    }
+
+    #[test]
+    fn isascii_predicate() {
+        reset();
+        assert_eq!(invoke(string("hello"), "isascii", &[]), TRUE);
+        assert_eq!(invoke(string("abc123!~ \t\r\n"), "isascii", &[]), TRUE);
+        // DEL (U+007F) is still ASCII.
+        assert_eq!(invoke(string("\u{7f}"), "isascii", &[]), TRUE);
+        // Latin-1, general Unicode, and astral characters are not.
+        assert_eq!(invoke(string("é"), "isascii", &[]), FALSE);
+        assert_eq!(invoke(string("abcé"), "isascii", &[]), FALSE);
+        assert_eq!(invoke(string("αβγ"), "isascii", &[]), FALSE);
+        assert_eq!(invoke(string("😀"), "isascii", &[]), FALSE);
+        // The empty string is ASCII.
+        assert_eq!(invoke(string(""), "isascii", &[]), TRUE);
     }
 
     #[test]

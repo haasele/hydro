@@ -1,13 +1,16 @@
 //! Runtime iterators for `for ... in` over lists, strings, dicts, tuples,
-//! sets, ranges, text files and `csv.reader` snapshots (ARCHITECTURE §3.2).
+//! sets, ranges, text files and `csv.reader` snapshots (ARCHITECTURE §3.2),
+//! plus the callable iterator built by `iter(callable, sentinel)`.
 //!
-//! Iterators are index-based: the target is not copied, so mutations made
-//! during the loop are observed. Iterating a string yields one-character
+//! Container iterators are index-based: the target is not copied, so mutations
+//! made during the loop are observed. Iterating a string yields one-character
 //! strings by Unicode scalar value; dicts yield keys in insertion order.
 //! Iterating a file yields its lines (each value keeps its trailing `\n`:
 //! `str` for a text file, `bytes` for a binary file), reading one line per
 //! step through the file's own cursor. A CSV reader yields a freshly built
-//! list (or dict for `DictReader`) per parsed row.
+//! list (or dict for `DictReader`) per parsed row. A callable iterator invokes
+//! its zero-argument callable once per step and stops as soon as the result
+//! equals the sentinel (`==`).
 
 use crate::exc::{self, TYPE_ERROR};
 use crate::value;
@@ -88,6 +91,29 @@ pub(crate) fn iter_of(obj: i64) -> i64 {
     }
 }
 
+/// `iter(callable, sentinel)`: an iterator that calls `callable()` on every
+/// step and stops when the result equals `sentinel` (`==`).
+///
+/// The callable is validated eagerly, as in CPython; the first call happens
+/// on the first `next`.
+pub(crate) fn iter_callable(callable: i64, sentinel: i64) -> i64 {
+    if !is_callable(callable) {
+        return exc::raise_with_message(TYPE_ERROR, "iter(v, w): v must be callable");
+    }
+    value::iter_callable_new(callable, sentinel)
+}
+
+/// Whether `builtins::call` can invoke `v`: a function value, an extension
+/// function, a class constructor, or an instance with `__call__`.
+fn is_callable(v: i64) -> bool {
+    value::as_function(v).is_some()
+        || value::as_class(v).is_some()
+        || value::as_ext_function(v).is_some()
+        || value::as_instance(v)
+            .map(|instance| value::class_lookup(instance.class, "__call__").is_some())
+            .unwrap_or(false)
+}
+
 /// `next(obj[, default])`: advances an iterator or generator by one step.
 ///
 /// Returns the element. At the end, raises `StopIteration` when no default was
@@ -139,8 +165,8 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
     {
         return generator_next(iter, out);
     }
-    let target = match value::as_iter(iter) {
-        Some(state) => state.target,
+    let (target, from_callable, exhausted) = match value::as_iter(iter) {
+        Some(state) => (state.target, state.from_callable, state.exhausted),
         None => {
             exc::raise_with_message(
                 TYPE_ERROR,
@@ -149,6 +175,9 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
             return 0;
         }
     };
+    if from_callable {
+        return callable_next(iter, target, exhausted, out);
+    }
     // A generator target runs user code on resume, so no iterator borrow is
     // held across the switch.
     if value::as_fiber(target).is_some() {
@@ -274,6 +303,42 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
         }
         None => 0,
     }
+}
+
+/// Steps a callable iterator: calls the zero-argument callable and compares
+/// the result with the sentinel (`==`). An equal result (or a previous
+/// exhaustion) ends iteration; the callable's own exceptions propagate.
+fn callable_next(iter: i64, pair: i64, exhausted: bool, out: *mut i64) -> i64 {
+    if exhausted {
+        return 0;
+    }
+    let Some(items) = value::as_tuple(pair) else {
+        exc::raise_with_message(TYPE_ERROR, "'iterator' object is not an iterator");
+        return 0;
+    };
+    let (Some(&callable), Some(&sentinel)) = (items.first(), items.get(1)) else {
+        exc::raise_with_message(TYPE_ERROR, "'iterator' object is not an iterator");
+        return 0;
+    };
+    // The callable runs user code, which may collect; keep the iterator and
+    // both of its values reachable for the duration of the call.
+    let roots = crate::heap::root_values(&[iter, pair, callable, sentinel]);
+    let result = crate::core::builtins::call(callable, 0, std::ptr::null());
+    if exc::pending() {
+        crate::heap::release_roots(roots);
+        return 0;
+    }
+    let reached_sentinel = crate::container::equals(result, sentinel);
+    crate::heap::release_roots(roots);
+    if reached_sentinel {
+        if let Some(state) = value::iter_state_mut(iter) {
+            state.exhausted = true;
+        }
+        return 0;
+    }
+    // SAFETY: the caller supplied a writable `i64` slot (checked above).
+    unsafe { *out = result };
+    1
 }
 
 /// Resumes a generator object for `for` loops. The yielded value becomes the
@@ -519,5 +584,126 @@ mod tests {
         assert_eq!(next_value(gen, int(-1), true), value::NONE);
         assert_eq!(exc::pending_tag(), crate::exc::VALUE_ERROR as i64);
         assert_eq!(value::to_string(exc::pending_value()), "boom");
+    }
+
+    static CALLABLE_STEPS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    /// Zero-argument callable yielding `0`, `1`, `2`, then `None`.
+    extern "C" fn steps_until_none(_argv: *const i64) -> i64 {
+        let step = CALLABLE_STEPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if step < 3 {
+            int(step)
+        } else {
+            value::NONE
+        }
+    }
+
+    /// Builds a fresh list equal to `[1]` but never identical to it.
+    extern "C" fn fresh_equal_list(_argv: *const i64) -> i64 {
+        value::list_new(vec![int(1)])
+    }
+
+    extern "C" fn raises_from_body(_argv: *const i64) -> i64 {
+        exc::raise_with_message(crate::exc::VALUE_ERROR, "boom")
+    }
+
+    fn function(entry: extern "C" fn(*const i64) -> i64) -> i64 {
+        value::function_new(entry as *const () as usize, 0, "source".to_string())
+    }
+
+    #[test]
+    fn callable_iterator_yields_values_until_the_sentinel() {
+        exc::init();
+        CALLABLE_STEPS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let iterator = iter_callable(function(steps_until_none), value::NONE);
+        assert!(!exc::pending());
+        assert_eq!(value::type_name(iterator), "iterator");
+        // Iterating a callable iterator leaves it untouched (one pass).
+        assert_eq!(iter_of(iterator), iterator);
+        assert_eq!(iter_new(iterator), iterator);
+
+        assert_eq!(take_all(iterator), vec![int(0), int(1), int(2)]);
+        assert!(!exc::pending());
+        // Four calls: three values and the sentinel.
+        assert_eq!(CALLABLE_STEPS.load(std::sync::atomic::Ordering::SeqCst), 4);
+
+        // Exhaustion is sticky: later steps no longer invoke the callable.
+        let mut out = int(-1);
+        assert_eq!(iter_next(iterator, &mut out), 0);
+        assert_eq!(out, int(-1));
+        assert!(!exc::pending());
+        assert_eq!(CALLABLE_STEPS.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(next_value(iterator, int(-1), true), int(-1));
+        assert!(!exc::pending());
+        assert_eq!(next_value(iterator, value::NONE, false), value::NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::STOP_ITERATION as i64);
+
+        // Materialising through the iterator ABI (the `for`/`list()` path).
+        exc::init();
+        CALLABLE_STEPS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let second = iter_callable(function(steps_until_none), value::NONE);
+        let collected = crate::builtins::list_from(second);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_list(collected),
+            Some(&[int(0), int(1), int(2)][..])
+        );
+    }
+
+    #[test]
+    fn callable_iterator_compares_with_equality_not_identity() {
+        exc::init();
+        let sentinel = value::list_new(vec![int(1)]);
+        let iterator = iter_callable(function(fresh_equal_list), sentinel);
+        let mut out = int(-1);
+        // A fresh `[1]` is not the sentinel object, but it is equal to it.
+        assert_eq!(iter_next(iterator, &mut out), 0);
+        assert!(!exc::pending());
+        assert_eq!(out, int(-1));
+        assert_eq!(iter_next(iterator, &mut out), 0);
+        assert!(!exc::pending());
+
+        // Numeric equality follows Python `==` across int and float too.
+        extern "C" fn returns_one(_argv: *const i64) -> i64 {
+            int(1)
+        }
+        let cross_type = iter_callable(function(returns_one), value::float_new(1.0));
+        assert_eq!(iter_next(cross_type, &mut out), 0);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn callable_iterator_propagates_callable_exceptions() {
+        exc::init();
+        let iterator = iter_callable(function(raises_from_body), value::NONE);
+        let mut out = int(-1);
+        assert_eq!(iter_next(iterator, &mut out), 0);
+        assert_eq!(exc::pending_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(value::to_string(exc::pending_value()), "boom");
+        assert_eq!(out, int(-1));
+
+        // `next()` reports the callable's exception, not the default.
+        exc::clear();
+        assert_eq!(next_value(iterator, int(-1), true), value::NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(value::to_string(exc::pending_value()), "boom");
+    }
+
+    #[test]
+    fn callable_iterator_requires_a_callable() {
+        exc::init();
+        assert_eq!(iter_callable(int(1), value::NONE), value::NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "iter(v, w): v must be callable"
+        );
+
+        // An instance without `__call__` is not callable either.
+        exc::init();
+        let class = value::class_new("Thing".to_string(), value::NONE, Vec::new());
+        let instance = value::instance_new(class);
+        assert_eq!(iter_callable(instance, value::NONE), value::NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
     }
 }

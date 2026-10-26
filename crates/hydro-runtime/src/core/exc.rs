@@ -650,6 +650,77 @@ pub(crate) fn handled_values() -> Vec<i64> {
     STATE.with(|s| s.borrow().handled.clone())
 }
 
+/// `sys.exc_info()`: the `(type, value, traceback)` triple of the exception
+/// whose handler is active, or `(None, None, None)` outside `except` handling.
+///
+/// The type is the exception's class value (`type(value)`), so a user-defined
+/// exception class keeps its identity and a built-in one matches the cached
+/// class the builtin name resolves to. Hydro records the raise location in
+/// [`ExcData`] but has no traceback object, so the third element is always
+/// `None`, as `value.__traceback__` reports.
+pub(crate) fn exc_info() -> i64 {
+    match handled() {
+        Some(exception) => value::tuple_new(vec![exception_type(exception), exception, NONE]),
+        None => value::tuple_new(vec![NONE, NONE, NONE]),
+    }
+}
+
+/// Class value reported as the first element of [`exc_info`].
+///
+/// A user-defined exception keeps its Python class; a built-in one resolves to
+/// the cached class for its tag. A malformed tag has no class to expose, so
+/// the type is `None` rather than an exception raised while reporting, and the
+/// handled value is still returned unchanged.
+fn exception_type(exception: i64) -> i64 {
+    if value::as_exc_instance(exception).is_some() {
+        return value::type_class(exception);
+    }
+    match value::exception_data(exception) {
+        Some(data) if known_tag(data.tag) => exception_class(data.tag),
+        _ => NONE,
+    }
+}
+
+/// Renders the traceback text CPython's default `sys.excepthook` prints for
+/// `value`: every exception in the cause/context chain, deepest first, each
+/// with its raise location. Returns `None` when `value` is not an exception
+/// object.
+pub(crate) fn render_exception(value: i64) -> Option<String> {
+    value::exception_clone(value).map(|data| render_chain(value, &data))
+}
+
+/// `sys.excepthook(type, value, traceback)`: CPython's default hook.
+///
+/// A `None` type prints nothing, like `sys_excepthook`. An exception `value`
+/// is rendered with [`render_exception`]; anything else is reported truthfully
+/// as `TypeName: repr(value)` because Hydro cannot build a traceback for a
+/// non-exception. The hook writes to stderr and never raises.
+pub(crate) fn excepthook(exc_type: i64, value: i64, _traceback: i64) -> i64 {
+    if let Some(text) = excepthook_text(exc_type, value) {
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        let _ = stderr.write_all(text.as_bytes());
+        let _ = stderr.flush();
+    }
+    NONE
+}
+
+/// Text [`excepthook`] writes, or `None` when the hook is silent (`type=None`).
+fn excepthook_text(exc_type: i64, value: i64) -> Option<String> {
+    if exc_type == NONE {
+        return None;
+    }
+    Some(match render_exception(value) {
+        Some(text) => text,
+        None => {
+            let name = value::class_display_name(exc_type)
+                .map(str::to_string)
+                .unwrap_or_else(|| value::type_name_of(exc_type));
+            format!("{name}: {}\n", value::repr(value))
+        }
+    })
+}
+
 /// Raises `tag` with `message`, capturing the current file/line/frame.
 /// Returns the ABI dummy value (`None`).
 ///
@@ -1829,6 +1900,7 @@ mod tests {
 
     #[test]
     fn collection_keeps_the_cause_of_the_pending_exception() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         init();
         crate::heap::reset();
         let outer = raise_chain_with_cause();
@@ -1876,6 +1948,85 @@ mod tests {
         assert_eq!(handler_depth(), 0);
         assert_eq!(handled(), None);
         handler_pop();
+        assert_eq!(handler_depth(), 0);
+        init();
+    }
+
+    #[test]
+    fn exc_info_reports_the_handled_exception() {
+        init();
+        // Outside `except` handling the triple is all `None`.
+        assert_eq!(value::as_tuple(exc_info()), Some(&[NONE, NONE, NONE][..]));
+
+        let error = value::exception_new(test_data(VALUE_ERROR, "boom", 4, "f", None));
+        handler_push(error);
+        let items = value::as_tuple(exc_info()).expect("tuple");
+        assert_eq!(items.len(), 3);
+        // The type is the cached class the name `ValueError` resolves to, and
+        // the value is the handled exception itself.
+        assert_eq!(items[0], exception_class(VALUE_ERROR));
+        assert_eq!(items[0], value::type_class(error));
+        assert_eq!(items[1], error);
+        // Hydro has no traceback object, so the third slot is `None`.
+        assert_eq!(items[2], NONE);
+
+        // A `finally` marker above the handler is skipped, like `handled()`.
+        let other = value::exception_new(test_data(TYPE_ERROR, "other", 5, "g", None));
+        handler_push(other);
+        handler_push(NONE);
+        let items = value::as_tuple(exc_info()).expect("tuple");
+        assert_eq!(items[0], exception_class(TYPE_ERROR));
+        assert_eq!(items[1], other);
+        assert_eq!(items[2], NONE);
+        handler_pop();
+        handler_pop();
+        handler_pop();
+
+        // A malformed tag has no class: the type is the `None` sentinel while
+        // the handled value is still reported unchanged.
+        let malformed = value::exception_new(test_data(99, "weird", 6, "h", None));
+        handler_push(malformed);
+        let items = value::as_tuple(exc_info()).expect("tuple");
+        assert_eq!(items[0], NONE);
+        assert_eq!(items[1], malformed);
+        handler_pop();
+
+        assert_eq!(value::as_tuple(exc_info()), Some(&[NONE, NONE, NONE][..]));
+        init();
+    }
+
+    #[test]
+    fn excepthook_renders_traceback_and_ignores_none_type() {
+        init();
+        let error = value::exception_new(test_data(VALUE_ERROR, "boom", 4, "f", None));
+        // `sys.excepthook(None, ...)` prints nothing, matching CPython.
+        assert_eq!(excepthook(NONE, error, NONE), NONE);
+        assert_eq!(excepthook_text(NONE, error), None);
+
+        let class = exception_class(VALUE_ERROR);
+        assert_eq!(
+            excepthook_text(class, error).expect("text"),
+            concat!(
+                "Traceback (most recent call last):\n",
+                "  File \"test.py\", line 4, in f\n",
+                "ValueError: boom\n",
+            )
+        );
+
+        // A non-exception value is reported truthfully as `Type: repr(value)`.
+        let plain = value::str_from_bytes(b"plain");
+        assert_eq!(
+            excepthook_text(class, plain).expect("text"),
+            "ValueError: 'plain'\n"
+        );
+        assert_eq!(
+            excepthook_text(value::type_class(plain), NONE).expect("text"),
+            "str: None\n"
+        );
+
+        // Calling the hook never panics and leaves the exception state alone.
+        assert_eq!(excepthook(class, error, NONE), NONE);
+        assert!(!pending());
         assert_eq!(handler_depth(), 0);
         init();
     }
@@ -1989,6 +2140,7 @@ mod tests {
 
     #[test]
     fn collection_keeps_the_context_of_the_pending_exception() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         init();
         crate::heap::reset();
         let outer = raise_chain_with_context();

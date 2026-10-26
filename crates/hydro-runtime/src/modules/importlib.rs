@@ -1,4 +1,4 @@
-//! `importlib.import_module`: dynamic imports backed by the module registry.
+//! `importlib`: dynamic imports, reload and cache invalidation.
 //!
 //! Hydro resolves ordinary imports statically. `import_module` exists for code
 //! that selects a module name at runtime: the runtime registry (`sys.modules`)
@@ -6,11 +6,20 @@
 //! module discovered in the globals store, and import returns that exact
 //! module value so identity matches `sys.modules[name]`.
 //!
-//! Names outside the registry fail with `ModuleNotFoundError`. The only
-//! remaining placeholder is the generated Unicode width tables
-//! (`rich._unicode_data.unicodeX`): their synthesized `cell_table` reports a
-//! single default-width range for every codepoint instead of failing the
-//! import. The real per-width tables are not bundled.
+//! The dotted submodules live in their own native modules
+//! ([`importlib_util`](super::importlib_util),
+//! [`importlib_machinery`](super::importlib_machinery),
+//! [`importlib_metadata`](super::importlib_metadata) and
+//! [`importlib_resources`](super::importlib_resources)), so importing
+//! `importlib.metadata` never compiles CPython's package files.
+//!
+//! `reload` re-imports native modules (the built-in loader's documented
+//! no-op) and reports a precise `ImportError` for compiled Python modules,
+//! which have no runtime execution engine. Names outside the registry fail
+//! with `ModuleNotFoundError`. The only remaining placeholder is the generated
+//! Unicode width tables (`rich._unicode_data.unicodeX`): their synthesized
+//! `cell_table` reports a single default-width range for every codepoint
+//! instead of failing the import. The real per-width tables are not bundled.
 
 use crate::exc::{self, IMPORT_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value;
@@ -26,11 +35,55 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             args.first().copied().unwrap_or(value::NONE),
             args.get(1).copied().unwrap_or(value::NONE),
         ),
+        "reload" => reload(args.first().copied().unwrap_or(value::NONE)),
+        "invalidate_caches" => {
+            super::importlib_metadata::invalidate_caches();
+            value::NONE
+        }
         _ => exc::raise_with_message(
             exc::ATTRIBUTE_ERROR,
             &format!("module 'importlib' has no attribute '{function}'"),
         ),
     }
+}
+
+/// `importlib.reload(module)`.
+///
+/// CPython asks the module's loader to execute the module body again. Hydro
+/// compiles module bodies ahead of time, so a pure-Python module cannot be
+/// re-executed at runtime: re-running it would either be a silent no-op or a
+/// partially reinitialized module, both worse than failing. Native modules are
+/// the exception — their loader is the built-in importer, whose reload is a
+/// documented no-op returning the same module.
+fn reload(module_arg: i64) -> i64 {
+    let Some(module) = value::as_module(module_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "reload() argument must be a module, not '{}'",
+                value::type_name(module_arg)
+            ),
+        );
+    };
+    let name = module.name().to_string();
+    if super::registry_lookup(&name) != Some(module_arg) {
+        return exc::raise_with_message(IMPORT_ERROR, &format!("module {name} not in sys.modules"));
+    }
+    if hydro_ir::stdlib::module(&name).is_some() {
+        // Built-in loader: `exec_module` is a no-op, so reload returns the
+        // same module object.
+        return module_arg;
+    }
+    if name == UNICODE_TABLE_PREFIX || name.starts_with("rich._unicode_data.") {
+        return unicode_table_placeholder();
+    }
+    exc::raise_with_message(
+        IMPORT_ERROR,
+        &format!(
+            "cannot reload '{name}': Hydro compiles Python modules ahead of time \
+             and has no runtime execution engine for module bodies"
+        ),
+    )
 }
 
 /// `importlib.import_module(name, package=None)`.
@@ -252,5 +305,54 @@ mod tests {
         call("import_module", &[text("")]);
         assert!(exc::pending());
         exc::clear();
+    }
+
+    #[test]
+    fn native_submodules_and_cache_invalidation_are_reachable() {
+        exc::init();
+        for name in [
+            "importlib.util",
+            "importlib.machinery",
+            "importlib.metadata",
+            "importlib.resources",
+        ] {
+            let module = call("import_module", &[text(name)]);
+            assert_eq!(
+                as_module(module).map(|module| module.name()),
+                Some(name),
+                "{name} must resolve to the native module"
+            );
+            assert!(!exc::pending(), "{name}");
+        }
+        // Reloading a built-in module is the documented no-op.
+        let math = call("import_module", &[text("math")]);
+        assert_eq!(call("reload", &[math]), math);
+        assert_eq!(call("invalidate_caches", &[]), value::NONE);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn reloading_a_compiled_module_reports_the_missing_executor() {
+        crate::core::globals::reset();
+        exc::init();
+        crate::core::globals::set("pkg.reloadable", "__name__", text("pkg.reloadable"));
+        let module = call("import_module", &[text("pkg.reloadable")]);
+        exc::clear();
+        call("reload", &[module]);
+        assert_eq!(exc::pending_tag(), i64::from(IMPORT_ERROR));
+        assert!(
+            value::to_string(exc::pending_value()).contains("no runtime execution engine"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+
+        // A module-like namespace is not a module value.
+        exc::clear();
+        let namespace = value::namespace_new(vec![("__name__".to_string(), text("ghost"))]);
+        call("reload", &[namespace]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+
+        crate::core::globals::reset();
+        exc::init();
     }
 }

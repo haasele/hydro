@@ -19,8 +19,6 @@
 //! - `compile()`: `NotImplementedError` (there is no bytecode compiler).
 //! - `type(name, bases, dict)`: `NotImplementedError` (dynamic class creation
 //!   is not part of the frontend's class model).
-//! - `iter(callable, sentinel)`: `NotImplementedError` (only container
-//!   iterators exist).
 //! - `builtins.__dict__` is a snapshot of the module namespace (the same
 //!   mapping `vars(builtins)` returns): the names and values are real, but
 //!   mutating the snapshot does not change the module.
@@ -51,17 +49,8 @@ use crate::value::{self, NONE, NOT_IMPLEMENTED};
 /// Dispatches an attribute-only builtin. Names present in
 /// `Builtin::from_name` are handled first.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
-    // Two forms take a second argument that the core implementations reject.
-    // Handle them before the `from_name` forwarding so the failure is an
-    // explicit "unsupported" instead of a misleading arity error.
-    if function == "iter" && args.len() == 2 {
-        return exc::raise_with_message(
-            NOT_IMPLEMENTED_ERROR,
-            "iter(callable, sentinel) is not supported by Hydro",
-        );
-    }
     if function == "__import__" {
-        return import_builtin(args);
+        return import_from_core(args);
     }
     if function == "open" {
         return modules::io_open(args);
@@ -392,14 +381,31 @@ fn vars(args: &[i64]) -> i64 {
 
 /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`.
 ///
+/// The entry point for both call shapes: `builtins.__import__(...)` (through
+/// [`call`]), the compiler's direct `__import__` lowering and the runtime
+/// keyword binder all reach it with a positional five-slot vector. Missing
+/// optional slots are `None`, which is how the defaults (`globals=None`,
+/// `locals=None`, `fromlist=()`, `level=0`) are spelled. `globals` and
+/// `locals` are accepted for signature compatibility only; resolution never
+/// consults a caller frame.
+///
 /// Resolution is registry-based, matching `importlib.import_module`: names the
 /// program cannot see statically still resolve to their already-loaded module
 /// value, and unknown names raise `ModuleNotFoundError`.
-fn import_builtin(args: &[i64]) -> i64 {
-    let Some(name) = value::as_str(args[0]) else {
+pub(crate) fn import_from_core(args: &[i64]) -> i64 {
+    if args.len() > 5 {
+        return type_error(&format!(
+            "__import__() takes at most 5 arguments ({} given)",
+            args.len()
+        ));
+    }
+    let Some(name_value) = args.first().copied() else {
+        return type_error("__import__() missing required argument 'name' (pos 1)");
+    };
+    let Some(name) = value::as_str(name_value) else {
         return type_error(&format!(
             "__import__() argument 1 must be str, not '{}'",
-            value::type_name(args[0])
+            value::type_name(name_value)
         ));
     };
     let name = name.to_string();
@@ -414,7 +420,9 @@ fn import_builtin(args: &[i64]) -> i64 {
             "relative imports are not supported by Hydro",
         );
     }
-    // `fromlist` requests the submodule instead of its top-level package.
+    // `fromlist` requests the submodule instead of its top-level package. Its
+    // truthiness follows Python's, so a list, tuple or string with any element
+    // selects the full dotted module and an empty one the top-level package.
     let fromlist = args.get(3).copied().unwrap_or(NONE);
     let want_full = fromlist != NONE && value::truthy(fromlist);
     if !want_full {
@@ -428,5 +436,208 @@ fn import_builtin(args: &[i64]) -> i64 {
         return module;
     }
     // Defer to the import machinery for the exact `ModuleNotFoundError`.
-    modules::importlib::call("import_module", &[args[0]])
+    modules::importlib::call("import_module", &[name_value])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn string(text: &str) -> i64 {
+        value::str_from_bytes(text.as_bytes())
+    }
+
+    fn int(n: i64) -> i64 {
+        value::encode_int(n).expect("representable")
+    }
+
+    fn import_function() -> i64 {
+        value::builtin_function_new(Builtin::Import)
+    }
+
+    fn pending_message() -> String {
+        value::to_string(exc::pending_value())
+    }
+
+    /// Calls `__import__` through the runtime keyword binder, which is the
+    /// path a first-class `__import__` value (or a keyword call the frontend
+    /// cannot bind statically) takes.
+    fn call_import(positional: &[i64], pairs: &[i64]) -> i64 {
+        assert_eq!(pairs.len() % 2, 0, "keyword pairs are name/value tuples");
+        let function = import_function();
+        core_builtins::call_kw(
+            function,
+            positional.len(),
+            positional.as_ptr(),
+            pairs.len() / 2,
+            pairs.as_ptr(),
+        )
+    }
+
+    #[test]
+    fn fromlist_list_selects_the_dotted_module() {
+        exc::init();
+        let name = string("os.path");
+        let star = string("*");
+        let fromlist = value::list_new(vec![star]);
+        let pairs = [string("fromlist"), fromlist];
+        let module = call_import(std::slice::from_ref(&name), &pairs);
+        assert!(
+            !exc::pending(),
+            "unexpected exception: {}",
+            pending_message()
+        );
+        assert_eq!(
+            module,
+            modules::registry_lookup("os.path").expect("os.path is registered")
+        );
+    }
+
+    #[test]
+    fn fromlist_string_selects_the_dotted_module() {
+        exc::init();
+        let name = string("os.path");
+        let fromlist = string("*");
+        let pairs = [string("fromlist"), fromlist];
+        let module = call_import(std::slice::from_ref(&name), &pairs);
+        assert!(
+            !exc::pending(),
+            "unexpected exception: {}",
+            pending_message()
+        );
+        assert_eq!(
+            module,
+            modules::registry_lookup("os.path").expect("os.path is registered")
+        );
+    }
+
+    #[test]
+    fn level_zero_binds_by_keyword_with_globals_and_locals() {
+        exc::init();
+        let name = string("os.path");
+        let globals = value::dict_new(Vec::new());
+        let locals = value::dict_new(Vec::new());
+        let fromlist = value::tuple_new(vec![string("abspath")]);
+        // The parameter order need not match the declaration: the binder maps
+        // every name onto its slot.
+        let pairs = [
+            string("level"),
+            int(0),
+            string("fromlist"),
+            fromlist,
+            string("locals"),
+            locals,
+            string("globals"),
+            globals,
+        ];
+        let module = call_import(std::slice::from_ref(&name), &pairs);
+        assert!(
+            !exc::pending(),
+            "unexpected exception: {}",
+            pending_message()
+        );
+        assert_eq!(
+            module,
+            modules::registry_lookup("os.path").expect("os.path is registered")
+        );
+    }
+
+    #[test]
+    fn duplicate_keyword_reports_multiple_values() {
+        exc::init();
+        let name = string("os.path");
+        let pairs = [string("level"), int(0), string("level"), int(0)];
+        let _ = call_import(std::slice::from_ref(&name), &pairs);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "__import__() got multiple values for argument 'level'"
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn positional_and_keyword_conflict_reports_multiple_values() {
+        exc::init();
+        let args = [string("os.path")];
+        let pairs = [string("name"), string("os.path")];
+        let _ = call_import(&args, &pairs);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "__import__() got multiple values for argument 'name'"
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn unknown_keyword_is_rejected() {
+        exc::init();
+        let name = string("os.path");
+        let pairs = [string("bogus"), int(1)];
+        let _ = call_import(std::slice::from_ref(&name), &pairs);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "__import__() got an unexpected keyword argument 'bogus'"
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn missing_name_is_reported() {
+        exc::init();
+        let pairs = [string("level"), int(0)];
+        let _ = call_import(&[], &pairs);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "__import__() missing required argument 'name' (pos 1)"
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn positional_five_slot_vector_selects_the_dotted_module() {
+        exc::init();
+        // The compiled direct `__import__` lowering passes the five slots
+        // positionally: name, globals, locals, fromlist, level.
+        let args = [
+            string("os.path"),
+            NONE,
+            NONE,
+            value::tuple_new(vec![string("*")]),
+            int(0),
+        ];
+        let module = core_builtins::call_builtin(Builtin::Import, args.len(), args.as_ptr());
+        assert!(
+            !exc::pending(),
+            "unexpected exception: {}",
+            pending_message()
+        );
+        assert_eq!(
+            module,
+            modules::registry_lookup("os.path").expect("os.path is registered")
+        );
+    }
+
+    #[test]
+    fn iter_callable_forwards_to_the_core_iterator() {
+        exc::init();
+        // `list()` with no arguments returns a fresh empty list per call.
+        let source = value::builtin_function_new(Builtin::List);
+        let sentinel = value::list_new(Vec::new());
+        let iterator = call("iter", &[source, sentinel]);
+        assert!(
+            !exc::pending(),
+            "unexpected exception: {}",
+            pending_message()
+        );
+        assert_eq!(value::type_name(iterator), "iterator");
+
+        // The first result already equals the sentinel, so iteration ends.
+        assert_eq!(call("next", &[iterator]), NONE);
+        assert_eq!(exc::pending_tag(), exc::STOP_ITERATION as i64);
+        exc::clear();
+    }
 }

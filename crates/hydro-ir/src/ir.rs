@@ -39,8 +39,8 @@ pub enum UnpackTarget {
     Cell(LocalId),
     /// `*name = element`: `element` is a fresh list holding the elements the
     /// plain targets around it did not consume (`a, *rest, b = value`). At
-    /// most one starred target is allowed, and it never nests inside another
-    /// container target.
+    /// most one starred target is allowed per sequence level; a nested
+    /// container target may own its own star.
     Star(Box<UnpackTarget>),
     /// `object.name = element`.
     Attr { object: Expr, name: String },

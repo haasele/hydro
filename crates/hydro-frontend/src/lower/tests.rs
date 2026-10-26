@@ -663,6 +663,165 @@ fn user_star_import_honors_a_literal_all() {
 }
 
 #[test]
+fn native_star_import_of_a_submodule_binds_its_functions() {
+    let source = "from os.path import *\nx = basename('/tmp/a.txt')\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "x").kind {
+        HExprKind::ModuleCall {
+            module, function, ..
+        } => assert_eq!(
+            (module.as_str(), function.as_str()),
+            ("os.path", "basename")
+        ),
+        other => panic!("expected a direct module call, got {other:?}"),
+    }
+}
+
+#[test]
+fn native_star_import_provides_token_constants() {
+    // `tokenize.py` does `from token import *` and then uses `OP`,
+    // `ENCODING` and `tok_name`; the native `token` module's public
+    // constants must resolve as plain compile-time attribute reads.
+    let source = "from token import *\nx = OP\ny = ENCODING\nz = tok_name\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    for (binding, member) in [("x", "OP"), ("y", "ENCODING"), ("z", "tok_name")] {
+        match &assigned(&hir, binding).kind {
+            HExprKind::ModuleAttr { module, name } => {
+                assert_eq!((module.as_str(), name.as_str()), ("token", member))
+            }
+            other => panic!("expected a token constant, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn module_level_conditional_star_imports_are_legal() {
+    // A module-level `if`/`try` body still runs at module level, so CPython
+    // accepts the wildcard form there.
+    let source = "if True:\n    from math import *\nx = sqrt(9)\ny = pi\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "x").kind,
+        HExprKind::ModuleCall { module, function, .. }
+            if module == "math" && function == "sqrt"
+    ));
+    assert!(matches!(
+        &assigned(&hir, "y").kind,
+        HExprKind::ModuleAttr { module, name } if module == "math" && name == "pi"
+    ));
+
+    let source = "try:\n    from math import *\nexcept ImportError:\n    pass\n\nx = sqrt(9)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "x").kind,
+        HExprKind::ModuleCall { module, function, .. }
+            if module == "math" && function == "sqrt"
+    ));
+}
+
+#[test]
+fn star_import_inside_a_function_is_a_syntax_error() {
+    let source = "def f():\n    from math import *\n    return 1\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::SYNTAX);
+    assert_eq!(diags[0].message, "import * only allowed at module level");
+
+    // The same rule applies to a star import nested in a module-level block
+    // inside a function.
+    let source = "def f():\n    if True:\n        from math import *\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::SYNTAX);
+    assert_eq!(diags[0].message, "import * only allowed at module level");
+}
+
+#[test]
+fn star_import_inside_a_class_body_is_a_syntax_error() {
+    let source = "class C:\n    from math import *\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::SYNTAX);
+    assert_eq!(diags[0].message, "import * only allowed at module level");
+
+    let source = "def outer():\n    class C:\n        from math import *\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::SYNTAX);
+    assert_eq!(diags[0].message, "import * only allowed at module level");
+}
+
+/// True when `stmts` or a nested `if` block binds `expected` through the
+/// runtime global table.
+fn binds_module_global(stmts: &[HStmt], expected: &str) -> bool {
+    stmts.iter().any(|stmt| match &stmt.kind {
+        HStmtKind::GlobalSet { name, .. } => name == expected,
+        HStmtKind::If {
+            then_body,
+            else_body,
+            ..
+        } => binds_module_global(then_body, expected) || binds_module_global(else_body, expected),
+        _ => false,
+    })
+}
+
+#[test]
+fn native_star_import_is_mirrored_into_module_globals() {
+    // An imported unit (or a session fragment) mirrors each star binding into
+    // its runtime global table, so the names are real module attributes for
+    // importers and later fragments.
+    let source = "from math import *\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "helper.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = &hir.functions[0].body;
+    assert!(
+        binds_module_global(body, "sqrt"),
+        "star-imported function must be mirrored: {body:?}"
+    );
+    assert!(
+        binds_module_global(body, "pi"),
+        "star-imported constant must be mirrored: {body:?}"
+    );
+}
+
+#[test]
+fn user_star_import_is_mirrored_into_module_globals() {
+    let source = "from helper import *\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "consumer.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    lowerer.set_user_modules(HashMap::from([(
+        "helper".to_string(),
+        UserModule {
+            name: "helper".to_string(),
+            exports: HashMap::from([
+                ("add".to_string(), UserExport::Function(7)),
+                ("VALUE".to_string(), UserExport::Global),
+                ("_private".to_string(), UserExport::Global),
+            ]),
+            all: None,
+        },
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = &hir.functions[0].body;
+    assert!(binds_module_global(body, "add"), "{body:?}");
+    assert!(binds_module_global(body, "VALUE"), "{body:?}");
+    assert!(!binds_module_global(body, "_private"), "{body:?}");
+}
+
+#[test]
 fn imports_emit_no_statements() {
     let source = "import math\nfrom math import pi\nx = pi\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
@@ -897,6 +1056,209 @@ fn raise_from_none_lowers_the_none_constant_as_cause() {
         &cause.as_ref().expect("cause").kind,
         HExprKind::Const(Const::None)
     ));
+}
+
+#[test]
+fn raise_of_a_caught_exception_value_keeps_the_object() {
+    let source = "try:\n    pass\nexcept Exception as e:\n    raise e from None\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Try { handlers, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a try statement");
+    };
+    let binding = handlers[0].binding.expect("handler binding");
+    let HStmtKind::Raise { exc, msg, cause } = &handlers[0].body[0].kind else {
+        panic!("expected a raise statement, got {:?}", handlers[0].body[0]);
+    };
+    assert_eq!(*exc, None, "the value form replaces the tag form");
+    assert!(
+        matches!(
+            &msg.as_ref().expect("raised value").kind,
+            HExprKind::Local(id) if *id == binding
+        ),
+        "{msg:?}"
+    );
+    assert!(matches!(
+        &cause.as_ref().expect("cause").kind,
+        HExprKind::Const(Const::None)
+    ));
+
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+    let program = crate::sema::emit(&hir, &mut infer);
+    let handlers = program.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            hydro_ir::StmtKind::Try { handlers, .. } => Some(handlers),
+            _ => None,
+        })
+        .expect("IR try statement");
+    let hydro_ir::StmtKind::Raise { exc, msg, cause } = &handlers[0].body[0].kind else {
+        panic!(
+            "expected an IR raise statement, got {:?}",
+            handlers[0].body[0]
+        );
+    };
+    assert_eq!(*exc, None);
+    assert!(matches!(
+        msg.as_ref().map(|value| &value.kind),
+        Some(hydro_ir::ExprKind::Local(_))
+    ));
+    assert!(matches!(
+        cause.as_ref().map(|value| &value.kind),
+        Some(hydro_ir::ExprKind::Const(hydro_ir::Const::None))
+    ));
+}
+
+#[test]
+fn raise_with_an_exception_value_and_cause_lowers_both_operands() {
+    let source = "def f(e, cause):\n    raise e from cause\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let e = f.params.iter().find(|param| param.name == "e").expect("e");
+    let cause_param = f
+        .params
+        .iter()
+        .find(|param| param.name == "cause")
+        .expect("cause");
+    let HStmtKind::Raise { exc, msg, cause } = &f.body[0].kind else {
+        panic!("expected a raise statement, got {:?}", f.body[0]);
+    };
+    assert_eq!(*exc, None);
+    assert!(
+        matches!(&msg.as_ref().expect("raised value").kind, HExprKind::Local(id) if *id == e.local),
+        "{msg:?}"
+    );
+    assert!(
+        matches!(
+            &cause.as_ref().expect("explicit cause").kind,
+            HExprKind::Local(id) if *id == cause_param.local
+        ),
+        "{cause:?}"
+    );
+}
+
+#[test]
+fn raise_with_two_argument_exception_constructor_raises_the_value() {
+    let source = "class TokenError(Exception):\n\
+                  \x20   pass\n\
+                  \n\
+                  def fail(msg, pos):\n\
+                  \x20   raise TokenError(msg, pos) from None\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let raise = function(&hir, "fail")
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Raise { exc, msg, cause } => Some((*exc, msg, cause)),
+            _ => None,
+        })
+        .expect("raise statement");
+    assert_eq!(raise.0, None, "the value form replaces the tag form");
+    assert!(raise.2.is_some(), "the `from None` cause must be preserved");
+    let HExprKind::IndirectCall { callee, args, .. } =
+        &raise.1.as_ref().expect("raised value").kind
+    else {
+        panic!(
+            "expected the constructor call, got {:?}",
+            raise.1.as_ref().map(|expr| &expr.kind)
+        );
+    };
+    assert_eq!(args.len(), 2, "both positional arguments must be passed");
+    assert!(matches!(
+        &callee.kind,
+        HExprKind::GlobalGet { name, .. } if name == "TokenError"
+    ));
+
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+    let program = crate::sema::emit(&hir, &mut infer);
+    let raise = program
+        .functions
+        .iter()
+        .find(|f| f.name == "fail")
+        .expect("fail")
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            hydro_ir::StmtKind::Raise { exc, msg, .. } => Some((*exc, msg)),
+            _ => None,
+        })
+        .expect("IR raise");
+    assert_eq!(raise.0, None);
+    let Some(
+        hydro_ir::ExprKind::Call { args, .. }
+        | hydro_ir::ExprKind::IndirectCall { args, .. }
+        | hydro_ir::ExprKind::ClassCall { args, .. },
+    ) = raise.1.as_ref().map(|value| &value.kind)
+    else {
+        panic!(
+            "expected the emitted constructor call, got {:?}",
+            raise.1.as_ref().map(|value| &value.kind)
+        );
+    };
+    assert_eq!(args.len(), 2);
+}
+
+#[test]
+fn raise_with_a_multi_argument_builtin_constructor_raises_the_value() {
+    let source = "def f(errno, text):\n    raise OSError(errno, text)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Raise { exc, msg, cause } = &function(&hir, "f").body[0].kind else {
+        panic!("expected a raise statement");
+    };
+    assert_eq!(*exc, None, "the value form replaces the tag form");
+    assert!(cause.is_none());
+    let HExprKind::IndirectCall { callee, args, .. } = &msg.as_ref().expect("raised value").kind
+    else {
+        panic!(
+            "expected the constructor call, got {:?}",
+            msg.as_ref().map(|expr| &expr.kind)
+        );
+    };
+    assert!(matches!(
+        &callee.kind,
+        HExprKind::ExceptionClass(ExcKind::OSError)
+    ));
+    assert_eq!(args.len(), 2, "both positional arguments must be passed");
+}
+
+#[test]
+fn raise_without_an_exception_stays_a_bare_re_raise() {
+    let source = "try:\n    pass\nexcept Exception:\n    raise\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Try { handlers, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a try statement");
+    };
+    let HStmtKind::Raise { exc, msg, cause } = &handlers[0].body[0].kind else {
+        panic!("expected a raise statement, got {:?}", handlers[0].body[0]);
+    };
+    assert_eq!(*exc, None);
+    assert!(msg.is_none());
+    assert!(cause.is_none());
+
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+    let program = crate::sema::emit(&hir, &mut infer);
+    let handlers = program.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            hydro_ir::StmtKind::Try { handlers, .. } => Some(handlers),
+            _ => None,
+        })
+        .expect("IR try statement");
+    let hydro_ir::StmtKind::Raise { exc, msg, cause } = &handlers[0].body[0].kind else {
+        panic!(
+            "expected an IR raise statement, got {:?}",
+            handlers[0].body[0]
+        );
+    };
+    assert_eq!(*exc, None);
+    assert!(msg.is_none());
+    assert!(cause.is_none());
 }
 
 #[test]
@@ -4233,8 +4595,19 @@ class C:
     def value(self, new):
         self._value = new
 ";
-    let (hir, _, diags) = lower_source(source, &parse(source));
+    let module = parse(source);
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    let hir = lowerer.lower_module(&module);
+    let diags = std::mem::take(&mut lowerer.diags);
     assert!(diags.is_empty(), "{diags:?}");
+    // A lone descriptor-factory decorator (and the known no-op markers) is
+    // fully described by the binding kind: the class keeps the static
+    // `ClassDef` shape instead of executing its body through a namespace.
+    assert!(
+        !class_plan(&lowerer, &module, "C").dynamic,
+        "binding-kind decorators keep the static class path"
+    );
     let HStmtKind::ClassDef { methods, .. } = &hir.functions[0].body[0].kind else {
         panic!("expected a class definition");
     };
@@ -4253,15 +4626,405 @@ class C:
     );
 }
 
+/// The value stored in a dynamically-built class namespace for `name`, with
+/// the `if True:`/control-flow wrappers peeled away.
+fn namespace_store<'a>(stmts: &'a [HStmt], name: &str) -> Option<&'a HExpr> {
+    for stmt in stmts {
+        match &stmt.kind {
+            HStmtKind::SetSubscript { index, value, .. } => {
+                if matches!(&index.kind, HExprKind::Const(Const::Str(key)) if key == name) {
+                    return Some(value);
+                }
+            }
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | HStmtKind::While {
+                body: then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(value) =
+                    namespace_store(then_body, name).or_else(|| namespace_store(else_body, name))
+                {
+                    return Some(value);
+                }
+            }
+            HStmtKind::ForRange {
+                body, else_body, ..
+            }
+            | HStmtKind::ForEach {
+                body, else_body, ..
+            } => {
+                if let Some(value) =
+                    namespace_store(body, name).or_else(|| namespace_store(else_body, name))
+                {
+                    return Some(value);
+                }
+            }
+            HStmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                let found = namespace_store(body, name)
+                    .or_else(|| {
+                        handlers
+                            .iter()
+                            .find_map(|handler| namespace_store(&handler.body, name))
+                    })
+                    .or_else(|| namespace_store(else_body, name))
+                    .or_else(|| namespace_store(finally_body, name));
+                if found.is_some() {
+                    return found;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The plan registered for the `class` statement in `module.body`.
+fn class_plan<'a>(lowerer: &'a Lowerer<'_>, module: &ast::ModModule, name: &str) -> &'a ClassPlan {
+    let class = module
+        .body
+        .iter()
+        .find_map(|stmt| match stmt {
+            ast::Stmt::ClassDef(class) if class.name.as_str() == name => Some(class),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no class '{name}'"));
+    lowerer
+        .class_defs
+        .get(&(u32::from(class.range.start()) as usize))
+        .unwrap_or_else(|| panic!("class '{name}' was not registered"))
+}
+
+/// Names of a planned method's runtime decorators, outermost first.
+fn planned_decorator_names(method: &PlannedMethod) -> Vec<String> {
+    method
+        .decorators
+        .iter()
+        .map(|decorator| decorator_final_name(decorator).unwrap_or_default())
+        .collect()
+}
+
 #[test]
-fn unknown_method_decorators_are_still_diagnosed() {
-    let source = "class C:\n    @custom\n    def f(self):\n        return 1\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
+fn method_decorators_apply_bottom_up_and_keep_classmethod_binding() {
+    let source = "\
+def logged(fn=None):
+    def decorate(inner):
+        return inner
+    if fn is None:
+        return decorate
+    return fn
+
+class C:
+    @logged
+    @classmethod
+    def decorated_classmethod(cls):
+        return 1
+
+    @classmethod
+    @logged
+    def classmethod_last(cls):
+        return 2
+
+    @logged()
+    def with_arguments(self):
+        return 3
+
+    @staticmethod
+    @logged
+    def decorated_static():
+        return 4
+";
+    let module = parse(source);
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    let hir = lowerer.lower_module(&module);
+    let diags = std::mem::take(&mut lowerer.diags);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let plan = class_plan(&lowerer, &module, "C");
+    assert!(plan.dynamic, "decorated methods need the runtime body");
+    let method = |name: &str| {
+        plan.methods
+            .iter()
+            .find(|method| method.name == name)
+            .unwrap_or_else(|| panic!("no method '{name}'"))
+    };
+    assert_eq!(
+        planned_decorator_names(method("decorated_classmethod")),
+        vec!["logged", "classmethod"]
+    );
+    assert_eq!(
+        method("decorated_classmethod").kind,
+        MethodKind::Classmethod
+    );
+    assert_eq!(
+        planned_decorator_names(method("classmethod_last")),
+        vec!["classmethod", "logged"]
+    );
+    assert_eq!(
+        planned_decorator_names(method("with_arguments")),
+        vec!["logged"]
+    );
+    assert_eq!(
+        planned_decorator_names(method("decorated_static")),
+        vec!["staticmethod", "logged"]
+    );
+
+    // `@logged @classmethod` applies `@logged` to the classmethod object:
+    // the stored value is `logged(classmethod(function))`.
+    let store = namespace_store(&hir.functions[0].body, "decorated_classmethod")
+        .expect("class namespace stores the decorated method");
+    let HExprKind::IndirectCall { args, .. } = &store.kind else {
+        panic!("expected the decorator call, got {:?}", store.kind);
+    };
+    assert_eq!(args.len(), 1);
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::Classmethod),
+        args: inner,
+    } = &args[0].kind
+    else {
+        panic!(
+            "expected classmethod(...) below @logged, got {:?}",
+            args[0].kind
+        );
+    };
+    assert!(matches!(inner[0].kind, HExprKind::FunctionRef(_)));
+
+    // `@classmethod @logged` stores `classmethod(logged(function))`.
+    let store = namespace_store(&hir.functions[0].body, "classmethod_last")
+        .expect("class namespace stores the decorated method");
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::Classmethod),
+        args,
+    } = &store.kind
+    else {
+        panic!("expected classmethod(...) outermost, got {:?}", store.kind);
+    };
+    assert!(matches!(args[0].kind, HExprKind::IndirectCall { .. }));
+
+    // `@logged()` evaluates its call expression once and applies the result to
+    // the function; it is not lowered as `logged(function)`.
+    let store = namespace_store(&hir.functions[0].body, "with_arguments")
+        .expect("class namespace stores the argument-decorated method");
+    let HExprKind::IndirectCall { callee, args, .. } = &store.kind else {
+        panic!("expected logged()(function), got {:?}", store.kind);
+    };
+    assert!(matches!(&callee.kind, HExprKind::Local(_)));
+    assert!(matches!(args[0].kind, HExprKind::FunctionRef(_)));
+}
+
+#[test]
+fn method_decorator_expressions_evaluate_top_down_and_apply_bottom_up() {
+    let source = "\
+def outer(fn):
+    return fn
+
+def inner(fn):
+    return fn
+
+class C:
+    @outer
+    @inner
+    def method(self):
+        return 0
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let module = &hir.functions[0];
+
+    // CPython evaluates `outer` before `inner`, so their hidden locals are
+    // emitted in that order.
+    fn collect_decorator_assigns(stmts: &[HStmt], locals: &[HLocal], out: &mut Vec<LocalId>) {
+        for stmt in stmts {
+            match &stmt.kind {
+                HStmtKind::Assign { target, .. }
+                    if locals[*target as usize].name.starts_with("$decor") =>
+                {
+                    out.push(*target);
+                }
+                HStmtKind::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect_decorator_assigns(then_body, locals, out);
+                    collect_decorator_assigns(else_body, locals, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut evaluated = Vec::new();
+    collect_decorator_assigns(&module.body, &module.locals, &mut evaluated);
+    let names: Vec<&str> = evaluated
+        .iter()
+        .map(|local| module.locals[*local as usize].name.as_str())
+        .collect();
+    assert_eq!(names, vec!["$decor0", "$decor1"]);
+
+    // The function is transformed bottom-up: the last-evaluated decorator
+    // (`inner`, `$decor1`) is applied first, then `outer` (`$decor0`).
+    let store = namespace_store(&module.body, "method").expect("class namespace store");
+    let HExprKind::IndirectCall { callee, args, .. } = &store.kind else {
+        panic!("expected outer(inner(function)), got {:?}", store.kind);
+    };
+    let HExprKind::Local(outer_local) = &callee.kind else {
+        panic!(
+            "expected the evaluated 'outer' local, got {:?}",
+            callee.kind
+        );
+    };
+    assert_eq!(module.locals[*outer_local as usize].name, "$decor0");
+    let HExprKind::IndirectCall {
+        callee,
+        args: inner_args,
+        ..
+    } = &args[0].kind
+    else {
+        panic!("expected the 'inner' application, got {:?}", args[0].kind);
+    };
+    let HExprKind::Local(inner_local) = &callee.kind else {
+        panic!(
+            "expected the evaluated 'inner' local, got {:?}",
+            callee.kind
+        );
+    };
+    assert_eq!(module.locals[*inner_local as usize].name, "$decor1");
+    assert!(matches!(inner_args[0].kind, HExprKind::FunctionRef(_)));
+}
+
+#[test]
+fn decorated_init_defers_constructor_binding_to_runtime() {
+    let source = "\
+def logged(fn):
+    return fn
+
+class C:
+    @logged
+    def __init__(self, value):
+        self.value = value
+";
+    let module = parse(source);
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    let hir = lowerer.lower_module(&module);
+    let diags = std::mem::take(&mut lowerer.diags);
+    assert!(diags.is_empty(), "{diags:?}");
     assert!(
-        diags[0].message.contains("decorators are not supported"),
+        !lowerer.class_inits.contains_key("C"),
+        "a decorated __init__ cannot be called through the static constructor path"
+    );
+    let store = namespace_store(&hir.functions[0].body, "__init__")
+        .expect("class namespace stores the decorated initializer");
+    assert!(
+        matches!(store.kind, HExprKind::IndirectCall { .. }),
         "{:?}",
-        diags[0].message
+        store.kind
+    );
+}
+
+#[test]
+fn nested_class_methods_capture_enclosing_locals() {
+    let source = "\
+def outer():
+    base = 1
+    class Inner:
+        def get(self):
+            return base
+        def bump(self):
+            nonlocal base
+            base += 1
+    return Inner
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let outer = function(&hir, "outer");
+    // `base` is read and rebound through the nested class, so the enclosing
+    // function owns a cell for it.
+    assert!(
+        outer
+            .body
+            .iter()
+            .any(|stmt| matches!(&stmt.kind, HStmtKind::CellInit { .. })),
+        "expected a cell for 'base': {:?}",
+        outer.body
+    );
+    let capture = function(&hir, "Inner.get");
+    assert_eq!(capture.capture_count, 1);
+    assert_eq!(capture.params[0].name, "base");
+    let bump = function(&hir, "Inner.bump");
+    assert_eq!(bump.capture_count, 1);
+    assert_eq!(bump.params[0].name, "base");
+    // The class itself is bound to the function's local slot, not a global.
+    assert!(
+        outer
+            .body
+            .iter()
+            .any(|stmt| matches!(&stmt.kind, HStmtKind::If { .. })),
+        "expected the dynamic class statement: {:?}",
+        outer.body
+    );
+    assert!(!outer
+        .body
+        .iter()
+        .any(|stmt| matches!(&stmt.kind, HStmtKind::GlobalSet { .. })));
+}
+
+#[test]
+fn setattr_and_delattr_lower_to_builtins_calls() {
+    let source = "\
+class C:
+    pass
+
+c = C()
+setattr(c, 'value', 1)
+delattr(c, 'value')
+alias = setattr
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let mut setattr_calls = 0;
+    let mut delattr_calls = 0;
+    for stmt in &hir.functions[0].body {
+        let HStmtKind::Expr(expr) = &stmt.kind else {
+            continue;
+        };
+        let HExprKind::ModuleCall {
+            module, function, ..
+        } = &expr.kind
+        else {
+            continue;
+        };
+        assert_eq!(module, "builtins");
+        match function.as_str() {
+            "setattr" => setattr_calls += 1,
+            "delattr" => delattr_calls += 1,
+            other => panic!("unexpected module call '{other}'"),
+        }
+    }
+    assert_eq!(
+        (setattr_calls, delattr_calls),
+        (1, 1),
+        "{:?}",
+        hir.functions[0].body
+    );
+    let alias = assigned(&hir, "alias");
+    assert!(
+        matches!(
+            &alias.kind,
+            HExprKind::ModuleAttr { module, name } if module == "builtins" && name == "setattr"
+        ),
+        "{:?}",
+        alias.kind
     );
 }
 
@@ -6196,19 +6959,39 @@ z = helper
 }
 
 #[test]
+fn module_level_try_extension_star_import_is_legal() {
+    // A module-level `try` body still runs at module level, so the wildcard
+    // form is allowed there; unresolvable names keep the lazy extension
+    // fallback instead of a diagnostic.
+    let dir = ExtensionDir::new("star-try");
+    let so = dir.add_extension("mod_ext.abi3.so");
+    let expected = fs::canonicalize(&so).expect("canonical extension path");
+    let expected_path = expected.to_string_lossy().into_owned();
+    let source = "try:\n    from mod_ext import *\nexcept ImportError:\n    pass\n\nx = helper\n";
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "x").kind {
+        HExprKind::ExtensionAttr { path, member } => {
+            assert_eq!(
+                (path.as_str(), member.as_str()),
+                (expected_path.as_str(), "helper")
+            );
+        }
+        other => panic!("expected the lazy extension fallback, got {other:?}"),
+    }
+}
+
+#[test]
 fn nested_extension_star_import_is_rejected() {
     // Python only allows `import *` at module level; a function-local star
-    // import stays a diagnostic.
+    // import is a syntax error regardless of the module kind.
     let dir = ExtensionDir::new("nested-star");
     dir.add_extension("mod_ext.abi3.so");
     let source = "def f():\n    from mod_ext import *\n";
     let (_, _, diags) = lower_source_in(&dir.path, source);
     assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::UNSUPPORTED);
-    assert_eq!(
-        diags[0].message,
-        "'from mod_ext import *' is not supported for extension modules"
-    );
+    assert_eq!(diags[0].code, codes::SYNTAX);
+    assert_eq!(diags[0].message, "import * only allowed at module level");
 }
 
 #[test]
@@ -7603,6 +8386,53 @@ fn sorted_rejects_conflicting_or_unsupported_keywords() {
 }
 
 #[test]
+fn import_keywords_lower_through_the_keyword_binder() {
+    // `encodings/__init__.py` calls `__import__('encodings.' + modname,
+    // fromlist=_import_tail, level=0)`; every CPython 3.14 parameter name must
+    // bind instead of being rejected.
+    let source = "mod = __import__('os.path', fromlist=['*'], level=0)\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::CallKw {
+        callee,
+        args,
+        keywords,
+    } = &assigned(&hir, "mod").kind
+    else {
+        panic!(
+            "expected a keyword __import__ call, got {:?}",
+            assigned(&hir, "mod")
+        );
+    };
+    assert!(matches!(
+        &callee.kind,
+        HExprKind::BuiltinRef(Builtin::Import)
+    ));
+    assert_eq!(args.len(), 1, "the positional name stays positional");
+    assert_eq!(
+        keywords
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["fromlist", "level"]
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn import_rejects_unknown_keyword() {
+    let source = "mod = __import__('os', nope=1)\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{source}: {diags:?}");
+    assert!(
+        diags[0]
+            .message
+            .contains("__import__() got an unexpected keyword argument 'nope'"),
+        "{source}: {diags:?}"
+    );
+}
+
+#[test]
 fn list_displays_expand_starred_operands_as_concatenation() {
     let source = "xs = [1, 2]\ny = ['a', *xs, 'b']\nz = [*xs]\n";
     let (hir, mut infer, diags) = lower_source(source, &parse(source));
@@ -7614,6 +8444,161 @@ fn list_displays_expand_starred_operands_as_concatenation() {
         assert_eq!(assigned(&hir, name).ty, Ty::Concrete(Type::List));
     }
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn tuple_displays_expand_starred_operands_in_order() {
+    let source = "xs = (1, 2)\ny = ('a', *xs, 'b')\nz = (*xs,)\nw = (1, *xs, 2, *xs)\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    for name in ["y", "z", "w"] {
+        let HExprKind::Bin { op: BinOp::Add, .. } = &assigned(&hir, name).kind else {
+            panic!("expected tuple concatenation for {name}");
+        };
+        assert_eq!(assigned(&hir, name).ty, Ty::Concrete(Type::Tuple));
+    }
+    // `(*xs,)` copies the operand through `tuple(xs)`; the plain chunks are
+    // evaluated before the starred operand in source order.
+    let HExprKind::Bin {
+        op: BinOp::Add,
+        rhs,
+        ..
+    } = &assigned(&hir, "z").kind
+    else {
+        unreachable!()
+    };
+    assert!(matches!(
+        &rhs.kind,
+        HExprKind::Call {
+            callee: Callee::Builtin(Builtin::Tuple),
+            args,
+        } if args.len() == 1
+    ));
+    let HExprKind::Bin {
+        op: BinOp::Add,
+        lhs,
+        ..
+    } = &assigned(&hir, "y").kind
+    else {
+        unreachable!()
+    };
+    let HExprKind::Bin {
+        op: BinOp::Add,
+        lhs,
+        rhs,
+        ..
+    } = &lhs.kind
+    else {
+        panic!("expected the starred operand before the trailing chunk");
+    };
+    assert!(matches!(
+        &rhs.kind,
+        HExprKind::Call {
+            callee: Callee::Builtin(Builtin::Tuple),
+            args,
+        } if args.len() == 1
+    ));
+    let HExprKind::Bin {
+        op: BinOp::Add,
+        rhs,
+        ..
+    } = &lhs.kind
+    else {
+        panic!("expected the leading plain chunk before the starred operand");
+    };
+    assert!(matches!(&rhs.kind, HExprKind::Tuple(elems) if elems.len() == 1));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn set_displays_expand_starred_operands_in_order() {
+    let source = "xs = {1, 2}\ny = {3, *xs, 4}\nz = {*xs}\nr = {*range(3)}\nw = {1, *xs, *xs}\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    for name in ["y", "w"] {
+        let HExprKind::Bin {
+            op: BinOp::BitOr, ..
+        } = &assigned(&hir, name).kind
+        else {
+            panic!("expected a set union for {name}");
+        };
+        assert_eq!(assigned(&hir, name).ty, Ty::Concrete(Type::Set));
+    }
+    // A leading star needs no empty-set seed: `set(list(xs))` already copies.
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::Set),
+        args,
+    } = &assigned(&hir, "z").kind
+    else {
+        panic!(
+            "expected set(list(xs)) for a leading star, got {:?}",
+            assigned(&hir, "z").kind
+        );
+    };
+    assert_eq!(args.len(), 1);
+    assert!(matches!(
+        &args[0].kind,
+        HExprKind::Call {
+            callee: Callee::Builtin(Builtin::List),
+            ..
+        }
+    ));
+    // Any iterable, including a range, is accepted after `*`.
+    assert!(matches!(
+        &assigned(&hir, "r").kind,
+        HExprKind::Call {
+            callee: Callee::Builtin(Builtin::Set),
+            args,
+        } if args.len() == 1
+    ));
+    let HExprKind::Bin {
+        op: BinOp::BitOr,
+        lhs,
+        ..
+    } = &assigned(&hir, "y").kind
+    else {
+        unreachable!()
+    };
+    assert!(matches!(
+        &lhs.kind,
+        HExprKind::Bin {
+            op: BinOp::BitOr,
+            ..
+        }
+    ));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn starred_displays_of_non_iterables_are_rejected() {
+    let source = "a = (1, *1)\nb = {*1}\nc = [*1]\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    // The starred set operand is materialised through `list(...)`; inference
+    // rejects a statically known non-iterable before the runtime can raise.
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::Set),
+        args,
+    } = &assigned(&hir, "b").kind
+    else {
+        panic!("expected set(list(1)) for a starred set display");
+    };
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::List),
+        args,
+    } = &args[0].kind
+    else {
+        panic!("expected the starred set operand to be materialised as a list");
+    };
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::Int(1))));
+    let diags = crate::sema::check(&hir, &mut infer, "test.py")
+        .expect_err("starred non-iterable operands must be rejected");
+    assert!(
+        diags
+            .iter()
+            .any(|diag| diag.message.contains("argument must be iterable")),
+        "{diags:?}"
+    );
 }
 
 #[test]
@@ -8125,24 +9110,64 @@ fn starred_unpack_target_binds_the_remaining_elements() {
 }
 
 #[test]
-fn nested_starred_unpack_targets_are_rejected() {
-    let source = "(a, *b), c = ((1, 2), 3)\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert!(
-        diags
-            .iter()
-            .any(|diag| diag.message.contains("starred unpacking cannot appear")),
-        "{diags:?}"
-    );
+fn nested_starred_unpack_targets_are_accepted() {
+    let source = "(a, *b), c = ((1, 2, 3), 4)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let targets = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Unpack { targets, .. } => Some(targets),
+            _ => None,
+        })
+        .expect("unpack statement");
+    let HUnpackTarget::Nested(inner) = &targets[0] else {
+        panic!("expected a nested target, got {:?}", targets[0]);
+    };
+    assert!(matches!(inner[0], HUnpackTarget::Name(_)));
+    assert!(matches!(inner[1], HUnpackTarget::Star(_)));
+    assert!(matches!(targets[1], HUnpackTarget::Name(_)));
 
-    let source = "*a, *b = (1, 2)\n";
+    // Every sequence level owns its star; list targets behave like tuples.
+    let source = "(a, *b), (*c, d) = ((1, 2, 3), (4, 5, 6))\n\
+                  [e, *f] = [1, 2, 3]\n\
+                  [*g, h] = [1, 2, 3]\n\
+                  for (i, *j), (*k, l) in [((1, 2), (3, 4))]:\n    pass\n";
     let (_, _, diags) = lower_source(source, &parse(source));
-    assert!(
-        diags
-            .iter()
-            .any(|diag| diag.message.contains("multiple starred unpacking targets")),
-        "{diags:?}"
-    );
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn multiple_starred_unpack_targets_are_rejected_per_level() {
+    for source in [
+        "*a, *b = (1, 2)\n",
+        "(a, *b), (*c, *d) = ((1, 2), (3, 4))\n",
+        "for *a, *b in [(1, 2)]:\n    pass\n",
+        "xs = [1 for *a, *b in [(1, 2)]]\n",
+    ] {
+        let (_, _, diags) = lower_source(source, &parse(source));
+        assert!(
+            diags
+                .iter()
+                .any(|diag| diag.message.contains("multiple starred unpacking targets")),
+            "{source}: {diags:?}"
+        );
+    }
+}
+
+#[test]
+fn inspect_starred_unpack_patterns_lower() {
+    let source = "\
+frame = 1
+lineno = 2
+positions = [3, 4]
+frame, *positions = (frame, lineno, *positions[1:])
+frame, *positions = (frame, *positions)
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 
 #[test]
@@ -9093,6 +10118,325 @@ class C(A, B, metaclass=type):
     assert!(class.iter().any(|(name, _)| name == "__slots__"));
 }
 
+/// The `HStmtKind::ClassDef` for `name`, descending into module-level
+/// control-flow blocks (and the `if True:` wrappers class lowering emits).
+fn class_def_in<'a>(stmts: &'a [HStmt], name: &str) -> Option<&'a HStmtKind> {
+    for stmt in stmts {
+        match &stmt.kind {
+            HStmtKind::ClassDef {
+                name: class_name, ..
+            } if class_name.as_str() == name => return Some(&stmt.kind),
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(found) =
+                    class_def_in(then_body, name).or_else(|| class_def_in(else_body, name))
+                {
+                    return Some(found);
+                }
+            }
+            HStmtKind::While {
+                body, else_body, ..
+            }
+            | HStmtKind::ForRange {
+                body, else_body, ..
+            }
+            | HStmtKind::ForEach {
+                body, else_body, ..
+            } => {
+                if let Some(found) =
+                    class_def_in(body, name).or_else(|| class_def_in(else_body, name))
+                {
+                    return Some(found);
+                }
+            }
+            HStmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                let found = class_def_in(body, name)
+                    .or_else(|| {
+                        handlers
+                            .iter()
+                            .find_map(|handler| class_def_in(&handler.body, name))
+                    })
+                    .or_else(|| class_def_in(else_body, name))
+                    .or_else(|| class_def_in(finally_body, name));
+                if found.is_some() {
+                    return found;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[test]
+fn module_level_unpack_assignments_bind_module_globals() {
+    let source = "\
+CO_OPTIMIZED, (CO_NEWLOCALS, *rest) = 1, (2, 4, 8)
+def flags():
+    return CO_OPTIMIZED, CO_NEWLOCALS, rest
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = &hir.functions[0].body;
+    assert!(
+        matches!(body[0].kind, HStmtKind::Unpack { .. }),
+        "expected an unpacking assignment: {:?}",
+        body[0].kind
+    );
+    let mirrored: Vec<&str> = body
+        .iter()
+        .filter_map(|stmt| match &stmt.kind {
+            HStmtKind::GlobalSet { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        mirrored,
+        ["CO_OPTIMIZED", "CO_NEWLOCALS", "rest"],
+        "every unpacked name must be mirrored, in binding order"
+    );
+    let HStmtKind::Return(Some(expr)) = &function(&hir, "flags").body[0].kind else {
+        panic!("expected a return statement");
+    };
+    let HExprKind::Tuple(items) = &expr.kind else {
+        panic!("expected a tuple, got {:?}", expr.kind);
+    };
+    let names: Vec<&str> = items
+        .iter()
+        .map(|item| match &item.kind {
+            HExprKind::GlobalGet { name, .. } => name.as_str(),
+            other => panic!("expected a global read, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["CO_OPTIMIZED", "CO_NEWLOCALS", "rest"]);
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn class_header_keywords_evaluate_between_bases_and_the_body() {
+    let source = "\
+def base():
+    return object
+def flag():
+    return True
+def mark():
+    return 1
+class C(base(), _root=flag()):
+    value = mark()
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let locals = &hir.functions[0].locals;
+    let then_body = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::If { then_body, .. }
+                if then_body.iter().any(
+                    |inner| matches!(&inner.kind, HStmtKind::ClassDef { name, .. } if name == "C"),
+                ) =>
+            {
+                Some(then_body)
+            }
+            _ => None,
+        })
+        .expect("the keyword-bearing class is wrapped in a statement block");
+    assert_eq!(then_body.len(), 3, "{then_body:?}");
+    let HStmtKind::Assign {
+        target: base_target,
+        value: base,
+    } = &then_body[0].kind
+    else {
+        panic!("expected the base temp, got {:?}", then_body[0].kind);
+    };
+    assert!(locals[*base_target as usize].name.starts_with("$classbase"));
+    // A header expression is an ordinary expression evaluated when the class
+    // statement runs, so a call to a known function stays a direct call.
+    assert!(matches!(
+        &base.kind,
+        HExprKind::Call {
+            callee: Callee::Function(id),
+            args,
+        } if args.is_empty() && hir.functions[*id as usize].name == "base"
+    ));
+    let HStmtKind::Assign {
+        target: keyword_target,
+        value: keyword,
+    } = &then_body[1].kind
+    else {
+        panic!("expected the keyword temp, got {:?}", then_body[1].kind);
+    };
+    assert!(locals[*keyword_target as usize]
+        .name
+        .starts_with("$classkw"));
+    assert!(matches!(
+        &keyword.kind,
+        HExprKind::Call {
+            callee: Callee::Function(id),
+            args,
+        } if args.is_empty() && hir.functions[*id as usize].name == "flag"
+    ));
+    let HStmtKind::ClassDef {
+        bases,
+        metaclass,
+        methods,
+        attributes,
+        ..
+    } = &then_body[2].kind
+    else {
+        panic!("expected the class definition, got {:?}", then_body[2].kind);
+    };
+    assert_eq!(bases.len(), 1);
+    assert!(matches!(
+        &bases[0].kind,
+        HExprKind::Local(local) if local == base_target
+    ));
+    assert!(metaclass.is_none());
+    assert!(methods.is_empty());
+    assert_eq!(
+        attributes
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["value"]
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn keyword_bearing_dynamic_class_evaluates_keywords_before_the_body() {
+    let source = "\
+def flag():
+    return True
+class C(object, total=flag()):
+    if flag():
+        pass
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let locals = &hir.functions[0].locals;
+    let then_body = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::If { then_body, .. }
+                if matches!(
+                    then_body.first().map(|first| &first.kind),
+                    Some(HStmtKind::Assign { target, .. })
+                        if locals[*target as usize].name.starts_with("$classbase")
+                ) =>
+            {
+                Some(then_body)
+            }
+            _ => None,
+        })
+        .expect("the dynamic class is wrapped in a statement block");
+    let assigned_name = |stmt: &HStmt| match &stmt.kind {
+        HStmtKind::Assign { target, .. } => locals[*target as usize].name.as_str(),
+        other => panic!("expected an assignment, got {other:?}"),
+    };
+    assert!(assigned_name(&then_body[0]).starts_with("$classbase"));
+    assert!(assigned_name(&then_body[1]).starts_with("$classkw"));
+    assert!(assigned_name(&then_body[2]).starts_with("$classns"));
+}
+
+#[test]
+fn class_keywords_with_an_explicit_metaclass_are_rejected() {
+    let source = "class C(metaclass=type, order=True):\n    pass\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(
+        diags
+            .iter()
+            .any(|diag| diag.message.contains("cannot be forwarded")),
+        "{diags:?}"
+    );
+    let source = "class C(**options):\n    pass\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(
+        diags.iter().any(|diag| diag.message.contains("'**'")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn module_level_binding_decorators_apply_at_runtime() {
+    fn has_builtin(stmts: &[HStmt], builtin: Builtin) -> bool {
+        stmts.iter().any(|stmt| match &stmt.kind {
+            HStmtKind::Assign { value, .. } => {
+                matches!(value.kind, HExprKind::BuiltinRef(actual) if actual == builtin)
+            }
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => has_builtin(then_body, builtin) || has_builtin(else_body, builtin),
+            _ => false,
+        })
+    }
+    for (decorator, builtin) in [
+        ("classmethod", Builtin::Classmethod),
+        ("staticmethod", Builtin::Staticmethod),
+        ("property", Builtin::Property),
+    ] {
+        let source =
+            format!("if True:\n    @{decorator}\n    def hook(cls):\n        return cls\n");
+        let (hir, _, diags) = lower_source(&source, &parse(&source));
+        assert!(diags.is_empty(), "{decorator}: {diags:?}");
+        assert!(
+            has_builtin(&hir.functions[0].body, builtin),
+            "{decorator}: the conditional definition must evaluate @{decorator} at runtime: {:?}",
+            hir.functions[0].body
+        );
+        assert!(
+            has_global_set(&hir.functions[0].body),
+            "{decorator}: the decorated conditional definition mirrors its result"
+        );
+    }
+}
+
+#[test]
+fn class_in_module_level_conditional_keeps_binding_kinds() {
+    let source = "\
+if True:
+    class C:
+        @classmethod
+        def build(cls):
+            return cls
+        @staticmethod
+        def helper(x):
+            return x
+        @property
+        def value(self):
+            return 1
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let Some(HStmtKind::ClassDef { methods, .. }) = class_def_in(&hir.functions[0].body, "C")
+    else {
+        panic!("class C was not lowered");
+    };
+    let kinds: Vec<(&str, MethodKind)> = methods
+        .iter()
+        .map(|(name, _, kind)| (name.as_str(), *kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("build", MethodKind::Classmethod),
+            ("helper", MethodKind::Staticmethod),
+            ("value", MethodKind::Property),
+        ]
+    );
+}
+
 #[test]
 fn bytearray_and_memoryview_lower_as_builtin_callables() {
     let source = "\
@@ -9673,6 +11017,103 @@ fn globals_call_carries_the_owning_module_name() {
         HExprKind::Const(Const::Str(name)) if name == "__main__"
     ));
     crate::sema::check(&hir, &mut infer, "test.py").expect("valid program");
+}
+
+#[test]
+fn inspect_style_dynamic_globals_compile_unknown_module_reads() {
+    // CPython's inspect.py installs its `CO_*` constants by writing through
+    // `globals()`, then reads them inside functions. The reads have no static
+    // binding, so they must become runtime global lookups.
+    let source = "\
+mod_dict = globals()
+for flag, value in [('GENERATOR', 32)]:
+    mod_dict['CO_' + flag] = value
+del flag, value, mod_dict
+
+def is_generator_function(obj):
+    return CO_GENERATOR
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let read = function(&hir, "is_generator_function");
+    let HStmtKind::Return(Some(value)) = &read.body[0].kind else {
+        panic!("expected a return, got {:?}", read.body[0]);
+    };
+    assert!(
+        matches!(
+            &value.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "CO_GENERATOR"
+        ),
+        "the dynamically installed name must be read from the module table, got {:?}",
+        value.kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("dynamic global read");
+}
+
+#[test]
+fn dynamic_global_alias_from_vars_allows_unknown_reads() {
+    let source = "namespace = vars()\nnamespace['injected'] = 1\ndef read():\n    return injected\ndef invoke(obj):\n    return hook(obj)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let read = function(&hir, "read");
+    let HStmtKind::Return(Some(value)) = &read.body[0].kind else {
+        panic!("expected a return, got {:?}", read.body[0]);
+    };
+    assert!(
+        matches!(
+            &value.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "injected"
+        ),
+        "an alias of vars() is dynamic too, got {:?}",
+        value.kind
+    );
+    // A dynamically installed callable is resolved the same way: the callee
+    // is a module global read, not a compile-time "not defined" error.
+    let invoke = function(&hir, "invoke");
+    let HStmtKind::Return(Some(value)) = &invoke.body[0].kind else {
+        panic!("expected a return, got {:?}", invoke.body[0]);
+    };
+    let HExprKind::IndirectCall { callee, .. } = &value.kind else {
+        panic!("expected an indirect call, got {:?}", value.kind);
+    };
+    assert!(
+        matches!(
+            &callee.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "hook"
+        ),
+        "the dynamic callee must be a global read, got {:?}",
+        callee.kind
+    );
+}
+
+#[test]
+fn undefined_name_in_an_ordinary_module_still_errors() {
+    let source = "value = 1\ndef read():\n    return valeu\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::NAME);
+    assert_eq!(diags[0].message, "name 'valeu' is not defined");
+}
+
+#[test]
+fn dynamic_globals_do_not_hide_local_scope_errors() {
+    // `item` is a module local no function can see; reaching it from `read`
+    // stays a compile-time scope error even though the module writes through
+    // `globals()`.
+    let source =
+        "namespace = globals()\nfor item in [1]:\n    pass\ndef read():\n    return item\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::NAME);
+    assert!(
+        diags[0]
+            .message
+            .contains("is not visible inside a function"),
+        "{diags:?}"
+    );
 }
 
 #[test]

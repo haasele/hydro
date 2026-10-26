@@ -7,7 +7,8 @@
 //! `CodeType` and `NoneType` follow the same pattern; no introspection API is
 //! attached to them.
 //!
-//! `CellType`, `FunctionType` and `UnionType` are cached:
+//! `CellType`, `FunctionType`, `UnionType` and `DynamicClassAttribute` are
+//! cached:
 //!
 //! * `CellType(value)` is a native instance carrying `cell_contents`;
 //! * `FunctionType` is the cached `function` class the runtime gives every
@@ -22,6 +23,11 @@
 //!   `types.UnionType[A, B]` and `A | B` (for type-like operands: classes,
 //!   `None`, function values and existing unions) construct them; a
 //!   one-element union collapses to its member.
+//! * `DynamicClassAttribute(fget, fset, fdel, doc)` is a real data descriptor:
+//!   instance access calls `fget(instance)`, class access raises
+//!   `AttributeError` (unless the getter is abstract, in which case the
+//!   descriptor itself is returned), and `getter`/`setter`/`deleter` return
+//!   updated copies. `inspect.getmembers` relies on this behaviour.
 //!
 //! `SimpleNamespace(...)` accepts one optional mapping and returns the native
 //! namespace object used by `argparse`, so attribute reads work immediately.
@@ -29,11 +35,22 @@
 //! `**kwargs` lowering for native module functions yet, so the runtime takes
 //! the equivalent mapping instead of rejecting the constructor outright.
 
+use hydro_ir::{MethodKind, ParamKind};
+
 use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, NOT_IMPLEMENTED_ERROR, TYPE_ERROR};
 use crate::heap;
 use crate::methods;
 use crate::value::{self, NONE};
+
+/// The class value for `types.<name>` when the name is a real class the
+/// attribute lookup must return instead of the module-call constructor.
+pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
+    if module == "types" && name == "DynamicClassAttribute" {
+        return Some(dynamic_class_attribute_class());
+    }
+    None
+}
 
 /// Names exposed as empty native classes.
 const CLASSES: &[&str] = &[
@@ -69,6 +86,7 @@ pub(crate) fn constant(name: &str) -> i64 {
         // the `isinstance` route through `type_check_target`.
         "FunctionType" => function_type_class(),
         "UnionType" => union_type_class(),
+        "DynamicClassAttribute" => dynamic_class_attribute_class(),
         _ if CLASSES.contains(&name) => value::class_new(name.to_string(), NONE, Vec::new()),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
@@ -121,6 +139,9 @@ fn cell_type_new(args: &[i64]) -> i64 {
 
 /// Dispatches a native `types` function. Arity is enforced by the central spec.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
+    if let Some(result) = dynamic_class_attribute_method(function, args) {
+        return result;
+    }
     match function {
         "SimpleNamespace" => simple_namespace(args.first().copied().unwrap_or(NONE)),
         "CellType" => cell_type_new(args),
@@ -129,11 +150,404 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         // `types.UnionType[a, b, ...]` through the module-call path (the
         // subscript spelling goes through [`union_subscript`]).
         "UnionType" => union_new(args),
+        "DynamicClassAttribute" => new_dynamic_class_attribute(
+            args.first().copied().unwrap_or(NONE),
+            args.get(1).copied().unwrap_or(NONE),
+            args.get(2).copied().unwrap_or(NONE),
+            args.get(3).copied().unwrap_or(NONE),
+        ),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'types' has no attribute '{function}'"),
         ),
     }
+}
+
+/// Keyword-aware `types` dispatch: `DynamicClassAttribute` accepts the four
+/// CPython parameter names.
+pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if function != "DynamicClassAttribute" {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("module 'types' has no attribute '{function}'"),
+        );
+    }
+    const PARAMS: [&str; 4] = ["fget", "fset", "fdel", "doc"];
+    if args.len() > PARAMS.len() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "DynamicClassAttribute() takes at most 4 arguments ({} given)",
+                args.len()
+            ),
+        );
+    }
+    let mut slots: [Option<i64>; 4] = [None; 4];
+    for (index, argument) in args.iter().enumerate() {
+        slots[index] = Some(*argument);
+    }
+    for (name, item) in keywords {
+        let Some(index) = PARAMS.iter().position(|param| param == name) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("DynamicClassAttribute() got an unexpected keyword argument '{name}'"),
+            );
+        };
+        if slots[index].is_some() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("DynamicClassAttribute() got multiple values for argument '{name}'"),
+            );
+        }
+        slots[index] = Some(*item);
+    }
+    let fget = slots[0].unwrap_or(NONE);
+    let fset = slots[1].unwrap_or(NONE);
+    let fdel = slots[2].unwrap_or(NONE);
+    let doc = slots[3].unwrap_or(NONE);
+    new_dynamic_class_attribute(fget, fset, fdel, doc)
+}
+
+/// The cached `types.DynamicClassAttribute` class.
+pub(crate) fn dynamic_class_attribute_class() -> i64 {
+    if let Some(cached) = globals::registry_get("types.DynamicClassAttribute") {
+        return cached;
+    }
+    let mut signature = Vec::with_capacity(5);
+    signature.push(value::ParamMeta {
+        name: "self".to_string(),
+        kind: ParamKind::Positional,
+        default: None,
+    });
+    for name in ["fget", "fset", "fdel", "doc"] {
+        signature.push(value::ParamMeta {
+            name: name.to_string(),
+            kind: ParamKind::Positional,
+            default: Some(NONE),
+        });
+    }
+    let init = value::native_function_new("types", "_dca_init", usize::MAX);
+    value::function_set_signature(init, signature);
+    value::function_set_full_entry(init, init_dynamic_class_attribute as *const () as usize);
+    let get = method_entry(
+        "types",
+        "_dca_get",
+        get_dynamic_class_attribute_entry,
+        &["self", "obj", "owner"],
+    );
+    let set = method_entry(
+        "types",
+        "_dca_set",
+        set_dynamic_class_attribute_entry,
+        &["self", "obj", "value"],
+    );
+    let delete = method_entry(
+        "types",
+        "_dca_delete",
+        delete_dynamic_class_attribute_entry,
+        &["self", "obj"],
+    );
+    let getter = method_entry(
+        "types",
+        "_dca_getter",
+        getter_dynamic_class_attribute_entry,
+        &["self", "fget"],
+    );
+    let setter = method_entry(
+        "types",
+        "_dca_setter",
+        setter_dynamic_class_attribute_entry,
+        &["self", "fset"],
+    );
+    let deleter = method_entry(
+        "types",
+        "_dca_deleter",
+        deleter_dynamic_class_attribute_entry,
+        &["self", "fdel"],
+    );
+    let class = value::class_new_full(
+        "DynamicClassAttribute".to_string(),
+        NONE,
+        vec![
+            ("__init__".to_string(), init, MethodKind::Normal),
+            ("__get__".to_string(), get, MethodKind::Normal),
+            ("__set__".to_string(), set, MethodKind::Normal),
+            ("__delete__".to_string(), delete, MethodKind::Normal),
+            ("getter".to_string(), getter, MethodKind::Normal),
+            ("setter".to_string(), setter, MethodKind::Normal),
+            ("deleter".to_string(), deleter, MethodKind::Normal),
+        ],
+        Vec::new(),
+    );
+    globals::registry_set("types.DynamicClassAttribute", class);
+    class
+}
+
+/// A native method with a declared signature and full-argv trampoline.
+///
+/// Descriptor methods are invoked through class binding, which uses the
+/// trampoline directly; they are not module-call targets and therefore need
+/// no central spec entry.
+fn method_entry(
+    module: &'static str,
+    name: &'static str,
+    entry: extern "C" fn(*const i64) -> i64,
+    params: &[&str],
+) -> i64 {
+    let function = value::native_function_new(module, name, usize::MAX);
+    let signature: Vec<value::ParamMeta> = params
+        .iter()
+        .map(|param| value::ParamMeta {
+            name: (*param).to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        })
+        .collect();
+    value::function_set_signature(function, signature);
+    value::function_set_full_entry(function, entry as *const () as usize);
+    function
+}
+
+extern "C" fn get_dynamic_class_attribute_entry(argv: *const i64) -> i64 {
+    // SAFETY: the descriptor binder passes `(self, obj, owner)`.
+    dynamic_class_attribute_get(unsafe { *argv }, unsafe { *argv.add(1) }, unsafe {
+        *argv.add(2)
+    })
+}
+
+extern "C" fn set_dynamic_class_attribute_entry(argv: *const i64) -> i64 {
+    // SAFETY: the descriptor binder passes `(self, obj, value)`.
+    dynamic_class_attribute_set(unsafe { *argv }, unsafe { *argv.add(1) }, unsafe {
+        *argv.add(2)
+    })
+}
+
+extern "C" fn delete_dynamic_class_attribute_entry(argv: *const i64) -> i64 {
+    // SAFETY: the descriptor binder passes `(self, obj)`.
+    dynamic_class_attribute_delete(unsafe { *argv }, unsafe { *argv.add(1) })
+}
+
+extern "C" fn getter_dynamic_class_attribute_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, function)`.
+    dynamic_class_attribute_copy(unsafe { *argv }, 0, unsafe { *argv.add(1) })
+}
+
+extern "C" fn setter_dynamic_class_attribute_entry(argv: *const i64) -> i64 {
+    dynamic_class_attribute_copy(unsafe { *argv }, 1, unsafe { *argv.add(1) })
+}
+
+extern "C" fn deleter_dynamic_class_attribute_entry(argv: *const i64) -> i64 {
+    dynamic_class_attribute_copy(unsafe { *argv }, 2, unsafe { *argv.add(1) })
+}
+
+/// `DynamicClassAttribute.__init__` through the class-call binder.
+extern "C" fn init_dynamic_class_attribute(argv: *const i64) -> i64 {
+    // SAFETY: the class-call binder passes `self` then the four parameters.
+    let instance = unsafe { *argv };
+    let fget = unsafe { *argv.add(1) };
+    let fset = unsafe { *argv.add(2) };
+    let fdel = unsafe { *argv.add(3) };
+    let doc = unsafe { *argv.add(4) };
+    initialize_dynamic_class_attribute(instance, fget, fset, fdel, doc)
+}
+
+/// `DynamicClassAttribute(fget=None, fset=None, fdel=None, doc=None)`.
+fn new_dynamic_class_attribute(fget: i64, fset: i64, fdel: i64, doc: i64) -> i64 {
+    let class = dynamic_class_attribute_class();
+    let roots = heap::root_values(&[class, fget, fset, fdel, doc]);
+    let instance = value::instance_new(class);
+    let instance_roots = heap::root_values(&[instance]);
+    let result = initialize_dynamic_class_attribute(instance, fget, fset, fdel, doc);
+    heap::release_roots(instance_roots);
+    heap::release_roots(roots);
+    result
+}
+
+/// Stores CPython's descriptor state: the accessors, the effective `__doc__`
+/// and the `overwrite_doc` flag.
+fn initialize_dynamic_class_attribute(
+    instance: i64,
+    fget: i64,
+    fset: i64,
+    fdel: i64,
+    doc: i64,
+) -> i64 {
+    let effective_doc = if doc != NONE {
+        doc
+    } else if fget != NONE {
+        accessor_doc(fget)
+    } else {
+        NONE
+    };
+    let is_abstract = if fget == NONE {
+        value::FALSE
+    } else {
+        accessor_flag(fget, "__isabstractmethod__")
+    };
+    let overwrite_doc = doc == NONE;
+    let roots = heap::root_values(&[instance, fget, fset, fdel, effective_doc]);
+    for (name, item) in [
+        ("fget", fget),
+        ("fset", fset),
+        ("fdel", fdel),
+        ("__doc__", effective_doc),
+        ("overwrite_doc", value::bool_value(overwrite_doc)),
+        ("__isabstractmethod__", is_abstract),
+    ] {
+        value::instance_setattr(instance, name.to_string(), item);
+    }
+    heap::release_roots(roots);
+    instance
+}
+
+/// Reads `obj.__doc__` without leaking a missing attribute as an exception.
+fn accessor_doc(obj: i64) -> i64 {
+    let doc = methods::getattr(obj, b"__doc__".as_ptr(), "__doc__".len());
+    if exc::pending() {
+        exc::clear();
+        NONE
+    } else {
+        doc
+    }
+}
+
+/// Reads `obj.__isabstractmethod__` as a boolean, defaulting to `False`.
+fn accessor_flag(obj: i64, name: &str) -> i64 {
+    let flag = methods::getattr(obj, name.as_ptr(), name.len());
+    if exc::pending() {
+        exc::clear();
+        value::FALSE
+    } else {
+        value::bool_value(value::truthy(flag))
+    }
+}
+
+fn dynamic_attribute_slot(instance: i64, name: &str) -> i64 {
+    value::instance_attr(instance, name).unwrap_or(NONE)
+}
+
+/// `DynamicClassAttribute.__get__(instance, ownerclass=None)`.
+fn dynamic_class_attribute_get(instance: i64, obj: i64, _owner: i64) -> i64 {
+    if obj == NONE {
+        if value::truthy(dynamic_attribute_slot(instance, "__isabstractmethod__")) {
+            return instance;
+        }
+        return exc::raise_with_message(ATTRIBUTE_ERROR, "");
+    }
+    let fget = dynamic_attribute_slot(instance, "fget");
+    if fget == NONE {
+        return exc::raise_with_message(ATTRIBUTE_ERROR, "unreadable attribute");
+    }
+    let args = [obj];
+    let roots = heap::root_values(&[instance, fget]);
+    let result = crate::core::builtins::call(fget, args.len(), args.as_ptr());
+    heap::release_roots(roots);
+    result
+}
+
+/// `DynamicClassAttribute.__set__(instance, value)`.
+fn dynamic_class_attribute_set(instance: i64, obj: i64, new_value: i64) -> i64 {
+    let fset = dynamic_attribute_slot(instance, "fset");
+    if fset == NONE {
+        return exc::raise_with_message(ATTRIBUTE_ERROR, "can't set attribute");
+    }
+    let args = [obj, new_value];
+    let roots = heap::root_values(&[instance, fset]);
+    let result = crate::core::builtins::call(fset, args.len(), args.as_ptr());
+    heap::release_roots(roots);
+    result
+}
+
+/// `DynamicClassAttribute.__delete__(instance)`.
+fn dynamic_class_attribute_delete(instance: i64, obj: i64) -> i64 {
+    let fdel = dynamic_attribute_slot(instance, "fdel");
+    if fdel == NONE {
+        return exc::raise_with_message(ATTRIBUTE_ERROR, "can't delete attribute");
+    }
+    let args = [obj];
+    let roots = heap::root_values(&[instance, fdel]);
+    let result = crate::core::builtins::call(fdel, args.len(), args.as_ptr());
+    heap::release_roots(roots);
+    result
+}
+
+/// `getter`/`setter`/`deleter`: returns an updated copy of the same (possibly
+/// user-derived) descriptor class.
+fn dynamic_class_attribute_copy(instance: i64, which: usize, function: i64) -> i64 {
+    let mut fget = dynamic_attribute_slot(instance, "fget");
+    let mut fset = dynamic_attribute_slot(instance, "fset");
+    let mut fdel = dynamic_attribute_slot(instance, "fdel");
+    let doc = dynamic_attribute_slot(instance, "__doc__");
+    let overwrite_doc = value::truthy(dynamic_attribute_slot(instance, "overwrite_doc"));
+    match which {
+        0 => fget = function,
+        1 => fset = function,
+        _ => fdel = function,
+    }
+    // CPython: `getter` keeps the previous docstring when the new getter has
+    // none (only when the descriptor owns its docstring); `setter`/`deleter`
+    // carry the current docstring over verbatim.
+    let effective_doc = if which == 0 && overwrite_doc {
+        let fdoc = accessor_doc(function);
+        if fdoc != NONE {
+            fdoc
+        } else {
+            doc
+        }
+    } else {
+        doc
+    };
+    let class = value::instance_class_value(instance).unwrap_or_else(dynamic_class_attribute_class);
+    let roots = heap::root_values(&[class, fget, fset, fdel, effective_doc]);
+    let copy = value::instance_new(class);
+    let copy_roots = heap::root_values(&[copy]);
+    let result = initialize_dynamic_class_attribute(copy, fget, fset, fdel, effective_doc);
+    value::instance_setattr(
+        copy,
+        "overwrite_doc".to_string(),
+        value::bool_value(overwrite_doc),
+    );
+    heap::release_roots(copy_roots);
+    heap::release_roots(roots);
+    result
+}
+
+/// Dispatches the native methods of `DynamicClassAttribute`.
+pub(crate) fn dynamic_class_attribute_method(function: &str, args: &[i64]) -> Option<i64> {
+    let method = function.strip_prefix("_dca_")?;
+    Some(match method {
+        "init" => match args {
+            [instance, fget, fset, fdel, doc] => {
+                initialize_dynamic_class_attribute(*instance, *fget, *fset, *fdel, *doc)
+            }
+            _ => exc::raise_with_message(TYPE_ERROR, "_dca_init() takes 5 arguments"),
+        },
+        "get" => match args {
+            [instance, obj, owner] => dynamic_class_attribute_get(*instance, *obj, *owner),
+            _ => exc::raise_with_message(TYPE_ERROR, "__get__() takes 3 arguments"),
+        },
+        "set" => match args {
+            [instance, obj, new_value] => dynamic_class_attribute_set(*instance, *obj, *new_value),
+            _ => exc::raise_with_message(TYPE_ERROR, "__set__() takes 3 arguments"),
+        },
+        "delete" => match args {
+            [instance, obj] => dynamic_class_attribute_delete(*instance, *obj),
+            _ => exc::raise_with_message(TYPE_ERROR, "__delete__() takes 2 arguments"),
+        },
+        "getter" => match args {
+            [instance, function] => dynamic_class_attribute_copy(*instance, 0, *function),
+            _ => exc::raise_with_message(TYPE_ERROR, "getter() takes 2 arguments"),
+        },
+        "setter" => match args {
+            [instance, function] => dynamic_class_attribute_copy(*instance, 1, *function),
+            _ => exc::raise_with_message(TYPE_ERROR, "setter() takes 2 arguments"),
+        },
+        "deleter" => match args {
+            [instance, function] => dynamic_class_attribute_copy(*instance, 2, *function),
+            _ => exc::raise_with_message(TYPE_ERROR, "deleter() takes 2 arguments"),
+        },
+        _ => return None,
+    })
 }
 
 /// `isinstance` membership for the `types` names that are exposed as module
@@ -552,5 +966,156 @@ mod tests {
         assert_eq!(value::instance_class_value(cell), Some(class));
         let read = methods::getattr(cell, b"cell_contents".as_ptr(), "cell_contents".len());
         assert_eq!(value::as_integer(read), Some(42));
+    }
+
+    extern "C" fn get_value(argv: *const i64) -> i64 {
+        // SAFETY: `__get__` passes the instance first.
+        let instance = unsafe { *argv };
+        value::instance_attr(instance, "value").unwrap_or(NONE)
+    }
+
+    extern "C" fn set_value(argv: *const i64) -> i64 {
+        // SAFETY: `__set__` passes `(instance, value)`.
+        let instance = unsafe { *argv };
+        let new_value = unsafe { *argv.add(1) };
+        value::instance_setattr(instance, "value".to_string(), new_value);
+        NONE
+    }
+
+    extern "C" fn delete_value(_argv: *const i64) -> i64 {
+        encode_int(777).unwrap()
+    }
+
+    fn wrapper(entry: extern "C" fn(*const i64) -> i64, arity: usize, name: &str) -> i64 {
+        value::function_new(entry as *const () as usize, arity, name.to_string())
+    }
+
+    fn plain_instance() -> i64 {
+        let class = value::class_new("Holder".to_string(), NONE, Vec::new());
+        value::instance_new(class)
+    }
+
+    #[test]
+    fn dynamic_class_attribute_is_cached_and_validates() {
+        exc::init();
+        let class = dynamic_class_attribute_class();
+        assert_eq!(class, constant("DynamicClassAttribute"));
+        assert_eq!(
+            class,
+            class_value("types", "DynamicClassAttribute").expect("class")
+        );
+        assert!(class_value("other", "DynamicClassAttribute").is_none());
+
+        let fget = wrapper(get_value, 1, "get_value");
+        let descriptor = call("DynamicClassAttribute", &[fget]);
+        assert!(!exc::pending());
+        assert_eq!(value::instance_attr(descriptor, "fget"), Some(fget));
+        assert_eq!(value::instance_attr(descriptor, "fset"), Some(NONE));
+        assert_eq!(
+            value::instance_attr(descriptor, "overwrite_doc"),
+            Some(value::TRUE)
+        );
+
+        // Keyword construction through the keyword-aware entry point.
+        exc::init();
+        let from_kw = call_kw("DynamicClassAttribute", &[], &[("fget".to_string(), fget)]);
+        assert_eq!(value::instance_attr(from_kw, "fget"), Some(fget));
+        assert!(!exc::pending());
+        call_kw("DynamicClassAttribute", &[], &[("bogus".to_string(), NONE)]);
+        assert!(exc::pending());
+        exc::clear();
+    }
+
+    #[test]
+    fn dynamic_class_attribute_dispatches_accessors() {
+        exc::init();
+        let fget = wrapper(get_value, 1, "get_value");
+        let fset = wrapper(set_value, 2, "set_value");
+        let fdel = wrapper(delete_value, 1, "delete_value");
+        let descriptor = call("DynamicClassAttribute", &[fget, fset, fdel]);
+        let instance = plain_instance();
+        value::instance_setattr(instance, "value".to_string(), encode_int(5).unwrap());
+
+        let read = call("_dca_get", &[descriptor, instance, NONE]);
+        assert_eq!(value::as_integer(read), Some(5));
+
+        // `__set__` forwards to fset.
+        call("_dca_set", &[descriptor, instance, encode_int(9).unwrap()]);
+        assert_eq!(
+            value::instance_attr(instance, "value").and_then(value::as_integer),
+            Some(9)
+        );
+
+        // `__delete__` forwards to fdel and returns its result.
+        let deleted = call("_dca_delete", &[descriptor, instance]);
+        assert_eq!(value::as_integer(deleted), Some(777));
+
+        // Class access raises AttributeError, like CPython.
+        exc::init();
+        call("_dca_get", &[descriptor, NONE, NONE]);
+        assert!(exc::pending());
+        assert_eq!(exc::pending_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        exc::clear();
+
+        // An abstract getter makes class access return the descriptor.
+        let is_abstract = call("DynamicClassAttribute", &[fget]);
+        value::instance_setattr(is_abstract, "__isabstractmethod__".to_string(), value::TRUE);
+        assert_eq!(call("_dca_get", &[is_abstract, NONE, NONE]), is_abstract);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn dynamic_class_attribute_missing_accessors_raise() {
+        exc::init();
+        let descriptor = call("DynamicClassAttribute", &[]);
+        let instance = plain_instance();
+        exc::init();
+        call("_dca_get", &[descriptor, instance, NONE]);
+        assert!(exc::pending());
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "unreadable attribute"
+        );
+        exc::init();
+        call("_dca_set", &[descriptor, instance, NONE]);
+        assert!(exc::pending());
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "can't set attribute"
+        );
+        exc::init();
+        call("_dca_delete", &[descriptor, instance]);
+        assert!(exc::pending());
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "can't delete attribute"
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn dynamic_class_attribute_copies_keep_the_class_and_accessors() {
+        exc::init();
+        let fget = wrapper(get_value, 1, "get_value");
+        let fset = wrapper(set_value, 2, "set_value");
+        let descriptor = call("DynamicClassAttribute", &[fget, fset]);
+        let new_getter = wrapper(get_value, 1, "new_getter");
+        let copy = call("_dca_getter", &[descriptor, new_getter]);
+        assert_eq!(
+            value::instance_class_value(copy),
+            Some(dynamic_class_attribute_class())
+        );
+        assert_eq!(value::instance_attr(copy, "fget"), Some(new_getter));
+        assert_eq!(value::instance_attr(copy, "fset"), Some(fset));
+
+        let new_setter = wrapper(set_value, 2, "new_setter");
+        let copy = call("_dca_setter", &[descriptor, new_setter]);
+        assert_eq!(value::instance_attr(copy, "fget"), Some(fget));
+        assert_eq!(value::instance_attr(copy, "fset"), Some(new_setter));
+
+        let new_deleter = wrapper(delete_value, 1, "new_deleter");
+        let copy = call("_dca_deleter", &[descriptor, new_deleter]);
+        assert_eq!(value::instance_attr(copy, "fdel"), Some(new_deleter));
+        assert!(!exc::pending());
     }
 }

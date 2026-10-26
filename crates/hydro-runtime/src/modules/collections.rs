@@ -32,7 +32,11 @@ fn attribute_error(name: &str) -> i64 {
 }
 
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
+    if let Some(method) = function.strip_prefix("OrderedDict.") {
+        return ordereddict_method(method, args);
+    }
     match function {
+        "OrderedDict" => ordereddict_new(args, &[]),
         "defaultdict" => {
             let factory = args.first().copied().unwrap_or(NONE);
             if factory != NONE && value::as_function(factory).is_none() {
@@ -48,6 +52,17 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             ATTRIBUTE_ERROR,
             &format!("module 'collections' has no attribute '{function}'"),
         ),
+    }
+}
+
+/// Keyword-aware dispatch: `OrderedDict(**items)` keeps the keyword names as
+/// keys. No other `collections` constructor accepts dynamic keywords.
+pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match function {
+        "OrderedDict" => ordereddict_new(args, keywords),
+        _ => type_error(&format!(
+            "collections.{function}() does not accept keyword arguments"
+        )),
     }
 }
 
@@ -290,6 +305,556 @@ pub(crate) fn getattr(obj: i64, attr: &str) -> Option<i64> {
         return None;
     }
     value::as_defaultdict(obj).map(|(_, factory)| factory)
+}
+
+// -------------------------------------------------------------------------
+// `collections.OrderedDict`
+// -------------------------------------------------------------------------
+
+/// Instance attribute holding the insertion-ordered backing dict.
+///
+/// The key is not a valid Python identifier, so it cannot collide with a
+/// method or a keyword passed to the constructor.
+const ORDERED_DATA_ATTR: &str = "\u{0}ordered_data";
+
+/// Identity-stable `collections.OrderedDict` class.
+///
+/// The class object is cached in the globals registry: `collections.OrderedDict
+/// is _collections.OrderedDict`, `isinstance` and method binding all require one
+/// class value per runtime.
+pub(crate) fn ordereddict_class() -> i64 {
+    if let Some(cached) = globals::registry_get("collections.OrderedDict.class") {
+        return cached;
+    }
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::with_capacity(20);
+    for (name, arity) in [
+        ("__init__", usize::MAX),
+        ("__getitem__", 2),
+        ("__setitem__", 3),
+        ("__delitem__", 2),
+        ("__iter__", 1),
+        ("__len__", 1),
+        ("__contains__", 2),
+        ("__eq__", 2),
+        ("__repr__", 1),
+        ("get", 3),
+        ("keys", 1),
+        ("values", 1),
+        ("items", 1),
+        ("move_to_end", 3),
+        ("popitem", 2),
+        ("pop", 3),
+        ("update", 2),
+        ("setdefault", 3),
+        ("copy", 1),
+        ("clear", 1),
+    ] {
+        let qualified = match name {
+            "__init__" => "OrderedDict.__init__",
+            "__getitem__" => "OrderedDict.__getitem__",
+            "__setitem__" => "OrderedDict.__setitem__",
+            "__delitem__" => "OrderedDict.__delitem__",
+            "__iter__" => "OrderedDict.__iter__",
+            "__len__" => "OrderedDict.__len__",
+            "__contains__" => "OrderedDict.__contains__",
+            "__eq__" => "OrderedDict.__eq__",
+            "__repr__" => "OrderedDict.__repr__",
+            "get" => "OrderedDict.get",
+            "keys" => "OrderedDict.keys",
+            "values" => "OrderedDict.values",
+            "items" => "OrderedDict.items",
+            "move_to_end" => "OrderedDict.move_to_end",
+            "popitem" => "OrderedDict.popitem",
+            "pop" => "OrderedDict.pop",
+            "update" => "OrderedDict.update",
+            "setdefault" => "OrderedDict.setdefault",
+            "copy" => "OrderedDict.copy",
+            "clear" => "OrderedDict.clear",
+            _ => unreachable!(),
+        };
+        methods.push((
+            name.to_string(),
+            value::native_function_new("collections", qualified, arity),
+            MethodKind::Normal,
+        ));
+    }
+    // `fromkeys` is a classmethod: the binder prepends the owner class.
+    methods.push((
+        "fromkeys".to_string(),
+        value::native_function_new("collections", "OrderedDict.fromkeys", 3),
+        MethodKind::Classmethod,
+    ));
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new_full("OrderedDict".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set("collections.OrderedDict.class", class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// Data dict of an `OrderedDict` (or subclass) instance.
+fn ordereddict_data(obj: i64) -> Option<i64> {
+    let class = value::instance_class_value(obj)?;
+    if !value::is_subclass_of(class, ordereddict_class()) {
+        return None;
+    }
+    value::instance_attr(obj, ORDERED_DATA_ATTR)
+}
+
+/// Snapshot of an `OrderedDict`'s `(key, value)` pairs in insertion order.
+fn ordereddict_pairs(obj: i64) -> Vec<(i64, i64)> {
+    ordereddict_data(obj)
+        .and_then(value::as_dict)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default()
+}
+
+/// Replaces the backing dict of `obj`, preserving the pair order in `pairs`.
+fn ordereddict_store(obj: i64, pairs: Vec<(i64, i64)>) {
+    let data = value::dict_new(pairs);
+    value::instance_setattr(obj, ORDERED_DATA_ATTR.to_string(), data);
+}
+
+/// Allocates an `OrderedDict` holding `pairs` in order.
+fn ordereddict_from_pairs(pairs: Vec<(i64, i64)>) -> i64 {
+    let data = value::dict_new(pairs);
+    let roots = heap::root_values(std::slice::from_ref(&data));
+    let instance = value::instance_new(ordereddict_class());
+    value::instance_setattr(instance, ORDERED_DATA_ATTR.to_string(), data);
+    heap::release_roots(roots);
+    instance
+}
+
+/// `(key, value)` from a 2-item tuple/list, for the iterable constructor form.
+fn ordereddict_pair(item: i64) -> Option<(i64, i64)> {
+    let values = value::as_tuple(item).or_else(|| value::as_list(item))?;
+    if values.len() != 2 {
+        return None;
+    }
+    Some((values[0], values[1]))
+}
+
+/// Collects the pairs of a mapping or of an iterable of 2-item sequences.
+///
+/// Every key is checked for hashability, exactly like `dict` construction.
+fn ordereddict_collect(source: i64) -> Result<Vec<(i64, i64)>, i64> {
+    if let Some(data) = ordereddict_data(source) {
+        let Some(pairs) = value::as_dict(data) else {
+            return Ok(Vec::new());
+        };
+        return Ok(pairs.to_vec());
+    }
+    if let Some(pairs) = value::as_dict(source) {
+        return Ok(pairs.to_vec());
+    }
+    if let Some((pairs, _)) = value::as_defaultdict(source) {
+        return Ok(pairs.to_vec());
+    }
+    let iterator = iter::iter_of(source);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    // The collected pairs live in Rust memory that the collector does not
+    // scan; the caller takes a root marker before calling so it can release
+    // them once the result owns the pairs.
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return Err(NONE);
+        }
+        if status == 0 {
+            break;
+        }
+        let Some((key, value)) = ordereddict_pair(item) else {
+            return Err(type_error(&format!(
+                "cannot convert dictionary update sequence element #{} to a sequence",
+                pairs.len()
+            )));
+        };
+        if let Some(name) = container::unhashable_name(key) {
+            return Err(type_error(&container::unhashable_message(name)));
+        }
+        heap::root_values(&[key, value]);
+        pairs.push((key, value));
+    }
+    Ok(pairs)
+}
+
+/// `OrderedDict()` / `OrderedDict(iterable_or_mapping, **kwargs)`.
+fn ordereddict_new(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let mark = heap::root_values(&[]);
+    let mut pairs = if let Some(source) = args.first().copied() {
+        match ordereddict_collect(source) {
+            Ok(pairs) => pairs,
+            Err(err) => {
+                heap::release_roots(mark);
+                return err;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    for (name, value) in keywords {
+        let key = value::str_alloc(name.clone());
+        heap::root_values(&[key, *value]);
+        if let Some(position) = container::dict_find(&pairs, key) {
+            pairs[position].1 = *value;
+        } else {
+            pairs.push((key, *value));
+        }
+    }
+    let result = ordereddict_from_pairs(pairs);
+    heap::release_roots(mark);
+    result
+}
+
+/// Shared validation for the mutating methods: only `OrderedDict` instances
+/// have this backing store.
+fn ordereddict_receiver(method: &str, args: &[i64]) -> Result<(i64, i64), i64> {
+    let Some(&obj) = args.first() else {
+        return Err(type_error(&format!(
+            "OrderedDict.{method}() missing required argument 'self'"
+        )));
+    };
+    match ordereddict_data(obj) {
+        Some(data) => Ok((obj, data)),
+        None => Err(type_error(&format!(
+            "descriptor '{method}' for 'OrderedDict' objects doesn't apply to a '{}' object",
+            value::type_name(obj)
+        ))),
+    }
+}
+
+fn ordereddict_items(args: &[i64], name: &str) -> i64 {
+    let Ok((_, data)) = ordereddict_receiver(name, args) else {
+        return crate::exc::pending_value();
+    };
+    let pairs = value::as_dict(data)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default();
+    view_list(name, pairs)
+}
+
+/// Implements the native `OrderedDict` method bodies.
+fn ordereddict_method(name: &str, args: &[i64]) -> i64 {
+    match name {
+        "__init__" => {
+            let Some(&obj) = args.first() else {
+                return type_error("OrderedDict.__init__() missing self");
+            };
+            if ordereddict_data(obj).is_some() {
+                // Re-initialisation replaces the contents, like dict.__init__.
+                if let Some(source) = args.get(1).copied() {
+                    return ordereddict_method("update", &[obj, source]);
+                }
+                return NONE;
+            }
+            let mark = heap::root_values(&[]);
+            let pairs = match args.get(1).copied() {
+                Some(source) => match ordereddict_collect(source) {
+                    Ok(pairs) => pairs,
+                    Err(err) => {
+                        heap::release_roots(mark);
+                        return err;
+                    }
+                },
+                None => Vec::new(),
+            };
+            let data = value::dict_new(pairs);
+            value::instance_setattr(obj, ORDERED_DATA_ATTR.to_string(), data);
+            heap::release_roots(mark);
+            NONE
+        }
+        "fromkeys" => {
+            // `OrderedDict.fromkeys(iterable, value=None)`: the classmethod
+            // binder passes the owner class first.
+            let Some(&iterable) = args.get(1) else {
+                return type_error("OrderedDict.fromkeys() missing required argument 'iterable'");
+            };
+            let default = args.get(2).copied().unwrap_or(NONE);
+            let iterator = iter::iter_of(iterable);
+            if exc::pending() {
+                return NONE;
+            }
+            let mark = heap::root_values(&[]);
+            let mut pairs: Vec<(i64, i64)> = Vec::new();
+            loop {
+                let mut key = NONE;
+                let status = iter::iter_next(iterator, &mut key);
+                if exc::pending() {
+                    heap::release_roots(mark);
+                    return NONE;
+                }
+                if status == 0 {
+                    break;
+                }
+                if let Some(unhashable) = container::unhashable_name(key) {
+                    heap::release_roots(mark);
+                    return type_error(&container::unhashable_message(unhashable));
+                }
+                if container::dict_find(&pairs, key).is_none() {
+                    heap::root_values(&[key, default]);
+                    pairs.push((key, default));
+                }
+            }
+            let result = ordereddict_from_pairs(pairs);
+            heap::release_roots(mark);
+            result
+        }
+        "__getitem__" | "__delitem__" | "pop" => {
+            let Ok((obj, data)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let Some(&key) = args.get(1) else {
+                return type_error(&format!("OrderedDict.{name}() missing required argument"));
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let pairs = value::as_dict(data)
+                .map(|pairs| pairs.to_vec())
+                .unwrap_or_default();
+            let Some(position) = container::dict_find(&pairs, key) else {
+                if name == "pop" {
+                    if let Some(&default) = args.get(2) {
+                        return default;
+                    }
+                }
+                return exc::raise_with_message(KEY_ERROR, &value::repr(key));
+            };
+            let (_, existing) = pairs[position];
+            if name == "__getitem__" {
+                return existing;
+            }
+            let mut remaining = pairs;
+            remaining.remove(position);
+            ordereddict_store(obj, remaining);
+            if name == "pop" {
+                existing
+            } else {
+                NONE
+            }
+        }
+        "__setitem__" => {
+            let Ok((_, data)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let (Some(&key), Some(&new_value)) = (args.get(1), args.get(2)) else {
+                return type_error("OrderedDict.__setitem__() requires a key and a value");
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            if let Some(mut pairs) = value::dict_pairs_mut(data) {
+                container::dict_insert_barrier(data, &mut *pairs, key, new_value);
+            }
+            NONE
+        }
+        "__iter__" => {
+            let Ok((_, data)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let keys: Vec<i64> = value::as_dict(data)
+                .map(|pairs| pairs.iter().map(|(key, _)| *key).collect())
+                .unwrap_or_default();
+            iter::iter_new(value::list_new(keys))
+        }
+        "__len__" => {
+            let Ok((_, data)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            value::encode_int(value::as_dict(data).map_or(0, |pairs| pairs.len() as i64))
+                .unwrap_or(NONE)
+        }
+        "__contains__" => {
+            let Ok((_, data)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let Some(&key) = args.get(1) else {
+                return value::bool_value(false);
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let found = value::as_dict(data)
+                .and_then(|pairs| container::dict_find(pairs, key))
+                .is_some();
+            value::bool_value(found)
+        }
+        "__eq__" => {
+            let Some(&obj) = args.first() else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let Some(&other) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let Some(left_data) = ordereddict_data(obj) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let Some(left) = value::as_dict(left_data) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            if let Some(right) = ordereddict_data(other).and_then(value::as_dict) {
+                let equal = left.len() == right.len()
+                    && left.iter().zip(right.iter()).all(|(&(lk, lv), &(rk, rv))| {
+                        container::equals(lk, rk) && container::equals(lv, rv)
+                    });
+                return value::bool_value(equal);
+            }
+            if value::as_dict(other).is_some() || value::as_defaultdict(other).is_some() {
+                return value::bool_value(container::equals(left_data, other));
+            }
+            value::NOT_IMPLEMENTED
+        }
+        "__repr__" => {
+            let Ok((_, data)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let pairs = value::as_dict(data)
+                .map(|pairs| pairs.to_vec())
+                .unwrap_or_default();
+            if pairs.is_empty() {
+                return value::str_alloc("OrderedDict()".to_string());
+            }
+            let roots = heap::root_values(
+                &pairs
+                    .iter()
+                    .flat_map(|(key, item)| [*key, *item])
+                    .collect::<Vec<_>>(),
+            );
+            let mut rendered = Vec::with_capacity(pairs.len());
+            for (key, item) in &pairs {
+                rendered.push(format!("({}, {})", value::repr(*key), value::repr(*item)));
+            }
+            heap::release_roots(roots);
+            value::str_alloc(format!("OrderedDict([{}])", rendered.join(", ")))
+        }
+        "get" => {
+            let Ok((_, data)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let Some(&key) = args.get(1) else {
+                return type_error("OrderedDict.get() missing required argument 'key'");
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let default = args.get(2).copied().unwrap_or(NONE);
+            match value::as_dict(data).and_then(|pairs| container::dict_find(pairs, key)) {
+                Some(position) => value::as_dict(data).expect("checked")[position].1,
+                None => default,
+            }
+        }
+        "keys" | "values" | "items" => ordereddict_items(args, name),
+        "move_to_end" => {
+            let Ok((obj, _)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let Some(&key) = args.get(1) else {
+                return type_error("OrderedDict.move_to_end() missing required argument 'key'");
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let last = args.get(2).copied().is_none_or(value::truthy);
+            let mut pairs = ordereddict_pairs(obj);
+            let Some(position) = container::dict_find(&pairs, key) else {
+                return exc::raise_with_message(KEY_ERROR, &value::repr(key));
+            };
+            let pair = pairs.remove(position);
+            if last {
+                pairs.push(pair);
+            } else {
+                pairs.insert(0, pair);
+            }
+            ordereddict_store(obj, pairs);
+            NONE
+        }
+        "popitem" => {
+            let Ok((obj, _)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let last = args.get(1).copied().is_none_or(value::truthy);
+            let mut pairs = ordereddict_pairs(obj);
+            if pairs.is_empty() {
+                return exc::raise_with_message(KEY_ERROR, "dictionary is empty");
+            }
+            let (key, item) = if last {
+                pairs.pop().expect("non-empty")
+            } else {
+                pairs.remove(0)
+            };
+            ordereddict_store(obj, pairs);
+            value::tuple_new(vec![key, item])
+        }
+        "update" => {
+            let Ok((_, data)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let Some(&source) = args.get(1) else {
+                return NONE;
+            };
+            let mark = heap::root_values(&[]);
+            let incoming = match ordereddict_collect(source) {
+                Ok(pairs) => pairs,
+                Err(err) => {
+                    heap::release_roots(mark);
+                    return err;
+                }
+            };
+            if let Some(mut pairs) = value::dict_pairs_mut(data) {
+                for (key, item) in incoming {
+                    container::dict_insert_barrier(data, &mut *pairs, key, item);
+                }
+            }
+            heap::release_roots(mark);
+            NONE
+        }
+        "setdefault" => {
+            let Ok((_, data)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let Some(&key) = args.get(1) else {
+                return type_error("OrderedDict.setdefault() missing required argument 'key'");
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let default = args.get(2).copied().unwrap_or(NONE);
+            if let Some(pairs) = value::as_dict(data) {
+                if let Some(position) = container::dict_find(pairs, key) {
+                    return pairs[position].1;
+                }
+            }
+            if let Some(mut pairs) = value::dict_pairs_mut(data) {
+                container::dict_insert_barrier(data, &mut *pairs, key, default);
+            }
+            default
+        }
+        "copy" => {
+            let Ok((obj, _)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            ordereddict_from_pairs(ordereddict_pairs(obj))
+        }
+        "clear" => {
+            let Ok((_, data)) = ordereddict_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            if let Some(mut pairs) = value::dict_pairs_mut(data) {
+                pairs.clear();
+            }
+            NONE
+        }
+        _ => exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("'OrderedDict' object has no attribute '{name}'"),
+        ),
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -847,4 +1412,156 @@ extern "C" fn namedtuple_replace(argv: *const i64) -> i64 {
     let result = crate::core::builtins::call(class, values.len(), values.as_ptr());
     heap::release_roots(roots);
     result
+}
+
+#[cfg(test)]
+mod ordereddict_tests {
+    use super::*;
+
+    fn int(n: i64) -> i64 {
+        value::encode_int(n).expect("representable")
+    }
+
+    fn text(s: &str) -> i64 {
+        value::str_alloc(s.to_string())
+    }
+
+    fn number(v: i64) -> i64 {
+        value::as_integer(v).expect("integer")
+    }
+
+    fn string(v: i64) -> String {
+        value::as_str(v).expect("string").to_string()
+    }
+
+    /// `OrderedDict([(key, value), ...])`.
+    fn ordered(items: &[(&str, i64)]) -> i64 {
+        let pairs: Vec<i64> = items
+            .iter()
+            .map(|(key, value)| value::tuple_new(vec![text(key), int(*value)]))
+            .collect();
+        call("OrderedDict", &[value::list_new(pairs)])
+    }
+
+    fn method(instance: i64, name: &str, args: &[i64]) -> i64 {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(instance);
+        argv.extend_from_slice(args);
+        let function = format!("OrderedDict.{name}");
+        call(&function, &argv)
+    }
+
+    fn keys(instance: i64) -> Vec<String> {
+        let result = method(instance, "keys", &[]);
+        value::as_list(result)
+            .expect("keys list")
+            .iter()
+            .map(|&key| string(key))
+            .collect()
+    }
+
+    fn pairs(instance: i64) -> Vec<(String, i64)> {
+        let result = method(instance, "items", &[]);
+        value::as_list(result)
+            .expect("items list")
+            .iter()
+            .map(|&pair| {
+                let tuple = value::as_tuple(pair).expect("pair tuple");
+                (string(tuple[0]), number(tuple[1]))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn constructor_preserves_insertion_order() {
+        exc::init();
+        let od = ordered(&[("b", 2), ("a", 1), ("c", 3)]);
+        assert!(!exc::pending());
+        assert_eq!(keys(od), vec!["b", "a", "c"]);
+        assert_eq!(
+            pairs(od),
+            vec![
+                ("b".to_string(), 2),
+                ("a".to_string(), 1),
+                ("c".to_string(), 3)
+            ]
+        );
+        assert_eq!(number(method(od, "__len__", &[])), 3);
+        assert_eq!(number(method(od, "__getitem__", &[text("a")])), 1);
+        assert_eq!(method(od, "__contains__", &[text("c")]), value::TRUE);
+        assert_eq!(
+            method(od, "__contains__", &[text("z")]),
+            value::bool_value(false)
+        );
+    }
+
+    #[test]
+    fn move_to_end_and_popitem_follow_insertion_order() {
+        exc::init();
+        let od = ordered(&[("a", 1), ("b", 2), ("c", 3)]);
+        method(od, "move_to_end", &[text("a")]);
+        assert_eq!(keys(od), vec!["b", "c", "a"]);
+        method(od, "move_to_end", &[text("a"), value::bool_value(false)]);
+        assert_eq!(keys(od), vec!["a", "b", "c"]);
+
+        let last = method(od, "popitem", &[]);
+        let last = value::as_tuple(last).expect("popitem tuple");
+        assert_eq!(string(last[0]), "c");
+        assert_eq!(number(last[1]), 3);
+        assert_eq!(keys(od), vec!["a", "b"]);
+
+        let first = method(od, "popitem", &[value::bool_value(false)]);
+        let first = value::as_tuple(first).expect("popitem tuple");
+        assert_eq!(string(first[0]), "a");
+        assert_eq!(keys(od), vec!["b"]);
+    }
+
+    #[test]
+    fn update_setdefault_copy_clear_and_equality() {
+        exc::init();
+        let od = ordered(&[("a", 1), ("b", 2)]);
+        method(od, "update", &[ordered(&[("b", 20), ("c", 3)])]);
+        assert_eq!(
+            pairs(od),
+            vec![
+                ("a".to_string(), 1),
+                ("b".to_string(), 20),
+                ("c".to_string(), 3)
+            ]
+        );
+        assert_eq!(number(method(od, "setdefault", &[text("d"), int(4)])), 4);
+        assert_eq!(number(method(od, "setdefault", &[text("a"), int(99)])), 1);
+        assert_eq!(keys(od), vec!["a", "b", "c", "d"]);
+
+        let copied = method(od, "copy", &[]);
+        assert_eq!(pairs(copied), pairs(od));
+        // OrderedDict equality is order-sensitive between two OrderedDicts.
+        assert_eq!(method(od, "__eq__", &[copied]), value::TRUE);
+        let reversed = ordered(&[("d", 4), ("c", 3), ("b", 20), ("a", 1)]);
+        assert_eq!(method(od, "__eq__", &[reversed]), value::bool_value(false));
+        // ... but order-insensitive against a plain dict with the same items.
+        let plain = value::dict_new(vec![
+            (text("d"), int(4)),
+            (text("c"), int(3)),
+            (text("b"), int(20)),
+            (text("a"), int(1)),
+        ]);
+        assert_eq!(method(od, "__eq__", &[plain]), value::TRUE);
+
+        method(od, "clear", &[]);
+        assert!(keys(od).is_empty());
+
+        let seeded = call(
+            "OrderedDict.fromkeys",
+            &[
+                ordereddict_class(),
+                value::list_new(vec![text("x"), text("y")]),
+                int(7),
+            ],
+        );
+        assert_eq!(
+            pairs(seeded),
+            vec![("x".to_string(), 7), ("y".to_string(), 7)]
+        );
+    }
 }

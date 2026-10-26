@@ -966,12 +966,18 @@ fn iter_and_next_result_types_and_arity() {
     );
     assert_eq!(
         check_errors("x = iter()\n"),
-        vec!["iter() takes exactly one argument (0 given)"]
+        vec!["iter() takes 1 or 2 positional arguments (0 given)"]
     );
     assert_eq!(
-        check_errors("x = iter([1], [2])\n"),
-        vec!["iter() takes exactly one argument (2 given)"]
+        check_errors("x = iter([1], [2], [3])\n"),
+        vec!["iter() takes 1 or 2 positional arguments (3 given)"]
     );
+    // `iter(callable, sentinel)` is accepted; the callable check (and the
+    // sentinel comparison) happen at runtime.
+    assert!(check_errors("def f():\n    return b''\nx = iter(f, b'')\n").is_empty());
+    assert!(check_errors("x = iter([1], [2])\n").is_empty());
+    let program = crate::check_source("x = iter(input, b'')\n", "test.py").expect("valid program");
+    assert_eq!(assigned_type(&program, 0), Type::Any);
     assert_eq!(
         check_errors("x = next()\n"),
         vec!["next() takes 1 or 2 positional arguments (0 given)"]
@@ -1249,9 +1255,10 @@ fn bytes_index_must_be_int() {
 #[test]
 fn bytes_builtin_and_method_arity_errors_are_reported() {
     assert_eq!(
-        check_errors("a = bytes(1, 2, 3)\n"),
-        vec!["bytes() takes 0 to 2 positional arguments (3 given)"]
+        check_errors("a = bytes(1, 2, 3, 4)\n"),
+        vec!["bytes() takes 0 to 3 positional arguments (4 given)"]
     );
+    assert!(check_errors("a = bytes('x', 'ascii', 'replace')\n").is_empty());
     assert_eq!(
         check_errors("a = 'x'.encode('utf-8', 'strict', 'extra')\n"),
         vec!["str.encode() takes 0 to 2 positional argument(s) (3 given)"]
@@ -2527,4 +2534,229 @@ fn module_global_read_by_a_function_keeps_concatenation() {
     let source = "s = \"\"\nfor _ in range(3):\n    s += \"x\"\ndef read():\n    return s\nprint(len(read()))\n";
     assert!(!has_builder_local(source));
     assert_eq!(builder_appends(loop_body(&module_body(source))), 0);
+}
+
+#[test]
+fn optional_local_indexing_is_dynamic() {
+    // `arg` starts as `None` and later receives a still-unresolved value.
+    // The slot must widen instead of pinning the value to `None`, so the
+    // tuple index stays valid (`dis.ArgResolver.get_argval_argrepr`).
+    let source =
+        "def lookup(value):\n    arg = None\n    arg = value\n    return (None, str, repr, ascii)[arg]\n";
+    crate::check_source(source, "test.py").expect("optional local indexing stays dynamic");
+}
+
+#[test]
+fn optional_local_floordiv_is_dynamic() {
+    // `arg` is `None` on one path and an int on another (`dis._unpack_opargs`).
+    let source = "def halve(value):\n    arg = None\n    arg = value\n    return arg // 2\n";
+    crate::check_source(source, "test.py").expect("optional local // stays dynamic");
+}
+
+#[test]
+fn optional_dict_receiver_keeps_method_calls_dynamic() {
+    // An omitted `None` default must not type `sink`'s parameter. The same
+    // unresolved argument is also checked as a dict in `helper`; pinning it
+    // to `None` would report a bogus `.values()` error
+    // (`dis._get_lineno_width`).
+    let source = "def sink(x=None):\n    return x\n\n\
+                  def early():\n    sink()\n\n\
+                  def caller():\n    ls = make()\n    helper(ls)\n    sink(ls)\n\n\
+                  def helper(ls):\n    return ls.values()\n\n\
+                  def make():\n    return {}\n";
+    crate::check_source(source, "test.py").expect("optional dict receiver stays dynamic");
+}
+
+#[test]
+fn disagreeing_call_sites_make_a_parameter_dynamic() {
+    let source = "def f(x):\n    return x // 2\n\n\
+                  def a():\n    return f('s')\n\n\
+                  def b():\n    return f(1)\n";
+    crate::check_source(source, "test.py").expect("disagreeing call sites widen the parameter");
+}
+
+#[test]
+fn builtin_class_methods_have_static_results() {
+    let source = "a = int.from_bytes(b'\\x01', 'little')\n\
+                  b = int.to_bytes(1, 2, 'little')\n\
+                  c = int.bit_length(7)\n\
+                  d = str.maketrans('a', 'b')\n\
+                  e = bytes.fromhex('00')\n\
+                  f = bytearray.fromhex('00')\n\
+                  g = dict.fromkeys([1, 2])\n\
+                  h = float.fromhex('1.0')\n\
+                  i = list.not_a_real_class_method()\n";
+    let program = crate::check_source(source, "test.py").expect("builtin class methods compile");
+    assert_eq!(assigned_type(&program, 0), Type::Int);
+    assert_eq!(assigned_type(&program, 1), Type::Bytes);
+    assert_eq!(assigned_type(&program, 2), Type::Int);
+    assert_eq!(assigned_type(&program, 3), Type::Dict);
+    assert_eq!(assigned_type(&program, 4), Type::Bytes);
+    assert_eq!(assigned_type(&program, 5), Type::Bytes);
+    assert_eq!(assigned_type(&program, 6), Type::Dict);
+    assert_eq!(assigned_type(&program, 7), Type::Float);
+    assert_eq!(
+        assigned_type(&program, 8),
+        Type::Any,
+        "unknown class-level methods dispatch dynamically"
+    );
+}
+
+#[test]
+fn literal_expression_errors_survive_dynamic_widening() {
+    assert_eq!(
+        check_errors("1 + \"x\"\n"),
+        vec!["unsupported operand type(s) for +: 'int' and 'str'"]
+    );
+    assert_eq!(
+        check_errors("[1][\"x\"]\n"),
+        vec!["list index must be int, not str"]
+    );
+}
+
+#[test]
+fn percent_formatting_accepts_a_dynamic_operand() {
+    // CPython `tokenize.py:523` is `perror("error: %s" % message)`: the
+    // untyped parameter is gradual, so the format string alone decides the
+    // result type and the runtime parses the format.
+    assert!(check_errors("def error(message):\n    print('%s' % message)\n").is_empty());
+    assert!(
+        check_errors("def error(message):\n    print('%s: error: %s' % (message, message))\n")
+            .is_empty()
+    );
+    assert!(check_errors("def f(message: Any):\n    print('%s' % message)\n").is_empty());
+    assert_eq!(op_result(BinOp::Mod, Type::Str, Type::Any), Some(Type::Str));
+    assert_eq!(op_result(BinOp::Mod, Type::Any, Type::Str), Some(Type::Any));
+}
+
+#[test]
+fn percent_formatting_result_keeps_the_format_string_type() {
+    let program = crate::check_source(
+        "def error(message):\n    return '%s' % message\n",
+        "test.py",
+    )
+    .expect("valid program");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "error")
+        .expect("function error");
+    assert_eq!(function.ret_ty, Type::Str);
+}
+
+#[test]
+fn percent_with_an_unknown_right_operand_does_not_report_unsupported() {
+    let prog = empty_prog();
+    let mut inf = Infer::new();
+    let mut ck = checker(&prog, &mut inf);
+    let value = ck.inf.fresh();
+    let out = ck.inf.fresh();
+    let op = Op {
+        kind: OpKind::Bin(BinOp::Mod),
+        a: Ty::Concrete(Type::Str),
+        b: value,
+        out,
+        line: 4,
+        col: 9,
+        done: false,
+    };
+    ck.ops.push(op);
+    assert!(ck.resolve_binary(0, op, BinOp::Mod));
+    assert!(ck.diags.is_empty());
+    assert_eq!(ck.inf.resolve(out), Ty::Concrete(Type::Str));
+    // The argument stays gradual; nothing pins it to a concrete type.
+    assert!(matches!(ck.inf.resolve(value), Ty::Var(_)));
+}
+
+#[test]
+fn percent_with_an_unknown_left_operand_is_dynamic() {
+    let prog = empty_prog();
+    let mut inf = Infer::new();
+    let mut ck = checker(&prog, &mut inf);
+    let value = ck.inf.fresh();
+    let out = ck.inf.fresh();
+    let op = Op {
+        kind: OpKind::Bin(BinOp::Mod),
+        a: value,
+        b: Ty::Concrete(Type::Str),
+        out,
+        line: 6,
+        col: 3,
+        done: false,
+    };
+    ck.ops.push(op);
+    assert!(ck.resolve_binary(0, op, BinOp::Mod));
+    assert!(ck.diags.is_empty());
+    assert_eq!(ck.inf.resolve(out), Ty::Concrete(Type::Any));
+}
+
+#[test]
+fn any_operand_is_never_an_unsupported_operand() {
+    for source in [
+        "def f(x: Any):\n    return x + 1\n",
+        "def f(x: Any):\n    return 1 + x\n",
+        "def f(x: Any):\n    return [1] - x\n",
+        "def f(x: Any):\n    return x % 'a'\n",
+        "def f(x: Any):\n    return x < 1\n",
+        "def f(x: Any):\n    return -x\n",
+        "def f(x: Any):\n    return ~x\n",
+    ] {
+        assert!(
+            check_errors(source).is_empty(),
+            "unexpected diagnostics for {source:?}"
+        );
+    }
+}
+
+#[test]
+fn any_operands_widen_arithmetic_to_any() {
+    assert_eq!(op_result(BinOp::Add, Type::Any, Type::Int), Some(Type::Any));
+    assert_eq!(op_result(BinOp::Add, Type::Int, Type::Any), Some(Type::Any));
+    assert_eq!(op_result(BinOp::Div, Type::Any, Type::Int), Some(Type::Any));
+    assert_eq!(
+        op_result(BinOp::Sub, Type::List, Type::Any),
+        Some(Type::Any)
+    );
+    assert_eq!(op_result(BinOp::Lt, Type::Any, Type::Int), Some(Type::Bool));
+    assert_eq!(op_result(BinOp::Eq, Type::Int, Type::Any), Some(Type::Bool));
+}
+
+#[test]
+fn untyped_operands_do_not_report_unsupported_operators() {
+    for source in [
+        "def f(x):\n    return [1] - x\n",
+        "def f(x):\n    return x + range(3)\n",
+        "def f(x):\n    return range(3) + x\n",
+        "def f(x):\n    return 'a' - x\n",
+    ] {
+        assert!(
+            check_errors(source).is_empty(),
+            "unexpected diagnostics for {source:?}"
+        );
+    }
+}
+
+#[test]
+fn concrete_incompatible_operands_are_still_reported() {
+    assert_eq!(
+        check_errors("1 + 'x'\n"),
+        vec!["unsupported operand type(s) for +: 'int' and 'str'"]
+    );
+    assert_eq!(
+        check_errors("1 % 'a'\n"),
+        vec!["unsupported operand type(s) for %: 'int' and 'str'"]
+    );
+    assert_eq!(
+        check_errors("r = range(3)\nx = r - 1\n"),
+        vec!["unsupported operand type(s) for -: 'range' and 'int'"]
+    );
+}
+
+#[test]
+fn bytes_percent_formatting_is_accepted() {
+    assert_eq!(
+        op_result(BinOp::Mod, Type::Bytes, Type::Int),
+        Some(Type::Bytes)
+    );
+    assert!(check_errors("def f(v):\n    return b'%d' % v\n").is_empty());
 }

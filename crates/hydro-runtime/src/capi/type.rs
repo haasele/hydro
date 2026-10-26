@@ -2673,6 +2673,24 @@ pub(crate) fn allocate_named_type(name: &str, flags: c_ulong) -> *mut TypeObject
     Box::into_raw(Box::new(type_object))
 }
 
+/// Allocates an immortal exception class.
+///
+/// Exception classes use [`TypeRole::Shim`] so instances of them can carry the
+/// [`super::ShimKind::Exception`] payload while the class object itself still
+/// satisfies `is_type_pointer` (`ob_type` is the shared metatype). The class
+/// starts with `object` as its base; `initialize_exception_types` links the
+/// CPython hierarchy afterwards.
+pub(crate) fn allocate_exception_type(name: &str, flags: c_ulong) -> *mut TypeObject {
+    let type_object = allocate_named_type(name, flags);
+    if !type_object.is_null() {
+        // SAFETY: freshly allocated, uniquely owned box.
+        unsafe {
+            (*type_object).role = TypeRole::Shim;
+        }
+    }
+    type_object
+}
+
 // ---------------------------------------------------------------------------
 // Method lookup
 // ---------------------------------------------------------------------------
@@ -4356,6 +4374,9 @@ pub extern "C" fn PyCallable_Check(object: *mut ShimObject) -> c_int {
         return 0;
     }
     if let Some(super::ShimKind::CFunction { .. }) = super::kind_ref(object) {
+        return 1;
+    }
+    if let Some(super::ShimKind::RuntimeFunction { .. }) = super::kind_ref(object) {
         return 1;
     }
     // SAFETY: live type object.

@@ -1,10 +1,15 @@
 //! `enum`: placeholder classes for the enum bases used by the corpus.
 //!
-//! Enum members and class bodies are a later compiler feature, so `Enum` and
-//! `IntEnum` are empty native classes and `auto()` evaluates to `None`. Code
-//! that only imports a base and subclasses it (`class Color(IntEnum)`)
+//! Enum members and class bodies are a later compiler feature, so `Enum`,
+//! `IntEnum` and `IntFlag` are empty native classes and `auto()` evaluates to
+//! `None`. Code that only imports a base and subclasses it (`class Color(IntEnum)`)
 //! therefore imports and defines cleanly; lookups such as `Color.RED` are
 //! resolved by the ordinary class attribute rules once the class body runs.
+//!
+//! `IntFlag` is modelled exactly like `IntEnum`: it is the subclassable base
+//! class, without member arithmetic. Compound values (`Color.RED | Color.BLUE`)
+//! are plain integer operations in this runtime because the class body stores
+//! the integer values; there is no separate flag-int wrapper type.
 
 use crate::exc::{self, ATTRIBUTE_ERROR};
 use crate::value::{self, NONE};
@@ -12,7 +17,7 @@ use crate::value::{self, NONE};
 /// Names a module constant as an empty native class.
 pub(crate) fn constant(name: &str) -> i64 {
     match name {
-        "Enum" | "IntEnum" => value::class_new(name.to_string(), NONE, Vec::new()),
+        "Enum" | "IntEnum" | "IntFlag" => value::class_new(name.to_string(), NONE, Vec::new()),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'enum' has no attribute '{name}'"),
@@ -41,7 +46,7 @@ mod tests {
     #[test]
     fn enum_bases_are_empty_native_classes() {
         exc::init();
-        for name in ["Enum", "IntEnum"] {
+        for name in ["Enum", "IntEnum", "IntFlag"] {
             let class = as_class(constant(name)).expect("class value");
             assert_eq!(class.name, name);
             assert_eq!(class.base, NONE);

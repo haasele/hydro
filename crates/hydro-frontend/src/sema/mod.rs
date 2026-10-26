@@ -286,6 +286,7 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
     ("isalpha", MethodSig::new(0, 0, &[], Type::Bool)),
     ("isalnum", MethodSig::new(0, 0, &[], Type::Bool)),
     ("isspace", MethodSig::new(0, 0, &[], Type::Bool)),
+    ("isascii", MethodSig::new(0, 0, &[], Type::Bool)),
     ("isupper", MethodSig::new(0, 0, &[], Type::Bool)),
     ("islower", MethodSig::new(0, 0, &[], Type::Bool)),
     (
@@ -458,6 +459,47 @@ fn closest_method(name: &str, table: &'static [(&'static str, MethodSig)]) -> Op
     diag::closest(name, candidates()).or_else(|| diag::closest_within(name, candidates(), 3))
 }
 
+/// Whether the HIR value of `builtin` denotes a builtin class object
+/// (`int`, `str`, `bytes`, ...), so `builtin.method(...)` names a class-level
+/// method rather than an instance method on a function value.
+fn is_builtin_class_value(builtin: Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Int
+            | Builtin::Float
+            | Builtin::Bool
+            | Builtin::Str
+            | Builtin::Bytes
+            | Builtin::ByteArray
+            | Builtin::List
+            | Builtin::Tuple
+            | Builtin::Dict
+            | Builtin::Set
+            | Builtin::Frozenset
+            | Builtin::Range
+            | Builtin::MemoryView
+    )
+}
+
+/// Result type of the class-level methods Hydro models on builtin class
+/// values. Every other class-level method is dispatched at runtime, so a
+/// missing entry only means "dynamic result", not "unknown attribute".
+fn builtin_class_method_result(builtin: Builtin, method: &str) -> Option<Type> {
+    Some(match (builtin, method) {
+        (Builtin::Int, "from_bytes") => Type::Int,
+        (Builtin::Int, "to_bytes") => Type::Bytes,
+        (Builtin::Int, "bit_length") => Type::Int,
+        (Builtin::Str, "maketrans") => Type::Dict,
+        (Builtin::Bytes, "fromhex") => Type::Bytes,
+        // `bytearray` shares the byte-sequence static type; the type lattice
+        // has no separate mutable-bytes variant.
+        (Builtin::ByteArray, "fromhex") => Type::Bytes,
+        (Builtin::Dict, "fromkeys") => Type::Dict,
+        (Builtin::Float, "fromhex") => Type::Float,
+        _ => return None,
+    })
+}
+
 /// Result type of `a <op> b`, or `None` if the combination is invalid.
 fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
     let any = a == Type::Any || b == Type::Any;
@@ -594,10 +636,11 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
             }
         }
         BinOp::Mod => {
-            if a == Type::Str {
-                // `str % value_or_tuple` is printf-style formatting; the
-                // runtime validates the format string and argument count.
-                Some(Type::Str)
+            if a == Type::Str || a == Type::Bytes {
+                // `str % value_or_tuple` and `bytes % value_or_tuple` are
+                // printf-style formatting; the runtime validates the format
+                // string and argument count.
+                Some(a)
             } else if any {
                 Some(Type::Any)
             } else if a.is_numeric() && b.is_numeric() {
@@ -849,6 +892,86 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Bind a value to a function-local slot.
+    ///
+    /// An inferred slot is a type variable: Python locals may hold a value of
+    /// any type, so a slot assigned incompatible types across branches or
+    /// iterations widens to `Any` (the runtime operators then decide).
+    /// Assigning a value whose type is not resolved yet must not pin it to the
+    /// slot's previous type (`x = None` followed by `x = maybe_value`); the
+    /// slot becomes dynamic instead, so later uses keep checking dynamically.
+    /// Annotated parameter slots are stored concrete and keep their strict
+    /// check.
+    fn assign_local(&mut self, local_ty: Ty, value_ty: Ty, name: &str, line: u32, col: u32) {
+        if matches!(local_ty, Ty::Concrete(_)) {
+            if let Err((expected, got)) = self.inf.unify(local_ty, value_ty) {
+                if (expected == Type::None) != (got == Type::None) {
+                    self.force_any(value_ty);
+                } else {
+                    self.error(
+                        line,
+                        col,
+                        format!(
+                            "cannot assign type {} to variable '{}' of type {}",
+                            got.name(),
+                            name,
+                            expected.name()
+                        ),
+                    );
+                }
+            }
+            return;
+        }
+        match (self.inf.resolve(local_ty), self.inf.resolve(value_ty)) {
+            (Ty::Concrete(Type::None), Ty::Var(_)) => {
+                // The slot is an optional slot (`x = None` on another path)
+                // and this value is not resolved yet. Do not pin the value to
+                // `None`; the slot stays dynamic instead.
+                self.force_any(local_ty);
+            }
+            _ => {
+                if self.inf.unify(local_ty, value_ty).is_err() {
+                    // The slot is dynamic; the assigned expression keeps its
+                    // own type so other reads of it stay precise.
+                    self.force_any(local_ty);
+                }
+            }
+        }
+    }
+
+    /// Widen the element slots of a yielded tuple whose element types differ.
+    ///
+    /// A generator may yield tuples from several branches/iterations whose
+    /// corresponding elements have different types (for example `arg` is an
+    /// `int` on one path and `None` on another). Keeping the elements dynamic
+    /// prevents one path's type from constraining the other.
+    fn widen_yielded_tuple(&mut self, value: &HExpr) {
+        let HExprKind::Tuple(elems) = &value.kind else {
+            return;
+        };
+        let differs = {
+            let mut concrete = elems
+                .iter()
+                .filter_map(|elem| match self.inf.resolve(elem.ty) {
+                    Ty::Concrete(ty) if ty != Type::Any => Some(ty),
+                    _ => None,
+                });
+            match concrete.next() {
+                Some(first) => concrete.any(|ty| ty != first),
+                None => false,
+            }
+        };
+        if differs {
+            // Only inferred slots can be widened; literal/expression types
+            // that are already concrete stay as they are.
+            for elem in elems {
+                if matches!(elem.ty, Ty::Var(_)) {
+                    self.force_any(elem.ty);
+                }
+            }
+        }
+    }
+
     fn check_stmt(
         &mut self,
         stmt: &HStmt,
@@ -860,27 +983,8 @@ impl<'a> Checker<'a> {
             HStmtKind::Expr(e) => self.check_expr(e, f),
             HStmtKind::Assign { target, value } => {
                 self.check_expr(value, f);
-                let local_ty = f.locals[*target as usize].ty;
-                if let Err((expected, got)) = self.inf.unify(local_ty, value.ty) {
-                    if (expected == Type::None) != (got == Type::None) {
-                        // `x = None` followed by a value (or vice versa) is a
-                        // common optional/dynamic pattern; widen the slot.
-                        self.force_any(local_ty);
-                        self.force_any(value.ty);
-                    } else {
-                        let name = &f.locals[*target as usize].name;
-                        self.error(
-                            stmt.line,
-                            stmt.col,
-                            format!(
-                                "cannot assign type {} to variable '{}' of type {}",
-                                got.name(),
-                                name,
-                                expected.name()
-                            ),
-                        );
-                    }
-                }
+                let local = &f.locals[*target as usize];
+                self.assign_local(local.ty, value.ty, &local.name, stmt.line, stmt.col);
             }
             HStmtKind::CellInit { value, .. } => {
                 if let Some(value) = value {
@@ -889,25 +993,8 @@ impl<'a> Checker<'a> {
             }
             HStmtKind::CellAssign { target, value } => {
                 self.check_expr(value, f);
-                let local_ty = f.locals[*target as usize].ty;
-                if let Err((expected, got)) = self.inf.unify(local_ty, value.ty) {
-                    if (expected == Type::None) != (got == Type::None) {
-                        self.force_any(local_ty);
-                        self.force_any(value.ty);
-                    } else {
-                        let name = &f.locals[*target as usize].name;
-                        self.error(
-                            stmt.line,
-                            stmt.col,
-                            format!(
-                                "cannot assign type {} to variable '{}' of type {}",
-                                got.name(),
-                                name,
-                                expected.name()
-                            ),
-                        );
-                    }
-                }
+                let local = &f.locals[*target as usize];
+                self.assign_local(local.ty, value.ty, &local.name, stmt.line, stmt.col);
             }
             HStmtKind::GlobalSet { value, .. } => {
                 // The global table stores dynamically typed values.
@@ -1159,6 +1246,7 @@ impl<'a> Checker<'a> {
             HStmtKind::Yield { value } => {
                 if let Some(value) = value {
                     self.check_expr(value, f);
+                    self.widen_yielded_tuple(value);
                 }
             }
             HStmtKind::Break | HStmtKind::Continue | HStmtKind::Pass => {}
@@ -1988,7 +2076,37 @@ impl<'a> Checker<'a> {
                                 }
                             },
                             Ty::Var(_) => {
-                                let _ = self.inf.unify(*param_ty, arg.ty);
+                                match (self.inf.resolve(*param_ty), self.inf.resolve(arg.ty)) {
+                                    (Ty::Concrete(_), Ty::Concrete(_)) => {
+                                        if self.inf.unify(*param_ty, arg.ty).is_err() {
+                                            // Call sites supply different types for
+                                            // one unannotated parameter: the
+                                            // parameter is dynamic.
+                                            self.force_any(*param_ty);
+                                        }
+                                    }
+                                    (Ty::Concrete(expected), Ty::Var(_)) => {
+                                        if expected != Type::Any {
+                                            // The argument is not resolved yet.
+                                            // Do not pin it to a type another call
+                                            // site supplied (e.g. a `None` from an
+                                            // omitted default); the parameter is
+                                            // dynamic instead.
+                                            self.force_any(*param_ty);
+                                        } else {
+                                            let _ = self.inf.unify(*param_ty, arg.ty);
+                                        }
+                                    }
+                                    (Ty::Var(_), Ty::Concrete(Type::None)) => {
+                                        // A `None` (often an omitted default)
+                                        // does not type an unannotated
+                                        // parameter; its own uses still infer it
+                                        // (`depth = depth - 1` makes it an int).
+                                    }
+                                    _ => {
+                                        let _ = self.inf.unify(*param_ty, arg.ty);
+                                    }
+                                }
                             }
                         }
                     }
@@ -2067,6 +2185,22 @@ impl<'a> Checker<'a> {
             }
             // A dynamic mapping supplies keywords with names unknown here.
             dynamic_keywords = true;
+        }
+
+        // A builtin class value is a function at runtime, but
+        // `int.from_bytes(...)` and friends are class-level methods with
+        // their own shapes. Recognised methods keep a concrete result type;
+        // unknown class-level methods dispatch dynamically.
+        if let HExprKind::BuiltinRef(builtin) = &object.kind {
+            if is_builtin_class_value(*builtin) {
+                match builtin_class_method_result(*builtin, method) {
+                    Some(result) => {
+                        let _ = self.inf.unify(expr.ty, Ty::Concrete(result));
+                    }
+                    None => self.force_any(expr.ty),
+                }
+                return;
+            }
         }
 
         let result = match self.inf.resolve(object.ty) {
@@ -2359,12 +2493,14 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Int));
             }
             Builtin::Str => {
-                if count != 1 {
+                // `str()`, `str(object)` and
+                // `str(bytes_like, encoding[, errors])`.
+                if count > 3 {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
-                        format!("str() takes exactly one argument ({count} given)"),
+                        format!("str() takes at most 3 arguments ({count} given)"),
                     );
                     return;
                 }
@@ -2718,12 +2854,12 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Bool));
             }
             Builtin::Bytes => {
-                if count > 2 {
+                if count > 3 {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
-                        format!("bytes() takes 0 to 2 positional arguments ({count} given)"),
+                        format!("bytes() takes 0 to 3 positional arguments ({count} given)"),
                     );
                     return;
                 }
@@ -2753,10 +2889,10 @@ impl<'a> Checker<'a> {
                             ),
                         ),
                     }
-                } else if count == 2 {
-                    // `bytes(source, encoding)`: the source must be a string
-                    // and the encoding a string.
-                    for (index, expected) in [(0usize, "str"), (1usize, "str")] {
+                } else if count >= 2 {
+                    // `bytes(source, encoding[, errors])`: the source, the
+                    // encoding and the error-handler name are all strings.
+                    for index in 0..count {
                         let (ty, arg_line, arg_col) = args[index];
                         match self.inf.resolve(ty) {
                             Ty::Var(_) | Ty::Concrete(Type::Any) | Ty::Concrete(Type::Never) => {}
@@ -2765,9 +2901,8 @@ impl<'a> Checker<'a> {
                                 arg_line,
                                 arg_col,
                                 format!(
-                                    "bytes() argument {} must be {}, not {}",
+                                    "bytes() argument {} must be str, not {}",
                                     index + 1,
-                                    expected,
                                     t.name()
                                 ),
                             ),
@@ -2777,18 +2912,22 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Bytes));
             }
             Builtin::Iter => {
-                if count != 1 {
+                if count == 0 || count > 2 {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
-                        format!("iter() takes exactly one argument ({count} given)"),
+                        format!("iter() takes 1 or 2 positional arguments ({count} given)"),
                     );
                     return;
                 }
-                let (ty, arg_line, arg_col) = args[0];
-                self.check_builtin_iterable(Builtin::Iter, ty, arg_line, arg_col);
-                // The element type is only known at runtime.
+                if count == 1 {
+                    let (ty, arg_line, arg_col) = args[0];
+                    self.check_builtin_iterable(Builtin::Iter, ty, arg_line, arg_col);
+                }
+                // The element type is only known at runtime. With the
+                // two-argument form the callable's return type is not
+                // statically constrained either.
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
             }
             Builtin::Next => {
@@ -3576,6 +3715,11 @@ impl<'a> Checker<'a> {
     }
 
     fn resolve_unary(&mut self, index: usize, op: Op, unary: UnOp) -> bool {
+        // An `Any` operand is dynamic: the runtime applies the operator and
+        // raises `TypeError` for a value that does not support it, so only a
+        // concrete operand type is reported here. An unresolved variable waits
+        // for a constraint and otherwise falls back to `Any` in
+        // `finalize_op`, also without a diagnostic.
         let operand = self.inf.resolve(op.a);
         match unary {
             UnOp::Not => self.bind_type(op.out, Type::Bool, op.line, op.col),
@@ -3652,7 +3796,29 @@ impl<'a> Checker<'a> {
                 true
             }
             (Ty::Concrete(x), Ty::Concrete(y)) => {
-                if matches!(binary, BinOp::In | BinOp::NotIn) {
+                // An `Any` operand makes the operation dynamic: the value it
+                // holds at runtime decides whether the operator applies (and
+                // a user type may supply the dunder), so an operand pair that
+                // only fails because one side is `Any` is never an
+                // unsupported-operand error. Comparisons are still boolean;
+                // other operators keep their precise result when the pair has
+                // one and are `Any` otherwise.
+                //
+                // Membership keeps its own diagnostics: an `Any` left operand
+                // is fine, but a concrete right operand that cannot be
+                // iterated is invalid whatever the left side holds.
+                if (x == Type::Any || y == Type::Any) && !matches!(binary, BinOp::In | BinOp::NotIn)
+                {
+                    // Keep the precise result when the operator has one for
+                    // this pair (`str % Any` is still `str`); otherwise the
+                    // result is dynamic.
+                    let result = if binary.is_comparison() {
+                        Type::Bool
+                    } else {
+                        op_result(binary, x, y).unwrap_or(Type::Any)
+                    };
+                    self.bind_type(op.out, result, op.line, op.col);
+                } else if matches!(binary, BinOp::In | BinOp::NotIn) {
                     match self.membership_result(x, y, op.line, op.col) {
                         Some(result) => self.bind_type(op.out, result, op.line, op.col),
                         None => self.force_any(op.out),
@@ -3728,6 +3894,24 @@ impl<'a> Checker<'a> {
             return;
         }
 
+        // `%` with a string on either side is printf-style formatting. A
+        // `str`/`bytes` right operand is the format string, and a `str`/`bytes`
+        // left operand accepts any single value or tuple on the right. The
+        // runtime parses the format, so neither operand constrains the other.
+        if binary == BinOp::Mod && matches!(known, Type::Str | Type::Bytes) {
+            if var_is_lhs {
+                // The unknown receiver decides whether `%` formats at all: a
+                // number modulo, or a user type's `__mod__`, yields another
+                // type.
+                self.force_any(op.out);
+            } else {
+                // `known` is the format string; a successful `%` returns the
+                // same string type.
+                self.bind_type(op.out, known, op.line, op.col);
+            }
+            return;
+        }
+
         let compatible = match binary {
             BinOp::Eq | BinOp::Ne | BinOp::Is | BinOp::IsNot => true,
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -3766,22 +3950,11 @@ impl<'a> Checker<'a> {
         };
 
         if !compatible {
-            // No possible type for the variable makes this operation valid.
-            let (lhs_name, rhs_name) = if var_is_lhs {
-                ("Any", known.name())
-            } else {
-                (known.name(), "Any")
-            };
-            self.error(
-                op.line,
-                op.col,
-                format!(
-                    "unsupported operand type(s) for {}: '{}' and '{}'",
-                    binary.symbol(),
-                    lhs_name,
-                    rhs_name
-                ),
-            );
+            // The unknown operand makes the operation dynamic: it may hold a
+            // value the operator accepts at runtime, or a user type with the
+            // matching dunder. Reporting an unsupported operand pair here
+            // would be a false positive (gradual `Any` is not a wrong type),
+            // so leave the unknown side open and let the runtime decide.
             self.force_any(op.out);
             return;
         }

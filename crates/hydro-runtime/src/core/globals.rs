@@ -12,7 +12,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 
-use crate::exc::{self, NAME_ERROR, RUNTIME_ERROR};
+use crate::exc::{self, NAME_ERROR};
 use crate::heap;
 use crate::value::NONE;
 
@@ -50,21 +50,21 @@ pub(crate) fn set(module: &str, name: &str, value: i64) {
     heap::add_thread_root(value);
 }
 
-/// Reads `module.name` without raising; used by runtime import fallbacks.
+/// Reads `module.name` from the store only, without raising; used by runtime
+/// import internals and by [`sync_view`], which must not observe view-only
+/// bindings. Public reads use [`get`]/[`lookup`], which also consult the
+/// cached `globals()` view.
 pub(crate) fn try_get(module: &str, name: &str) -> Option<i64> {
     GLOBALS.with(|globals| globals.borrow().get(&key(module, name)).copied())
 }
 
-/// Reads `module.name`. A missing entry raises `RuntimeError`, matching the
-/// runtime's use of `RuntimeError` for internal name-resolution failures.
+/// Reads `module.name`, consulting the store and then the cached `globals()`
+/// view (see [`lookup`]). A missing entry raises CPython's `NameError`
+/// (`name '<name>' is not defined`) and returns `None`.
 pub(crate) fn get(module: &str, name: &str) -> i64 {
-    let found = GLOBALS.with(|globals| globals.borrow().get(&key(module, name)).copied());
-    match found {
+    match lookup(module, name) {
         Some(value) => value,
-        None => exc::raise_with_message(
-            RUNTIME_ERROR,
-            &format!("name '{name}' is not defined in module '{module}'"),
-        ),
+        None => exc::raise_with_message(NAME_ERROR, &format!("name '{name}' is not defined")),
     }
 }
 
@@ -240,6 +240,7 @@ pub(crate) fn view_names(module: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container;
     use crate::value::{self, encode_int};
 
     fn int(n: i64) -> i64 {
@@ -264,15 +265,33 @@ mod tests {
     }
 
     #[test]
-    fn missing_global_raises() {
+    fn missing_global_raises_name_error() {
         reset();
         exc::init();
         assert_eq!(get("app", "missing"), NONE);
-        assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
-        assert_eq!(
-            pending_message(),
-            "name 'missing' is not defined in module 'app'"
-        );
+        assert_eq!(exc::pending_tag(), NAME_ERROR as i64);
+        assert_eq!(pending_message(), "name 'missing' is not defined");
+    }
+
+    #[test]
+    fn get_falls_back_to_globals_view() {
+        reset();
+        exc::init();
+        // `g = globals(); g["x"] = 1` writes into the cached view without a
+        // further `globals()` call, so the side store has no entry yet.
+        let g = view("mod");
+        let key = value::str_alloc("x".to_string());
+        let roots = heap::root_values(&[g, key]);
+        container::dict_set(g, key, int(1));
+        heap::release_roots(roots);
+        assert_eq!(try_get("mod", "x"), None);
+        assert_eq!(get("mod", "x"), int(1));
+        assert!(!exc::pending());
+
+        // Names absent from both the store and the view still raise.
+        assert_eq!(get("mod", "absent"), NONE);
+        assert_eq!(exc::pending_tag(), NAME_ERROR as i64);
+        assert_eq!(pending_message(), "name 'absent' is not defined");
     }
 
     #[test]
@@ -285,12 +304,12 @@ mod tests {
         assert_eq!(get("second", "value"), int(2));
         // A name only resolves in its own module.
         assert_eq!(get("third", "value"), NONE);
-        assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
+        assert_eq!(exc::pending_tag(), NAME_ERROR as i64);
 
         exc::init();
         reset();
         assert_eq!(get("first", "value"), NONE);
-        assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
+        assert_eq!(exc::pending_tag(), NAME_ERROR as i64);
     }
 
     #[test]

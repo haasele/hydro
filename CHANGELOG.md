@@ -8,6 +8,46 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-26 general starred expressions
+
+- Starred unpacking targets now work at every sequence level
+  (`(a, *b), (*c, d) = value`, `for (a, *b), c in ...`), each level allowing
+  exactly one star; the starred target binds a fresh list of the remaining
+  elements through `hydro_unpack_star`.
+- Tuple and set displays expand starred iterables (`(a, *xs)`, `{a, *xs}`)
+  in source order through the tuple/list/set constructors, matching the
+  existing list-display concatenation. A statically known non-iterable
+  operand is a compile-time diagnostic.
+
+### Added — 2026-10-26 ASCII and Latin-1 codecs
+
+- `_codecs.encode`/`_codecs.decode` and the stateless `ascii_encode`/
+  `ascii_decode`/`latin_1_encode`/`latin_1_decode` entries implement real
+  ASCII and Latin-1 (ISO-8859-1) conversions with CPython's
+  `UnicodeEncodeError`/`UnicodeDecodeError`, the `ignore`/`replace` handlers
+  and alias resolution (`us-ascii`, `iso-8859-1`, `latin1`, `latin_1`).
+  Latin-1 decoding maps every byte and cannot fail.
+- `_codecs.lookup` answers `utf-8`, `ascii` and `latin-1` (and their aliases)
+  with real `(encode, decode, None, None)` entries; unknown names stay
+  `LookupError`.
+- `str.encode`, `bytes(str, encoding[, errors])` (three arguments are now
+  accepted by sema and codegen), `bytearray(str, encoding, errors)` and
+  `bytes.decode` route through the shared codec engine; `bytes.decode` raises
+  `UnicodeDecodeError` instead of a bare `ValueError` for malformed input.
+
+### Added — 2026-10-26 linecache/importlib filesystem surface
+
+- `os.stat(path, *, dir_fd=None, follow_symlinks=True)` returns a real
+  `os.stat_result`-shaped namespace (`st_mode`, `st_ino`, `st_dev`,
+  `st_nlink`, `st_uid`, `st_gid`, `st_size`, `st_atime`/`st_mtime`/`st_ctime`
+  plus their exact `st_*_ns` integer aliases, and the Unix `st_rdev`/
+  `st_blksize`/`st_blocks`), follows symlinks by default and raises the
+  matching `OSError` subclass with CPython wording.
+- `os.path.isabs`, `sys.path_importer_cache` (a stable, mutable real dict) and
+  `importlib.util.decode_source` (UTF-8 BOM, `coding[:=]` cookie on the first
+  two lines, universal newlines, `SyntaxError` for unknown codecs,
+  `UnicodeDecodeError` for invalid data).
+
 ### Added — 2026-10-26 pydantic/annotationlib type surface
 
 - Real `types.UnionType` (native union values, `UnionType[A, B]`, `A | B`

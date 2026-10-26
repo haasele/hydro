@@ -1248,6 +1248,26 @@ pub(crate) fn weakref_test_kill(reference: i64) {
 #[cfg(test)]
 pub(crate) static WEAK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serialises unit tests around [`reset`].
+///
+/// A reset frees every registered object, so it must never overlap a test that
+/// still uses tagged values from this heap: the other test would observe freed
+/// objects (stale class values, corrupted counters). Every resetting test holds
+/// the lock across its reset (or across its whole body when it must not be
+/// interrupted, as in the stdlib surface test), so resets never interleave with
+/// a test that owns the heap.
+#[cfg(test)]
+pub(crate) static HEAP_RESET_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquires [`HEAP_RESET_TEST_LOCK`], ignoring poisoning: a panicking test must
+/// not lock the remaining tests out of the heap they reset.
+#[cfg(test)]
+pub(crate) fn heap_reset_test_guard() -> MutexGuard<'static, ()> {
+    HEAP_RESET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Drains the worklist to a fixed point.
 ///
 /// Each iteration pops one address without holding any lock and traces it
