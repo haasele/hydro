@@ -14,6 +14,9 @@
 //!   `ast.Expression`, `ast.Module`, `ast.Expr`);
 //! * the operator/context node classes (`ast.Add`, `ast.Eq`, `ast.Load`, ...)
 //!   and the `ast.AST`/`ast.NodeVisitor`/`ast.NodeTransformer` classes.
+//! * the PEP 750 template nodes `ast.TemplateStr(values=...)` and
+//!   `ast.Interpolation(value, str, conversion, format_spec)`, which `unparse`
+//!   renders back as a `t'...'` literal (the shape `annotationlib` produces).
 //!
 //! The node classes are native class values, so `isinstance(node, ast.AST)`
 //! and `class _Fixer(ast.NodeTransformer)` behave like CPython. Construction
@@ -185,6 +188,21 @@ const NODE_SPECS: &[NodeSpec] = &[
         fields: &["test", "body", "orelse"],
         init: init_IfExp,
     },
+    // PEP 750 template-string nodes. `annotationlib` builds these from a
+    // `Template` value in `_template_to_ast_literal`; `unparse` renders them
+    // back as a `t'...'` literal.
+    NodeSpec {
+        name: "Interpolation",
+        base: "expr",
+        fields: &["value", "str", "conversion", "format_spec"],
+        init: init_Interpolation,
+    },
+    NodeSpec {
+        name: "TemplateStr",
+        base: "expr",
+        fields: &["values"],
+        init: init_TemplateStr,
+    },
 ];
 
 /// Defines one `__init__` trampoline that stores the declared fields (and any
@@ -234,6 +252,11 @@ node_init!(init_UnaryOp, ["op", "operand"]);
 node_init!(init_BoolOp, ["op", "values"]);
 node_init!(init_Compare, ["left", "ops", "comparators"]);
 node_init!(init_IfExp, ["test", "body", "orelse"]);
+node_init!(
+    init_Interpolation,
+    ["value", "str", "conversion", "format_spec"]
+);
+node_init!(init_TemplateStr, ["values"]);
 
 /// Holder base classes exposed on the module (`ast.expr`, `ast.operator`, ...).
 const BASE_CLASSES: &[&str] = &[
@@ -1686,6 +1709,12 @@ fn render_inner(node: i64) -> Result<(String, u8), String> {
             let orelse = render(field(node, "orelse"), 0)?;
             (format!("{body} if {test} else {orelse}"), PREC_OR)
         }
+        "TemplateStr" => render_template_str(node)?,
+        "Interpolation" => {
+            return Err(
+                "ast.Interpolation cannot be rendered outside a template string".to_string(),
+            )
+        }
         other => {
             return Err(format!(
                 "ast.unparse() does not support the '{other}' node in Hydro"
@@ -1693,6 +1722,112 @@ fn render_inner(node: i64) -> Result<(String, u8), String> {
         }
     };
     Ok(result)
+}
+
+/// Appends literal t-string text, doubling braces exactly like CPython's
+/// `escape_braces` so the result parses back to the same literal.
+fn push_template_literal(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '{' => out.push_str("{{"),
+            '}' => out.push_str("}}"),
+            other => out.push(other),
+        }
+    }
+}
+
+/// Renders `ast.TemplateStr(values=[...])` as a `t'...'` literal.
+///
+/// The body (constants with doubled braces, interpolations expanded) is
+/// quoted with the runtime's Python `repr` for `str`, matching CPython's
+/// `append_repr` of the assembled body.
+fn render_template_str(node: i64) -> Result<(String, u8), String> {
+    let values = value::as_list(field(node, "values")).unwrap_or(&[]);
+    let mut body = String::new();
+    for item in values {
+        match node_name(*item) {
+            Some("Constant") => match value::as_str(field(*item, "value")) {
+                Some(text) => push_template_literal(&mut body, text),
+                None => {
+                    return Err(
+                        "ast.TemplateStr only accepts str constants; non-str constants are \
+                         not representable in a t-string"
+                            .to_string(),
+                    )
+                }
+            },
+            Some("Interpolation") => body.push_str(&render_interpolation(*item)?),
+            Some(other) => {
+                return Err(format!(
+                    "ast.TemplateStr cannot contain the '{other}' node in Hydro"
+                ))
+            }
+            None => return Err("ast.TemplateStr has a non-AST value".to_string()),
+        }
+    }
+    Ok((format!("t{}", value::quote_str(&body)), PREC_ATOM))
+}
+
+/// One `{expression!conversion:format_spec}` replacement field.
+fn render_interpolation(node: i64) -> Result<String, String> {
+    let Some(expression) = value::as_str(field(node, "str")) else {
+        return Err("ast.Interpolation is missing its str field".to_string());
+    };
+    let mut out = String::from("{");
+    out.push_str(expression);
+    let conversion = value::as_integer(field(node, "conversion")).unwrap_or(-1);
+    if conversion != -1 {
+        out.push('!');
+        // CPython spells the conversion as the ordinal of the flag character.
+        out.push(
+            u32::try_from(conversion)
+                .ok()
+                .and_then(char::from_u32)
+                .unwrap_or('\u{fffd}'),
+        );
+    }
+    let format_spec = field(node, "format_spec");
+    if format_spec != NONE {
+        out.push(':');
+        render_format_spec(format_spec, &mut out)?;
+    }
+    out.push('}');
+    Ok(out)
+}
+
+/// Renders an interpolation format spec (literal text / joined string) into
+/// `out`, doubling braces in literal fragments.
+fn render_format_spec(node: i64, out: &mut String) -> Result<(), String> {
+    match node_name(node) {
+        Some("Constant") => match value::as_str(field(node, "value")) {
+            Some(text) => {
+                push_template_literal(out, text);
+                Ok(())
+            }
+            None => Err("ast format spec constants must be str".to_string()),
+        },
+        Some("JoinedStr") => {
+            for item in value::as_list(field(node, "values")).unwrap_or(&[]) {
+                match node_name(*item) {
+                    Some("Constant") => match value::as_str(field(*item, "value")) {
+                        Some(text) => push_template_literal(out, text),
+                        None => return Err("ast format spec constants must be str".to_string()),
+                    },
+                    Some(other) => {
+                        return Err(format!(
+                            "ast format spec cannot contain the '{other}' node in Hydro"
+                        ))
+                    }
+                    None => return Err("ast format spec has a non-AST value".to_string()),
+                }
+            }
+            Ok(())
+        }
+        Some(other) => Err(format!(
+            "ast format spec cannot contain the '{other}' node in Hydro"
+        )),
+        None => Err("ast format spec is not an AST node".to_string()),
+    }
 }
 
 fn render_slice(node: i64) -> Result<String, String> {

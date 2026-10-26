@@ -8,6 +8,18 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-26 pydantic/annotationlib type surface
+
+- Real `types.UnionType` (native union values, `UnionType[A, B]`, `A | B`
+  for class/None/union/function operands, `__args__`, `repr`),
+  `types.FunctionType` (the cached `function` class for identity/`isinstance`
+  plus construction from a Hydro function value; code objects and
+  argdefs/closure rebinding raise a tagged `NotImplementedError`), and builtin
+  `complex`/`slice` class values with parseable complex numbers and
+  `slice.indices`.
+- `ast.TemplateStr`/`ast.Interpolation` nodes and t-string `unparse` support
+  (PEP 750 shapes produced by `annotationlib._template_to_ast_literal`).
+
 ### Added — 2026-10-26 package-prerequisite slice
 
 - Installed real CPython 3.14 NumPy 2.5, pandas 3.1, pydantic 2.14 and

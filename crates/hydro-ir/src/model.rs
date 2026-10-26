@@ -297,6 +297,9 @@ pub enum Builtin {
     Str,
     /// `repr(value)`: Python's representation string.
     Repr,
+    /// `ascii(value)`: like [`Builtin::Repr`], with every non-ASCII character
+    /// escaped as `\xNN`, `\uNNNN` or `\U000NNNNN`.
+    Ascii,
     /// `id(value)`: the value's identity as an integer.
     ///
     /// Heap values report their runtime address with the tag bits masked off;
@@ -317,6 +320,12 @@ pub enum Builtin {
     Bool,
     /// `type(x)`.
     Type,
+    /// `super(type, object)`: the explicit two-argument form builds a runtime
+    /// super proxy positioned after `type` in the MRO of `object`'s class (or
+    /// of `object` itself when it is a class). The zero-argument form cannot
+    /// name its defining class without frame context, so the frontend lowers
+    /// it to the receiver's `$super_new` helper instead of this builtin.
+    Super,
     /// `reversed(iterable)`.
     Reversed,
     /// `__import__(name, ...)`: dynamic imports are not supported at runtime.
@@ -411,6 +420,15 @@ pub enum Builtin {
     /// floor-division semantics for ints and floats. A zero divisor raises
     /// `ZeroDivisionError`; non-numeric operands raise `TypeError`.
     Divmod,
+    /// `hex(integer)`: the lowercase hexadecimal spelling with the `0x`
+    /// prefix (`-0xa` for negative values). Only integer operands are
+    /// accepted; every other type raises `TypeError`. Arbitrary-precision
+    /// values keep their exact digits.
+    Hex,
+    /// `bin(integer)`: the binary spelling with the `0b` prefix.
+    Bin,
+    /// `oct(integer)`: the octal spelling with the `0o` prefix.
+    Oct,
     /// `callable(object)`: `True` for functions, builtins, native module
     /// functions, classes and extension functions.
     Callable,
@@ -489,6 +507,7 @@ impl Builtin {
             Builtin::Len => "len",
             Builtin::Str => "str",
             Builtin::Repr => "repr",
+            Builtin::Ascii => "ascii",
             Builtin::Hash => "hash",
             Builtin::Id => "id",
             Builtin::Int => "int",
@@ -496,6 +515,7 @@ impl Builtin {
             Builtin::Abs => "abs",
             Builtin::Bool => "bool",
             Builtin::Type => "type",
+            Builtin::Super => "super",
             Builtin::Reversed => "reversed",
             Builtin::Import => "__import__",
             Builtin::Set => "set",
@@ -531,6 +551,9 @@ impl Builtin {
             Builtin::Ord => "ord",
             Builtin::Chr => "chr",
             Builtin::Divmod => "divmod",
+            Builtin::Hex => "hex",
+            Builtin::Bin => "bin",
+            Builtin::Oct => "oct",
             Builtin::Callable => "callable",
             Builtin::DictMerge => "dict merge",
             Builtin::Input => "input",
@@ -556,6 +579,7 @@ impl Builtin {
             "len" => Builtin::Len,
             "str" => Builtin::Str,
             "repr" => Builtin::Repr,
+            "ascii" => Builtin::Ascii,
             "hash" => Builtin::Hash,
             "id" => Builtin::Id,
             "int" => Builtin::Int,
@@ -563,6 +587,7 @@ impl Builtin {
             "abs" => Builtin::Abs,
             "bool" => Builtin::Bool,
             "type" => Builtin::Type,
+            "super" => Builtin::Super,
             "reversed" => Builtin::Reversed,
             "__import__" => Builtin::Import,
             "set" => Builtin::Set,
@@ -598,6 +623,9 @@ impl Builtin {
             "ord" => Builtin::Ord,
             "chr" => Builtin::Chr,
             "divmod" => Builtin::Divmod,
+            "hex" => Builtin::Hex,
+            "bin" => Builtin::Bin,
+            "oct" => Builtin::Oct,
             "callable" => Builtin::Callable,
             "input" => Builtin::Input,
             "get_ipython" => Builtin::GetIpython,
@@ -1106,5 +1134,16 @@ mod tests {
         // The name is distinct from `isinstance`: first-class values must
         // dispatch to the right runtime entry point.
         assert_ne!(Builtin::Issubclass.name(), Builtin::Isinstance.name());
+    }
+
+    #[test]
+    fn super_is_a_source_builtin() {
+        // The explicit two-argument form is a real builtin; the zero-argument
+        // form is lowered by the frontend to the receiver helper.
+        assert_eq!(Builtin::from_name("super"), Some(Builtin::Super));
+        assert_eq!(Builtin::Super.name(), "super");
+        // `object` is a `builtins` constant (a class value), not a compiler
+        // builtin: bare calls lower through the module attribute.
+        assert_eq!(Builtin::from_name("object"), None);
     }
 }

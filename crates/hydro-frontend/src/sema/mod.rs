@@ -2382,6 +2382,18 @@ impl<'a> Checker<'a> {
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Str));
             }
+            Builtin::Ascii => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("ascii() takes exactly one argument ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Str));
+            }
             Builtin::Int | Builtin::Float => {
                 let target = if builtin == Builtin::Int {
                     Type::Int
@@ -2477,6 +2489,21 @@ impl<'a> Checker<'a> {
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
             }
+            Builtin::Super => {
+                // `super(type, object)` is the explicit proxy form; the
+                // zero-argument form is lowered by the frontend before it
+                // reaches this builtin. `super(type)` is the unbound proxy.
+                if count > 2 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("super() takes at most 2 arguments ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
             Builtin::Bool => {
                 if count > 1 {
                     self.error_code(
@@ -2555,8 +2582,10 @@ impl<'a> Checker<'a> {
             }
             Builtin::Format => {
                 // Source-level `format(value, spec)` and the internal f-string
-                // field (value, constant spec, constant conversion flag)
-                // share this builtin. The constants are validated by codegen.
+                // field (value, spec, conversion flag) share this builtin.
+                // The spec is a `str` in either case: a static literal for the
+                // common path, a runtime expression when the f-string spec has
+                // nested replacement fields.
                 if !(2..=3).contains(&count) {
                     self.error_code(
                         line,
@@ -3158,6 +3187,41 @@ impl<'a> Checker<'a> {
                         arg_line,
                         arg_col,
                         format!("chr() argument must be an int, not {}", t.name()),
+                    ),
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Str));
+            }
+            Builtin::Hex | Builtin::Bin | Builtin::Oct => {
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!(
+                            "{}() takes exactly one argument ({count} given)",
+                            builtin.name()
+                        ),
+                    );
+                    return;
+                }
+                let (ty, arg_line, arg_col) = args[0];
+                match self.inf.resolve(ty) {
+                    Ty::Var(_) => {
+                        let _ = self.inf.unify(ty, Ty::Concrete(Type::Int));
+                    }
+                    Ty::Concrete(Type::Int)
+                    | Ty::Concrete(Type::BigInt)
+                    | Ty::Concrete(Type::Bool)
+                    | Ty::Concrete(Type::Any)
+                    | Ty::Concrete(Type::Never) => {}
+                    Ty::Concrete(t) => self.error(
+                        arg_line,
+                        arg_col,
+                        format!(
+                            "{}() argument must be an int, not {}",
+                            builtin.name(),
+                            t.name()
+                        ),
                     ),
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Str));

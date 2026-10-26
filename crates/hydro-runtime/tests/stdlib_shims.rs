@@ -165,11 +165,13 @@ fn opcode_exposes_only_the_specialization_flags() {
     assert_int(module_get("_opcode", "ENABLE_SPECIALIZATION"), 0);
     assert_int(module_get("_opcode", "ENABLE_SPECIALIZATION_FT"), 0);
 
-    // `stack_effect` does not exist and must not be fabricated.
-    let _ = module_get("_opcode", "stack_effect");
-    assert_error_tag(ATTRIBUTE_ERROR);
+    // `stack_effect` exists for CPython 3.14's `opcode.py` import surface but
+    // Hydro has no bytecode, so calling it must fail explicitly.
+    let stack_effect = module_get("_opcode", "stack_effect");
+    assert_no_error();
+    assert!(hydro_binop(OP_IS, stack_effect, hydro_none()) == hydro_false());
     let _ = module("_opcode", "stack_effect", &[int(1)]);
-    assert_error_tag(ATTRIBUTE_ERROR);
+    assert_error_tag(NOT_IMPLEMENTED_ERROR);
 }
 
 // -------------------------------------------------------------------------

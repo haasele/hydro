@@ -1021,6 +1021,11 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
     // at runtime (for example a module-level `CellSpan = Tuple[int, int]`)
     // gets a usable value instead of `TypeError`/`None[...]`.
     if value::as_class(obj).is_some() {
+        // `types.UnionType[A, B]` is the only class subscript with real
+        // semantics: it builds a native union value (PEP 604).
+        if let Some(union) = crate::modules::types::union_subscript(obj, index) {
+            return union;
+        }
         return obj;
     }
     type_error(format!(

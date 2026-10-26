@@ -169,6 +169,20 @@ pub static MODULES: &[&ModuleSpec] = &[
     &GC,
     &ATEXIT,
     &SITE,
+    &_CONTEXTVARS,
+    &CONTEXTVARS,
+    &CTYPES,
+    &_CTYPES,
+    &LOCALE,
+    &SYSCONFIG,
+    &ZONEINFO,
+    &DECIMAL,
+    &_DECIMAL,
+    &_STRUCT,
+    &STRUCT,
+    &UNICODEDATA,
+    &ZLIB,
+    &MMAP,
 ];
 
 pub fn module(name: &str) -> Option<&'static ModuleSpec> {

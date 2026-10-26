@@ -39,7 +39,10 @@ pub(crate) mod codecs;
 pub(crate) mod collections;
 pub(crate) mod collections_abc;
 pub(crate) mod colorsys;
+pub(crate) mod contextvars;
+pub(crate) mod ctypes;
 pub(crate) mod datetime;
+pub(crate) mod decimal;
 pub(crate) mod r#enum;
 pub(crate) mod errno;
 pub(crate) mod extension;
@@ -53,8 +56,10 @@ pub(crate) mod imp;
 pub(crate) mod importlib;
 pub(crate) mod itertools;
 pub(crate) mod keyword;
+pub(crate) mod locale;
 pub(crate) mod marshal;
 pub(crate) mod mimetypes;
+pub(crate) mod mmap_mod;
 pub(crate) mod opcode;
 pub(crate) mod pytest;
 pub(crate) mod quopri;
@@ -65,16 +70,21 @@ pub(crate) mod site;
 pub(crate) mod socket;
 pub(crate) mod stat;
 pub(crate) mod string;
+pub(crate) mod struct_mod;
 pub(crate) mod subprocess;
+pub(crate) mod sysconfig;
 pub(crate) mod tempfile;
 pub(crate) mod textwrap;
 pub(crate) mod timeit;
 pub(crate) mod tokenize;
 pub(crate) mod types;
 pub(crate) mod typing;
+pub(crate) mod unicodedata;
 pub(crate) mod unittest;
 pub(crate) mod warnings;
 pub(crate) mod weakref;
+pub(crate) mod zlib_mod;
+pub(crate) mod zoneinfo;
 
 use crate::container;
 use crate::exc::{
@@ -231,6 +241,412 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
             min_args: 0,
             max_args: 1,
             ret: hydro_ir::Type::Any,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    // Native methods of `_struct.Struct`. The native values carry these
+    // dotted names (`FunctionBody::Native`), so the central table must know
+    // them even though they are not Python-visible module functions.
+    (
+        "_struct.Struct.__init__",
+        stdlib::FunctionSpec {
+            name: "Struct.__init__",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::None,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "_struct.Struct.pack",
+        stdlib::FunctionSpec {
+            name: "Struct.pack",
+            min_args: 1,
+            max_args: usize::MAX,
+            ret: hydro_ir::Type::Bytes,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "_struct.Struct.pack_into",
+        stdlib::FunctionSpec {
+            name: "Struct.pack_into",
+            min_args: 3,
+            max_args: usize::MAX,
+            ret: hydro_ir::Type::None,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "_struct.Struct.unpack",
+        stdlib::FunctionSpec {
+            name: "Struct.unpack",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::Tuple,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "_struct.Struct.unpack_from",
+        stdlib::FunctionSpec {
+            name: "Struct.unpack_from",
+            min_args: 2,
+            max_args: 3,
+            ret: hydro_ir::Type::Tuple,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "_struct.Struct.iter_unpack",
+        stdlib::FunctionSpec {
+            name: "Struct.iter_unpack",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::Any,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    // Native methods of `abc.ABCMeta`. A metaclass method is reached through a
+    // class (`Number.register(int)`), so the class is the first argument and
+    // the name is not a Python-visible module member.
+    (
+        "abc.ABCMeta.register",
+        stdlib::FunctionSpec {
+            name: "ABCMeta.register",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::Any,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "abc.ABCMeta.__instancecheck__",
+        stdlib::FunctionSpec {
+            name: "ABCMeta.__instancecheck__",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "abc.ABCMeta.__subclasscheck__",
+        stdlib::FunctionSpec {
+            name: "ABCMeta.__subclasscheck__",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "abc.ABCMeta.__abstractmethods__",
+        stdlib::FunctionSpec {
+            name: "ABCMeta.__abstractmethods__",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Set,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    // Native methods of the in-memory streams. They are not Python-visible
+    // module members; the class namespace holds the function values and the
+    // central table validates their arity (the receiver counts as the first
+    // argument, like any bound method).
+    (
+        "io.StringIO.write",
+        stdlib::FunctionSpec {
+            name: "StringIO.write",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::Int,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.read",
+        stdlib::FunctionSpec {
+            name: "StringIO.read",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Str,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.readline",
+        stdlib::FunctionSpec {
+            name: "StringIO.readline",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Str,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.getvalue",
+        stdlib::FunctionSpec {
+            name: "StringIO.getvalue",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Str,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.seek",
+        stdlib::FunctionSpec {
+            name: "StringIO.seek",
+            min_args: 2,
+            max_args: 3,
+            ret: hydro_ir::Type::Int,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.tell",
+        stdlib::FunctionSpec {
+            name: "StringIO.tell",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Int,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.close",
+        stdlib::FunctionSpec {
+            name: "StringIO.close",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::None,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.flush",
+        stdlib::FunctionSpec {
+            name: "StringIO.flush",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::None,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.readable",
+        stdlib::FunctionSpec {
+            name: "StringIO.readable",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.writable",
+        stdlib::FunctionSpec {
+            name: "StringIO.writable",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.seekable",
+        stdlib::FunctionSpec {
+            name: "StringIO.seekable",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.__enter__",
+        stdlib::FunctionSpec {
+            name: "StringIO.__enter__",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Any,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.StringIO.__exit__",
+        stdlib::FunctionSpec {
+            name: "StringIO.__exit__",
+            min_args: 4,
+            max_args: 4,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.write",
+        stdlib::FunctionSpec {
+            name: "BytesIO.write",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::Int,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.read",
+        stdlib::FunctionSpec {
+            name: "BytesIO.read",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Bytes,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.readline",
+        stdlib::FunctionSpec {
+            name: "BytesIO.readline",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Bytes,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.getvalue",
+        stdlib::FunctionSpec {
+            name: "BytesIO.getvalue",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bytes,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.seek",
+        stdlib::FunctionSpec {
+            name: "BytesIO.seek",
+            min_args: 2,
+            max_args: 3,
+            ret: hydro_ir::Type::Int,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.tell",
+        stdlib::FunctionSpec {
+            name: "BytesIO.tell",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Int,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.close",
+        stdlib::FunctionSpec {
+            name: "BytesIO.close",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::None,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.flush",
+        stdlib::FunctionSpec {
+            name: "BytesIO.flush",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::None,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.readable",
+        stdlib::FunctionSpec {
+            name: "BytesIO.readable",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.writable",
+        stdlib::FunctionSpec {
+            name: "BytesIO.writable",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.seekable",
+        stdlib::FunctionSpec {
+            name: "BytesIO.seekable",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.__enter__",
+        stdlib::FunctionSpec {
+            name: "BytesIO.__enter__",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Any,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.BytesIO.__exit__",
+        stdlib::FunctionSpec {
+            name: "BytesIO.__exit__",
+            min_args: 4,
+            max_args: 4,
+            ret: hydro_ir::Type::Bool,
             params: &[],
             dynamic_keywords: false,
         },
@@ -472,6 +888,17 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if module == "builtins" && name == "object" {
         return value::object_class();
     }
+    // `io.StringIO`/`io.BytesIO` are declared as functions so calls lower as
+    // module calls, but the runtime value is the cached class: identity,
+    // `isinstance` and method binding all need a class, not a constructor
+    // function.
+    if matches!(module, "io" | "_io") {
+        match name {
+            "StringIO" => return string_io_class(),
+            "BytesIO" => return bytes_io_class(),
+            _ => {}
+        }
+    }
     // `_collections` is the accelerator alias of `collections`; both names
     // must expose the same `defaultdict` object.
     if matches!(module, "collections" | "_collections") && name == "defaultdict" {
@@ -485,6 +912,20 @@ fn module_get_named(module: &str, name: &str) -> i64 {
         return class;
     }
     if let Some(class) = typing::class_value(module, name) {
+        return class;
+    }
+    // `_struct.Struct` and `_struct.error` are declared as functions/constants
+    // so calls lower as module calls; the runtime values are real classes (the
+    // class protocol and `isinstance` need them).
+    if let Some(class) = struct_mod::class_value(module, name) {
+        return class;
+    }
+    // `mmap.mmap` must be a class value (identity/`isinstance`/method binding),
+    // and `zlib.error` is exposed the same way.
+    if let Some(class) = mmap_mod::class_value(module, name) {
+        return class;
+    }
+    if let Some(class) = zlib_mod::class_value(module, name) {
         return class;
     }
     if let Some(spec) = stdlib::function(module, name) {
@@ -807,6 +1248,8 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "fnmatch" => fnmatch::call(function, args),
         "getopt" => getopt::call(function, args),
         "mimetypes" => mimetypes::call(function, args),
+        "mmap" => mmap_mod::call(function, args),
+        "zlib" => zlib_mod::call(function, args),
         "subprocess" => subprocess::call(function, args),
         "tempfile" => tempfile::call(function, args),
         "shutil" => shutil::call(function, args),
@@ -817,6 +1260,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "contextlib" => contextlib_call(function, args),
         "typing" => typing::call(function, args),
         "abc" => abc::call(function, args),
+        "_opcode" => opcode::call(function, args),
         "enum" => r#enum::call(function, args),
         "_imp" => imp::call(function, args),
         "_codecs" => codecs::call(function, args),
@@ -829,6 +1273,14 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "gc" => gc::call(function, args),
         "atexit" => atexit::call(function, args),
         "site" => site::call(function, args),
+        "ctypes" | "_ctypes" => ctypes::call(function, args),
+        "locale" => locale::call(function, args),
+        "sysconfig" => sysconfig::call(function, args),
+        "zoneinfo" => zoneinfo::call(function, args),
+        "decimal" | "_decimal" => decimal::call(function, args),
+        "_struct" | "struct" => struct_mod::call(function, args),
+        "unicodedata" => unicodedata::call(function, args),
+        "_contextvars" | "contextvars" => contextvars::call(function, args),
         _ => missing_attribute(module, function),
     }
 }
@@ -1101,6 +1553,13 @@ fn constant_value(module: &str, name: &str) -> i64 {
                 .unwrap_or_default(),
         ),
         ("sys", "platform") => value::str_from_bytes(platform().as_bytes()),
+        // Target endianness, as CPython reports it (the compiler and runtime
+        // always share one target).
+        ("sys", "byteorder") => value::str_from_bytes(if cfg!(target_endian = "little") {
+            b"little"
+        } else {
+            b"big"
+        }),
         ("sys", "version") => value::str_alloc(format!(
             "{PYTHON_VERSION_STRING} (Hydro {})",
             env!("CARGO_PKG_VERSION")
@@ -1123,6 +1582,14 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `i64::MAX` does not fit into the 61-bit tagged integer; the
         // documented value is `2^60 - 1` (`value::MAX_INT`).
         ("sys", "maxsize") => encode_int(value::MAX_INT),
+        // Last uncaught exception (`sys.last_exc`/`last_type`/`last_value`/
+        // `last_traceback`). CPython sets these only while an interactive
+        // interpreter reports an exception; Hydro compiles and runs whole
+        // programs, so no value outlives an uncaught exception and the names
+        // are `None` instead of a fabricated exception. `dis` reads
+        // `last_exc` behind `hasattr` and follows the same "no last
+        // traceback" path it takes in CPython script mode.
+        ("sys", "last_exc" | "last_type" | "last_value" | "last_traceback") => NONE,
         // Fresh native streams over the standard descriptors on every
         // resolution; `__std*__` are the original streams, which this runtime
         // never rebinds, so both spellings resolve alike. They hold no Hydro
@@ -1196,6 +1663,8 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("stat" | "_stat", name) => stat::constant(name),
         ("re", name) => re::constant(name),
         ("mimetypes", name) => mimetypes::constant(name),
+        ("mmap", name) => mmap_mod::constant(name),
+        ("zlib", name) => zlib_mod::constant(name),
         ("datetime", name) => datetime::constant(name),
         ("typing", name) => typing::constant(name),
         ("abc", name) => abc::constant(name),
@@ -1214,6 +1683,16 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("collections" | "collections.abc", "abc") => collections_abc_module(),
         ("_collections_abc" | "collections.abc", name) => collections_abc::constant(name),
         ("site", name) => site::constant(name),
+        ("ctypes" | "_ctypes", name) => ctypes::constant(name),
+        ("locale", name) => locale::constant(name),
+        ("sysconfig", name) => sysconfig::constant(name),
+        ("zoneinfo", name) => zoneinfo::constant(name),
+        ("decimal" | "_decimal", name) => decimal::constant(name),
+        ("_struct" | "struct", "error") => struct_mod::error_value(),
+        ("unicodedata", "unidata_version") => {
+            value::str_alloc(unicodedata::UNIDATA_VERSION.to_string())
+        }
+        ("_contextvars" | "contextvars", name) => contextvars::constant(name),
         // The `@dataclass` decorator is expanded by the frontend; the runtime
         // value only has to exist for the import.
         ("dataclasses", "dataclass") => NONE,
@@ -4379,9 +4858,562 @@ fn sys_exit(args: &[i64]) -> i64 {
 /// mode, as are `errors`. Binary mode rejects `encoding`, `newline` and
 /// `errors` with `ValueError`, like CPython.
 fn io_call(function: &str, args: &[i64]) -> i64 {
+    if let Some(method) = function.strip_prefix("StringIO.") {
+        return string_io_method(method, args);
+    }
+    if let Some(method) = function.strip_prefix("BytesIO.") {
+        return bytes_io_method(method, args);
+    }
     match function {
         "open" => io_open(args),
+        "StringIO" => string_io_new(args),
+        "BytesIO" => bytes_io_new(args),
         _ => missing_attribute("io", function),
+    }
+}
+
+/// The cached `io.StringIO` / `io.BytesIO` classes. Native instances compare
+/// by class identity, so every access must return the same class value.
+fn in_memory_class(name: &'static str, methods: Vec<(String, i64)>) -> i64 {
+    let key = format!("io.{name}");
+    if let Some(cached) = globals::registry_get(&key) {
+        return cached;
+    }
+    // The method table holds freshly allocated native functions; root them
+    // while the class object itself is being allocated and registered.
+    let method_values: Vec<i64> = methods.iter().map(|(_, value)| *value).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new(name.to_string(), NONE, methods);
+    let class_roots = heap::root_values(&[class]);
+    globals::registry_set(&key, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+fn string_io_class() -> i64 {
+    in_memory_class(
+        "StringIO",
+        vec![
+            (
+                "write".to_string(),
+                value::native_function_new("io", "StringIO.write", 2),
+            ),
+            (
+                "read".to_string(),
+                value::native_function_new("io", "StringIO.read", 2),
+            ),
+            (
+                "readline".to_string(),
+                value::native_function_new("io", "StringIO.readline", 2),
+            ),
+            (
+                "getvalue".to_string(),
+                value::native_function_new("io", "StringIO.getvalue", 1),
+            ),
+            (
+                "seek".to_string(),
+                value::native_function_new("io", "StringIO.seek", 3),
+            ),
+            (
+                "tell".to_string(),
+                value::native_function_new("io", "StringIO.tell", 1),
+            ),
+            (
+                "close".to_string(),
+                value::native_function_new("io", "StringIO.close", 1),
+            ),
+            (
+                "flush".to_string(),
+                value::native_function_new("io", "StringIO.flush", 1),
+            ),
+            (
+                "readable".to_string(),
+                value::native_function_new("io", "StringIO.readable", 1),
+            ),
+            (
+                "writable".to_string(),
+                value::native_function_new("io", "StringIO.writable", 1),
+            ),
+            (
+                "seekable".to_string(),
+                value::native_function_new("io", "StringIO.seekable", 1),
+            ),
+            (
+                "__enter__".to_string(),
+                value::native_function_new("io", "StringIO.__enter__", 1),
+            ),
+            (
+                "__exit__".to_string(),
+                value::native_function_new("io", "StringIO.__exit__", 4),
+            ),
+        ],
+    )
+}
+
+fn bytes_io_class() -> i64 {
+    in_memory_class(
+        "BytesIO",
+        vec![
+            (
+                "write".to_string(),
+                value::native_function_new("io", "BytesIO.write", 2),
+            ),
+            (
+                "read".to_string(),
+                value::native_function_new("io", "BytesIO.read", 2),
+            ),
+            (
+                "readline".to_string(),
+                value::native_function_new("io", "BytesIO.readline", 2),
+            ),
+            (
+                "getvalue".to_string(),
+                value::native_function_new("io", "BytesIO.getvalue", 1),
+            ),
+            (
+                "seek".to_string(),
+                value::native_function_new("io", "BytesIO.seek", 3),
+            ),
+            (
+                "tell".to_string(),
+                value::native_function_new("io", "BytesIO.tell", 1),
+            ),
+            (
+                "close".to_string(),
+                value::native_function_new("io", "BytesIO.close", 1),
+            ),
+            (
+                "flush".to_string(),
+                value::native_function_new("io", "BytesIO.flush", 1),
+            ),
+            (
+                "readable".to_string(),
+                value::native_function_new("io", "BytesIO.readable", 1),
+            ),
+            (
+                "writable".to_string(),
+                value::native_function_new("io", "BytesIO.writable", 1),
+            ),
+            (
+                "seekable".to_string(),
+                value::native_function_new("io", "BytesIO.seekable", 1),
+            ),
+            (
+                "__enter__".to_string(),
+                value::native_function_new("io", "BytesIO.__enter__", 1),
+            ),
+            (
+                "__exit__".to_string(),
+                value::native_function_new("io", "BytesIO.__exit__", 4),
+            ),
+        ],
+    )
+}
+
+const IO_DATA: &str = "_hydro_io_data";
+const IO_POS: &str = "_hydro_io_pos";
+const IO_CLOSED: &str = "closed";
+
+/// Raises `ValueError` when an in-memory stream has been closed.
+fn io_open_check(instance: i64) -> Option<i64> {
+    match value::instance_attr(instance, IO_CLOSED) {
+        Some(closed) if closed == TRUE => Some(exc::raise_with_message(
+            VALUE_ERROR,
+            "I/O operation on closed file.",
+        )),
+        _ => None,
+    }
+}
+
+fn io_store(instance: i64, name: &str, value: i64) {
+    let roots = heap::root_values(&[value]);
+    value::instance_setattr(instance, name.to_string(), value);
+    heap::release_roots(roots);
+}
+
+fn io_data(instance: i64) -> i64 {
+    value::instance_attr(instance, IO_DATA).unwrap_or(NONE)
+}
+
+fn io_pos(instance: i64) -> usize {
+    value::instance_attr(instance, IO_POS)
+        .and_then(value::as_integer)
+        .and_then(|pos| usize::try_from(pos).ok())
+        .unwrap_or(0)
+}
+
+fn io_set_pos(instance: i64, pos: usize) {
+    io_store(instance, IO_POS, ops::int_result(pos as i64));
+}
+
+fn io_size_arg(value: i64) -> Result<i64, i64> {
+    match value::as_integer(value) {
+        Some(size) => Ok(size),
+        None => Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "argument should be integer or None, not {}",
+                value::type_name(value)
+            ),
+        )),
+    }
+}
+
+fn io_seek(instance: i64, args: &[i64], length: usize) -> i64 {
+    if let Some(error) = io_open_check(instance) {
+        return error;
+    }
+    let offset = match args.get(1).copied() {
+        Some(value) => match value::as_integer(value) {
+            Some(offset) => offset,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("integer argument expected, got {}", value::type_name(value)),
+                )
+            }
+        },
+        None => {
+            return exc::raise_with_message(TYPE_ERROR, "seek() missing required argument 'pos'")
+        }
+    };
+    let whence = match args.get(2).copied() {
+        None | Some(NONE) => 0,
+        Some(value) => match value::as_integer(value) {
+            Some(whence) => whence,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("integer argument expected, got {}", value::type_name(value)),
+                )
+            }
+        },
+    };
+    let base = match whence {
+        0 => 0,
+        1 => io_pos(instance) as i64,
+        2 => length as i64,
+        other => {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("invalid whence ({other}, should be 0, 1 or 2)"),
+            )
+        }
+    };
+    let target = base.saturating_add(offset);
+    if target < 0 {
+        return exc::raise_with_message(VALUE_ERROR, &format!("negative seek position {target}"));
+    }
+    io_set_pos(instance, target as usize);
+    ops::int_result(target)
+}
+
+fn io_tell(instance: i64) -> i64 {
+    if let Some(error) = io_open_check(instance) {
+        return error;
+    }
+    ops::int_result(io_pos(instance) as i64)
+}
+
+fn io_close(instance: i64) -> i64 {
+    io_store(instance, IO_CLOSED, TRUE);
+    NONE
+}
+
+fn io_enter(instance: i64) -> i64 {
+    if let Some(error) = io_open_check(instance) {
+        return error;
+    }
+    instance
+}
+
+fn io_exit(instance: i64) -> i64 {
+    io_close(instance);
+    FALSE
+}
+
+fn io_probe(instance: i64) -> i64 {
+    if let Some(error) = io_open_check(instance) {
+        return error;
+    }
+    TRUE
+}
+
+/// `io.StringIO(initial_value="", newline="\n")`.
+fn string_io_new(args: &[i64]) -> i64 {
+    let instance = value::instance_new(string_io_class());
+    string_io_init(instance, args.first().copied())
+}
+
+fn string_io_init(instance: i64, initial: Option<i64>) -> i64 {
+    let roots = heap::root_values(&[instance]);
+    let result = string_io_init_attrs(instance, initial);
+    heap::release_roots(roots);
+    result
+}
+
+fn string_io_init_attrs(instance: i64, initial: Option<i64>) -> i64 {
+    let initial = match initial {
+        None | Some(NONE) => String::new(),
+        Some(value) => match value::as_str(value) {
+            Some(text) => text.to_string(),
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "initial_value should be a string, not {}",
+                        value::type_name(value)
+                    ),
+                )
+            }
+        },
+    };
+    io_store(instance, IO_DATA, value::str_from_bytes(initial.as_bytes()));
+    io_set_pos(instance, 0);
+    io_store(instance, IO_CLOSED, FALSE);
+    instance
+}
+
+fn string_io_method(method: &str, args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, &format!("StringIO.{method}() missing self"));
+    };
+    match method {
+        "write" => {
+            if let Some(error) = io_open_check(instance) {
+                return error;
+            }
+            let Some(value) = args.get(1).copied() else {
+                return exc::raise_with_message(TYPE_ERROR, "write() missing required argument");
+            };
+            let Some(text) = value::as_str(value) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "string argument expected, got '{}'",
+                        value::type_name(value)
+                    ),
+                );
+            };
+            let text = text.to_string();
+            let mut chars: Vec<char> = value::as_str(io_data(instance))
+                .unwrap_or_default()
+                .chars()
+                .collect();
+            let pos = io_pos(instance);
+            while chars.len() < pos {
+                chars.push('\0');
+            }
+            let written = text.chars().count();
+            for (index, ch) in text.chars().enumerate() {
+                let at = pos + index;
+                if at < chars.len() {
+                    chars[at] = ch;
+                } else {
+                    chars.push(ch);
+                }
+            }
+            io_store(
+                instance,
+                IO_DATA,
+                value::str_alloc(chars.into_iter().collect()),
+            );
+            io_set_pos(instance, pos + written);
+            ops::int_result(written as i64)
+        }
+        "read" | "readline" => {
+            if let Some(error) = io_open_check(instance) {
+                return error;
+            }
+            let data: Vec<char> = value::as_str(io_data(instance))
+                .unwrap_or_default()
+                .chars()
+                .collect();
+            let pos = io_pos(instance).min(data.len());
+            let limit = match args.get(1).copied() {
+                None | Some(NONE) => -1,
+                Some(value) => match io_size_arg(value) {
+                    Ok(size) => size,
+                    Err(error) => return error,
+                },
+            };
+            let end = if method == "readline" {
+                let mut end = data.len();
+                if limit >= 0 {
+                    end = end.min(pos.saturating_add(limit as usize));
+                }
+                match data[pos..end].iter().position(|ch| *ch == '\n') {
+                    Some(offset) => pos + offset + 1,
+                    None => end,
+                }
+            } else if limit < 0 {
+                data.len()
+            } else {
+                data.len().min(pos.saturating_add(limit as usize))
+            };
+            let text: String = data[pos..end].iter().collect();
+            io_set_pos(instance, end);
+            value::str_alloc(text)
+        }
+        "getvalue" => {
+            if let Some(error) = io_open_check(instance) {
+                return error;
+            }
+            match value::instance_attr(instance, IO_DATA) {
+                Some(data) => data,
+                None => value::str_alloc(String::new()),
+            }
+        }
+        "seek" => {
+            let length = value::as_str(io_data(instance))
+                .unwrap_or_default()
+                .chars()
+                .count();
+            io_seek(instance, args, length)
+        }
+        "tell" => io_tell(instance),
+        "close" => io_close(instance),
+        "flush" => match io_open_check(instance) {
+            Some(error) => error,
+            None => NONE,
+        },
+        "readable" | "writable" | "seekable" => io_probe(instance),
+        "__enter__" => io_enter(instance),
+        "__exit__" => io_exit(instance),
+        _ => missing_attribute("io", method),
+    }
+}
+
+/// `io.BytesIO(initial_bytes=b"")`.
+fn bytes_io_new(args: &[i64]) -> i64 {
+    let instance = value::instance_new(bytes_io_class());
+    bytes_io_init(instance, args.first().copied())
+}
+
+fn bytes_io_init(instance: i64, initial: Option<i64>) -> i64 {
+    let roots = heap::root_values(&[instance]);
+    let result = bytes_io_init_attrs(instance, initial);
+    heap::release_roots(roots);
+    result
+}
+
+fn bytes_io_init_attrs(instance: i64, initial: Option<i64>) -> i64 {
+    let initial = match initial {
+        None | Some(NONE) => Vec::new(),
+        Some(value) => match value::as_bytes(value) {
+            Some(bytes) => bytes.to_vec(),
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "a bytes-like object is required, not '{}'",
+                        value::type_name(value)
+                    ),
+                )
+            }
+        },
+    };
+    io_store(instance, IO_DATA, value::bytes_new(initial));
+    io_set_pos(instance, 0);
+    io_store(instance, IO_CLOSED, FALSE);
+    instance
+}
+
+fn bytes_io_method(method: &str, args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, &format!("BytesIO.{method}() missing self"));
+    };
+    match method {
+        "write" => {
+            if let Some(error) = io_open_check(instance) {
+                return error;
+            }
+            let Some(value) = args.get(1).copied() else {
+                return exc::raise_with_message(TYPE_ERROR, "write() missing required argument");
+            };
+            let Some(data) = value::as_bytes(value) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "a bytes-like object is required, not '{}'",
+                        value::type_name(value)
+                    ),
+                );
+            };
+            let data = data.to_vec();
+            let mut bytes: Vec<u8> = value::as_bytes(io_data(instance)).unwrap_or(&[]).to_vec();
+            let pos = io_pos(instance);
+            while bytes.len() < pos {
+                bytes.push(0);
+            }
+            for (index, byte) in data.iter().enumerate() {
+                let at = pos + index;
+                if at < bytes.len() {
+                    bytes[at] = *byte;
+                } else {
+                    bytes.push(*byte);
+                }
+            }
+            let written = data.len();
+            io_store(instance, IO_DATA, value::bytes_new(bytes));
+            io_set_pos(instance, pos + written);
+            ops::int_result(written as i64)
+        }
+        "read" | "readline" => {
+            if let Some(error) = io_open_check(instance) {
+                return error;
+            }
+            let data: Vec<u8> = value::as_bytes(io_data(instance)).unwrap_or(&[]).to_vec();
+            let pos = io_pos(instance).min(data.len());
+            let limit = match args.get(1).copied() {
+                None | Some(NONE) => -1,
+                Some(value) => match io_size_arg(value) {
+                    Ok(size) => size,
+                    Err(error) => return error,
+                },
+            };
+            let end = if method == "readline" {
+                let mut end = data.len();
+                if limit >= 0 {
+                    end = end.min(pos.saturating_add(limit as usize));
+                }
+                match data[pos..end].iter().position(|byte| *byte == b'\n') {
+                    Some(offset) => pos + offset + 1,
+                    None => end,
+                }
+            } else if limit < 0 {
+                data.len()
+            } else {
+                data.len().min(pos.saturating_add(limit as usize))
+            };
+            let slice = data[pos..end].to_vec();
+            io_set_pos(instance, end);
+            value::bytes_new(slice)
+        }
+        "getvalue" => {
+            if let Some(error) = io_open_check(instance) {
+                return error;
+            }
+            match value::instance_attr(instance, IO_DATA) {
+                Some(data) => data,
+                None => value::bytes_new(Vec::new()),
+            }
+        }
+        "seek" => {
+            let length = value::as_bytes(io_data(instance)).unwrap_or(&[]).len();
+            io_seek(instance, args, length)
+        }
+        "tell" => io_tell(instance),
+        "close" => io_close(instance),
+        "flush" => match io_open_check(instance) {
+            Some(error) => error,
+            None => NONE,
+        },
+        "readable" | "writable" | "seekable" => io_probe(instance),
+        "__enter__" => io_enter(instance),
+        "__exit__" => io_exit(instance),
+        _ => missing_attribute("io", method),
     }
 }
 
@@ -5136,6 +6168,12 @@ mod tests {
         }
         for name in ["prefix", "base_prefix", "exec_prefix"] {
             assert!(value::as_str(get("sys", name)).is_some(), "{name}");
+        }
+        // No interactive frame survives an uncaught exception, so the last
+        // exception attributes are the `None` singleton rather than an
+        // invented exception object.
+        for name in ["last_exc", "last_type", "last_value", "last_traceback"] {
+            assert_eq!(get("sys", name), NONE, "{name}");
         }
         assert!(stdlib::function("sys", "exit").is_some());
         for name in [
@@ -6463,7 +7501,14 @@ mod tests {
                 .name,
             "ABC"
         );
+        assert_eq!(
+            value::as_class(get("abc", "ABCMeta"))
+                .expect("class value")
+                .name,
+            "ABCMeta"
+        );
         assert_eq!(call("abc", "abstractmethod", &[payload]), payload);
+        assert!(value::as_integer(call("abc", "get_cache_token", &[])).is_some());
 
         for name in ["Enum", "IntEnum"] {
             let class = value::as_class(get("enum", name)).expect("class value");

@@ -156,6 +156,9 @@ pub(crate) struct ArgParserState {
     pub(crate) add_help: bool,
     pub(crate) allow_abbrev: bool,
     pub(crate) exit_on_error: bool,
+    /// CPython 3.14's `color=` constructor keyword. Help output has no ANSI
+    /// styling in Hydro, so the flag is stored for introspection only.
+    pub(crate) color: bool,
     pub(crate) options: Vec<ArgSpec>,
     pub(crate) groups: Vec<GroupState>,
     pub(crate) subparsers: Option<SubparsersState>,
@@ -179,6 +182,7 @@ impl ArgParserState {
             add_help: true,
             allow_abbrev: true,
             exit_on_error: true,
+            color: true,
             options: Vec::new(),
             groups: vec![GroupState::default()],
             subparsers: None,
@@ -332,7 +336,7 @@ fn opt_bool(argument: i64, default: bool) -> bool {
 
 /// `ArgumentParser(prog, usage, description, epilog, parents,
 /// formatter_class, prefix_chars, fromfile_prefix_chars, argument_default,
-/// conflict_handler, add_help, allow_abbrev, exit_on_error)`.
+/// conflict_handler, add_help, allow_abbrev, exit_on_error, color)`.
 fn new_parser(args: &[i64]) -> i64 {
     let arg = |index: usize| args.get(index).copied().unwrap_or(NONE);
     let prog = match opt_str(arg(0), "prog must be str or None") {
@@ -389,6 +393,7 @@ fn new_parser(args: &[i64]) -> i64 {
     state.add_help = opt_bool(arg(10), true);
     state.allow_abbrev = opt_bool(arg(11), true);
     state.exit_on_error = opt_bool(arg(12), true);
+    state.color = opt_bool(arg(13), true);
     if state.prog.is_none() {
         state.prog = Some(default_prog());
     }
@@ -1148,7 +1153,7 @@ fn add_parser(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     let Some(name) = value::as_str(name_value).map(str::to_string) else {
         return type_error("add_parser() name must be str");
     };
-    let mut slots = vec![NONE; 13];
+    let mut slots = vec![NONE; 14];
     let mut help_text = String::new();
     let mut explicit_prog = false;
     for (keyword, argument) in keywords {
@@ -1169,6 +1174,7 @@ fn add_parser(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
             "add_help" => slots[10] = *argument,
             "allow_abbrev" => slots[11] = *argument,
             "exit_on_error" => slots[12] = *argument,
+            "color" => slots[13] = *argument,
             "help" => match value::as_str(*argument) {
                 Some(text) => help_text = text.to_string(),
                 None => return type_error("add_parser() help must be str"),
@@ -3017,6 +3023,11 @@ pub(crate) fn parser_attr(obj: i64, attr: &str) -> Option<i64> {
             value::FALSE
         }),
         "exit_on_error" => Some(if state.exit_on_error {
+            value::TRUE
+        } else {
+            value::FALSE
+        }),
+        "color" => Some(if state.color {
             value::TRUE
         } else {
             value::FALSE

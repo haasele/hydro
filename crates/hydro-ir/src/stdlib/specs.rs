@@ -384,6 +384,8 @@ pub static SYS: ModuleSpec = ModuleSpec {
     constants: &[
         c("argv", Type::List),
         c("executable", Type::Str),
+        // "little" or "big": the byte order of the target the program runs on.
+        c("byteorder", Type::Str),
         c("platform", Type::Str),
         c("version", Type::Str),
         c("version_info", Type::Tuple),
@@ -414,6 +416,15 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("prefix", Type::Str),
         c("base_prefix", Type::Str),
         c("exec_prefix", Type::Str),
+        // Last uncaught exception. Hydro is a batch compiler with no
+        // interactive frame that survives an uncaught exception, so these
+        // resolve to `None`. They exist (rather than raising
+        // `AttributeError`) because libraries such as `dis` and `code` read
+        // them behind `hasattr`.
+        c("last_exc", Type::Any),
+        c("last_type", Type::Any),
+        c("last_value", Type::Any),
+        c("last_traceback", Type::Any),
     ],
 };
 
@@ -421,7 +432,7 @@ pub static SYS: ModuleSpec = ModuleSpec {
 ///
 /// The table covers every name the compiler resolves through
 /// `hydro_ir::Builtin::from_name` plus the attribute-only entries
-/// (`object`, `setattr`, ...). Runtime dispatch for these functions and
+/// (`setattr`, `object`, ...). Runtime dispatch for these functions and
 /// constants belongs to the builtins module implementation; this spec makes
 /// the names importable and gives native function values their arity.
 pub static BUILTINS: ModuleSpec = ModuleSpec {
@@ -432,12 +443,14 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("len", 1, 1, Type::Int),
         f("str", 0, 3, Type::Str),
         f("repr", 1, 1, Type::Str),
+        f("ascii", 1, 1, Type::Str),
         f("hash", 1, 1, Type::Int),
         f("int", 0, 2, Type::Int),
         f("float", 0, 1, Type::Float),
         f("abs", 1, 1, Type::Any),
         f("bool", 0, 1, Type::Bool),
         f("type", 1, 3, Type::Any),
+        f("super", 0, 2, Type::Any),
         f("reversed", 1, 1, Type::Any),
         f("__import__", 1, 5, Type::Any),
         f("set", 0, 1, Type::Set),
@@ -467,6 +480,12 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("ord", 1, 1, Type::Int),
         f("chr", 1, 1, Type::Str),
         f("divmod", 2, 2, Type::Tuple),
+        // Integer-base spellings: `hex`, `bin` and `oct` take exactly one
+        // integer (including arbitrary-precision values) and return the
+        // prefixed literal text.
+        f("hex", 1, 1, Type::Str),
+        f("bin", 1, 1, Type::Str),
+        f("oct", 1, 1, Type::Str),
         f("callable", 1, 1, Type::Bool),
         // Descriptor factories (unqualified compiler builtins). `property`
         // keeps CPython's parameter names; the runtime accepts and does not
@@ -487,7 +506,6 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         // same identity encoding.
         f("id", 1, 1, Type::Int),
         // Attribute-only names (not unqualified compiler builtins).
-        f("object", 0, 0, Type::Any),
         f("setattr", 3, 3, Type::None),
         f("delattr", 2, 2, Type::None),
         f("dir", 0, 1, Type::List),
@@ -577,17 +595,33 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         c("Ellipsis", Type::Any),
         c("NotImplemented", Type::Any),
         c("__debug__", Type::Bool),
+        // Attribute-only builtin types used as values (`isinstance(x, slice)`)
+        // and as constructors. The runtime serves the class values.
+        c("complex", Type::Any),
+        c("slice", Type::Any),
+        // `object` is CPython's universal base class. It is a class value, not
+        // a native function: `class C(object)`, `isinstance(x, object)` and
+        // `object()` all need the runtime class. The bare name resolves like
+        // every other `builtins` constant.
+        c("object", Type::Any),
     ],
 };
 
 /// `io` and `_io` share the same function table.
-const IO_FUNCTIONS: &[FunctionSpec] = &[kw(
-    "open",
-    1,
-    5,
-    Type::Any,
-    &["file", "mode", "encoding", "newline", "errors"],
-)];
+const IO_FUNCTIONS: &[FunctionSpec] = &[
+    kw(
+        "open",
+        1,
+        5,
+        Type::Any,
+        &["file", "mode", "encoding", "newline", "errors"],
+    ),
+    // In-memory text and binary streams. Declared as functions so
+    // `io.StringIO(...)` lowers as a module call; the runtime value is the
+    // cached class (identity, `isinstance` and method binding need a class).
+    kw("StringIO", 0, 2, Type::Any, &["initial_value", "newline"]),
+    kw("BytesIO", 0, 1, Type::Any, &["initial_value"]),
+];
 
 pub static IO: ModuleSpec = ModuleSpec {
     name: "io",
@@ -612,7 +646,7 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
         kw(
             "ArgumentParser",
             0,
-            13,
+            14,
             Type::Any,
             &[
                 "prog",
@@ -628,6 +662,7 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
                 "add_help",
                 "allow_abbrev",
                 "exit_on_error",
+                "color",
             ],
         ),
         // `Namespace` is a class in CPython; exposing it as a native
@@ -656,7 +691,19 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
 
 pub static COLLECTIONS: ModuleSpec = ModuleSpec {
     name: "collections",
-    functions: &[kw("defaultdict", 1, 1, Type::Any, &["default_factory"])],
+    functions: &[
+        kw("defaultdict", 1, 1, Type::Any, &["default_factory"]),
+        // `namedtuple(typename, field_names, *, rename=False, defaults=None,
+        // module=None)` returns a tuple-like class. The declared keywords let
+        // the frontend fold them into the constructor's positional slots.
+        kw(
+            "namedtuple",
+            2,
+            5,
+            Type::Any,
+            &["typename", "field_names", "rename", "defaults", "module"],
+        ),
+    ],
     // `collections.abc` is a nested module; the constant lets the frontend
     // resolve `collections.abc.Mapping` through the runtime module value
     // (the general nested-module chain is still a frontend follow-up).
@@ -1523,11 +1570,26 @@ pub static TYPING: ModuleSpec = ModuleSpec {
     ],
 };
 
-/// `abc`: the `ABC` base and the `abstractmethod` decorator.
+/// `abc`: abstract base classes (PEP 3119).
+///
+/// `ABCMeta` is a real metaclass class (a subclass of the native `type` class)
+/// with `register`, `__instancecheck__`, `__subclasscheck__` and
+/// `__abstractmethods__`; `ABC` is the mix-in helper whose metaclass is
+/// `ABCMeta`. Virtual-subclass registrations are consulted by the runtime
+/// `isinstance`/`issubclass` paths. The deprecated decorator classes are
+/// importable but raise a tagged `NotImplementedError` when called (use
+/// `@classmethod`/`@staticmethod`/`@property` with `@abstractmethod`).
 pub static ABC: ModuleSpec = ModuleSpec {
     name: "abc",
-    functions: &[f("abstractmethod", 1, 1, Type::Any)],
-    constants: &[c("ABC", Type::Any)],
+    functions: &[
+        f("abstractmethod", 1, 1, Type::Any),
+        f("get_cache_token", 0, 0, Type::Int),
+        f("update_abstractmethods", 1, 1, Type::Any),
+        f("abstractclassmethod", 1, 1, Type::Any),
+        f("abstractstaticmethod", 1, 1, Type::Any),
+        f("abstractproperty", 1, 1, Type::Any),
+    ],
+    constants: &[c("ABC", Type::Any), c("ABCMeta", Type::Any)],
 };
 
 /// `enum`: placeholder enum bases and `auto()`.
@@ -1560,11 +1622,45 @@ pub static FUTURE: ModuleSpec = ModuleSpec {
 /// CPython's keyword constructor.
 pub static TYPES: ModuleSpec = ModuleSpec {
     name: "types",
-    functions: &[f("SimpleNamespace", 0, 1, Type::Any)],
+    functions: &[
+        f("SimpleNamespace", 0, 1, Type::Any),
+        // `FunctionType(code, globals, name=None, argdefs=None, closure=None,
+        // kwdefaults=None)` builds a callable from code metadata. Declared as
+        // a function so calls lower as a module call; the runtime still
+        // exposes the class value through `constant` for identity checks.
+        kw(
+            "FunctionType",
+            1,
+            6,
+            Type::Any,
+            &[
+                "code",
+                "globals",
+                "name",
+                "argdefs",
+                "closure",
+                "kwdefaults",
+            ],
+        ),
+    ],
     constants: &[
         c("CodeType", Type::Any),
         c("FrameType", Type::Any),
-        c("FunctionType", Type::Any),
+        c("UnionType", Type::Any),
+        c("BuiltinFunctionType", Type::Any),
+        c("BuiltinMethodType", Type::Any),
+        c("LambdaType", Type::Any),
+        c("MethodType", Type::Any),
+        c("GeneratorType", Type::Any),
+        c("CoroutineType", Type::Any),
+        c("AsyncGeneratorType", Type::Any),
+        c("EllipsisType", Type::Any),
+        c("MethodWrapperType", Type::Any),
+        c("WrapperDescriptorType", Type::Any),
+        c("MethodDescriptorType", Type::Any),
+        c("ClassMethodDescriptorType", Type::Any),
+        c("GetSetDescriptorType", Type::Any),
+        c("MemberDescriptorType", Type::Any),
         c("GenericAlias", Type::Any),
         c("MappingProxyType", Type::Any),
         c("ModuleType", Type::Any),
@@ -1623,6 +1719,10 @@ pub static AST: ModuleSpec = ModuleSpec {
         kw_dynamic("Set", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("Dict", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("Slice", 0, usize::MAX, Type::Any, &[]),
+        // PEP 750 template nodes: `Interpolation(value, str, conversion,
+        // format_spec)` and the `TemplateStr` literal node.
+        kw_dynamic("Interpolation", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("TemplateStr", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("Starred", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("BinOp", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("UnaryOp", 0, usize::MAX, Type::Any, &[]),
@@ -1680,6 +1780,8 @@ pub static AST: ModuleSpec = ModuleSpec {
         c("excepthandler", Type::Any),
         c("arguments", Type::Any),
         c("alias", Type::Any),
+        c("Interpolation", Type::Any),
+        c("TemplateStr", Type::Any),
         c("Add", Type::Any),
         c("Sub", Type::Any),
         c("Mult", Type::Any),
@@ -1794,10 +1896,39 @@ pub static _IMP: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
-/// `_opcode`: only the two truthful specialization flags exist.
+/// `_opcode`: truthful introspection for a bytecode-less runtime.
+///
+/// The predicates answer `False` for every opcode (this runtime has none) and
+/// the operations that would need CPython bytecode (`stack_effect`,
+/// `get_executor`, `get_specialization_stats`) raise `NotImplementedError`.
+/// The intrinsic/specialization metadata helpers return empty collections.
+/// `opmap`/`opname` are not part of `_opcode` (CPython 3.14 keeps them in
+/// `_opcode_metadata`).
 pub static _OPCODE: ModuleSpec = ModuleSpec {
     name: "_opcode",
-    functions: &[],
+    functions: &[
+        kw(
+            "stack_effect",
+            1,
+            3,
+            Type::Int,
+            &["opcode", "oparg", "jump"],
+        ),
+        f("has_arg", 1, 1, Type::Bool),
+        f("has_const", 1, 1, Type::Bool),
+        f("has_name", 1, 1, Type::Bool),
+        f("has_jump", 1, 1, Type::Bool),
+        f("has_free", 1, 1, Type::Bool),
+        f("has_local", 1, 1, Type::Bool),
+        f("has_exc", 1, 1, Type::Bool),
+        f("is_valid", 1, 1, Type::Bool),
+        f("get_executor", 2, 2, Type::Any),
+        f("get_specialization_stats", 0, 0, Type::Dict),
+        f("get_intrinsic1_descs", 0, 0, Type::List),
+        f("get_intrinsic2_descs", 0, 0, Type::List),
+        f("get_special_method_names", 0, 0, Type::Dict),
+        f("get_nb_ops", 0, 0, Type::List),
+    ],
     constants: &[
         c("ENABLE_SPECIALIZATION", Type::Int),
         c("ENABLE_SPECIALIZATION_FT", Type::Int),
@@ -2075,6 +2206,521 @@ pub static SITE: ModuleSpec = ModuleSpec {
     ],
 };
 
+/// Shared function table of `_contextvars` and `contextvars`.
+///
+/// `ContextVar` is declared as a function even though CPython exposes a type:
+/// Hydro's native class constructor path only binds declared *module*
+/// parameters, so a class value would reject `ContextVar(name, default=...)`.
+/// The value returned by the constructor is an instance of the real native
+/// `ContextVar` class, which carries `get`/`set`/`reset`. `Context` and
+/// `Token` stay class constants so they work as `isinstance` targets and can
+/// be constructed with the class protocol.
+///
+/// The `_contextvars_*` entries are the native method bodies installed on those
+/// classes. They are never imported by name; they exist because
+/// `FunctionBody::Native` calls are validated against this table.
+const CONTEXTVARS_FUNCTIONS: &[FunctionSpec] = &[
+    kw("ContextVar", 1, 2, Type::Any, &["name", "default"]),
+    f("copy_context", 0, 0, Type::Any),
+    f("_contextvars_var_get", 1, 1, Type::Any),
+    f("_contextvars_var_set", 2, 2, Type::Any),
+    f("_contextvars_var_reset", 2, 2, Type::None),
+    f("_contextvars_var_repr", 1, 1, Type::Str),
+    f("_contextvars_token_init", 1, usize::MAX, Type::None),
+    f("_contextvars_token_repr", 1, 1, Type::Str),
+    f("_contextvars_ctx_init", 1, usize::MAX, Type::None),
+    f("_contextvars_ctx_run", 2, usize::MAX, Type::Any),
+    f("_contextvars_ctx_copy", 1, 1, Type::Any),
+    f("_contextvars_ctx_get", 2, 3, Type::Any),
+    f("_contextvars_ctx_getitem", 2, 2, Type::Any),
+    f("_contextvars_ctx_setitem", 3, 3, Type::None),
+    f("_contextvars_ctx_delitem", 2, 2, Type::None),
+    f("_contextvars_ctx_contains", 2, 2, Type::Bool),
+    f("_contextvars_ctx_len", 1, 1, Type::Int),
+    f("_contextvars_ctx_keys", 1, 1, Type::List),
+    f("_contextvars_ctx_values", 1, 1, Type::List),
+    f("_contextvars_ctx_items", 1, 1, Type::List),
+    f("_contextvars_ctx_repr", 1, 1, Type::Str),
+    f("_contextvars_missing_repr", 1, 1, Type::Str),
+];
+
+const CONTEXTVARS_CONSTANTS: &[ConstantSpec] = &[c("Context", Type::Any), c("Token", Type::Any)];
+
+/// `_contextvars`: the native context-variable implementation. The pure
+/// `contextvars` module in CPython is only a re-export of this module, so an
+/// explicit `contextvars` table keeps both import spellings native.
+pub static _CONTEXTVARS: ModuleSpec = ModuleSpec {
+    name: "_contextvars",
+    functions: CONTEXTVARS_FUNCTIONS,
+    constants: CONTEXTVARS_CONSTANTS,
+};
+
+/// `contextvars`: `Context`, `ContextVar`, `Token` and `copy_context`.
+pub static CONTEXTVARS: ModuleSpec = ModuleSpec {
+    name: "contextvars",
+    functions: CONTEXTVARS_FUNCTIONS,
+    constants: CONTEXTVARS_CONSTANTS,
+};
+
+/// `ctypes` / `_ctypes`: arena-backed C data types, structures, pointers and
+/// dynamic libraries. Every `_cdata_*`, `_cdll_*` and `_loader_*` entry is a
+/// native method body reachable through the class values; they are declared
+/// here because native calls are validated against this table.
+const CTYPES_FUNCTIONS: &[FunctionSpec] = &[
+    f("sizeof", 1, 1, Type::Int),
+    f("alignment", 1, 1, Type::Int),
+    f("offsetof", 2, 2, Type::Int),
+    f("POINTER", 1, 1, Type::Any),
+    f("pointer", 1, 1, Type::Any),
+    f("byref", 1, 1, Type::Any),
+    f("cast", 2, 2, Type::Any),
+    f("addressof", 1, 1, Type::Int),
+    f("string_at", 1, 2, Type::Bytes),
+    f("wstring_at", 1, 2, Type::Str),
+    f("memmove", 3, 3, Type::None),
+    f("memset", 3, 3, Type::None),
+    f("resize", 2, 2, Type::None),
+    f("create_string_buffer", 1, 2, Type::Any),
+    f("create_unicode_buffer", 1, 2, Type::Any),
+    f("CFUNCTYPE", 1, usize::MAX, Type::Any),
+    f("WINFUNCTYPE", 1, usize::MAX, Type::Any),
+    f("PYFUNCTYPE", 1, usize::MAX, Type::Any),
+    f("get_last_error", 0, 0, Type::Int),
+    f("set_last_error", 1, 1, Type::None),
+    f("_cdata_init", 1, usize::MAX, Type::Any),
+    f("_cdata_get_value", 1, 1, Type::Any),
+    f("_cdata_set_value", 2, 2, Type::None),
+    f("_cdata_get_contents", 1, 1, Type::Any),
+    f("_cdata_get_raw", 1, 1, Type::Bytes),
+    f("_cdata_set_raw", 2, 2, Type::None),
+    f("_cdata_len", 1, 1, Type::Int),
+    f("_cdata_getitem", 2, 2, Type::Any),
+    f("_cdata_setitem", 3, 3, Type::None),
+    f("_cdata_str", 1, 1, Type::Str),
+    f("_cdata_repr", 1, 1, Type::Str),
+    f("_cdata_call", 1, usize::MAX, Type::Any),
+    f("_cdata_add", 2, 2, Type::Any),
+    f("_cdata_radd", 2, 2, Type::Any),
+    f("_cdll_init", 1, 6, Type::None),
+    f("_cdll_getitem", 2, 2, Type::Any),
+    f("_loader_init", 1, 2, Type::None),
+    f("_loader_load", 2, 2, Type::Any),
+    f("_loader_getitem", 2, 2, Type::Any),
+];
+
+const CTYPES_CONSTANTS: &[ConstantSpec] = &[
+    c("_CData", Type::Any),
+    c("_SimpleCData", Type::Any),
+    c("_Pointer", Type::Any),
+    c("Array", Type::Any),
+    c("Structure", Type::Any),
+    c("Union", Type::Any),
+    c("CFuncPtr", Type::Any),
+    c("_CFuncPtr", Type::Any),
+    c("CDLL", Type::Any),
+    c("PyDLL", Type::Any),
+    c("LibraryLoader", Type::Any),
+    c("ArgumentError", Type::Any),
+    c("c_bool", Type::Any),
+    c("c_byte", Type::Any),
+    c("c_int8", Type::Any),
+    c("c_ubyte", Type::Any),
+    c("c_uint8", Type::Any),
+    c("c_char", Type::Any),
+    c("c_wchar", Type::Any),
+    c("c_short", Type::Any),
+    c("c_int16", Type::Any),
+    c("c_ushort", Type::Any),
+    c("c_uint16", Type::Any),
+    c("c_int", Type::Any),
+    c("c_int32", Type::Any),
+    c("c_uint", Type::Any),
+    c("c_uint32", Type::Any),
+    c("c_long", Type::Any),
+    c("c_int64", Type::Any),
+    c("c_ssize_t", Type::Any),
+    c("c_ptrdiff_t", Type::Any),
+    c("c_ulong", Type::Any),
+    c("c_uint64", Type::Any),
+    c("c_size_t", Type::Any),
+    c("c_longlong", Type::Any),
+    c("c_ulonglong", Type::Any),
+    c("c_intp", Type::Any),
+    c("c_float", Type::Any),
+    c("c_double", Type::Any),
+    c("c_longdouble", Type::Any),
+    c("c_void_p", Type::Any),
+    c("c_char_p", Type::Any),
+    c("c_wchar_p", Type::Any),
+    c("cdll", Type::Any),
+    c("RTLD_LOCAL", Type::Int),
+    c("RTLD_GLOBAL", Type::Int),
+    c("DEFAULT_MODE", Type::Int),
+    c("FUNCFLAG_CDECL", Type::Int),
+    c("FUNCFLAG_PYTHONAPI", Type::Int),
+    c("FUNCFLAG_USE_ERRNO", Type::Int),
+    c("FUNCFLAG_USE_LASTERROR", Type::Int),
+    c("SIZEOF_TIME_T", Type::Int),
+    c("__version__", Type::Str),
+];
+
+pub static CTYPES: ModuleSpec = ModuleSpec {
+    name: "ctypes",
+    functions: CTYPES_FUNCTIONS,
+    constants: CTYPES_CONSTANTS,
+};
+
+pub static _CTYPES: ModuleSpec = ModuleSpec {
+    name: "_ctypes",
+    functions: CTYPES_FUNCTIONS,
+    constants: CTYPES_CONSTANTS,
+};
+
+/// `locale`: libc-backed locale queries plus the `LC_*` categories.
+pub static LOCALE: ModuleSpec = ModuleSpec {
+    name: "locale",
+    functions: &[
+        f("setlocale", 1, 2, Type::Str),
+        f("getlocale", 0, 1, Type::Tuple),
+        f("getpreferredencoding", 0, 1, Type::Str),
+        f("getencoding", 0, 0, Type::Str),
+        f("normalize", 1, 1, Type::Str),
+        f("strcoll", 2, 2, Type::Int),
+        f("strxfrm", 1, 1, Type::Str),
+        f("bindtextdomain", 1, 2, Type::Any),
+        f("textdomain", 0, 1, Type::Any),
+        f("gettext", 1, 1, Type::Str),
+        f("dgettext", 2, 2, Type::Str),
+        f("dcgettext", 2, 3, Type::Str),
+        f("_gettext", 1, 1, Type::Str),
+        f("_dgettext", 2, 2, Type::Str),
+        f("_dcgettext", 2, 3, Type::Str),
+    ],
+    constants: &[
+        c("LC_CTYPE", Type::Int),
+        c("LC_NUMERIC", Type::Int),
+        c("LC_TIME", Type::Int),
+        c("LC_COLLATE", Type::Int),
+        c("LC_MONETARY", Type::Int),
+        c("LC_MESSAGES", Type::Int),
+        c("LC_ALL", Type::Int),
+        c("Error", Type::Any),
+    ],
+};
+
+/// `sysconfig`: build-time variables and installation paths.
+pub static SYSCONFIG: ModuleSpec = ModuleSpec {
+    name: "sysconfig",
+    functions: &[
+        f("get_config_var", 1, 1, Type::Any),
+        f("_get_config_var", 1, 1, Type::Any),
+        f("get_config_vars", 0, usize::MAX, Type::Dict),
+        f("_get_config_vars", 0, usize::MAX, Type::Dict),
+        f("get_paths", 0, 3, Type::Dict),
+        f("_get_paths", 0, 3, Type::Dict),
+        f("get_path", 1, 4, Type::Str),
+        f("_get_path", 1, 4, Type::Str),
+        f("get_python_version", 0, 0, Type::Str),
+        f("get_platform", 0, 0, Type::Str),
+        f("get_scheme_names", 0, 0, Type::Tuple),
+        f("get_default_scheme", 0, 0, Type::Str),
+        f("get_preferred_scheme", 1, 1, Type::Str),
+        f("is_python_build", 0, 0, Type::Bool),
+    ],
+    constants: &[
+        c("PREFIX", Type::Str),
+        c("EXEC_PREFIX", Type::Str),
+        c("BASE_PREFIX", Type::Str),
+        c("BASE_EXEC_PREFIX", Type::Str),
+        c("installed_base", Type::Str),
+        c("installed_platbase", Type::Str),
+        c("platbase", Type::Str),
+        c("prefix", Type::Str),
+        c("exec_prefix", Type::Str),
+        c("py_version", Type::Str),
+        c("py_version_short", Type::Str),
+        c("py_version_nodot", Type::Str),
+        c("abiflags", Type::Str),
+        c("platform", Type::Str),
+    ],
+};
+
+/// `zoneinfo`: system tzdata-backed `ZoneInfo`.
+pub static ZONEINFO: ModuleSpec = ModuleSpec {
+    name: "zoneinfo",
+    functions: &[
+        f("available_timezones", 0, 0, Type::Set),
+        f("reset_tzpath", 0, 1, Type::None),
+        f("_zoneinfo_init", 1, 3, Type::None),
+        f("_zoneinfo_get_key", 1, 1, Type::Any),
+        f("_zoneinfo_utcoffset", 2, 2, Type::Any),
+        f("_zoneinfo_dst", 2, 2, Type::Any),
+        f("_zoneinfo_tzname", 2, 2, Type::Any),
+        f("_zoneinfo_fromutc", 2, 2, Type::Any),
+        f("_zoneinfo_str", 1, 1, Type::Str),
+        f("_zoneinfo_repr", 1, 1, Type::Str),
+    ],
+    constants: &[
+        c("ZoneInfo", Type::Any),
+        c("ZoneInfoNotFoundError", Type::Any),
+        c("TZPATH", Type::Tuple),
+    ],
+};
+
+/// Shared function/constant tables of `_decimal` and `decimal`.
+const DECIMAL_FUNCTIONS: &[FunctionSpec] = &[
+    f("_decimal_init", 1, 2, Type::None),
+    f("_decimal_str", 1, 1, Type::Str),
+    f("_decimal_repr", 1, 1, Type::Str),
+    f("_decimal_as_tuple", 1, 1, Type::Tuple),
+    f("_decimal_eq", 2, 2, Type::Bool),
+    f("_decimal_ne", 2, 2, Type::Bool),
+    f("_decimal_lt", 2, 2, Type::Bool),
+    f("_decimal_le", 2, 2, Type::Bool),
+    f("_decimal_gt", 2, 2, Type::Bool),
+    f("_decimal_ge", 2, 2, Type::Bool),
+    f("_decimal_add", 2, 2, Type::Any),
+    f("_decimal_radd", 2, 2, Type::Any),
+    f("_decimal_subtract", 2, 2, Type::Any),
+    f("_decimal_multiply", 2, 2, Type::Any),
+    f("_decimal_divide", 2, 2, Type::Any),
+    f("_decimal_neg", 1, 1, Type::Any),
+    f("_decimal_pos", 1, 1, Type::Any),
+    f("_decimal_abs", 1, 1, Type::Any),
+    f("_decimal_quantize", 2, 2, Type::Any),
+    f("_decimal_compare", 2, 2, Type::Any),
+    f("_decimal_copy_abs", 1, 1, Type::Any),
+    f("_decimal_copy_negate", 1, 1, Type::Any),
+    f("_decimal_copy_sign", 2, 2, Type::Any),
+    f("_decimal_adjusted", 1, 1, Type::Int),
+    f("_decimal_is_nan", 1, 1, Type::Bool),
+    f("_decimal_is_qnan", 1, 1, Type::Bool),
+    f("_decimal_is_snan", 1, 1, Type::Bool),
+    f("_decimal_is_finite", 1, 1, Type::Bool),
+    f("_decimal_is_infinite", 1, 1, Type::Bool),
+    f("_decimal_is_zero", 1, 1, Type::Bool),
+    f("_decimal_is_signed", 1, 1, Type::Bool),
+    f("_decimal_to_integral_value", 1, 1, Type::Any),
+    f("getcontext", 0, 0, Type::Any),
+    f("setcontext", 1, 1, Type::None),
+    f("localcontext", 0, 1, Type::Any),
+    f("_context_init", 1, 9, Type::None),
+    f("_context_enter", 1, 1, Type::Any),
+    f("_context_exit", 1, 4, Type::None),
+    f("_context_copy", 1, 1, Type::Any),
+    f("_localcontext_init", 1, 2, Type::None),
+];
+
+const DECIMAL_CONSTANTS: &[ConstantSpec] = &[
+    c("Decimal", Type::Any),
+    c("Context", Type::Any),
+    c("DefaultContext", Type::Any),
+    c("DecimalException", Type::Any),
+    c("InvalidOperation", Type::Any),
+    c("DivisionByZero", Type::Any),
+    c("Overflow", Type::Any),
+    c("Underflow", Type::Any),
+    c("Inexact", Type::Any),
+    c("Rounded", Type::Any),
+    c("Subnormal", Type::Any),
+    c("Clamped", Type::Any),
+    c("ConversionSyntax", Type::Any),
+    c("ROUND_CEILING", Type::Str),
+    c("ROUND_DOWN", Type::Str),
+    c("ROUND_FLOOR", Type::Str),
+    c("ROUND_HALF_DOWN", Type::Str),
+    c("ROUND_HALF_EVEN", Type::Str),
+    c("ROUND_HALF_UP", Type::Str),
+    c("ROUND_UP", Type::Str),
+    c("ROUND_05UP", Type::Str),
+    c("__libmpdec_version__", Type::Str),
+    c("MAX_PREC", Type::Int),
+    c("MAX_EMAX", Type::Int),
+    c("MIN_EMIN", Type::Int),
+    c("MIN_ETINY", Type::Int),
+];
+
+pub static DECIMAL: ModuleSpec = ModuleSpec {
+    name: "decimal",
+    functions: DECIMAL_FUNCTIONS,
+    constants: DECIMAL_CONSTANTS,
+};
+
+pub static _DECIMAL: ModuleSpec = ModuleSpec {
+    name: "_decimal",
+    functions: DECIMAL_FUNCTIONS,
+    constants: DECIMAL_CONSTANTS,
+};
+
+/// Shared function table of `_struct` and `struct`.
+pub static _STRUCT_FUNCTIONS: &[FunctionSpec] = &[
+    f("calcsize", 1, 1, Type::Int),
+    f("pack", 1, usize::MAX, Type::Bytes),
+    f("pack_into", 3, usize::MAX, Type::None),
+    f("unpack", 2, 2, Type::Tuple),
+    f("unpack_from", 2, 3, Type::Tuple),
+    f("iter_unpack", 2, 2, Type::Any),
+    f("_clearcache", 0, 0, Type::None),
+    f("Struct", 1, 1, Type::Any),
+];
+
+pub static _STRUCT: ModuleSpec = ModuleSpec {
+    name: "_struct",
+    functions: _STRUCT_FUNCTIONS,
+    constants: &[c("error", Type::Any)],
+};
+
+pub static STRUCT: ModuleSpec = ModuleSpec {
+    name: "struct",
+    functions: _STRUCT_FUNCTIONS,
+    constants: &[c("error", Type::Any)],
+};
+
+/// `unicodedata`: Unicode 16.0.0 character database and normalization.
+pub static UNICODEDATA: ModuleSpec = ModuleSpec {
+    name: "unicodedata",
+    functions: &[
+        f("category", 1, 1, Type::Str),
+        f("combining", 1, 1, Type::Int),
+        f("east_asian_width", 1, 1, Type::Str),
+        f("bidirectional", 1, 1, Type::Str),
+        f("decomposition", 1, 1, Type::Str),
+        f("normalize", 2, 2, Type::Str),
+        f("is_normalized", 2, 2, Type::Bool),
+        f("name", 1, 2, Type::Str),
+        f("lookup", 1, 1, Type::Str),
+        f("numeric", 1, 2, Type::Float),
+        f("digit", 1, 2, Type::Int),
+        f("decimal", 1, 2, Type::Int),
+    ],
+    constants: &[c("unidata_version", Type::Str)],
+};
+
+/// `zlib`: real zlib-format compression through the system `libz`.
+///
+/// The public functions and constants mirror CPython 3.14. The `_zlib_*`
+/// entries are the native method bodies of the `Compress`/`Decompress`
+/// classes; they are internal hooks, validated through this table like every
+/// other native callable.
+pub static ZLIB: ModuleSpec = ModuleSpec {
+    name: "zlib",
+    functions: &[
+        kw("compress", 1, 3, Type::Bytes, &["data", "level", "wbits"]),
+        kw(
+            "decompress",
+            1,
+            3,
+            Type::Bytes,
+            &["data", "wbits", "bufsize"],
+        ),
+        kw("crc32", 1, 2, Type::Int, &["data", "value"]),
+        kw("adler32", 1, 2, Type::Int, &["data", "value"]),
+        kw(
+            "compressobj",
+            0,
+            5,
+            Type::Any,
+            &["level", "method", "wbits", "memLevel", "strategy"],
+        ),
+        kw("decompressobj", 0, 2, Type::Any, &["wbits", "zdict"]),
+        // `Compress` / `Decompress` native method bodies.
+        f("_zlib_compress", 2, 2, Type::Bytes),
+        f("_zlib_flush", 1, 2, Type::Bytes),
+        f("_zlib_copy", 1, 1, Type::Any),
+        f("_zlib_decompress", 2, 3, Type::Bytes),
+        f("_zlib_decompress_flush", 1, 2, Type::Bytes),
+        f("_zlib_decompress_copy", 1, 1, Type::Any),
+    ],
+    constants: &[
+        c("error", Type::Any),
+        c("Z_NO_COMPRESSION", Type::Int),
+        c("Z_BEST_SPEED", Type::Int),
+        c("Z_BEST_COMPRESSION", Type::Int),
+        c("Z_DEFAULT_COMPRESSION", Type::Int),
+        c("DEFLATED", Type::Int),
+        c("DEF_MEM_LEVEL", Type::Int),
+        c("MAX_WBITS", Type::Int),
+        c("Z_DEFAULT_STRATEGY", Type::Int),
+        c("Z_FILTERED", Type::Int),
+        c("Z_HUFFMAN_ONLY", Type::Int),
+        c("Z_RLE", Type::Int),
+        c("Z_FIXED", Type::Int),
+        c("Z_NO_FLUSH", Type::Int),
+        c("Z_PARTIAL_FLUSH", Type::Int),
+        c("Z_SYNC_FLUSH", Type::Int),
+        c("Z_FULL_FLUSH", Type::Int),
+        c("Z_FINISH", Type::Int),
+        c("Z_BLOCK", Type::Int),
+        c("Z_TREES", Type::Int),
+        c("Z_OK", Type::Int),
+        c("Z_STREAM_END", Type::Int),
+        c("Z_NEED_DICT", Type::Int),
+        c("Z_ERRNO", Type::Int),
+        c("Z_STREAM_ERROR", Type::Int),
+        c("Z_DATA_ERROR", Type::Int),
+        c("Z_MEM_ERROR", Type::Int),
+        c("Z_BUF_ERROR", Type::Int),
+        c("Z_VERSION_ERROR", Type::Int),
+        c("ZLIB_VERSION", Type::Str),
+        c("ZLIB_RUNTIME_VERSION", Type::Str),
+    ],
+};
+
+/// `mmap`: real memory-mapped files through the platform `mmap`.
+///
+/// The `_mmap_*` entries are the native method bodies of the `mmap.mmap`
+/// class (arity includes `self`); they are internal hooks, validated through
+/// this table like every other native callable.
+pub static MMAP: ModuleSpec = ModuleSpec {
+    name: "mmap",
+    functions: &[
+        kw(
+            "mmap",
+            2,
+            7,
+            Type::Any,
+            &[
+                "fileno", "length", "flags", "prot", "access", "offset", "trackfd",
+            ],
+        ),
+        f("_mmap_init", 3, 8, Type::None),
+        f("_mmap_close", 1, 1, Type::None),
+        f("_mmap_read", 1, 2, Type::Bytes),
+        f("_mmap_read_byte", 1, 1, Type::Int),
+        f("_mmap_readline", 1, 1, Type::Bytes),
+        f("_mmap_write", 2, 2, Type::Int),
+        f("_mmap_write_byte", 2, 2, Type::None),
+        f("_mmap_seek", 2, 3, Type::Int),
+        f("_mmap_seekable", 1, 1, Type::Bool),
+        f("_mmap_tell", 1, 1, Type::Int),
+        f("_mmap_size", 1, 1, Type::Int),
+        f("_mmap_flush", 1, 3, Type::None),
+        f("_mmap_resize", 2, 2, Type::None),
+        f("_mmap_move", 4, 4, Type::None),
+        f("_mmap_find", 2, 4, Type::Int),
+        f("_mmap_rfind", 2, 4, Type::Int),
+        f("_mmap_getitem", 2, 2, Type::Any),
+        f("_mmap_setitem", 3, 3, Type::None),
+        f("_mmap_len", 1, 1, Type::Int),
+        f("_mmap_enter", 1, 1, Type::Any),
+        f("_mmap_exit", 1, 4, Type::None),
+        f("_mmap_repr", 1, 1, Type::Str),
+    ],
+    constants: &[
+        c("ACCESS_DEFAULT", Type::Int),
+        c("ACCESS_READ", Type::Int),
+        c("ACCESS_WRITE", Type::Int),
+        c("ACCESS_COPY", Type::Int),
+        c("ALLOCATIONGRANULARITY", Type::Int),
+        c("PAGESIZE", Type::Int),
+        c("MAP_SHARED", Type::Int),
+        c("MAP_PRIVATE", Type::Int),
+        c("MAP_ANONYMOUS", Type::Int),
+        c("PROT_READ", Type::Int),
+        c("PROT_WRITE", Type::Int),
+    ],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2217,11 +2863,120 @@ mod tests {
     #[test]
     fn abc_and_enum_surfaces_are_registered() {
         assert_eq!(constant("abc", "ABC").unwrap().ty, Type::Any);
+        assert_eq!(constant("abc", "ABCMeta").unwrap().ty, Type::Any);
         assert_eq!(function("abc", "abstractmethod").unwrap().max_args, 1);
+        assert_eq!(function("abc", "get_cache_token").unwrap().ret, Type::Int);
+        for name in [
+            "abstractclassmethod",
+            "abstractstaticmethod",
+            "abstractproperty",
+        ] {
+            assert_eq!(function("abc", name).unwrap().max_args, 1, "{name}");
+        }
         assert_eq!(constant("enum", "Enum").unwrap().ty, Type::Any);
         assert_eq!(constant("enum", "IntEnum").unwrap().ty, Type::Any);
         let auto = function("enum", "auto").unwrap();
         assert_eq!((auto.min_args, auto.max_args), (0, 0));
+    }
+
+    #[test]
+    fn opcode_surface_is_truthful_for_a_bytecode_less_runtime() {
+        // The predicates exist and answer `False` at runtime; the operations
+        // that need CPython bytecode exist and raise `NotImplementedError`.
+        for name in [
+            "has_arg",
+            "has_const",
+            "has_name",
+            "has_jump",
+            "has_free",
+            "has_local",
+            "has_exc",
+            "is_valid",
+        ] {
+            let spec = function("_opcode", name).unwrap();
+            assert_eq!((spec.min_args, spec.max_args), (1, 1), "{name}");
+            assert_eq!(spec.ret, Type::Bool, "{name}");
+        }
+        assert_eq!(function("_opcode", "stack_effect").unwrap().max_args, 3);
+        assert_eq!(function("_opcode", "get_executor").unwrap().min_args, 2);
+        assert_eq!(
+            function("_opcode", "get_intrinsic1_descs").unwrap().ret,
+            Type::List
+        );
+        assert_eq!(
+            function("_opcode", "get_special_method_names").unwrap().ret,
+            Type::Dict
+        );
+        // `opmap`/`opname` are not `_opcode` members in CPython 3.14 either.
+        assert!(constant("_opcode", "opmap").is_none());
+        assert!(constant("_opcode", "opname").is_none());
+        assert_eq!(
+            constant("_opcode", "ENABLE_SPECIALIZATION").unwrap().ty,
+            Type::Int
+        );
+    }
+
+    #[test]
+    fn zlib_and_mmap_surfaces_are_registered() {
+        // Public zlib functions plus the internal `Compress`/`Decompress`
+        // method bodies that the runtime validates against this table.
+        for name in [
+            "compress",
+            "decompress",
+            "crc32",
+            "adler32",
+            "compressobj",
+            "decompressobj",
+            "_zlib_compress",
+            "_zlib_flush",
+            "_zlib_copy",
+            "_zlib_decompress",
+            "_zlib_decompress_flush",
+            "_zlib_decompress_copy",
+        ] {
+            assert!(function("zlib", name).is_some(), "zlib.{name}");
+        }
+        assert_eq!(function("zlib", "compress").unwrap().ret, Type::Bytes);
+        assert_eq!(function("zlib", "crc32").unwrap().ret, Type::Int);
+        assert_eq!(function("zlib", "compressobj").unwrap().min_args, 0);
+        for name in [
+            "error",
+            "Z_BEST_COMPRESSION",
+            "DEFLATED",
+            "Z_FINISH",
+            "Z_STREAM_ERROR",
+            "ZLIB_VERSION",
+        ] {
+            assert!(constant("zlib", name).is_some(), "zlib.{name}");
+        }
+
+        // `mmap.mmap` is both the constructor spec and the class hook; every
+        // `_mmap_*` body is an internal method entry.
+        assert_eq!(function("mmap", "mmap").unwrap().max_args, 7);
+        assert_eq!(function("mmap", "_mmap_init").unwrap().min_args, 3);
+        for name in [
+            "_mmap_close",
+            "_mmap_read",
+            "_mmap_write",
+            "_mmap_seek",
+            "_mmap_size",
+            "_mmap_getitem",
+            "_mmap_setitem",
+            "_mmap_repr",
+        ] {
+            assert!(function("mmap", name).is_some(), "mmap.{name}");
+        }
+        for name in [
+            "ACCESS_DEFAULT",
+            "ACCESS_READ",
+            "ACCESS_WRITE",
+            "ACCESS_COPY",
+            "PAGESIZE",
+            "MAP_SHARED",
+            "PROT_READ",
+        ] {
+            assert_eq!(constant("mmap", name).unwrap().ty, Type::Int, "{name}");
+        }
     }
 
     #[test]
@@ -2245,14 +3000,27 @@ mod tests {
             "FrameType",
             "ModuleType",
             "TracebackType",
-            "FunctionType",
             "CodeType",
             "GenericAlias",
             "MappingProxyType",
             "NoneType",
+            "UnionType",
         ] {
             assert_eq!(constant("types", name).unwrap().ty, Type::Any, "{name}");
         }
+        let function_type = function("types", "FunctionType").unwrap();
+        assert_eq!((function_type.min_args, function_type.max_args), (1, 6));
+        assert_eq!(
+            function_type.params,
+            &[
+                "code",
+                "globals",
+                "name",
+                "argdefs",
+                "closure",
+                "kwdefaults"
+            ][..]
+        );
         let namespace = function("types", "SimpleNamespace").unwrap();
         assert_eq!((namespace.min_args, namespace.max_args), (0, 1));
     }
@@ -2358,6 +3126,10 @@ mod tests {
             ("prefix", Type::Str),
             ("base_prefix", Type::Str),
             ("exec_prefix", Type::Str),
+            ("last_exc", Type::Any),
+            ("last_type", Type::Any),
+            ("last_value", Type::Any),
+            ("last_traceback", Type::Any),
         ] {
             assert_eq!(constant("sys", name).expect(name).ty, ty, "{name}");
         }
@@ -2370,15 +3142,23 @@ mod tests {
         for name in [
             "len",
             "print",
-            "object",
             "setattr",
             "compile",
             "__import__",
             "classmethod",
             "staticmethod",
             "property",
+            "super",
+            "hex",
+            "bin",
+            "oct",
         ] {
             assert!(function("builtins", name).is_some(), "{name}");
+        }
+        for name in ["hex", "bin", "oct"] {
+            let conversion = function("builtins", name).expect(name);
+            assert_eq!((conversion.min_args, conversion.max_args), (1, 1));
+            assert_eq!(conversion.ret, Type::Str);
         }
         let classmethod = function("builtins", "classmethod").unwrap();
         assert_eq!((classmethod.min_args, classmethod.max_args), (1, 1));
@@ -2397,6 +3177,7 @@ mod tests {
             "Ellipsis",
             "NotImplemented",
             "__debug__",
+            "object",
         ] {
             assert!(constant("builtins", name).is_some(), "{name}");
         }

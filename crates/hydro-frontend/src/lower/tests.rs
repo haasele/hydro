@@ -424,6 +424,99 @@ fn module_level_try_import_binds_a_preloaded_submodule() {
 }
 
 #[test]
+fn module_level_conditional_imports_bind_top_level_and_defer_absent_modules() {
+    // NumPy imports its `_core` package inside `if __NUMPY_SETUP__: ... else:`
+    // and binds its public surface from that branch. Those statements execute
+    // while the module initializes, so their bindings are module-level (not
+    // function-local deferred stubs); a branch-specific module that does not
+    // exist on this host stays a runtime import error instead of a compile
+    // error.
+    let source = "STATE = False\nif STATE:\n    from . import absent\nelse:\n    from . import core\n    from .core import value\n\ndef f():\n    return value()\n\ndef g():\n    return absent\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "pkg/__init__.py", &mut infer);
+    lowerer.set_dunder_name("pkg");
+    lowerer.set_package("pkg");
+    lowerer.set_mirror_all_globals(true);
+    lowerer.set_deferred_imports(std::collections::HashSet::from(["pkg.absent".to_string()]));
+    lowerer.set_user_modules(HashMap::from([(
+        "pkg.core".to_string(),
+        UserModule {
+            name: "pkg.core".to_string(),
+            exports: HashMap::from([("value".to_string(), UserExport::Function(9))]),
+            all: None,
+        },
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    // `core` is a module attribute of the package, bound by the `else` body.
+    // Import statements sit inside the lowered `if`/`else` block, not at the
+    // top level of the module body.
+    fn binds_global(stmts: &[HStmt], expected: &str) -> bool {
+        stmts.iter().any(|stmt| match &stmt.kind {
+            HStmtKind::GlobalSet { name, .. } => name == expected,
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => binds_global(then_body, expected) || binds_global(else_body, expected),
+            _ => false,
+        })
+    }
+    assert!(
+        binds_global(&hir.functions[0].body, "core"),
+        "the else branch must mirror the imported module: {:?}",
+        hir.functions[0].body
+    );
+
+    // The member import from the same branch links to `core.value` directly.
+    // A linked user function with the generic call path lowers to `CallKw`
+    // (empty args/keywords here); both shapes must target the linked id.
+    let body = function_body(&hir, "f");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    let linked = match &value.kind {
+        HExprKind::Call {
+            callee: Callee::Function(9),
+            ..
+        } => true,
+        HExprKind::CallKw {
+            callee,
+            args,
+            keywords,
+        } => {
+            args.is_empty()
+                && keywords.is_empty()
+                && matches!(&callee.kind, HExprKind::FunctionRef(9))
+        }
+        _ => false,
+    };
+    assert!(
+        linked,
+        "expected the linked core.value call, got {:?}",
+        value.kind
+    );
+
+    // The absent platform module is a late import error, not a compile error.
+    let body = function_body(&hir, "g");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(
+        matches!(
+            &value.kind,
+            HExprKind::DeferredImport { module, member }
+                if module == "pkg" && member.as_deref() == Some("absent")
+        ),
+        "expected a deferred import, got {:?}",
+        value.kind
+    );
+}
+
+#[test]
 fn imports_inside_blocks_bind_names() {
     let source = "if True:\n    from math import sqrt\n\nx = sqrt(4)\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
@@ -1665,14 +1758,21 @@ fn fstring_conversion_with_spec_keeps_both() {
 }
 
 #[test]
-fn fstring_dynamic_format_spec_is_rejected() {
-    let source = "n = 7\nw = 5\nprint(f'{n:{w}}')\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(
-        diags[0].message,
-        "dynamic f-string format specs are not supported"
+fn fstring_dynamic_format_spec_is_lowered_to_the_format_builtin() {
+    let source = "n = 7\nw = 5\nx = f'{n:>{w}}'\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let call = find_format_call(&hir).expect("format call");
+    // The spec is evaluated at runtime: a nested replacement field lowers to
+    // an HIR expression (here `'>' + str(w)`), never to a constant.
+    assert!(
+        !matches!(&call.1.kind, HExprKind::Const(_)),
+        "{:?}",
+        call.1.kind
     );
+    assert_eq!(call.1.ty, Ty::Concrete(Type::Str));
+    assert!(matches!(&call.2.kind, HExprKind::Const(Const::Int(0))));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 
 /// Finds the first `Builtin::Format` call and returns `(value, spec, flag)`.
@@ -6053,10 +6153,55 @@ a = ext.add(y=2)
 }
 
 #[test]
-fn extension_star_import_is_rejected() {
+fn extension_star_import_binds_all_names_and_falls_back() {
+    // A module-level star import of a compiled extension binds the importing
+    // unit's literal `__all__` names and leaves every other read as a lazy
+    // extension member lookup; nothing is rejected or silently dropped.
     let dir = ExtensionDir::new("star");
+    let so = dir.add_extension("mod_ext.abi3.so");
+    let expected = fs::canonicalize(&so).expect("canonical extension path");
+    let expected_path = expected.to_string_lossy().into_owned();
+    let source = r#"__all__ = ['array', 'add']
+from mod_ext import *
+
+x = array
+y = add(2, 3)
+z = helper
+"#;
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    match &assigned(&hir, "x").kind {
+        HExprKind::ExtensionAttr { path, member } => {
+            assert_eq!(
+                (path.as_str(), member.as_str()),
+                (expected_path.as_str(), "array")
+            );
+        }
+        other => panic!("expected an extension member read, got {other:?}"),
+    }
+    assert_eq!(
+        extension_callee(assigned(&hir, "y")),
+        (expected_path.as_str(), "add")
+    );
+    match &assigned(&hir, "z").kind {
+        HExprKind::ExtensionAttr { path, member } => {
+            assert_eq!(
+                (path.as_str(), member.as_str()),
+                (expected_path.as_str(), "helper")
+            );
+        }
+        other => panic!("expected the lazy fallback, got {other:?}"),
+    }
+}
+
+#[test]
+fn nested_extension_star_import_is_rejected() {
+    // Python only allows `import *` at module level; a function-local star
+    // import stays a diagnostic.
+    let dir = ExtensionDir::new("nested-star");
     dir.add_extension("mod_ext.abi3.so");
-    let source = "from mod_ext import *\n";
+    let source = "def f():\n    from mod_ext import *\n";
     let (_, _, diags) = lower_source_in(&dir.path, source);
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, codes::UNSUPPORTED);

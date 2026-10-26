@@ -145,6 +145,14 @@ pub(crate) fn binop(op: u32, a: i64, b: i64) -> i64 {
     if op == OP_DIV && value::as_path(a).is_some() {
         return path_join_op(a, b);
     }
+    // PEP 604 type unions: `A | B` for class values, `None` and existing
+    // union values (`types.UnionType`). Non-type operands fall through to the
+    // native bitwise path and report its usual `TypeError`.
+    if op == OP_BIT_OR {
+        if let Some(result) = crate::modules::types::union_binary_or(a, b) {
+            return result;
+        }
+    }
     // Set operators over sets and live `dict` views (`dict_keys`/`dict_items`).
     if matches!(op, OP_BIT_AND | OP_BIT_OR | OP_BIT_XOR | OP_SUB)
         && container::is_set_like(a)

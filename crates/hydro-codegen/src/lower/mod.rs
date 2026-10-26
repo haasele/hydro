@@ -6829,10 +6829,57 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(result)
     }
 
+    /// Lower a direct call to `builtins.<name>(values...)` through the module
+    /// ABI, without materialising a per-call builtin function value.
+    ///
+    /// Used when the shared implementation lives in the `builtins` module
+    /// dispatch (`id`, `hex`, `bin`, `oct`) rather than in a dedicated runtime
+    /// entry point.
+    fn lower_builtins_direct(
+        &mut self,
+        function: &str,
+        values: &[Value],
+    ) -> Result<Value, CodegenError> {
+        let argc = values.len();
+        let argv_slot = self.stack_array_slot(argc, function)?;
+        for (index, value) in values.iter().enumerate() {
+            self.builder
+                .ins()
+                .stack_store(*value, argv_slot, (index * 8) as i32);
+        }
+        let (module_slot, module_len) = make_bytes_slot(&mut self.builder, b"builtins")?;
+        let module_ptr = self.builder.ins().stack_addr(self.ptr_ty, module_slot, 0);
+        let module_len = self.builder.ins().iconst(self.ptr_ty, module_len as i64);
+        let (function_slot, function_len) =
+            make_bytes_slot(&mut self.builder, function.as_bytes())?;
+        let function_ptr = self.builder.ins().stack_addr(self.ptr_ty, function_slot, 0);
+        let function_len = self.builder.ins().iconst(self.ptr_ty, function_len as i64);
+        let argc_value = self.builder.ins().iconst(self.ptr_ty, argc as i64);
+        let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
+        let scope = self.open_scope(argv, argc)?;
+        let id = self.runtime.module_call;
+        let result = self.call_rt(
+            id,
+            &[
+                module_ptr,
+                module_len,
+                function_ptr,
+                function_len,
+                argc_value,
+                argv,
+            ],
+        );
+        self.close_scope(scope);
+        let result = result?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
     fn lower_builtin(&mut self, builtin: Builtin, values: &[Value]) -> Result<Value, CodegenError> {
         match builtin {
             Builtin::Bool
             | Builtin::Type
+            | Builtin::Super
             | Builtin::Reversed
             | Builtin::Divmod
             | Builtin::Callable
@@ -6937,6 +6984,28 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.emit_exc_check()?;
                 Ok(result)
             }
+            Builtin::Hex | Builtin::Bin | Builtin::Oct => {
+                if values.len() != 1 {
+                    let name = builtin.name();
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin {name} expects exactly 1 argument, got {actual}"
+                    )));
+                }
+                self.lower_builtins_direct(builtin.name(), values)
+            }
+            Builtin::Ascii => {
+                if values.len() != 1 {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "builtin ascii expects exactly 1 argument, got {actual}"
+                    )));
+                }
+                // The runtime spelling lives in the `builtins` module dispatch
+                // (`builtins::call_builtin`), so the direct call uses the
+                // module ABI without materialising a function value.
+                self.lower_builtins_direct("ascii", values)
+            }
             Builtin::DictMerge => {
                 if values.len() != 2 {
                     let actual = values.len();
@@ -6959,13 +7028,15 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 self.lower_builtin_values(builtin, values)
             }
             Builtin::Format => {
-                // Three arguments are the internal f-string shape and are
-                // handled by `lower_format_call` before they reach this point;
+                // Three arguments are the internal f-string shape. A static
+                // spec (and conversion) is handled by `lower_format_call`
+                // before it reaches this point; a dynamic spec arrives here
+                // and is evaluated by the runtime `format` builtin. A
                 // source-level `format(value, spec)` takes exactly two.
-                if values.len() != 2 {
+                if !(2..=3).contains(&values.len()) {
                     let actual = values.len();
                     return Err(CodegenError::new(format!(
-                        "builtin format expects 2 arguments, got {actual}"
+                        "builtin format expects 2 or 3 arguments, got {actual}"
                     )));
                 }
                 self.lower_builtin_values(builtin, values)
@@ -6992,33 +7063,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         "builtin id expects exactly 1 argument, got {actual}"
                     )));
                 }
-                let argv_slot = self.stack_array_slot(1, "builtin id argument")?;
-                self.builder.ins().stack_store(values[0], argv_slot, 0);
-                let (module_slot, module_len) = make_bytes_slot(&mut self.builder, b"builtins")?;
-                let module_ptr = self.builder.ins().stack_addr(self.ptr_ty, module_slot, 0);
-                let module_len = self.builder.ins().iconst(self.ptr_ty, module_len as i64);
-                let (function_slot, function_len) = make_bytes_slot(&mut self.builder, b"id")?;
-                let function_ptr = self.builder.ins().stack_addr(self.ptr_ty, function_slot, 0);
-                let function_len = self.builder.ins().iconst(self.ptr_ty, function_len as i64);
-                let argc = self.builder.ins().iconst(self.ptr_ty, 1);
-                let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
-                let scope = self.open_scope(argv, 1)?;
-                let id = self.runtime.module_call;
-                let result = self.call_rt(
-                    id,
-                    &[
-                        module_ptr,
-                        module_len,
-                        function_ptr,
-                        function_len,
-                        argc,
-                        argv,
-                    ],
-                );
-                self.close_scope(scope);
-                let result = result?;
-                self.emit_exc_check()?;
-                Ok(result)
+                self.lower_builtins_direct("id", values)
             }
             Builtin::Isinstance => {
                 if values.len() != 2 {
@@ -7323,13 +7368,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     }
 }
 
-/// True when `Builtin::Format` arguments have the internal f-string shape.
+/// True when `Builtin::Format` arguments have the internal f-string shape
+/// with a static spec and conversion.
 ///
 /// An f-string field always passes three arguments `(value, spec,
-/// conversion)`; source-level `format(value, spec)` passes two and is lowered
-/// through the ordinary builtin path.
+/// conversion)`; source-level `format(value, spec)` passes two. A dynamic spec
+/// (`f"{x:{width}}"`) also passes three, but its second argument is a runtime
+/// expression, so it takes the ordinary builtin path, where the runtime
+/// evaluates the spec string.
 fn is_format_field(args: &[Expr]) -> bool {
     args.len() == 3
+        && matches!(&args[1].kind, ExprKind::Const(Const::Str(_)))
+        && matches!(&args[2].kind, ExprKind::Const(Const::Int(flag)) if (0..=3).contains(flag))
 }
 
 /// Materialize `bytes` in a stack slot and return the slot plus its length.
@@ -7670,23 +7720,35 @@ mod tests {
     }
 
     #[test]
-    fn fstring_format_field_requires_a_constant_spec() {
+    fn fstring_format_field_accepts_a_dynamic_spec() {
         let value = Expr::new(ExprKind::Const(Const::Int(42)), Type::Int, 1);
-        let spec = Expr::new(ExprKind::Local(0), Type::Str, 1);
+        // A runtime spec expression takes the ordinary `format` builtin path,
+        // where the runtime evaluates the spec string.
+        let spec = Expr::new(ExprKind::Const(Const::Str(">4".to_string())), Type::Str, 1);
+        let dynamic_spec = Expr::new(
+            ExprKind::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(spec),
+                rhs: Box::new(Expr::new(
+                    ExprKind::Const(Const::Str("d".to_string())),
+                    Type::Str,
+                    1,
+                )),
+            },
+            Type::Str,
+            1,
+        );
         let conversion = Expr::new(ExprKind::Const(Const::Int(0)), Type::Int, 1);
         let program = program_assigning(Expr::new(
             ExprKind::Call {
                 callee: Callee::Builtin(Builtin::Format),
-                args: vec![value, spec, conversion],
+                args: vec![value, dynamic_spec, conversion],
             },
             Type::Str,
             1,
         ));
-        let error = crate::compile_object(&program).expect_err("non-constant spec must fail");
-        assert!(
-            error.message.contains("constant string"),
-            "unexpected error: {error}"
-        );
+        let object = crate::compile_object(&program).expect("dynamic spec must lower");
+        assert!(!object.is_empty());
     }
 
     #[test]
@@ -9267,6 +9329,7 @@ mod tests {
             // The frontend appends the key and reverse slots.
             (Builtin::Sorted, vec![int(1), none(), none()]),
             (Builtin::All, vec![int(1)]),
+            (Builtin::Ascii, vec![text("x")]),
             (Builtin::Round, vec![int(1)]),
             (Builtin::Format, vec![int(1), text("d")]),
             (Builtin::Isinstance, vec![int(1), int_type()]),
@@ -9842,6 +9905,36 @@ mod tests {
             0,
             "the direct path must not materialise a builtin function value"
         );
+    }
+
+    #[test]
+    fn hex_bin_oct_builtins_call_their_builtins_module_entries() {
+        // The three base conversions share the `builtins` module dispatch, so
+        // the direct path calls `hydro_module_call` and never materialises a
+        // per-call builtin function value.
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        for builtin in [Builtin::Hex, Builtin::Bin, Builtin::Oct] {
+            let program = program_assigning(Expr::new(
+                ExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    args: vec![int(10)],
+                },
+                Type::Str,
+                1,
+            ));
+            let object = crate::compile_object(&program).expect("builtin must lower");
+            assert!(
+                runtime_call_sites(&object, "hydro_module_call") > 0,
+                "{} did not lower through the module ABI",
+                builtin.name()
+            );
+            assert_eq!(
+                runtime_call_sites(&object, "hydro_builtin_function"),
+                0,
+                "{} materialised a builtin function value on the direct path",
+                builtin.name()
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Builtin functions: `print`, `len`, `str`, `int`, `float`, `abs`, `range`,
-//! `list`, `dict`, `sum`, `enumerate`, `zip`, `ord`, `chr`, `divmod`,
-//! `callable` (ARCHITECTURE §3.2).
+//! `list`, `dict`, `sum`, `enumerate`, `zip`, `ord`, `chr`, `hex`, `bin`,
+//! `oct`, `divmod`, `callable` (ARCHITECTURE §3.2).
 
 use std::io::Write as _;
 
@@ -156,6 +156,32 @@ pub(crate) fn to_repr(v: i64) -> i64 {
     value::str_alloc(value::repr(v))
 }
 
+/// `ascii(v)`: `repr(v)` with every non-ASCII character escaped.
+///
+/// The escapes match CPython's `ascii()`: `\xNN` for code points up to
+/// `0xff`, `\uNNNN` up to `0xffff` and `\U000NNNNN` above.
+pub(crate) fn to_ascii(v: i64) -> i64 {
+    value::str_alloc(ascii_escape(&value::repr(v)))
+}
+
+/// Escapes the non-ASCII characters of an already rendered `repr` string.
+fn ascii_escape(repr: &str) -> String {
+    let mut out = String::with_capacity(repr.len() + 8);
+    for character in repr.chars() {
+        let code = character as u32;
+        if code < 0x80 {
+            out.push(character);
+        } else if code <= 0xff {
+            out.push_str(&format!("\\x{code:02x}"));
+        } else if code <= 0xffff {
+            out.push_str(&format!("\\u{code:04x}"));
+        } else {
+            out.push_str(&format!("\\U{code:08x}"));
+        }
+    }
+    out
+}
+
 /// `hash(v)`: the runtime's dict-key hash mapped into a non-negative tagged
 /// integer.
 ///
@@ -296,6 +322,46 @@ pub(crate) fn chr_value(v: i64) -> i64 {
         Some(ch) => value::str_alloc(ch.to_string()),
         None => exc::raise_with_message(VALUE_ERROR, "chr() arg cannot be a surrogate code point"),
     }
+}
+
+/// Shared implementation of `hex`, `bin` and `oct`: the `radix` spelling of
+/// `v` with `prefix` and a leading `-` for negative values.
+///
+/// Exact integers (tagged `int`, `bool` and heap `BigInt`) produce their full
+/// digit sequence; every other type raises the same `TypeError` CPython
+/// reports for a missing `__index__`.
+fn radix_literal(v: i64, radix: u32, prefix: &str) -> i64 {
+    let Some(number) = value::to_bigint(v) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name_of(v)
+            ),
+        );
+    };
+    let sign = if number.sign() == num_bigint::Sign::Minus {
+        "-"
+    } else {
+        ""
+    };
+    let digits = number.magnitude().to_str_radix(radix);
+    value::str_alloc(format!("{sign}{prefix}{digits}"))
+}
+
+/// `hex(v)`: `0x`-prefixed lowercase hexadecimal.
+pub(crate) fn hex_value(v: i64) -> i64 {
+    radix_literal(v, 16, "0x")
+}
+
+/// `bin(v)`: `0b`-prefixed binary.
+pub(crate) fn bin_value(v: i64) -> i64 {
+    radix_literal(v, 2, "0b")
+}
+
+/// `oct(v)`: `0o`-prefixed octal.
+pub(crate) fn oct_value(v: i64) -> i64 {
+    radix_literal(v, 8, "0o")
 }
 
 /// `int(v)`.
@@ -1061,6 +1127,16 @@ fn list_buffer(argc: usize, argv: *const i64) -> &'static [i64] {
 /// each row is collected in a registered list before the tuple is allocated,
 /// so freshly created string elements stay reachable across collections.
 pub(crate) fn zip(argc: usize, argv: *const i64) -> i64 {
+    zip_strict(argc, argv, false)
+}
+
+/// `zip(*iterables, strict=...)`: [`zip`] plus Python's length check.
+///
+/// With `strict`, the first source that runs out must be the only one with
+/// elements left: an earlier source reports itself as shorter, and otherwise
+/// every later source is probed for an extra element, matching CPython's
+/// `zip_next` diagnostics (and its `ValueError` tags).
+pub(crate) fn zip_strict(argc: usize, argv: *const i64, strict: bool) -> i64 {
     if argc == 0 {
         return value::list_new(Vec::new());
     }
@@ -1094,11 +1170,13 @@ pub(crate) fn zip(argc: usize, argv: *const i64) -> i64 {
     loop {
         let row = value::list_new(Vec::new());
         let mut ended = false;
+        let mut ended_at = 0;
         for index in 0..argc {
             let Some(iterator) =
                 value::as_list(roots).and_then(|items| items.get(argc + index).copied())
             else {
                 ended = true;
+                ended_at = index;
                 break;
             };
             let mut item = NONE;
@@ -1108,6 +1186,7 @@ pub(crate) fn zip(argc: usize, argv: *const i64) -> i64 {
             }
             if status == 0 {
                 ended = true;
+                ended_at = index;
                 break;
             }
             if let Some(mut items) = value::list_items_mut(row) {
@@ -1116,6 +1195,9 @@ pub(crate) fn zip(argc: usize, argv: *const i64) -> i64 {
             }
         }
         if ended {
+            if strict && !zip_strict_end(roots, argc, ended_at) {
+                return NONE;
+            }
             break;
         }
         let values = value::as_list(row)
@@ -1130,7 +1212,106 @@ pub(crate) fn zip(argc: usize, argv: *const i64) -> i64 {
     result
 }
 
+/// The strict `zip` end-of-row check (CPython's `zip_next` `check:` block).
+///
+/// `ended` is the position of the first source that ran out for this row.
+/// A source that ran out after an earlier one produced an element is reported
+/// as shorter; only when the first source ended are the remaining ones probed,
+/// and an extra element there reports that source as longer. Returns `false`
+/// with a pending `ValueError` on a mismatch, `true` when all sources ended
+/// together.
+fn zip_strict_end(roots: i64, argc: usize, ended: usize) -> bool {
+    if ended > 0 {
+        let plural = if ended == 1 { " " } else { "s 1-" };
+        exc::raise_with_message(
+            VALUE_ERROR,
+            &format!(
+                "zip() argument {} is shorter than argument{plural}{ended}",
+                ended + 1
+            ),
+        );
+        return false;
+    }
+    for index in 1..argc {
+        let Some(iterator) =
+            value::as_list(roots).and_then(|items| items.get(argc + index).copied())
+        else {
+            break;
+        };
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return false;
+        }
+        if status != 0 {
+            let plural = if index == 1 { " " } else { "s 1-" };
+            exc::raise_with_message(
+                VALUE_ERROR,
+                &format!(
+                    "zip() argument {} is longer than argument{plural}{index}",
+                    index + 1
+                ),
+            );
+            return false;
+        }
+    }
+    true
+}
+
 // First-class functions
+
+/// `super(type, object)`: the explicit two-argument super proxy.
+///
+/// `object` may be an instance (ordinary method) or a class (`classmethod`
+/// calling `super(cls, cls)`); the proxy starts the MRO lookup after `type`,
+/// exactly like the receiver form the frontend lowers for `super()`. `None`
+/// is not accepted: Hydro has no unbound-super protocol surface, so a bad
+/// second argument reports CPython's message.
+fn super_two_arg(class: i64, object: i64) -> i64 {
+    if value::as_class(class).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "super() argument 1 must be a type, not '{}'",
+                value::type_name(class)
+            ),
+        );
+    }
+    let start = match value::instance_class_value(object) {
+        Some(start) => start,
+        None if value::as_class(object).is_some() => object,
+        None => {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "super(type, obj): obj must be an instance or subtype of type",
+            )
+        }
+    };
+    if !value::class_mro(start).contains(&class) {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "super(type, obj): obj must be an instance or subtype of type",
+        );
+    }
+    value::super_new(class, object)
+}
+
+/// `super(type)`: the unbound super object.
+///
+/// Attribute access on an unbound proxy has no receiver, so it raises
+/// `AttributeError`; the value itself only exists for signature parity.
+fn super_unbound(class: i64) -> i64 {
+    if value::as_class(class).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "super() argument 1 must be a type, not '{}'",
+                value::type_name(class)
+            ),
+        );
+    }
+    value::super_new(class, NONE)
+}
 
 /// `fn(args...)`: calls a function value.
 ///
@@ -1762,6 +1943,44 @@ pub(crate) fn call_kw(
                 kw_argv,
             );
         }
+        // `zip(*iterables, strict=...)`: the only keyword `zip` accepts. The
+        // flag is evaluated like CPython's `PyObject_IsTrue`, so any object
+        // works; a duplicate or unknown keyword reports `TypeError` without
+        // dropping it.
+        if matches!(&func.body, FunctionBody::Builtin(Builtin::Zip)) {
+            let mut strict = false;
+            let mut seen = false;
+            if kwargc > 0 {
+                if kw_argv.is_null() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "keyword arguments were passed without an argument buffer",
+                    );
+                }
+                // SAFETY: `kw_argv` holds `2 * kwargc` readable values.
+                let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+                for pair in pairs.as_chunks::<2>().0 {
+                    let Some(keyword) = value::as_str(pair[0]) else {
+                        return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                    };
+                    if keyword != "strict" {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("zip() got an unexpected keyword argument '{keyword}'"),
+                        );
+                    }
+                    if seen {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            "zip() got multiple values for keyword argument 'strict'",
+                        );
+                    }
+                    strict = value::truthy(pair[1]);
+                    seen = true;
+                }
+            }
+            return zip_strict(argc, argv, strict);
+        }
         // `print(*args, sep=..., end=..., file=..., flush=...)` is the only
         // builtin with runtime keyword parameters.
         if matches!(&func.body, FunctionBody::Builtin(Builtin::Print)) {
@@ -1914,6 +2133,11 @@ pub(crate) fn call_kw(
                 .map(|slot| slot.unwrap_or(NONE))
                 .collect();
             return call_builtin(*builtin, bound.len(), bound.as_ptr());
+        }
+        // `max`/`min` bind `key=` and the keyword-only `default=` here; the
+        // direct lowering path appends the key slot instead.
+        if matches!(builtin, Builtin::Max | Builtin::Min) {
+            return extremum_keywords(*builtin, argc, argv, kwargc, kw_argv);
         }
     }
     let signature = value::function_signature(function);
@@ -2447,6 +2671,29 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
             unsafe { std::slice::from_raw_parts(argv, argc) }
         };
         return modules::types::call("CellType", args);
+    }
+    // `complex` and `slice` are native instances of cached classes; calling
+    // the class value must run their constructors instead of allocating a
+    // blank instance. The name check keeps the registry lookup off the hot
+    // path for ordinary user classes.
+    let native_name = value::class_display_name(class);
+    if native_name == Some("complex") && globals::registry_get("builtins.complex") == Some(class) {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: argc > 0 implies a non-null, readable buffer.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        return complex_new(args);
+    }
+    if native_name == Some("slice") && globals::registry_get("builtins.slice") == Some(class) {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: argc > 0 implies a non-null, readable buffer.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        return slice_new(args);
     }
     if let Some(tag) = exc::exception_tag_of_class(class) {
         return instantiate_exception(tag, argc, argv);
@@ -3755,9 +4002,9 @@ fn builtin_arity_error(name: &str, expected: &str, argc: usize) -> i64 {
 /// final argument is the key slot), `sorted` one to three
 /// `(iterable, key, reverse)`, `round` one or two, `format` two (or
 /// three for the internal conversion flag), `isinstance` and `issubclass`
-/// exactly two, `all` exactly one, `ord`/`chr` exactly one, `divmod` exactly
-/// two, `callable` exactly one, `id` exactly one and the internal dict merge
-/// exactly two.
+/// exactly two, `all` exactly one, `ord`/`chr`/`hex`/`bin`/`oct` exactly one,
+/// `divmod` exactly two, `callable` exactly one, `id` exactly one and the
+/// internal dict merge exactly two.
 pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -3898,6 +4145,10 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [value] => to_repr(*value),
             _ => builtin_arity_error("repr", "exactly 1", argc),
         },
+        Builtin::Ascii => match args {
+            [value] => to_ascii(*value),
+            _ => builtin_arity_error("ascii", "exactly 1", argc),
+        },
         Builtin::Hash => match args {
             [value] => hash(*value),
             _ => builtin_arity_error("hash", "exactly 1", argc),
@@ -3929,6 +4180,12 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [value] => value::type_class(*value),
             [name, bases, namespace] => type_three_arg(*name, *bases, *namespace),
             _ => builtin_arity_error("type", "1 or 3", argc),
+        },
+        Builtin::Super => match args {
+            [class, object] => super_two_arg(*class, *object),
+            [class] => super_unbound(*class),
+            [] => exc::raise_with_message(RUNTIME_ERROR, "super(): no arguments"),
+            _ => builtin_arity_error("super", "at most 2", argc),
         },
         Builtin::Reversed => match args {
             [value] => reversed(*value),
@@ -3992,6 +4249,18 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
         Builtin::Chr => match args {
             [value] => chr_value(*value),
             _ => builtin_arity_error("chr", "exactly 1", argc),
+        },
+        Builtin::Hex => match args {
+            [value] => hex_value(*value),
+            _ => builtin_arity_error("hex", "exactly 1", argc),
+        },
+        Builtin::Bin => match args {
+            [value] => bin_value(*value),
+            _ => builtin_arity_error("bin", "exactly 1", argc),
+        },
+        Builtin::Oct => match args {
+            [value] => oct_value(*value),
+            _ => builtin_arity_error("oct", "exactly 1", argc),
         },
         Builtin::Divmod => match args {
             [a, b] => divmod(*a, *b),
@@ -4345,7 +4614,20 @@ fn extremum(name: &str, argc: usize, argv: *const i64, want_max: bool) -> i64 {
             &format!("{name} expected at least 1 argument, got 0"),
         );
     }
+    extremum_values(name, candidates, key, None, want_max)
+}
 
+/// Shared `max`/`min` evaluation over already-split candidates.
+///
+/// `default` is the `default=` keyword (keyword-only, single iterable form);
+/// it is returned when the iterable is empty instead of raising `ValueError`.
+fn extremum_values(
+    name: &str,
+    candidates: &[i64],
+    key: i64,
+    default: Option<i64>,
+    want_max: bool,
+) -> i64 {
     let mut best = NONE;
     let mut best_key = NONE;
     let mut found = false;
@@ -4408,9 +4690,98 @@ fn extremum(name: &str, argc: usize, argv: *const i64, want_max: bool) -> i64 {
     }
 
     if !found {
+        if let Some(default) = default {
+            return default;
+        }
         return exc::raise_with_message(VALUE_ERROR, &format!("{name}() arg is an empty sequence"));
     }
     best
+}
+
+/// Binds `max`/`min` keyword arguments (`key=`, `default=`) for a call
+/// through a first-class builtin value (or the frontend's keyword lowering of
+/// the single-iterable `default=` form).
+///
+/// CPython restricts `default` to the single-positional iterable form; the
+/// positional arguments are otherwise treated like [`extremum`].
+fn extremum_keywords(
+    builtin: Builtin,
+    argc: usize,
+    argv: *const i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> i64 {
+    let name = builtin.name();
+    if argc > 0 && argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name}() received {argc} argument(s) without an argument buffer"),
+        );
+    }
+    let args: Vec<i64> = if argc == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: ABI contract: `argv..argv+argc` is readable; checked above.
+        unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+    };
+    let mut key = NONE;
+    let mut key_seen = false;
+    let mut default: Option<i64> = None;
+    if kwargc > 0 {
+        if kw_argv.is_null() || kwargc > isize::MAX as usize / (2 * std::mem::size_of::<i64>()) {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "keyword arguments were passed without an argument buffer",
+            );
+        }
+        // SAFETY: ABI contract: `kw_argv` holds `2 * kwargc` readable values.
+        let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+        for pair in pairs.as_chunks::<2>().0 {
+            let Some(keyword) = value::as_str(pair[0]) else {
+                return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+            };
+            match keyword {
+                "key" => {
+                    if key_seen {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("{name}() got multiple values for keyword argument 'key'"),
+                        );
+                    }
+                    key_seen = true;
+                    key = pair[1];
+                }
+                "default" => {
+                    if default.is_some() {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("{name}() got multiple values for keyword argument 'default'"),
+                        );
+                    }
+                    default = Some(pair[1]);
+                }
+                _ => {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("{name}() got an unexpected keyword argument '{keyword}'"),
+                    )
+                }
+            }
+        }
+    }
+    if default.is_some() && args.len() > 1 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("Cannot specify a default for {name}() with multiple positional arguments"),
+        );
+    }
+    if args.is_empty() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name} expected at least 1 argument, got 0"),
+        );
+    }
+    extremum_values(name, &args, key, default, builtin == Builtin::Max)
 }
 
 /// `reversed(iterable)`: materialise and reverse a sequence (the rich/stdlib
@@ -4835,6 +5206,11 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
     if value::class_mro(subclass).contains(&class) {
         return Ok(true);
     }
+    // Concrete classes registered through `ABCMeta.register` are virtual
+    // subclasses here (the registry is empty unless an ABC was used).
+    if crate::modules::abc::is_virtual_subclass(subclass, class) {
+        return Ok(true);
+    }
     if let Some(class_tag) = exc::exception_tag_of_class(class) {
         if let Some(sub_tag) = value::exception_tag_of_derived_class(subclass) {
             return Ok(exc::tag_is_subclass(sub_tag, class_tag));
@@ -4864,8 +5240,26 @@ fn type_check(value: i64, target: i64) -> Option<bool> {
         return Some(instance_of(value, target));
     }
     if let Some(function) = value::as_function(target) {
-        if let FunctionBody::Builtin(builtin) = &function.body {
-            return named_type_check(value, builtin.name());
+        match &function.body {
+            FunctionBody::Builtin(builtin) => {
+                if *builtin == Builtin::Tuple {
+                    return Some(instance_of(
+                        value,
+                        value::type_class(value::tuple_new(Vec::new())),
+                    ));
+                }
+                return named_type_check(value, builtin.name());
+            }
+            // `types.FunctionType` and `types.UnionType` are declared as
+            // module functions so `types.FunctionType(...)` compiles; the
+            // module value is therefore the native function object, not the
+            // class. Resolve it to the same membership test the class form
+            // uses.
+            FunctionBody::Native {
+                module: "types",
+                name,
+            } => return crate::modules::types::type_check_target(value, name),
+            _ => {}
         }
     }
     None
@@ -4927,9 +5321,15 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
             .unwrap_or(false),
         "list" => value::as_list(value).is_some(),
         "dict" => value::as_dict(value).is_some() || value::as_defaultdict(value).is_some(),
-        "tuple" => value::as_tuple(value).is_some(),
+        "tuple" => {
+            value::as_tuple(value).is_some()
+                || crate::modules::collections::is_namedtuple_instance(value)
+        }
         "set" | "frozenset" => value::as_set(value).is_some(),
         "NoneType" | "None" => value == NONE,
+        // `types.FunctionType`: every function value (`def`, lambda,
+        // builtin/bound/native) reports the cached `function` type name.
+        "function" => value::as_function(value).is_some(),
         "object" => true,
         "type" => value::as_class(value).is_some(),
         _ => return None,
@@ -4950,6 +5350,13 @@ fn instance_of(value: i64, class: i64) -> bool {
     if value::is_object_class(class) {
         return true;
     }
+    // Instances (and native scalars registered through their builtin spelling)
+    // of a class recorded with `ABCMeta.register` are virtual instances. The
+    // registry is empty unless an ABC was used, so this is one atomic load in
+    // the common case.
+    if crate::modules::abc::is_virtual_instance(value, class) {
+        return true;
+    }
     // Classes are instances of their metaclass (the cached `type` class when no
     // explicit metaclass was given), so `isinstance(C, Meta)` works for a
     // `type` subclass.
@@ -4967,6 +5374,11 @@ fn instance_of(value: i64, class: i64) -> bool {
     }
     if is_protocol_class(class) {
         return protocol_instance_of(value, class);
+    }
+    if value::class_display_name(class) == Some("tuple")
+        && crate::modules::collections::is_namedtuple_instance(value)
+    {
+        return true;
     }
     // A user-defined exception instance keeps its Python class identity; its
     // native payload adds the built-in exception ancestry.
@@ -5009,6 +5421,421 @@ fn instance_of(value: i64, class: i64) -> bool {
         }
     }
     false
+}
+
+// -------------------------------------------------------------------------
+// `complex` and `slice` values
+// -------------------------------------------------------------------------
+//
+// Hydro has no dedicated complex/slice object kinds, so both are native
+// instances of cached classes. That keeps `type(x)`, `isinstance(x, ...)` and
+// class-identity comparisons working, and the classes are callable through the
+// ordinary class path (routed below, in [`instantiate`]).
+
+/// Allocates one native method value. `entry` receives the bound arguments
+/// (`self` first) and its exact arity is checked by [`call`].
+fn native_method(entry: extern "C" fn(*const i64) -> i64, arity: usize, name: &str) -> i64 {
+    value::function_new(entry as *const () as usize, arity, name.to_string())
+}
+
+/// The cached `complex` class used by `type(complex value)` and
+/// `isinstance(x, complex)`.
+pub(crate) fn complex_class() -> i64 {
+    if let Some(class) = globals::registry_get("builtins.complex") {
+        return class;
+    }
+    let class = value::class_new(
+        "complex".to_string(),
+        NONE,
+        vec![
+            (
+                "__repr__".to_string(),
+                native_method(complex_repr_method, 1, "__repr__"),
+            ),
+            (
+                "conjugate".to_string(),
+                native_method(complex_conjugate, 1, "conjugate"),
+            ),
+            (
+                "__eq__".to_string(),
+                native_method(complex_eq_method, 2, "__eq__"),
+            ),
+        ],
+    );
+    globals::registry_set("builtins.complex", class);
+    class
+}
+
+/// The cached `slice` class.
+pub(crate) fn slice_class() -> i64 {
+    if let Some(class) = globals::registry_get("builtins.slice") {
+        return class;
+    }
+    let class = value::class_new(
+        "slice".to_string(),
+        NONE,
+        vec![
+            (
+                "__repr__".to_string(),
+                native_method(slice_repr_method, 1, "__repr__"),
+            ),
+            (
+                "indices".to_string(),
+                native_method(slice_indices_method, 2, "indices"),
+            ),
+            (
+                "__eq__".to_string(),
+                native_method(slice_eq_method, 2, "__eq__"),
+            ),
+        ],
+    );
+    globals::registry_set("builtins.slice", class);
+    class
+}
+
+fn is_complex_instance(v: i64) -> bool {
+    globals::registry_get("builtins.complex")
+        .is_some_and(|class| value::instance_class_value(v) == Some(class))
+}
+
+fn is_slice_instance(v: i64) -> bool {
+    globals::registry_get("builtins.slice")
+        .is_some_and(|class| value::instance_class_value(v) == Some(class))
+}
+
+/// Numeric view of `v` for complex construction (`bool`, `int`, `bigint` and
+/// `float`).
+fn numeric_f64(v: i64) -> Option<f64> {
+    if let Some(f) = value::as_float(v) {
+        return Some(f);
+    }
+    if let Some(i) = value::as_integer(v) {
+        return Some(i as f64);
+    }
+    value::as_bigint(v).and_then(value::bigint_to_f64)
+}
+
+/// `(real, imag)` of a complex value or any numeric value.
+fn complex_components(v: i64) -> Option<(f64, f64)> {
+    if is_complex_instance(v) {
+        let real = value::instance_attr(v, "real").and_then(value::as_float);
+        let imag = value::instance_attr(v, "imag").and_then(value::as_float);
+        return Some((real.unwrap_or(0.0), imag.unwrap_or(0.0)));
+    }
+    numeric_f64(v).map(|real| (real, 0.0))
+}
+
+/// Allocates one complex value carrying `real`/`imag` attributes.
+fn build_complex(real: f64, imag: f64) -> i64 {
+    let class = complex_class();
+    let instance = value::instance_new(class);
+    let real_value = value::float_new(real);
+    let imag_value = value::float_new(imag);
+    let roots = crate::heap::root_values(&[instance, real_value, imag_value]);
+    value::instance_setattr(instance, "real".to_string(), real_value);
+    value::instance_setattr(instance, "imag".to_string(), imag_value);
+    crate::heap::release_roots(roots);
+    instance
+}
+
+/// Parses the imaginary suffix of a complex literal.
+fn parse_imaginary_part(text: &str) -> Option<f64> {
+    match text {
+        "" | "+" => Some(1.0),
+        "-" => Some(-1.0),
+        _ => text.parse::<f64>().ok(),
+    }
+}
+
+/// Parses CPython's `complex(str)` grammar: an optional surrounding pair of
+/// parentheses, then either a real number or `<real><sign><imag>j`. Spaces
+/// inside the expression are rejected, like CPython.
+fn parse_complex_text(text: &str) -> Option<(f64, f64)> {
+    let trimmed = text.trim();
+    let body = if trimmed.starts_with('(') && trimmed.ends_with(')') {
+        trimmed[1..trimmed.len() - 1].trim()
+    } else {
+        trimmed
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let bytes = body.as_bytes();
+    if bytes
+        .last()
+        .is_some_and(|last| *last == b'j' || *last == b'J')
+    {
+        let stem = &body[..body.len() - 1];
+        // Locate the last top-level sign, skipping exponent signs (`1e-3j`).
+        let mut split = None;
+        let mut previous = '\0';
+        for (index, ch) in stem.char_indices() {
+            if (ch == '+' || ch == '-') && index > 0 && previous != 'e' && previous != 'E' {
+                split = Some((index, ch));
+            }
+            previous = ch;
+        }
+        let (real, imag) = match split {
+            Some((index, sign)) => {
+                let real = stem[..index].parse::<f64>().ok()?;
+                let sign_text = if sign == '+' { "+" } else { "-" };
+                let rest = &stem[index + 1..];
+                (real, format!("{sign_text}{rest}").parse::<f64>().ok()?)
+            }
+            None => (0.0, parse_imaginary_part(stem)?),
+        };
+        return Some((real, imag));
+    }
+    body.parse::<f64>().ok().map(|real| (real, 0.0))
+}
+
+/// `complex(real=0, imag=0)` / `complex(str)`.
+pub(crate) fn complex_new(args: &[i64]) -> i64 {
+    match args {
+        [] => build_complex(0.0, 0.0),
+        [single] => {
+            if let Some(text) = value::as_str(*single) {
+                return match parse_complex_text(text) {
+                    Some((real, imag)) => build_complex(real, imag),
+                    None => {
+                        exc::raise_with_message(VALUE_ERROR, "complex() arg is a malformed string")
+                    }
+                };
+            }
+            if is_complex_instance(*single) {
+                let (real, imag) = complex_components(*single).unwrap_or((0.0, 0.0));
+                return build_complex(real, imag);
+            }
+            match numeric_f64(*single) {
+                Some(real) => build_complex(real, 0.0),
+                None => exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "complex() first argument must be a string or a number, not '{}'",
+                        value::type_name_of(*single)
+                    ),
+                ),
+            }
+        }
+        [real, imag] => {
+            let Some(real) = numeric_f64(*real) else {
+                return complex_argument_error(*real, "real");
+            };
+            let Some(imag) = numeric_f64(*imag) else {
+                return complex_argument_error(*imag, "imag");
+            };
+            build_complex(real, imag)
+        }
+        _ => exc::raise_with_message(TYPE_ERROR, "complex() takes at most 2 arguments"),
+    }
+}
+
+fn complex_argument_error(v: i64, which: &str) -> i64 {
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "complex() {which} part must be a number, not '{}'",
+            value::type_name_of(v)
+        ),
+    )
+}
+
+/// Formats one component the way `complex.__repr__` does (integral values
+/// lose the trailing `.0`).
+fn complex_part(v: f64) -> String {
+    let text = value::format_float(v);
+    if v.is_finite() && v.fract() == 0.0 {
+        text.strip_suffix(".0").map(str::to_string).unwrap_or(text)
+    } else {
+        text
+    }
+}
+
+fn complex_repr_text(real: f64, imag: f64) -> String {
+    let imag_text = complex_part(imag.abs());
+    if real == 0.0 && !real.is_sign_negative() {
+        return format!(
+            "{}{}j",
+            if imag.is_sign_negative() { "-" } else { "" },
+            imag_text
+        );
+    }
+    format!(
+        "({}{}{}j)",
+        complex_part(real),
+        if imag.is_sign_negative() { "-" } else { "+" },
+        imag_text
+    )
+}
+
+extern "C" fn complex_repr_method(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let (real, imag) = complex_components(this).unwrap_or((0.0, 0.0));
+    value::str_alloc(complex_repr_text(real, imag))
+}
+
+extern "C" fn complex_conjugate(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let (real, imag) = complex_components(this).unwrap_or((0.0, 0.0));
+    build_complex(real, -imag)
+}
+
+extern "C" fn complex_eq_method(argv: *const i64) -> i64 {
+    // SAFETY: `__eq__` receives `self` and the other operand.
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    match (complex_components(left), complex_components(right)) {
+        (Some((lr, li)), Some((rr, ri))) => value::bool_value(lr == rr && li == ri),
+        _ => value::NOT_IMPLEMENTED,
+    }
+}
+
+/// Allocates one slice value. Missing bounds are stored as `None`, matching
+/// CPython's attribute values.
+fn build_slice(start: i64, stop: i64, step: i64) -> i64 {
+    let class = slice_class();
+    let instance = value::instance_new(class);
+    let roots = crate::heap::root_values(&[instance, start, stop, step]);
+    value::instance_setattr(instance, "start".to_string(), start);
+    value::instance_setattr(instance, "stop".to_string(), stop);
+    value::instance_setattr(instance, "step".to_string(), step);
+    crate::heap::release_roots(roots);
+    instance
+}
+
+/// `slice(stop)` / `slice(start, stop[, step])`.
+pub(crate) fn slice_new(args: &[i64]) -> i64 {
+    match args {
+        [stop] => build_slice(NONE, *stop, NONE),
+        [start, stop] => build_slice(*start, *stop, NONE),
+        [start, stop, step] => build_slice(*start, *stop, *step),
+        [] => exc::raise_with_message(TYPE_ERROR, "slice expected at least 1 argument, got 0"),
+        _ => exc::raise_with_message(TYPE_ERROR, "slice() takes at most 3 arguments"),
+    }
+}
+
+extern "C" fn slice_repr_method(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let start = value::instance_attr(this, "start").unwrap_or(NONE);
+    let stop = value::instance_attr(this, "stop").unwrap_or(NONE);
+    let step = value::instance_attr(this, "step").unwrap_or(NONE);
+    let roots = crate::heap::root_values(&[start, stop, step]);
+    let rendered = format!(
+        "slice({}, {}, {})",
+        value::repr(start),
+        value::repr(stop),
+        value::repr(step)
+    );
+    crate::heap::release_roots(roots);
+    value::str_alloc(rendered)
+}
+
+/// One `slice.indices` operand: `None` stays unset, integers are decoded,
+/// everything else raises the CPython `TypeError`.
+fn slice_bound_argument(v: i64) -> Result<Option<i64>, i64> {
+    if v == NONE {
+        return Ok(None);
+    }
+    match value::as_integer(v) {
+        Some(n) => Ok(Some(n)),
+        None => Err(exc::raise_with_message(
+            TYPE_ERROR,
+            "slice indices must be integers or None or have an __index__ method",
+        )),
+    }
+}
+
+extern "C" fn slice_indices_method(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` and `len`.
+    let this = unsafe { *argv };
+    let length_value = unsafe { *argv.add(1) };
+    let Some(length) = value::as_integer(length_value) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name_of(length_value)
+            ),
+        );
+    };
+    let start = match slice_bound_argument(value::instance_attr(this, "start").unwrap_or(NONE)) {
+        Ok(bound) => bound,
+        Err(error) => return error,
+    };
+    let stop = match slice_bound_argument(value::instance_attr(this, "stop").unwrap_or(NONE)) {
+        Ok(bound) => bound,
+        Err(error) => return error,
+    };
+    let step = match slice_bound_argument(value::instance_attr(this, "step").unwrap_or(NONE)) {
+        Ok(bound) => bound,
+        Err(error) => return error,
+    };
+    let step = step.unwrap_or(1) as i128;
+    if step == 0 {
+        return exc::raise_with_message(VALUE_ERROR, "slice step cannot be zero");
+    }
+    let len = length as i128;
+    let start = match start {
+        None => {
+            if step < 0 {
+                len - 1
+            } else {
+                0
+            }
+        }
+        Some(start) => {
+            let start = start as i128;
+            if start < 0 {
+                (start + len).max(if step < 0 { -1 } else { 0 })
+            } else {
+                start.min(if step < 0 { len - 1 } else { len })
+            }
+        }
+    };
+    let stop = match stop {
+        None => {
+            if step < 0 {
+                -1
+            } else {
+                len
+            }
+        }
+        Some(stop) => {
+            let stop = stop as i128;
+            if stop < 0 {
+                (stop + len).max(-1)
+            } else {
+                stop.min(len)
+            }
+        }
+    };
+    let clamp = |n: i128| i64::try_from(n).unwrap_or(if n < 0 { i64::MIN } else { i64::MAX });
+    let values = [
+        ops::int_result(clamp(start)),
+        ops::int_result(clamp(stop)),
+        ops::int_result(clamp(step)),
+    ];
+    value::tuple_new(values.to_vec())
+}
+
+extern "C" fn slice_eq_method(argv: *const i64) -> i64 {
+    // SAFETY: `__eq__` receives `self` and the other operand.
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    if !is_slice_instance(right) {
+        return value::NOT_IMPLEMENTED;
+    }
+    for field in ["start", "stop", "step"] {
+        let l = value::instance_attr(left, field).unwrap_or(NONE);
+        let r = value::instance_attr(right, field).unwrap_or(NONE);
+        if !container::equals(l, r) {
+            return value::FALSE;
+        }
+    }
+    value::TRUE
 }
 
 #[cfg(test)]
@@ -5558,6 +6385,168 @@ mod tests {
         assert_eq!(zip(1, invalid.as_ptr()), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(pending_message(), "'int' object is not iterable");
+        exc::init();
+    }
+
+    #[test]
+    fn zip_strict_reports_length_mismatches() {
+        exc::init();
+        // `strict=False` keeps the truncating behaviour.
+        let longer = value::list_new(vec![int(1), int(2)]);
+        let shorter = value::list_new(vec![int(3)]);
+        let sources = [longer, shorter];
+        assert_eq!(rendered(zip_strict(2, sources.as_ptr(), false)), "[(1, 3)]");
+        assert!(!exc::pending());
+
+        // A later source that ended first is reported as shorter.
+        assert_eq!(zip_strict(2, sources.as_ptr(), true), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "zip() argument 2 is shorter than argument 1"
+        );
+        exc::init();
+
+        // The first source ended while a later one still yields: that one is
+        // longer (CPython's `check:` block probes the remaining iterators).
+        let first = value::list_new(vec![int(1)]);
+        let second = value::list_new(vec![int(2), int(3)]);
+        let sources = [first, second];
+        assert_eq!(zip_strict(2, sources.as_ptr(), true), NONE);
+        assert_eq!(
+            pending_message(),
+            "zip() argument 2 is longer than argument 1"
+        );
+        exc::init();
+
+        // Three sources use CPython's plural spelling.
+        let a = value::list_new(vec![int(1), int(2), int(3)]);
+        let b = value::list_new(vec![int(4), int(5), int(6)]);
+        let c = value::list_new(vec![int(7), int(8)]);
+        let sources = [a, b, c];
+        assert_eq!(zip_strict(3, sources.as_ptr(), true), NONE);
+        assert_eq!(
+            pending_message(),
+            "zip() argument 3 is shorter than arguments 1-2"
+        );
+        exc::init();
+
+        let a = value::list_new(vec![int(1)]);
+        let b = value::list_new(vec![int(2)]);
+        let c = value::list_new(vec![int(3), int(4)]);
+        let sources = [a, b, c];
+        assert_eq!(zip_strict(3, sources.as_ptr(), true), NONE);
+        assert_eq!(
+            pending_message(),
+            "zip() argument 3 is longer than arguments 1-2"
+        );
+        exc::init();
+
+        // Equal lengths and zero sources succeed under `strict=True`.
+        let left = value::list_new(vec![int(1), int(2)]);
+        let right = value::list_new(vec![int(3), int(4)]);
+        let sources = [left, right];
+        assert_eq!(
+            rendered(zip_strict(2, sources.as_ptr(), true)),
+            "[(1, 3), (2, 4)]"
+        );
+        assert!(!exc::pending());
+        assert_eq!(rendered(zip_strict(0, std::ptr::null(), true)), "[]");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn zip_strict_keyword_binding() {
+        exc::init();
+        let zip_fn = value::builtin_function_new(Builtin::Zip);
+        let left = value::list_new(vec![int(1), int(2)]);
+        let right = value::list_new(vec![int(3)]);
+        let args = [left, right];
+
+        let pairs = [string("strict"), TRUE];
+        assert_eq!(call_kw(zip_fn, 2, args.as_ptr(), 1, pairs.as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::init();
+
+        let pairs = [string("strict"), FALSE];
+        assert_eq!(
+            rendered(call_kw(zip_fn, 2, args.as_ptr(), 1, pairs.as_ptr())),
+            "[(1, 3)]"
+        );
+        assert!(!exc::pending());
+
+        // Any truthy object enables the check, like `PyObject_IsTrue`.
+        let pairs = [string("strict"), int(1)];
+        assert_eq!(call_kw(zip_fn, 2, args.as_ptr(), 1, pairs.as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::init();
+
+        let pairs = [string("mode"), TRUE];
+        assert_eq!(call_kw(zip_fn, 2, args.as_ptr(), 1, pairs.as_ptr()), NONE);
+        assert_eq!(
+            pending_message(),
+            "zip() got an unexpected keyword argument 'mode'"
+        );
+        exc::init();
+
+        // No keyword keeps the plain positional path.
+        assert_eq!(
+            rendered(call_kw(zip_fn, 2, args.as_ptr(), 0, std::ptr::null())),
+            "[(1, 3)]"
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn super_two_argument_builds_a_proxy() {
+        exc::init();
+        let object = value::object_class();
+        let base = value::class_new("Base".to_string(), object, Vec::new());
+        let derived = value::class_new("Derived".to_string(), base, Vec::new());
+        let instance = value::instance_new(derived);
+
+        let proxy = builtin_call(Builtin::Super, &[base, instance]);
+        assert!(!exc::pending());
+        let state = value::as_super(proxy).expect("super proxy");
+        assert_eq!(state.class, base);
+        assert_eq!(state.object, instance);
+
+        // The second argument may be a class (the `classmethod` form).
+        let proxy = builtin_call(Builtin::Super, &[base, derived]);
+        assert!(!exc::pending());
+        let state = value::as_super(proxy).expect("super proxy");
+        assert_eq!(state.class, base);
+        assert_eq!(state.object, derived);
+
+        // A class outside the MRO is rejected like CPython.
+        let unrelated = value::class_new("Unrelated".to_string(), object, Vec::new());
+        assert_eq!(builtin_call(Builtin::Super, &[unrelated, instance]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "super(type, obj): obj must be an instance or subtype of type"
+        );
+        exc::init();
+
+        // The first argument must be a class.
+        assert_eq!(builtin_call(Builtin::Super, &[int(1), instance]), NONE);
+        assert_eq!(
+            pending_message(),
+            "super() argument 1 must be a type, not 'int'"
+        );
+        exc::init();
+
+        // `super(type)` stays unbound: a proxy without a receiver.
+        let proxy = builtin_call(Builtin::Super, &[derived]);
+        assert!(!exc::pending());
+        let state = value::as_super(proxy).expect("unbound super proxy");
+        assert_eq!(state.class, derived);
+        assert_eq!(state.object, NONE);
+
+        // A zero-argument call only reaches the runtime through a
+        // first-class value; it reports CPython's RuntimeError.
+        assert_eq!(builtin_call(Builtin::Super, &[]), NONE);
+        assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
         exc::init();
     }
 

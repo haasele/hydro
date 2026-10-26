@@ -82,6 +82,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         }
         "setattr" => setattr(args),
         "delattr" => delattr(args),
+        "complex" => core_builtins::complex_new(args),
+        "slice" => core_builtins::slice_new(args),
         "id" => id_value(args[0]),
         "dir" => dir(args),
         "vars" => vars(args),
@@ -111,6 +113,11 @@ pub(crate) fn constant(name: &str) -> i64 {
         // right `type()`; only its `repr` (and the absence of an `is`
         // recognizer elsewhere in the runtime) differs from CPython.
         "Ellipsis" => ellipsis_value(),
+        // Native instance-backed builtin types. The class values are cached,
+        // so `type(x) in (complex, slice)` and `isinstance(x, slice)` compare
+        // exact identities.
+        "complex" => core_builtins::complex_class(),
+        "slice" => core_builtins::slice_class(),
         _ => match exception_tag(name) {
             Some(tag) => exc::exception_class(tag),
             None => missing_attribute(name),

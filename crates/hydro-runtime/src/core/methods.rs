@@ -634,16 +634,48 @@ fn call_descriptor(
     builtins::call(function, call_args.len(), call_args.as_ptr())
 }
 
+/// Resolves `class.attr` through the class's metaclass.
+///
+/// Used only after the class namespace misses (CPython's normal lookup order).
+/// Returns `None` when the class has no explicit metaclass or the metaclass
+/// does not define `attr`. A metaclass property runs with the class as its
+/// receiver, so `Number.__abstractmethods__` works; every other entry becomes
+/// a bound-method value that [`class_member_method`] rebinds through
+/// [`call_bound_entry`].
+fn metaclass_attribute(class: i64, attr: &str) -> Option<i64> {
+    let metaclass = value::class_metaclass(class);
+    if metaclass == NONE {
+        return None;
+    }
+    match value::class_lookup(metaclass, attr)? {
+        value::ClassEntry::Attr(item) => {
+            if let Some(result) = descriptor_get(item, NONE, class) {
+                return Some(result);
+            }
+            Some(item)
+        }
+        value::ClassEntry::Method(MethodKind::Property, function) => {
+            let args = [class];
+            Some(builtins::call(function, 1, args.as_ptr()))
+        }
+        value::ClassEntry::Method(_, _) => Some(value::bound_method_new(class, attr.to_string())),
+    }
+}
+
 /// Calls `Class.method(...)` and `Class.attr`-style methods on a class value.
 ///
 /// Ordinary methods are unbound (the caller supplies `self`), classmethods
 /// bind the class and staticmethods bind nothing. Properties are data
 /// attributes of instances, not callables on the class, so they report an
-/// `AttributeError` here.
+/// `AttributeError` here. A name missing from the class namespace is resolved
+/// on the metaclass, where the class itself is the receiver.
 fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
-    if method == "__new__" && value::class_lookup(class, "__new__").is_none() {
+    if method == "__new__"
+        && value::class_lookup(class, "__new__").is_none()
+        && !metaclass_defines_new(class)
+    {
         // `Cls.__new__(Cls)` allocates without running `__init__` when the
-        // class defines no custom `__new__`.
+        // class (and its metaclass) define no custom `__new__`.
         return value::instance_new(class);
     }
     if argc > 0 && (argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>()) {
@@ -654,9 +686,34 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
             argc
         ));
     }
-    let Some(entry) = value::class_lookup(class, method) else {
-        return attribute_error(class, method);
+    let (entry, via_metaclass) = match value::class_lookup(class, method) {
+        Some(entry) => (entry, false),
+        None => {
+            let metaclass = value::class_metaclass(class);
+            if metaclass == NONE {
+                return attribute_error(class, method);
+            }
+            match value::class_lookup(metaclass, method) {
+                Some(entry) => (entry, true),
+                None => return attribute_error(class, method),
+            }
+        }
     };
+    if via_metaclass {
+        // A property is a data attribute of the class, not something callable
+        // through `Cls.prop()`.
+        if matches!(&entry, value::ClassEntry::Method(MethodKind::Property, _)) {
+            return attribute_error(class, method);
+        }
+        let metaclass = value::class_metaclass(class);
+        let args = if argc == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: argument buffer validated above.
+            unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+        };
+        return call_bound_entry(class, metaclass, entry, method, &args, &[]);
+    }
     let (kind, function) = match entry {
         value::ClassEntry::Attr(value) => return builtins::call(value, argc, argv),
         value::ClassEntry::Method(MethodKind::Property, _) => {
@@ -685,6 +742,12 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
         call_args.extend_from_slice(args);
     }
     builtins::call(function, call_args.len(), call_args.as_ptr())
+}
+
+/// Whether the class's metaclass defines `__new__`.
+fn metaclass_defines_new(class: i64) -> bool {
+    let metaclass = value::class_metaclass(class);
+    metaclass != NONE && value::class_lookup(metaclass, "__new__").is_some()
 }
 
 /// Keyword parameter names for native class methods that bind keywords.
@@ -1511,6 +1574,13 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 return value::bound_method_new(obj, attr);
             }
             None => {}
+        }
+        // A name missing from the class namespace falls back to the
+        // metaclass, as in CPython: this is how `ABCMeta.register`,
+        // `__instancecheck__`, `__subclasscheck__` and `__abstractmethods__`
+        // reach every class created with that metaclass.
+        if let Some(metaclass) = metaclass_attribute(obj, &attr) {
+            return metaclass;
         }
         return attribute_error(obj, &attr);
     }

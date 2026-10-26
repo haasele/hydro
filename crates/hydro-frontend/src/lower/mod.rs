@@ -27,7 +27,7 @@ use crate::sema::{Infer, Ty};
 
 pub const MODULE_NAME: &str = "<module>";
 
-const BUILTIN_NAMES: [&str; 30] = [
+const BUILTIN_NAMES: [&str; 32] = [
     "print",
     "len",
     "str",
@@ -58,6 +58,8 @@ const BUILTIN_NAMES: [&str; 30] = [
     "input",
     "get_ipython",
     "id",
+    "object",
+    "super",
 ];
 
 /// A resolved source unit prior to type inference.
@@ -1470,6 +1472,19 @@ pub struct Lowerer<'a> {
     pending_self_stars: Vec<TextRange>,
     /// Literal `__all__` of this unit, used by a pending self star import.
     module_all: Option<Vec<String>>,
+    /// Names defined by module-level `def`/`async def` in this unit. Used to
+    /// keep a star import from a compiled extension from shadowing a local
+    /// definition of the same name.
+    module_def_names: HashSet<String>,
+    /// Compiled-extension paths this unit star-imports. The extension's
+    /// namespace cannot be enumerated at compile time, so an otherwise
+    /// unresolved name is lowered to a lazy extension member read.
+    extension_stars: Vec<String>,
+    /// `(binding, extension path)` pairs materialised from a module-level
+    /// `from <extension> import *`: the literal `__all__` names of this unit.
+    /// Their values are stored into the runtime global table by the import
+    /// statement, which is what makes them real module globals for importers.
+    extension_star_bindings: Vec<(String, String)>,
     /// Names bound by imports nested inside functions, classes or compound
     /// bodies that could not be linked statically. Reading one raises
     /// `RuntimeError` at runtime.
@@ -1633,6 +1648,9 @@ impl<'a> Lowerer<'a> {
             pending_self_imports: Vec::new(),
             pending_self_stars: Vec::new(),
             module_all: None,
+            module_def_names: HashSet::new(),
+            extension_stars: Vec::new(),
+            extension_star_bindings: Vec::new(),
             deferred_imports: HashMap::new(),
             top_level_imports: HashSet::new(),
             deferred_modules: HashSet::new(),
@@ -1791,6 +1809,22 @@ impl<'a> Lowerer<'a> {
         self.deferred_modules.is_empty() || self.deferred_modules.contains(module)
     }
 
+    /// Whether the binding of `module` may fall back to the runtime import
+    /// stub at this site.
+    ///
+    /// Nested imports follow [`Self::may_defer`] (an empty set means the unit
+    /// was lowered without the loader). Module-level imports normally link or
+    /// fail, but a module the loader explicitly recorded as deferred — an
+    /// absent module imported from a conditional block, or a platform-specific
+    /// `if` branch — must stay a runtime error instead of a compile error.
+    fn may_defer_at(&self, module: &str, nested: bool) -> bool {
+        if nested {
+            self.may_defer(module)
+        } else {
+            self.deferred_modules.contains(module)
+        }
+    }
+
     /// Names this unit exports to importers: top-level functions plus every
     /// module-level value mirrored into the global table (classes included).
     pub fn exported_names(&self) -> HashMap<String, UserExport> {
@@ -1808,6 +1842,40 @@ impl<'a> Lowerer<'a> {
         for name in &self.global_names {
             exports.entry(name.clone()).or_insert(UserExport::Global);
         }
+        // Module-level imports are module attributes too: imported units
+        // mirror every binding into their runtime global table, so a package
+        // `__init__.py` (or `numeric`, which re-exports hundreds of names from
+        // `multiarray`) keeps them when a consumer star-imports it. Only
+        // bindings established by a *top-level* import qualify; a nested
+        // import binds a local of that function, not a module attribute.
+        for name in &self.top_level_imports {
+            if exports.contains_key(name) {
+                continue;
+            }
+            let export = if let Some(id) = self.imported_user_functions.get(name) {
+                UserExport::Function(*id)
+            } else if self.imported_user_globals.contains_key(name)
+                || self.user_module_aliases.contains_key(name)
+                || self.module_aliases.contains_key(name)
+                || self.imported_functions.contains_key(name)
+                || self.imported_constants.contains_key(name)
+                || self.imported_extension_members.contains_key(name)
+            {
+                UserExport::Global
+            } else {
+                // Extension aliases have no first-class IR value and are not
+                // mirrored, and a deferred (optional) import has no known
+                // value at compile time: neither can be re-exported.
+                continue;
+            };
+            exports.insert(name.clone(), export);
+        }
+        // Names materialised by `from <extension> import *`. Their values are
+        // stored into this module's runtime global table by the import
+        // statement, so importers read them like any other module global.
+        for (binding, _) in &self.extension_star_bindings {
+            exports.entry(binding.clone()).or_insert(UserExport::Global);
+        }
         exports
     }
 
@@ -1824,6 +1892,8 @@ impl<'a> Lowerer<'a> {
         //    The exported global names are known first: `from . import name`
         //    inside a package may refer to a name defined by this unit.
         self.module_all = module_all_names(&module.body);
+        self.module_def_names.clear();
+        collect_module_def_names(&module.body, &mut self.module_def_names);
         collect_global_names(&module.body, &mut self.global_names);
         // Functions may read module globals, so those names must be mirrored
         // even when the assignment is lowered before the function body. Scan
@@ -3005,9 +3075,13 @@ impl<'a> Lowerer<'a> {
     ///
     /// Import statements emit no IR: they only affect name resolution.
     /// Module-level imports execute before any function of the unit, so the
-    /// names they bind are visible everywhere and can be called directly. An
-    /// import under an `if`, loop, `try`, class or function body is collected
-    /// by [`Self::collect_nested_imports`] and deferred instead.
+    /// names they bind are visible everywhere and can be called directly.
+    /// Imports inside module-level control flow (`if`/loops/`with`) are
+    /// collected here too: those bodies run while the module initializes, so
+    /// their names are real module attributes — NumPy assigns its public
+    /// surface from an `if`/`else` block. An import under a function or class
+    /// body is collected by [`Self::collect_nested_imports`] and deferred
+    /// instead.
     fn collect_top_imports(&mut self, stmts: &[ast::Stmt]) {
         for stmt in stmts {
             match stmt {
@@ -3017,24 +3091,54 @@ impl<'a> Lowerer<'a> {
                     }
                 }
                 ast::Stmt::ImportFrom(s) => self.collect_import_from(s, false),
+                ast::Stmt::If(s) => {
+                    let branch = static_if_branch(&s.test, &self.dunder_name);
+                    match branch {
+                        Some(true) => self.collect_top_imports(&s.body),
+                        Some(false) => self.collect_top_imports(&s.orelse),
+                        None => {
+                            self.collect_top_imports(&s.body);
+                            self.collect_top_imports(&s.orelse);
+                        }
+                    }
+                }
+                ast::Stmt::For(s) => {
+                    self.collect_top_imports(&s.body);
+                    self.collect_top_imports(&s.orelse);
+                }
+                ast::Stmt::AsyncFor(s) => {
+                    self.collect_top_imports(&s.body);
+                    self.collect_top_imports(&s.orelse);
+                }
+                ast::Stmt::While(s) => {
+                    self.collect_top_imports(&s.body);
+                    self.collect_top_imports(&s.orelse);
+                }
+                ast::Stmt::With(s) => self.collect_top_imports(&s.body),
+                ast::Stmt::AsyncWith(s) => self.collect_top_imports(&s.body),
                 _ => {}
             }
         }
     }
 
-    /// Collects imports nested inside functions, classes and compound bodies.
+    /// Collects imports nested inside functions, classes and remaining
+    /// compound bodies.
     ///
-    /// The loader does not execute these imports, so a name they bind that
-    /// cannot be linked (a user module that is not already a dependency)
-    /// becomes a [`DeferredImport`]: reading it raises `RuntimeError` instead
-    /// of printing a compile error or silently ignoring the import. Guards
-    /// fixed by the import contract are still skipped (`if TYPE_CHECKING:`
-    /// and `if __name__ == "__main__":`, see [`static_if_branch`]), so
-    /// type-only imports never bind anything.
+    /// Module-level `if`/loop/`with` bodies are handled by
+    /// [`Self::collect_top_imports`] because they execute while the module
+    /// initializes; `try` bodies stay here so a missing optional module remains
+    /// a runtime import error for the handler. The loader does not execute
+    /// these imports, so a name they bind that cannot be linked (a user module
+    /// that is not already a dependency) becomes a [`DeferredImport`]: reading
+    /// it raises the runtime import error instead of printing a compile error
+    /// or silently ignoring the import. Guards fixed by the import contract are
+    /// still skipped (`if TYPE_CHECKING:` and `if __name__ == "__main__":`, see
+    /// [`static_if_branch`]), so type-only imports never bind anything.
     ///
     /// `root` is true for the module body, whose direct imports were already
-    /// handled by [`Self::collect_top_imports`]; compound statements below it
-    /// are all nested.
+    /// handled by [`Self::collect_top_imports`]; an import this pass reaches
+    /// is nested (a function/class body, or a `try` part), and its binding is
+    /// skipped when the top-level pass already claimed the name.
     fn collect_nested_imports(&mut self, stmts: &[ast::Stmt], root: bool) {
         for stmt in stmts {
             match stmt {
@@ -3157,8 +3261,9 @@ impl<'a> Lowerer<'a> {
                 // An optional import (inside a module-level `try`) must not
                 // turn an unloadable wheel into a compile error: leave the
                 // binding deferred so the handler sees the runtime import
-                // failure.
-                if nested && self.may_defer(imported) {
+                // failure. A conditional module-level import behaves the same
+                // way when the loader recorded it as deferred.
+                if self.may_defer_at(imported, nested) {
                     self.record_deferred(binding, module, None);
                     return;
                 }
@@ -3167,21 +3272,26 @@ impl<'a> Lowerer<'a> {
             }
             ExtensionLookup::Missing => {}
         }
-        if nested && self.may_defer(imported) {
+        // A module that is initializing right now (an ancestor package, or a
+        // module on the load stack that closes an import cycle) has no
+        // compile-time exports. Binding it as a module alias is still exact:
+        // `ModuleRef` materialises the registry value, and every attribute
+        // read goes through the target's global table at use time, after its
+        // one-time initializer ran. This is how CPython's partially
+        // initialized modules behave, including the `import numpy as np`
+        // spelling used throughout NumPy's own package. Checked before the
+        // deferred fallback: the unit's deferred set is per module name, so a
+        // nested import must not turn a resolvable cycle edge into a runtime
+        // error.
+        if self.late_modules.contains(imported) || self.is_initializing_ancestor(imported) {
+            self.user_module_aliases
+                .insert(binding.to_string(), module.to_string());
+            return;
+        }
+        if self.may_defer_at(imported, nested) {
             // The loader did not execute the import, so the module is not
             // linked: bind the alias to the runtime error stub.
             self.record_deferred(binding, module, None);
-            return;
-        }
-        // A module that is still initializing has no known exports, so a plain
-        // `import` would bind a module value with nothing to read attributes
-        // from. Members can still be bound with `from X import name`.
-        if self.late_modules.contains(imported) {
-            self.error_at_code(
-                alias.range,
-                codes::UNSUPPORTED,
-                format!("module '{imported}' is still initializing; import its members with 'from {imported} import <name>'"),
-            );
             return;
         }
         self.error_unsupported_module(alias.range, imported);
@@ -3293,7 +3403,7 @@ impl<'a> Lowerer<'a> {
                         continue;
                     }
                     ExtensionLookup::Incompatible { path, reason } => {
-                        if nested && self.may_defer(imported) {
+                        if self.may_defer_at(imported, nested) {
                             self.record_deferred(binding, imported, Some(member));
                         } else {
                             self.error_incompatible_extension(alias.range, &path, &reason);
@@ -3319,12 +3429,22 @@ impl<'a> Lowerer<'a> {
                             (imported.to_string(), member.to_string()),
                         );
                     }
-                    None if self_package && !nested => self.pending_self_imports.push((
-                        binding.to_string(),
-                        member.to_string(),
-                        alias.range,
-                    )),
-                    None if nested && self.may_defer(imported) => {
+                    None if self_package && !nested => {
+                        // `from . import missing` inside a module-level
+                        // conditional branch: the loader recorded the absent
+                        // submodule, so bind the runtime import error instead
+                        // of rejecting the whole program.
+                        if self.may_defer_at(&submodule, nested) {
+                            self.record_deferred(binding, imported, Some(member));
+                        } else {
+                            self.pending_self_imports.push((
+                                binding.to_string(),
+                                member.to_string(),
+                                alias.range,
+                            ));
+                        }
+                    }
+                    None if self.may_defer_at(imported, nested) => {
                         self.record_deferred(binding, imported, Some(member));
                     }
                     None => self.error_at_code(
@@ -3367,11 +3487,30 @@ impl<'a> Lowerer<'a> {
                 if self.user_modules.contains_key(&submodule) {
                     self.user_module_aliases
                         .insert(binding.to_string(), submodule);
-                } else {
-                    self.imported_user_globals.insert(
-                        binding.to_string(),
-                        (imported.to_string(), member.to_string()),
-                    );
+                    continue;
+                }
+                // `from . import _multiarray_umath` inside an initializing
+                // package names a compiled extension submodule, not a package
+                // attribute. Bind the lazy ABI loader exactly like the
+                // non-late branch does.
+                match self.find_extension(&submodule) {
+                    ExtensionLookup::Found(path) => {
+                        self.extension_aliases
+                            .insert(binding.to_string(), path.to_string_lossy().into_owned());
+                    }
+                    ExtensionLookup::Incompatible { path, reason } => {
+                        if self.may_defer_at(imported, nested) {
+                            self.record_deferred(binding, imported, Some(member));
+                        } else {
+                            self.error_incompatible_extension(alias.range, &path, &reason);
+                        }
+                    }
+                    ExtensionLookup::Missing => {
+                        self.imported_user_globals.insert(
+                            binding.to_string(),
+                            (imported.to_string(), member.to_string()),
+                        );
+                    }
                 }
             }
             return;
@@ -3383,7 +3522,7 @@ impl<'a> Lowerer<'a> {
                 self.collect_extension_members(s, imported, &path, nested);
             }
             ExtensionLookup::Incompatible { path, reason }
-                if nested && self.may_defer(imported) =>
+                if self.may_defer_at(imported, nested) =>
             {
                 // Optional import of an unloadable wheel: defer every binding
                 // so the runtime raises the import error inside the `try`.
@@ -3404,7 +3543,7 @@ impl<'a> Lowerer<'a> {
                         Some(name) => name.as_str(),
                         None => member,
                     };
-                    if !self.claim_import_binding(binding, true) {
+                    if !self.claim_import_binding(binding, nested) {
                         continue;
                     }
                     self.record_deferred(binding, imported, Some(member));
@@ -3413,10 +3552,10 @@ impl<'a> Lowerer<'a> {
             ExtensionLookup::Incompatible { path, reason } => {
                 self.error_incompatible_extension(s.range, &path, &reason);
             }
-            ExtensionLookup::Missing if nested && self.may_defer(imported) => {
-                // The loader never probes nested modules, so the module may
-                // simply not be a dependency. Record the bindings as deferred
-                // instead of rejecting the program at compile time.
+            ExtensionLookup::Missing if self.may_defer_at(imported, nested) => {
+                // The loader never probed this module, so it may simply not be
+                // a dependency. Record the bindings as deferred instead of
+                // rejecting the program at compile time.
                 for alias in &s.names {
                     let member = alias.name.as_str();
                     if member == "*" {
@@ -3433,7 +3572,7 @@ impl<'a> Lowerer<'a> {
                         Some(name) => name.as_str(),
                         None => member,
                     };
-                    if !self.claim_import_binding(binding, true) {
+                    if !self.claim_import_binding(binding, nested) {
                         continue;
                     }
                     self.record_deferred(binding, imported, Some(member));
@@ -3659,11 +3798,47 @@ impl<'a> Lowerer<'a> {
         for alias in &s.names {
             let member = alias.name.as_str();
             if member == "*" {
-                self.error_at_code(
-                    alias.range,
-                    codes::UNSUPPORTED,
-                    format!("'from {module} import *' is not supported for extension modules"),
-                );
+                // A compiled extension's namespace cannot be enumerated while
+                // compiling. Inside a module body the literal `__all__` of the
+                // importing unit names the extension attributes it re-exports;
+                // those become ordinary module globals (the import statement
+                // stores them) and imports of this module keep working. Reads
+                // of any other name fall back to a lazy member lookup, so the
+                // whole extension surface stays reachable without inventing
+                // names. A star import nested in a function is a Python syntax
+                // error and stays rejected.
+                if nested {
+                    self.error_at_code(
+                        alias.range,
+                        codes::UNSUPPORTED,
+                        format!("'from {module} import *' is not supported for extension modules"),
+                    );
+                    continue;
+                }
+                if !self.extension_stars.iter().any(|existing| existing == path) {
+                    self.extension_stars.push(path.to_string());
+                }
+                let Some(all) = self.module_all.clone() else {
+                    continue;
+                };
+                for name in all {
+                    if self.global_names.contains(&name) || self.module_def_names.contains(&name) {
+                        continue;
+                    }
+                    if !self.claim_import_binding(&name, nested) {
+                        continue;
+                    }
+                    self.imported_extension_members
+                        .insert(name.clone(), (path.to_string(), name.clone()));
+                    if !self
+                        .extension_star_bindings
+                        .iter()
+                        .any(|(binding, _)| binding == &name)
+                    {
+                        self.extension_star_bindings
+                            .push((name.clone(), path.to_string()));
+                    }
+                }
                 continue;
             }
             let binding = match &alias.asname {
@@ -3716,6 +3891,23 @@ impl<'a> Lowerer<'a> {
         let mut stores = Vec::new();
         for alias in &s.names {
             if alias.name.as_str() == "*" {
+                // `from <extension> import *`: the statically known names (the
+                // unit's literal `__all__`) are stored into the runtime global
+                // table here, exactly like `from ... import name` bindings.
+                // Reading the extension attribute loads the shared object
+                // through the normal ABI.
+                for (binding, path) in &self.extension_star_bindings {
+                    let value = HExpr {
+                        kind: HExprKind::ExtensionAttr {
+                            path: path.clone(),
+                            member: binding.clone(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    };
+                    stores.push(self.session_global_store(binding, value, line, col));
+                }
                 continue;
             }
             let binding = import_binding(alias);
@@ -4178,6 +4370,41 @@ impl<'a> Lowerer<'a> {
                 }
             }
             Some(ModuleMember::Constant(constant)) => {
+                // A dynamically typed constant is often a class or factory
+                // (`contextvars.Context`, `types.FunctionType`, `ast.Name`):
+                // call it through its runtime value. A typed constant keeps
+                // the compile-time "not callable" diagnostic.
+                if constant.ty == Type::Any {
+                    let (callee_line, callee_col) = self.span(call.func.range());
+                    let callee = HExpr {
+                        kind: HExprKind::ModuleAttr {
+                            module: module.name.to_string(),
+                            name: constant.name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line: callee_line,
+                        col: callee_col,
+                    };
+                    if !call.keywords.is_empty() {
+                        let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                            return self.error_expr(call.range);
+                        };
+                        return result;
+                    }
+                    let Some(args) = self.plain_call_args(call, fs) else {
+                        return self.error_expr(call.range);
+                    };
+                    return HExpr {
+                        kind: HExprKind::IndirectCall {
+                            callee: Box::new(callee),
+                            args,
+                            star: None,
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
+                }
                 self.error_at_code(
                     call.range,
                     codes::CALL,
@@ -11940,7 +12167,7 @@ impl<'a> Lowerer<'a> {
                     }
                 } else if fs.in_lambda
                     && !self.fn_ids.contains_key(name)
-                    && builtin_by_name(name).is_none()
+                    && !is_builtin_value_name(name)
                     && ExcKind::from_class_name(name).is_none()
                     && name != "NotImplemented"
                 {
@@ -12023,6 +12250,36 @@ impl<'a> Lowerer<'a> {
                     HExpr {
                         kind: HExprKind::GlobalGet {
                             module: self.dunder_name.clone(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
+                } else if let Some(path) = self.extension_stars.first() {
+                    // A `from <compiled extension> import *` binds every name
+                    // of the extension at runtime. The literal `__all__` names
+                    // are bound above; any other read is a lazy extension
+                    // member lookup, so private helpers and names missing
+                    // from `__all__` stay reachable.
+                    HExpr {
+                        kind: HExprKind::ExtensionAttr {
+                            path: path.clone(),
+                            member: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
+                } else if stdlib::constant("builtins", name).is_some() {
+                    // A bare name that is a `builtins` module constant (for
+                    // example `object`, `slice`, `complex`, `Ellipsis`)
+                    // resolves exactly like CPython's implicit builtins
+                    // lookup. Exception classes and special constants were
+                    // handled above, so this only covers plain builtin values.
+                    HExpr {
+                        kind: HExprKind::ModuleAttr {
+                            module: "builtins".to_string(),
                             name: name.to_string(),
                         },
                         ty: Ty::Concrete(Type::Any),
@@ -12835,20 +13092,6 @@ impl<'a> Lowerer<'a> {
         // their own diagnostics.
         let value = self.expr(&fv.value, fs);
 
-        let spec = match &fv.format_spec {
-            None => String::new(),
-            Some(spec) => match static_format_spec(spec) {
-                Ok(text) => text,
-                Err(()) => {
-                    self.error_at(
-                        spec.range(),
-                        "dynamic f-string format specs are not supported",
-                    );
-                    return self.error_expr(fv.range);
-                }
-            },
-        };
-
         let conversion = match fv.conversion {
             ast::ConversionFlag::None => 0u8,
             ast::ConversionFlag::Str => 1,
@@ -12856,8 +13099,16 @@ impl<'a> Lowerer<'a> {
             ast::ConversionFlag::Ascii => 3,
         };
 
-        // Plain `{value}` and `{value!s}` are exactly `str(value)`.
-        if spec.is_empty() && conversion <= 1 {
+        // Plain `{value}` and `{value!s}` are exactly `str(value)`. A static
+        // empty spec keeps that shortcut; a dynamic spec must always be
+        // evaluated (it can have side effects), so it takes the full path.
+        let static_spec = fv.format_spec.as_deref().map(static_format_spec);
+        let static_empty = match &static_spec {
+            None => true,
+            Some(Ok(text)) => text.is_empty(),
+            Some(Err(())) => false,
+        };
+        if conversion <= 1 && static_empty {
             return HExpr {
                 kind: HExprKind::Call {
                     callee: Callee::Builtin(Builtin::Str),
@@ -12869,11 +13120,23 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        let spec_expr = HExpr {
-            kind: HExprKind::Const(Const::Str(spec)),
-            ty: Ty::Concrete(Type::Str),
-            line,
-            col,
+        let spec_expr = match static_spec {
+            None => HExpr {
+                kind: HExprKind::Const(Const::Str(String::new())),
+                ty: Ty::Concrete(Type::Str),
+                line,
+                col,
+            },
+            Some(Ok(text)) => HExpr {
+                kind: HExprKind::Const(Const::Str(text)),
+                ty: Ty::Concrete(Type::Str),
+                line,
+                col,
+            },
+            Some(Err(())) => {
+                let spec = fv.format_spec.as_deref().expect("dynamic spec is present");
+                self.format_spec_expr(spec, fs)
+            }
         };
         let conversion_expr = HExpr {
             kind: HExprKind::Const(Const::Int(conversion as i64)),
@@ -12889,6 +13152,43 @@ impl<'a> Lowerer<'a> {
             ty: Ty::Concrete(Type::Str),
             line,
             col,
+        }
+    }
+
+    /// Lowers an f-string format spec to a `str` expression.
+    ///
+    /// A spec with only literal text is a constant. A nested replacement field
+    /// (`{value:{width}}`, `{value:{width}.{precision}f}`) makes the spec
+    /// dynamic: the spec AST is a `JoinedStr`, whose literal chunks and nested
+    /// fields lower exactly like an f-string body. The runtime evaluates the
+    /// resulting string with the same mini-language parser as a static spec.
+    fn format_spec_expr(&mut self, spec: &ast::Expr, fs: &mut FuncState) -> HExpr {
+        let (line, col) = self.span(spec.range());
+        if let Ok(text) = static_format_spec(spec) {
+            return HExpr {
+                kind: HExprKind::Const(Const::Str(text)),
+                ty: Ty::Concrete(Type::Str),
+                line,
+                col,
+            };
+        }
+        match spec {
+            ast::Expr::JoinedStr(joined) => self.joined_str_expr(joined, fs, line, col),
+            // The parser wraps every f-string spec in a `JoinedStr`; keep a
+            // defensive fallback for hand-built IR by stringifying the
+            // expression the same way `{expr}` would.
+            other => {
+                let value = self.expr(other, fs);
+                HExpr {
+                    kind: HExprKind::Call {
+                        callee: Callee::Builtin(Builtin::Str),
+                        args: vec![value],
+                    },
+                    ty: Ty::Concrete(Type::Str),
+                    line,
+                    col,
+                }
+            }
         }
     }
 
@@ -14302,7 +14602,7 @@ impl<'a> Lowerer<'a> {
         // slots are simply absent from its scope.
         if fs.in_lambda
             && !self.fn_ids.contains_key(name)
-            && builtin_by_name(name).is_none()
+            && !is_builtin_value_name(name)
             && ExcKind::from_class_name(name).is_none()
         {
             self.error_at_code(
@@ -14397,6 +14697,28 @@ impl<'a> Lowerer<'a> {
             // above and use the same runtime path.
             if builtin == Builtin::Print && !call.keywords.is_empty() {
                 return self.lower_print_keywords(call, fs, line, col);
+            }
+            // `zip(*iterables, strict=...)`: `strict` is the one keyword the
+            // runtime binder accepts for `zip`, and the iterable list stays
+            // positional, so the call goes through the keyword ABI with the
+            // builtin function value as the callee.
+            if builtin == Builtin::Zip && !call.keywords.is_empty() {
+                return self.lower_zip_keywords(call, fs, line, col);
+            }
+            // `max(iterable, default=...)`: CPython 3.14's keyword-only
+            // `default` only exists for the single-iterable form, so the call
+            // goes through the runtime keyword binder (which also enforces
+            // "Cannot specify a default ... with multiple positional
+            // arguments").
+            if matches!(builtin, Builtin::Max | Builtin::Min)
+                && call.keywords.iter().any(|keyword| {
+                    keyword
+                        .arg
+                        .as_ref()
+                        .is_some_and(|name| name.as_str() == "default")
+                })
+            {
+                return self.lower_extremum_keywords(call, fs, line, col, builtin);
             }
             let Some(mut args) = self.builtin_call_arguments(builtin, call, fs, line, col) else {
                 return self.error_expr(call.range);
@@ -14519,6 +14841,46 @@ impl<'a> Lowerer<'a> {
             let callee = HExpr {
                 kind: HExprKind::GlobalGet {
                     module: self.dunder_name.clone(),
+                    name: name.to_string(),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line: callee_line,
+                col: callee_col,
+            };
+            if !call.keywords.is_empty() {
+                let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                    return self.error_expr(call.range);
+                };
+                return result;
+            }
+            let mut args = Vec::with_capacity(call.args.len());
+            for arg in &call.args {
+                args.push(self.expr(arg, fs));
+            }
+            return HExpr {
+                kind: HExprKind::IndirectCall {
+                    callee: Box::new(callee),
+                    args,
+                    star: None,
+                },
+                ty: self.infer.fresh(),
+                line,
+                col,
+            };
+        }
+
+        if let Some(path) = self.extension_stars.first().cloned() {
+            if !call.keywords.is_empty() {
+                return self.lower_deferred_call(call, fs, line, col);
+            }
+            return self.extension_call(&path, name, call, fs, line, col);
+        }
+
+        if stdlib::constant("builtins", name).is_some() {
+            let (callee_line, callee_col) = self.span(name_expr.range);
+            let callee = HExpr {
+                kind: HExprKind::ModuleAttr {
+                    module: "builtins".to_string(),
                     name: name.to_string(),
                 },
                 ty: Ty::Concrete(Type::Any),
@@ -15642,6 +16004,166 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Lower `zip(*iterables, strict=...)` to the runtime keyword binder
+    /// (`hydro_call_kw` on the `zip` builtin value).
+    ///
+    /// The iterables stay positional; `strict` is the only accepted keyword
+    /// (a duplicate or unknown name is a compile-time diagnostic). The value
+    /// is any object: the runtime applies Python truthiness, so `strict=0`
+    /// keeps the truncating behaviour.
+    fn lower_zip_keywords(
+        &mut self,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let Some(args) = self.plain_call_args(call, fs) else {
+            return self.error_expr(call.range);
+        };
+        let mut keywords: Vec<(String, HExpr)> = Vec::with_capacity(call.keywords.len());
+        for keyword in &call.keywords {
+            let Some(name) = keyword.arg.as_ref() else {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    "zip() does not accept **mapping arguments in this position",
+                );
+                continue;
+            };
+            if name.as_str() != "strict" {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!("zip() got an unexpected keyword argument '{name}'"),
+                );
+                continue;
+            }
+            if keywords
+                .iter()
+                .any(|(existing, _)| existing.as_str() == name.as_str())
+            {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    "zip() got multiple values for keyword argument 'strict'",
+                );
+                continue;
+            }
+            keywords.push((name.to_string(), self.expr(&keyword.value, fs)));
+        }
+        HExpr {
+            kind: HExprKind::CallKw {
+                callee: Box::new(HExpr {
+                    kind: HExprKind::BuiltinRef(Builtin::Zip),
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                }),
+                args,
+                keywords,
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
+    /// Lower `max(iterable, default=..., key=...)` (and `min`) to the runtime
+    /// keyword binder (`hydro_call_kw` on the builtin value).
+    ///
+    /// `default` is keyword-only and CPython rejects it together with multiple
+    /// positional candidates; the diagnostic is emitted here so the runtime
+    /// keeps the same rule for indirect calls.
+    fn lower_extremum_keywords(
+        &mut self,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+        builtin: Builtin,
+    ) -> HExpr {
+        let Some(args) = self.plain_call_args(call, fs) else {
+            return self.error_expr(call.range);
+        };
+        let mut keywords: Vec<(String, HExpr)> = Vec::with_capacity(call.keywords.len());
+        let mut has_default = false;
+        for keyword in &call.keywords {
+            let Some(name) = keyword.arg.as_ref() else {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!(
+                        "{}() does not accept **mapping arguments in this position",
+                        builtin.name()
+                    ),
+                );
+                return self.error_expr(call.range);
+            };
+            if name.as_str() != "key" && name.as_str() != "default" {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!(
+                        "{}() got an unexpected keyword argument '{name}'",
+                        builtin.name()
+                    ),
+                );
+                return self.error_expr(call.range);
+            }
+            if keywords
+                .iter()
+                .any(|(existing, _)| existing.as_str() == name.as_str())
+            {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!(
+                        "{}() got multiple values for keyword argument '{name}'",
+                        builtin.name()
+                    ),
+                );
+                return self.error_expr(call.range);
+            }
+            has_default |= name.as_str() == "default";
+            keywords.push((name.to_string(), self.expr(&keyword.value, fs)));
+        }
+        if has_default && args.len() > 1 {
+            self.error_at_code(
+                call.range,
+                codes::CALL,
+                format!(
+                    "Cannot specify a default for {}() with multiple positional arguments",
+                    builtin.name()
+                ),
+            );
+            return self.error_expr(call.range);
+        }
+        if args.is_empty() {
+            self.error_at_code(
+                call.range,
+                codes::CALL,
+                format!("{}() expects at least 1 argument", builtin.name()),
+            );
+            return self.error_expr(call.range);
+        }
+        HExpr {
+            kind: HExprKind::CallKw {
+                callee: Box::new(HExpr {
+                    kind: HExprKind::BuiltinRef(builtin),
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                }),
+                args,
+                keywords,
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
     fn builtin_call_arguments(
         &mut self,
         builtin: Builtin,
@@ -15982,8 +16504,9 @@ fn cmp_op(op: ast::CmpOp) -> BinOp {
 /// Extracts the static text of an f-string format spec.
 ///
 /// The parser represents `:{...}` as a `JoinedStr`; only literal parts are
-/// supported. A nested replacement field (a dynamic spec such as `{x:{w}}`)
-/// yields `Err(())` so lowering can report a clear diagnostic.
+/// static. A nested replacement field (a dynamic spec such as `{x:{w}}`)
+/// yields `Err(())`, and the caller lowers the spec to a runtime `str`
+/// expression instead.
 fn static_format_spec(spec: &ast::Expr) -> Result<String, ()> {
     match spec {
         ast::Expr::Constant(c) => match &c.value {
@@ -16009,6 +16532,13 @@ fn static_format_spec(spec: &ast::Expr) -> Result<String, ()> {
 
 fn builtin_by_name(name: &str) -> Option<Builtin> {
     Builtin::from_name(name)
+}
+
+/// Whether `name` resolves to an unqualified builtin value: a compiler
+/// builtin (`len`, `zip`, ...) or a `builtins` module constant (`object`,
+/// `Ellipsis`, ...). Lambdas may read both without a capture.
+fn is_builtin_value_name(name: &str) -> bool {
+    builtin_by_name(name).is_some() || stdlib::constant("builtins", name).is_some()
 }
 
 /// One `namespace[name] = value` store used while building a dynamic class
@@ -16933,6 +17463,49 @@ fn module_docstring(stmts: &[ast::Stmt]) -> Option<String> {
         return None;
     };
     Some(text.clone())
+}
+
+/// Names bound by module-level `def`/`async def` statements.
+///
+/// Only statements that execute at module level are visited: a `def` inside a
+/// function is a local of that function and not a module binding. Conditional
+/// module-level blocks (`if`/`try`/loops/`with`) execute at module level, so
+/// their definitions are included.
+fn collect_module_def_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::FunctionDef(s) => {
+                out.insert(s.name.to_string());
+            }
+            ast::Stmt::AsyncFunctionDef(s) => {
+                out.insert(s.name.to_string());
+            }
+            ast::Stmt::ClassDef(_) => {}
+            ast::Stmt::If(s) => {
+                collect_module_def_names(&s.body, out);
+                collect_module_def_names(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_module_def_names(&s.body, out);
+                collect_module_def_names(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_module_def_names(&s.body, out);
+                collect_module_def_names(&s.orelse, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_module_def_names(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_module_def_names(&handler.body, out);
+                }
+                collect_module_def_names(&s.orelse, out);
+                collect_module_def_names(&s.finalbody, out);
+            }
+            ast::Stmt::With(s) => collect_module_def_names(&s.body, out),
+            _ => {}
+        }
+    }
 }
 
 /// Collects the module-level simple-name assignment targets and class

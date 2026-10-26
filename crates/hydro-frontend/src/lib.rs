@@ -101,11 +101,16 @@ fn parse_module(
 /// segment: it is importable and acts as a search root for its submodules, but
 /// it has no module body and therefore no initializer. Every module is loaded
 /// once per canonical path; missing files and incompatible
-/// extensions are reported as diagnostics, as are import cycles made only of
-/// module-level imports. Imports nested inside functions, classes and compound
-/// statements only run when that code does: they are recorded but never
-/// loaded, and reading a name they bind raises `RuntimeError` (`dynamic import
-/// ... is not supported`) instead of failing compilation. Imported module
+/// extensions are reported as diagnostics. Import cycles bind the edge that
+/// reaches a module still being initialized late, through its runtime global
+/// table, so each unit is compiled and initialized exactly once. Imports
+/// nested inside functions and classes only run when that code does: they are
+/// recorded but never loaded, and reading a name they bind raises the runtime
+/// import error instead of failing compilation. Imports inside module-level
+/// control flow (`if`/`for`/`while`/`with`) run while the module initializes,
+/// so a module found on the search path is linked like a top-level import
+/// while an absent one stays deferred; a module-level `try` body links only
+/// modules whose initializer cannot fail inside the handler. Imported module
 /// bodies are compiled into the returned [`Program`] and run before the entry
 /// module (see [`Program::initializers`]).
 pub fn check_file(path: &Path) -> Result<Program, Vec<Diagnostic>> {
@@ -258,6 +263,9 @@ struct LoadedModule {
     /// binds their names to a runtime `RuntimeError` stub unless the module is
     /// already a visible dependency or native.
     deferred: Vec<(String, Option<String>)>,
+    /// Module-level `from X import *` targets of this unit (see
+    /// [`ImportScan::star_imports`]).
+    star_imports: Vec<String>,
 }
 
 /// One module's import scan: linked dependencies, failure state and the
@@ -275,6 +283,11 @@ struct ImportScan {
     /// They are never loaded; the lowerer binds the names to a runtime error
     /// stub (`dynamic import ... is not supported`).
     deferred: Vec<(String, Option<String>)>,
+    /// User modules this unit star-imports at module level (`from X import *`).
+    /// Their literal `__all__` feeds the unit's effective `__all__`, mirroring
+    /// the runtime `extend_all(module)` pattern NumPy uses to re-export whole
+    /// dependency surfaces.
+    star_imports: Vec<String>,
 }
 
 impl ImportScan {
@@ -320,14 +333,11 @@ enum NamedLoad {
     Missing,
     /// A diagnostic was already produced for the module (read/parse error).
     Failed,
-    /// The module is already on the load stack; the payload is the import
-    /// chain from the cycle start.
-    Cyclic {
-        chain: Vec<String>,
-    },
-    /// The module is the importer itself or one of its ancestor packages and
-    /// is still initializing: importable, but it must not become a dependency
-    /// edge (that would be a cycle).
+    /// The module is already initializing (it is on the load stack, either the
+    /// importer's ancestor package or a module reached through an import
+    /// cycle): importable, but it must not become a dependency edge. Its
+    /// members are bound late through the runtime global table, and its body
+    /// still becomes exactly one initializer.
     InProgress,
 }
 
@@ -424,6 +434,7 @@ impl ModuleLoader {
             deps: scan.deps,
             late: scan.late,
             deferred: scan.deferred,
+            star_imports: scan.star_imports,
         });
         // The key is not registered in `loaded`: a session deliberately
         // compiles every fragment as a new unit, even when it reuses a
@@ -516,6 +527,7 @@ impl ModuleLoader {
             deps: scan.deps,
             late: scan.late,
             deferred: scan.deferred,
+            star_imports: scan.star_imports,
         });
         self.loaded.insert(key, index);
         self.by_name.insert(name, index);
@@ -551,22 +563,19 @@ impl ModuleLoader {
                 loaded.push(index);
                 continue;
             }
-            if let Some(start) = self.stack.iter().position(|(path, _)| path == &key) {
+            if let Some(_start) = self.stack.iter().position(|(path, _)| path == &key) {
                 if final_module {
-                    // A package that is importing this module right now is
-                    // the caller's ancestor and stays partially initialized,
-                    // exactly like CPython's parent module during `import
-                    // pkg.sub`. It is importable, but linking it as a
-                    // dependency would be a cycle.
-                    if self.is_initializing_ancestor(&resolved.name) {
-                        return NamedLoad::InProgress;
-                    }
-                    let mut cycle: Vec<String> = self.stack[start..]
-                        .iter()
-                        .map(|(_, module)| module.clone())
-                        .collect();
-                    cycle.push(resolved.name);
-                    return NamedLoad::Cyclic { chain: cycle };
+                    // The module is initializing right now (an ancestor
+                    // package or a genuine import cycle). CPython exposes the
+                    // partially initialized module and binds members when the
+                    // code that reads them runs; Hydro has the same observable
+                    // contract by recording the name as *late*: the importer
+                    // reads the target's global table at use time, the target
+                    // is not linked as a dependency, and its single unit —
+                    // loaded by the outer frame on the stack — provides the
+                    // one-time initializer. Re-loading the file here would
+                    // compile it twice and run its initializer twice.
+                    return NamedLoad::InProgress;
                 }
                 // Package `__init__.py` currently initializing: its own unit
                 // is the importer, so it must not be linked as a dependency.
@@ -614,10 +623,7 @@ impl ModuleLoader {
     ) -> Option<usize> {
         match self.load_named(name, importer_dir, module_root) {
             NamedLoad::Loaded(mut loaded) => loaded.pop(),
-            NamedLoad::Missing
-            | NamedLoad::Failed
-            | NamedLoad::Cyclic { .. }
-            | NamedLoad::InProgress => None,
+            NamedLoad::Missing | NamedLoad::Failed | NamedLoad::InProgress => None,
         }
     }
 
@@ -1105,19 +1111,6 @@ impl ModuleLoader {
         true
     }
 
-    /// Whether `name` is the module currently being scanned or one of its
-    /// ancestor packages. Both are on the load stack when a module-level
-    /// import reaches back to the package that is initializing them.
-    fn is_initializing_ancestor(&self, name: &str) -> bool {
-        let Some((_, importer)) = self.stack.last() else {
-            return false;
-        };
-        importer == name
-            || (importer.len() > name.len()
-                && importer.starts_with(name)
-                && importer.as_bytes()[name.len()] == b'.')
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn scan_imports(
         &mut self,
@@ -1141,6 +1134,7 @@ impl ModuleLoader {
             scan,
             false,
             false,
+            false,
         );
     }
 
@@ -1149,12 +1143,19 @@ impl ModuleLoader {
     /// `deferred == false` is the module body: its imports are resolved and
     /// linked eagerly, so their initializers keep dependency order
     /// (dependencies before importers) and circular imports are diagnosed.
-    /// Everything nested inside a function, class or compound statement is
-    /// `deferred == true`: the import only runs when that code executes, so it
-    /// is recorded as a `(module, member)` edge and never loaded. This keeps
-    /// optional dependency graphs (for example `rich/_extension.py` importing
+    /// `deferred == true` means the import runs only when the enclosing
+    /// function or class body executes, so it is recorded as a
+    /// `(module, member)` edge and never loaded. This keeps optional
+    /// dependency graphs (for example `rich/_extension.py` importing
     /// `rich.pretty` and `rich.traceback` inside a function) out of the
     /// program unless their code is actually needed.
+    ///
+    /// Module-level control flow (`if`/`for`/`while`/`with` in the module body)
+    /// is *conditional*: its body runs while the module initializes, so an
+    /// import there may not be dropped — NumPy imports `_core` inside an
+    /// `if`/`else`. A module found on the search path is linked like a
+    /// top-level import, while one that is absent stays deferred (a platform
+    /// branch that does not run on this host must still compile).
     ///
     /// Branches whose guard is fixed by the import contract are still skipped
     /// — `if TYPE_CHECKING:` never runs (annotations are not evaluated) and
@@ -1179,6 +1180,7 @@ impl ModuleLoader {
         scan: &mut ImportScan,
         deferred: bool,
         optional: bool,
+        conditional: bool,
     ) {
         for stmt in stmts {
             match stmt {
@@ -1228,6 +1230,7 @@ impl ModuleLoader {
                             alias.name.as_str(),
                             alias.range,
                             scan,
+                            conditional,
                         );
                     }
                 }
@@ -1311,6 +1314,7 @@ impl ModuleLoader {
                             &module_name,
                             s.range,
                             scan,
+                            conditional,
                         );
                     }
                     // `from pkg import sub` may name a submodule rather than
@@ -1324,7 +1328,23 @@ impl ModuleLoader {
                             if !scan.deps.contains(&index) {
                                 scan.deps.push(index);
                             }
+                            continue;
                         }
+                        // Inside module-level control flow an absent submodule
+                        // may simply be a branch that does not run here. Record
+                        // the name so the lowerer binds it late instead of
+                        // rejecting the program; `X.member` attribute imports
+                        // from a module that *was* linked never take this path.
+                        if conditional
+                            && (module_name == current || !self.by_name.contains_key(&module_name))
+                        {
+                            scan.record_deferred(&full, Some(alias.name.as_str()));
+                        }
+                    }
+                    if module_name != current
+                        && s.names.iter().any(|alias| alias.name.as_str() == "*")
+                    {
+                        scan.star_imports.push(module_name.clone());
                     }
                 }
                 ast::Stmt::FunctionDef(s) => self.scan_stmts(
@@ -1338,6 +1358,7 @@ impl ModuleLoader {
                     scan,
                     true,
                     false,
+                    false,
                 ),
                 ast::Stmt::AsyncFunctionDef(s) => self.scan_stmts(
                     &s.body,
@@ -1349,6 +1370,7 @@ impl ModuleLoader {
                     package,
                     scan,
                     true,
+                    false,
                     false,
                 ),
                 // A class body executes when the class statement runs, but it
@@ -1365,8 +1387,15 @@ impl ModuleLoader {
                     scan,
                     true,
                     false,
+                    false,
                 ),
                 ast::Stmt::If(s) => {
+                    // Module-level branches execute while the module
+                    // initializes, so imports inside them are linked (or
+                    // recorded as deferred when the module is absent — a
+                    // platform branch that does not run here). Inside a
+                    // function or class body the whole block stays deferred.
+                    let conditional = conditional || !deferred;
                     let branch = lower::static_if_branch(&s.test, current);
                     if branch != Some(false) {
                         self.scan_stmts(
@@ -1378,8 +1407,9 @@ impl ModuleLoader {
                             current,
                             package,
                             scan,
-                            true,
+                            deferred,
                             optional,
+                            conditional,
                         );
                     }
                     if branch != Some(true) {
@@ -1392,8 +1422,9 @@ impl ModuleLoader {
                             current,
                             package,
                             scan,
-                            true,
+                            deferred,
                             optional,
+                            conditional,
                         );
                     }
                 }
@@ -1408,7 +1439,9 @@ impl ModuleLoader {
                         current,
                         package,
                         scan,
+                        deferred,
                         optional,
+                        conditional,
                     );
                 }
                 ast::Stmt::AsyncFor(s) => {
@@ -1422,7 +1455,9 @@ impl ModuleLoader {
                         current,
                         package,
                         scan,
+                        deferred,
                         optional,
+                        conditional,
                     );
                 }
                 ast::Stmt::While(s) => {
@@ -1436,7 +1471,9 @@ impl ModuleLoader {
                         current,
                         package,
                         scan,
+                        deferred,
                         optional,
+                        conditional,
                     );
                 }
                 ast::Stmt::Try(s) => {
@@ -1455,7 +1492,13 @@ impl ModuleLoader {
                         scan,
                         true,
                         optional || !deferred,
+                        conditional,
                     );
+                    // Handler, `else` and `finally` bodies execute at import
+                    // time too (a handler only on an exception), so their
+                    // imports are conditional rather than dropped. Nested in a
+                    // function they stay deferred like every other block.
+                    let conditional = conditional || !deferred;
                     for handler in &s.handlers {
                         let ast::ExceptHandler::ExceptHandler(handler) = handler;
                         self.scan_stmts(
@@ -1467,8 +1510,9 @@ impl ModuleLoader {
                             current,
                             package,
                             scan,
-                            true,
+                            deferred,
                             false,
+                            conditional,
                         );
                     }
                     self.scan_stmts(
@@ -1480,8 +1524,9 @@ impl ModuleLoader {
                         current,
                         package,
                         scan,
-                        true,
+                        deferred,
                         false,
+                        conditional,
                     );
                     self.scan_stmts(
                         &s.finalbody,
@@ -1492,8 +1537,9 @@ impl ModuleLoader {
                         current,
                         package,
                         scan,
-                        true,
+                        deferred,
                         false,
+                        conditional,
                     );
                 }
                 ast::Stmt::With(s) => self.scan_stmts(
@@ -1505,8 +1551,9 @@ impl ModuleLoader {
                     current,
                     package,
                     scan,
-                    true,
+                    deferred,
                     optional,
+                    conditional || !deferred,
                 ),
                 ast::Stmt::AsyncWith(s) => self.scan_stmts(
                     &s.body,
@@ -1517,8 +1564,9 @@ impl ModuleLoader {
                     current,
                     package,
                     scan,
-                    true,
+                    deferred,
                     optional,
+                    conditional || !deferred,
                 ),
                 _ => {}
             }
@@ -1538,7 +1586,9 @@ impl ModuleLoader {
         current: &str,
         package: &str,
         scan: &mut ImportScan,
+        deferred: bool,
         optional: bool,
+        conditional: bool,
     ) {
         self.scan_stmts(
             body,
@@ -1549,8 +1599,9 @@ impl ModuleLoader {
             current,
             package,
             scan,
-            true,
+            deferred,
             optional,
+            conditional || !deferred,
         );
         self.scan_stmts(
             orelse,
@@ -1561,15 +1612,25 @@ impl ModuleLoader {
             current,
             package,
             scan,
-            true,
+            deferred,
             optional,
+            conditional || !deferred,
         );
     }
 
     /// Resolves one module-level user import and loads it on demand.
     ///
     /// A module that is still initializing (an ancestor package of the
-    /// importer) is recorded for late binding; a real cycle is reported.
+    /// importer) is recorded for late binding.
+    ///
+    /// `conditional` marks an import that runs only when a module-level
+    /// control-flow branch executes (`if`/loop/`with`, or a `try` handler).
+    /// The loader still links the module when the search path finds it — NumPy
+    /// imports its `_core` package inside `if __NUMPY_SETUP__: ... else:` — but
+    /// an absent module stays deferred instead of failing compilation: a
+    /// platform branch that never runs must not require the platform's
+    /// modules, and the runtime raises `ModuleNotFoundError` only if the branch
+    /// actually executes.
     #[allow(clippy::too_many_arguments)]
     fn resolve_import(
         &mut self,
@@ -1580,6 +1641,7 @@ impl ModuleLoader {
         name: &str,
         range: rustpython_parser::text_size::TextRange,
         scan: &mut ImportScan,
+        conditional: bool,
     ) {
         if hydro_ir::stdlib::module(name).is_some() {
             return;
@@ -1617,21 +1679,19 @@ impl ModuleLoader {
                 }
             }
             NamedLoad::Failed => scan.failed = true,
-            // The module is already initializing (an ancestor package of the
-            // importer): no unit to link, and nothing to report here. The
-            // lowerer binds its members late, through the runtime global table.
+            // The module is initializing right now: an ancestor package, or a
+            // module reached through a true import cycle. No second unit is
+            // created; members are read late from its global table once the
+            // outer frame finishes its one-time initializer.
             NamedLoad::InProgress => scan.record_late(name),
-            NamedLoad::Cyclic { chain } => {
-                self.push_span(
-                    source,
-                    display,
-                    range,
-                    codes::UNSUPPORTED,
-                    format!("circular import: {}", chain.join(" -> ")),
-                );
-                scan.failed = true;
-            }
             NamedLoad::Missing => {
+                if conditional {
+                    // The branch may not run on this platform/interpreter;
+                    // link nothing and let the runtime importer report the
+                    // missing module only if the branch executes.
+                    scan.record_deferred(name, None);
+                    return;
+                }
                 self.push_span(
                     source,
                     display,
@@ -1864,6 +1924,61 @@ fn resolve_module_in(root: &Path, parts: &[&str]) -> Option<Vec<ResolvedModule>>
     None
 }
 
+/// Effective `__all__` of a loaded unit, including names a module re-exports
+/// through module-level `from dependency import *`.
+///
+/// NumPy builds its public surface with `from .umath import *` followed by
+/// `extend_all(umath)`, which appends the dependency's `__all__` to its own at
+/// runtime. A star import of that module must therefore see the union, not the
+/// literal list only; otherwise whole dependency surfaces (`absolute`, every
+/// ufunc, ...) silently disappear from `numpy._core` and `numpy`.
+///
+/// A dependency without a literal `__all__` contributes its public export
+/// names (the same fallback CPython uses). `visiting` breaks cycles: a module
+/// reached again keeps its literal list.
+fn effective_module_all(
+    units: &[LoadedModule],
+    exports: &[HashMap<String, lower::UserExport>],
+    index: usize,
+    visiting: &mut HashSet<usize>,
+) -> Option<Vec<String>> {
+    let literal = lower::module_all_names(&units[index].module.body);
+    if !visiting.insert(index) {
+        return literal;
+    }
+    let Some(mut names) = literal else {
+        visiting.remove(&index);
+        return None;
+    };
+    for dependency in &units[index].star_imports {
+        let Some(dep) = units
+            .iter()
+            .position(|unit| unit.name.as_str() == dependency.as_str())
+        else {
+            continue;
+        };
+        let extra = match effective_module_all(units, exports, dep, visiting) {
+            Some(dep_names) => dep_names,
+            None => {
+                let mut public: Vec<String> = exports[dep]
+                    .keys()
+                    .filter(|name| !name.starts_with('_'))
+                    .cloned()
+                    .collect();
+                public.sort();
+                public
+            }
+        };
+        for name in extra {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    visiting.remove(&index);
+    Some(names)
+}
+
 /// Lowers every loaded module in dependency order and links the results.
 ///
 /// The module bodies of imported units become [`Program::initializers`] (in
@@ -1922,7 +2037,7 @@ fn lower_modules(
                 UserModule {
                     name: dep.name.clone(),
                     exports: exports[dep_index].clone(),
-                    all: lower::module_all_names(&dep.module.body),
+                    all: effective_module_all(units, &exports, dep_index, &mut HashSet::new()),
                 },
             );
         }
@@ -2190,6 +2305,10 @@ mod tests {
             ExprKind::IndirectCall { callee, .. } => {
                 matches!(&callee.kind, ExprKind::FunctionRef(f) if *f == id)
             }
+            // The keyword-capable call path wraps the same function value.
+            ExprKind::CallKw { callee, .. } => {
+                matches!(&callee.kind, ExprKind::FunctionRef(f) if *f == id)
+            }
             _ => false,
         }
     }
@@ -2393,21 +2512,151 @@ mod tests {
     }
 
     #[test]
-    fn circular_imports_are_diagnosed_with_both_files() {
-        let dir = TestDir::new("cycle");
-        dir.write("a.py", "from b import g\n\ndef f():\n    return 1\n");
-        dir.write("b.py", "from a import f\n\ndef g():\n    return 2\n");
-        let main = dir.write("main.py", "import a\nprint(a.f())\n");
-        let diags = check_file(&main).expect_err("cycle must fail");
-        assert!(
-            diags
-                .iter()
-                .any(|diag| diag.message.contains("circular import")),
-            "{diags:?}"
+    fn imports_in_module_level_branches_are_linked() {
+        // NumPy imports its `_core` package from `if __NUMPY_SETUP__: ...
+        // else:`. The branch runs while the module initializes, so the package
+        // is a real dependency whose initializer runs before the importer;
+        // dropping it produced `ModuleNotFoundError: No module named
+        // 'numpy._core'` at runtime. A module absent on this host (a platform
+        // branch) stays a deferred runtime import instead of a compile error.
+        let dir = TestDir::new("conditional-import");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "SETUP = False\nif SETUP:\n    from . import absent\nelse:\n    from . import core\n    from .core import value\n\ndef exported():\n    return value()\n",
+        )
+        .expect("write package init");
+        fs::write(pkg.join("core.py"), "def value():\n    return 7\n").expect("write core");
+        let main = dir.write("main.py", "import pkg\nprint(pkg.exported())\n");
+        let program = program(&main);
+
+        // The `else` branch executes at import time: `core` is compiled once
+        // and initialized before the package body that imports it.
+        let initializer_names: Vec<&str> = program
+            .initializers
+            .iter()
+            .map(|id| program.functions[*id as usize].name.as_str())
+            .collect();
+        assert_eq!(
+            initializer_names,
+            ["pkg.core.<module>", "pkg.<module>"],
+            "the conditional dependency initializes before its importer"
         );
+
+        // `pkg.exported` calls the linked `core.value` directly.
+        let exported = function_id(&program, "pkg.exported");
         assert!(
-            diags.iter().any(|diag| diag.file.ends_with("b.py")),
-            "diagnostic must point at the importing file: {diags:?}"
+            calls_function(
+                returned_expression(&program, exported),
+                function_id(&program, "pkg.core.value"),
+            ),
+            "the else branch must link core.value: {:?}",
+            returned_expression(&program, exported).kind
+        );
+
+        // The absent branch module never becomes a unit.
+        assert!(
+            program
+                .functions
+                .iter()
+                .all(|function| !function.name.contains("absent")),
+            "a deferred branch module must not be compiled"
+        );
+    }
+
+    #[test]
+    fn circular_imports_bind_late_and_initialize_each_unit_once() {
+        // `a` imports `b` eagerly and `b` imports back from `a`. CPython
+        // exposes the partially initialized `a` to `b`; Hydro records that
+        // back edge as late binding, compiles each file once and runs exactly
+        // one initializer per module, `b` before `a` because `b` finishes
+        // loading first.
+        let dir = TestDir::new("cycle");
+        dir.write("a.py", "from b import g\n\ndef f():\n    return g()\n");
+        dir.write("b.py", "from a import f\n\ndef g():\n    return f()\n");
+        let main = dir.write("main.py", "import a\nprint(a.f())\n");
+        let program = program(&main);
+
+        // Each unit is compiled exactly once.
+        for name in ["a.f", "b.g"] {
+            assert_eq!(
+                program
+                    .functions
+                    .iter()
+                    .filter(|function| function.name == name)
+                    .count(),
+                1,
+                "{name} must be compiled once"
+            );
+        }
+        let initializer_names: Vec<&str> = program
+            .initializers
+            .iter()
+            .map(|id| program.functions[*id as usize].name.as_str())
+            .collect();
+        assert_eq!(
+            initializer_names,
+            ["b.<module>", "a.<module>"],
+            "one initializer per module, dependency side first"
+        );
+
+        // `b` reads the still-initializing `a.f` through the global table.
+        use hydro_ir::ExprKind;
+        let g = function_id(&program, "b.g");
+        let (ExprKind::IndirectCall { callee, .. } | ExprKind::CallKw { callee, .. }) =
+            &returned_expression(&program, g).kind
+        else {
+            panic!(
+                "b.g must call the late-bound a.f, got {:?}",
+                returned_expression(&program, g).kind
+            );
+        };
+        assert!(
+            matches!(
+                &callee.kind,
+                ExprKind::GlobalGet { module, name } if module == "a" && name == "f"
+            ),
+            "the cycle back edge must read a.f late: {:?}",
+            callee.kind
+        );
+
+        // The eager edge `a` -> `b` keeps its direct function link.
+        let f = function_id(&program, "a.f");
+        let g_id = function_id(&program, "b.g");
+        assert!(
+            calls_function(returned_expression(&program, f), g_id),
+            "a.f must call b.g directly"
+        );
+    }
+
+    #[test]
+    fn star_reexports_extend_the_effective_all() {
+        // `base` defines `value`; `middle` star-imports it and declares a
+        // literal `__all__` of its own. NumPy extends `__all__` at runtime
+        // with `extend_all(...)`; the loader must mirror that union, or every
+        // re-exported name disappears from the importer's namespace.
+        let dir = TestDir::new("effective-all");
+        dir.write(
+            "base.py",
+            "__all__ = ['value']\n\ndef value():\n    return 7\n",
+        );
+        dir.write(
+            "middle.py",
+            "from base import *\n\n__all__ = ['local']\n\ndef local():\n    return 1\n",
+        );
+        let main = dir.write("main.py", "from middle import *\nvalue()\nlocal()\n");
+        let program = program(&main);
+
+        let value = function_id(&program, "base.value");
+        assert!(
+            program.main_function().body.iter().any(|stmt| {
+                matches!(
+                    &stmt.kind,
+                    hydro_ir::StmtKind::Expr(expr) if calls_function(expr, value)
+                )
+            }),
+            "middle must re-export base.value through its effective __all__"
         );
     }
 
