@@ -8,6 +8,23 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-26 package-prerequisite slice
+
+- Installed real CPython 3.14 NumPy 2.5, pandas 3.1, pydantic 2.14 and
+  pydantic-core 2.50 wheels through `tea install`.
+- Added module-global views (`globals`, `locals`, `vars`, `dir`,
+  `builtins.__dict__`), dynamic module-global writes, class-body runtime
+  namespaces (`del`/control flow), literal `eval`, and explicit
+  eval/exec/compile gaps.
+- Exported CPython builtin type data symbols (`PyLong_Type`, `PyType_Type`,
+  `PyUnicode_Type`, …), getset/member/number/sequence/mapping/iter/
+  richcompare slots, multiple-base C3, module/import/sys APIs, unicode/long
+  writers, allocators and mutexes; added real `PyNumber_Negative` scalar
+  fallback.
+- Real `.so` inventory recorded: NumPy needs 227 missing symbols,
+  pydantic-core 112, sampled pandas libs at least 124. Import remains
+  blocked by language and runtime semantics before those C calls.
+
 ### Added — 2026-10-26 four-scope checkpoint
 
 - Import/module registry: `sys.path`/`sys.modules`/`sys.builtin_module_names`,

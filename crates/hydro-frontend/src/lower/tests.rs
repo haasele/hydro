@@ -9075,3 +9075,43 @@ fn print_rejects_unknown_keywords() {
         "{diags:?}"
     );
 }
+
+#[test]
+fn globals_call_carries_the_owning_module_name() {
+    let source = "def read():\n    return globals()\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Return(Some(value)) = &hir.functions[1].body[0].kind else {
+        panic!("expected a return, got {:?}", hir.functions[1].body[0]);
+    };
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::Globals),
+        args,
+    } = &value.kind
+    else {
+        panic!("expected a globals() call, got {:?}", value.kind);
+    };
+    // The module name is compile-time knowledge: it is the call's single
+    // hidden argument instead of a runtime frame lookup.
+    assert_eq!(args.len(), 1, "{args:?}");
+    assert!(matches!(
+        &args[0].kind,
+        HExprKind::Const(Const::Str(name)) if name == "__main__"
+    ));
+    crate::sema::check(&hir, &mut infer, "test.py").expect("valid program");
+}
+
+#[test]
+fn class_body_statements_run_against_a_runtime_namespace() {
+    let source = "class C:\n    x = 1\n    del x\n    if True:\n        y = 2\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    // A body that executes statements lowers to the namespace sequence
+    // wrapper rather than the static `class` statement.
+    assert!(
+        matches!(&hir.functions[0].body[0].kind, HStmtKind::If { .. }),
+        "expected the dynamic class wrapper, got {:?}",
+        hir.functions[0].body[0].kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("valid program");
+}

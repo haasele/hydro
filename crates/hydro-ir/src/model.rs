@@ -409,6 +409,58 @@ pub enum Builtin {
     /// therefore reports "not a Jupyter kernel". The bare name also resolves,
     /// so `try: get_ipython / except NameError:` never takes the handler.
     GetIpython,
+    /// `globals()`: a live view of the enclosing module's global namespace.
+    ///
+    /// A direct call always carries the owning module's dotted name as a
+    /// hidden trailing constant argument (the frontend knows the unit). The
+    /// runtime returns one cached `dict` per module, refreshed from the
+    /// runtime global store, so reads and item writes observe the compiled
+    /// module globals. The bare name resolves as a callable value too, but
+    /// calling that value without the hidden module argument raises a tagged
+    /// `RuntimeError` (a function value carries no module context).
+    Globals,
+    /// `locals()`: a `dict` snapshot of the current frame's locals.
+    ///
+    /// Codegen materialises the dict from the live local slots, using the
+    /// names recorded in the function's local table (compiler-private `$…`
+    /// slots are omitted). At module level this is the module body's own
+    /// namespace, mirroring CPython's `locals() is globals()` there.
+    Locals,
+    /// `dir([object])`: the sorted attribute-name list of a module, class,
+    /// instance or builtin value. With no argument, codegen lists the current
+    /// frame's local names instead of calling the runtime.
+    Dir,
+    /// `vars([object])`: the object's `__dict__` (or, without an argument, the
+    /// current frame's locals). Modules return their namespace mapping.
+    Vars,
+    /// `eval(source[, globals[, locals]])`: evaluates a Python expression
+    /// string. Hydro compiles ahead of time, so this supports the forms a
+    /// bootstrap path can evaluate without a parser: literals (`ast`
+    /// literal grammar) and bare/dotted names looked up in the given
+    /// namespaces. Every other expression raises a tagged
+    /// `NotImplementedError` naming the source, never a placeholder value.
+    Eval,
+    /// `exec(source[, globals[, locals]])`: Hydro has no runtime statement
+    /// compiler, so this always raises a tagged `NotImplementedError`.
+    Exec,
+    /// `compile(source, filename, mode, ...)`: Hydro has no bytecode compiler,
+    /// so this always raises a tagged `NotImplementedError`.
+    Compile,
+    /// Internal: build a class from a runtime namespace `dict`, the shape used
+    /// by class bodies that execute statements (`del`, `if`, `for`, `with`,
+    /// `try`, …). Arguments are the class name, a tuple of bases, the
+    /// metaclass value or `None`, and the namespace dict. Function values in
+    /// the namespace become ordinary methods, `classmethod`/`staticmethod`/
+    /// `property` descriptors keep their binding kind, and every other value
+    /// becomes a frozen class attribute. Not reachable from source: the name
+    /// starts with `$`, which cannot appear in a Python identifier.
+    ClassFromNamespace,
+    /// Internal: `globals()[name] = value` writes through the module's live
+    /// namespace view into the runtime global store, so later static reads and
+    /// `getattr(module, name)` observe the binding. The frontend lowers that
+    /// exact store shape to this builtin; arguments are the module name, the
+    /// key and the value. Not reachable from source (`$`-prefixed name).
+    GlobalSetDynamic,
 }
 
 impl Builtin {
@@ -463,6 +515,17 @@ impl Builtin {
             Builtin::DictMerge => "dict merge",
             Builtin::Input => "input",
             Builtin::GetIpython => "get_ipython",
+            Builtin::Globals => "globals",
+            Builtin::Locals => "locals",
+            Builtin::Dir => "dir",
+            Builtin::Vars => "vars",
+            Builtin::Eval => "eval",
+            Builtin::Exec => "exec",
+            Builtin::Compile => "compile",
+            // Internal spellings start with `$`, which cannot occur in a
+            // Python identifier, so source code can never name them.
+            Builtin::ClassFromNamespace => "$class_from_namespace",
+            Builtin::GlobalSetDynamic => "$global_set_dynamic",
         }
     }
 
@@ -517,6 +580,16 @@ impl Builtin {
             "callable" => Builtin::Callable,
             "input" => Builtin::Input,
             "get_ipython" => Builtin::GetIpython,
+            "globals" => Builtin::Globals,
+            "locals" => Builtin::Locals,
+            "dir" => Builtin::Dir,
+            "vars" => Builtin::Vars,
+            "eval" => Builtin::Eval,
+            "exec" => Builtin::Exec,
+            "compile" => Builtin::Compile,
+            // Internal names (never produced by the parser).
+            "$class_from_namespace" => Builtin::ClassFromNamespace,
+            "$global_set_dynamic" => Builtin::GlobalSetDynamic,
             _ => return None,
         })
     }

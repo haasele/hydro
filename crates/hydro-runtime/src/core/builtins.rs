@@ -4,11 +4,13 @@
 
 use std::io::Write as _;
 
-use hydro_ir::{Builtin, MethodKind, ParamKind};
+use hydro_ir::{stdlib, Builtin, MethodKind, ParamKind};
 
 use crate::container;
+use crate::core::globals;
 use crate::exc::{
-    self, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
+    self, NAME_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, SYNTAX_ERROR,
+    TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
 };
 use crate::format;
 use crate::iter;
@@ -2355,6 +2357,377 @@ fn type_three_arg(name: i64, bases: i64, namespace: i64) -> i64 {
     value::class_new_multi(name_text, base_values, NONE, methods, attrs)
 }
 
+/// `globals()`: the live namespace mapping of the module codegen named.
+///
+/// The frontend appends the owning module's dotted name as a hidden trailing
+/// argument, so a direct `globals()` never guesses a frame. Calls through a
+/// first-class `globals` value carry no module and fail loudly instead.
+fn globals_builtin(module_arg: i64) -> i64 {
+    let Some(module) = value::as_str(module_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "globals() requires the owning module name supplied by codegen",
+        );
+    };
+    globals::view(module)
+}
+
+/// `vars(object)`: the object's namespace mapping.
+fn vars_value(object: i64) -> i64 {
+    if let Some(module) = value::as_module(object) {
+        let name = module.name().to_string();
+        return modules::module_dict(&name);
+    }
+    if value::as_instance(object).is_some() {
+        return match value::instance_dict(object) {
+            Some(mapping) => mapping,
+            None => exc::raise_with_message(TYPE_ERROR, "instance has no __dict__"),
+        };
+    }
+    if value::as_class(object).is_some() {
+        // Hydro class namespaces are immutable after creation, so `vars` is a
+        // snapshot, exactly like `Cls.__dict__`.
+        let pairs = value::class_namespace(object);
+        let namespace = value::dict_new(Vec::new());
+        let roots = crate::heap::root_values(&[namespace]);
+        for (name, item) in pairs {
+            insert_namespace_pair(namespace, &name, item);
+        }
+        crate::heap::release_roots(roots);
+        return namespace;
+    }
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "vars() argument must have __dict__ attribute, not '{}'",
+            value::type_name(object)
+        ),
+    )
+}
+
+/// Inserts one string-keyed pair into `namespace`, rooting the fresh key until
+/// the dict owns it.
+fn insert_namespace_pair(namespace: i64, name: &str, item: i64) {
+    let key = value::str_alloc(name.to_string());
+    let roots = crate::heap::root_values(&[key, item]);
+    container::dict_set(namespace, key, item);
+    crate::heap::release_roots(roots);
+}
+
+/// `dir(object)`: sorted attribute names of a module, class or instance.
+fn dir_value(object: i64) -> i64 {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(state) = value::as_instance(object) {
+        names.push("__class__".to_string());
+        names.push("__dict__".to_string());
+        {
+            let attrs = state.lock_attrs();
+            names.extend(attrs.iter().map(|(name, _)| name.clone()));
+        }
+        collect_class_names_dir(state.class, &mut names);
+    } else if value::as_class(object).is_some() {
+        names.push("__name__".to_string());
+        names.push("__class__".to_string());
+        names.push("__dict__".to_string());
+        names.extend(
+            value::class_namespace(object)
+                .into_iter()
+                .map(|(name, _)| name),
+        );
+        collect_class_names_dir(object, &mut names);
+    } else if let Some(module) = value::as_module(object) {
+        let module_name = module.name().to_string();
+        if module_name == "errno" {
+            return exc::raise_with_message(
+                NOT_IMPLEMENTED_ERROR,
+                "dir() cannot enumerate 'errno': its names are resolved on demand",
+            );
+        }
+        names.push("__name__".to_string());
+        names.push("__dict__".to_string());
+        match stdlib::module(&module_name) {
+            Some(spec) => {
+                names.extend(spec.functions.iter().map(|f| f.name.to_string()));
+                names.extend(spec.constants.iter().map(|c| c.name.to_string()));
+                if module_name == "builtins" {
+                    names.push("eval".to_string());
+                    names.push("exec".to_string());
+                }
+            }
+            None => {
+                // Compiled user module: the globals side store plus any names
+                // bound dynamically through its `globals()` view.
+                names.extend(globals::names(&module_name));
+                names.extend(globals::view_names(&module_name));
+            }
+        }
+    } else {
+        return exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            &format!(
+                "dir() is not supported for '{}' objects in Hydro",
+                value::type_name(object)
+            ),
+        );
+    }
+    names.sort_unstable();
+    names.dedup();
+    let result = value::list_new(Vec::new());
+    for name in names {
+        let text = value::str_alloc(name);
+        let roots = crate::heap::root_values(&[text]);
+        container::list_append(result, text);
+        crate::heap::release_roots(roots);
+    }
+    result
+}
+
+/// Appends the own-namespace names of `class` and its base chain.
+fn collect_class_names_dir(class: i64, names: &mut Vec<String>) {
+    let mut current = class;
+    for _ in 0..1024 {
+        let Some(state) = value::as_class(current) else {
+            return;
+        };
+        names.extend(
+            value::class_namespace(current)
+                .into_iter()
+                .map(|(name, _)| name),
+        );
+        if state.base == NONE {
+            return;
+        }
+        current = state.base;
+    }
+}
+
+/// Shortens a source string for an error message (char-boundary safe).
+fn source_snippet(source: &str) -> String {
+    const LIMIT: usize = 60;
+    if source.chars().count() <= LIMIT {
+        return source.to_string();
+    }
+    let mut snippet: String = source.chars().take(LIMIT).collect();
+    snippet.push('…');
+    snippet
+}
+
+/// Whether `text` is a plain Python identifier (ASCII or Unicode letters).
+fn is_python_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_alphanumeric())
+}
+
+/// Splits a dotted name expression (`pkg.attr`) into its identifier parts.
+fn dotted_name_parts(text: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    for part in text.split('.') {
+        if !is_python_identifier(part) {
+            return None;
+        }
+        parts.push(part);
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// Reads `name` from a namespace dict, without raising for a miss.
+fn namespace_get(namespace: i64, name: &str) -> Option<i64> {
+    let entries = value::as_dict(namespace)?;
+    entries
+        .iter()
+        .find_map(|(key, item)| (value::as_str(*key) == Some(name)).then_some(*item))
+}
+
+/// `eval(source[, globals[, locals]])`.
+///
+/// Hydro has no runtime Python compiler. The forms a bootstrap path actually
+/// evaluates are supported without one: literals through the shared `ast`
+/// literal parser (which gives `ast.literal_eval` the same grammar) and bare
+/// or dotted names looked up in the caller-supplied namespaces, then in
+/// `builtins` (a miss is `NameError`, which probe code relies on). Any other
+/// expression raises a tagged `NotImplementedError`; nothing is guessed or
+/// silently returned.
+fn eval_builtin(args: &[i64]) -> i64 {
+    let (source, global_ns, local_ns) = match args {
+        [source] => (*source, NONE, NONE),
+        [source, globals] => (*source, *globals, NONE),
+        [source, globals, locals] => (*source, *globals, *locals),
+        _ => return builtin_arity_error("eval", "1 to 3", args.len()),
+    };
+    let Some(text) = value::as_str(source) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "eval() arg 1 must be a string, bytes or code object, not '{}'",
+                value::type_name(source)
+            ),
+        );
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return exc::raise_with_message(SYNTAX_ERROR, "invalid syntax");
+    }
+    // Namespaces must be real dicts before anything is evaluated.
+    for namespace in [global_ns, local_ns] {
+        if namespace != NONE && value::as_dict(namespace).is_none() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "eval() namespace must be a dict, not '{}'",
+                    value::type_name(namespace)
+                ),
+            );
+        }
+    }
+    let trimmed_value = value::str_alloc(trimmed.to_string());
+    let literal = modules::ast::call("literal_eval", &[trimmed_value]);
+    if !exc::pending() {
+        return literal;
+    }
+    // `literal_eval` reports non-literal text as `ValueError`; that only means
+    // "not a literal", not a user-visible failure.
+    if exc::pending_tag() != VALUE_ERROR as i64 {
+        return NONE;
+    }
+    exc::clear();
+
+    let Some(parts) = dotted_name_parts(trimmed) else {
+        return exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            &format!(
+                "eval() cannot compile Python source at runtime in Hydro: '{}' \
+                 (whole programs are compiled ahead of time)",
+                source_snippet(trimmed)
+            ),
+        );
+    };
+    let mut found = None;
+    for namespace in [local_ns, global_ns] {
+        if namespace == NONE {
+            continue;
+        }
+        if let Some(item) = namespace_get(namespace, parts[0]) {
+            found = Some(item);
+            break;
+        }
+    }
+    let mut current = match found {
+        Some(item) => item,
+        None => {
+            let item = modules::module_get_by_name("builtins", parts[0]);
+            if exc::pending() {
+                if exc::pending_tag() == exc::ATTRIBUTE_ERROR as i64 {
+                    exc::clear();
+                }
+                return exc::raise_with_message(
+                    NAME_ERROR,
+                    &format!("name '{}' is not defined", parts[0]),
+                );
+            }
+            item
+        }
+    };
+    for part in &parts[1..] {
+        current = methods::getattr(current, part.as_ptr(), part.len());
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    current
+}
+
+/// `exec(...)`: no runtime statement compiler exists, so fail loudly.
+fn exec_builtin(args: &[i64]) -> i64 {
+    if args.is_empty() || args.len() > 3 {
+        return builtin_arity_error("exec", "1 to 3", args.len());
+    }
+    let snippet = value::as_str(args[0])
+        .map(source_snippet)
+        .unwrap_or_else(|| "<non-string source>".to_string());
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        &format!(
+            "exec() cannot execute Python source at runtime in Hydro: '{}' \
+             (whole programs are compiled ahead of time)",
+            snippet
+        ),
+    )
+}
+
+/// `compile(...)`: no bytecode compiler exists, so fail loudly.
+fn compile_builtin(args: &[i64]) -> i64 {
+    if args.len() < 3 || args.len() > 6 {
+        return builtin_arity_error("compile", "3 to 6", args.len());
+    }
+    let snippet = value::as_str(args[0])
+        .map(source_snippet)
+        .unwrap_or_else(|| "<non-string source>".to_string());
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        &format!(
+            "compile() is not supported: Hydro consumes Python source ahead of time \
+             and has no bytecode compiler (source: '{}')",
+            snippet
+        ),
+    )
+}
+
+/// Internal: build a class from a runtime namespace dict (see
+/// [`Builtin::ClassFromNamespace`]).
+///
+/// Function values become normal methods (so `Cls.method` is unbound and
+/// `instance.method()` binds `self`); every other namespace entry — including
+/// `classmethod`/`staticmethod`/`property` descriptor objects — becomes a class
+/// attribute, which the attribute protocols already bind correctly.
+fn class_from_namespace(name: i64, bases: i64, metaclass: i64, namespace: i64) -> i64 {
+    let Some(name_text) = value::as_str(name) else {
+        return exc::raise_with_message(TYPE_ERROR, "class name must be a str");
+    };
+    let name_text = name_text.to_string();
+    let Some(base_values) = value::as_tuple(bases) else {
+        return exc::raise_with_message(TYPE_ERROR, "class bases must be a tuple");
+    };
+    let base_values: Vec<i64> = base_values
+        .iter()
+        .copied()
+        .filter(|base| *base != NONE)
+        .collect();
+    let Some(entries) = value::as_dict(namespace) else {
+        return exc::raise_with_message(TYPE_ERROR, "class namespace must be a dict");
+    };
+    let entries = entries.to_vec();
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::new();
+    let mut attrs: Vec<(String, i64)> = Vec::new();
+    for (key, item) in entries {
+        let Some(attr) = value::as_str(key) else {
+            return exc::raise_with_message(TYPE_ERROR, "class namespace keys must be strings");
+        };
+        if value::as_function(item).is_some() {
+            methods.push((attr.to_string(), item, MethodKind::Normal));
+        } else {
+            attrs.push((attr.to_string(), item));
+        }
+    }
+    value::class_new_multi(name_text, base_values, metaclass, methods, attrs)
+}
+
+/// Internal: `globals()[name] = value` writes the binding into the module's
+/// runtime global store (see [`Builtin::GlobalSetDynamic`]).
+fn dynamic_global_set(module: i64, name: i64, item: i64) -> i64 {
+    let (Some(module), Some(name)) = (value::as_str(module), value::as_str(name)) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "globals() item assignment requires a string key",
+        );
+    };
+    globals::set(module, name, item);
+    NONE
+}
+
 /// Shared `getattr(obj, name)` lookup used by the 2- and 3-argument forms.
 fn getattr_builtin(object: i64, name: i64) -> i64 {
     let Some(name) = value::as_str(name) else {
@@ -2637,6 +3010,63 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
         Builtin::DictMerge => match args {
             [left, right] => dict_merge(*left, *right),
             _ => builtin_arity_error("dict merge", "exactly 2", argc),
+        },
+        // `globals()` carries the module name as its hidden trailing argument
+        // (see the frontend call lowering). A first-class `globals` value has
+        // no module context, so it fails loudly instead of returning a fake
+        // empty namespace.
+        Builtin::Globals => match args {
+            [module] => globals_builtin(*module),
+            [] => exc::raise_with_message(
+                RUNTIME_ERROR,
+                "globals() has no module context when called through a first-class value; \
+                 call globals() directly",
+            ),
+            _ => builtin_arity_error("globals", "no", argc),
+        },
+        // Direct `locals()` is materialised by codegen from the live local
+        // slots. The runtime entry point is only reachable through a function
+        // value, which has no frame.
+        Builtin::Locals => match args {
+            [] => exc::raise_with_message(
+                RUNTIME_ERROR,
+                "locals() has no frame context when called through a first-class value; \
+                 call locals() directly",
+            ),
+            _ => builtin_arity_error("locals", "no", argc),
+        },
+        Builtin::Dir => match args {
+            [object] => dir_value(*object),
+            [] => exc::raise_with_message(
+                RUNTIME_ERROR,
+                "dir() without arguments has no frame context when called through a \
+                 first-class value; call dir() directly",
+            ),
+            _ => builtin_arity_error("dir", "at most 1", argc),
+        },
+        // `vars()` without an argument is `locals()`; codegen handles that
+        // shape directly.
+        Builtin::Vars => match args {
+            [object] => vars_value(*object),
+            [] => exc::raise_with_message(
+                RUNTIME_ERROR,
+                "vars() without arguments has no frame context when called through a \
+                 first-class value; call vars() directly",
+            ),
+            _ => builtin_arity_error("vars", "at most 1", argc),
+        },
+        Builtin::Eval => eval_builtin(args),
+        Builtin::Exec => exec_builtin(args),
+        Builtin::Compile => compile_builtin(args),
+        Builtin::ClassFromNamespace => match args {
+            [name, bases, metaclass, namespace] => {
+                class_from_namespace(*name, *bases, *metaclass, *namespace)
+            }
+            _ => builtin_arity_error("internal class construction", "exactly 4", argc),
+        },
+        Builtin::GlobalSetDynamic => match args {
+            [module, name, item] => dynamic_global_set(*module, *name, *item),
+            _ => builtin_arity_error("internal global store", "exactly 3", argc),
         },
     }
 }
@@ -5480,5 +5910,134 @@ mod tests {
         );
         assert_eq!(crate::exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
         crate::exc::clear();
+    }
+
+    #[test]
+    fn globals_view_reads_the_store_and_publishes_dynamic_writes() {
+        globals::reset();
+        exc::init();
+        globals::set("mod", "counter", int(7));
+        let view = builtin_call(Builtin::Globals, &[string("mod")]);
+        assert!(!crate::exc::pending());
+        assert_eq!(namespace_get(view, "counter"), Some(int(7)));
+        assert_eq!(view, builtin_call(Builtin::Globals, &[string("mod")]));
+
+        // A write through the view reaches the runtime global store on the
+        // next `globals()` call, so static reads and `getattr` observe it.
+        container::dict_set(view, string("extra"), int(3));
+        let _ = builtin_call(Builtin::Globals, &[string("mod")]);
+        assert_eq!(globals::try_get("mod", "extra"), Some(int(3)));
+
+        // The frontend's `globals()[key] = value` shape stores directly.
+        assert_eq!(
+            builtin_call(
+                Builtin::GlobalSetDynamic,
+                &[string("mod"), string("dyn"), int(5)],
+            ),
+            NONE
+        );
+        assert_eq!(globals::try_get("mod", "dyn"), Some(int(5)));
+
+        // A first-class `globals` value has no module context.
+        let _ = builtin_call(Builtin::Globals, &[]);
+        assert_eq!(crate::exc::pending_tag(), RUNTIME_ERROR as i64);
+        crate::exc::clear();
+    }
+
+    #[test]
+    fn vars_and_dir_expose_real_namespaces() {
+        exc::init();
+        globals::reset();
+        let class = value::class_new_full(
+            "C".to_string(),
+            NONE,
+            vec![(
+                "method".to_string(),
+                value::builtin_function_new(Builtin::Len),
+                MethodKind::Normal,
+            )],
+            vec![("attr".to_string(), int(4))],
+        );
+        let instance = value::instance_new(class);
+        value::instance_setattr(instance, "x".to_string(), int(1));
+
+        let mapping = builtin_call(Builtin::Vars, &[instance]);
+        assert_eq!(namespace_get(mapping, "x"), Some(int(1)));
+
+        let names = builtin_call(Builtin::Dir, &[class]);
+        let names = value::as_list(names).expect("dir() returns a list");
+        assert!(names
+            .iter()
+            .any(|name| value::as_str(*name) == Some("attr")));
+        assert!(names
+            .iter()
+            .any(|name| value::as_str(*name) == Some("method")));
+
+        // `builtins.__dict__` carries the actual builtin values, including
+        // the ones without a central spec entry.
+        let dict = modules::module_dict("builtins");
+        assert!(namespace_get(dict, "len").is_some());
+        assert!(namespace_get(dict, "eval").is_some());
+        assert!(namespace_get(dict, "exec").is_some());
+        assert_eq!(namespace_get(dict, "None"), Some(NONE));
+    }
+
+    #[test]
+    fn eval_supports_literals_and_names_and_fails_loudly() {
+        exc::init();
+        globals::reset();
+        assert_eq!(
+            rendered(builtin_call(Builtin::Eval, &[string("[1, 2]")])),
+            "[1, 2]"
+        );
+        let function = builtin_call(Builtin::Eval, &[string("len")]);
+        assert_eq!(
+            value::as_function(function).map(|function| function.name.as_str()),
+            Some("len")
+        );
+        // A name the builtins do not define is a real `NameError` (probe code
+        // such as pydantic's `in_ipython` relies on it).
+        let _ = builtin_call(Builtin::Eval, &[string("__IPYTHON__")]);
+        assert_eq!(exc::pending_tag(), NAME_ERROR as i64);
+        exc::clear();
+        // General expression/statement compilation is impossible at runtime
+        // and says so with a tagged NotImplementedError.
+        let _ = builtin_call(Builtin::Eval, &[string("1 + 2")]);
+        assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
+        exc::clear();
+        let _ = builtin_call(Builtin::Exec, &[string("x = 1")]);
+        assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
+        exc::clear();
+        let _ = builtin_call(
+            Builtin::Compile,
+            &[string("x = 1"), string("<test>"), string("exec")],
+        );
+        assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn class_from_namespace_binds_functions_as_normal_methods() {
+        exc::init();
+        let namespace = value::dict_new(Vec::new());
+        container::dict_set(namespace, string("answer"), int(42));
+        container::dict_set(
+            namespace,
+            string("size"),
+            value::builtin_function_new(Builtin::Len),
+        );
+        let class = builtin_call(
+            Builtin::ClassFromNamespace,
+            &[string("K"), value::tuple_new(Vec::new()), NONE, namespace],
+        );
+        assert!(!crate::exc::pending());
+        assert!(matches!(
+            value::class_lookup(class, "answer"),
+            Some(value::ClassEntry::Attr(value)) if value == int(42)
+        ));
+        assert!(matches!(
+            value::class_lookup(class, "size"),
+            Some(value::ClassEntry::Method(MethodKind::Normal, _))
+        ));
     }
 }

@@ -42,16 +42,18 @@
 //!
 //! # Types and calls
 //!
-//! [`types::PyType_FromSpec`] builds a real heap type with `tp_name`,
-//! `tp_basicsize`, `tp_itemsize`, flags, methods, doc, buffer slots and one
-//! base. `PyType_Ready`, `PyType_GetSlot`, `PyType_GetName`,
-//! `PyType_GetQualName`, `PyType_GetFlags`, `PyType_GenericAlloc`,
-//! `PyType_GenericNew`, `_PyObject_New`, `_PyObject_NewVar`, `PyObject_Init`
-//! and `PyObject_InitVar` are implemented. Slots without an implementation
-//! (members/getset descriptors, iteration, rich comparison, number, sequence,
-//! mapping protocols, `tp_del`, `tp_clear`, tokens) are rejected by
-//! `PyType_FromSpec` with a tagged error naming the slot; they are never
-//! silently ignored.
+//! [`types::PyType_FromSpec`] builds a real heap type with multiple bases
+//! (C3 linearisation), `tp_name`, `tp_basicsize`, `tp_itemsize`, flags,
+//! methods, doc, buffer slots, members/getset descriptors, iteration, rich
+//! comparison, the number/sequence/mapping suites, `tp_clear`, `tp_del` and
+//! the construction/deallocation slots. `PyType_Ready`, `PyType_GetSlot`,
+//! `PyType_GetName`, `PyType_GetQualName`, `PyType_GetFlags`,
+//! `PyType_GenericAlloc`, `PyType_GenericNew`, `_PyObject_New`,
+//! `_PyObject_NewVar`, `PyObject_Init` and `PyObject_InitVar` are implemented.
+//! Every accepted slot has a real code path; only the async suites and the
+//! heap-type token are rejected, with a tagged error naming the slot.
+//! `tp_mro` stores the merged bases (the type itself is re-prepended by
+//! `mro_of`), which avoids a reference-count cycle.
 //!
 //! Calls go through PEP 590 vectorcall: `PyObject_Vectorcall`,
 //! `PyObject_VectorcallDict`, `PyObject_VectorcallMethod`, `PyVectorcall_Call`,
@@ -108,10 +110,22 @@
 //!
 //! # Remaining limits
 //!
-//! Full NumPy/pydantic compatibility is **not** claimed: multiple inheritance,
-//! descriptors, sequence/number/mapping protocols, iteration, attribute
-//! dictionaries, weak references and the C terminator/token APIs are absent and
-//! fail loudly. Those are explicitly later gates.
+//! Full NumPy/pydantic compatibility is **not** claimed. Instance attribute
+//! dictionaries/weak references, the async protocol suites and Python source
+//! evaluation are absent; the evaluation entry points fail with a tagged
+//! `RuntimeError` instead of resolving to nothing. `PyImport_ImportModule` and
+//! friends resolve modules already loaded into the extension registry and fail
+//! with a tagged `ImportError` for anything else, because this host has no
+//! Python-level module finder bridge.
+//!
+//! # Exported data
+//!
+//! Every CPython 3.14 builtin type is a real exported `PyTypeObject` data
+//! symbol (`PyLong_Type`, `PyType_Type`, `PyBaseObject_Type`, descriptor and
+//! function types, ...), and `ob_type` of each handle points at the matching
+//! address. `Py_Version`, `_Py_ascii_whitespace`, `_PyByteArray_empty_string`,
+//! `_Py_NoneStruct`, `_Py_TrueStruct`, `_Py_FalseStruct` and the
+//! `Py_None`/`Py_True`/`Py_False` pointer spellings are exported as well.
 
 #![allow(non_snake_case)]
 // CPython's exported data symbols keep their historical C spelling
@@ -818,6 +832,38 @@ constant_objects! {
     _Py_EllipsisObject => ShimKind::Ellipsis,
 }
 
+/// Pointer spellings of the constant singletons (`Py_None`, `Py_True`,
+/// `Py_False`). CPython 3.14 headers normally macro-expand these names, but
+/// extension code built against older headers (or taking the address
+/// explicitly) expects real data symbols.
+#[no_mangle]
+pub static mut Py_None: *mut ShimObject = ptr::null_mut();
+#[no_mangle]
+pub static mut Py_True: *mut ShimObject = ptr::null_mut();
+#[no_mangle]
+pub static mut Py_False: *mut ShimObject = ptr::null_mut();
+
+/// `Py_Version`: CPython's `PY_VERSION_HEX` for 3.14.9 final.
+#[no_mangle]
+pub static Py_Version: std::os::raw::c_ulong = 0x030E_09F0;
+
+/// `_Py_ascii_whitespace`: 128-entry table, one for ASCII whitespace.
+#[no_mangle]
+pub static _Py_ascii_whitespace: [u8; 128] = {
+    let mut table = [0u8; 128];
+    table[0x09] = 1; // tab
+    table[0x0A] = 1; // newline
+    table[0x0B] = 1; // vertical tab
+    table[0x0C] = 1; // form feed
+    table[0x0D] = 1; // carriage return
+    table[0x20] = 1; // space
+    table
+};
+
+/// `_PyByteArray_empty_string`: the shared empty bytearray buffer.
+#[no_mangle]
+pub static mut _PyByteArray_empty_string: [u8; 1] = [0];
+
 /// Patches the constant singletons' `ob_type` after the builtin type table is
 /// ready. Called once from [`types::ensure_builtin_types`].
 pub(crate) fn patch_constant_types() {
@@ -829,6 +875,9 @@ pub(crate) fn patch_constant_types() {
         _Py_TrueStruct.head.ob_type = ptr::addr_of_mut!(types::BOOL_TYPE);
         _Py_NotImplementedStruct.head.ob_type = ptr::addr_of_mut!(types::NOT_IMPLEMENTED_TYPE);
         _Py_EllipsisObject.head.ob_type = ptr::addr_of_mut!(types::ELLIPSIS_TYPE);
+        Py_None = ptr::addr_of_mut!(_Py_NoneStruct);
+        Py_True = ptr::addr_of_mut!(_Py_TrueStruct);
+        Py_False = ptr::addr_of_mut!(_Py_FalseStruct);
     }
 }
 
@@ -1719,6 +1768,17 @@ pub(crate) struct MethodSpec {
 
 struct ModuleEntry {
     name: String,
+    /// NUL-terminated spelling returned by `PyModule_GetName`.
+    c_name: CString,
+    /// NUL-terminated spelling returned by `PyModule_GetFilename`.
+    filename: CString,
+    /// The extension-owned `PyModuleDef`, or 0 for a module created by
+    /// `PyImport_AddModule`/`PyModule_NewObject`.
+    definition: usize,
+    /// Per-module state block (`m_size` bytes), or 0.
+    state: usize,
+    /// Module `__dict__`, created lazily.
+    dict: usize,
     #[allow(dead_code)]
     handle: usize,
     /// Module objects are owned by the registry (the initializer's new
@@ -1732,6 +1792,9 @@ struct Registry {
     next_id: u64,
     modules: HashMap<u64, ModuleEntry>,
     by_path: HashMap<String, u64>,
+    by_name: HashMap<String, u64>,
+    /// `sys.modules`-equivalent dict, created lazily.
+    module_dict: usize,
 }
 
 impl Default for Registry {
@@ -1740,6 +1803,8 @@ impl Default for Registry {
             next_id: 1,
             modules: HashMap::new(),
             by_path: HashMap::new(),
+            by_name: HashMap::new(),
+            module_dict: 0,
         }
     }
 }
@@ -1814,10 +1879,21 @@ fn create_module_from_definition(
     definition: *mut PyModuleDefMirror,
 ) -> Result<(u64, *mut ShimObject), String> {
     let (name, methods) = read_module_definition(definition)?;
+    // SAFETY: the definition is live for the duration of module creation.
+    let (doc, size) = unsafe {
+        (
+            if (*definition).m_doc.is_null() {
+                None
+            } else {
+                Some(read_c_string((*definition).m_doc))
+            },
+            (*definition).m_size,
+        )
+    };
     let id = allocate_module_id();
-    let module_object = new_object(ShimKind::Module(id));
+    let module_object = make_immortal(new_object(ShimKind::Module(id)));
 
-    let mut attrs = HashMap::with_capacity(methods.len());
+    let mut attrs = HashMap::with_capacity(methods.len() + 4);
     for (index, method) in methods.iter().enumerate() {
         attrs.insert(
             method.name.clone(),
@@ -1827,11 +1903,51 @@ fn create_module_from_definition(
             }),
         );
     }
+    attrs.insert(
+        "__name__".to_string(),
+        ShimAttr::Value(ShimValue::Str(name.clone())),
+    );
+    attrs.insert(
+        "__file__".to_string(),
+        ShimAttr::Value(ShimValue::Str(name.clone())),
+    );
+    attrs.insert(
+        "__package__".to_string(),
+        ShimAttr::Value(ShimValue::Str(String::new())),
+    );
+    attrs.insert(
+        "__doc__".to_string(),
+        ShimAttr::Value(match doc {
+            Some(doc) => ShimValue::Str(doc),
+            None => ShimValue::None,
+        }),
+    );
 
-    registry_lock().modules.insert(
+    let state = if size > 0 {
+        // SAFETY: `malloc` returns zeroed storage after the memset below, or
+        // NULL on failure (reported lazily by `PyModule_GetState`).
+        let memory = unsafe { libc::calloc(1, size as usize) };
+        memory as usize
+    } else {
+        0
+    };
+
+    let c_name = CString::new(name.clone())
+        .map_err(|_| "extension module name contains a NUL".to_string())?;
+    let filename = c_name.clone();
+
+    let mut registry = registry_lock();
+    registry.by_name.insert(name.clone(), id);
+    registry.module_dict_invalidate(id, &name, module_object as usize);
+    registry.modules.insert(
         id,
         ModuleEntry {
             name,
+            c_name,
+            filename,
+            definition: definition as usize,
+            state,
+            dict: 0,
             handle: 0,
             module_object: module_object as usize,
             attrs,
@@ -1839,6 +1955,26 @@ fn create_module_from_definition(
         },
     );
     Ok((id, module_object))
+}
+
+impl Registry {
+    /// Adds a freshly created module to the cached `sys.modules` dict when it
+    /// already exists.
+    fn module_dict_invalidate(&mut self, _id: u64, name: &str, module: usize) {
+        if self.module_dict == 0 {
+            return;
+        }
+        let key = new_str(name.to_string());
+        let status = PyDict_SetItem(
+            self.module_dict as *mut ShimObject,
+            key,
+            module as *mut ShimObject,
+        );
+        dec_ref(key);
+        if status != 0 {
+            clear_error();
+        }
+    }
 }
 
 fn definition_name(definition: &PyModuleDefMirror) -> String {
@@ -1945,6 +2081,39 @@ fn module_id(object: *mut ShimObject) -> Result<u64, String> {
     }
 }
 
+/// Builds a new reference for a module attribute, for its `__dict__`.
+fn attribute_handle(entry: &ModuleEntry, attribute: &ShimAttr) -> Option<*mut ShimObject> {
+    match attribute {
+        ShimAttr::Value(value) => Some(value_object(value.clone())),
+        ShimAttr::Type(address) => {
+            let pointer = *address as *mut ShimObject;
+            inc_ref(pointer);
+            Some(pointer)
+        }
+        ShimAttr::Callable(callable) => {
+            let definition = entry
+                .methods
+                .get(callable.method as usize)
+                .map(|spec| spec.definition)
+                .unwrap_or(0);
+            if definition == 0 {
+                return None;
+            }
+            let result = PyCFunction_NewEx(
+                definition as *mut PyMethodDefMirror,
+                entry.module_object as *mut ShimObject,
+                ptr::null_mut(),
+            );
+            if result.is_null() {
+                clear_error();
+                None
+            } else {
+                Some(result)
+            }
+        }
+    }
+}
+
 fn add_attribute(object: *mut ShimObject, name: String, attribute: ShimAttr) -> Result<(), String> {
     let id = module_id(object)?;
     let mut registry = registry_lock();
@@ -1952,7 +2121,22 @@ fn add_attribute(object: *mut ShimObject, name: String, attribute: ShimAttr) -> 
         .modules
         .get_mut(&id)
         .ok_or_else(|| format!("unknown extension module {id}"))?;
-    entry.attrs.insert(name, attribute);
+    entry.attrs.insert(name.clone(), attribute);
+    if entry.dict != 0 {
+        let snapshot = entry.attrs.get(&name).cloned();
+        let handle = snapshot.and_then(|attribute| attribute_handle(entry, &attribute));
+        if let Some(handle) = handle {
+            let key = new_str(name);
+            let status = PyDict_SetItem(entry.dict as *mut ShimObject, key, handle);
+            dec_ref(key);
+            dec_ref(handle);
+            if status != 0 {
+                return Err(take_error().unwrap_or_else(|| {
+                    "AttributeError: cannot update the module dictionary".into()
+                }));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2286,7 +2470,1341 @@ pub extern "C" fn PyModule_AddObject(
 }
 
 // ---------------------------------------------------------------------------
+// Module, import, evaluation, sys and allocator API
+// ---------------------------------------------------------------------------
+
+/// Creates a module object with no extension definition (used by the import
+/// registry). The module object is immortal, like the loader-created ones.
+fn create_named_module(name: String) -> Result<(u64, *mut ShimObject), String> {
+    let id = allocate_module_id();
+    let module_object = make_immortal(new_object(ShimKind::Module(id)));
+    let c_name =
+        CString::new(name.clone()).map_err(|_| "module name contains a NUL".to_string())?;
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "__name__".to_string(),
+        ShimAttr::Value(ShimValue::Str(name.clone())),
+    );
+    attrs.insert(
+        "__file__".to_string(),
+        ShimAttr::Value(ShimValue::Str(name.clone())),
+    );
+    attrs.insert(
+        "__package__".to_string(),
+        ShimAttr::Value(ShimValue::Str(String::new())),
+    );
+    attrs.insert("__doc__".to_string(), ShimAttr::Value(ShimValue::None));
+    let mut registry = registry_lock();
+    registry.by_name.insert(name.clone(), id);
+    registry.modules.insert(
+        id,
+        ModuleEntry {
+            name,
+            c_name: c_name.clone(),
+            filename: c_name,
+            definition: 0,
+            state: 0,
+            dict: 0,
+            handle: 0,
+            module_object: module_object as usize,
+            attrs,
+            methods: Vec::new(),
+        },
+    );
+    Ok((id, module_object))
+}
+
+/// Adds one `PyMethodDef` to a module and its attribute table.
+fn add_module_method(module: *mut ShimObject, method: MethodSpec) -> Result<(), String> {
+    let id = module_id(module)?;
+    let mut registry = registry_lock();
+    let entry = registry
+        .modules
+        .get_mut(&id)
+        .ok_or_else(|| format!("unknown module {id}"))?;
+    let index = entry.methods.len();
+    let name = method.name.clone();
+    entry.methods.push(method);
+    let attribute = ShimAttr::Callable(ShimCallable {
+        module: id,
+        method: index as u32,
+    });
+    entry.attrs.insert(name.clone(), attribute);
+    if entry.dict != 0 {
+        let snapshot = entry.attrs.get(&name).cloned();
+        if let Some(handle) = snapshot.and_then(|attribute| attribute_handle(entry, &attribute)) {
+            let key = new_str(name);
+            let status = PyDict_SetItem(entry.dict as *mut ShimObject, key, handle);
+            dec_ref(key);
+            dec_ref(handle);
+            if status != 0 {
+                return Err(take_error()
+                    .unwrap_or_else(|| "AttributeError: cannot update module dictionary".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn module_entry_pointer<F, T>(module: *mut ShimObject, f: F) -> Result<T, String>
+where
+    F: FnOnce(&ModuleEntry) -> T,
+{
+    let id = module_id(module)?;
+    let registry = registry_lock();
+    registry
+        .modules
+        .get(&id)
+        .map(f)
+        .ok_or_else(|| format!("SystemError: unknown module {id}"))
+}
+
+/// `PyModule_GetName`.
+#[no_mangle]
+pub extern "C" fn PyModule_GetName(module: *mut ShimObject) -> *const c_char {
+    match module_entry_pointer(module, |entry| entry.c_name.as_ptr()) {
+        Ok(pointer) => pointer,
+        Err(error) => {
+            set_error(error);
+            ptr::null()
+        }
+    }
+}
+
+/// `PyModule_GetNameObject`.
+#[no_mangle]
+pub extern "C" fn PyModule_GetNameObject(module: *mut ShimObject) -> *mut ShimObject {
+    match module_entry_pointer(module, |entry| entry.name.clone()) {
+        Ok(name) => new_str(name),
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyModule_GetFilename`.
+#[no_mangle]
+pub extern "C" fn PyModule_GetFilename(module: *mut ShimObject) -> *const c_char {
+    match module_entry_pointer(module, |entry| entry.filename.as_ptr()) {
+        Ok(pointer) => pointer,
+        Err(error) => {
+            set_error(error);
+            ptr::null()
+        }
+    }
+}
+
+/// `PyModule_GetFilenameObject`.
+#[no_mangle]
+pub extern "C" fn PyModule_GetFilenameObject(module: *mut ShimObject) -> *mut ShimObject {
+    match module_entry_pointer(module, |entry| {
+        entry.filename.to_string_lossy().into_owned()
+    }) {
+        Ok(name) => new_str(name),
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyModule_GetDef`.
+#[no_mangle]
+pub extern "C" fn PyModule_GetDef(module: *mut ShimObject) -> *mut PyModuleDefMirror {
+    match module_entry_pointer(module, |entry| entry.definition) {
+        Ok(definition) => definition as *mut PyModuleDefMirror,
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyModule_GetState`.
+#[no_mangle]
+pub extern "C" fn PyModule_GetState(module: *mut ShimObject) -> *mut c_void {
+    match module_entry_pointer(module, |entry| entry.state) {
+        Ok(state) => state as *mut c_void,
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyModule_GetDict`: returns the module's borrowed `__dict__`.
+#[no_mangle]
+pub extern "C" fn PyModule_GetDict(module: *mut ShimObject) -> *mut ShimObject {
+    let id = match module_id(module) {
+        Ok(id) => id,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let mut registry = registry_lock();
+    let existing = match registry.modules.get(&id) {
+        Some(entry) => entry.dict,
+        None => {
+            drop(registry);
+            set_error(format!("SystemError: unknown module {id}"));
+            return ptr::null_mut();
+        }
+    };
+    if existing != 0 {
+        return existing as *mut ShimObject;
+    }
+    let names: Vec<(String, ShimAttr)> = match registry.modules.get(&id) {
+        Some(entry) => entry
+            .attrs
+            .iter()
+            .map(|(name, attribute)| (name.clone(), attribute.clone()))
+            .collect(),
+        None => Vec::new(),
+    };
+    let dict = PyDict_New();
+    if dict.is_null() {
+        return ptr::null_mut();
+    }
+    for (name, attribute) in names {
+        let Some(entry) = registry.modules.get(&id) else {
+            break;
+        };
+        let Some(value) = attribute_handle(entry, &attribute) else {
+            continue;
+        };
+        let key = new_str(name);
+        let status = PyDict_SetItem(dict, key, value);
+        dec_ref(key);
+        dec_ref(value);
+        if status != 0 {
+            let error = take_error()
+                .unwrap_or_else(|| "SystemError: cannot populate the module dictionary".into());
+            dec_ref(dict);
+            drop(registry);
+            set_error(error);
+            return ptr::null_mut();
+        }
+    }
+    if let Some(entry) = registry.modules.get_mut(&id) {
+        entry.dict = dict as usize;
+    }
+    dict
+}
+
+/// `PyModule_NewObject`.
+#[no_mangle]
+pub extern "C" fn PyModule_NewObject(name: *mut ShimObject) -> *mut ShimObject {
+    let Some(name) = as_string(name) else {
+        set_error("TypeError: PyModule_NewObject requires a str name");
+        return ptr::null_mut();
+    };
+    match create_named_module(name) {
+        Ok((_, module)) => module,
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyModule_AddIntConstant`.
+#[allow(clippy::unnecessary_cast)] // `c_long` is `i64` on x86_64.
+#[no_mangle]
+pub extern "C" fn PyModule_AddIntConstant(
+    module: *mut ShimObject,
+    name: *const c_char,
+    value: c_long,
+) -> c_int {
+    if name.is_null() {
+        set_error("TypeError: PyModule_AddIntConstant: name is NULL");
+        return -1;
+    }
+    let name = read_c_string(name);
+    match add_attribute(module, name, ShimAttr::Value(ShimValue::Int(value as i64))) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_error(error);
+            -1
+        }
+    }
+}
+
+/// `PyModule_AddFunctions`.
+#[no_mangle]
+pub extern "C" fn PyModule_AddFunctions(
+    module: *mut ShimObject,
+    methods: *mut PyMethodDefMirror,
+) -> c_int {
+    if methods.is_null() {
+        set_error("TypeError: PyModule_AddFunctions: methods table is NULL");
+        return -1;
+    }
+    let table = match read_method_table(methods, "PyModule_AddFunctions") {
+        Ok(table) => table,
+        Err(error) => {
+            set_error(error);
+            return -1;
+        }
+    };
+    for method in table {
+        if let Err(error) = add_module_method(module, method) {
+            set_error(error);
+            return -1;
+        }
+    }
+    0
+}
+
+/// `PyModule_ExecDef`.
+#[no_mangle]
+pub extern "C" fn PyModule_ExecDef(
+    module: *mut ShimObject,
+    definition: *mut PyModuleDefMirror,
+) -> c_int {
+    match run_module_slots(definition, module) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_error(error);
+            -1
+        }
+    }
+}
+
+/// `PyModule_FromDefAndSpec2`.
+#[no_mangle]
+pub extern "C" fn PyModule_FromDefAndSpec2(
+    definition: *mut PyModuleDefMirror,
+    _spec: *mut c_void,
+    _api_version: c_int,
+) -> *mut ShimObject {
+    let (id, module_object) = match create_module_from_definition(definition) {
+        Ok(created) => created,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    if let Err(error) = run_module_slots(definition, module_object) {
+        set_error(error);
+        {
+            let mut registry = registry_lock();
+            registry.modules.remove(&id);
+            registry.by_name.retain(|_, module| *module != id);
+        }
+        dec_ref(module_object);
+        return ptr::null_mut();
+    }
+    module_object
+}
+
+/// `PyState_FindModule`: borrowed module whose definition is `definition`.
+#[no_mangle]
+pub extern "C" fn PyState_FindModule(definition: *mut PyModuleDefMirror) -> *mut ShimObject {
+    if definition.is_null() {
+        return ptr::null_mut();
+    }
+    let registry = registry_lock();
+    for entry in registry.modules.values() {
+        if entry.definition == definition as usize {
+            return entry.module_object as *mut ShimObject;
+        }
+    }
+    ptr::null_mut()
+}
+
+// -- imports ----------------------------------------------------------------
+
+/// Looks up a loaded module by name and returns it with a new reference.
+fn import_loaded(name: &str) -> Result<*mut ShimObject, String> {
+    let registry = registry_lock();
+    let Some(id) = registry.by_name.get(name).copied() else {
+        return Err(format!(
+            "ImportError: No module named '{name}' (Hydro's embedded extension bridge only \
+             resolves extension modules already loaded by the interpreter)"
+        ));
+    };
+    let Some(entry) = registry.modules.get(&id) else {
+        return Err(format!(
+            "ImportError: dangling module registry entry for '{name}'"
+        ));
+    };
+    let module = entry.module_object as *mut ShimObject;
+    inc_ref(module);
+    Ok(module)
+}
+
+/// `PyImport_ImportModule`.
+#[no_mangle]
+pub extern "C" fn PyImport_ImportModule(name: *const c_char) -> *mut ShimObject {
+    if name.is_null() {
+        set_error("SystemError: PyImport_ImportModule: name is NULL");
+        return ptr::null_mut();
+    }
+    match import_loaded(&read_c_string(name)) {
+        Ok(module) => module,
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyImport_Import`.
+#[no_mangle]
+pub extern "C" fn PyImport_Import(name: *mut ShimObject) -> *mut ShimObject {
+    let Some(name) = as_string(name) else {
+        set_error("TypeError: PyImport_Import requires a str module name");
+        return ptr::null_mut();
+    };
+    match import_loaded(&name) {
+        Ok(module) => module,
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyImport_ImportModuleLevel`.
+#[no_mangle]
+pub extern "C" fn PyImport_ImportModuleLevel(
+    name: *const c_char,
+    _globals: *mut ShimObject,
+    _locals: *mut ShimObject,
+    _fromlist: *mut ShimObject,
+    level: c_int,
+) -> *mut ShimObject {
+    if level > 0 {
+        set_error(
+            "ImportError: relative imports are not supported by the embedded extension bridge",
+        );
+        return ptr::null_mut();
+    }
+    PyImport_ImportModule(name)
+}
+
+/// `PyImport_ImportModuleLevelObject`.
+#[no_mangle]
+pub extern "C" fn PyImport_ImportModuleLevelObject(
+    name: *mut ShimObject,
+    _globals: *mut ShimObject,
+    _locals: *mut ShimObject,
+    _fromlist: *mut ShimObject,
+    level: c_int,
+) -> *mut ShimObject {
+    if level > 0 {
+        set_error(
+            "ImportError: relative imports are not supported by the embedded extension bridge",
+        );
+        return ptr::null_mut();
+    }
+    PyImport_Import(name)
+}
+
+/// `PyImport_GetModule`: borrowed reference to a loaded module, or NULL.
+#[no_mangle]
+pub extern "C" fn PyImport_GetModule(name: *mut ShimObject) -> *mut ShimObject {
+    let Some(name) = as_string(name) else {
+        set_error("TypeError: PyImport_GetModule requires a str module name");
+        return ptr::null_mut();
+    };
+    let registry = registry_lock();
+    registry
+        .by_name
+        .get(&name)
+        .and_then(|id| registry.modules.get(id))
+        .map(|entry| entry.module_object as *mut ShimObject)
+        .unwrap_or(ptr::null_mut())
+}
+
+/// `PyImport_AddModule`: borrowed module object, created on demand.
+#[no_mangle]
+pub extern "C" fn PyImport_AddModule(name: *const c_char) -> *mut ShimObject {
+    if name.is_null() {
+        set_error("SystemError: PyImport_AddModule: name is NULL");
+        return ptr::null_mut();
+    }
+    let name = read_c_string(name);
+    {
+        let registry = registry_lock();
+        if let Some(id) = registry.by_name.get(&name) {
+            if let Some(entry) = registry.modules.get(id) {
+                return entry.module_object as *mut ShimObject;
+            }
+        }
+    }
+    match create_named_module(name) {
+        Ok((_, module)) => module,
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyImport_AddModuleRef`: like [`PyImport_AddModule`] with a new reference.
+#[no_mangle]
+pub extern "C" fn PyImport_AddModuleRef(name: *const c_char) -> *mut ShimObject {
+    let module = PyImport_AddModule(name);
+    if !module.is_null() {
+        inc_ref(module);
+    }
+    module
+}
+
+/// `PyImport_GetModuleDict`: borrowed `sys.modules`-equivalent dictionary.
+#[no_mangle]
+pub extern "C" fn PyImport_GetModuleDict() -> *mut ShimObject {
+    let mut registry = registry_lock();
+    if registry.module_dict == 0 {
+        let dict = PyDict_New();
+        if dict.is_null() {
+            return ptr::null_mut();
+        }
+        registry.module_dict = dict as usize;
+    }
+    let dict = registry.module_dict as *mut ShimObject;
+    let entries: Vec<(String, usize)> = registry
+        .modules
+        .values()
+        .map(|entry| (entry.name.clone(), entry.module_object))
+        .collect();
+    for (name, module) in entries {
+        let key = new_str(name);
+        let status = PyDict_SetItem(dict, key, module as *mut ShimObject);
+        dec_ref(key);
+        if status != 0 {
+            clear_error();
+        }
+    }
+    dict
+}
+
+// -- evaluation and sys -----------------------------------------------------
+
+fn dict_set_string(dict: *mut ShimObject, name: &str, value: *mut ShimObject) {
+    let key = new_str(name.to_string());
+    let status = PyDict_SetItem(dict, key, value);
+    dec_ref(key);
+    if status != 0 {
+        clear_error();
+    }
+}
+
+fn builtins_dict() -> usize {
+    static BUILTINS: LazyLock<usize> = LazyLock::new(|| {
+        ensure_builtin_types();
+        let dict = PyDict_New();
+        if dict.is_null() {
+            return 0;
+        }
+        unsafe {
+            for (name, pointer) in [
+                ("None", ptr::addr_of_mut!(_Py_NoneStruct)),
+                ("True", ptr::addr_of_mut!(_Py_TrueStruct)),
+                ("False", ptr::addr_of_mut!(_Py_FalseStruct)),
+                (
+                    "NotImplemented",
+                    ptr::addr_of_mut!(_Py_NotImplementedStruct),
+                ),
+                ("Ellipsis", ptr::addr_of_mut!(_Py_EllipsisObject)),
+            ] {
+                dict_set_string(dict, name, pointer);
+            }
+            for (name, type_object) in [
+                ("bool", ptr::addr_of_mut!(types::BOOL_TYPE)),
+                ("int", ptr::addr_of_mut!(types::INT_TYPE)),
+                ("float", ptr::addr_of_mut!(types::FLOAT_TYPE)),
+                ("complex", ptr::addr_of_mut!(types::COMPLEX_TYPE)),
+                ("str", ptr::addr_of_mut!(types::STR_TYPE)),
+                ("bytes", ptr::addr_of_mut!(types::BYTES_TYPE)),
+                ("bytearray", ptr::addr_of_mut!(types::BYTEARRAY_TYPE)),
+                ("list", ptr::addr_of_mut!(types::LIST_TYPE)),
+                ("tuple", ptr::addr_of_mut!(types::TUPLE_TYPE)),
+                ("dict", ptr::addr_of_mut!(types::DICT_TYPE)),
+                ("set", ptr::addr_of_mut!(types::SET_TYPE)),
+                ("frozenset", ptr::addr_of_mut!(types::FROZENSET_TYPE)),
+                ("slice", ptr::addr_of_mut!(types::SLICE_TYPE)),
+                ("memoryview", ptr::addr_of_mut!(types::MEMORYVIEW_TYPE)),
+                ("range", ptr::addr_of_mut!(types::RANGE_TYPE)),
+                ("object", ptr::addr_of_mut!(types::OBJECT_TYPE)),
+                ("type", ptr::addr_of_mut!(types::TYPE_TYPE)),
+            ] {
+                dict_set_string(dict, name, type_object as *mut ShimObject);
+            }
+            let exceptions: [(*const c_char, *mut ShimObject); 6] = [
+                (c"Exception".as_ptr(), PyExc_Exception),
+                (c"BaseException".as_ptr(), PyExc_BaseException),
+                (c"TypeError".as_ptr(), PyExc_TypeError),
+                (c"ValueError".as_ptr(), PyExc_ValueError),
+                (c"AttributeError".as_ptr(), PyExc_AttributeError),
+                (c"RuntimeError".as_ptr(), PyExc_RuntimeError),
+            ];
+            for (name, exception) in exceptions {
+                dict_set_string(dict, &read_c_string(name), exception);
+            }
+        }
+        dict as usize
+    });
+    *BUILTINS
+}
+
+std::thread_local! {
+    static EVAL_GLOBALS: RefCell<Option<usize>> = const { RefCell::new(None) };
+    static EVAL_LOCALS: RefCell<Option<usize>> = const { RefCell::new(None) };
+}
+
+fn frame_dict(slot: &'static std::thread::LocalKey<RefCell<Option<usize>>>) -> usize {
+    slot.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.is_none() {
+            let dict = PyDict_New();
+            if dict.is_null() {
+                return 0;
+            }
+            let name = new_str("__hydro__".to_string());
+            dict_set_string(dict, "__name__", name);
+            dec_ref(name);
+            let builtins = builtins_dict();
+            if builtins != 0 {
+                dict_set_string(dict, "__builtins__", builtins as *mut ShimObject);
+            }
+            *cell = Some(dict as usize);
+        }
+        (*cell).unwrap_or(0)
+    })
+}
+
+/// `PyEval_GetBuiltins`: borrowed builtins dictionary.
+#[no_mangle]
+pub extern "C" fn PyEval_GetBuiltins() -> *mut ShimObject {
+    builtins_dict() as *mut ShimObject
+}
+
+/// `PyEval_GetGlobals`: borrowed per-thread globals dictionary.
+#[no_mangle]
+pub extern "C" fn PyEval_GetGlobals() -> *mut ShimObject {
+    frame_dict(&EVAL_GLOBALS) as *mut ShimObject
+}
+
+/// `PyEval_GetLocals`: borrowed per-thread locals dictionary.
+#[no_mangle]
+pub extern "C" fn PyEval_GetLocals() -> *mut ShimObject {
+    frame_dict(&EVAL_LOCALS) as *mut ShimObject
+}
+
+fn sys_dict() -> usize {
+    static SYS: LazyLock<usize> = LazyLock::new(|| {
+        let dict = PyDict_New();
+        if dict.is_null() {
+            return 0;
+        }
+        let modules = PyImport_GetModuleDict();
+        if !modules.is_null() {
+            dict_set_string(dict, "modules", modules);
+        }
+        let path = PyList_New(0);
+        if !path.is_null() {
+            dict_set_string(dict, "path", path);
+            dec_ref(path);
+        }
+        let argv = PyList_New(0);
+        if !argv.is_null() {
+            dict_set_string(dict, "argv", argv);
+            dec_ref(argv);
+        }
+        dict as usize
+    });
+    *SYS
+}
+
+/// `PySys_GetObject`: borrowed object from the `sys` dictionary, or NULL.
+#[no_mangle]
+pub extern "C" fn PySys_GetObject(name: *const c_char) -> *mut ShimObject {
+    if name.is_null() {
+        set_error("SystemError: PySys_GetObject: name is NULL");
+        return ptr::null_mut();
+    }
+    let dict = sys_dict();
+    if dict == 0 {
+        set_error("MemoryError: cannot create the sys dictionary");
+        return ptr::null_mut();
+    }
+    PyDict_GetItemString(dict as *mut ShimObject, name)
+}
+
+/// `PySys_SetObject`.
+#[no_mangle]
+pub extern "C" fn PySys_SetObject(name: *const c_char, value: *mut ShimObject) -> c_int {
+    if name.is_null() {
+        set_error("SystemError: PySys_SetObject: name is NULL");
+        return -1;
+    }
+    let dict = sys_dict();
+    if dict == 0 {
+        set_error("MemoryError: cannot create the sys dictionary");
+        return -1;
+    }
+    if value.is_null() {
+        set_error("TypeError: PySys_SetObject: value is NULL");
+        return -1;
+    }
+    PyDict_SetItemString(dict as *mut ShimObject, name, value)
+}
+
+fn unsupported_eval(name: &str) -> String {
+    format!(
+        "RuntimeError: {name} is not available: this runtime has no Python source evaluator \
+         bridge, so extension code must not execute Python source"
+    )
+}
+
+/// `PyRun_SimpleString`: explicit failure (no evaluator bridge).
+#[no_mangle]
+pub extern "C" fn PyRun_SimpleString(_source: *const c_char) -> c_int {
+    set_error(unsupported_eval("PyRun_SimpleString"));
+    -1
+}
+
+/// `PyRun_SimpleStringFlags`: explicit failure.
+#[no_mangle]
+pub extern "C" fn PyRun_SimpleStringFlags(_source: *const c_char, _flags: *mut c_void) -> c_int {
+    set_error(unsupported_eval("PyRun_SimpleStringFlags"));
+    -1
+}
+
+/// `PyRun_String`: explicit failure.
+#[no_mangle]
+pub extern "C" fn PyRun_String(
+    _source: *const c_char,
+    _start: c_int,
+    _globals: *mut ShimObject,
+    _locals: *mut ShimObject,
+) -> *mut ShimObject {
+    set_error(unsupported_eval("PyRun_String"));
+    ptr::null_mut()
+}
+
+/// `PyRun_StringFlags`: explicit failure.
+#[no_mangle]
+pub extern "C" fn PyRun_StringFlags(
+    _source: *const c_char,
+    _start: c_int,
+    _globals: *mut ShimObject,
+    _locals: *mut ShimObject,
+    _flags: *mut c_void,
+) -> *mut ShimObject {
+    set_error(unsupported_eval("PyRun_StringFlags"));
+    ptr::null_mut()
+}
+
+// -- allocators -------------------------------------------------------------
+
+/// `PyMem_Malloc`.
+#[no_mangle]
+pub extern "C" fn PyMem_Malloc(size: usize) -> *mut c_void {
+    // SAFETY: `malloc` is the process allocator; size 0 still yields a unique
+    // pointer, matching CPython's guarantee.
+    unsafe { libc::malloc(size.max(1)) }
+}
+
+/// `PyMem_Free`.
+#[no_mangle]
+pub extern "C" fn PyMem_Free(pointer: *mut c_void) {
+    if !pointer.is_null() {
+        // SAFETY: the pointer came from this allocator family.
+        unsafe { libc::free(pointer) };
+    }
+}
+
+/// `PyMem_Realloc`.
+#[no_mangle]
+pub extern "C" fn PyMem_Realloc(pointer: *mut c_void, size: usize) -> *mut c_void {
+    // SAFETY: `realloc` accepts NULL and any pointer from `malloc`/`realloc`.
+    unsafe { libc::realloc(pointer, size.max(1)) }
+}
+
+/// `PyMem_Calloc`.
+#[no_mangle]
+pub extern "C" fn PyMem_Calloc(count: usize, size: usize) -> *mut c_void {
+    // SAFETY: `calloc` returns zeroed storage or NULL.
+    unsafe { libc::calloc(count.max(1), size.max(1)) }
+}
+
+/// `PyObject_Malloc`.
+#[no_mangle]
+pub extern "C" fn PyObject_Malloc(size: usize) -> *mut c_void {
+    PyMem_Malloc(size)
+}
+
+/// `PyObject_Free`.
+#[no_mangle]
+pub extern "C" fn PyObject_Free(pointer: *mut c_void) {
+    PyMem_Free(pointer);
+}
+
+/// `PyObject_Realloc`.
+#[no_mangle]
+pub extern "C" fn PyObject_Realloc(pointer: *mut c_void, size: usize) -> *mut c_void {
+    PyMem_Realloc(pointer, size)
+}
+
+/// `PyObject_Calloc`.
+#[no_mangle]
+pub extern "C" fn PyObject_Calloc(count: usize, size: usize) -> *mut c_void {
+    PyMem_Calloc(count, size)
+}
+
+/// `PyMem_RawMalloc`.
+#[no_mangle]
+pub extern "C" fn PyMem_RawMalloc(size: usize) -> *mut c_void {
+    PyMem_Malloc(size)
+}
+
+/// `PyMem_RawFree`.
+#[no_mangle]
+pub extern "C" fn PyMem_RawFree(pointer: *mut c_void) {
+    PyMem_Free(pointer);
+}
+
+/// `PyMem_RawRealloc`.
+#[no_mangle]
+pub extern "C" fn PyMem_RawRealloc(pointer: *mut c_void, size: usize) -> *mut c_void {
+    PyMem_Realloc(pointer, size)
+}
+
+/// `PyMem_RawCalloc`.
+#[no_mangle]
+pub extern "C" fn PyMem_RawCalloc(count: usize, size: usize) -> *mut c_void {
+    PyMem_Calloc(count, size)
+}
+
+// -- Unicode writer ---------------------------------------------------------
+
+/// Opaque `PyUnicodeWriter` (CPython 3.14 declares it opaque).
+struct UnicodeWriter {
+    text: String,
+}
+
+fn unicode_writer<'a>(writer: *mut c_void) -> Option<&'a mut UnicodeWriter> {
+    if writer.is_null() {
+        set_error("SystemError: NULL PyUnicodeWriter");
+        return None;
+    }
+    // SAFETY: the pointer came from `PyUnicodeWriter_Create`, which boxes one
+    // `UnicodeWriter`; the caller keeps it alive until Finish/Discard.
+    Some(unsafe { &mut *(writer as *mut UnicodeWriter) })
+}
+
+/// `PyUnicodeWriter_Create`.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_Create(length: isize) -> *mut c_void {
+    let capacity = usize::try_from(length).unwrap_or(0);
+    Box::into_raw(Box::new(UnicodeWriter {
+        text: String::with_capacity(capacity),
+    })) as *mut c_void
+}
+
+/// `PyUnicodeWriter_Discard`.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_Discard(writer: *mut c_void) {
+    if !writer.is_null() {
+        // SAFETY: see `unicode_writer`.
+        drop(unsafe { Box::from_raw(writer as *mut UnicodeWriter) });
+    }
+}
+
+/// `PyUnicodeWriter_Finish`: returns the accumulated string, consuming writer.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_Finish(writer: *mut c_void) -> *mut ShimObject {
+    if writer.is_null() {
+        set_error("SystemError: NULL PyUnicodeWriter");
+        return ptr::null_mut();
+    }
+    // SAFETY: see `unicode_writer`; Finish consumes the box.
+    let mut boxed = unsafe { Box::from_raw(writer as *mut UnicodeWriter) };
+    let text = std::mem::take(&mut boxed.text);
+    new_str(text)
+}
+
+/// `PyUnicodeWriter_WriteChar`.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_WriteChar(writer: *mut c_void, character: c_uint) -> c_int {
+    let Some(writer) = unicode_writer(writer) else {
+        return -1;
+    };
+    match char::from_u32(character) {
+        Some(character) => {
+            writer.text.push(character);
+            0
+        }
+        None => {
+            set_error(format!(
+                "ValueError: {character:#x} is not a valid Unicode code point"
+            ));
+            -1
+        }
+    }
+}
+
+/// `PyUnicodeWriter_WriteUTF8`.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_WriteUTF8(
+    writer: *mut c_void,
+    data: *const c_char,
+    length: isize,
+) -> c_int {
+    let Some(writer) = unicode_writer(writer) else {
+        return -1;
+    };
+    let Ok(length) = usize::try_from(length) else {
+        set_error("ValueError: negative string length");
+        return -1;
+    };
+    if data.is_null() && length != 0 {
+        set_error("SystemError: NULL string with a non-zero length");
+        return -1;
+    }
+    // SAFETY: the caller supplies `length` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
+    match std::str::from_utf8(bytes) {
+        Ok(text) => {
+            writer.text.push_str(text);
+            0
+        }
+        Err(_) => {
+            set_error("UnicodeDecodeError: invalid UTF-8 string");
+            -1
+        }
+    }
+}
+
+/// `PyUnicodeWriter_WriteASCII`.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_WriteASCII(
+    writer: *mut c_void,
+    data: *const c_char,
+    length: isize,
+) -> c_int {
+    let Some(writer) = unicode_writer(writer) else {
+        return -1;
+    };
+    let Ok(length) = usize::try_from(length) else {
+        set_error("ValueError: negative string length");
+        return -1;
+    };
+    if data.is_null() && length != 0 {
+        set_error("SystemError: NULL string with a non-zero length");
+        return -1;
+    }
+    // SAFETY: the caller supplies `length` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
+    if !bytes.is_ascii() {
+        set_error("UnicodeEncodeError: string is not ASCII");
+        return -1;
+    }
+    // SAFETY: ASCII bytes are valid UTF-8.
+    writer
+        .text
+        .push_str(unsafe { std::str::from_utf8_unchecked(bytes) });
+    0
+}
+
+/// `PyUnicodeWriter_WriteWideChar` (`wchar_t` is a signed 32-bit value here).
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_WriteWideChar(
+    writer: *mut c_void,
+    data: *const i32,
+    length: isize,
+) -> c_int {
+    let Some(writer) = unicode_writer(writer) else {
+        return -1;
+    };
+    let Ok(length) = usize::try_from(length) else {
+        set_error("ValueError: negative string length");
+        return -1;
+    };
+    if data.is_null() && length != 0 {
+        set_error("SystemError: NULL string with a non-zero length");
+        return -1;
+    }
+    for index in 0..length {
+        // SAFETY: the caller supplies `length` values.
+        let value = unsafe { *data.add(index) };
+        match u32::try_from(value).ok().and_then(char::from_u32) {
+            Some(character) => writer.text.push(character),
+            None => {
+                set_error(format!(
+                    "ValueError: {value:#x} is not a valid Unicode code point"
+                ));
+                return -1;
+            }
+        }
+    }
+    0
+}
+
+/// `PyUnicodeWriter_WriteUCS4`.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_WriteUCS4(
+    writer: *mut c_void,
+    data: *const c_uint,
+    length: isize,
+) -> c_int {
+    let Some(writer) = unicode_writer(writer) else {
+        return -1;
+    };
+    let Ok(length) = usize::try_from(length) else {
+        set_error("ValueError: negative string length");
+        return -1;
+    };
+    if data.is_null() && length != 0 {
+        set_error("SystemError: NULL string with a non-zero length");
+        return -1;
+    }
+    for index in 0..length {
+        // SAFETY: the caller supplies `length` values.
+        let value = unsafe { *data.add(index) };
+        match char::from_u32(value) {
+            Some(character) => writer.text.push(character),
+            None => {
+                set_error(format!(
+                    "ValueError: {value:#x} is not a valid Unicode code point"
+                ));
+                return -1;
+            }
+        }
+    }
+    0
+}
+
+/// `PyUnicodeWriter_WriteStr`.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_WriteStr(writer: *mut c_void, object: *mut ShimObject) -> c_int {
+    let Some(writer) = unicode_writer(writer) else {
+        return -1;
+    };
+    match as_string(object) {
+        Some(text) => {
+            writer.text.push_str(&text);
+            0
+        }
+        None => {
+            set_error("TypeError: PyUnicodeWriter_WriteStr requires a str");
+            -1
+        }
+    }
+}
+
+/// `PyUnicodeWriter_WriteRepr`.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_WriteRepr(writer: *mut c_void, object: *mut ShimObject) -> c_int {
+    let Some(writer) = unicode_writer(writer) else {
+        return -1;
+    };
+    let repr = PyObject_Repr(object);
+    if repr.is_null() {
+        return -1;
+    }
+    let outcome = as_string(repr);
+    dec_ref(repr);
+    match outcome {
+        Some(text) => {
+            writer.text.push_str(&text);
+            0
+        }
+        None => {
+            set_error("TypeError: repr() did not return a str");
+            -1
+        }
+    }
+}
+
+/// `PyUnicodeWriter_WriteSubstring`.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_WriteSubstring(
+    writer: *mut c_void,
+    object: *mut ShimObject,
+    start: isize,
+    end: isize,
+) -> c_int {
+    let Some(writer) = unicode_writer(writer) else {
+        return -1;
+    };
+    let Some(text) = as_string(object) else {
+        set_error("TypeError: PyUnicodeWriter_WriteSubstring requires a str");
+        return -1;
+    };
+    let characters: Vec<char> = text.chars().collect();
+    let length = characters.len() as isize;
+    if start < 0 || end < start || end > length {
+        set_error(format!(
+            "SystemError: invalid substring bounds {start}:{end} for a string of length {length}"
+        ));
+        return -1;
+    }
+    writer
+        .text
+        .extend(&characters[start as usize..end as usize]);
+    0
+}
+
+fn decode_error(error: &std::str::Utf8Error) -> String {
+    format!(
+        "UnicodeDecodeError: invalid UTF-8 at byte {}: {}",
+        error.valid_up_to(),
+        error
+    )
+}
+
+/// `PyUnicodeWriter_DecodeUTF8Stateful`.
+#[no_mangle]
+pub extern "C" fn PyUnicodeWriter_DecodeUTF8Stateful(
+    writer: *mut c_void,
+    data: *const c_char,
+    length: isize,
+    errors: *const c_char,
+    consumed: *mut isize,
+) -> c_int {
+    let Some(writer) = unicode_writer(writer) else {
+        return -1;
+    };
+    let Ok(length) = usize::try_from(length) else {
+        set_error("ValueError: negative string length");
+        return -1;
+    };
+    if data.is_null() && length != 0 {
+        set_error("SystemError: NULL string with a non-zero length");
+        return -1;
+    }
+    let error_mode = if errors.is_null() {
+        "strict".to_string()
+    } else {
+        read_c_string(errors)
+    };
+    // SAFETY: the caller supplies `length` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
+    let result = match error_mode.as_str() {
+        "strict" => std::str::from_utf8(bytes)
+            .map(|text| text.to_string())
+            .map_err(|error| decode_error(&error)),
+        "ignore" => Ok(String::from_utf8_lossy(bytes)
+            .chars()
+            .filter(|character| *character != '\u{FFFD}')
+            .collect::<String>()),
+        "replace" => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        other => Err(format!("LookupError: unknown error handler name '{other}'")),
+    };
+    match result {
+        Ok(text) => {
+            writer.text.push_str(&text);
+            if !consumed.is_null() {
+                // SAFETY: the caller passes a writable Py_ssize_t.
+                unsafe { *consumed = length as isize };
+            }
+            0
+        }
+        Err(error) => {
+            if !consumed.is_null() {
+                // SAFETY: the caller passes a writable Py_ssize_t.
+                unsafe { *consumed = 0 };
+            }
+            set_error(error);
+            -1
+        }
+    }
+}
+
+// -- long writer ------------------------------------------------------------
+
+/// Opaque `PyLongWriter` (CPython 3.14 declares it opaque).
+struct LongWriter {
+    negative: bool,
+    digits: Vec<u32>,
+}
+
+/// `PyLongWriter_Create`: exposes a zeroed base-2^30 digit buffer.
+#[no_mangle]
+pub extern "C" fn PyLongWriter_Create(
+    negative: c_int,
+    ndigits: isize,
+    digits: *mut *mut c_void,
+) -> *mut c_void {
+    let Ok(count) = usize::try_from(ndigits) else {
+        set_error("ValueError: negative digit count");
+        return ptr::null_mut();
+    };
+    let mut vector: Vec<u32> = Vec::new();
+    if vector.try_reserve_exact(count).is_err() {
+        set_error("MemoryError: cannot allocate long digits");
+        return ptr::null_mut();
+    }
+    vector.resize(count, 0);
+    if !digits.is_null() {
+        // SAFETY: the caller supplies a writable `void *` output slot.
+        unsafe { *digits = vector.as_mut_ptr() as *mut c_void };
+    }
+    Box::into_raw(Box::new(LongWriter {
+        negative: negative != 0,
+        digits: vector,
+    })) as *mut c_void
+}
+
+/// `PyLongWriter_Finish`: builds the integer, consuming the writer.
+#[no_mangle]
+pub extern "C" fn PyLongWriter_Finish(writer: *mut c_void) -> *mut ShimObject {
+    if writer.is_null() {
+        set_error("SystemError: NULL PyLongWriter");
+        return ptr::null_mut();
+    }
+    // SAFETY: the pointer came from `PyLongWriter_Create`.
+    let boxed = unsafe { Box::from_raw(writer as *mut LongWriter) };
+    let mut magnitude: u128 = 0;
+    // CPython stores digits little-endian, 30 bits each on this platform.
+    for &digit in boxed.digits.iter().rev() {
+        magnitude = match magnitude
+            .checked_mul(1 << 30)
+            .and_then(|value| value.checked_add(digit as u128))
+        {
+            Some(value) => value,
+            None => {
+                set_error(
+                    "OverflowError: PyLongWriter result does not fit in a Python int on this host",
+                );
+                return ptr::null_mut();
+            }
+        };
+        if magnitude > (i64::MAX as u128) + 1 {
+            set_error(
+                "OverflowError: PyLongWriter result does not fit in a Python int on this host",
+            );
+            return ptr::null_mut();
+        }
+    }
+    let number: i128 = if boxed.negative {
+        -(magnitude as i128)
+    } else {
+        magnitude as i128
+    };
+    match i64::try_from(number) {
+        Ok(value) => new_int(value),
+        Err(_) => {
+            set_error(
+                "OverflowError: PyLongWriter result does not fit in a Python int on this host",
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyLongWriter_Discard`.
+#[no_mangle]
+pub extern "C" fn PyLongWriter_Discard(writer: *mut c_void) {
+    if !writer.is_null() {
+        // SAFETY: see `PyLongWriter_Finish`.
+        drop(unsafe { Box::from_raw(writer as *mut LongWriter) });
+    }
+}
+
+// -- PyMutex ----------------------------------------------------------------
+
+/// `PyMutex_Lock`: a real mutual-exclusion lock on CPython's one-byte layout.
+#[no_mangle]
+pub extern "C" fn PyMutex_Lock(mutex: *mut u8) {
+    if mutex.is_null() {
+        return;
+    }
+    // SAFETY: `PyMutex` is exactly one byte; the caller owns it.
+    let atomic = unsafe { &*(mutex as *const std::sync::atomic::AtomicU8) };
+    loop {
+        if atomic
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// `PyMutex_Unlock`.
+#[no_mangle]
+pub extern "C" fn PyMutex_Unlock(mutex: *mut u8) {
+    if mutex.is_null() {
+        return;
+    }
+    // SAFETY: `PyMutex` is exactly one byte; the caller owns it.
+    let atomic = unsafe { &*(mutex as *const std::sync::atomic::AtomicU8) };
+    atomic.store(0, Ordering::Release);
+}
+
+/// `PyMutex_IsLocked`.
+#[no_mangle]
+pub extern "C" fn PyMutex_IsLocked(mutex: *mut u8) -> c_int {
+    if mutex.is_null() {
+        return 0;
+    }
+    // SAFETY: as above.
+    let atomic = unsafe { &*(mutex as *const std::sync::atomic::AtomicU8) };
+    (atomic.load(Ordering::Relaxed) != 0) as c_int
+}
+
+// -- type helpers -----------------------------------------------------------
+
+/// `PyType_GetModuleName`: the module component of `tp_name`.
+#[no_mangle]
+pub extern "C" fn PyType_GetModuleName(type_object: *mut ShimObject) -> *mut ShimObject {
+    match types::as_type(type_object) {
+        Ok(type_object) => {
+            let name = types::type_name(type_object);
+            let module = name
+                .rsplit_once('.')
+                .map(|(module, _)| module)
+                .unwrap_or("builtins");
+            new_str(module.to_string())
+        }
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyType_FromModuleAndSpec`.
+#[no_mangle]
+pub extern "C" fn PyType_FromModuleAndSpec(
+    _module: *mut ShimObject,
+    spec: *mut types::PyTypeSpecMirror,
+    bases: *mut ShimObject,
+) -> *mut ShimObject {
+    PyType_FromSpecWithBases(spec, bases)
+}
+
+/// `PyType_FromMetaclass`.
+#[no_mangle]
+pub extern "C" fn PyType_FromMetaclass(
+    metaclass: *mut ShimObject,
+    _module: *mut ShimObject,
+    spec: *mut types::PyTypeSpecMirror,
+    bases: *mut ShimObject,
+) -> *mut ShimObject {
+    if !metaclass.is_null() && types::is_type_pointer(metaclass) {
+        let name = types::type_name(metaclass as *mut TypeObject);
+        if name != "type" {
+            set_error(format!(
+                "TypeError: PyType_FromMetaclass: metaclass '{name}' is not supported"
+            ));
+            return ptr::null_mut();
+        }
+    }
+    PyType_FromSpecWithBases(spec, bases)
+}
+
+// ---------------------------------------------------------------------------
 // Scalar, container and capsule API
+
 // ---------------------------------------------------------------------------
 
 /// `PyLong_FromLong`.
@@ -3757,6 +5275,197 @@ pub extern "C" fn PyCFunction_GetModule(object: *mut ShimObject) -> *mut ShimObj
 // Attribute, repr, string and hash API
 // ---------------------------------------------------------------------------
 
+/// Looks up an attribute of a loaded module through the registry.
+fn module_attribute(
+    module: *mut ShimObject,
+    name: &str,
+) -> Option<Result<*mut ShimObject, String>> {
+    let id = match kind_ref(module) {
+        Some(ShimKind::Module(id)) => *id,
+        _ => return None,
+    };
+    if name == "__dict__" {
+        let dict = PyModule_GetDict(module);
+        if !dict.is_null() {
+            // The registry owns the dictionary; attribute lookup returns a new
+            // reference like every other `getattr`.
+            inc_ref(dict);
+        }
+        return Some(Ok(dict));
+    }
+    let registry = registry_lock();
+    let entry = registry.modules.get(&id);
+    let Some(entry) = entry else {
+        return Some(Err(format!("AttributeError: unknown module {id}")));
+    };
+    if entry.dict != 0 {
+        let key = new_str(name.to_string());
+        let value = PyDict_GetItem(entry.dict as *mut ShimObject, key);
+        dec_ref(key);
+        if !value.is_null() {
+            inc_ref(value);
+            return Some(Ok(value));
+        }
+    }
+    match entry.attrs.get(name) {
+        Some(ShimAttr::Value(value)) => Some(Ok(value_object(value.clone()))),
+        Some(ShimAttr::Type(address)) => {
+            inc_ref(*address as *mut ShimObject);
+            Some(Ok(*address as *mut ShimObject))
+        }
+        Some(ShimAttr::Callable(callable)) => {
+            let definition = entry
+                .methods
+                .get(callable.method as usize)
+                .map(|spec| spec.definition)
+                .unwrap_or(0);
+            if definition == 0 {
+                return Some(Err(format!(
+                    "AttributeError: module '{}' has no method implementation for '{name}'",
+                    entry.name
+                )));
+            }
+            let result = PyCFunction_NewEx(
+                definition as *mut PyMethodDefMirror,
+                entry.module_object as *mut ShimObject,
+                ptr::null_mut(),
+            );
+            if result.is_null() {
+                return Some(Err(take_error().unwrap_or_else(|| {
+                    format!("AttributeError: cannot bind module method '{name}'")
+                })));
+            }
+            Some(Ok(result))
+        }
+        None => Some(Err(format!(
+            "AttributeError: module '{}' has no attribute '{name}'",
+            entry.name
+        ))),
+    }
+}
+
+/// Class-level attributes exposed by this host without a type dictionary.
+fn type_attribute(
+    type_pointer: *mut ShimObject,
+    name: &str,
+) -> Option<Result<*mut ShimObject, String>> {
+    let type_object = type_pointer as *mut TypeObject;
+    // SAFETY: `type_pointer` was validated with `is_type_pointer`.
+    unsafe {
+        Some(match name {
+            "__name__" => Ok(new_str(
+                types::type_name(type_object)
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            )),
+            "__qualname__" => Ok(new_str(types::type_name(type_object))),
+            "__module__" => {
+                let full = types::type_name(type_object);
+                let module = full
+                    .rsplit_once('.')
+                    .map(|(module, _)| module)
+                    .unwrap_or("builtins");
+                Ok(new_str(module.to_string()))
+            }
+            "__doc__" => {
+                let doc = (*type_object).tp_doc;
+                if doc.is_null() {
+                    Ok(value_object(ShimValue::None))
+                } else {
+                    Ok(new_str(read_c_string(doc)))
+                }
+            }
+            "__flags__" => Ok(new_int((*type_object).tp_flags as i64)),
+            "__basicsize__" => Ok(new_int((*type_object).tp_basicsize as i64)),
+            "__itemsize__" => Ok(new_int((*type_object).tp_itemsize as i64)),
+            "__dictoffset__" => Ok(new_int((*type_object).tp_dictoffset as i64)),
+            "__weakrefoffset__" => Ok(new_int((*type_object).tp_weaklistoffset as i64)),
+            "__vectorcalloffset__" => Ok(new_int((*type_object).tp_vectorcall_offset as i64)),
+            "__base__" => {
+                let base = (*type_object).tp_base;
+                if base.is_null() {
+                    Ok(value_object(ShimValue::None))
+                } else {
+                    inc_ref(base as *mut ShimObject);
+                    Ok(base as *mut ShimObject)
+                }
+            }
+            "__bases__" => {
+                let bases = (*type_object).tp_bases as *mut ShimObject;
+                if bases.is_null() {
+                    let tuple = PyTuple_New(0);
+                    Ok(tuple)
+                } else {
+                    inc_ref(bases);
+                    Ok(bases)
+                }
+            }
+            "__mro__" => {
+                let order = types::mro_of(type_object);
+                let tuple = PyTuple_New(order.len() as isize);
+                if tuple.is_null() {
+                    return Some(Err(take_error().unwrap_or_else(|| {
+                        "MemoryError: cannot create __mro__".to_string()
+                    })));
+                }
+                for (index, &entry) in order.iter().enumerate() {
+                    inc_ref(entry as *mut ShimObject);
+                    if PyTuple_SetItem(tuple, index as isize, entry as *mut ShimObject) != 0 {
+                        dec_ref(entry as *mut ShimObject);
+                        dec_ref(tuple);
+                        return Some(Err(take_error()
+                            .unwrap_or_else(|| "TypeError: cannot fill __mro__".to_string())));
+                    }
+                }
+                Ok(tuple)
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// The shared descriptor-aware attribute lookup used by
+/// `PyObject_GenericGetAttr` and by the host's own `PyObject_GetAttr*` path.
+fn generic_attribute(object: *mut ShimObject, name: &str) -> Result<*mut ShimObject, String> {
+    if types::is_type_pointer(object) {
+        return type_attribute(object, name).unwrap_or_else(|| {
+            Err(format!(
+                "AttributeError: type object '{}' has no attribute '{name}'",
+                types::type_name(object as *mut TypeObject)
+            ))
+        });
+    }
+    if let Some(module) = module_attribute(object, name) {
+        return module;
+    }
+    let type_object = type_of(object);
+    if type_object.is_null() {
+        return Err(format!("AttributeError: object has no attribute '{name}'"));
+    }
+    if let Some(definition) = types::find_member(type_object, name) {
+        return types::member_get(object, definition);
+    }
+    if let Some(definition) = types::find_getset(type_object, name) {
+        return types::getset_get(object, definition);
+    }
+    if let Some(spec) = types::find_method(type_object, name) {
+        // SAFETY: the definition belongs to the live extension.
+        let method = spec.definition as *mut PyMethodDefMirror;
+        let result = PyCFunction_NewEx(method, object, ptr::null_mut());
+        if result.is_null() {
+            return Err(take_error()
+                .unwrap_or_else(|| format!("AttributeError: cannot bind method '{name}'")));
+        }
+        return Ok(result);
+    }
+    Err(format!(
+        "AttributeError: '{}' object has no attribute '{name}'",
+        types::type_name(type_object)
+    ))
+}
+
 /// Looks up `name` on `object`, returning a new reference.
 fn attribute_lookup(object: *mut ShimObject, name: &str) -> Result<*mut ShimObject, String> {
     ensure_builtin_types();
@@ -3766,12 +5475,7 @@ fn attribute_lookup(object: *mut ShimObject, name: &str) -> Result<*mut ShimObje
         ));
     }
     if types::is_type_pointer(object) {
-        // Class-level attributes (a type dictionary) are not implemented; the
-        // method table describes instances, not the class.
-        return Err(format!(
-            "AttributeError: type object '{}' has no attribute '{name}'",
-            types::type_name(object as *mut TypeObject)
-        ));
+        return generic_attribute(object, name);
     }
     let type_object = type_of(object);
     if type_object.is_null() {
@@ -3779,7 +5483,8 @@ fn attribute_lookup(object: *mut ShimObject, name: &str) -> Result<*mut ShimObje
     }
     // SAFETY: live type object.
     let getattro = unsafe { (*type_object).tp_getattro };
-    if getattro != 0 {
+    let generic = PyObject_GenericGetAttr as *const () as usize;
+    if getattro != 0 && getattro != generic {
         let name_object = new_str(name.to_string());
         let getattro: unsafe extern "C" fn(*mut ShimObject, *mut ShimObject) -> *mut ShimObject =
             unsafe { std::mem::transmute(getattro as *const c_void) };
@@ -3804,42 +5509,129 @@ fn attribute_lookup(object: *mut ShimObject, name: &str) -> Result<*mut ShimObje
         clear_error();
         return Ok(result);
     }
-    let getattr = unsafe { (*type_object).tp_getattr };
-    if getattr != 0 {
-        let c_name = match CString::new(name) {
-            Ok(c_name) => c_name,
-            Err(_) => return Err(format!("AttributeError: invalid attribute name '{name}'")),
-        };
-        let getattr: unsafe extern "C" fn(*mut ShimObject, *const c_char) -> *mut ShimObject =
-            unsafe { std::mem::transmute(getattr as *const c_void) };
-        let _gripper = GilGuard::new();
-        // SAFETY: `tp_getattr` has this signature.
-        let result = unsafe { getattr(object, c_name.as_ptr()) };
-        if result.is_null() {
-            return Err(take_error().unwrap_or_else(|| {
-                format!(
-                    "AttributeError: '{}' object has no attribute '{name}'",
-                    types::type_name(type_object)
-                )
-            }));
+    if getattro == 0 {
+        let getattr = unsafe { (*type_object).tp_getattr };
+        if getattr != 0 {
+            let c_name = match CString::new(name) {
+                Ok(c_name) => c_name,
+                Err(_) => return Err(format!("AttributeError: invalid attribute name '{name}'")),
+            };
+            let getattr: unsafe extern "C" fn(*mut ShimObject, *const c_char) -> *mut ShimObject =
+                unsafe { std::mem::transmute(getattr as *const c_void) };
+            let _gripper = GilGuard::new();
+            // SAFETY: `tp_getattr` has this signature.
+            let result = unsafe { getattr(object, c_name.as_ptr()) };
+            if result.is_null() {
+                return Err(take_error().unwrap_or_else(|| {
+                    format!(
+                        "AttributeError: '{}' object has no attribute '{name}'",
+                        types::type_name(type_object)
+                    )
+                }));
+            }
+            clear_error();
+            return Ok(result);
         }
-        clear_error();
-        return Ok(result);
     }
-    if let Some(spec) = types::find_method(type_object, name) {
-        // SAFETY: the definition belongs to the live extension.
-        let method = spec.definition as *mut PyMethodDefMirror;
-        let result = PyCFunction_NewEx(method, object, ptr::null_mut());
-        if result.is_null() {
-            return Err(take_error()
-                .unwrap_or_else(|| format!("AttributeError: cannot bind method '{name}'")));
+    generic_attribute(object, name)
+}
+
+/// `PyObject_GenericGetAttr`: descriptor-aware lookup used as the default
+/// `tp_getattro` for heap types.
+#[no_mangle]
+pub extern "C" fn PyObject_GenericGetAttr(
+    object: *mut ShimObject,
+    name: *mut ShimObject,
+) -> *mut ShimObject {
+    let Some(name) = as_string(name) else {
+        set_error("TypeError: attribute name must be a string");
+        return ptr::null_mut();
+    };
+    match generic_attribute(object, &name) {
+        Ok(attribute) => attribute,
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
         }
-        return Ok(result);
+    }
+}
+
+/// Descriptor-aware attribute assignment used as the default `tp_setattro`.
+fn generic_setattr(
+    object: *mut ShimObject,
+    name: &str,
+    value: *mut ShimObject,
+) -> Result<(), String> {
+    if types::is_type_pointer(object) {
+        return Err(format!(
+            "AttributeError: cannot set '{name}' on immutable type '{}'",
+            types::type_name(object as *mut TypeObject)
+        ));
+    }
+    if let Some(ShimKind::Module(_)) = kind_ref(object) {
+        if value.is_null() {
+            return Err(format!(
+                "AttributeError: cannot delete module attribute '{name}'"
+            ));
+        }
+        let attribute = if types::is_type_pointer(value) {
+            ShimAttr::Type(value as usize)
+        } else {
+            ShimAttr::Value(object_to_value(value)?)
+        };
+        let id = module_id(object)?;
+        let mut registry = registry_lock();
+        let entry = registry
+            .modules
+            .get_mut(&id)
+            .ok_or_else(|| format!("AttributeError: unknown module {id}"))?;
+        entry.attrs.insert(name.to_string(), attribute);
+        if entry.dict != 0 {
+            let key = new_str(name.to_string());
+            let status = PyDict_SetItem(entry.dict as *mut ShimObject, key, value);
+            dec_ref(key);
+            if status != 0 {
+                return Err(take_error().unwrap_or_else(|| {
+                    format!("AttributeError: cannot set module attribute '{name}'")
+                }));
+            }
+        }
+        return Ok(());
+    }
+    let type_object = type_of(object);
+    if type_object.is_null() {
+        return Err(format!("AttributeError: object has no attribute '{name}'"));
+    }
+    if let Some(definition) = types::find_member(type_object, name) {
+        return types::member_set(object, definition, value);
+    }
+    if let Some(definition) = types::find_getset(type_object, name) {
+        return types::getset_set(object, definition, value);
     }
     Err(format!(
         "AttributeError: '{}' object has no attribute '{name}'",
         types::type_name(type_object)
     ))
+}
+
+/// `PyObject_GenericSetAttr`.
+#[no_mangle]
+pub extern "C" fn PyObject_GenericSetAttr(
+    object: *mut ShimObject,
+    name: *mut ShimObject,
+    value: *mut ShimObject,
+) -> c_int {
+    let Some(name) = as_string(name) else {
+        set_error("TypeError: attribute name must be a string");
+        return -1;
+    };
+    match generic_setattr(object, &name, value) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_error(error);
+            -1
+        }
+    }
 }
 
 /// `PyObject_GetAttrString`.
@@ -3934,11 +5726,13 @@ pub extern "C" fn PyObject_SetAttrString(
         // SAFETY: `tp_setattr` has this signature.
         return unsafe { setattr(object, c_name.as_ptr(), value) };
     }
-    set_error(format!(
-        "AttributeError: '{}' object has no attribute '{name}'",
-        types::type_name(type_object)
-    ));
-    -1
+    match generic_setattr(object, &name, value) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_error(error);
+            -1
+        }
+    }
 }
 
 /// `PyObject_SetAttr`.
@@ -4297,6 +6091,9 @@ extern "C" {
 
     /// Defined in `parse.c`; the variadic form of [`PyObject_Call`].
     fn PyObject_CallFunctionObjArgs(callable: *mut c_void, ...) -> *mut c_void;
+
+    /// Defined in `parse.c`; printf-style formatting into a Unicode writer.
+    fn PyUnicodeWriter_Format(writer: *mut c_void, format: *const c_char, ...) -> c_int;
 }
 
 /// References every exported entry point so the linker keeps the definitions.
@@ -4305,6 +6102,61 @@ pub(crate) fn anchor() {
     initialize_exception_types();
     anchor_exception_types();
     anchor_constant_objects();
+    // Builtin type data symbols: staticlib linkers keep a definition only when
+    // something references it, so take every address here.
+    let type_symbols: [*const TypeObject; 37] = {
+        [
+            ptr::addr_of!(types::TYPE_TYPE),
+            ptr::addr_of!(types::OBJECT_TYPE),
+            ptr::addr_of!(types::NONE_TYPE),
+            ptr::addr_of!(types::BOOL_TYPE),
+            ptr::addr_of!(types::INT_TYPE),
+            ptr::addr_of!(types::FLOAT_TYPE),
+            ptr::addr_of!(types::COMPLEX_TYPE),
+            ptr::addr_of!(types::STR_TYPE),
+            ptr::addr_of!(types::BYTES_TYPE),
+            ptr::addr_of!(types::BYTEARRAY_TYPE),
+            ptr::addr_of!(types::LIST_TYPE),
+            ptr::addr_of!(types::TUPLE_TYPE),
+            ptr::addr_of!(types::DICT_TYPE),
+            ptr::addr_of!(types::SET_TYPE),
+            ptr::addr_of!(types::FROZENSET_TYPE),
+            ptr::addr_of!(types::SLICE_TYPE),
+            ptr::addr_of!(types::MEMORYVIEW_TYPE),
+            ptr::addr_of!(types::RANGE_TYPE),
+            ptr::addr_of!(types::CAPSULE_TYPE),
+            ptr::addr_of!(types::MODULE_TYPE),
+            ptr::addr_of!(types::CFUNCTION_TYPE),
+            ptr::addr_of!(types::ERROR_TYPE),
+            ptr::addr_of!(types::NOT_IMPLEMENTED_TYPE),
+            ptr::addr_of!(types::ELLIPSIS_TYPE),
+            ptr::addr_of!(types::FUNCTION_TYPE),
+            ptr::addr_of!(types::METHOD_TYPE),
+            ptr::addr_of!(types::PROPERTY_TYPE),
+            ptr::addr_of!(types::GETSET_DESCR_TYPE),
+            ptr::addr_of!(types::MEMBER_DESCR_TYPE),
+            ptr::addr_of!(types::METHOD_DESCR_TYPE),
+            ptr::addr_of!(types::WRAPPER_DESCR_TYPE),
+            ptr::addr_of!(types::CLASSMETHOD_DESCR_TYPE),
+            ptr::addr_of!(types::STATICMETHOD_TYPE),
+            ptr::addr_of!(types::CLASSMETHOD_TYPE),
+            ptr::addr_of!(types::DICT_PROXY_TYPE),
+            ptr::addr_of!(types::TRACEBACK_TYPE),
+            ptr::addr_of!(types::OBJECT_ALIAS_TYPE),
+        ]
+    };
+    let data_symbols: [*const u8; 6] = {
+        [
+            ptr::addr_of!(Py_Version) as *const u8,
+            ptr::addr_of!(_Py_ascii_whitespace) as *const u8,
+            ptr::addr_of!(_PyByteArray_empty_string) as *const u8,
+            ptr::addr_of!(Py_None) as *const u8,
+            ptr::addr_of!(Py_True) as *const u8,
+            ptr::addr_of!(Py_False) as *const u8,
+        ]
+    };
+    let _ = std::hint::black_box(type_symbols);
+    let _ = std::hint::black_box(data_symbols);
     let symbols: &[*const ()] = &[
         PyModule_Create2 as *const (),
         PyModuleDef_Init as *const (),
@@ -4433,6 +6285,146 @@ pub(crate) fn anchor() {
         hydro_capi_set_error as *const (),
         hydro_capi_set_type_error as *const (),
         hydro_capi_set_exception_message as *const (),
+        // Module / import / evaluation / allocator surface.
+        PyModule_GetName as *const (),
+        PyModule_GetNameObject as *const (),
+        PyModule_GetFilename as *const (),
+        PyModule_GetFilenameObject as *const (),
+        PyModule_GetDef as *const (),
+        PyModule_GetState as *const (),
+        PyModule_GetDict as *const (),
+        PyModule_NewObject as *const (),
+        PyModule_AddIntConstant as *const (),
+        PyModule_AddFunctions as *const (),
+        PyModule_ExecDef as *const (),
+        PyModule_FromDefAndSpec2 as *const (),
+        PyState_FindModule as *const (),
+        PyImport_ImportModule as *const (),
+        PyImport_Import as *const (),
+        PyImport_ImportModuleLevel as *const (),
+        PyImport_ImportModuleLevelObject as *const (),
+        PyImport_GetModule as *const (),
+        PyImport_AddModule as *const (),
+        PyImport_AddModuleRef as *const (),
+        PyImport_GetModuleDict as *const (),
+        PyEval_GetBuiltins as *const (),
+        PyEval_GetGlobals as *const (),
+        PyEval_GetLocals as *const (),
+        PySys_GetObject as *const (),
+        PySys_SetObject as *const (),
+        PyRun_SimpleString as *const (),
+        PyRun_SimpleStringFlags as *const (),
+        PyRun_String as *const (),
+        PyRun_StringFlags as *const (),
+        PyMem_Malloc as *const (),
+        PyMem_Free as *const (),
+        PyMem_Realloc as *const (),
+        PyMem_Calloc as *const (),
+        PyObject_Malloc as *const (),
+        PyObject_Free as *const (),
+        PyObject_Realloc as *const (),
+        PyObject_Calloc as *const (),
+        PyMem_RawMalloc as *const (),
+        PyMem_RawFree as *const (),
+        PyMem_RawRealloc as *const (),
+        PyMem_RawCalloc as *const (),
+        PyUnicodeWriter_Create as *const (),
+        PyUnicodeWriter_Discard as *const (),
+        PyUnicodeWriter_Finish as *const (),
+        PyUnicodeWriter_WriteChar as *const (),
+        PyUnicodeWriter_WriteUTF8 as *const (),
+        PyUnicodeWriter_WriteASCII as *const (),
+        PyUnicodeWriter_WriteWideChar as *const (),
+        PyUnicodeWriter_WriteUCS4 as *const (),
+        PyUnicodeWriter_WriteStr as *const (),
+        PyUnicodeWriter_WriteRepr as *const (),
+        PyUnicodeWriter_WriteSubstring as *const (),
+        PyUnicodeWriter_DecodeUTF8Stateful as *const (),
+        PyUnicodeWriter_Format as *const (),
+        PyLongWriter_Create as *const (),
+        PyLongWriter_Finish as *const (),
+        PyLongWriter_Discard as *const (),
+        PyMutex_Lock as *const (),
+        PyMutex_Unlock as *const (),
+        PyMutex_IsLocked as *const (),
+        PyType_GetModuleName as *const (),
+        PyType_FromModuleAndSpec as *const (),
+        PyType_FromMetaclass as *const (),
+        PyObject_GenericGetAttr as *const (),
+        PyObject_GenericSetAttr as *const (),
+        // Slot-driven protocol surface (defined in `type.rs`).
+        types::PyNumber_Add as *const (),
+        types::PyNumber_Subtract as *const (),
+        types::PyNumber_Multiply as *const (),
+        types::PyNumber_Remainder as *const (),
+        types::PyNumber_Divmod as *const (),
+        types::PyNumber_Power as *const (),
+        types::PyNumber_Negative as *const (),
+        types::PyNumber_Positive as *const (),
+        types::PyNumber_Absolute as *const (),
+        types::PyNumber_Invert as *const (),
+        types::PyNumber_Lshift as *const (),
+        types::PyNumber_Rshift as *const (),
+        types::PyNumber_And as *const (),
+        types::PyNumber_Xor as *const (),
+        types::PyNumber_Or as *const (),
+        types::PyNumber_FloorDivide as *const (),
+        types::PyNumber_TrueDivide as *const (),
+        types::PyNumber_MatrixMultiply as *const (),
+        types::PyNumber_Int as *const (),
+        types::PyNumber_Long as *const (),
+        types::PyNumber_Float as *const (),
+        types::PyNumber_Index as *const (),
+        types::PyNumber_InPlaceAdd as *const (),
+        types::PyNumber_InPlaceSubtract as *const (),
+        types::PyNumber_InPlaceMultiply as *const (),
+        types::PyNumber_InPlaceRemainder as *const (),
+        types::PyNumber_InPlacePower as *const (),
+        types::PyNumber_InPlaceLshift as *const (),
+        types::PyNumber_InPlaceRshift as *const (),
+        types::PyNumber_InPlaceAnd as *const (),
+        types::PyNumber_InPlaceXor as *const (),
+        types::PyNumber_InPlaceOr as *const (),
+        types::PyNumber_InPlaceFloorDivide as *const (),
+        types::PyNumber_InPlaceTrueDivide as *const (),
+        types::PyNumber_InPlaceMatrixMultiply as *const (),
+        types::PyNumber_AsSsize_t as *const (),
+        types::PyNumber_Check as *const (),
+        types::PyIndex_Check as *const (),
+        types::PySequence_Length as *const (),
+        types::PySequence_Size as *const (),
+        types::PySequence_Check as *const (),
+        types::PySequence_GetItem as *const (),
+        types::PySequence_SetItem as *const (),
+        types::PySequence_DelItem as *const (),
+        types::PySequence_Concat as *const (),
+        types::PySequence_Repeat as *const (),
+        types::PySequence_InPlaceConcat as *const (),
+        types::PySequence_InPlaceRepeat as *const (),
+        types::PySequence_Contains as *const (),
+        types::PyMapping_Length as *const (),
+        types::PyMapping_Size as *const (),
+        types::PyMapping_GetItemString as *const (),
+        types::PyMapping_SetItemString as *const (),
+        types::PyObject_Length as *const (),
+        types::PyObject_Size as *const (),
+        types::PyObject_GetItem as *const (),
+        types::PyObject_SetItem as *const (),
+        types::PyObject_DelItem as *const (),
+        types::PyObject_GetIter as *const (),
+        types::PyObject_SelfIter as *const (),
+        types::PyObject_Next as *const (),
+        types::PyIter_Check as *const (),
+        types::PyIter_Next as *const (),
+        types::PyObject_RichCompare as *const (),
+        types::PyObject_RichCompareBool as *const (),
+        types::PyObject_IsTrue as *const (),
+        types::PyObject_Not as *const (),
+        types::PyCallable_Check as *const (),
+        types::PyType_Freeze as *const (),
+        types::PyType_IsSubtype as *const (),
+        types::PyType_Modified as *const (),
+        types::PyUnstable_Object_IsUniquelyReferenced as *const (),
     ];
     let _ = std::hint::black_box(symbols);
 }
@@ -4534,7 +6526,7 @@ mod tests {
         let capsule = PyCapsule_New(
             &VALUE as *const i64 as *mut c_void,
             std::ptr::null(),
-            count_capsule_drop as *mut c_void,
+            count_capsule_drop as *const () as *mut c_void,
         );
         assert!(!capsule.is_null());
         assert_eq!(Py_REFCNT(capsule), 1);
@@ -4552,7 +6544,7 @@ mod tests {
         let escaped = PyCapsule_New(
             &VALUE as *const i64 as *mut c_void,
             std::ptr::null(),
-            count_capsule_drop as *mut c_void,
+            count_capsule_drop as *const () as *mut c_void,
         );
         match object_to_value(escaped) {
             Ok(ShimValue::Capsule { ptr, name: None }) => {
@@ -4584,7 +6576,7 @@ mod tests {
         let capsule = PyCapsule_New(
             &VALUE as *const i64 as *mut c_void,
             std::ptr::null(),
-            count_list_capsule_drop as *mut c_void,
+            count_list_capsule_drop as *const () as *mut c_void,
         );
         assert_eq!(PyList_Append(list, capsule), 0);
         assert_eq!(Py_REFCNT(capsule), 2, "append takes a new reference");
@@ -4660,7 +6652,7 @@ mod tests {
         let mut methods = [
             PyMethodDefMirror {
                 ml_name: c"seven".as_ptr(),
-                ml_meth: method_seven as *mut c_void,
+                ml_meth: method_seven as *const () as *mut c_void,
                 ml_flags: METH_NOARGS,
                 ml_doc: std::ptr::null(),
             },
@@ -4678,11 +6670,11 @@ mod tests {
             },
             PyTypeSlotMirror {
                 slot: 65,
-                pfunc: construct_instance as *mut c_void,
+                pfunc: construct_instance as *const () as *mut c_void,
             },
             PyTypeSlotMirror {
                 slot: 60,
-                pfunc: initialise_instance as *mut c_void,
+                pfunc: initialise_instance as *const () as *mut c_void,
             },
             PyTypeSlotMirror {
                 slot: 56,
@@ -4715,7 +6707,7 @@ mod tests {
         );
         assert_eq!(
             PyType_GetSlot(type_object, 60),
-            initialise_instance as *mut c_void
+            initialise_instance as *const () as *mut c_void
         );
         assert_eq!(
             PyType_GetSlot(type_object, 64),
@@ -4752,7 +6744,7 @@ mod tests {
         anchor();
         let mut slots = [
             PyTypeSlotMirror {
-                slot: 72, // Py_tp_members
+                slot: 77, // Py_am_await (async suites are not implemented)
                 pfunc: std::ptr::null_mut(),
             },
             PyTypeSlotMirror {
@@ -4770,7 +6762,7 @@ mod tests {
         clear_error();
         assert!(PyType_FromSpec(&mut spec).is_null());
         let message = take_error().expect("unsupported slot");
-        assert!(message.contains("Py_tp_members"), "{message}");
+        assert!(message.contains("Py_am_await"), "{message}");
         assert!(message.starts_with("TypeError: "), "{message}");
 
         // Managed-dict layout is an interpreter-only flag.
@@ -4834,13 +6826,19 @@ mod tests {
         let message = take_error().expect("shim base");
         assert!(message.contains("base"), "{message}");
 
+        // Multiple bases are accepted and linearised with C3.
         let pair = PyTuple_New(2);
         Py_IncRef(object_type);
         assert_eq!(PyTuple_SetItem(pair, 0, object_type), 0);
         Py_IncRef(object_type);
         assert_eq!(PyTuple_SetItem(pair, 1, object_type), 0);
-        assert!(PyType_FromSpecWithBases(&mut spec, pair).is_null());
-        assert!(take_error().unwrap().contains("multiple bases"));
+        let multiple = PyType_FromSpecWithBases(&mut spec, pair);
+        assert!(!multiple.is_null(), "{:?}", take_error());
+        let mro = PyObject_GetAttrString(multiple, c"__mro__".as_ptr());
+        assert!(!mro.is_null(), "{:?}", take_error());
+        assert_eq!(PyTuple_Size(mro), 2, "duplicate base is merged once");
+        Py_DecRef(mro);
+        Py_DecRef(multiple);
         Py_DecRef(pair);
     }
 
@@ -4933,7 +6931,7 @@ mod tests {
     fn fast_method_def() -> PyMethodDefMirror {
         PyMethodDefMirror {
             ml_name: c"fast_sum".as_ptr(),
-            ml_meth: fast_sum as *mut c_void,
+            ml_meth: fast_sum as *const () as *mut c_void,
             ml_flags: METH_FASTCALL | METH_KEYWORDS,
             ml_doc: std::ptr::null(),
         }
@@ -4949,7 +6947,10 @@ mod tests {
             PyCFunction_GetFlags(function),
             METH_FASTCALL | METH_KEYWORDS
         );
-        assert_eq!(PyCFunction_GetFunction(function), fast_sum as *mut c_void);
+        assert_eq!(
+            PyCFunction_GetFunction(function),
+            fast_sum as *const () as *mut c_void
+        );
 
         let values = [PyLong_FromLong(2), PyLong_FromLong(3), PyLong_FromLong(4)];
         let names = PyTuple_New(1);
@@ -5014,7 +7015,7 @@ mod tests {
         let mut methods = [
             PyMethodDefMirror {
                 ml_name: c"seven".as_ptr(),
-                ml_meth: method_seven as *mut c_void,
+                ml_meth: method_seven as *const () as *mut c_void,
                 ml_flags: METH_NOARGS,
                 ml_doc: std::ptr::null(),
             },
@@ -5141,11 +7142,11 @@ mod tests {
         let mut slots = [
             PyTypeSlotMirror {
                 slot: 1,
-                pfunc: strided_getbuffer as *mut c_void,
+                pfunc: strided_getbuffer as *const () as *mut c_void,
             },
             PyTypeSlotMirror {
                 slot: 2,
-                pfunc: strided_releasebuffer as *mut c_void,
+                pfunc: strided_releasebuffer as *const () as *mut c_void,
             },
             PyTypeSlotMirror {
                 slot: 0,
@@ -5254,11 +7255,11 @@ mod tests {
         let mut slots = [
             PyTypeSlotMirror {
                 slot: 1,
-                pfunc: bad_getbuffer as *mut c_void,
+                pfunc: bad_getbuffer as *const () as *mut c_void,
             },
             PyTypeSlotMirror {
                 slot: 2,
-                pfunc: bad_releasebuffer as *mut c_void,
+                pfunc: bad_releasebuffer as *const () as *mut c_void,
             },
             PyTypeSlotMirror {
                 slot: 0,
@@ -5323,7 +7324,7 @@ mod tests {
         anchor();
         let mut definition = PyMethodDefMirror {
             ml_name: c"gil_probe".as_ptr(),
-            ml_meth: gil_probe as *mut c_void,
+            ml_meth: gil_probe as *const () as *mut c_void,
             ml_flags: METH_NOARGS,
             ml_doc: std::ptr::null(),
         };
@@ -5359,7 +7360,7 @@ mod tests {
         // Save/restore releases the lock completely and reacquires it.
         let mut definition = PyMethodDefMirror {
             ml_name: c"save_restore".as_ptr(),
-            ml_meth: save_restore as *mut c_void,
+            ml_meth: save_restore as *const () as *mut c_void,
             ml_flags: METH_NOARGS,
             ml_doc: std::ptr::null(),
         };
@@ -5463,11 +7464,11 @@ mod tests {
         let mut slots = [
             PyModuleDefSlotMirror {
                 slot: PY_MOD_EXEC,
-                value: exec as *mut c_void,
+                value: exec as *const () as *mut c_void,
             },
             PyModuleDefSlotMirror {
                 slot: PY_MOD_EXEC,
-                value: exec as *mut c_void,
+                value: exec as *const () as *mut c_void,
             },
             PyModuleDefSlotMirror {
                 slot: 0,
@@ -5569,4 +7570,1097 @@ mod tests {
         ];
         assert!(exported.iter().all(|pointer| !pointer.is_null()));
     }
+
+    // -- full ABI layer -------------------------------------------------
+
+    #[test]
+    fn builtin_type_symbols_match_handle_types() {
+        use std::ptr::addr_of_mut;
+        anchor();
+        let int_object = PyLong_FromLong(1_000_000);
+        assert_eq!(
+            Py_TYPE(int_object) as usize,
+            addr_of_mut!(types::INT_TYPE) as usize
+        );
+        Py_DecRef(int_object);
+        let float_object = PyFloat_FromDouble(1.5);
+        assert_eq!(
+            Py_TYPE(float_object) as usize,
+            addr_of_mut!(types::FLOAT_TYPE) as usize
+        );
+        Py_DecRef(float_object);
+        let text = PyUnicode_FromString(c"x".as_ptr());
+        assert_eq!(
+            Py_TYPE(text) as usize,
+            addr_of_mut!(types::STR_TYPE) as usize
+        );
+        Py_DecRef(text);
+        let bytes = PyBytes_FromStringAndSize(b"x".as_ptr() as *const c_char, 1);
+        assert_eq!(
+            Py_TYPE(bytes) as usize,
+            addr_of_mut!(types::BYTES_TYPE) as usize
+        );
+        Py_DecRef(bytes);
+        let list = PyList_New(0);
+        assert_eq!(
+            Py_TYPE(list) as usize,
+            addr_of_mut!(types::LIST_TYPE) as usize
+        );
+        Py_DecRef(list);
+        let tuple = PyTuple_New(0);
+        assert_eq!(
+            Py_TYPE(tuple) as usize,
+            addr_of_mut!(types::TUPLE_TYPE) as usize
+        );
+        Py_DecRef(tuple);
+        let dict = PyDict_New();
+        assert_eq!(
+            Py_TYPE(dict) as usize,
+            addr_of_mut!(types::DICT_TYPE) as usize
+        );
+        Py_DecRef(dict);
+        assert_eq!(
+            Py_TYPE(Py_GetConstantBorrowed(PY_CONSTANT_NONE)) as usize,
+            addr_of_mut!(types::NONE_TYPE) as usize
+        );
+        assert_eq!(
+            Py_TYPE(Py_GetConstantBorrowed(PY_CONSTANT_TRUE)) as usize,
+            addr_of_mut!(types::BOOL_TYPE) as usize
+        );
+        // Type objects point at the shared metatype, and the exported
+        // `PyType_Type` address is that metatype.
+        let object_type = addr_of_mut!(types::OBJECT_TYPE) as *mut ShimObject;
+        assert_eq!(
+            Py_TYPE(object_type) as usize,
+            addr_of_mut!(types::TYPE_TYPE) as usize
+        );
+        let type_name = PyType_GetName(object_type);
+        assert!(!type_name.is_null());
+        Py_DecRef(type_name);
+        // A heap type gets the same metatype.
+        let mut slots = empty_slots();
+        let heap = make_type(c"probe.Identity", 32, 0, 0, &mut slots);
+        assert_eq!(
+            Py_TYPE(heap) as usize,
+            addr_of_mut!(types::TYPE_TYPE) as usize
+        );
+        Py_DecRef(heap);
+        // Version and whitespace data symbols carry their documented values.
+        assert_eq!(Py_Version, 0x030E_09F0);
+        assert_eq!(_Py_ascii_whitespace[0x20], 1);
+        assert_eq!(_Py_ascii_whitespace[0x41], 0);
+        assert_eq!(unsafe { _PyByteArray_empty_string[0] }, 0);
+        // Copy the pointer values out of the `static mut`s instead of taking
+        // shared references to them.
+        let (none, truth, falsity) = unsafe { (Py_None, Py_True, Py_False) };
+        assert!(!none.is_null());
+        assert!(!truth.is_null());
+        assert!(!falsity.is_null());
+        assert_eq!(none, addr_of_mut!(_Py_NoneStruct));
+        assert_eq!(truth, addr_of_mut!(_Py_TrueStruct));
+        assert_eq!(falsity, addr_of_mut!(_Py_FalseStruct));
+    }
+
+    static LAST_SET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    static GETSET_SETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static ADD_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static ITEM_INDEX: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
+    static NEXT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static LAST_OP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    extern "C" fn slot_getset_get(
+        _self: *mut ShimObject,
+        _closure: *mut c_void,
+    ) -> *mut ShimObject {
+        PyLong_FromLong(123)
+    }
+
+    extern "C" fn slot_getset_set(
+        _self: *mut ShimObject,
+        value: *mut ShimObject,
+        _closure: *mut c_void,
+    ) -> c_int {
+        match as_int(value) {
+            Ok(value) => {
+                GETSET_SETS.fetch_add(1, SEQ);
+                LAST_SET.store(value, SEQ);
+                0
+            }
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                -1
+            }
+        }
+    }
+
+    extern "C" fn slot_add(left: *mut ShimObject, right: *mut ShimObject) -> *mut ShimObject {
+        ADD_CALLS.fetch_add(1, SEQ);
+        // The slot is only reachable through the custom type instance.
+        if types::type_name(types::type_of(left)) != "probe.Slots" {
+            set_error("TypeError: slot add received a non-instance left operand");
+            return std::ptr::null_mut();
+        }
+        match as_int(right) {
+            Ok(right) => PyLong_FromLong((right + 10) as c_long),
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    extern "C" fn slot_negative(object: *mut ShimObject) -> *mut ShimObject {
+        match as_int(object) {
+            Ok(value) => PyLong_FromLong(-value as c_long),
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    extern "C" fn slot_bool(_object: *mut ShimObject) -> c_int {
+        1
+    }
+
+    extern "C" fn slot_length(_object: *mut ShimObject) -> isize {
+        3
+    }
+
+    extern "C" fn slot_item(_object: *mut ShimObject, index: isize) -> *mut ShimObject {
+        ITEM_INDEX.store(index, SEQ);
+        PyLong_FromLong(index as c_long * 10)
+    }
+
+    extern "C" fn slot_ass_item(
+        _object: *mut ShimObject,
+        index: isize,
+        value: *mut ShimObject,
+    ) -> c_int {
+        ITEM_INDEX.store(index, SEQ);
+        match as_int(value) {
+            Ok(value) => {
+                LAST_SET.store(value, SEQ);
+                0
+            }
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                -1
+            }
+        }
+    }
+
+    extern "C" fn slot_mp_length(_object: *mut ShimObject) -> isize {
+        4
+    }
+
+    extern "C" fn slot_mp_subscript(
+        _object: *mut ShimObject,
+        key: *mut ShimObject,
+    ) -> *mut ShimObject {
+        match as_int(key) {
+            Ok(key) => PyLong_FromLong((key + 100) as c_long),
+            Err(_) => {
+                set_error("KeyError: fixture key");
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    extern "C" fn slot_mp_ass_subscript(
+        _object: *mut ShimObject,
+        key: *mut ShimObject,
+        value: *mut ShimObject,
+    ) -> c_int {
+        if value.is_null() {
+            set_error("TypeError: fixture mapping does not delete");
+            return -1;
+        }
+        match (as_int(key), as_int(value)) {
+            (Ok(key), Ok(value)) => {
+                ITEM_INDEX.store(key as isize, SEQ);
+                LAST_SET.store(value, SEQ);
+                0
+            }
+            _ => {
+                set_error("TypeError: fixture mapping requires integers");
+                -1
+            }
+        }
+    }
+
+    extern "C" fn slot_iter(object: *mut ShimObject) -> *mut ShimObject {
+        inc_ref(object);
+        object
+    }
+
+    extern "C" fn slot_iternext(_object: *mut ShimObject) -> *mut ShimObject {
+        let index = NEXT_CALLS.fetch_add(1, SEQ);
+        if index < 2 {
+            PyLong_FromLong(index as c_long)
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+
+    extern "C" fn slot_richcompare(
+        left: *mut ShimObject,
+        right: *mut ShimObject,
+        op: c_int,
+    ) -> *mut ShimObject {
+        LAST_OP.store(op, SEQ);
+        let equal = as_int(left).ok() == as_int(right).ok();
+        Py_GetConstant(if equal {
+            PY_CONSTANT_TRUE
+        } else {
+            PY_CONSTANT_FALSE
+        })
+    }
+
+    extern "C" fn slot_hash(_object: *mut ShimObject) -> isize {
+        77
+    }
+
+    extern "C" fn slot_call(
+        _object: *mut ShimObject,
+        _args: *mut ShimObject,
+        _kwds: *mut ShimObject,
+    ) -> *mut ShimObject {
+        PyLong_FromLong(5)
+    }
+
+    #[test]
+    fn slot_suites_dispatch_through_the_c_function_pointers() {
+        anchor();
+        static mut MEMBER_VALUE: i64 = 0;
+        let mut members = [
+            types::PyMemberDefMirror {
+                name: c"count".as_ptr(),
+                type_: types::T_LONG,
+                offset: 16,
+                flags: 0,
+                doc: std::ptr::null(),
+            },
+            types::PyMemberDefMirror {
+                name: std::ptr::null(),
+                type_: 0,
+                offset: 0,
+                flags: 0,
+                doc: std::ptr::null(),
+            },
+        ];
+        let mut getsets = [
+            types::PyGetSetDefMirror {
+                name: c"computed".as_ptr(),
+                get: slot_getset_get as *const () as usize,
+                set: slot_getset_set as *const () as usize,
+                doc: std::ptr::null(),
+                closure: std::ptr::addr_of_mut!(MEMBER_VALUE) as *mut c_void,
+            },
+            types::PyGetSetDefMirror {
+                name: std::ptr::null(),
+                get: 0,
+                set: 0,
+                doc: std::ptr::null(),
+                closure: std::ptr::null_mut(),
+            },
+        ];
+        let mut slots = [
+            PyTypeSlotMirror {
+                slot: 3,
+                pfunc: slot_mp_ass_subscript as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 4,
+                pfunc: slot_mp_length as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 5,
+                pfunc: slot_mp_subscript as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 7,
+                pfunc: slot_add as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 9,
+                pfunc: slot_bool as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 30,
+                pfunc: slot_negative as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 39,
+                pfunc: slot_ass_item as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 44,
+                pfunc: slot_item as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 45,
+                pfunc: slot_length as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 50,
+                pfunc: slot_call as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 59,
+                pfunc: slot_hash as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 62,
+                pfunc: slot_iter as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 63,
+                pfunc: slot_iternext as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 67,
+                pfunc: slot_richcompare as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 72,
+                pfunc: members.as_mut_ptr() as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 73,
+                pfunc: getsets.as_mut_ptr() as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: std::ptr::null_mut(),
+            },
+        ];
+        let type_object = make_type(c"probe.Slots", 48, 0, 0, &mut slots);
+        let instance = PyType_GenericAlloc(type_object, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+
+        // Members: zeroed storage, then a real write/read round trip.
+        let value = PyObject_GetAttrString(instance, c"count".as_ptr());
+        assert!(!value.is_null(), "{:?}", take_error());
+        assert_eq!(PyLong_AsLong(value), 0);
+        Py_DecRef(value);
+        let forty_two = PyLong_FromLong(42);
+        assert_eq!(
+            PyObject_SetAttrString(instance, c"count".as_ptr(), forty_two),
+            0
+        );
+        let value = PyObject_GetAttrString(instance, c"count".as_ptr());
+        assert_eq!(PyLong_AsLong(value), 42);
+        Py_DecRef(value);
+        Py_DecRef(forty_two);
+
+        // getset getter and setter.
+        let computed = PyObject_GetAttrString(instance, c"computed".as_ptr());
+        assert!(!computed.is_null(), "{:?}", take_error());
+        assert_eq!(PyLong_AsLong(computed), 123);
+        Py_DecRef(computed);
+        let nine = PyLong_FromLong(9);
+        assert_eq!(
+            PyObject_SetAttrString(instance, c"computed".as_ptr(), nine),
+            0
+        );
+        assert_eq!(GETSET_SETS.load(SEQ), 1);
+        assert_eq!(LAST_SET.load(SEQ), 9);
+        Py_DecRef(nine);
+
+        // Number suite.
+        ADD_CALLS.store(0, SEQ);
+        let left = PyLong_FromLong(2);
+        let right = PyLong_FromLong(3);
+        // Exercise the custom type's `nb_add` (the instance is the left
+        // operand); builtin integers have no slot suite of their own.
+        let sum = types::PyNumber_Add(instance, right);
+        assert!(!sum.is_null(), "{:?}", take_error());
+        assert_eq!(PyLong_AsLong(sum), 13);
+        assert_eq!(ADD_CALLS.load(SEQ), 1);
+        Py_DecRef(sum);
+        let negative = types::PyNumber_Negative(right);
+        assert_eq!(PyLong_AsLong(negative), -3);
+        Py_DecRef(negative);
+        assert_eq!(types::PyObject_IsTrue(instance), 1);
+        assert_eq!(types::PyNumber_Check(instance), 1);
+
+        // Sequence suite, including `types::PyObject_Length` precedence over mapping.
+        ITEM_INDEX.store(-1, SEQ);
+        assert_eq!(types::PySequence_Length(instance), 3);
+        assert_eq!(types::PySequence_Size(instance), 3);
+        let item = types::PySequence_GetItem(instance, 4);
+        assert_eq!(PyLong_AsLong(item), 40);
+        assert_eq!(ITEM_INDEX.load(SEQ), 4);
+        Py_DecRef(item);
+        let seventeen = PyLong_FromLong(17);
+        assert_eq!(types::PySequence_SetItem(instance, 2, seventeen), 0);
+        assert_eq!(ITEM_INDEX.load(SEQ), 2);
+        assert_eq!(LAST_SET.load(SEQ), 17);
+
+        // Mapping suite and the abstract item API.
+        assert_eq!(types::PyMapping_Length(instance), 4);
+        assert_eq!(types::PyObject_Length(instance), 4);
+        let key = PyLong_FromLong(5);
+        let mapped = types::PyObject_GetItem(instance, key);
+        assert_eq!(PyLong_AsLong(mapped), 105);
+        Py_DecRef(mapped);
+        let mapped = types::PyMapping_GetItemString(instance, c"x".as_ptr());
+        assert!(mapped.is_null());
+        assert!(take_error().unwrap().contains("KeyError"));
+        assert_eq!(types::PyObject_SetItem(instance, key, seventeen), 0);
+        assert_eq!(ITEM_INDEX.load(SEQ), 5);
+        Py_DecRef(key);
+
+        // Iteration, including the NULL -> StopIteration protocol.
+        NEXT_CALLS.store(0, SEQ);
+        let iterator = types::PyObject_GetIter(instance);
+        assert!(!iterator.is_null(), "{:?}", take_error());
+        assert_eq!(types::PyIter_Check(iterator), 1);
+        let first = types::PyIter_Next(iterator);
+        assert_eq!(PyLong_AsLong(first), 0);
+        Py_DecRef(first);
+        let second = types::PyIter_Next(iterator);
+        assert_eq!(PyLong_AsLong(second), 1);
+        Py_DecRef(second);
+        clear_error();
+        assert!(types::PyIter_Next(iterator).is_null());
+        assert!(take_error().unwrap().contains("StopIteration"));
+        Py_DecRef(iterator);
+
+        // Rich comparison and hash.
+        let result = types::PyObject_RichCompare(left, left, 2);
+        assert!(!result.is_null());
+        assert_eq!(types::PyObject_IsTrue(result), 1);
+        Py_DecRef(result);
+        assert_eq!(types::PyObject_RichCompareBool(left, left, 2), 1);
+        assert_eq!(PyObject_Hash(instance), 77);
+        LAST_OP.store(-1, SEQ);
+        let rich = types::PyObject_RichCompare(instance, instance, 0);
+        assert!(!rich.is_null(), "{:?}", take_error());
+        assert_eq!(LAST_OP.load(SEQ), 0);
+        Py_DecRef(rich);
+
+        // tp_call through the vectorcall dispatch.
+        let called = PyObject_Call(instance, std::ptr::null_mut(), std::ptr::null_mut());
+        assert!(!called.is_null(), "{:?}", take_error());
+        assert_eq!(PyLong_AsLong(called), 5);
+        Py_DecRef(called);
+
+        // `PyType_GetSlot` reports every suite slot.
+        assert_eq!(
+            PyType_GetSlot(type_object, 7),
+            slot_add as *const () as *mut c_void
+        );
+        assert_eq!(
+            PyType_GetSlot(type_object, 45),
+            slot_length as *const () as *mut c_void
+        );
+        assert_eq!(
+            PyType_GetSlot(type_object, 3),
+            slot_mp_ass_subscript as *const () as *mut c_void
+        );
+        assert_eq!(
+            PyType_GetSlot(type_object, 72),
+            members.as_mut_ptr() as *mut c_void
+        );
+        assert_eq!(
+            PyType_GetSlot(type_object, 73),
+            getsets.as_mut_ptr() as *mut c_void
+        );
+        assert_eq!(
+            PyType_GetSlot(type_object, 67),
+            slot_richcompare as *const () as *mut c_void
+        );
+
+        Py_DecRef(left);
+        Py_DecRef(right);
+        Py_DecRef(seventeen);
+        Py_DecRef(instance);
+        Py_DecRef(type_object);
+    }
+
+    #[test]
+    fn multiple_bases_use_c3_linearisation() {
+        anchor();
+        let mut sequence_slots = [
+            PyTypeSlotMirror {
+                slot: 45,
+                pfunc: slot_length as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: std::ptr::null_mut(),
+            },
+        ];
+        let first = make_type(
+            c"probe.First",
+            32,
+            0,
+            PY_TPFLAGS_BASETYPE as c_uint,
+            &mut sequence_slots,
+        );
+        let mut getsets = [
+            types::PyGetSetDefMirror {
+                name: c"first_attr".as_ptr(),
+                get: slot_getset_get as *const () as usize,
+                set: 0,
+                doc: std::ptr::null(),
+                closure: std::ptr::null_mut(),
+            },
+            types::PyGetSetDefMirror {
+                name: std::ptr::null(),
+                get: 0,
+                set: 0,
+                doc: std::ptr::null(),
+                closure: std::ptr::null_mut(),
+            },
+        ];
+        let mut getset_slots = [
+            PyTypeSlotMirror {
+                slot: 73,
+                pfunc: getsets.as_mut_ptr() as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: std::ptr::null_mut(),
+            },
+        ];
+        let second = make_type(
+            c"probe.Second",
+            32,
+            0,
+            PY_TPFLAGS_BASETYPE as c_uint,
+            &mut getset_slots,
+        );
+
+        let mut derived_slots = empty_slots();
+        let bases = PyTuple_New(2);
+        Py_IncRef(first);
+        assert_eq!(PyTuple_SetItem(bases, 0, first), 0);
+        Py_IncRef(second);
+        assert_eq!(PyTuple_SetItem(bases, 1, second), 0);
+        let mut spec = PyTypeSpecMirror {
+            name: c"probe.Derived".as_ptr(),
+            basicsize: 0,
+            itemsize: 0,
+            flags: PY_TPFLAGS_BASETYPE as c_uint,
+            slots: derived_slots.as_mut_ptr(),
+        };
+        let derived = PyType_FromSpecWithBases(&mut spec, bases);
+        assert!(!derived.is_null(), "{:?}", take_error());
+        Py_DecRef(bases);
+
+        let instance = PyType_GenericAlloc(derived, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+        assert_eq!(
+            types::PySequence_Length(instance),
+            3,
+            "inherited sequence suite"
+        );
+        let attribute = PyObject_GetAttrString(instance, c"first_attr".as_ptr());
+        assert!(!attribute.is_null(), "{:?}", take_error());
+        assert_eq!(PyLong_AsLong(attribute), 123);
+        Py_DecRef(attribute);
+
+        // `__mro__` is (Derived, First, Second, object).
+        let mro = PyObject_GetAttrString(derived, c"__mro__".as_ptr());
+        assert!(!mro.is_null(), "{:?}", take_error());
+        assert_eq!(PyTuple_Size(mro), 4);
+        assert_eq!(PyTuple_GetItem(mro, 1) as usize, first as usize);
+        assert_eq!(PyTuple_GetItem(mro, 2) as usize, second as usize);
+        assert_eq!(
+            PyTuple_GetItem(mro, 3) as usize,
+            std::ptr::addr_of_mut!(types::OBJECT_TYPE) as usize
+        );
+        Py_DecRef(mro);
+
+        // An inconsistent base order is a C3 conflict, not silent MRO.
+        let left_bases = PyTuple_New(2);
+        Py_IncRef(first);
+        PyTuple_SetItem(left_bases, 0, first);
+        Py_IncRef(second);
+        PyTuple_SetItem(left_bases, 1, second);
+        let mut left_slots = empty_slots();
+        let mut left_spec = PyTypeSpecMirror {
+            name: c"probe.Left".as_ptr(),
+            basicsize: 0,
+            itemsize: 0,
+            flags: PY_TPFLAGS_BASETYPE as c_uint,
+            slots: left_slots.as_mut_ptr(),
+        };
+        let left = PyType_FromSpecWithBases(&mut left_spec, left_bases);
+        assert!(!left.is_null(), "{:?}", take_error());
+        Py_DecRef(left_bases);
+
+        let right_bases = PyTuple_New(2);
+        Py_IncRef(second);
+        PyTuple_SetItem(right_bases, 0, second);
+        Py_IncRef(first);
+        PyTuple_SetItem(right_bases, 1, first);
+        let mut right_slots = empty_slots();
+        let mut right_spec = PyTypeSpecMirror {
+            name: c"probe.Right".as_ptr(),
+            basicsize: 0,
+            itemsize: 0,
+            flags: PY_TPFLAGS_BASETYPE as c_uint,
+            slots: right_slots.as_mut_ptr(),
+        };
+        let right = PyType_FromSpecWithBases(&mut right_spec, right_bases);
+        assert!(!right.is_null(), "{:?}", take_error());
+        Py_DecRef(right_bases);
+
+        let conflict_bases = PyTuple_New(2);
+        Py_IncRef(left);
+        PyTuple_SetItem(conflict_bases, 0, left);
+        Py_IncRef(right);
+        PyTuple_SetItem(conflict_bases, 1, right);
+        let mut conflict_slots = empty_slots();
+        let mut conflict_spec = PyTypeSpecMirror {
+            name: c"probe.Conflict".as_ptr(),
+            basicsize: 0,
+            itemsize: 0,
+            flags: PY_TPFLAGS_BASETYPE as c_uint,
+            slots: conflict_slots.as_mut_ptr(),
+        };
+        clear_error();
+        let conflict = PyType_FromSpecWithBases(&mut conflict_spec, conflict_bases);
+        assert!(conflict.is_null());
+        let message = take_error().expect("MRO conflict");
+        assert!(message.contains("method resolution order"), "{message}");
+        Py_DecRef(conflict_bases);
+
+        Py_DecRef(instance);
+        Py_DecRef(derived);
+        Py_DecRef(left);
+        Py_DecRef(right);
+        Py_DecRef(first);
+        Py_DecRef(second);
+        // Keep the method tables alive until the types are gone (they live on
+        // the stack of this test until here).
+        let _ = &mut getsets;
+        let _ = &mut sequence_slots;
+        let _ = &mut getset_slots;
+        let _ = &mut derived_slots;
+        let _ = &mut left_slots;
+        let _ = &mut right_slots;
+        let _ = &mut conflict_slots;
+    }
+
+    #[test]
+    fn module_import_and_sys_surface_behaves() {
+        anchor();
+        let mut methods = [
+            PyMethodDefMirror {
+                ml_name: c"seven".as_ptr(),
+                ml_meth: method_seven as *const () as *mut c_void,
+                ml_flags: METH_NOARGS,
+                ml_doc: std::ptr::null(),
+            },
+            PyMethodDefMirror {
+                ml_name: std::ptr::null(),
+                ml_meth: std::ptr::null_mut(),
+                ml_flags: 0,
+                ml_doc: std::ptr::null(),
+            },
+        ];
+        let mut definition = empty_definition();
+        definition.m_name = c"hydro_abi_fixture".as_ptr();
+        definition.m_doc = c"fixture documentation".as_ptr();
+        definition.m_size = 16;
+        definition.m_methods = methods.as_mut_ptr();
+        let module = PyModule_Create2(&mut definition, 3);
+        assert!(!module.is_null(), "{:?}", take_error());
+
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr(PyModule_GetName(module)),
+                c"hydro_abi_fixture"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(PyModule_GetFilename(module)),
+                c"hydro_abi_fixture"
+            );
+        }
+        assert_eq!(
+            PyModule_GetDef(module) as usize,
+            &mut definition as *mut PyModuleDefMirror as usize
+        );
+        assert!(!PyModule_GetState(module).is_null());
+        assert_eq!(PyModule_AddIntConstant(module, c"answer".as_ptr(), 42), 0);
+        let dict = PyModule_GetDict(module);
+        assert!(!dict.is_null(), "{:?}", take_error());
+        assert_eq!(PyModule_GetDict(module), dict, "the dictionary is stable");
+        let value = PyDict_GetItemString(dict, c"answer".as_ptr());
+        assert_eq!(PyLong_AsLong(value), 42);
+        let name = PyModule_GetNameObject(module);
+        assert_eq!(as_string(name).as_deref(), Some("hydro_abi_fixture"));
+        Py_DecRef(name);
+        assert_eq!(PyModule_AddFunctions(module, methods.as_mut_ptr()), 0);
+        assert!(!PyDict_GetItemString(dict, c"seven".as_ptr()).is_null());
+        // The module's `__doc__` came from the definition.
+        let doc = PyDict_GetItemString(dict, c"__doc__".as_ptr());
+        assert_eq!(as_string(doc).as_deref(), Some("fixture documentation"));
+
+        let imported = PyImport_ImportModule(c"hydro_abi_fixture".as_ptr());
+        assert_eq!(imported, module, "the registry resolves the module by name");
+        Py_DecRef(imported);
+        let named = PyImport_AddModule(c"hydro_abi_dynamic".as_ptr());
+        assert!(!named.is_null(), "{:?}", take_error());
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr(PyModule_GetName(named)),
+                c"hydro_abi_dynamic"
+            );
+        }
+        let module_dict = PyImport_GetModuleDict();
+        assert!(!module_dict.is_null());
+        assert!(!PyDict_GetItemString(module_dict, c"hydro_abi_fixture".as_ptr()).is_null());
+        let modules = PySys_GetObject(c"modules".as_ptr());
+        assert_eq!(modules, module_dict);
+        let probe = PyLong_FromLong(7);
+        assert_eq!(PySys_SetObject(c"hydro_probe".as_ptr(), probe), 0);
+        Py_DecRef(probe);
+        assert_eq!(PyLong_AsLong(PySys_GetObject(c"hydro_probe".as_ptr())), 7);
+        let builtins = PyEval_GetBuiltins();
+        assert!(!builtins.is_null());
+        let int_type = PyDict_GetItemString(builtins, c"int".as_ptr());
+        assert_eq!(
+            int_type as usize,
+            std::ptr::addr_of_mut!(types::INT_TYPE) as usize
+        );
+        assert!(!PyEval_GetGlobals().is_null());
+        assert!(!PyEval_GetLocals().is_null());
+
+        // Unsupported evaluation fails loudly instead of returning a fake
+        // result.
+        clear_error();
+        assert_eq!(PyRun_SimpleString(c"x = 1".as_ptr()), -1);
+        assert!(take_error().unwrap().contains("PyRun_SimpleString"));
+        clear_error();
+        assert!(PyRun_String(
+            c"x".as_ptr(),
+            256,
+            std::ptr::null_mut(),
+            std::ptr::null_mut()
+        )
+        .is_null());
+        assert!(take_error().unwrap().contains("PyRun_String"));
+
+        clear_error();
+        assert!(PyImport_ImportModule(c"not_a_loaded_module".as_ptr()).is_null());
+        assert!(take_error().unwrap().contains("ImportError"));
+    }
+
+    #[test]
+    fn writers_allocators_and_mutex_work() {
+        anchor();
+        // Unicode writer.
+        let writer = PyUnicodeWriter_Create(8);
+        assert!(!writer.is_null());
+        assert_eq!(
+            PyUnicodeWriter_WriteUTF8(writer, b"ab".as_ptr() as *const c_char, 2),
+            0
+        );
+        assert_eq!(PyUnicodeWriter_WriteChar(writer, 'c' as c_uint), 0);
+        let text = PyUnicode_FromString(c"d".as_ptr());
+        assert_eq!(PyUnicodeWriter_WriteStr(writer, text), 0);
+        Py_DecRef(text);
+        let result = PyUnicodeWriter_Finish(writer);
+        assert_eq!(as_string(result).as_deref(), Some("abcd"));
+        Py_DecRef(result);
+        let writer = PyUnicodeWriter_Create(0);
+        assert_eq!(
+            PyUnicodeWriter_WriteASCII(writer, b"ok".as_ptr() as *const c_char, 2),
+            0
+        );
+        let result = PyUnicodeWriter_Finish(writer);
+        assert_eq!(as_string(result).as_deref(), Some("ok"));
+        Py_DecRef(result);
+        let writer = PyUnicodeWriter_Create(0);
+        PyUnicodeWriter_Discard(writer);
+
+        // Long writer: little-endian base-2^30 digits.
+        let mut digits: *mut c_void = std::ptr::null_mut();
+        let writer = PyLongWriter_Create(0, 2, &mut digits);
+        assert!(!writer.is_null());
+        assert!(!digits.is_null());
+        unsafe {
+            *(digits as *mut u32) = 0;
+            *(digits as *mut u32).add(1) = 1;
+        }
+        let value = PyLongWriter_Finish(writer);
+        assert_eq!(PyLong_AsLong(value), 1 << 30);
+        Py_DecRef(value);
+        let writer = PyLongWriter_Create(1, 1, &mut digits);
+        unsafe {
+            *(digits as *mut u32) = 5;
+        }
+        let value = PyLongWriter_Finish(writer);
+        assert_eq!(PyLong_AsLong(value), -5);
+        Py_DecRef(value);
+        PyLongWriter_Discard(PyLongWriter_Create(0, 1, std::ptr::null_mut()));
+
+        // Allocators.
+        let memory = PyMem_Malloc(16) as *mut u8;
+        assert!(!memory.is_null());
+        unsafe {
+            *memory = 7;
+        }
+        let memory = PyMem_Realloc(memory as *mut c_void, 32) as *mut u8;
+        assert!(!memory.is_null());
+        assert_eq!(unsafe { *memory }, 7);
+        PyMem_Free(memory as *mut c_void);
+        let zeroed = PyObject_Calloc(4, 4) as *const u8;
+        assert!(!zeroed.is_null());
+        assert_eq!(unsafe { *zeroed.add(15) }, 0);
+        PyObject_Free(zeroed as *mut c_void);
+        let raw = PyMem_RawMalloc(4);
+        assert!(!raw.is_null());
+        PyMem_RawFree(raw);
+
+        // PyMutex on CPython's one-byte layout.
+        static mut LOCK: u8 = 0;
+        let lock = std::ptr::addr_of_mut!(LOCK);
+        assert_eq!(PyMutex_IsLocked(lock), 0);
+        PyMutex_Lock(lock);
+        assert_eq!(PyMutex_IsLocked(lock), 1);
+        PyMutex_Unlock(lock);
+        assert_eq!(PyMutex_IsLocked(lock), 0);
+    }
+
+    #[test]
+    fn dlopened_fixture_type_spec_dispatches() {
+        // SAFETY: the fixture exports C-layout type tables and callbacks.
+        let library =
+            unsafe { libc::dlopen(FIXTURE_PATH.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        assert!(!library.is_null(), "dlopen failed: {}", dl_error());
+        // SAFETY: symbol names are NUL-terminated.
+        let spec_symbol = unsafe { libc::dlsym(library, c"hydro_fixture_spec".as_ptr()) };
+        assert!(!spec_symbol.is_null(), "fixture spec symbol");
+        let spec_function: unsafe extern "C" fn() -> *mut c_void =
+            unsafe { std::mem::transmute(spec_symbol) };
+        let spec = unsafe { spec_function() } as *mut PyTypeSpecMirror;
+        assert!(!spec.is_null());
+        let query = |name: &std::ffi::CStr| -> unsafe extern "C" fn() -> c_long {
+            let symbol = unsafe { libc::dlsym(library, name.as_ptr()) };
+            assert!(!symbol.is_null(), "fixture symbol {name:?}");
+            unsafe { std::mem::transmute(symbol) }
+        };
+        let getset_sets = query(c"hydro_fixture_getset_sets");
+        let next_calls = query(c"hydro_fixture_next_calls");
+        let item_index = query(c"hydro_fixture_item_index");
+        let last_op = query(c"hydro_fixture_last_op");
+
+        let type_object = PyType_FromSpec(spec);
+        assert!(!type_object.is_null(), "{:?}", take_error());
+        let instance = PyType_GenericAlloc(type_object, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+
+        // Member descriptor from the fixture's PyMemberDef table.
+        let member = PyObject_GetAttrString(instance, c"count".as_ptr());
+        assert_eq!(PyLong_AsLong(member), 0);
+        Py_DecRef(member);
+        let forty = PyLong_FromLong(40);
+        assert_eq!(
+            PyObject_SetAttrString(instance, c"count".as_ptr(), forty),
+            0
+        );
+        let member = PyObject_GetAttrString(instance, c"count".as_ptr());
+        assert_eq!(PyLong_AsLong(member), 40);
+        Py_DecRef(member);
+        Py_DecRef(forty);
+
+        // getset descriptor: the getter returns `self` (borrowed), so give the
+        // result a reference the caller will own.
+        Py_IncRef(instance);
+        let getset = PyObject_GetAttrString(instance, c"self_ref".as_ptr());
+        assert_eq!(getset, instance);
+        Py_DecRef(getset);
+        let value = PyLong_FromLong(1);
+        assert_eq!(
+            PyObject_SetAttrString(instance, c"self_ref".as_ptr(), value),
+            0
+        );
+        assert_eq!(unsafe { getset_sets() }, 1);
+        Py_DecRef(value);
+
+        // Number, sequence, iteration, comparison and hash slots.
+        let three = PyLong_FromLong(3);
+        Py_IncRef(three);
+        let sum = types::PyNumber_Add(instance, three);
+        assert_eq!(sum, three, "fixture nb_add returns its second operand");
+        Py_DecRef(sum);
+        assert_eq!(types::PyObject_IsTrue(instance), 1);
+        assert_eq!(types::PySequence_Length(instance), 7);
+        Py_IncRef(instance);
+        let item = types::PySequence_GetItem(instance, 4);
+        assert_eq!(item, instance);
+        assert_eq!(unsafe { item_index() }, 4);
+        Py_DecRef(item);
+        assert_eq!(PyObject_Hash(instance), 99);
+
+        Py_IncRef(instance);
+        let iterator = types::PyObject_GetIter(instance);
+        assert_eq!(iterator, instance);
+        assert_eq!(types::PyIter_Check(instance), 1);
+        clear_error();
+        assert!(types::PyIter_Next(iterator).is_null());
+        assert!(take_error().unwrap().contains("StopIteration"));
+        assert_eq!(unsafe { next_calls() }, 1);
+        Py_DecRef(iterator);
+
+        Py_IncRef(instance);
+        let comparison = types::PyObject_RichCompare(instance, instance, 0);
+        assert_eq!(comparison, instance);
+        assert_eq!(unsafe { last_op() }, 0);
+        Py_DecRef(comparison);
+
+        // `PyType_GetSlot` returns the fixture's function pointers.
+        let slot_pointer = |slot: c_int| -> *mut c_void {
+            let mut cursor = unsafe { (*spec).slots };
+            loop {
+                let entry = unsafe { &*cursor };
+                if entry.slot == 0 {
+                    panic!("fixture slot {slot} is missing");
+                }
+                if entry.slot == slot {
+                    return entry.pfunc;
+                }
+                cursor = unsafe { cursor.add(1) };
+            }
+        };
+        for slot in [7, 9, 44, 45, 59, 62, 63, 67, 72, 73] {
+            assert_eq!(PyType_GetSlot(type_object, slot), slot_pointer(slot));
+        }
+
+        Py_DecRef(instance);
+        Py_DecRef(type_object);
+        Py_DecRef(three);
+    }
+
+    static FIXTURE_PATH: std::sync::LazyLock<std::ffi::CString> = std::sync::LazyLock::new(|| {
+        let directory =
+            std::env::temp_dir().join(format!("hydro-capi-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("fixture directory");
+        let source = directory.join("fixture.c");
+        let library = directory.join("fixture.so");
+        std::fs::write(&source, FIXTURE_SOURCE).expect("write fixture source");
+        let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let output = std::process::Command::new(compiler)
+            .arg("-shared")
+            .arg("-fPIC")
+            .arg("-O1")
+            .arg("-o")
+            .arg(&library)
+            .arg(&source)
+            .output()
+            .expect("run the C compiler for the fixture");
+        assert!(
+            output.status.success(),
+            "fixture compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::ffi::CString::new(library.to_string_lossy().as_bytes()).expect("fixture path")
+    });
+
+    const FIXTURE_SOURCE: &str = r#"
+typedef struct PyObject PyObject;
+typedef struct { int slot; void *pfunc; } PyType_Slot;
+typedef struct {
+    const char *name;
+    int basicsize;
+    int itemsize;
+    unsigned int flags;
+    PyType_Slot *slots;
+} PyType_Spec;
+typedef struct {
+    const char *name;
+    int type;
+    long offset;
+    int flags;
+    const char *doc;
+} PyMemberDef;
+typedef struct {
+    const char *name;
+    void *get;
+    void *set;
+    const char *doc;
+    void *closure;
+} PyGetSetDef;
+
+static long getset_sets;
+static long next_calls;
+static long item_index;
+static long last_op;
+
+static PyObject *fixture_get(PyObject *self, void *closure)
+{
+    (void)closure;
+    return self;
+}
+static int fixture_set(PyObject *self, PyObject *value, void *closure)
+{
+    (void)self; (void)value; (void)closure;
+    getset_sets++;
+    return 0;
+}
+static PyObject *fixture_add(PyObject *left, PyObject *right)
+{
+    (void)left;
+    return right;
+}
+static int fixture_bool(PyObject *self) { (void)self; return 1; }
+static long fixture_length(PyObject *self) { (void)self; return 7; }
+static PyObject *fixture_item(PyObject *self, long index)
+{
+    item_index = index;
+    return self;
+}
+static PyObject *fixture_iter(PyObject *self) { return self; }
+static PyObject *fixture_next(PyObject *self)
+{
+    (void)self;
+    next_calls++;
+    return 0;
+}
+static PyObject *fixture_richcompare(PyObject *left, PyObject *right, int op)
+{
+    (void)right;
+    last_op = op;
+    return left;
+}
+static long fixture_hash(PyObject *self) { (void)self; return 99; }
+
+static PyMemberDef fixture_members[] = {
+    {"count", 2, 16, 0, 0},
+    {0, 0, 0, 0, 0},
+};
+static PyGetSetDef fixture_getsets[] = {
+    {"self_ref", (void *)fixture_get, (void *)fixture_set, 0, 0},
+    {0, 0, 0, 0, 0},
+};
+static PyType_Slot fixture_slots[] = {
+    {72, fixture_members},
+    {73, fixture_getsets},
+    {7, (void *)fixture_add},
+    {9, (void *)fixture_bool},
+    {45, (void *)fixture_length},
+    {44, (void *)fixture_item},
+    {59, (void *)fixture_hash},
+    {62, (void *)fixture_iter},
+    {63, (void *)fixture_next},
+    {67, (void *)fixture_richcompare},
+    {0, 0},
+};
+static PyType_Spec fixture_spec = {
+    "hydro_fixture.Type", 32, 0, 0, fixture_slots,
+};
+
+void *hydro_fixture_spec(void) { return &fixture_spec; }
+long hydro_fixture_getset_sets(void) { return getset_sets; }
+long hydro_fixture_next_calls(void) { return next_calls; }
+long hydro_fixture_item_index(void) { return item_index; }
+long hydro_fixture_last_op(void) { return last_op; }
+"#;
 }

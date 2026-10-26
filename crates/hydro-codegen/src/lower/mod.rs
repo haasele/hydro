@@ -6161,6 +6161,97 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(result)
     }
 
+    /// Whether a local-table name is visible to Python introspection.
+    ///
+    /// Compiler-private slots (hidden temporaries, unpack targets, loop
+    /// temporaries, `with` state) start with `$`, which cannot appear in a
+    /// Python identifier; they never show up in `locals()`/`dir()`.
+    fn is_visible_local_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(first) if first == '_' || first.is_alphabetic() => {}
+            _ => return false,
+        }
+        chars.all(|c| c == '_' || c.is_alphanumeric())
+    }
+
+    /// Visible `(name, local id)` pairs of the current frame, in slot order
+    /// with the first binding of a duplicated name kept.
+    fn visible_locals(&self) -> Vec<(String, LocalId)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut locals = Vec::new();
+        for (index, local) in self.locals.iter().enumerate() {
+            if !Self::is_visible_local_name(&local.name) {
+                continue;
+            }
+            if !seen.insert(local.name.clone()) {
+                continue;
+            }
+            locals.push((local.name.clone(), index as LocalId));
+        }
+        locals
+    }
+
+    /// Materialise a constant `str` for a name or key.
+    fn materialize_str(&mut self, text: &str) -> Result<Value, CodegenError> {
+        let (slot, len) = make_bytes_slot(&mut self.builder, text.as_bytes())?;
+        let ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+        let len = self.builder.ins().iconst(self.ptr_ty, len as i64);
+        let id = self.runtime.str_new;
+        let value = self.call_rt(id, &[ptr, len])?;
+        self.emit_exc_check()?;
+        Ok(value)
+    }
+
+    /// Build the `dict` a direct `locals()` (or zero-argument `vars()`) call
+    /// returns from the live local slots.
+    ///
+    /// The dict is parked in a rooted temporary and filled one entry at a
+    /// time; each key is allocated immediately before `hydro_dict_set`, so no
+    /// allocation can leave an untraced key behind.
+    fn lower_locals_dict(&mut self) -> Result<Value, CodegenError> {
+        let empty_slot = self.stack_array_slot(0, "locals()")?;
+        let empty_ptr = self.builder.ins().stack_addr(self.ptr_ty, empty_slot, 0);
+        let zero = self.builder.ins().iconst(self.ptr_ty, 0);
+        let dict = self.call_rt(self.runtime.dict_new, &[zero, empty_ptr, empty_ptr])?;
+        let holder = self.temp_var()?;
+        self.define_var(holder, dict)?;
+        self.emit_exc_check()?;
+        for (name, id) in self.visible_locals() {
+            let value = self.builder.use_var(self.local_var(id)?);
+            let key = self.materialize_str(&name)?;
+            let dict = self.builder.use_var(holder);
+            self.call_rt(self.runtime.dict_set, &[dict, key, value])?;
+            self.emit_exc_check()?;
+        }
+        Ok(self.builder.use_var(holder))
+    }
+
+    /// Build the sorted name `list` a zero-argument `dir()` call returns from
+    /// the current frame's visible locals.
+    fn lower_local_names_list(&mut self) -> Result<Value, CodegenError> {
+        let empty_slot = self.stack_array_slot(0, "dir()")?;
+        let empty_ptr = self.builder.ins().stack_addr(self.ptr_ty, empty_slot, 0);
+        let zero = self.builder.ins().iconst(self.ptr_ty, 0);
+        let list = self.call_rt(self.runtime.list_new, &[zero, empty_ptr])?;
+        let holder = self.temp_var()?;
+        self.define_var(holder, list)?;
+        self.emit_exc_check()?;
+        let mut names: Vec<String> = self
+            .visible_locals()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+        for name in names {
+            let item = self.materialize_str(&name)?;
+            let list = self.builder.use_var(holder);
+            self.call_rt(self.runtime.list_append, &[list, item])?;
+            self.emit_exc_check()?;
+        }
+        Ok(self.builder.use_var(holder))
+    }
+
     /// Lower a call through a function value via `hydro_call(fn, argc, argv)`,
     /// or `hydro_call_star(fn, argc, argv, star)` when the call has a starred
     /// operand.
@@ -6753,7 +6844,40 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             | Builtin::Classmethod
             | Builtin::Staticmethod
             | Builtin::Property
+            | Builtin::Globals
+            | Builtin::Eval
+            | Builtin::Exec
+            | Builtin::Compile
+            | Builtin::ClassFromNamespace
+            | Builtin::GlobalSetDynamic
             | Builtin::AnyValue => self.lower_builtin_values(builtin, values),
+            Builtin::Locals => {
+                // Codegen materialises the frame's locals; the runtime entry
+                // point only serves first-class `locals` values, which carry
+                // no frame context.
+                if !values.is_empty() {
+                    let actual = values.len();
+                    return Err(CodegenError::new(format!(
+                        "internal locals() lowering received {actual} argument(s)"
+                    )));
+                }
+                self.lower_locals_dict()
+            }
+            Builtin::Dir => match values.len() {
+                0 => self.lower_local_names_list(),
+                1 => self.lower_builtin_values(builtin, values),
+                actual => Err(CodegenError::new(format!(
+                    "builtin dir expects 0 or 1 argument, got {actual}"
+                ))),
+            },
+            Builtin::Vars => match values.len() {
+                // `vars()` without an argument is `locals()`.
+                0 => self.lower_locals_dict(),
+                1 => self.lower_builtin_values(builtin, values),
+                actual => Err(CodegenError::new(format!(
+                    "builtin vars expects 0 or 1 argument, got {actual}"
+                ))),
+            },
             Builtin::Max | Builtin::Min => {
                 // The frontend always appends the key slot as the final
                 // argument (`None` without `key=`, the callable otherwise) and

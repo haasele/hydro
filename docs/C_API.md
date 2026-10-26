@@ -131,7 +131,13 @@ The first vertical slice of option B is in `hydro-runtime` and verified by
 
 ### 3.2 Full-ABI foundation (2026-10-26)
 
-The next layer is implemented but **not yet NumPy/pydantic compatible**:
+The next layer is implemented but **not yet NumPy/pydantic compatible**.
+Real-wheel inventory (2026-10-26): NumPy 2.5 needs 227, pydantic-core 2.50
+needs 112, and sampled pandas 3.1 libs need at least 124 missing CPython
+symbols. Builtin `Py*_Type` data symbols and the full type-slot suites are
+now exported; the remaining gap is the long tail of object/module APIs,
+NumPy C-API handles, and true traverse/clear integration.
+
 `PyObject_HEAD`/`PyVarObject` headers with real refcounts and immortal
 singletons, a 3.14 `PyTypeObject` layout with `PyType_FromSpec`/`GetSlot`,
 `PyType_GenericAlloc`/`PyObject_Init`, vectorcall and FASTCALL/KEYWORDS,

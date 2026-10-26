@@ -31,6 +31,15 @@ and `docs/LAYOUT.md` (source tree).
 Official `Lib/test` runs are a release gate; the offline manifest check runs
 in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
+**2026-10-26 package checkpoint:** real CPython 3.14 wheels for NumPy 2.5,
+pandas 3.1, pydantic 2.14 and pydantic-core 2.50 install through `tea install`.
+Import is **not yet green**: NumPy stops on non-module-level function
+definitions/class-body deletes, pandas on `_ctypes`, and pydantic on
+`__slots__`/`annotationlib` introspection. ABI inventory against the real
+`.so` files: NumPy needs 227 missing CPython symbols, pydantic-core 112,
+sampled pandas libs at least 124; builtin `Py*_Type` exports and slot suites
+are now implemented, but this is not an ecosystem-compatibility claim.
+
 **2026-10-26 checkpoint:** the four open construction sites received a
 substantial implementation slice: import/module registry + `HYDRO_STDLIB`,
 the core builtin/frozen shims, PEP 701/750 parser and templates, the P4-02
@@ -41,13 +50,13 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo test --workspace` on 2026-10-26: **1542 Hydro tests**:
+`cargo test --workspace` on 2026-10-26: **1554 Hydro tests**:
 
 | Suite | Tests |
 |---|---:|
-| runtime unit | 585 |
-| runtime integration | 322 |
-| frontend | 515 (incl. 6 fuzz smoke) |
+| runtime unit | 596 |
+| runtime integration | 321 |
+| frontend | 517 (incl. 6 fuzz smoke) |
 | codegen | 61 |
 | IR | 29 |
 | interpreter unit | 11 |

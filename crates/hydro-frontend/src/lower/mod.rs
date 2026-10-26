@@ -771,14 +771,24 @@ struct ClassPlan {
     /// Indices of the decorator expressions that are applied at runtime,
     /// bottom-up after the class object is created.
     decorators: Vec<usize>,
-    /// Method name, function id, the index of its `FunctionDef` in the class
-    /// body and its binding kind. Methods are lowered after their signatures
-    /// are registered. A synthesized method (the dataclass/NamedTuple
-    /// `__init__`) has no source body and therefore stores `None`.
-    methods: Vec<(String, FunctionId, Option<usize>, MethodKind)>,
+    /// Method name, function id, the source range start of its
+    /// `FunctionDef` and its binding kind. Methods are lowered after their
+    /// signatures are registered. A synthesized method (the
+    /// dataclass/NamedTuple `__init__`) has no source body and therefore
+    /// stores `None`; the runtime module `None` index denotes that case.
+    methods: Vec<(String, FunctionId, Option<u32>, MethodKind)>,
     /// Class attribute name and the index of its assignment in the class
     /// body. Values are lowered when the class statement itself is lowered.
+    /// Only the static path collects attributes.
     attributes: Vec<(String, usize)>,
+    /// True when the class body executes statements the static plan cannot
+    /// express (`del`, `if`, `for`, `with`, `try`, `raise`, calls, …). Such a
+    /// body runs at runtime against a namespace `dict`, preserving CPython's
+    /// class-namespace semantics.
+    dynamic: bool,
+    /// Names bound anywhere in a dynamic class body, including nested control
+    /// flow. Reads of these names resolve against the runtime namespace.
+    bindings: HashSet<String>,
 }
 
 /// Cell analysis for one function, computed from its AST before the body is
@@ -790,6 +800,24 @@ struct CellPlan {
     owned: HashSet<String>,
     /// Capture parameters that already hold an enclosing function's cell.
     aliases: HashSet<String>,
+}
+
+/// Active class-body namespace while lowering a dynamic class body.
+///
+/// A class body that executes statements keeps CPython's class namespace in a
+/// runtime `dict` local: assignments and `del` write that dict, reads of bound
+/// names come from it, and the class object is built from it when the body
+/// finishes.
+#[derive(Clone)]
+struct ClassNs {
+    /// Local slot holding the namespace `dict`.
+    ns: LocalId,
+    /// Names bound anywhere in the class body (methods, assignments, loop and
+    /// handler targets).
+    bindings: HashSet<String>,
+    /// Method bodies by definition span start: the function id and binding
+    /// kind the class namespace must receive.
+    methods: HashMap<u32, (FunctionId, MethodKind)>,
 }
 
 struct FuncState {
@@ -819,6 +847,9 @@ struct FuncState {
     /// suspended fiber, so an assignment expression cannot write back to the
     /// enclosing function.
     genexp_frame: bool,
+    /// Class-namespace context of a dynamic class body being lowered; `None`
+    /// in ordinary module/function scopes.
+    class_ns: Option<ClassNs>,
 }
 
 impl FuncState {
@@ -1804,15 +1835,14 @@ impl<'a> Lowerer<'a> {
                     else {
                         continue;
                     };
-                    for (_, fid, method_idx, _) in plan.methods {
+                    let bodies = class_method_bodies(&c.body);
+                    for (_, fid, method_start, _) in plan.methods {
                         // Synthesized methods already carry their body.
-                        let Some(method_idx) = method_idx else {
+                        let Some(method_start) = method_start else {
                             continue;
                         };
-                        let body = match &c.body[method_idx] {
-                            ast::Stmt::FunctionDef(f) => &f.body,
-                            ast::Stmt::AsyncFunctionDef(f) => &f.body,
-                            _ => continue,
+                        let Some(body) = bodies.get(&method_start) else {
+                            continue;
                         };
                         let body = self.lower_function_body(fid, body);
                         self.functions[fid as usize].body = body;
@@ -1840,6 +1870,7 @@ impl<'a> Lowerer<'a> {
             is_async: false,
             is_generator: false,
             genexp_frame: false,
+            class_ns: None,
         };
         let mut body = Vec::new();
         for (idx, stmt) in module.body.iter().enumerate() {
@@ -4199,11 +4230,41 @@ impl<'a> Lowerer<'a> {
             .first()
             .is_some_and(|base| self.is_typing_namedtuple(base));
 
-        let mut methods: Vec<(String, FunctionId, Option<usize>, MethodKind)> = Vec::new();
+        let mut methods: Vec<(String, FunctionId, Option<u32>, MethodKind)> = Vec::new();
         let mut fields: Vec<DataclassField<'s>> = Vec::new();
         let mut attributes: Vec<(String, usize)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let dynamic = class_body_needs_namespace(&s.body);
         for (idx, stmt) in s.body.iter().enumerate() {
+            if dynamic {
+                // A dynamic body only needs its annotated fields here; every
+                // statement (and method definition) is executed or bound at
+                // runtime. Method bodies are registered after this loop.
+                if let ast::Stmt::AnnAssign(ann) = stmt {
+                    let ast::Expr::Name(target) = &*ann.target else {
+                        continue;
+                    };
+                    let field = target.id.to_string();
+                    if !seen.insert(field.clone()) {
+                        continue;
+                    }
+                    let ty = self.annotation_ty(&ann.annotation);
+                    let default = if is_dataclass || is_namedtuple {
+                        match ann.value.as_deref() {
+                            None => FieldDefault::Required,
+                            Some(value) => self.annotated_field_default(value),
+                        }
+                    } else {
+                        FieldDefault::Required
+                    };
+                    fields.push(DataclassField {
+                        name: target.id.as_str(),
+                        ty,
+                        default,
+                    });
+                }
+                continue;
+            }
             if matches!(stmt, ast::Stmt::Pass(_)) {
                 continue;
             }
@@ -4362,7 +4423,27 @@ impl<'a> Lowerer<'a> {
             if let Some((id, kind)) = registered {
                 self.class_methods
                     .insert(id, (class.clone(), kind, first_param_name(self, id)));
-                methods.push((method, id, Some(idx), kind));
+                methods.push((method, id, Some(u32::from(range.start())), kind));
+            }
+        }
+
+        // A dynamic class body executes at runtime: its method definitions
+        // (including those inside `if`/`for`/`try` branches) must still be
+        // registered now so their bodies are lowered with the module, and the
+        // set of names bound anywhere in the body drives namespace reads.
+        let mut bindings = HashSet::new();
+        if dynamic {
+            self.collect_dynamic_class_methods(&class, &s.body, &mut methods);
+            collect_source_bound_names(&s.body, &mut bindings, true);
+            // The class statement itself binds these in the namespace.
+            bindings.insert("__module__".to_string());
+            bindings.insert("__qualname__".to_string());
+            if class_body_assigns_slots(&s.body) {
+                self.error_at_code(
+                    s.range,
+                    codes::UNSUPPORTED,
+                    "__slots__ is not supported: Hydro class instances always use a dynamic attribute table",
+                );
             }
         }
 
@@ -4400,6 +4481,68 @@ impl<'a> Lowerer<'a> {
             decorators,
             methods,
             attributes,
+            dynamic,
+            bindings,
+        }
+    }
+
+    /// Registers every method definition reachable from a dynamic class body.
+    ///
+    /// The definitions execute conditionally at runtime (`if not
+    /// TYPE_CHECKING:` and friends), but their signatures and bodies are
+    /// compiled unconditionally, exactly like CPython compiles both branches
+    /// of a class-body `if`.
+    fn collect_dynamic_class_methods(
+        &mut self,
+        class: &str,
+        body: &[ast::Stmt],
+        methods: &mut Vec<(String, FunctionId, Option<u32>, MethodKind)>,
+    ) {
+        for stmt in body {
+            match stmt {
+                ast::Stmt::FunctionDef(f) => {
+                    if f.decorator_list
+                        .iter()
+                        .any(|d| is_overload_decorator(d) || is_property_accessor_decorator(d))
+                    {
+                        continue;
+                    }
+                    if let Some((id, kind)) = self.create_method_function(f, class) {
+                        self.class_methods
+                            .insert(id, (class.to_string(), kind, first_param_name(self, id)));
+                        methods.push((
+                            f.name.to_string(),
+                            id,
+                            Some(u32::from(f.range.start())),
+                            kind,
+                        ));
+                    }
+                }
+                ast::Stmt::AsyncFunctionDef(f) => {
+                    if f.decorator_list
+                        .iter()
+                        .any(|d| is_overload_decorator(d) || is_property_accessor_decorator(d))
+                    {
+                        continue;
+                    }
+                    if let Some((id, kind)) = self.create_async_method_function(f, class) {
+                        self.class_methods
+                            .insert(id, (class.to_string(), kind, first_param_name(self, id)));
+                        methods.push((
+                            f.name.to_string(),
+                            id,
+                            Some(u32::from(f.range.start())),
+                            kind,
+                        ));
+                    }
+                }
+                ast::Stmt::ClassDef(_) => {}
+                other => {
+                    for block in class_body_blocks(other) {
+                        self.collect_dynamic_class_methods(class, block, methods);
+                    }
+                }
+            }
         }
     }
 
@@ -4651,6 +4794,7 @@ impl<'a> Lowerer<'a> {
             is_async: false,
             is_generator: false,
             genexp_frame: false,
+            class_ns: None,
         };
 
         let self_expr = HExpr {
@@ -4799,6 +4943,7 @@ impl<'a> Lowerer<'a> {
             is_async: false,
             is_generator: false,
             genexp_frame: false,
+            class_ns: None,
         };
         let previous = self.in_default_expr;
         self.in_default_expr = true;
@@ -4972,6 +5117,7 @@ impl<'a> Lowerer<'a> {
             is_async: function.is_async,
             is_generator: function.is_generator,
             genexp_frame: false,
+            class_ns: None,
         };
 
         // `nonlocal` must name a binding captured from an enclosing function.
@@ -5373,6 +5519,51 @@ impl<'a> Lowerer<'a> {
                     return None;
                 };
                 let op = self.bin_op(s.op, s.range)?;
+                if let Some(ns) = fs.class_ns.as_ref().map(|state| state.ns) {
+                    // `name op= value` in a class body: read the namespace
+                    // entry, apply the operator and store it back.
+                    let namespace = HExpr {
+                        kind: HExprKind::Local(ns),
+                        ty: Ty::Concrete(Type::Dict),
+                        line,
+                        col,
+                    };
+                    let key = HExpr {
+                        kind: HExprKind::Const(Const::Str(target.id.to_string())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    };
+                    let lhs = HExpr {
+                        kind: HExprKind::Subscript {
+                            object: Box::new(namespace.clone()),
+                            index: Box::new(key.clone()),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    };
+                    let rhs = self.expr(&s.value, fs);
+                    let value = HExpr {
+                        kind: HExprKind::Bin {
+                            op,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
+                    return Some(HStmt {
+                        kind: HStmtKind::SetSubscript {
+                            object: namespace,
+                            index: key,
+                            value,
+                        },
+                        line,
+                        col,
+                    });
+                }
                 if fs.is_global(target.id.as_str()) {
                     // `global x; x += v` reads the global, applies the
                     // operator and stores the result back.
@@ -5583,6 +5774,15 @@ impl<'a> Lowerer<'a> {
             ast::Stmt::Raise(s) => return self.lower_raise(s, fs, line, col),
             ast::Stmt::Try(s) => return self.lower_try(s, fs, line, col),
             ast::Stmt::FunctionDef(s) => {
+                if fs.class_ns.is_some() {
+                    return self.lower_class_body_function(
+                        s.name.as_str(),
+                        u32::from(s.range.start()),
+                        fs,
+                        line,
+                        col,
+                    );
+                }
                 if fs.is_module {
                     self.error_at(
                         s.range,
@@ -5593,6 +5793,15 @@ impl<'a> Lowerer<'a> {
                 return self.lower_nested_function(FnDecl::from_def(s), fs, line, col);
             }
             ast::Stmt::AsyncFunctionDef(s) => {
+                if fs.class_ns.is_some() {
+                    return self.lower_class_body_function(
+                        s.name.as_str(),
+                        u32::from(s.range.start()),
+                        fs,
+                        line,
+                        col,
+                    );
+                }
                 if fs.is_module {
                     self.error_at(
                         s.range,
@@ -5607,12 +5816,28 @@ impl<'a> Lowerer<'a> {
             // session fragment also mirrors them into the runtime global
             // table so a later fragment sees the same names.
             ast::Stmt::Import(s) => {
+                if fs.class_ns.is_some() {
+                    self.error_at_code(
+                        s.range,
+                        codes::UNSUPPORTED,
+                        "imports inside a class body are not supported yet",
+                    );
+                    return None;
+                }
                 if !self.session_mode || !fs.is_module {
                     return None;
                 }
                 return self.lower_session_import(s, line, col);
             }
             ast::Stmt::ImportFrom(s) => {
+                if fs.class_ns.is_some() {
+                    self.error_at_code(
+                        s.range,
+                        codes::UNSUPPORTED,
+                        "imports inside a class body are not supported yet",
+                    );
+                    return None;
+                }
                 if !self.session_mode || !fs.is_module {
                     return None;
                 }
@@ -6944,6 +7169,34 @@ impl<'a> Lowerer<'a> {
             || self.global_names.contains("super")
     }
 
+    /// Whether `expr` is a call of the *builtin* `globals` with no arguments.
+    ///
+    /// Used to lower `globals()[key] = value` into a real module-global store:
+    /// the returned dict is a namespace view, so a plain item assignment would
+    /// otherwise only mutate that view and stay invisible to static reads.
+    fn is_globals_call(&self, expr: &ast::Expr, fs: &FuncState) -> bool {
+        let ast::Expr::Call(call) = expr else {
+            return false;
+        };
+        let ast::Expr::Name(name) = &*call.func else {
+            return false;
+        };
+        name.id.as_str() == "globals"
+            && call.args.is_empty()
+            && call.keywords.is_empty()
+            && fs.lookup("globals").is_none()
+            && !fs.is_global("globals")
+            && !self.fn_ids.contains_key("globals")
+            && !self.decorated_functions.contains_key("globals")
+            && !self.global_names.contains("globals")
+            && !self.imported_user_functions.contains_key("globals")
+            && !self.imported_user_globals.contains_key("globals")
+            && !self.imported_functions.contains_key("globals")
+            && !self.imported_constants.contains_key("globals")
+            && !self.module_aliases.contains_key("globals")
+            && !self.user_module_aliases.contains_key("globals")
+    }
+
     /// Materialise zero-argument `super()` for the enclosing method.
     ///
     /// The runtime's `$super_new` helper needs the receiver and, to start at
@@ -7005,6 +7258,285 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Lower a class whose body executes statements.
+    ///
+    /// The body runs against a fresh namespace `dict` (CPython's `STORE_NAME`
+    /// semantics) and the class object is built from that dict afterwards by
+    /// `Builtin::ClassFromNamespace`. Base expressions and the `metaclass=`
+    /// keyword are evaluated first, matching CPython's order, and are parked
+    /// in rooted hidden locals across the body.
+    ///
+    /// The whole sequence is wrapped in an `if True:` block because HIR
+    /// statements nest only through statement bodies; the wrapper is a single
+    /// statement for the module body loop and decorator handling.
+    fn lower_dynamic_class_stmt(
+        &mut self,
+        s: &ast::StmtClassDef,
+        plan: &ClassPlan,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let name = s.name.to_string();
+        let Some(target) = fs.lookup(&name) else {
+            self.error_name(
+                s.range,
+                &name,
+                fs,
+                format!("class '{name}' has no local slot"),
+            );
+            return None;
+        };
+        let mut statements = Vec::new();
+        // Bases, in source order, then the metaclass keyword.
+        let mut base_refs = Vec::new();
+        for index in &plan.bases {
+            let Some(base) = s.bases.get(*index) else {
+                continue;
+            };
+            let value = self.expr(base, fs);
+            let (temp, temp_ref) = self.hidden_temp(fs, "$classbase", Type::Any);
+            statements.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: temp,
+                    value,
+                },
+                line,
+                col,
+            });
+            base_refs.push(temp_ref);
+        }
+        let metaclass = match plan.metaclass.and_then(|index| s.keywords.get(index)) {
+            Some(keyword) => {
+                let value = self.expr(&keyword.value, fs);
+                let (temp, temp_ref) = self.hidden_temp(fs, "$classmeta", Type::Any);
+                statements.push(HStmt {
+                    kind: HStmtKind::Assign {
+                        target: temp,
+                        value,
+                    },
+                    line,
+                    col,
+                });
+                temp_ref
+            }
+            None => HExpr {
+                kind: HExprKind::Const(Const::None),
+                ty: Ty::Concrete(Type::None),
+                line,
+                col,
+            },
+        };
+        // The class namespace itself.
+        let (ns, ns_ref) = self.hidden_temp(fs, "$classns", Type::Dict);
+        statements.push(HStmt {
+            kind: HStmtKind::Assign {
+                target: ns,
+                value: HExpr {
+                    kind: HExprKind::Dict(Vec::new()),
+                    ty: Ty::Concrete(Type::Dict),
+                    line,
+                    col,
+                },
+            },
+            line,
+            col,
+        });
+        // CPython publishes `__module__`/`__qualname__` in the namespace.
+        for (dunder, constant) in [
+            ("__module__", Const::Str(self.dunder_name.clone())),
+            ("__qualname__", Const::Str(name.clone())),
+        ] {
+            statements.push(HStmt {
+                kind: HStmtKind::SetSubscript {
+                    object: ns_ref.clone(),
+                    index: HExpr {
+                        kind: HExprKind::Const(Const::Str(dunder.to_string())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    },
+                    value: HExpr {
+                        kind: HExprKind::Const(constant),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    },
+                },
+                line,
+                col,
+            });
+        }
+        // Synthesized methods (the dataclass `__init__`) exist before the
+        // body runs, so a body definition can still replace them.
+        for (method, fid, method_start, kind) in &plan.methods {
+            if method_start.is_some() {
+                continue;
+            }
+            let value = self.class_method_binding_value(*fid, *kind, line, col);
+            statements.push(HStmt {
+                kind: HStmtKind::SetSubscript {
+                    object: ns_ref.clone(),
+                    index: HExpr {
+                        kind: HExprKind::Const(Const::Str(method.clone())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    },
+                    value,
+                },
+                line,
+                col,
+            });
+        }
+        let methods = plan
+            .methods
+            .iter()
+            .filter_map(|(_, fid, method_start, kind)| {
+                method_start.as_ref().map(|start| (*start, (*fid, *kind)))
+            })
+            .collect();
+        let previous = fs.class_ns.take();
+        fs.class_ns = Some(ClassNs {
+            ns,
+            bindings: plan.bindings.clone(),
+            methods,
+        });
+        let body = self.lower_block(&s.body, fs);
+        fs.class_ns = previous;
+        statements.extend(body);
+        let class_value = HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Builtin(Builtin::ClassFromNamespace),
+                args: vec![
+                    HExpr {
+                        kind: HExprKind::Const(Const::Str(name.clone())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    },
+                    HExpr {
+                        kind: HExprKind::Tuple(base_refs),
+                        ty: Ty::Concrete(Type::Tuple),
+                        line,
+                        col,
+                    },
+                    metaclass,
+                    ns_ref.clone(),
+                ],
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        };
+        statements.push(HStmt {
+            kind: HStmtKind::Assign {
+                target,
+                value: class_value,
+            },
+            line,
+            col,
+        });
+        if self.mirror_all_globals || self.used_globals.contains(&name) {
+            statements.push(HStmt {
+                kind: HStmtKind::GlobalSet {
+                    module: self.dunder_name.clone(),
+                    name: name.clone(),
+                    value: HExpr {
+                        kind: HExprKind::Local(target),
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    },
+                },
+                line,
+                col,
+            });
+        }
+        Some(HStmt {
+            kind: HStmtKind::If {
+                cond: self.bool_const(true, line, col),
+                then_body: statements,
+                else_body: Vec::new(),
+            },
+            line,
+            col,
+        })
+    }
+
+    /// Bind one class-body method definition into the runtime namespace.
+    fn lower_class_body_function(
+        &mut self,
+        name: &str,
+        definition_start: u32,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let (ns, entry) = fs
+            .class_ns
+            .as_ref()
+            .map(|state| (state.ns, state.methods.get(&definition_start).copied()))?;
+        // `@overload` stubs and property accessors are type-only markers and
+        // bind nothing (the static path skips them the same way).
+        let (fid, kind) = entry?;
+        let value = self.class_method_binding_value(fid, kind, line, col);
+        Some(HStmt {
+            kind: HStmtKind::SetSubscript {
+                object: HExpr {
+                    kind: HExprKind::Local(ns),
+                    ty: Ty::Concrete(Type::Dict),
+                    line,
+                    col,
+                },
+                index: HExpr {
+                    kind: HExprKind::Const(Const::Str(name.to_string())),
+                    ty: Ty::Concrete(Type::Str),
+                    line,
+                    col,
+                },
+                value,
+            },
+            line,
+            col,
+        })
+    }
+
+    /// Value a class namespace receives for a method definition: the function
+    /// itself, or the matching descriptor factory call for
+    /// `@classmethod`/`@staticmethod`/`@property`.
+    fn class_method_binding_value(
+        &mut self,
+        fid: FunctionId,
+        kind: MethodKind,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        // Plan ids are unit-local; referenced values use the program-wide id.
+        let fid = self.fid_base + fid;
+        let function = HExpr {
+            kind: HExprKind::FunctionRef(fid),
+            ty: Ty::Concrete(Type::Function),
+            line,
+            col,
+        };
+        let builtin = match kind {
+            MethodKind::Normal => return function,
+            MethodKind::Classmethod => Builtin::Classmethod,
+            MethodKind::Staticmethod => Builtin::Staticmethod,
+            MethodKind::Property => Builtin::Property,
+        };
+        HExpr {
+            kind: HExprKind::Call {
+                callee: Callee::Builtin(builtin),
+                args: vec![function],
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        }
+    }
+
     /// Lower a `class` statement: bases and `metaclass=` in source order,
     /// then the method functions and class attribute values of the body.
     ///
@@ -7046,6 +7578,9 @@ impl<'a> Lowerer<'a> {
         // `__slots__` has no runtime meaning for Hydro classes (every instance
         // has a dynamic attribute table), so it is diagnosed rather than
         // silently ignored.
+        if plan.dynamic {
+            return self.lower_dynamic_class_stmt(s, &plan, fs, line, col);
+        }
         if plan
             .attributes
             .iter()
@@ -7147,6 +7682,28 @@ impl<'a> Lowerer<'a> {
                         name: name_text.to_string(),
                         value,
                     })
+                } else if let Some(class_ns) = &fs.class_ns {
+                    // A dynamic class body binds through `STORE_NAME`: the
+                    // name always lands in the class namespace, shadowing any
+                    // module binding of the same name.
+                    let (line, col) = self.span(name.range);
+                    let namespace = HExpr {
+                        kind: HExprKind::Local(class_ns.ns),
+                        ty: Ty::Concrete(Type::Dict),
+                        line,
+                        col,
+                    };
+                    let key = HExpr {
+                        kind: HExprKind::Const(Const::Str(name_text.to_string())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    };
+                    Some(HStmtKind::SetSubscript {
+                        object: namespace,
+                        index: key,
+                        value,
+                    })
                 } else if let Some(local) = fs.lookup(name_text) {
                     Some(if fs.is_cell(local) {
                         HStmtKind::CellAssign {
@@ -7187,6 +7744,29 @@ impl<'a> Lowerer<'a> {
                     });
                 }
                 // The IR keeps Python's evaluation order: value, object, index.
+                if self.is_globals_call(&sub.value, fs) {
+                    // `globals()[key] = value` binds a real module global so
+                    // later static reads and `getattr(module, key)` see it.
+                    // Evaluation order matches Python: the right-hand side is
+                    // already lowered, then the key.
+                    let (line, col) = self.span(sub.range);
+                    let index = self.expr(&sub.slice, fs);
+                    let module = HExpr {
+                        kind: HExprKind::Const(Const::Str(self.dunder_name.clone())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    };
+                    return Some(HStmtKind::Expr(HExpr {
+                        kind: HExprKind::Call {
+                            callee: Callee::Builtin(Builtin::GlobalSetDynamic),
+                            args: vec![module, index, value],
+                        },
+                        ty: Ty::Concrete(Type::None),
+                        line,
+                        col,
+                    }));
+                }
                 let object = self.expr(&sub.value, fs);
                 let index = self.expr(&sub.slice, fs);
                 Some(HStmtKind::SetSubscript {
@@ -7244,6 +7824,27 @@ impl<'a> Lowerer<'a> {
                         targets.push(HDeleteTarget::Global {
                             module: self.dunder_name.clone(),
                             name: text.to_string(),
+                        });
+                        continue;
+                    }
+                    if let Some(class_ns) = &fs.class_ns {
+                        // `del name` in a class body deletes from the class
+                        // namespace (`DELETE_NAME`), even when the module also
+                        // binds the name.
+                        let (name_line, name_col) = self.span(name.range);
+                        targets.push(HDeleteTarget::Subscript {
+                            object: HExpr {
+                                kind: HExprKind::Local(class_ns.ns),
+                                ty: Ty::Concrete(Type::Dict),
+                                line: name_line,
+                                col: name_col,
+                            },
+                            index: HExpr {
+                                kind: HExprKind::Const(Const::Str(text.to_string())),
+                                ty: Ty::Concrete(Type::Str),
+                                line: name_line,
+                                col: name_col,
+                            },
                         });
                         continue;
                     }
@@ -8452,6 +9053,7 @@ impl<'a> Lowerer<'a> {
             is_async: frame_is_async,
             is_generator: true,
             genexp_frame: true,
+            class_ns: None,
         };
 
         let mut saved = Vec::new();
@@ -8596,6 +9198,7 @@ impl<'a> Lowerer<'a> {
             is_async: true,
             is_generator: false,
             genexp_frame: true,
+            class_ns: None,
         };
         let accum_ref = HExpr {
             kind: HExprKind::Local(accum),
@@ -10334,6 +10937,35 @@ impl<'a> Lowerer<'a> {
                     // template side table; it is never a variable.
                     return self.template_expr(range, fs, line, col);
                 }
+                // A dynamic class body keeps its namespace in a runtime dict;
+                // every name bound anywhere in the body reads from it first
+                // (CPython's `LOAD_NAME` order), before module bindings and
+                // builtins.
+                if let Some(class_ns) = &fs.class_ns {
+                    if class_ns.bindings.contains(name) {
+                        let namespace = HExpr {
+                            kind: HExprKind::Local(class_ns.ns),
+                            ty: Ty::Concrete(Type::Dict),
+                            line,
+                            col,
+                        };
+                        let key = HExpr {
+                            kind: HExprKind::Const(Const::Str(name.to_string())),
+                            ty: Ty::Concrete(Type::Str),
+                            line,
+                            col,
+                        };
+                        return HExpr {
+                            kind: HExprKind::Subscript {
+                                object: Box::new(namespace),
+                                index: Box::new(key),
+                            },
+                            ty: Ty::Concrete(Type::Any),
+                            line,
+                            col,
+                        };
+                    }
+                }
                 // A class body resolves names against its own namespace
                 // first (methods and attributes declared earlier), before any
                 // enclosing module/function binding or builtin.
@@ -11269,6 +11901,7 @@ impl<'a> Lowerer<'a> {
             is_async: false,
             is_generator: false,
             genexp_frame: false,
+            class_ns: None,
         };
         let value = self.expr(&l.body, &mut fs);
         let (body_line, body_col) = self.span(l.body.range());
@@ -12810,9 +13443,21 @@ impl<'a> Lowerer<'a> {
             if builtin == Builtin::Print && !call.keywords.is_empty() {
                 return self.lower_print_keywords(call, fs, line, col);
             }
-            let Some(args) = self.builtin_call_arguments(builtin, call, fs, line, col) else {
+            let Some(mut args) = self.builtin_call_arguments(builtin, call, fs, line, col) else {
                 return self.error_expr(call.range);
             };
+            if builtin == Builtin::Globals {
+                // `globals()` needs the owning module's namespace. The unit
+                // name is compile-time knowledge, so it travels as a hidden
+                // trailing argument instead of a runtime frame lookup (Hydro
+                // keeps no Python frame objects). Sema and codegen expect it.
+                args.push(HExpr {
+                    kind: HExprKind::Const(Const::Str(self.dunder_name.clone())),
+                    ty: Ty::Concrete(Type::Str),
+                    line,
+                    col,
+                });
+            }
             return HExpr {
                 kind: HExprKind::Call {
                     callee: Callee::Builtin(builtin),
@@ -14350,6 +14995,127 @@ fn static_format_spec(spec: &ast::Expr) -> Result<String, ()> {
 
 fn builtin_by_name(name: &str) -> Option<Builtin> {
     Builtin::from_name(name)
+}
+
+/// Child statement blocks of one class-body statement, in source order.
+///
+/// Used by the class-body walkers: a dynamic class body executes control flow
+/// at runtime, but its method definitions (and their bodies) still have to be
+/// registered before any body is lowered.
+fn class_body_blocks(stmt: &ast::Stmt) -> Vec<&[ast::Stmt]> {
+    let mut blocks = Vec::new();
+    match stmt {
+        ast::Stmt::If(s) => {
+            blocks.push(s.body.as_slice());
+            blocks.push(s.orelse.as_slice());
+        }
+        ast::Stmt::While(s) => {
+            blocks.push(s.body.as_slice());
+            blocks.push(s.orelse.as_slice());
+        }
+        ast::Stmt::For(s) => {
+            blocks.push(s.body.as_slice());
+            blocks.push(s.orelse.as_slice());
+        }
+        ast::Stmt::AsyncFor(s) => {
+            blocks.push(s.body.as_slice());
+            blocks.push(s.orelse.as_slice());
+        }
+        ast::Stmt::With(s) => blocks.push(&s.body),
+        ast::Stmt::AsyncWith(s) => blocks.push(&s.body),
+        ast::Stmt::Try(s) => {
+            blocks.push(s.body.as_slice());
+            for handler in &s.handlers {
+                let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                blocks.push(handler.body.as_slice());
+            }
+            blocks.push(s.orelse.as_slice());
+            blocks.push(s.finalbody.as_slice());
+        }
+        ast::Stmt::TryStar(s) => {
+            blocks.push(s.body.as_slice());
+            for handler in &s.handlers {
+                let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                blocks.push(handler.body.as_slice());
+            }
+            blocks.push(s.orelse.as_slice());
+            blocks.push(s.finalbody.as_slice());
+        }
+        ast::Stmt::Match(s) => {
+            for case in &s.cases {
+                blocks.push(case.body.as_slice());
+            }
+        }
+        _ => {}
+    }
+    blocks
+}
+
+/// Whether a class body needs the runtime-namespace path.
+///
+/// The static plan can express method definitions, field declarations,
+/// docstrings, `pass` and plain assignments (evaluated in declaration order).
+/// Anything else — `del`, control flow, calls, `raise`, imports — executes
+/// statements and therefore needs the dynamic namespace.
+fn class_body_needs_namespace(body: &[ast::Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        ast::Stmt::Pass(_) => false,
+        ast::Stmt::Expr(expr) => !is_docstring_expr(&expr.value),
+        ast::Stmt::Assign(_) | ast::Stmt::AnnAssign(_) => false,
+        ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => false,
+        _ => true,
+    })
+}
+
+/// Whether a class body (recursively) assigns `__slots__`.
+fn class_body_assigns_slots(body: &[ast::Stmt]) -> bool {
+    fn assigns(stmt: &ast::Stmt) -> bool {
+        match stmt {
+            ast::Stmt::Assign(assign) => assign.targets.iter().any(
+                |target| matches!(target, ast::Expr::Name(name) if name.id.as_str() == "__slots__"),
+            ),
+            ast::Stmt::AnnAssign(assign) => {
+                matches!(&*assign.target, ast::Expr::Name(name) if name.id.as_str() == "__slots__")
+            }
+            ast::Stmt::AugAssign(assign) => {
+                matches!(&*assign.target, ast::Expr::Name(name) if name.id.as_str() == "__slots__")
+            }
+            _ => false,
+        }
+    }
+    body.iter().any(|stmt| {
+        assigns(stmt)
+            || class_body_blocks(stmt)
+                .into_iter()
+                .any(class_body_assigns_slots)
+    })
+}
+
+/// Bodies of every method definition reachable from `body` (including those
+/// nested in control-flow statements, but never inside a method or nested
+/// class body), keyed by the definition's source range start.
+fn class_method_bodies(body: &[ast::Stmt]) -> HashMap<u32, &[ast::Stmt]> {
+    let mut bodies = HashMap::new();
+    fn walk<'a>(body: &'a [ast::Stmt], bodies: &mut HashMap<u32, &'a [ast::Stmt]>) {
+        for stmt in body {
+            match stmt {
+                ast::Stmt::FunctionDef(f) => {
+                    bodies.insert(u32::from(f.range.start()), &f.body);
+                }
+                ast::Stmt::AsyncFunctionDef(f) => {
+                    bodies.insert(u32::from(f.range.start()), &f.body);
+                }
+                ast::Stmt::ClassDef(_) => {}
+                other => {
+                    for block in class_body_blocks(other) {
+                        walk(block, bodies);
+                    }
+                }
+            }
+        }
+    }
+    walk(body, &mut bodies);
+    bodies
 }
 
 /// Names bound by an assignment target: a plain name or a tuple/list of

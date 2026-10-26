@@ -60,12 +60,6 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             "iter(callable, sentinel) is not supported by Hydro",
         );
     }
-    if function == "type" && args.len() > 1 {
-        return exc::raise_with_message(
-            NOT_IMPLEMENTED_ERROR,
-            "type(name, bases, dict) is not supported by Hydro",
-        );
-    }
     if function == "__import__" {
         return import_builtin(args);
     }

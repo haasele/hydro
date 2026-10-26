@@ -698,3 +698,53 @@ PyObject *PyObject_CallFunctionObjArgs(PyObject *callable, ...)
     }
     return result;
 }
+
+/*
+ * PyUnicodeWriter_Format: printf-style formatting into the opaque writer.
+ * The writer itself lives in Rust; this entry point only needs the variadic
+ * formatting step, which Rust cannot express.
+ */
+typedef struct PyUnicodeWriter PyUnicodeWriter;
+extern int PyUnicodeWriter_WriteUTF8(PyUnicodeWriter *writer,
+                                     const char *data,
+                                     long length);
+
+int PyUnicodeWriter_Format(PyUnicodeWriter *writer, const char *format, ...)
+{
+    va_list arguments;
+    char stack_buffer[HYDRO_CAPI_MESSAGE_SIZE];
+    char *heap_buffer = NULL;
+    char *buffer = stack_buffer;
+    int needed;
+    int status;
+
+    if (writer == NULL || format == NULL) {
+        hydro_capi_set_error(
+            "SystemError: PyUnicodeWriter_Format requires a writer and a format");
+        return -1;
+    }
+
+    va_start(arguments, format);
+    needed = vsnprintf(stack_buffer, sizeof stack_buffer, format, arguments);
+    va_end(arguments);
+    if (needed < 0) {
+        hydro_capi_set_error("ValueError: invalid PyUnicodeWriter_Format format");
+        return -1;
+    }
+    if ((size_t)needed >= sizeof stack_buffer) {
+        heap_buffer = malloc((size_t)needed + 1);
+        if (heap_buffer == NULL) {
+            hydro_capi_set_error(
+                "MemoryError: cannot allocate the formatted string");
+            return -1;
+        }
+        va_start(arguments, format);
+        (void)vsnprintf(heap_buffer, (size_t)needed + 1, format, arguments);
+        va_end(arguments);
+        buffer = heap_buffer;
+    }
+
+    status = PyUnicodeWriter_WriteUTF8(writer, buffer, (long)needed);
+    free(heap_buffer);
+    return status;
+}

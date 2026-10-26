@@ -130,6 +130,113 @@ pub(crate) fn set_value(module: &str, name: &str, value: i64) -> i64 {
     NONE
 }
 
+/// Every `(name, value)` binding of `module`, sorted by name.
+///
+/// The runtime owns no per-module dict object, so introspection
+/// (`globals()`, `vars(module)`, `dir(module)`) reads this side store. The
+/// reserved registry pseudo-module is a different module name, so its cache
+/// entries never appear here.
+pub(crate) fn entries(module: &str) -> Vec<(String, i64)> {
+    let prefix = format!("{module}\0");
+    GLOBALS.with(|globals| {
+        let globals = globals.borrow();
+        let mut entries: Vec<(String, i64)> = globals
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix(prefix.as_str())
+                    .map(|name| (name.to_string(), *value))
+            })
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    })
+}
+
+/// Binding names of `module`, sorted; see [`entries`].
+pub(crate) fn names(module: &str) -> Vec<String> {
+    entries(module).into_iter().map(|(name, _)| name).collect()
+}
+
+/// Registry key of the live `globals()` dict cached for `module`.
+fn view_key(module: &str) -> String {
+    format!("globals.view:{module}")
+}
+
+/// The live `globals()` mapping of `module`, created on first use.
+///
+/// One `dict` is cached per module (CPython exposes a stable module
+/// `__dict__`), so `globals() is globals()` and item writes through the same
+/// view accumulate. Every call refreshes the cached dict from the runtime
+/// global store first, then publishes keys that only exist in the view back
+/// into the store: `g = globals(); g["x"] = v` is therefore visible to later
+/// static reads and `getattr(module, "x")`.
+pub(crate) fn view(module: &str) -> i64 {
+    if let Some(cached) = registry_get(&view_key(module)) {
+        sync_view(module, cached);
+        return cached;
+    }
+    // Publish the empty dict before filling it: the registry entry is a GC
+    // root, so every key and value inserted below stays reachable.
+    let dict = crate::value::dict_new(Vec::new());
+    registry_set(&view_key(module), dict);
+    sync_view(module, dict);
+    dict
+}
+
+/// Refreshes `dict` from the global store, then stores view-only keys.
+fn sync_view(module: &str, dict: i64) {
+    for (name, value) in entries(module) {
+        let key = crate::value::str_alloc(name);
+        let roots = heap::root_values(&[key, value]);
+        crate::container::dict_set(dict, key, value);
+        heap::release_roots(roots);
+    }
+    let Some(entries) = crate::value::as_dict(dict) else {
+        return;
+    };
+    // Snapshot before mutating the side store: `set` installs a root and must
+    // not run while the dict slice is borrowed through a re-entrant path.
+    let pending: Vec<(String, i64)> = entries
+        .iter()
+        .filter_map(|(key, value)| {
+            let name = crate::value::as_str(*key)?;
+            try_get(module, name)
+                .is_none()
+                .then(|| (name.to_string(), *value))
+        })
+        .collect();
+    for (name, value) in pending {
+        set(module, &name, value);
+    }
+}
+
+/// Reads `module.name` from the store, falling back to the cached
+/// `globals()` view for names a program bound with `globals()[name] = value`.
+pub(crate) fn lookup(module: &str, name: &str) -> Option<i64> {
+    if let Some(value) = try_get(module, name) {
+        return Some(value);
+    }
+    let cached = registry_get(&view_key(module))?;
+    crate::value::as_dict(cached)?
+        .iter()
+        .find_map(|(key, value)| (crate::value::as_str(*key) == Some(name)).then_some(*value))
+}
+
+/// Names currently held by the cached `globals()` view of `module` (empty
+/// when no view was materialised yet).
+pub(crate) fn view_names(module: &str) -> Vec<String> {
+    let Some(dict) = registry_get(&view_key(module)) else {
+        return Vec::new();
+    };
+    let Some(entries) = crate::value::as_dict(dict) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|(key, _)| crate::value::as_str(*key).map(str::to_string))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

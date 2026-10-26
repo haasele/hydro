@@ -393,6 +393,12 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if name == "__name__" {
         return value::str_alloc(module.to_string());
     }
+    // `module.__dict__` is the module namespace mapping. Compiled user
+    // modules take the live `globals()` view; native modules are enumerated
+    // from the central spec. `vars(module)` shares this mapping.
+    if name == "__dict__" {
+        return module_dict(module);
+    }
     // `errno` attributes are platform-defined names resolved on demand; the
     // static spec table cannot enumerate them.
     if module == "errno" {
@@ -420,13 +426,85 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if stdlib::constant(module, name).is_some() {
         return constant_value(module, name);
     }
+    // Builtins that Hydro knows as bare compiler builtins but that have no
+    // central spec entry (`eval`, `exec`) still exist on the `builtins`
+    // module, matching `builtins.__dict__` below.
+    if module == "builtins" {
+        if let Some(value) = extra_builtin(name) {
+            return value;
+        }
+    }
     // Compiled user modules keep their attributes in the globals side store.
     // Native modules win above, so a user module named like a stdlib module
-    // cannot shadow native attributes.
-    if let Some(value) = globals::try_get(module, name) {
+    // cannot shadow native attributes. The `globals()` view is consulted for
+    // names bound dynamically through `globals()[name] = value`.
+    if let Some(value) = globals::lookup(module, name) {
         return value;
     }
     missing_attribute(module, name)
+}
+
+/// Builtins without a central spec entry, exposed through the `builtins`
+/// module and its namespace mapping.
+fn extra_builtin(name: &str) -> Option<i64> {
+    let builtin = match name {
+        "eval" => hydro_ir::Builtin::Eval,
+        "exec" => hydro_ir::Builtin::Exec,
+        _ => return None,
+    };
+    Some(value::builtin_function_new(builtin))
+}
+
+/// `module.__dict__` / `vars(module)`: the module's namespace mapping.
+///
+/// A compiled user module (`globals()` view) returns the live mapping; a
+/// native module gets one cached dict holding `__name__`, every function and
+/// every constant from the central spec. An unknown, never-loaded module
+/// resolves to its (empty) globals view instead of a fabricated spec.
+pub(crate) fn module_dict(module: &str) -> i64 {
+    if stdlib::module(module).is_none() {
+        return globals::view(module);
+    }
+    let cache_key = format!("module.dict:{module}");
+    if let Some(cached) = globals::registry_get(&cache_key) {
+        return cached;
+    }
+    let dict = value::dict_new(Vec::new());
+    globals::registry_set(&cache_key, dict);
+    let roots = crate::heap::root_values(&[dict]);
+    insert_namespace_entry(dict, "__name__", value::str_alloc(module.to_string()));
+    let Some(spec) = stdlib::module(module) else {
+        crate::heap::release_roots(roots);
+        return dict;
+    };
+    let mut names: Vec<&'static str> = spec.functions.iter().map(|f| f.name).collect();
+    names.extend(spec.constants.iter().map(|c| c.name));
+    if module == "builtins" {
+        names.push("eval");
+        names.push("exec");
+    }
+    for name in names {
+        let item = module_get_named(module, name);
+        if exc::pending() {
+            // A spec entry that cannot be materialised (none today, but the
+            // table is shared) must not silently become `None`: propagate so
+            // the caller sees the real failure.
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+        insert_namespace_entry(dict, name, item);
+    }
+    crate::heap::release_roots(roots);
+    dict
+}
+
+/// Inserts one `(name, value)` pair into a namespace dict, rooting the freshly
+/// allocated key until the dict owns it.
+fn insert_namespace_entry(dict: i64, name: &str, item: i64) {
+    let key = value::str_alloc(name.to_string());
+    let roots = crate::heap::root_values(&[key, item]);
+    container::dict_set(dict, key, item);
+    crate::heap::release_roots(roots);
 }
 
 /// Calls a native function by name, validating it against the central spec.

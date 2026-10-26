@@ -3304,6 +3304,113 @@ impl<'a> Checker<'a> {
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
             }
+            Builtin::Globals => {
+                // The frontend appends the owning module's name as a hidden
+                // trailing argument, so the lowered call always has one.
+                if count != 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        "globals() takes no arguments".to_string(),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Dict));
+            }
+            Builtin::Locals => {
+                if count != 0 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("locals() takes no arguments ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Dict));
+            }
+            Builtin::Dir => {
+                if count > 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("dir() takes at most 1 argument ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::List));
+            }
+            Builtin::Vars => {
+                if count > 1 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("vars() takes at most 1 argument ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Dict));
+            }
+            Builtin::Eval | Builtin::Exec => {
+                if count == 0 || count > 3 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!(
+                            "{}() takes 1 to 3 arguments ({count} given)",
+                            builtin.name()
+                        ),
+                    );
+                    return;
+                }
+                // The result of `eval` depends on the source text; `exec`
+                // returns `None` at runtime but the failure path is dynamic.
+                if builtin == Builtin::Exec {
+                    let _ = self.inf.unify(out, Ty::Concrete(Type::None));
+                } else {
+                    let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+                }
+            }
+            Builtin::Compile => {
+                if !(3..=6).contains(&count) {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        format!("compile() takes 3 to 6 arguments ({count} given)"),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
+            Builtin::ClassFromNamespace => {
+                if count != 4 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        "internal class-from-namespace expects 4 arguments".to_string(),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
+            Builtin::GlobalSetDynamic => {
+                if count != 3 {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::CALL,
+                        "internal dynamic global store expects 3 arguments".to_string(),
+                    );
+                    return;
+                }
+                let _ = self.inf.unify(out, Ty::Concrete(Type::None));
+            }
         }
     }
 

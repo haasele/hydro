@@ -131,9 +131,19 @@ fn singleton_constants_are_the_runtime_values() {
             "{name} should be a class value"
         );
     }
-    // `__dict__` is deliberately absent.
-    let _ = module_get("builtins", "__dict__");
-    assert_error_tag(ATTRIBUTE_ERROR);
+    // `__dict__` is the builtins namespace mapping: it carries the actual
+    // singleton constants and callable values.
+    let namespace = module_get("builtins", "__dict__");
+    assert_no_error();
+    assert_same(hydro_subscript(namespace, text("None")), hydro_none());
+    assert_same(hydro_subscript(namespace, text("True")), hydro_true());
+    let len_function = hydro_subscript(namespace, text("len"));
+    assert_no_error();
+    assert_eq!(
+        hydro_binop(OP_IS, len_function, hydro_none()),
+        hydro_false(),
+        "builtins.__dict__['len'] should be a function value"
+    );
 }
 
 #[test]
@@ -192,11 +202,29 @@ fn unsupported_names_raise_tagged_errors() {
     let _ = module("builtins", "compile", &[source, filename, mode]);
     assert_error_tag(NOT_IMPLEMENTED_ERROR);
 
-    // `type(name, bases, dict)` is not supported.
+    // `type(name, bases, dict)` is a real class constructor through the
+    // `builtins` module as well as through a first-class `type` value.
     let name = text("Made");
-    let bases = hydro_tuple_new(0, std::ptr::null());
-    let _ = module("builtins", "type", &[name, bases]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    let object = module_get("builtins", "object");
+    let base_values = [object];
+    let bases = hydro_tuple_new(1, base_values.as_ptr());
+    let keys = [text("answer")];
+    let values = [int(7)];
+    let namespace = hydro_dict_new(1, keys.as_ptr(), values.as_ptr());
+    let type_args = [name, bases, namespace];
+    let made = module("builtins", "type", &type_args);
+    assert_no_error();
+    assert_str(getattr(made, "__name__"), "Made");
+    assert_int(getattr(made, "answer"), 7);
+    let type_function = hydro_builtin_function("type".as_ptr(), 4);
+    assert_no_error();
+    let made = hydro_call(type_function, type_args.len(), type_args.as_ptr());
+    assert_no_error();
+    assert_str(getattr(made, "__name__"), "Made");
+
+    // The 2-argument form has no meaning and is an arity error.
+    let _ = module("builtins", "type", &[text("Made"), bases]);
+    assert_error_tag(TYPE_ERROR);
 
     // `iter(callable, sentinel)` is not supported.
     let _ = module("builtins", "iter", &[hydro_true(), hydro_true()]);
@@ -207,12 +235,22 @@ fn unsupported_names_raise_tagged_errors() {
     assert_no_error();
     assert!(hydro_binop(OP_IS, class, hydro_none()) == hydro_false());
 
+    // Without a frame context the zero-argument forms fail loudly.
     let _ = module("builtins", "vars", &[]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    assert_error_tag(RUNTIME_ERROR);
 
+    // `vars(module)` returns the module namespace mapping, not an error.
     let module_value = hydro_module_value("math".as_ptr(), "math".len());
-    let _ = module("builtins", "vars", &[module_value]);
-    assert_error_tag(TYPE_ERROR);
+    let namespace = module("builtins", "vars", &[module_value]);
+    assert_no_error();
+    assert_str(hydro_subscript(namespace, text("__name__")), "math");
+    let sqrt = hydro_subscript(namespace, text("sqrt"));
+    assert_no_error();
+    assert_eq!(
+        hydro_binop(OP_IS, sqrt, hydro_none()),
+        hydro_false(),
+        "math namespace should expose its functions"
+    );
 }
 
 #[test]
@@ -236,9 +274,10 @@ fn id_and_attribute_name_validation() {
     assert_error_tag(TYPE_ERROR);
     let _ = module("builtins", "delattr", &[instance, int(1)]);
     assert_error_tag(TYPE_ERROR);
-    // `dir()` without an argument has no frame namespace.
+    // `dir()` without an argument has no frame context, so the runtime entry
+    // point reports that instead of inventing a namespace.
     let _ = module("builtins", "dir", &[]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    assert_error_tag(RUNTIME_ERROR);
     let _ = VALUE_ERROR;
 }
 
