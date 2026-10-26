@@ -33,14 +33,14 @@ in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
 ### Test counts (canonical — update only here)
 
-`cargo test --workspace` on 2026-10-26: **1375 Hydro tests**:
+`cargo test --workspace` on 2026-10-26: **1376 Hydro tests**:
 
 | Suite | Tests |
 |---|---:|
 | runtime unit | 532 |
 | runtime integration | 278 |
 | frontend | 476 (incl. 4 fuzz smoke) |
-| codegen | 60 |
+| codegen | 61 |
 | IR | 18 |
 | interpreter unit | 11 |
 

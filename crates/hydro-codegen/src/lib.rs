@@ -188,6 +188,34 @@ mod tests {
     }
 
     #[test]
+    fn hot_function_map_changes_object_layout() {
+        let program = sample_program();
+        let mut hot_first = HashMap::new();
+        hot_first.insert("hot".to_string(), 100);
+        hot_first.insert("cold".to_string(), 1);
+        let mut cold_first = HashMap::new();
+        cold_first.insert("hot".to_string(), 1);
+        cold_first.insert("cold".to_string(), 100);
+        let a = compile_object_with_options(
+            &program,
+            &CodegenOptions {
+                collect_profile: false,
+                hot_functions: hot_first,
+            },
+        )
+        .expect("hot-first object");
+        let b = compile_object_with_options(
+            &program,
+            &CodegenOptions {
+                collect_profile: false,
+                hot_functions: cold_first,
+            },
+        )
+        .expect("cold-first object");
+        assert_ne!(a, b, "different hotness must change emitted body order");
+    }
+
+    #[test]
     fn hot_function_map_runs_with_unchanged_semantics() {
         let program = sample_program();
         let default = run_jit(&program).expect("default run");
