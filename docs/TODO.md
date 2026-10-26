@@ -363,7 +363,7 @@ cover cycles; container semantics tested against CPython behavior.
 - [ ] P3-05 Reproducible builds (deterministic objects, path stripping).
       Moved to the Tea repository: `scripts/repro_check.sh` compares two
       `--no-cache` builds, cache/fresh links, hashes and program output;
-      `docs/REPRODUCIBLE.md` records the current contract. Same spelling/path is deterministic;
+      the Tea repository’s `docs/REPRODUCIBLE.md` records the current contract. Same spelling/path is deterministic;
       relative vs absolute source paths still change embedded path immediates.
       Program: path-independent output, `SOURCE_DATE_EPOCH`, stripped
       absolute paths (Q-10 relies on this). Acceptance: two builds from
