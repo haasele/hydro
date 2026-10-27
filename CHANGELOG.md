@@ -8,6 +8,16 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 String padding methods
+
+- `str.rjust`, `str.ljust` and `str.center` pad to a character (code point)
+  width with an optional single-character `fillchar`, defaulting to a space;
+  `str.zfill` pads with zeros after a leading sign. Widths no greater than the
+  current length return the string unchanged, and the CPython `TypeError`
+  wording covers non-integer widths, non-string fill characters and
+  multi-character fills. All four methods carry static signatures, so their
+  `str` results propagate through type inference.
+
 ### Added — 2026-10-27 Recursive nested functions
 
 - A `def`/`async def`/`class` name that a nested closure reads is bound

@@ -2407,6 +2407,50 @@ fn int_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, i64)]) 
 
 // str
 
+/// Converts the `width` argument of the padding methods to a character count.
+///
+/// CPython converts through `Py_ssize_t`, so integers outside that range raise
+/// `OverflowError` rather than `TypeError`.
+fn padding_width(v: i64) -> Result<i64, i64> {
+    if let Some(width) = value::as_integer(v) {
+        return Ok(width);
+    }
+    match value::as_bigint(v) {
+        Some(number) => i64::try_from(number).map_err(|_| {
+            exc::raise_with_message(
+                OVERFLOW_ERROR,
+                "Python int too large to convert to C ssize_t",
+            )
+        }),
+        None => Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            value::type_name(v)
+        ))),
+    }
+}
+
+/// Resolves the optional `fillchar` argument of the padding methods.
+///
+/// CPython requires a single-character string; the default is a space.
+fn padding_fill(argument: Option<i64>) -> Result<char, i64> {
+    let Some(argument) = argument else {
+        return Ok(' ');
+    };
+    let Some(text) = value::as_str(argument) else {
+        return Err(type_error(format!(
+            "The fill character must be a unicode character, not {}",
+            value::type_name(argument)
+        )));
+    };
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(fill), None) => Ok(fill),
+        _ => Err(type_error(
+            "The fill character must be exactly one character long".to_string(),
+        )),
+    }
+}
+
 fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
     match method {
         "upper" => {
@@ -2431,6 +2475,74 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
                 _ => s.trim_end(),
             };
             value::str_alloc(trimmed.to_string())
+        }
+        "rjust" | "ljust" | "center" => {
+            if let Some(err) = check_arity("str", method, args.len(), 1, 2) {
+                return err;
+            }
+            let width = match padding_width(args[0]) {
+                Ok(width) => width,
+                Err(err) => return err,
+            };
+            let fill = match padding_fill(args.get(1).copied()) {
+                Ok(fill) => fill,
+                Err(err) => return err,
+            };
+            // The padding methods count code points, so `width` is compared
+            // against the character length rather than the byte length.
+            let length = s.chars().count();
+            let total = match usize::try_from(width) {
+                Ok(total) if total > length => total,
+                _ => return value::str_alloc(s),
+            };
+            let padding = total - length;
+            let (left, right) = match method {
+                "rjust" => (padding, 0),
+                "ljust" => (0, padding),
+                _ => {
+                    // CPython places the extra fill character on the right
+                    // when the width is odd; `marg & width & 1` encodes that.
+                    let left = padding / 2 + (padding & total & 1);
+                    (left, padding - left)
+                }
+            };
+            let mut out = String::new();
+            for _ in 0..left {
+                out.push(fill);
+            }
+            out.push_str(&s);
+            for _ in 0..right {
+                out.push(fill);
+            }
+            value::str_alloc(out)
+        }
+        "zfill" => {
+            if let Some(err) = check_arity("str", method, args.len(), 1, 1) {
+                return err;
+            }
+            let width = match padding_width(args[0]) {
+                Ok(width) => width,
+                Err(err) => return err,
+            };
+            let length = s.chars().count();
+            let padding = match usize::try_from(width) {
+                Ok(width) if width > length => width - length,
+                _ => return value::str_alloc(s),
+            };
+            // Zeros go after a leading sign, so `'-42'.zfill(5)` is `'-0042'`.
+            let (sign, rest) = match s.chars().next() {
+                Some(sign @ ('+' | '-')) => (Some(sign), &s[sign.len_utf8()..]),
+                _ => (None, s.as_str()),
+            };
+            let mut out = String::new();
+            if let Some(sign) = sign {
+                out.push(sign);
+            }
+            for _ in 0..padding {
+                out.push('0');
+            }
+            out.push_str(rest);
+            value::str_alloc(out)
         }
         "split" => {
             if let Some(err) = check_arity("str", method, args.len(), 0, 2) {
@@ -5853,6 +5965,103 @@ mod tests {
         assert_eq!(text(invoke(padded, "lstrip", &[])), "Hi\u{2003}  ");
         assert_eq!(text(invoke(padded, "rstrip", &[])), "  \u{2003}Hi");
         assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn padding_methods() {
+        reset();
+        assert_eq!(text(invoke(string("ab"), "rjust", &[int(5)])), "   ab");
+        assert_eq!(
+            text(invoke(string("ab"), "rjust", &[int(5), string("-")])),
+            "---ab"
+        );
+        assert_eq!(text(invoke(string("ab"), "ljust", &[int(5)])), "ab   ");
+        assert_eq!(
+            text(invoke(string("ab"), "ljust", &[int(5), string("-")])),
+            "ab---"
+        );
+        // An odd amount of padding keeps the extra character on the right.
+        assert_eq!(text(invoke(string("a"), "center", &[int(6)])), "  a   ");
+        assert_eq!(
+            text(invoke(string("ab"), "center", &[int(5), string("-")])),
+            "--ab-"
+        );
+        assert_eq!(text(invoke(string("abc"), "center", &[int(3)])), "abc");
+        // Width is a code-point count, and the fill character may be any
+        // single character, including a non-ASCII one.
+        assert_eq!(
+            text(invoke(string("äöü"), "rjust", &[int(4), string("·")])),
+            "·äöü"
+        );
+        assert_eq!(
+            text(invoke(string("é"), "center", &[int(4), string("é")])),
+            "éééé"
+        );
+        // A width no greater than the current length returns the string
+        // unchanged, including a negative width.
+        assert_eq!(text(invoke(string("abc"), "rjust", &[int(2)])), "abc");
+        assert_eq!(text(invoke(string("abc"), "ljust", &[int(-1)])), "abc");
+        assert_eq!(text(invoke(string(""), "center", &[int(0)])), "");
+
+        assert_eq!(text(invoke(string("42"), "zfill", &[int(5)])), "00042");
+        assert_eq!(text(invoke(string("-42"), "zfill", &[int(5)])), "-0042");
+        assert_eq!(text(invoke(string("+42"), "zfill", &[int(5)])), "+0042");
+        assert_eq!(text(invoke(string("-42"), "zfill", &[int(2)])), "-42");
+        assert_eq!(text(invoke(string(""), "zfill", &[int(2)])), "00");
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn padding_errors() {
+        reset();
+        invoke(string("a"), "rjust", &[string("3")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "'str' object cannot be interpreted as an integer"
+        );
+
+        reset();
+        invoke(string("a"), "ljust", &[int(3), string("")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "The fill character must be exactly one character long"
+        );
+
+        reset();
+        invoke(string("a"), "center", &[int(3), string("xy")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "The fill character must be exactly one character long"
+        );
+
+        reset();
+        invoke(string("a"), "rjust", &[int(3), int(5)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "The fill character must be a unicode character, not int"
+        );
+
+        reset();
+        invoke(string("a"), "rjust", &[]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "rjust() takes at least 1 argument (0 given)");
+
+        reset();
+        invoke(string("a"), "center", &[int(1), string(" "), string(" ")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "center() takes at most 2 arguments (3 given)");
+
+        reset();
+        invoke(string("a"), "zfill", &[int(2), string("0")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "str.zfill() takes exactly one argument (2 given)"
+        );
     }
 
     #[test]

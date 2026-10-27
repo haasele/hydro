@@ -321,6 +321,42 @@ fn method_argument_type_mismatch_is_reported() {
 }
 
 #[test]
+fn padding_method_signatures_are_registered() {
+    let source = "a = 'x'.rjust(3)\n\
+                  b = 'x'.ljust(3, '-')\n\
+                  c = 'x'.center(3, '-')\n\
+                  d = 'x'.zfill(3)\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    for index in 0..4 {
+        assert_eq!(assigned_type(&program, index), Type::Str, "index {index}");
+    }
+
+    let errors = check_errors("print('x'.rjust())\n");
+    assert_eq!(
+        errors,
+        vec!["str.rjust() takes 1 to 2 positional argument(s) (0 given)"]
+    );
+
+    let errors = check_errors("print('x'.center(1, '-', '-'))\n");
+    assert_eq!(
+        errors,
+        vec!["str.center() takes 1 to 2 positional argument(s) (3 given)"]
+    );
+
+    let errors = check_errors("print('x'.zfill('3'))\n");
+    assert_eq!(
+        errors,
+        vec!["str.zfill() argument 1 has wrong type: expected int, got str"]
+    );
+
+    let errors = check_errors("print('x'.rjust(3, 0))\n");
+    assert_eq!(
+        errors,
+        vec!["str.rjust() argument 2 has wrong type: expected str, got int"]
+    );
+}
+
+#[test]
 fn any_receiver_accepts_any_method() {
     let source = "def f(x: Any):\n    return x.nope(1, 2)\n";
     assert!(check_errors(source).is_empty());

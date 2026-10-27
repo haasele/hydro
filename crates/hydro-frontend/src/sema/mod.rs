@@ -309,6 +309,19 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
         "splitlines",
         MethodSig::new(0, 1, &[ArgKind::Any], Type::List),
     ),
+    (
+        "rjust",
+        MethodSig::new(1, 2, &[ArgKind::Int, ArgKind::Str], Type::Str),
+    ),
+    (
+        "ljust",
+        MethodSig::new(1, 2, &[ArgKind::Int, ArgKind::Str], Type::Str),
+    ),
+    (
+        "center",
+        MethodSig::new(1, 2, &[ArgKind::Int, ArgKind::Str], Type::Str),
+    ),
+    ("zfill", MethodSig::new(1, 1, &[ArgKind::Int], Type::Str)),
     ("join", MethodSig::new(1, 1, &[ArgKind::List], Type::Str)),
     (
         "replace",
