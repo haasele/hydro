@@ -4339,21 +4339,19 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_arity("dict", method, args.len(), 1, 1) {
                 return err;
             }
-            let Some(source) = value::as_dict(args[0]) else {
-                return type_error(format!(
-                    "'{}' object is not iterable",
-                    value::type_name(args[0])
-                ));
-            };
-            // Copy before mutating so `d.update(d)` cannot observe a moving
-            // pair vector; existing keys keep their position, new ones append.
-            let source: Vec<(i64, i64)> = source.to_vec();
-            if let Some(mut pairs) = value::dict_pairs_mut(obj) {
-                for (key, val) in source {
-                    container::dict_insert_barrier(obj, &mut pairs, key, val);
+            if let Some(source) = value::as_dict(args[0]) {
+                // Copy before mutating so `d.update(d)` cannot observe a moving
+                // pair vector; existing keys keep their position, new ones
+                // append.
+                let source: Vec<(i64, i64)> = source.to_vec();
+                if let Some(mut pairs) = value::dict_pairs_mut(obj) {
+                    for (key, val) in source {
+                        container::dict_insert_barrier(obj, &mut pairs, key, val);
+                    }
                 }
+                return NONE;
             }
-            NONE
+            dict_update_from_pairs(obj, args[0])
         }
         "copy" => {
             if let Some(err) = check_arity("dict", method, args.len(), 0, 0) {
@@ -4373,6 +4371,56 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
         }
         _ => attribute_error(obj, method),
     }
+}
+
+/// `d.update(iterable)`: copies an iterable of key/value pairs into `d`.
+///
+/// CPython accepts any iterable whose elements are two-item sequences, so each
+/// element must be a list or tuple of exactly two values; other shapes report
+/// the same `TypeError`/`ValueError` wording as `dict(iterable)`. Keys must be
+/// hashable, and pairs are inserted as they are read, so an iterator that
+/// yields from `d`'s own items observes the updates made so far.
+fn dict_update_from_pairs(obj: i64, source: i64) -> i64 {
+    let iterator = crate::iter::iter_new(source);
+    if exc::pending() {
+        return NONE;
+    }
+    let mut index = 0usize;
+    loop {
+        let mut item = NONE;
+        let status = crate::iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        let Some(items) = value::as_list(item).or_else(|| value::as_tuple(item)) else {
+            return type_error(format!(
+                "cannot convert dictionary update sequence element #{} to a sequence",
+                index
+            ));
+        };
+        if items.len() != 2 {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!(
+                    "dictionary update sequence element #{} has length {}; 2 is required",
+                    index,
+                    items.len()
+                ),
+            );
+        }
+        let (key, val) = (items[0], items[1]);
+        if let Some(name) = container::unhashable_name(key) {
+            return type_error(container::unhashable_message(name));
+        }
+        if let Some(mut pairs) = value::dict_pairs_mut(obj) {
+            container::dict_insert_barrier(obj, &mut pairs, key, val);
+        }
+        index += 1;
+    }
+    NONE
 }
 
 /// Rejects dict keys that Python considers unhashable (`list`, `dict`,
@@ -6482,6 +6530,58 @@ mod tests {
 
         invoke(d, "clear", &[]);
         assert_eq!(rendered_list(d), "{}");
+    }
+
+    #[test]
+    fn dict_update_accepts_an_iterable_of_pairs() {
+        reset();
+        let d = dict(&[(string("a"), int(1))]);
+        // A list of pairs behaves like a mapping: existing keys keep their
+        // position and take the new value, new keys append.
+        invoke(
+            d,
+            "update",
+            &[list(&[
+                tuple(&[string("b"), int(2)]),
+                tuple(&[string("a"), int(3)]),
+            ])],
+        );
+        assert_eq!(rendered_list(d), "{'a': 3, 'b': 2}");
+        assert!(!crate::exc::pending());
+
+        // Pairs nested in a tuple iterable are accepted too.
+        invoke(d, "update", &[tuple(&[tuple(&[string("c"), int(4)])])]);
+        assert_eq!(rendered_list(d), "{'a': 3, 'b': 2, 'c': 4}");
+
+        reset();
+        invoke(dict(&[]), "update", &[list(&[int(1)])]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "cannot convert dictionary update sequence element #0 to a sequence"
+        );
+
+        reset();
+        invoke(
+            dict(&[]),
+            "update",
+            &[list(&[tuple(&[int(1), int(2), int(3)])])],
+        );
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "dictionary update sequence element #0 has length 3; 2 is required"
+        );
+
+        reset();
+        invoke(dict(&[]), "update", &[list(&[tuple(&[list(&[]), int(1)])])]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "unhashable type: 'list'");
+
+        reset();
+        invoke(dict(&[]), "update", &[int(1)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "'int' object is not iterable");
     }
 
     #[test]

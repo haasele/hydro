@@ -493,6 +493,67 @@ fn numeric_receiver_has_no_methods() {
 }
 
 #[test]
+fn missing_method_on_a_variable_receiver_is_left_to_the_runtime() {
+    // Python resolves methods from the runtime class. A local can hold a
+    // subclass, or a value an `isinstance` check narrowed at runtime while the
+    // frontend keeps the assignment type (`missing_values or ()` stays a
+    // tuple), so the lookup is dynamic and the result is `Any`.
+    let cases = [
+        ("xs = [1]\na = xs.items()\n", Type::Any),
+        ("xs = [1]\na = xs.decode()\n", Type::Any),
+        ("t = ()\na = t.decode()\n", Type::Any),
+        ("d = {}\na = d.decode()\n", Type::Any),
+        ("s = 'x'\na = s.nope()\n", Type::Any),
+        ("blob = b'x'\na = blob.items()\n", Type::Any),
+        ("s = 'abc'\na = s[0].nope()\n", Type::Any),
+    ];
+    for (source, expected) in cases {
+        let program = crate::check_source(source, "test.py").expect("valid program");
+        assert_eq!(assigned_type(&program, 1), expected, "{source}");
+    }
+}
+
+#[test]
+fn missing_method_on_a_literal_receiver_is_still_reported() {
+    for (source, expected) in [
+        ("print([1].nope())\n", "type 'list' has no method 'nope'"),
+        ("print({}.decode())\n", "type 'dict' has no method 'decode'"),
+        (
+            "print((1, 2).nope())\n",
+            "type 'tuple' has no method 'nope'",
+        ),
+        (
+            "print(b'x'.items())\n",
+            "type 'bytes' has no method 'items'",
+        ),
+        ("print('x'.nope())\n", "type 'str' has no method 'nope'"),
+    ] {
+        assert_eq!(check_errors(source), vec![expected], "{source}");
+    }
+}
+
+#[test]
+fn dict_update_accepts_an_iterable_of_pairs() {
+    for source in [
+        "d = {}\nd.update([('a', 1)])\n",
+        "d = {}\nd.update([('a', 1), ('b', 2)])\n",
+        "d = {}\nd.update((('a', 1),))\n",
+        "d = {}\nd.update({'a': 1})\n",
+        "d = {}\nd.update([])\n",
+    ] {
+        assert_eq!(check_errors(source), Vec::<String>::new(), "{source}");
+    }
+
+    assert_eq!(
+        check_errors("d = {}\nd.update(1)\n"),
+        vec![
+            "dict.update() argument 1 has wrong type: \
+             expected mapping or iterable of pairs, got int"
+        ]
+    );
+}
+
+#[test]
 fn method_arity_mismatch_is_reported() {
     let errors = check_errors("print('x'.upper(1))\n");
     assert_eq!(

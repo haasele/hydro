@@ -211,7 +211,10 @@ enum ArgKind {
     Str,
     Bytes,
     Int,
-    Dict,
+    /// `dict.update` operand: a mapping or any iterable of key/value pairs.
+    /// The static checks cannot tell a dict from a list of pairs, so every
+    /// iterable is accepted and the runtime validates the element shapes.
+    MappingOrPairs,
     /// Any value Python can hash: containers are rejected recursively.
     Hashable,
     /// `set.union` accepts a set, list or tuple.
@@ -233,12 +236,11 @@ impl ArgKind {
             ArgKind::Str => got == Type::Str,
             ArgKind::Bytes => got == Type::Bytes,
             ArgKind::Int => got == Type::Int || got == Type::BigInt || got == Type::Bool,
-            ArgKind::Dict => got == Type::Dict,
             // Detailed hashability is checked on the expression itself so
             // tuples with unhashable elements are rejected recursively.
             ArgKind::Hashable => true,
             ArgKind::SetIterable => matches!(got, Type::Set | Type::List | Type::Tuple),
-            ArgKind::Iterable => matches!(
+            ArgKind::MappingOrPairs | ArgKind::Iterable => matches!(
                 got,
                 Type::List
                     | Type::Tuple
@@ -257,7 +259,7 @@ impl ArgKind {
             ArgKind::Str => "str",
             ArgKind::Bytes => "bytes",
             ArgKind::Int => "int",
-            ArgKind::Dict => "dict",
+            ArgKind::MappingOrPairs => "mapping or iterable of pairs",
             ArgKind::Hashable => "hashable",
             ArgKind::SetIterable => "set, list or tuple",
             ArgKind::Iterable => "iterable",
@@ -271,7 +273,9 @@ impl ArgKind {
             ArgKind::Str => Some(Type::Str),
             ArgKind::Bytes => Some(Type::Bytes),
             ArgKind::Int => Some(Type::Int),
-            ArgKind::Dict => Some(Type::Dict),
+            // A mapping and a pair iterable are both accepted, so an
+            // unresolved argument cannot be narrowed to either shape.
+            ArgKind::MappingOrPairs => None,
             ArgKind::SetIterable => Some(Type::Set),
             // Lists are the common `join` operand; keep the previous
             // narrowing so later list operations on the same unresolved
@@ -468,7 +472,10 @@ const DICT_METHODS: &[(&str, MethodSig)] = &[
         "pop",
         MethodSig::new(1, 2, &[ArgKind::Any, ArgKind::Any], Type::Any),
     ),
-    ("update", MethodSig::new(1, 1, &[ArgKind::Dict], Type::None)),
+    (
+        "update",
+        MethodSig::new(1, 1, &[ArgKind::MappingOrPairs], Type::None),
+    ),
     (
         "setdefault",
         MethodSig::new(1, 2, &[ArgKind::Any, ArgKind::Any], Type::Any),
@@ -510,6 +517,30 @@ const SET_METHODS: &[(&str, MethodSig)] = &[
 fn closest_method(name: &str, table: &'static [(&'static str, MethodSig)]) -> Option<&'static str> {
     let candidates = || table.iter().map(|(candidate, _)| *candidate);
     diag::closest(name, candidates()).or_else(|| diag::closest_within(name, candidates(), 3))
+}
+
+/// Whether a method lookup through `kind` is decided at runtime even when the
+/// inferred receiver type is a concrete builtin.
+///
+/// Python resolves `receiver.method` from the value's runtime class. An
+/// unannotated local, parameter, closure cell, global or any derived value can
+/// hold a subclass, or a value that an `isinstance` check narrowed at runtime
+/// while the frontend still tracks its assignment type (`missing_values or ()`
+/// stays a tuple even inside `isinstance(missing_values, bytes)`). Reporting a
+/// missing builtin method for those receivers rejects valid Python, so the
+/// lookup stays dynamic and the runtime raises `AttributeError` on a real miss.
+///
+/// Literal containers and `str`/`bytes` constants are written out with their
+/// exact type, so an unknown method on them is always a static error.
+fn is_gradual_receiver(kind: &HExprKind) -> bool {
+    !matches!(
+        kind,
+        HExprKind::List(_)
+            | HExprKind::Tuple(_)
+            | HExprKind::Set(_)
+            | HExprKind::Dict(_)
+            | HExprKind::Const(Const::Str(_) | Const::Bytes(_))
+    )
 }
 
 /// Whether the HIR value of `builtin` denotes a builtin class object
@@ -2524,6 +2555,12 @@ impl<'a> Checker<'a> {
     /// Receivers whose type is not statically known (or `Any`) are executed
     /// dynamically: every method name and arity is accepted and the result is
     /// `Any`, leaving the checks to the runtime.
+    ///
+    /// A receiver with a concrete builtin type only reports a missing method
+    /// when it is written out literally. Values held in locals, parameters,
+    /// closure cells, globals or any derived expression keep the runtime's
+    /// class resolution (see [`is_gradual_receiver`]), so their result type is
+    /// forced to `Any` and the runtime reports a genuine `AttributeError`.
     #[allow(clippy::too_many_arguments)]
     fn check_method(
         &mut self,
@@ -2596,6 +2633,10 @@ impl<'a> Checker<'a> {
                     }
                 };
                 let Some(entry) = table.iter().find(|entry| entry.0 == method) else {
+                    if is_gradual_receiver(&object.kind) {
+                        self.force_any(expr.ty);
+                        return;
+                    }
                     self.error_no_method(expr, receiver, method, Some(table));
                     self.force_any(expr.ty);
                     return;

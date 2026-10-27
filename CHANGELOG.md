@@ -8,6 +8,22 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — 2026-10-27 gradual method dispatch and `dict.update`
+
+- A missing builtin method on a value whose receiver is not written out
+  literally is no longer a compile error: locals, parameters, closure cells,
+  globals, subscripts, calls and other derived expressions keep the runtime's
+  class resolution, so `isinstance`-narrowed values (`bytes.decode` on a
+  variable inferred as `tuple`, `dict.items` on a variable inferred as `list`)
+  type-check and a genuine miss raises `AttributeError` at runtime. Literal
+  list/tuple/set/dict/str/bytes receivers still report
+  `type '<type>' has no method '<name>'` statically.
+- `dict.update` accepts any iterable of key/value pairs, not just a mapping:
+  lists and tuples of two-element pairs copy with `dict`'s position and
+  overwrite rules, and malformed elements raise CPython's
+  `cannot convert dictionary update sequence element #N to a sequence` /
+  `... has length N; 2 is required` errors.
+
 ### Added — 2026-10-27 `contextlib.closing` and `ExitStack`
 
 - `contextlib.closing(thing)` is a native context manager: `__enter__`
