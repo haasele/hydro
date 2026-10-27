@@ -215,6 +215,11 @@ pub(crate) fn call(
     if is_builtin_int_type(obj) {
         return int_class_method(obj, &method, &args, &[]);
     }
+    // `type` is the metaclass builtin: metaclasses and typing stubs reach
+    // `type.__new__`/`type.__subclasscheck__` through the same value.
+    if is_builtin_type_type(obj) {
+        return type_class_method(obj, &method, &args, &[]);
+    }
     if is_integer_value(obj) {
         return int_method(obj, &method, &args, &[]);
     }
@@ -1227,6 +1232,9 @@ pub(crate) fn call_kw(
     if is_builtin_int_type(obj) {
         return int_class_method(obj, &method, &args, &keywords.items);
     }
+    if is_builtin_type_type(obj) {
+        return type_class_method(obj, &method, &args, &keywords.items);
+    }
     if is_integer_value(obj) {
         return int_method(obj, &method, &args, &keywords.items);
     }
@@ -1424,6 +1432,26 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             value::FunctionBody::Builtin(hydro_ir::Builtin::Int)
         ) && matches!(attr.as_str(), "from_bytes" | "to_bytes" | "bit_length")
         {
+            return value::bound_method_new(obj, attr);
+        }
+        // The `type` metaclass exposes its C-level class operations as
+        // attributes; metaclasses assign them into their own namespace
+        // (`__instancecheck__ = type.__instancecheck__`).
+        if matches!(
+            &function.body,
+            value::FunctionBody::Builtin(hydro_ir::Builtin::Type)
+        ) && matches!(
+            attr.as_str(),
+            "__new__"
+                | "__call__"
+                | "__subclasscheck__"
+                | "__instancecheck__"
+                | "__hash__"
+                | "__repr__"
+                | "__prepare__"
+                | "__getattribute__"
+                | "mro"
+        ) {
             return value::bound_method_new(obj, attr);
         }
         if let value::FunctionBody::Partial {
@@ -2133,9 +2161,10 @@ fn int_arg(v: i64) -> Result<i64, i64> {
 ///
 /// Builtin types are plain builtin function values at runtime (`int` is the
 /// `Builtin::Int` function), so `int.from_bytes(...)` reaches [`call`] with a
-/// function receiver instead of a class object. Only `int` has a class-level
-/// method table here; every other builtin function value keeps the plain
-/// function attribute surface.
+/// function receiver instead of a class object. The class-level method table
+/// here covers `int`; `type` has its own table in [`type_class_method`], and
+/// every other builtin function value keeps the plain function attribute
+/// surface.
 fn is_builtin_int_type(obj: i64) -> bool {
     let Some(function) = value::as_function(obj) else {
         return false;
@@ -2143,6 +2172,143 @@ fn is_builtin_int_type(obj: i64) -> bool {
     matches!(
         &function.body,
         value::FunctionBody::Builtin(hydro_ir::Builtin::Int)
+    )
+}
+
+/// Class-level methods reached through the `type` builtin value.
+///
+/// `type` is both the metaclass of every class and a builtin function value at
+/// runtime, so a metaclass calling `type.__new__(...)` or a typing stub calling
+/// `type.__subclasscheck__(...)` arrives here. The operations are the C-level
+/// type checks and constructors: class creation with an explicit metaclass,
+/// `issubclass`/`isinstance`, hashing and the MRO.
+fn type_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match method {
+        "__new__" => {
+            if let Some(err) = check_arity("type", method, args.len(), 4, usize::MAX) {
+                return err;
+            }
+            // Class-header keywords are accepted for signature parity; the
+            // runtime class construction does not forward them.
+            let _ = keywords;
+            builtins::type_new(args[0], args[1], args[2], args[3])
+        }
+        "__call__" => {
+            let Some((callable, rest)) = args.split_first() else {
+                return type_error("type.__call__() missing the class argument".to_string());
+            };
+            if keywords.is_empty() {
+                builtins::call(*callable, rest.len(), rest.as_ptr())
+            } else {
+                let roots_source: Vec<i64> = keywords.iter().map(|(_, item)| *item).collect();
+                let roots = crate::heap::root_values(&roots_source);
+                let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+                for (name, item) in keywords {
+                    pairs.push(value::str_alloc(name.clone()));
+                    pairs.push(*item);
+                }
+                let result = builtins::call_kw(
+                    *callable,
+                    rest.len(),
+                    rest.as_ptr(),
+                    keywords.len(),
+                    pairs.as_ptr(),
+                );
+                crate::heap::release_roots(roots);
+                result
+            }
+        }
+        "__subclasscheck__" => {
+            if let Some(err) = check_arity("type", method, args.len(), 2, 2) {
+                return err;
+            }
+            let Some(class) = type_class_operand(args[0], method) else {
+                return NONE;
+            };
+            let subclass = value::normalize_class_base(args[1]);
+            builtins::issubclass(subclass, class)
+        }
+        "__instancecheck__" => {
+            if let Some(err) = check_arity("type", method, args.len(), 2, 2) {
+                return err;
+            }
+            let Some(class) = type_class_operand(args[0], method) else {
+                return NONE;
+            };
+            let instance = args[1];
+            builtins::isinstance(instance, class)
+        }
+        "__hash__" => {
+            if let Some(err) = check_arity("type", method, args.len(), 1, 1) {
+                return err;
+            }
+            let class = value::normalize_class_base(args[0]);
+            builtins::hash(class)
+        }
+        "mro" => {
+            if let Some(err) = check_arity("type", method, args.len(), 1, 1) {
+                return err;
+            }
+            let Some(class) = type_class_operand(args[0], method) else {
+                return NONE;
+            };
+            value::list_new(value::class_mro(class))
+        }
+        "__repr__" => {
+            if let Some(err) = check_arity("type", method, args.len(), 1, 1) {
+                return err;
+            }
+            let Some(class) = type_class_operand(args[0], method) else {
+                return NONE;
+            };
+            value::str_alloc(value::repr(class))
+        }
+        "__prepare__" => {
+            let _ = (args, keywords);
+            value::dict_new(Vec::new())
+        }
+        "__getattribute__" => {
+            if let Some(err) = check_arity("type", method, args.len(), 2, 2) {
+                return err;
+            }
+            let Some(class) = type_class_operand(args[0], method) else {
+                return NONE;
+            };
+            let Some(name) = value::as_str(args[1]) else {
+                return type_error(format!(
+                    "attribute name must be string, not '{}'",
+                    value::type_name(args[1])
+                ));
+            };
+            getattr(class, name.as_ptr(), name.len())
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
+/// Resolves a `type` class-method operand to a class, reporting CPython's
+/// descriptor error for non-class values.
+fn type_class_operand(operand: i64, method: &str) -> Option<i64> {
+    let class = value::normalize_class_base(operand);
+    if value::as_class(class).is_some() {
+        Some(class)
+    } else {
+        type_error(format!(
+            "descriptor '{method}' for 'type' objects doesn't apply to a '{}' object",
+            value::type_name(operand)
+        ));
+        None
+    }
+}
+
+/// Whether `obj` is the `type` builtin value.
+fn is_builtin_type_type(obj: i64) -> bool {
+    let Some(function) = value::as_function(obj) else {
+        return false;
+    };
+    matches!(
+        &function.body,
+        value::FunctionBody::Builtin(hydro_ir::Builtin::Type)
     )
 }
 
@@ -6798,6 +6964,79 @@ mod tests {
         crate::exc::clear();
         invoke(instance, "missing", &[]);
         assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+    }
+
+    #[test]
+    fn type_class_methods_delegate_to_class_operations() {
+        reset();
+        let base = value::class_new("Base".to_string(), NONE, Vec::new());
+        let derived = value::class_new_full("Derived".to_string(), base, Vec::new(), Vec::new());
+        let type_builtin = value::builtin_function_new(hydro_ir::Builtin::Type);
+
+        assert_eq!(
+            invoke(type_builtin, "__subclasscheck__", &[base, derived]),
+            TRUE
+        );
+        assert_eq!(
+            invoke(type_builtin, "__subclasscheck__", &[derived, base]),
+            FALSE
+        );
+        let instance = value::instance_new(derived);
+        assert_eq!(
+            invoke(type_builtin, "__instancecheck__", &[derived, instance]),
+            TRUE
+        );
+        assert_eq!(
+            invoke(type_builtin, "__instancecheck__", &[derived, base]),
+            FALSE
+        );
+        assert_eq!(
+            invoke(type_builtin, "__hash__", &[derived]),
+            crate::builtins::hash(derived)
+        );
+        assert_eq!(
+            items(invoke(type_builtin, "mro", &[derived])),
+            vec![derived, base]
+        );
+        assert_eq!(
+            text(invoke(type_builtin, "__repr__", &[derived])),
+            "<class 'Derived'>"
+        );
+        assert!(value::as_dict(invoke(
+            type_builtin,
+            "__prepare__",
+            &[string("C"), tuple(&[])]
+        ))
+        .is_some_and(<[(i64, i64)]>::is_empty));
+
+        // `type.__new__` allocates directly instead of re-entering the
+        // metaclass `__new__` that called it.
+        let arguments = [type_builtin, string("Made"), tuple(&[base]), dict(&[])];
+        let created = invoke(type_builtin, "__new__", &arguments);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::class_display_name(created), Some("Made"));
+        assert_eq!(value::class_mro(created), vec![created, base]);
+
+        // A builtin type function in the bases tuple denotes its native class
+        // (`type.__new__(type, 'D', (dict,), {})`).
+        let dict_builtin = value::builtin_function_new(hydro_ir::Builtin::Dict);
+        let builtin_base = [
+            type_builtin,
+            string("DictBase"),
+            tuple(&[dict_builtin]),
+            dict(&[]),
+        ];
+        let created = invoke(type_builtin, "__new__", &builtin_base);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::class_display_name(created), Some("DictBase"));
+
+        // `type.__hash__` read as an attribute is the same bound method.
+        let bound = getattr(type_builtin, b"__hash__".as_ptr(), 8);
+        assert_eq!(
+            crate::builtins::call(bound, 1, [derived].as_ptr()),
+            crate::builtins::hash(derived)
+        );
+        assert!(!crate::exc::pending());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! side of `*`. Variables that never resolve become [`Type::Any`], which makes
 //! the codegen use the dynamic runtime operators.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hydro_ir::stdlib;
 use hydro_ir::{
@@ -35,6 +35,16 @@ pub enum Ty {
 pub struct Infer {
     parent: Vec<u32>,
     binding: Vec<Option<Type>>,
+    /// Roots of inference variables that belong to unannotated parameters.
+    ///
+    /// Such parameters are gradual: a call argument may narrow them, a
+    /// conflicting call site widens the slot to `Any`, and a body use that
+    /// the narrowed type cannot serve keeps its operation dynamic instead of
+    /// reporting an error. Union-find merges keep the mark on the surviving
+    /// root, and [`Infer::inherit_gradual`] carries it onto the open
+    /// variables a body use reads the slot through, so locals that receive a
+    /// parameter value inherit it as well.
+    gradual: HashSet<u32>,
 }
 
 impl Infer {
@@ -42,7 +52,55 @@ impl Infer {
         Infer {
             parent: Vec::new(),
             binding: Vec::new(),
+            gradual: HashSet::new(),
         }
+    }
+
+    /// Mark a type slot as an unannotated parameter. Only inference variables
+    /// can carry provenance; an explicitly annotated parameter is concrete
+    /// and keeps its static checks.
+    pub fn mark_gradual(&mut self, t: Ty) {
+        if let Ty::Var(v) = t {
+            let root = self.root(v);
+            self.gradual.insert(root);
+        }
+    }
+
+    /// Whether the slot is an unannotated parameter (or was unified with
+    /// one), whether or not a call site already narrowed it to a concrete
+    /// type.
+    pub fn is_gradual(&mut self, t: Ty) -> bool {
+        match t {
+            Ty::Concrete(_) => false,
+            Ty::Var(v) => {
+                let root = self.root(v);
+                self.gradual.contains(&root)
+            }
+        }
+    }
+
+    /// Carry unannotated-parameter provenance onto a still-open inference
+    /// variable that is unified with a gradual slot.
+    ///
+    /// A call site narrows an unannotated parameter by binding its slot, and
+    /// every body use reads the slot through its own variable. Without this
+    /// transfer the read resolves to the concrete argument type and loses the
+    /// gradual contract, so `len(parameters)` and `parameters < 'x'` would be
+    /// reported against the caller's `bool` instead of staying dynamic.
+    fn inherit_gradual(&mut self, from: Ty, to: Ty) {
+        let Ty::Var(v) = to else {
+            return;
+        };
+        let root = self.root(v);
+        // A slot that is already pinned to a concrete type was typed by
+        // something other than the gradual value; leave it concrete.
+        if self.binding[root as usize].is_some() {
+            return;
+        }
+        if !self.is_gradual(from) {
+            return;
+        }
+        self.gradual.insert(root);
     }
 
     pub fn fresh(&mut self) -> Ty {
@@ -81,6 +139,11 @@ impl Infer {
     /// Unify two type slots, widening numeric types. On failure the two
     /// resolved concrete types are returned without mutating the store.
     pub fn unify(&mut self, a: Ty, b: Ty) -> Result<Ty, (Type, Type)> {
+        // Provenance must survive the narrowing that `resolve` collapses: a
+        // parameter slot can already be bound to the type one call site
+        // supplied while the other side is a fresh use of that slot.
+        self.inherit_gradual(a, b);
+        self.inherit_gradual(b, a);
         let ra = self.resolve(a);
         let rb = self.resolve(b);
         match (ra, rb) {
@@ -98,6 +161,10 @@ impl Infer {
                     return Ok(Ty::Var(x));
                 }
                 self.parent[y as usize] = x;
+                // Gradual provenance follows the surviving root.
+                if self.gradual.remove(&y) {
+                    self.gradual.insert(x);
+                }
                 Ok(Ty::Var(x))
             }
             (Ty::Var(x), Ty::Concrete(y)) => {
@@ -562,6 +629,7 @@ fn is_builtin_class_value(builtin: Builtin) -> bool {
             | Builtin::Frozenset
             | Builtin::Range
             | Builtin::MemoryView
+            | Builtin::Type
     )
 }
 
@@ -600,6 +668,16 @@ fn builtin_class_method_result(builtin: Builtin, method: &str) -> Option<Type> {
         (Builtin::ByteArray, "fromhex") => Type::Bytes,
         (Builtin::Dict, "fromkeys") => Type::Dict,
         (Builtin::Float, "fromhex") => Type::Float,
+        // `type` is the metaclass every class value carries. Its class-level
+        // methods are the C-level type operations CPython exposes
+        // (`type.__new__`, `type.__subclasscheck__`, …); typing stubs and
+        // metaclasses call them directly on the `type` builtin.
+        (Builtin::Type, "__new__" | "__call__" | "__getattribute__") => Type::Any,
+        (Builtin::Type, "__subclasscheck__" | "__instancecheck__") => Type::Bool,
+        (Builtin::Type, "__hash__") => Type::Int,
+        (Builtin::Type, "mro") => Type::List,
+        (Builtin::Type, "__repr__") => Type::Str,
+        (Builtin::Type, "__prepare__") => Type::Dict,
         _ => return None,
     })
 }
@@ -1095,9 +1173,9 @@ impl<'a> Checker<'a> {
                 );
             }
         } else {
-            // A stub body (`...` or `pass`) returns `None` at runtime, so a
-            // non-`None` return annotation on it states the contract its
-            // implementations honour (typing protocols, abstract
+            // A stub body (`...`, `pass`, or just a docstring) returns `None`
+            // at runtime, so a non-`None` return annotation on it states the
+            // contract its implementations honour (typing protocols, abstract
             // placeholders) rather than a missing return value. An
             // unannotated stub used as a value still reports below.
             //
@@ -1171,13 +1249,15 @@ impl<'a> Checker<'a> {
     }
 
     /// Whether a body only declares a stub: an optional docstring followed by
-    /// `pass` or `...` (a typing stub or an abstract placeholder).
+    /// `pass` or `...` (a typing stub or an abstract placeholder), or just the
+    /// docstring itself.
     ///
     /// Lowering keeps the markers as statements, so detection works on the
     /// HIR. At runtime such a body returns `None`; the declared return type
     /// describes what an implementation must return.
     fn is_stub_body(body: &[HStmt]) -> bool {
         match Self::body_without_docstring(body) {
+            [] => true,
             [stmt] => Self::is_stub_marker(stmt),
             _ => false,
         }
@@ -1221,7 +1301,12 @@ impl<'a> Checker<'a> {
     fn assign_local(&mut self, local_ty: Ty, value_ty: Ty, name: &str, line: u32, col: u32) {
         if matches!(local_ty, Ty::Concrete(_)) {
             if let Err((expected, got)) = self.inf.unify(local_ty, value_ty) {
-                if (expected == Type::None) != (got == Type::None) {
+                if self.inf.is_gradual(value_ty) {
+                    // The value comes from an unannotated parameter: its
+                    // runtime type is unknown, so it is compatible with the
+                    // annotated slot.
+                    self.force_any(value_ty);
+                } else if (expected == Type::None) != (got == Type::None) {
                     self.force_any(value_ty);
                 } else {
                     self.error(
@@ -1318,6 +1403,9 @@ impl<'a> Checker<'a> {
             }
             HStmtKind::Unpack { targets, value } => {
                 self.check_expr(value, f);
+                if self.inf.is_gradual(value.ty) {
+                    self.force_any(value.ty);
+                }
                 match self.inf.resolve(value.ty) {
                     // The runtime accepts every iterable; lists, tuples,
                     // strings and bytes are unpacked without materialisation.
@@ -1474,6 +1562,9 @@ impl<'a> Checker<'a> {
                 else_body,
             } => {
                 self.check_expr(iterable, f);
+                if self.inf.is_gradual(iterable.ty) {
+                    self.force_any(iterable.ty);
+                }
                 let iterable_ty = self.inf.resolve(iterable.ty);
                 match iterable_ty {
                     Ty::Concrete(Type::List)
@@ -1527,7 +1618,12 @@ impl<'a> Checker<'a> {
                             Ty::Concrete(expected) => match self.inf.resolve(value.ty) {
                                 Ty::Concrete(got) => {
                                     if !annotation_accepts(expected, got) {
-                                        if expected == Type::None || got == Type::None {
+                                        if self.inf.is_gradual(value.ty) {
+                                            // The returned value comes from an
+                                            // unannotated parameter, so its
+                                            // runtime type is unknown.
+                                            self.force_any(value.ty);
+                                        } else if expected == Type::None || got == Type::None {
                                             // A function that returns both a
                                             // value and `None` is dynamic; the
                                             // implicit return typing must not
@@ -1644,6 +1740,10 @@ impl<'a> Checker<'a> {
     /// Validate the receiver and index of an assignment-style subscript after
     /// both expressions were checked.
     fn check_subscript_assignment(&mut self, object: &HExpr, index: &HExpr) {
+        if self.inf.is_gradual(object.ty) {
+            self.force_any(object.ty);
+            return;
+        }
         match self.inf.resolve(object.ty) {
             Ty::Concrete(Type::List) => {
                 // A slice-carrying tuple key is a dynamic key: the runtime
@@ -1672,6 +1772,10 @@ impl<'a> Checker<'a> {
     /// like a dict slice read (a `slice` is unhashable) and every other known
     /// type rejects item assignment, matching the runtime errors.
     fn check_slice_assignment_target(&mut self, object: &HExpr) {
+        if self.inf.is_gradual(object.ty) {
+            self.force_any(object.ty);
+            return;
+        }
         match self.inf.resolve(object.ty) {
             Ty::Concrete(Type::List) | Ty::Concrete(Type::Any) => {}
             Ty::Var(_) => {
@@ -1735,11 +1839,15 @@ impl<'a> Checker<'a> {
         }
         if let Ty::Concrete(t) = self.inf.resolve(key.ty) {
             if t == Type::List || t == Type::Dict || t == Type::Set {
-                self.error(
-                    key.line,
-                    key.col,
-                    format!("unhashable type: '{}'", t.name()),
-                );
+                if self.inf.is_gradual(key.ty) {
+                    self.force_any(key.ty);
+                } else {
+                    self.error(
+                        key.line,
+                        key.col,
+                        format!("unhashable type: '{}'", t.name()),
+                    );
+                }
             }
         }
     }
@@ -1749,6 +1857,9 @@ impl<'a> Checker<'a> {
     fn check_comp_clauses(&mut self, clauses: &[HCompClause], f: &HFunction) {
         for clause in clauses {
             self.check_expr(&clause.iterable, f);
+            if self.inf.is_gradual(clause.iterable.ty) {
+                self.force_any(clause.iterable.ty);
+            }
             if clause.is_async {
                 // An asynchronous iterable only needs `__aiter__`; library and
                 // user objects are dynamically typed, so only a concrete
@@ -1814,15 +1925,19 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Int));
             }
             Ty::Concrete(got) => {
-                self.error(
-                    expr.line,
-                    expr.col,
-                    format!(
-                        "range() argument '{}' has type {}, expected int",
-                        name,
-                        got.name()
-                    ),
-                );
+                if self.inf.is_gradual(expr.ty) {
+                    self.force_any(expr.ty);
+                } else {
+                    self.error(
+                        expr.line,
+                        expr.col,
+                        format!(
+                            "range() argument '{}' has type {}, expected int",
+                            name,
+                            got.name()
+                        ),
+                    );
+                }
             }
         }
     }
@@ -1855,12 +1970,18 @@ impl<'a> Checker<'a> {
             Ty::Var(_) => {
                 let _ = self.inf.unify(index, Ty::Concrete(Type::Int));
             }
-            Ty::Concrete(got) => self.error_code(
-                line,
-                col,
-                codes::INDEX,
-                format!("{} index must be int, not {}", container, got.name()),
-            ),
+            Ty::Concrete(got) => {
+                if self.inf.is_gradual(index) {
+                    self.force_any(index);
+                } else {
+                    self.error_code(
+                        line,
+                        col,
+                        codes::INDEX,
+                        format!("{} index must be int, not {}", container, got.name()),
+                    );
+                }
+            }
         }
     }
 
@@ -1883,12 +2004,18 @@ impl<'a> Checker<'a> {
             Ty::Var(_) => {
                 let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Int));
             }
-            Ty::Concrete(_) => self.error_code(
-                expr.line,
-                expr.col,
-                codes::INDEX,
-                "slice indices must be integers or None".to_string(),
-            ),
+            Ty::Concrete(_) => {
+                if self.inf.is_gradual(expr.ty) {
+                    self.force_any(expr.ty);
+                } else {
+                    self.error_code(
+                        expr.line,
+                        expr.col,
+                        codes::INDEX,
+                        "slice indices must be integers or None".to_string(),
+                    );
+                }
+            }
         }
     }
 
@@ -2064,6 +2191,14 @@ impl<'a> Checker<'a> {
                     let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
                     return;
                 }
+                // An unannotated parameter is gradual: a call site may have
+                // narrowed it (a marker passed as `bool`), but a subscript in
+                // the body is still valid Python and the runtime decides.
+                if self.inf.is_gradual(object.ty) {
+                    self.force_any(object.ty);
+                    let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
+                    return;
+                }
                 match self.inf.resolve(object.ty) {
                     Ty::Concrete(Type::List) => {
                         if !slice_index {
@@ -2134,6 +2269,11 @@ impl<'a> Checker<'a> {
                 self.check_slice_bound(start, f);
                 self.check_slice_bound(stop, f);
                 self.check_slice_bound(step, f);
+                if self.inf.is_gradual(object.ty) {
+                    self.force_any(object.ty);
+                    let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
+                    return;
+                }
                 match self.inf.resolve(object.ty) {
                     Ty::Concrete(Type::Str) => {
                         let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Str));
@@ -2286,6 +2426,9 @@ impl<'a> Checker<'a> {
                 if let Some(star) = star {
                     self.check_expr(star, f);
                 }
+                if self.inf.is_gradual(callee.ty) {
+                    self.force_any(callee.ty);
+                }
                 match self.inf.resolve(callee.ty) {
                     Ty::Concrete(Type::Function) | Ty::Concrete(Type::Any) => {}
                     Ty::Var(_) => {
@@ -2356,7 +2499,9 @@ impl<'a> Checker<'a> {
                     self.check_expr(mapping, f);
                     // `**mapping` must be a dict; a runtime value that cannot
                     // be a mapping is rejected here when its type is known.
-                    if let Ty::Concrete(got) = self.inf.resolve(mapping.ty) {
+                    if self.inf.is_gradual(mapping.ty) {
+                        self.force_any(mapping.ty);
+                    } else if let Ty::Concrete(got) = self.inf.resolve(mapping.ty) {
                         if !matches!(got, Type::Dict | Type::Any) {
                             self.error_code(
                                 mapping.line,
@@ -2369,6 +2514,9 @@ impl<'a> Checker<'a> {
                             );
                         }
                     }
+                }
+                if self.inf.is_gradual(callee.ty) {
+                    self.force_any(callee.ty);
                 }
                 match self.inf.resolve(callee.ty) {
                     Ty::Concrete(Type::Function) | Ty::Concrete(Type::Any) => {}
@@ -2449,7 +2597,7 @@ impl<'a> Checker<'a> {
                         CallArity::of(function),
                         function.params[captures..]
                             .iter()
-                            .map(|p| p.ty)
+                            .map(|p| (p.ty, p.declared))
                             .collect::<Vec<_>>(),
                         function.ret_ty,
                         function.is_async || function.is_generator,
@@ -2460,36 +2608,52 @@ impl<'a> Checker<'a> {
                     self.error_code(expr.line, expr.col, codes::CALL, message);
                 }
                 for (index, arg) in args.iter().enumerate() {
-                    if let Some(param_ty) = params.get(index) {
-                        match *param_ty {
+                    if let Some(&(param_ty, declared)) = params.get(index) {
+                        match param_ty {
                             Ty::Concrete(expected) => match self.inf.resolve(arg.ty) {
                                 Ty::Concrete(got) => {
                                     if !annotation_accepts(expected, got) {
-                                        self.error(
-                                            arg.line,
-                                            arg.col,
-                                            format!(
-                                                "argument {} of {} has type {}, expected {}",
-                                                index + 1,
-                                                name,
-                                                got.name(),
-                                                expected.name()
-                                            ),
-                                        );
+                                        if declared {
+                                            self.error(
+                                                arg.line,
+                                                arg.col,
+                                                format!(
+                                                    "argument {} of {} has type {}, expected {}",
+                                                    index + 1,
+                                                    name,
+                                                    got.name(),
+                                                    expected.name()
+                                                ),
+                                            );
+                                        } else {
+                                            // An unannotated parameter has no
+                                            // declared contract: the argument
+                                            // and any conflicting body use widen
+                                            // it to `Any`, and the runtime
+                                            // decides.
+                                            self.force_any(param_ty);
+                                        }
                                     }
                                 }
                                 Ty::Var(_) => {
-                                    let _ = self.inf.unify(arg.ty, Ty::Concrete(expected));
+                                    if declared {
+                                        let _ = self.inf.unify(arg.ty, Ty::Concrete(expected));
+                                    } else if expected != Type::Any {
+                                        // An argument that is still unresolved
+                                        // must not be pinned to the argument
+                                        // type of another call site.
+                                        self.force_any(param_ty);
+                                    }
                                 }
                             },
                             Ty::Var(_) => {
-                                match (self.inf.resolve(*param_ty), self.inf.resolve(arg.ty)) {
+                                match (self.inf.resolve(param_ty), self.inf.resolve(arg.ty)) {
                                     (Ty::Concrete(_), Ty::Concrete(_)) => {
-                                        if self.inf.unify(*param_ty, arg.ty).is_err() {
+                                        if self.inf.unify(param_ty, arg.ty).is_err() {
                                             // Call sites supply different types for
                                             // one unannotated parameter: the
                                             // parameter is dynamic.
-                                            self.force_any(*param_ty);
+                                            self.force_any(param_ty);
                                         }
                                     }
                                     (Ty::Concrete(expected), Ty::Var(_)) => {
@@ -2499,9 +2663,9 @@ impl<'a> Checker<'a> {
                                             // site supplied (e.g. a `None` from an
                                             // omitted default); the parameter is
                                             // dynamic instead.
-                                            self.force_any(*param_ty);
+                                            self.force_any(param_ty);
                                         } else {
-                                            let _ = self.inf.unify(*param_ty, arg.ty);
+                                            let _ = self.inf.unify(param_ty, arg.ty);
                                         }
                                     }
                                     (Ty::Var(_), Ty::Concrete(Type::None)) => {
@@ -2511,7 +2675,7 @@ impl<'a> Checker<'a> {
                                         // (`depth = depth - 1` makes it an int).
                                     }
                                     _ => {
-                                        let _ = self.inf.unify(*param_ty, arg.ty);
+                                        let _ = self.inf.unify(param_ty, arg.ty);
                                     }
                                 }
                             }
@@ -2586,7 +2750,9 @@ impl<'a> Checker<'a> {
         let mut dynamic_keywords = false;
         if let Some(mapping) = double_star {
             self.check_expr(mapping, f);
-            if let Ty::Concrete(got) = self.inf.resolve(mapping.ty) {
+            if self.inf.is_gradual(mapping.ty) {
+                self.force_any(mapping.ty);
+            } else if let Ty::Concrete(got) = self.inf.resolve(mapping.ty) {
                 if !matches!(got, Type::Dict | Type::Any) {
                     self.error_code(
                         mapping.line,
@@ -2616,6 +2782,14 @@ impl<'a> Checker<'a> {
             }
         }
 
+        // An unannotated parameter is gradual: a call site may have narrowed
+        // it to a builtin type, but the body's method call is valid Python
+        // (the argument may be a subclass or another value at runtime).
+        if self.inf.is_gradual(object.ty) {
+            self.force_any(object.ty);
+            self.force_any(expr.ty);
+            return;
+        }
         let result = match self.inf.resolve(object.ty) {
             Ty::Var(_) | Ty::Concrete(Type::Any) => Type::Any,
             Ty::Concrete(receiver) => {
@@ -2721,18 +2895,22 @@ impl<'a> Checker<'a> {
             }
             Ty::Concrete(got) => {
                 if !kind.accepts(got) {
-                    self.error(
-                        arg.line,
-                        arg.col,
-                        format!(
-                            "{}.{}() argument {} has wrong type: expected {}, got {}",
-                            receiver.name(),
-                            method,
-                            index + 1,
-                            expected,
-                            got.name()
-                        ),
-                    );
+                    if self.inf.is_gradual(arg.ty) {
+                        self.force_any(arg.ty);
+                    } else {
+                        self.error(
+                            arg.line,
+                            arg.col,
+                            format!(
+                                "{}.{}() argument {} has wrong type: expected {}, got {}",
+                                receiver.name(),
+                                method,
+                                index + 1,
+                                expected,
+                                got.name()
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -2743,6 +2921,12 @@ impl<'a> Checker<'a> {
     // ------------------------------------------------------------------
 
     fn bind_type(&mut self, out: Ty, ty: Type, line: u32, col: u32) {
+        if self.inf.is_gradual(out) {
+            // An unannotated parameter used as an augmented-assignment target
+            // stays dynamic instead of pinning a result type.
+            self.force_any(out);
+            return;
+        }
         if self.inf.unify(out, Ty::Concrete(ty)).is_err() {
             let existing = self.inf.name_of(out);
             if existing == "None" {
@@ -2765,6 +2949,17 @@ impl<'a> Checker<'a> {
 
     fn force_any(&mut self, ty: Ty) {
         let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
+    }
+
+    /// Widen a gradual (unannotated-parameter) slot to `Any`, returning
+    /// whether it was gradual.
+    fn widen_gradual(&mut self, ty: Ty) -> bool {
+        if self.inf.is_gradual(ty) {
+            self.force_any(ty);
+            true
+        } else {
+            false
+        }
     }
 
     /// Validate `left in right` for concrete operand types, reporting the
@@ -2867,6 +3062,17 @@ impl<'a> Checker<'a> {
         line: u32,
         col: u32,
     ) {
+        // An unannotated parameter is gradual. A builtin argument that
+        // happens to be constrained by a call site (e.g. `len(parameters)`
+        // where a caller passed a `bool`) is not a static error: the slot
+        // widens to `Any` and the runtime validates the actual value.
+        let mut args = args;
+        for (ty, _, _) in &mut args {
+            if self.inf.is_gradual(*ty) {
+                self.force_any(*ty);
+                *ty = Ty::Concrete(Type::Any);
+            }
+        }
         let count = args.len();
         match builtin {
             Builtin::Print => {
@@ -4033,6 +4239,10 @@ impl<'a> Checker<'a> {
 
     /// Reject a statically known non-iterable argument for a builtin.
     fn check_builtin_iterable(&mut self, builtin: Builtin, ty: Ty, line: u32, col: u32) {
+        if self.inf.is_gradual(ty) {
+            self.force_any(ty);
+            return;
+        }
         match self.inf.resolve(ty) {
             Ty::Var(_) => {
                 let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
@@ -4124,11 +4334,17 @@ impl<'a> Checker<'a> {
                     self.bind_type(op.out, Type::BigInt, op.line, op.col);
                 }
                 Ty::Concrete(t) => {
-                    self.error(
-                        op.line,
-                        op.col,
-                        format!("bad operand type for unary ~: '{}'", t.name()),
-                    );
+                    if self.inf.is_gradual(op.a) {
+                        // An unannotated parameter is gradual; a callsite
+                        // narrowing it to a non-int is not a static contract.
+                        self.force_any(op.a);
+                    } else {
+                        self.error(
+                            op.line,
+                            op.col,
+                            format!("bad operand type for unary ~: '{}'", t.name()),
+                        );
+                    }
                     self.force_any(op.out);
                 }
             },
@@ -4149,15 +4365,19 @@ impl<'a> Checker<'a> {
                     self.bind_type(op.out, result, op.line, op.col);
                 }
                 Ty::Concrete(t) => {
-                    self.error(
-                        op.line,
-                        op.col,
-                        format!(
-                            "bad operand type for unary {}: '{}'",
-                            unary.symbol(),
-                            t.name()
-                        ),
-                    );
+                    if self.inf.is_gradual(op.a) {
+                        self.force_any(op.a);
+                    } else {
+                        self.error(
+                            op.line,
+                            op.col,
+                            format!(
+                                "bad operand type for unary {}: '{}'",
+                                unary.symbol(),
+                                t.name()
+                            ),
+                        );
+                    }
                     self.force_any(op.out);
                 }
             },
@@ -4211,16 +4431,34 @@ impl<'a> Checker<'a> {
                     };
                     self.bind_type(op.out, result, op.line, op.col);
                 } else if matches!(binary, BinOp::In | BinOp::NotIn) {
-                    match self.membership_result(x, y, op.line, op.col) {
-                        Some(result) => self.bind_type(op.out, result, op.line, op.col),
-                        None => self.force_any(op.out),
+                    // An unannotated parameter may hold an iterable (or a
+                    // string) at runtime; only a fully concrete pair is a
+                    // static error.
+                    let gradual_a = self.widen_gradual(op.a);
+                    let gradual_b = self.widen_gradual(op.b);
+                    if gradual_a || gradual_b {
+                        self.bind_type(op.out, Type::Bool, op.line, op.col);
+                    } else {
+                        match self.membership_result(x, y, op.line, op.col) {
+                            Some(result) => self.bind_type(op.out, result, op.line, op.col),
+                            None => self.force_any(op.out),
+                        }
                     }
                 } else {
                     match op_result(binary, x, y) {
                         Some(result) => self.bind_type(op.out, result, op.line, op.col),
                         None => {
-                            self.unsupported(binary, x, y, op.line, op.col);
-                            self.force_any(op.out);
+                            let gradual_a = self.widen_gradual(op.a);
+                            let gradual_b = self.widen_gradual(op.b);
+                            if gradual_a || gradual_b {
+                                // The pair only fails because a call site
+                                // narrowed an unannotated parameter; keep the
+                                // operation dynamic.
+                                self.force_any(op.out);
+                            } else {
+                                self.unsupported(binary, x, y, op.line, op.col);
+                                self.force_any(op.out);
+                            }
                         }
                     }
                 }
@@ -4256,6 +4494,14 @@ impl<'a> Checker<'a> {
                     // Any value is accepted; the runtime decides membership.
                     Type::List | Type::Tuple | Type::Dict | Type::Set | Type::Range => {}
                     _ => {
+                        let known_slot = if var_is_lhs { op.b } else { op.a };
+                        if self.inf.is_gradual(known_slot) {
+                            // A call site narrowed an unannotated parameter to
+                            // a non-iterable; its runtime value may differ.
+                            self.force_any(known_slot);
+                            self.force_any(op.out);
+                            return;
+                        }
                         self.error(
                             op.line,
                             op.col,
@@ -4440,6 +4686,7 @@ fn emit_function(function: &HFunction, inf: &mut Infer) -> IrFunction {
             local: p.local,
             name: p.name.clone(),
             ty: inf.type_of(p.ty),
+            declared: p.declared,
             default: p.default.clone(),
             default_expr: p
                 .default_expr

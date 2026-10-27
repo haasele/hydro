@@ -725,6 +725,10 @@ pub struct Param {
     pub local: LocalId,
     pub name: String,
     pub ty: Type,
+    /// The source wrote a type annotation for this parameter. Unannotated
+    /// parameters are gradual: the frontend widens them to `Any` instead of
+    /// treating a call argument as their declared type.
+    pub declared: bool,
     /// Literal default (`def f(x=1)`). Direct calls fill omitted parameters
     /// with it; the runtime binder of a dynamic signature uses it for
     /// calls through a function value.

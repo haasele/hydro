@@ -2950,6 +2950,22 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
 /// (see [`value::class_new_multi`]). Functions in the namespace become normal
 /// methods; every other value is a class attribute.
 fn type_three_arg(name: i64, bases: i64, namespace: i64) -> i64 {
+    type_new_impl(NONE, name, bases, namespace, true)
+}
+
+/// `type.__new__(metaclass, name, bases, namespace)`: the underlying class
+/// allocator with an explicit metaclass, the C-level operation metaclasses
+/// call from their `__new__`.
+///
+/// Unlike `type(name, bases, namespace)`, this does not run the metaclass
+/// `__new__`/`__init__` hooks: the caller is that hook, so re-entering it
+/// would recurse. The metaclass must be a class (or the `type` builtin, which
+/// denotes the native `type` class).
+pub(crate) fn type_new(metaclass: i64, name: i64, bases: i64, namespace: i64) -> i64 {
+    type_new_impl(metaclass, name, bases, namespace, false)
+}
+
+fn type_new_impl(metaclass: i64, name: i64, bases: i64, namespace: i64, run_hooks: bool) -> i64 {
     let Some(name_text) = value::as_str(name) else {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -2960,6 +2976,16 @@ fn type_three_arg(name: i64, bases: i64, namespace: i64) -> i64 {
         );
     };
     let name_text = name_text.to_string();
+    let metaclass = value::normalize_class_base(metaclass);
+    if metaclass != NONE && value::as_class(metaclass).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "type.__new__() argument 1 must be a type, not '{}'",
+                value::type_name(metaclass)
+            ),
+        );
+    }
     let Some(base_values) = value::as_tuple(bases) else {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -2969,7 +2995,11 @@ fn type_three_arg(name: i64, bases: i64, namespace: i64) -> i64 {
             ),
         );
     };
-    let base_values = base_values.to_vec();
+    let base_values: Vec<i64> = base_values
+        .iter()
+        .copied()
+        .map(value::normalize_class_base)
+        .collect();
     for &base in &base_values {
         if value::as_class(base).is_none() && base != NONE {
             return exc::raise_with_message(TYPE_ERROR, "type() argument 2 must be tuple of types");
@@ -3002,7 +3032,11 @@ fn type_three_arg(name: i64, bases: i64, namespace: i64) -> i64 {
             attrs.push((attr.to_string(), item));
         }
     }
-    value::class_new_multi(name_text, base_values, NONE, methods, attrs)
+    if run_hooks {
+        value::class_new_multi(name_text, base_values, metaclass, methods, attrs)
+    } else {
+        value::class_new_multi_without_hooks(name_text, base_values, metaclass, methods, attrs)
+    }
 }
 
 /// `globals()`: the live namespace mapping of the module codegen named.

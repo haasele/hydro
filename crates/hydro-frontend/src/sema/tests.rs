@@ -379,6 +379,7 @@ fn signature_param(name: &str, kind: ParamKind, default: Option<Const>) -> HPara
         local: 0,
         name: name.to_string(),
         ty: Ty::Concrete(Type::Any),
+        declared: false,
         default,
         default_expr: None,
         kind,
@@ -3033,6 +3034,34 @@ fn builtin_class_methods_have_static_results() {
 }
 
 #[test]
+fn type_class_methods_have_static_results() {
+    // The `type` metaclass exposes C-level type operations that typing stubs
+    // and metaclasses call directly (`type.__subclasscheck__(cls, other)`,
+    // `type.__new__(mcls, name, bases, namespace)`).
+    let source = "a = type.__subclasscheck__(int, bool)\n\
+                  b = type.__instancecheck__(1, int)\n\
+                  c = type.__hash__(int)\n\
+                  d = type.mro(int)\n\
+                  e = type.__new__(type, 'C', (), {})\n\
+                  f = type.__repr__(int)\n\
+                  g = type.__prepare__('C', ())\n\
+                  h = type.not_a_real_class_method()\n";
+    let program = crate::check_source(source, "test.py").expect("type class methods compile");
+    assert_eq!(assigned_type(&program, 0), Type::Bool);
+    assert_eq!(assigned_type(&program, 1), Type::Bool);
+    assert_eq!(assigned_type(&program, 2), Type::Int);
+    assert_eq!(assigned_type(&program, 3), Type::List);
+    assert_eq!(assigned_type(&program, 4), Type::Any);
+    assert_eq!(assigned_type(&program, 5), Type::Str);
+    assert_eq!(assigned_type(&program, 6), Type::Dict);
+    assert_eq!(
+        assigned_type(&program, 7),
+        Type::Any,
+        "unknown type methods dispatch dynamically"
+    );
+}
+
+#[test]
 fn literal_expression_errors_survive_dynamic_widening() {
     assert_eq!(
         check_errors("1 + \"x\"\n"),
@@ -3198,6 +3227,7 @@ fn stub_bodies_accept_return_annotations() {
         "def f() -> int:\n    ...\n",
         "def f() -> int:\n    pass\n",
         "def f() -> int:\n    \"\"\"Doc.\"\"\"\n    ...\n",
+        "def f() -> int:\n    \"\"\"Doc.\"\"\"\n",
         "def f() -> int:\n    'Doc.'\n    pass\n",
         "def f() -> list:\n    ...\n",
         "async def f() -> int:\n    ...\n",
@@ -3270,8 +3300,6 @@ fn non_stub_bodies_still_report_a_missing_return() {
         // A real body with no `return`.
         "def f() -> int:\n    x = 1\n",
         "def f() -> int:\n    print(1)\n",
-        // A docstring alone is a no-op implementation, not a stub marker.
-        "def f() -> int:\n    \"\"\"Doc.\"\"\"\n",
         // `...` mixed with real code is not a stub declaration either.
         "def f() -> int:\n    ...\n    x = 1\n",
         "def f() -> int:\n    x = 1\n    ...\n",
@@ -3308,4 +3336,185 @@ fn stub_bodies_keep_their_declared_return_type() {
     let program = crate::check_source("def f() -> int: ...\nprint(f())\n", "test.py")
         .expect("a stub body typechecks");
     assert_eq!(program_function(&program, "f").ret_ty, Type::Int);
+}
+
+#[test]
+fn docstring_only_bodies_are_declared_stubs() {
+    // Protocol methods in typing stubs often document the contract and omit
+    // the `...` marker (`typing_extensions.Reader.read`). The declared return
+    // type still describes the implementation's result.
+    let program = crate::check_source(
+        "def f() -> int:\n    \"\"\"Documented stub.\"\"\"\n\nprint(f())\n",
+        "test.py",
+    )
+    .expect("a docstring-only stub typechecks");
+    assert_eq!(program_function(&program, "f").ret_ty, Type::Int);
+
+    let source = "class Reader:\n\x20   def read(self, size: int = -1) -> bytes:\n\x20       \"\"\"Read at most *size* bytes.\"\"\"\n";
+    let errors = check_errors(source);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    // Without a declared return type a docstring-only body is still an
+    // implementation returning `None`, so a use as a value reports.
+    let diags = check_diags(
+        "def take(x: int) -> int:\n    return x\n\ndef f():\n    \"\"\"Doc.\"\"\"\n\ntake(f())\n",
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::CONTROL);
+}
+
+#[test]
+fn unannotated_parameter_sequence_body_stays_dynamic() {
+    // The caller passes a marker (`bool`) where the helper uses `parameters`
+    // as a sequence. The parameter is unannotated, so the call site must not
+    // turn subscripting, `len` and comparisons in the body into errors.
+    // `caller` is checked first, which pins the parameter before the helper
+    // body is visited.
+    let source = r#"
+def caller():
+    return _check_generic(True)
+
+def _check_generic(parameters):
+    alen = len(parameters)
+    if parameters[0] < alen or parameters < 'x':
+        return parameters[0]
+    return parameters
+"#;
+    crate::check_source(source, "test.py")
+        .expect("an unannotated parameter stays dynamic in the body");
+}
+
+#[test]
+fn unannotated_parameter_comparison_stays_dynamic() {
+    // The call pins `parameters` to `bool`; comparing it with a string is
+    // invalid for that concrete pair but valid Python for an unannotated
+    // parameter, whose runtime value the call site does not restrict.
+    let source = r#"
+def caller():
+    return compare(True)
+
+def compare(parameters):
+    return parameters < 'x'
+"#;
+    crate::check_source(source, "test.py")
+        .expect("a comparison through a gradual parameter stays dynamic");
+}
+
+#[test]
+fn local_copied_from_a_gradual_parameter_stays_dynamic() {
+    // A local that receives an unannotated parameter value inherits the
+    // gradual contract; a call site narrowing the parameter must not turn the
+    // local's comparison into a static error either.
+    let source = r#"
+def caller():
+    return compare(True)
+
+def compare(parameters):
+    value = parameters
+    return value < 'x'
+"#;
+    crate::check_source(source, "test.py")
+        .expect("a local copied from a gradual parameter stays dynamic");
+}
+
+#[test]
+fn unannotated_parameter_sequence_calls_keep_their_shape() {
+    // A consistent call site still allows normal sequence operations; the
+    // parameter is gradual, not rejected.
+    let source = r#"
+def first(xs):
+    n = len(xs)
+    return xs[0], n, xs == xs
+
+first((1, 2))
+"#;
+    crate::check_source(source, "test.py")
+        .expect("a sequence-shaped unannotated parameter typechecks");
+}
+
+#[test]
+fn annotated_parameter_mismatch_is_still_reported() {
+    let errors = check_errors(
+        "def f(parameters: int):\n    return parameters\n\ndef caller():\n    return f('s')\n",
+    );
+    assert_eq!(
+        errors,
+        vec!["argument 1 of f has type str, expected int"],
+        "{errors:?}"
+    );
+
+    // An unannotated argument conflict must not stop the loop before a
+    // declared parameter is checked.
+    let errors = check_errors(
+        "def f(a, b: int):\n    return a, b\n\ndef caller():\n    return f('x', 'y')\n",
+    );
+    assert_eq!(
+        errors,
+        vec!["argument 2 of f has type str, expected int"],
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn unannotated_parameter_conflict_widens_to_any() {
+    let program = crate::check_source(
+        r#"
+def f(parameters):
+    return parameters
+
+def a():
+    return f(1)
+
+def b():
+    return f('s')
+"#,
+        "test.py",
+    )
+    .expect("disagreeing call sites widen an unannotated parameter");
+    let f = program_function(&program, "f");
+    assert!(!f.params[0].declared, "the source has no annotation");
+    assert_eq!(f.params[0].ty, Type::Any);
+}
+
+#[test]
+fn parameter_annotation_provenance_reaches_the_ir() {
+    let program = crate::check_source(
+        "def f(unannotated, annotated: int):\n    return unannotated, annotated\n",
+        "test.py",
+    )
+    .expect("valid program");
+    let f = program_function(&program, "f");
+    assert!(!f.params[0].declared);
+    assert!(f.params[1].declared);
+    assert_eq!(f.params[1].ty, Type::Int);
+}
+
+#[test]
+fn narrowed_parameter_provenance_reaches_its_reads() {
+    // A call site binds an unannotated parameter to the argument type, so
+    // `resolve` no longer shows the slot as gradual. Every body use reads the
+    // slot through its own variable, which must keep the provenance.
+    let prog = empty_prog();
+    let mut inf = Infer::new();
+    let ck = checker(&prog, &mut inf);
+    let parameter = ck.inf.fresh();
+    ck.inf.mark_gradual(parameter);
+    assert!(ck.inf.unify(parameter, Ty::Concrete(Type::Bool)).is_ok());
+    let read = ck.inf.fresh();
+    assert!(ck.inf.unify(parameter, read).is_ok());
+    assert_eq!(ck.inf.resolve(read), Ty::Concrete(Type::Bool));
+    assert!(
+        ck.inf.is_gradual(read),
+        "a use of a narrowed unannotated parameter stays gradual"
+    );
+
+    // A slot that already holds an unrelated concrete type does not become
+    // gradual just because it is unified with a gradual value.
+    let typed = ck.inf.fresh();
+    assert!(ck.inf.unify(typed, Ty::Concrete(Type::Int)).is_ok());
+    let gradual = ck.inf.fresh();
+    ck.inf.mark_gradual(gradual);
+    assert!(ck.inf.unify(gradual, Ty::Concrete(Type::Bool)).is_ok());
+    assert!(ck.inf.unify(typed, gradual).is_ok());
+    assert!(!ck.inf.is_gradual(typed));
 }

@@ -8,6 +8,26 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 type class methods and docstring-only stubs
+
+- `type.__new__`, `type.__call__`, `type.__subclasscheck__`,
+  `type.__instancecheck__`, `type.__hash__`, `type.mro`, `type.__repr__`,
+  `type.__prepare__` and `type.__getattribute__` typecheck with their concrete
+  result types (`bool`, `int`, `str`, `list`, `dict`, or dynamic for class
+  construction). Metaclasses that assign `type.__instancecheck__` into their
+  namespace get the callable attribute, and `type.__new__` allocates the class
+  without re-entering the metaclass `__new__` that called it. Builtin type
+  functions (`dict`, `int`, …) now normalize to their native class when used as
+  a `type.__new__` base.
+- A function body that consists only of its docstring is a declared stub when
+  it has a return annotation, like `...`/`pass`; typing protocols such as
+  `typing_extensions.Reader.read` document their contract without a marker.
+- Unannotated parameters are gradual: a call site narrows the slot for
+  inference, but a conflicting body use (`len(parameters)`, `parameters < 'x'`)
+  stays dynamic instead of reporting the caller's type as an error, and
+  disagreeing call sites widen the parameter to `Any`. Annotated parameters
+  keep their checks.
+
 ### Added — 2026-10-27 pydantic import surfaces (typing/contextlib/re)
 
 - `typing.get_overloads`/`typing.clear_overloads` operate on a real

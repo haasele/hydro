@@ -407,8 +407,11 @@ impl SessionCompiler {
 
             // Type-check this unit with placeholders for every function
             // emitted so far, so cross-fragment calls see their signatures.
-            let mut combined: Vec<crate::lower::HFunction> =
-                self.functions.iter().map(placeholder_function).collect();
+            let mut combined: Vec<crate::lower::HFunction> = self
+                .functions
+                .iter()
+                .map(|function| placeholder_function(function, &mut infer))
+                .collect();
             combined.extend(hir.functions.iter().cloned());
             let check_hir = LHir {
                 source_name: unit.display.clone(),

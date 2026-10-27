@@ -4749,17 +4749,33 @@ fn compute_mro(bases: &[i64]) -> Option<Vec<i64>> {
 
 /// Maps a class-base operand to the class value it denotes.
 ///
-/// Python's `type` is both a callable and the default metaclass; the runtime
-/// represents the bare name as the `type` builtin function value. As a base it
-/// denotes the cached native `type` class, so `class Meta(type)` creates a
-/// subclass of it. Every other value is returned unchanged.
+/// Python's builtin type names are both callables and class objects; the
+/// runtime represents the bare name as a builtin function value. As a base
+/// (`class C(dict)`, `class Meta(type)`, or the `bases` argument of
+/// `type.__new__`) each denotes the cached native class of that name, so the
+/// C3 merge sees real classes. Every other value is returned unchanged.
 pub(crate) fn normalize_class_base(v: i64) -> i64 {
     if let Some(function) = as_function(v) {
-        if matches!(
-            &function.body,
-            FunctionBody::Builtin(hydro_ir::Builtin::Type)
-        ) {
-            return native_class("type");
+        if let FunctionBody::Builtin(builtin) = &function.body {
+            if matches!(
+                builtin,
+                hydro_ir::Builtin::Int
+                    | hydro_ir::Builtin::Float
+                    | hydro_ir::Builtin::Bool
+                    | hydro_ir::Builtin::Str
+                    | hydro_ir::Builtin::Bytes
+                    | hydro_ir::Builtin::ByteArray
+                    | hydro_ir::Builtin::List
+                    | hydro_ir::Builtin::Tuple
+                    | hydro_ir::Builtin::Dict
+                    | hydro_ir::Builtin::Set
+                    | hydro_ir::Builtin::Frozenset
+                    | hydro_ir::Builtin::Range
+                    | hydro_ir::Builtin::MemoryView
+                    | hydro_ir::Builtin::Type
+            ) {
+                return native_class(builtin.name());
+            }
         }
     }
     // `class D(C[int])`: a PEP 695 specialization is a
@@ -4867,6 +4883,34 @@ pub(crate) fn class_new_multi(
     methods: Vec<(String, i64, MethodKind)>,
     attrs: Vec<(String, i64)>,
 ) -> i64 {
+    class_new_multi_impl(name, bases, metaclass, methods, attrs, true)
+}
+
+/// [`class_new_multi`] without invoking the metaclass `__new__`/`__init__`
+/// hooks.
+///
+/// `type.__new__(mcls, name, bases, namespace)` is the underlying allocator:
+/// it constructs the class for `mcls` but must not call `mcls.__new__` again
+/// (that is the call the metaclass is currently executing), which would
+/// recurse. Normal class-statement creation keeps the hooks.
+pub(crate) fn class_new_multi_without_hooks(
+    name: String,
+    bases: Vec<i64>,
+    metaclass: i64,
+    methods: Vec<(String, i64, MethodKind)>,
+    attrs: Vec<(String, i64)>,
+) -> i64 {
+    class_new_multi_impl(name, bases, metaclass, methods, attrs, false)
+}
+
+fn class_new_multi_impl(
+    name: String,
+    bases: Vec<i64>,
+    metaclass: i64,
+    methods: Vec<(String, i64, MethodKind)>,
+    attrs: Vec<(String, i64)>,
+    run_hooks: bool,
+) -> i64 {
     // `type` used as a base denotes the native `type` class, not the builtin
     // function value.
     let bases: Vec<i64> = bases.into_iter().map(normalize_class_base).collect();
@@ -4910,11 +4954,11 @@ pub(crate) fn class_new_multi(
     let base = bases.first().copied().unwrap_or(NONE);
     // A metaclass subclass may implement `__new__`/`__init__`; both receive
     // `(name, bases, namespace)`. The namespace mirrors the frozen class body.
-    let has_new = resolved != NONE && class_member(resolved, "__new__").is_some();
-    let init_hook = if resolved == NONE {
-        None
-    } else {
+    let has_new = run_hooks && resolved != NONE && class_member(resolved, "__new__").is_some();
+    let init_hook = if run_hooks && resolved != NONE {
         class_member(resolved, "__init__")
+    } else {
+        None
     };
     let hook_arguments = if has_new || init_hook.is_some() {
         Some(metaclass_hook_arguments(&name, &bases, &methods, &attrs))

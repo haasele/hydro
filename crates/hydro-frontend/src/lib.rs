@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use hydro_ir::{FunctionId, Program};
+use hydro_ir::{FunctionId, ParamKind, Program};
 use rustpython_parser::{ast, Mode, TemplateString};
 
 use diag::codes;
@@ -2165,7 +2165,10 @@ fn lower_modules(
         // Type-check this unit against placeholders for the already emitted
         // dependencies so cross-module calls see their signatures. Placeholder
         // module bodies are empty and therefore produce no diagnostics.
-        let mut combined: Vec<HFunction> = all_functions.iter().map(placeholder_function).collect();
+        let mut combined: Vec<HFunction> = all_functions
+            .iter()
+            .map(|function| placeholder_function(function, &mut infer))
+            .collect();
         combined.extend(hir.functions.iter().cloned());
         let check_hir = LHir {
             source_name: unit.display.clone(),
@@ -2194,19 +2197,36 @@ fn lower_modules(
 
 /// Placeholder HIR for an already emitted dependency function: signature only,
 /// empty body and module flag set so return checks are skipped.
-fn placeholder_function(function: &hydro_ir::Function) -> HFunction {
+///
+/// An unannotated parameter was emitted with its inferred (or widened) type,
+/// but it has no source contract: the placeholder gives the slot fresh
+/// gradual provenance so an importer's call site can still widen a conflict.
+/// Variadic parameters keep their list/dict container type.
+fn placeholder_function(function: &hydro_ir::Function, inf: &mut Infer) -> HFunction {
     HFunction {
         name: function.name.clone(),
         params: function
             .params
             .iter()
-            .map(|param| HParam {
-                local: param.local,
-                name: param.name.clone(),
-                ty: Ty::Concrete(param.ty),
-                default: param.default.clone(),
-                default_expr: None,
-                kind: param.kind,
+            .map(|param| {
+                let ty = if param.declared
+                    || matches!(param.kind, ParamKind::VarArg | ParamKind::KwArg)
+                {
+                    Ty::Concrete(param.ty)
+                } else {
+                    let ty = inf.fresh();
+                    inf.mark_gradual(ty);
+                    ty
+                };
+                HParam {
+                    local: param.local,
+                    name: param.name.clone(),
+                    ty,
+                    declared: param.declared,
+                    default: param.default.clone(),
+                    default_expr: None,
+                    kind: param.kind,
+                }
             })
             .collect(),
         capture_count: function.capture_count,

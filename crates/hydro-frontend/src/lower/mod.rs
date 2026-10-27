@@ -96,6 +96,10 @@ pub struct HParam {
     pub local: LocalId,
     pub name: String,
     pub ty: Ty,
+    /// The source wrote a type annotation for this parameter. An unannotated
+    /// parameter is gradual: a call argument does not make a conflicting use
+    /// in the body a static error.
+    pub declared: bool,
     /// Literal default value (`def f(x=1)`). Direct calls fill omitted
     /// trailing parameters with it; first-class calls still require the full
     /// positional arity.
@@ -5177,6 +5181,7 @@ impl<'a> Lowerer<'a> {
                 local,
                 name: capture.clone(),
                 ty,
+                declared: false,
                 default: None,
                 default_expr: None,
                 kind: ParamKind::Positional,
@@ -6084,6 +6089,7 @@ impl<'a> Lowerer<'a> {
             local: 0,
             name: "self".to_string(),
             ty: self_ty,
+            declared: false,
             default: None,
             default_expr: None,
             kind: ParamKind::Positional,
@@ -6107,6 +6113,7 @@ impl<'a> Lowerer<'a> {
                 local,
                 name: field.name.to_string(),
                 ty: field.ty,
+                declared: true,
                 default,
                 default_expr: None,
                 kind: ParamKind::Positional,
@@ -6261,12 +6268,20 @@ impl<'a> Lowerer<'a> {
         // `*args` binds a list and `**kwargs` a dict. The variadic local is
         // dynamically retyped by real code (`args = (...,)`), so it stays
         // `Any`; an annotation on it only describes the elements.
+        let declared = arg.annotation.is_some();
         let ty = match kind {
             ParamKind::VarArg => Ty::Concrete(Type::Any),
             ParamKind::KwArg => Ty::Concrete(Type::Dict),
             _ => match &arg.annotation {
                 Some(ann) => self.annotation_ty(ann),
-                None => self.infer.fresh(),
+                None => {
+                    let ty = self.infer.fresh();
+                    // Unannotated parameters are gradual: call arguments may
+                    // narrow the slot, but a conflicting body use widens it
+                    // to `Any` instead of erroring.
+                    self.infer.mark_gradual(ty);
+                    ty
+                }
             },
         };
         let local = locals.len() as LocalId;
@@ -6274,6 +6289,7 @@ impl<'a> Lowerer<'a> {
             local,
             name: name.clone(),
             ty,
+            declared,
             default,
             default_expr,
             kind,
@@ -11896,6 +11912,7 @@ impl<'a> Lowerer<'a> {
                 local,
                 name: name.to_string(),
                 ty: Ty::Concrete(Type::Any),
+                declared: false,
                 default: None,
                 default_expr: None,
                 kind: ParamKind::Positional,
@@ -12043,6 +12060,7 @@ impl<'a> Lowerer<'a> {
                 local,
                 name: name.to_string(),
                 ty: Ty::Concrete(Type::Any),
+                declared: false,
                 default: None,
                 default_expr: None,
                 kind: ParamKind::Positional,
@@ -15077,6 +15095,7 @@ impl<'a> Lowerer<'a> {
                 local,
                 name: capture.clone(),
                 ty,
+                declared: false,
                 default: None,
                 default_expr: None,
                 kind: ParamKind::Positional,
@@ -15210,6 +15229,7 @@ impl<'a> Lowerer<'a> {
                 local,
                 name: name.clone(),
                 ty: Ty::Concrete(Type::Any),
+                declared: false,
                 default: None,
                 default_expr: None,
                 kind: ParamKind::Positional,
