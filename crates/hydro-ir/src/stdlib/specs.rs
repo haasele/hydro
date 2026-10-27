@@ -323,6 +323,11 @@ pub static OS_PATH: ModuleSpec = ModuleSpec {
         f("abspath", 1, 1, Type::Str),
         f("splitext", 1, 1, Type::Tuple),
         f("split", 1, 1, Type::Tuple),
+        // `normpath` is purely lexical and returns `bytes` for a `bytes`
+        // operand, so the result type is dynamic. `splitdrive` always reports
+        // an empty drive on POSIX, preserving a `bytes` operand's flavour.
+        f("normpath", 1, 1, Type::Any),
+        f("splitdrive", 1, 1, Type::Tuple),
         // `normcase` is the identity on POSIX; `realpath(filename, *,
         // strict=False)` resolves symlinks component by component (the
         // keyword is parsed by the runtime).
@@ -379,10 +384,14 @@ pub static OS: ModuleSpec = ModuleSpec {
         // directory. Keyword-dynamic so the runtime can bind `path=` instead
         // of rejecting the call when it is not first.
         kw_dynamic("listdir", 0, 1, Type::List, &["path"]),
+        // `os.makedirs(name, mode=0o777, exist_ok=False)`: recursive directory
+        // creation. `exist_ok` tolerates only an existing directory.
+        kw("makedirs", 1, 3, Type::None, &["name", "mode", "exist_ok"]),
     ],
     constants: &[
         c("name", Type::Str),
         c("sep", Type::Str),
+        c("pardir", Type::Str),
         c("environ", Type::Dict),
         c("PathLike", Type::Any),
         c("devnull", Type::Str),
@@ -1639,6 +1648,9 @@ pub static SHUTIL: ModuleSpec = ModuleSpec {
         kw("which", 1, 3, Type::Any, &["cmd", "mode", "path"]),
         kw("get_terminal_size", 0, 1, Type::Any, &["fallback"]),
         kw("copyfile", 2, 2, Type::Str, &["src", "dst"]),
+        // Streams between file-like objects; the buffer size defaults to
+        // shutil's 256 KiB (`length=0`).
+        kw("copyfileobj", 2, 3, Type::None, &["fsrc", "fdst", "length"]),
         kw("copy", 2, 2, Type::Str, &["src", "dst"]),
         kw("copy2", 2, 2, Type::Str, &["src", "dst"]),
         kw("rmtree", 1, 2, Type::None, &["path", "ignore_errors"]),
@@ -3661,6 +3673,35 @@ mod tests {
             listdir.dynamic_keywords,
             "listdir(path=...) is accepted by CPython's Python wrapper"
         );
+    }
+
+    #[test]
+    fn os_path_normpath_splitdrive_makedirs_and_copyfileobj_specs() {
+        let normpath = function("os.path", "normpath").expect("os.path.normpath");
+        assert_eq!(
+            (normpath.min_args, normpath.max_args, normpath.ret),
+            (1, 1, Type::Any)
+        );
+        let splitdrive = function("os.path", "splitdrive").expect("os.path.splitdrive");
+        assert_eq!(
+            (splitdrive.min_args, splitdrive.max_args, splitdrive.ret),
+            (1, 1, Type::Tuple)
+        );
+
+        let makedirs = function("os", "makedirs").expect("os.makedirs");
+        assert_eq!(
+            (makedirs.min_args, makedirs.max_args, makedirs.ret),
+            (1, 3, Type::None)
+        );
+        assert_eq!(makedirs.params, &["name", "mode", "exist_ok"][..]);
+        assert_eq!(constant("os", "pardir").unwrap().ty, Type::Str);
+
+        let copyfileobj = function("shutil", "copyfileobj").expect("shutil.copyfileobj");
+        assert_eq!(
+            (copyfileobj.min_args, copyfileobj.max_args, copyfileobj.ret),
+            (2, 3, Type::None)
+        );
+        assert_eq!(copyfileobj.params, &["fsrc", "fdst", "length"][..]);
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
@@ -2649,6 +2649,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
             let sep = if cfg!(windows) { "\\" } else { "/" };
             value::str_from_bytes(sep.as_bytes())
         }
+        // `os.pardir` is `'..'` on every platform; `posixpath` uses it
+        // directly when joining relative paths.
+        ("os", "pardir") => value::str_from_bytes(b".."),
         ("os", "environ") => environ_dict(),
         // `os.PathLike` is the abstract base of path objects; Hydro path values
         // are plain strings (`pathlib.Path` included), so the class carries no
@@ -6116,6 +6119,128 @@ fn os_path_normcase(value: i64) -> i64 {
     }
 }
 
+/// Borrows a path operand for the `os.path` functions that follow CPython's
+/// `str`/`bytes` split: `bytes` stays raw, everything path-like is text.
+enum OsPathOperand {
+    Text(&'static str),
+    Bytes(Vec<u8>),
+}
+
+/// Converts an `os.path` argument into the operand flavour CPython preserves.
+///
+/// On failure a `TypeError` is pending and `None` is returned.
+fn os_path_operand(function: &str, arg: i64) -> Option<OsPathOperand> {
+    if let Some(text) = value::as_str(arg) {
+        return Some(OsPathOperand::Text(text));
+    }
+    // `os.fspath` rejects `bytearray`, so a path operand is either a pure
+    // `bytes` object or a path-like value.
+    if let Some(bytes) = os_bytes_operand(arg) {
+        return Some(OsPathOperand::Bytes(bytes));
+    }
+    if let Some(path) = value::as_path(arg) {
+        return Some(OsPathOperand::Text(path.path()));
+    }
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "{}() argument must be str, bytes or os.PathLike object, not {}",
+            function,
+            value::type_name(arg)
+        ),
+    );
+    None
+}
+
+/// `posixpath.normpath` for raw path bytes: purely lexical, so it never
+/// touches the filesystem.
+///
+/// Every separator run collapses to one, `.` components disappear and `..`
+/// removes the preceding component when there is one to remove. A leading
+/// `//` is preserved (POSIX leaves exactly-two-slash paths
+/// implementation-defined), while `///` and longer runs collapse to `/`.
+fn posix_normpath_bytes(path: &[u8]) -> Vec<u8> {
+    if path.is_empty() {
+        return b".".to_vec();
+    }
+    let (slashes, rest) = if path.starts_with(b"//") && path.get(2) != Some(&b'/') {
+        (2usize, &path[2..])
+    } else if path.starts_with(b"/") {
+        (1usize, &path[1..])
+    } else {
+        (0usize, path)
+    };
+    let mut components: Vec<&[u8]> = Vec::new();
+    for component in rest.split(|byte| *byte == b'/') {
+        if component.is_empty() || component == b"." {
+            continue;
+        }
+        if component == b".." {
+            // A leading `..` in a relative path and a `..` after another `..`
+            // are kept; an absolute path absorbs any excess `..` at its root.
+            if (slashes == 0 && components.is_empty())
+                || components.last().is_some_and(|last| *last == b"..")
+            {
+                components.push(component);
+            } else if !components.is_empty() {
+                components.pop();
+            }
+            continue;
+        }
+        components.push(component);
+    }
+    let mut normalized = Vec::with_capacity(path.len());
+    normalized.extend(std::iter::repeat_n(b'/', slashes));
+    for (index, component) in components.iter().enumerate() {
+        if index > 0 {
+            normalized.push(b'/');
+        }
+        normalized.extend_from_slice(component);
+    }
+    if normalized.is_empty() {
+        normalized.push(b'.');
+    }
+    normalized
+}
+
+/// `os.path.normpath(path)`: lexical POSIX normalisation, returning `bytes`
+/// for a `bytes` operand and `str` otherwise.
+fn os_path_normpath(arg: i64) -> i64 {
+    let Some(operand) = os_path_operand("normpath", arg) else {
+        return NONE;
+    };
+    match operand {
+        OsPathOperand::Text(path) => {
+            let normalized = posix_normpath_bytes(path.as_bytes());
+            // Normalisation only inserts/removes ASCII separators and dots,
+            // so a valid UTF-8 operand stays valid.
+            match String::from_utf8(normalized) {
+                Ok(text) => value::str_alloc(text),
+                Err(error) => {
+                    value::str_alloc(String::from_utf8_lossy(error.as_bytes()).into_owned())
+                }
+            }
+        }
+        OsPathOperand::Bytes(path) => value::bytes_new(posix_normpath_bytes(&path)),
+    }
+}
+
+/// `os.path.splitdrive(path)`: POSIX has no drive concept, so the drive is
+/// always empty and the path is returned unchanged in the operand's flavour.
+fn os_path_splitdrive(arg: i64) -> i64 {
+    let Some(operand) = os_path_operand("splitdrive", arg) else {
+        return NONE;
+    };
+    let (drive, path) = match operand {
+        OsPathOperand::Text(path) => (
+            value::str_alloc(String::new()),
+            value::str_alloc(path.to_string()),
+        ),
+        OsPathOperand::Bytes(path) => (value::bytes_new(Vec::new()), value::bytes_new(path)),
+    };
+    value::tuple_new(vec![drive, path])
+}
+
 /// One component while resolving symlinks.
 enum RealpathStep {
     Root,
@@ -6306,6 +6431,8 @@ fn os_path_call(function: &str, args: &[i64]) -> i64 {
         "abspath" => os_path_abspath(args[0]),
         "splitext" => os_path_splitext_pair(args[0]),
         "split" => os_path_split_pair(args[0]),
+        "normpath" => os_path_normpath(args[0]),
+        "splitdrive" => os_path_splitdrive(args[0]),
         "normcase" => os_path_normcase(args[0]),
         "realpath" => os_path_realpath(args[0], args.get(1).is_some_and(|v| value::truthy(*v))),
         _ => missing_attribute("os.path", function),
@@ -6476,6 +6603,8 @@ fn os_stat_error(error: std::io::Error, path: &str) -> i64 {
     let tag = match error.kind() {
         std::io::ErrorKind::NotFound => exc::FILE_NOT_FOUND_ERROR,
         std::io::ErrorKind::PermissionDenied => exc::PERMISSION_ERROR,
+        std::io::ErrorKind::AlreadyExists => exc::FILE_EXISTS_ERROR,
+        std::io::ErrorKind::NotADirectory => exc::NOT_A_DIRECTORY_ERROR,
         _ => OS_ERROR,
     };
     let text = error.to_string();
@@ -6483,6 +6612,112 @@ fn os_stat_error(error: std::io::Error, path: &str) -> i64 {
     match error.raw_os_error() {
         Some(code) => exc::raise_with_message(tag, &format!("[Errno {code}] {detail}: '{path}'")),
         None => exc::raise_with_message(tag, &format!("{detail}: '{path}'")),
+    }
+}
+
+/// `os.makedirs(name, mode=0o777, exist_ok=False)`: creates `name` and every
+/// missing parent directory.
+///
+/// `exist_ok` tolerates only an existing directory; a pre-existing file (or
+/// dangling symlink) still raises `FileExistsError`. `mode` applies to the
+/// leaf, while missing parents are created with the default `0o777` (subject
+/// to the process umask), like CPython's recursive wrapper. Path errors use
+/// CPython's `[Errno N] message: 'path'` wording and the OSError subclass
+/// matching the errno.
+fn os_makedirs(args: &[i64]) -> i64 {
+    let argument = args.first().copied().unwrap_or(NONE);
+    let path = if let Some(text) = value::as_str(argument) {
+        OsString::from(text)
+    } else if let Some(bytes) = os_bytes_operand(argument) {
+        os_string_from_bytes(&bytes)
+    } else if let Some(path) = value::as_path(argument) {
+        OsString::from(path.path())
+    } else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "makedirs() argument must be a path string, not {}",
+                value::type_name(argument)
+            ),
+        );
+    };
+    // The frontend pads omitted keyword arguments with `None`, so `None` in
+    // either optional slot selects the default.
+    let mode = match args.get(1).copied() {
+        None | Some(NONE) => 0o777,
+        Some(argument) => match value::as_integer(argument) {
+            Some(mode) => {
+                // CPython converts the argument to a C `int` before calling
+                // `mkdir`, so wider values overflow and negative values wrap
+                // into the mode bits.
+                match i32::try_from(mode) {
+                    Ok(mode) => (mode as u32) & 0o7777,
+                    Err(_) => {
+                        return exc::raise_with_message(
+                            OVERFLOW_ERROR,
+                            "makedirs: mode is out of range for an int",
+                        )
+                    }
+                }
+            }
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "makedirs() mode must be an integer, not {}",
+                        value::type_name(argument)
+                    ),
+                )
+            }
+        },
+    };
+    let exist_ok = match args.get(2).copied() {
+        None | Some(NONE) => false,
+        Some(flag) => value::truthy(flag),
+    };
+    if os_str_bytes(path.as_os_str()).contains(&0) {
+        return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+    }
+    if path.is_empty() {
+        // `mkdir("")` reports ENOENT; `create_dir_all("")` would silently
+        // succeed.
+        return os_stat_error(std::io::Error::from_raw_os_error(libc::ENOENT), "");
+    }
+    let path = PathBuf::from(path);
+    let display = path.to_string_lossy().into_owned();
+    // `os.makedirs` creates missing parents with the default 0o777 mode and
+    // applies `mode` to the leaf only; an existing parent is left untouched
+    // (even when it is a file, in which case `mkdir` below reports ENOTDIR).
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                // The recursive wrapper fails on the parent it was creating.
+                let parent_display = parent.to_string_lossy().into_owned();
+                return os_stat_error(error, &parent_display);
+            }
+        }
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(mode);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+    }
+    match builder.create(&path) {
+        Ok(()) => NONE,
+        // `mkdir` reports EEXIST for an existing entry. With `exist_ok`, only
+        // a directory is tolerated (`os.makedirs`' `path.isdir(name)` check);
+        // a file or dangling symlink still raises `FileExistsError`.
+        Err(error)
+            if exist_ok && error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() =>
+        {
+            NONE
+        }
+        Err(error) => os_stat_error(error, &display),
     }
 }
 
@@ -6609,6 +6844,7 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "putenv" => os_putenv(args),
         "unsetenv" => os_unsetenv(args),
         "listdir" => os_listdir(args),
+        "makedirs" => os_makedirs(args),
         _ => missing_attribute("os", function),
     }
 }
@@ -11048,6 +11284,154 @@ mod tests {
             ),
             FALSE
         );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn os_makedirs_creates_parents_and_honours_exist_ok() {
+        exc::init();
+        let root = temp_root("makedirs");
+        let nested = root.join("a").join("b").join("c");
+        let nested_text = nested.to_string_lossy().into_owned();
+
+        // Missing parents are created recursively.
+        assert_eq!(call("os", "makedirs", &[string(&nested_text)]), NONE);
+        assert!(!exc::pending(), "makedirs raised");
+        assert!(nested.is_dir());
+
+        // An existing leaf directory is an error unless `exist_ok` is true.
+        assert_eq!(call("os", "makedirs", &[string(&nested_text)]), NONE);
+        assert_eq!(
+            exc::pending_tag(),
+            crate::exc::FILE_EXISTS_ERROR as i64,
+            "{}",
+            message()
+        );
+        assert!(message().contains("[Errno 17]"), "{}", message());
+        exc::clear();
+        assert_eq!(
+            call("os", "makedirs", &[string(&nested_text), int(0o700), TRUE]),
+            NONE
+        );
+        assert!(!exc::pending(), "exist_ok rejected an existing directory");
+
+        // `exist_ok` does not tolerate an existing file.
+        let file = root.join("leaf.txt");
+        std::fs::write(&file, b"data").expect("write leaf file");
+        let file_text = file.to_string_lossy().into_owned();
+        assert_eq!(
+            call("os", "makedirs", &[string(&file_text), int(0o777), TRUE]),
+            NONE
+        );
+        assert_eq!(
+            exc::pending_tag(),
+            crate::exc::FILE_EXISTS_ERROR as i64,
+            "{}",
+            message()
+        );
+        exc::clear();
+
+        // A `pathlib.Path` operand is accepted (the frontend pads the omitted
+        // optional slots with `None`, exercised here explicitly).
+        let pathlib_target = root.join("pathlib").join("leaf");
+        let path_object = call(
+            "pathlib",
+            "Path",
+            &[string(&pathlib_target.to_string_lossy())],
+        );
+        assert_eq!(call("os", "makedirs", &[path_object, NONE, TRUE]), NONE);
+        assert!(!exc::pending(), "Path makedirs raised");
+        assert!(pathlib_target.is_dir());
+
+        // A bytes path is accepted and created.
+        let byte_root = root.join("bytes").join("dir");
+        let byte_path = value::bytes_new(byte_root.to_string_lossy().as_bytes().to_vec());
+        assert_eq!(call("os", "makedirs", &[byte_path]), NONE);
+        assert!(!exc::pending(), "bytes makedirs raised");
+        assert!(byte_root.is_dir());
+
+        // An empty name reports ENOENT instead of succeeding.
+        assert_eq!(call("os", "makedirs", &[string("")]), NONE);
+        assert_eq!(
+            exc::pending_tag(),
+            crate::exc::FILE_NOT_FOUND_ERROR as i64,
+            "{}",
+            message()
+        );
+        exc::clear();
+
+        // A non-path operand is a TypeError.
+        assert_eq!(call("os", "makedirs", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+
+        std::fs::remove_dir_all(&root).expect("remove scratch directory");
+    }
+
+    #[test]
+    fn os_path_normpath_is_lexical_and_preserves_bytes() {
+        exc::init();
+        for (input, expected) in [
+            ("", "."),
+            (".", "."),
+            ("./", "."),
+            ("a//b/./c/", "a/b/c"),
+            ("/a/b/../c", "/a/c"),
+            ("../a/../..", "../.."),
+            ("..", ".."),
+            ("/..", "/"),
+            ("//a/../b", "//b"),
+            ("///a", "/a"),
+            ("//", "//"),
+            ("/", "/"),
+        ] {
+            let result = call("os.path", "normpath", &[string(input)]);
+            assert!(!exc::pending(), "normpath({input:?}) raised");
+            assert_eq!(value::as_str(result), Some(expected), "{input:?}");
+        }
+
+        // A bytes operand yields bytes; a path-like operand yields str.
+        let bytes = value::bytes_new(b"//a/./b/../c/".to_vec());
+        let result = call("os.path", "normpath", &[bytes]);
+        assert_eq!(value::as_bytes(result), Some(&b"//a/c"[..]));
+
+        let path = call("pathlib", "Path", &[string("/tmp/./x/../y")]);
+        let result = call("os.path", "normpath", &[path]);
+        assert_eq!(value::as_str(result), Some("/tmp/y"));
+
+        // Non-path operands raise TypeError.
+        assert_eq!(call("os.path", "normpath", &[int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn os_path_splitdrive_has_an_empty_drive_on_posix() {
+        exc::init();
+        for input in ["", "relative/path", "/absolute/path", "//host/share"] {
+            let result = call("os.path", "splitdrive", &[string(input)]);
+            assert!(!exc::pending(), "splitdrive({input:?}) raised");
+            let parts = value::as_tuple(result).expect("splitdrive tuple");
+            assert_eq!(value::as_str(parts[0]), Some(""));
+            assert_eq!(value::as_str(parts[1]), Some(input));
+        }
+
+        let bytes = value::bytes_new(b"/absolute/path".to_vec());
+        let result = call("os.path", "splitdrive", &[bytes]);
+        let parts = value::as_tuple(result).expect("splitdrive tuple");
+        assert_eq!(value::as_bytes(parts[0]), Some(&b""[..]));
+        assert_eq!(value::as_bytes(parts[1]), Some(&b"/absolute/path"[..]));
+
+        assert_eq!(call("os.path", "splitdrive", &[int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn os_pardir_is_the_parent_component() {
+        exc::init();
+        assert_eq!(value::as_str(get("os", "pardir")), Some(".."));
+        assert!(stdlib::constant("os", "pardir").is_some());
         assert!(!exc::pending());
     }
 

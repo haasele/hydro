@@ -1,10 +1,13 @@
 //! `shutil`: filesystem copy/move helpers used by the benchmarks.
 //!
 //! Only the file-oriented subset is implemented: `which`,
-//! `get_terminal_size`, `copyfile`, `copy`, `copy2`, `rmtree` and `move`.
-//! Paths are strings or `pathlib.Path` objects; every other argument type is
+//! `get_terminal_size`, `copyfile`, `copyfileobj`, `copy`, `copy2`, `rmtree`
+//! and `move`.
+//! Path arguments are strings or `pathlib.Path` objects; every other type is
 //! rejected with `TypeError`, and filesystem failures surface as `OSError`
-//! with Python's `[Errno N] message: 'path'` rendering.
+//! with Python's `[Errno N] message: 'path'` rendering. `copyfileobj` instead
+//! streams between file-like objects through their own `read`/`write`
+//! methods, so their errors propagate unchanged.
 //!
 //! `copy2` preserves permissions (and file access/modification times where
 //! the platform exposes them); `copy` copies contents and permissions.
@@ -469,6 +472,65 @@ fn destination_target(src: &Path, dst: &Path) -> Result<PathBuf, i64> {
     }
 }
 
+/// `shutil.COPY_BUFSIZE` on POSIX.
+const COPY_BUFSIZE: i64 = 256 * 1024;
+
+/// `shutil.copyfileobj(fsrc, fdst, length=0)`: copies chunks from a readable
+/// file-like object into a writable one until `read` reports end of file.
+///
+/// A zero (or missing) `length` selects `COPY_BUFSIZE`; a negative length is
+/// handed to `read`, which then reads until EOF, exactly like CPython. Errors
+/// raised by `read`/`write` (including a missing attribute on a non-file
+/// operand) propagate unchanged. Returns `None`.
+fn copyfileobj(args: &[i64]) -> i64 {
+    let Some(source) = args.first().copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "copyfileobj() missing required argument: 'fsrc'",
+        );
+    };
+    let Some(destination) = args.get(1).copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "copyfileobj() missing required argument: 'fdst'",
+        );
+    };
+    let length = match optional_int(args, 2, "copyfileobj", "length") {
+        Ok(Some(length)) if length != 0 => length,
+        Ok(_) => COPY_BUFSIZE,
+        Err(error) => return error,
+    };
+    // A length above the tagged-integer range becomes a heap int; root it so
+    // the collector keeps it alive across `read` allocations.
+    let limit = crate::ops::int_result(length);
+    let roots = crate::heap::root_values(&[limit]);
+    let result = copyfileobj_chunks(source, destination, limit);
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// Runs the `read`/`write` loop of [`copyfileobj`] with a prepared buffer
+/// length.
+fn copyfileobj_chunks(source: i64, destination: i64, limit: i64) -> i64 {
+    loop {
+        let chunk = crate::methods::call(source, b"read".as_ptr(), 4, 1, [limit].as_ptr());
+        if exc::pending() {
+            return NONE;
+        }
+        // `read` returned an empty str/bytes: end of stream.
+        if !value::truthy(chunk) {
+            return NONE;
+        }
+        // `chunk` is not otherwise reachable, so root it while `write` runs.
+        let roots = crate::heap::root_values(&[chunk]);
+        let _ = crate::methods::call(destination, b"write".as_ptr(), 5, 1, [chunk].as_ptr());
+        crate::heap::release_roots(roots);
+        if exc::pending() {
+            return NONE;
+        }
+    }
+}
+
 /// `shutil.copyfile(src, dst)`.
 fn copyfile(args: &[i64]) -> i64 {
     let source = match required_path(args, 0, "copyfile", "src") {
@@ -660,6 +722,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "which" => which(args),
         "get_terminal_size" => get_terminal_size(args),
         "copyfile" => copyfile(args),
+        "copyfileobj" => copyfileobj(args),
         "copy" => copy_entry(args, "copy", false),
         "copy2" => copy_entry(args, "copy2", true),
         "rmtree" => rmtree(args),
@@ -969,6 +1032,80 @@ mod tests {
     fn path_arguments_reject_other_types() {
         let result = call("rmtree", &[value::encode_int(1).expect("small int")]);
         assert_eq!(error_tag(result), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn copyfileobj_streams_text_and_binary_files() {
+        let root = temp_root("copyfileobj");
+        let source_path = root.join("source.txt");
+        fs::write(&source_path, b"hello world").expect("write source");
+        let source = value::file_new_read(
+            source_path.to_string_lossy().into_owned(),
+            "hello world".to_string(),
+        );
+        let target_path = root.join("target.txt");
+        let target_handle = fs::File::create(&target_path).expect("create target");
+        let target = value::file_new_write(
+            target_path.to_string_lossy().into_owned(),
+            'w',
+            target_handle,
+            false,
+        );
+        // A small chunk size forces several read/write rounds.
+        assert_eq!(call("copyfileobj", &[source, target, encode_size(4)]), NONE);
+        assert!(!exc::pending(), "copyfileobj raised");
+        assert_eq!(fs::read(&target_path).expect("read target"), b"hello world");
+
+        // Binary file objects copy raw bytes, including non-UTF-8 payloads.
+        let payload = vec![0u8, 0x9f, 0x92, 0x96, 0xff];
+        let binary_source = value::file_new_read_bytes("source.bin".to_string(), payload.clone());
+        let binary_path = root.join("target.bin");
+        let binary_handle = fs::File::create(&binary_path).expect("create binary target");
+        let binary_target = value::file_new_write(
+            binary_path.to_string_lossy().into_owned(),
+            'w',
+            binary_handle,
+            true,
+        );
+        assert_eq!(call("copyfileobj", &[binary_source, binary_target]), NONE);
+        assert!(!exc::pending(), "binary copyfileobj raised");
+        assert_eq!(fs::read(&binary_path).expect("read binary target"), payload);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn copyfileobj_validates_its_arguments() {
+        assert_eq!(error_tag(call("copyfileobj", &[])), TYPE_ERROR as i64);
+        assert_eq!(
+            error_tag(call("copyfileobj", &[text("source")])),
+            TYPE_ERROR as i64
+        );
+
+        let root = temp_root("copyfileobj-bad-length");
+        let source = value::file_new_read("source".to_string(), "payload".to_string());
+        let target_path = root.join("target.txt");
+        let target_handle = fs::File::create(&target_path).expect("create target");
+        let target = value::file_new_write(
+            target_path.to_string_lossy().into_owned(),
+            'w',
+            target_handle,
+            false,
+        );
+        assert_eq!(
+            error_tag(call("copyfileobj", &[source, target, text("not a length")])),
+            TYPE_ERROR as i64
+        );
+
+        // A non-file source reports the missing `read` method, like CPython.
+        let source = value::file_new_read("source".to_string(), "payload".to_string());
+        let integer = value::encode_int(1).expect("small int");
+        assert_eq!(
+            error_tag(call("copyfileobj", &[integer, source])),
+            ATTRIBUTE_ERROR as i64
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]
