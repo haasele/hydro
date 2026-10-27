@@ -1808,6 +1808,7 @@ fn itertools_call(function: &str, args: &[i64]) -> i64 {
         "combinations_with_replacement" => itertools_combinations_with_replacement(args),
         "product" => itertools_product(args, 1),
         "takewhile" => itertools_takewhile(args),
+        "dropwhile" => itertools_dropwhile(args),
         _ => itertools::call(function, args),
     }
 }
@@ -2140,6 +2141,47 @@ fn itertools_takewhile(args: &[i64]) -> i64 {
             break;
         }
         container::list_append(result, item);
+    }
+    heap::release_roots(roots);
+    result
+}
+
+/// `dropwhile(predicate, iterable)`: everything after the longest prefix the
+/// predicate accepts.
+///
+/// The predicate is consulted only until it first rejects an element; that
+/// element and the whole remaining stream are emitted without further calls,
+/// as CPython's lazy iterator does when it is consumed.
+fn itertools_dropwhile(args: &[i64]) -> i64 {
+    let predicate = args[0];
+    let iterator = iter::iter_of(args[1]);
+    if exc::pending() {
+        return NONE;
+    }
+    let result = value::list_new(Vec::new());
+    let roots = heap::root_values(&[result]);
+    let mut dropping = true;
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            heap::release_roots(roots);
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        if dropping {
+            let keep = crate::builtins::call(predicate, 1, [item].as_ptr());
+            if exc::pending() {
+                heap::release_roots(roots);
+                return keep;
+            }
+            dropping = value::truthy(keep);
+        }
+        if !dropping {
+            container::list_append(result, item);
+        }
     }
     heap::release_roots(roots);
     result
@@ -15134,7 +15176,7 @@ mod tests {
     }
 
     #[test]
-    fn itertools_permutations_product_and_takewhile_are_correct() {
+    fn itertools_permutations_product_takewhile_and_dropwhile_are_correct() {
         exc::init();
         let input = value::list_new(vec![int(1), int(2), int(3)]);
         let permutations = call("itertools", "permutations", &[input]);
@@ -15292,6 +15334,35 @@ mod tests {
             .map(|item| value::as_integer(*item).unwrap_or(i64::MIN))
             .collect();
         assert_eq!(prefix, vec![1, 2]);
+
+        // `dropwhile` skips that same prefix and keeps the first rejected
+        // element plus everything after it.
+        let rest = call("itertools", "dropwhile", &[predicate, values]);
+        assert!(!exc::pending(), "{}", message());
+        let rest: Vec<i64> = value::as_list(rest)
+            .unwrap_or_default()
+            .iter()
+            .map(|item| value::as_integer(*item).unwrap_or(i64::MIN))
+            .collect();
+        assert_eq!(rest, vec![0, 4]);
+
+        // A predicate that accepts everything drops the whole input; a
+        // predicate that rejects the first element drops nothing.
+        let all_true = call("itertools", "dropwhile", &[predicate, input]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::as_list(all_true).is_some_and(|items| items.is_empty()));
+        let rejects_first = call(
+            "itertools",
+            "dropwhile",
+            &[predicate, value::list_new(vec![int(0), int(4)])],
+        );
+        assert!(!exc::pending(), "{}", message());
+        let rejects_first: Vec<i64> = value::as_list(rejects_first)
+            .unwrap_or_default()
+            .iter()
+            .map(|item| value::as_integer(*item).unwrap_or(i64::MIN))
+            .collect();
+        assert_eq!(rejects_first, vec![0, 4]);
     }
 
     #[test]

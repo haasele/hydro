@@ -1784,7 +1784,7 @@ fn count_body(body: &[Stmt]) -> usize {
 /// tagged keyword name can both be pending). The fixed margin keeps small
 /// functions and nested literals safe. `temp_var` and `scratch_reserve` raise a
 /// lowering error instead of writing past the frame.
-fn root_layout(function: &Function) -> (usize, usize, usize) {
+fn root_layout(function: &Function, program: &Program) -> (usize, usize, usize) {
     let nodes = count_body(&function.body)
         + function
             .params
@@ -1796,7 +1796,20 @@ fn root_layout(function: &Function) -> (usize, usize, usize) {
         .saturating_mul(4)
         .saturating_add(locals.saturating_mul(4))
         .saturating_add(16);
-    let scratch_roots = nodes.saturating_mul(2).saturating_add(64);
+    // A direct call roots one operand per parameter slot while the remaining
+    // arguments (and any default it supplies for an omitted parameter) are
+    // evaluated, so the widest signature in the program bounds that transient
+    // usage.
+    let call_slots = program
+        .functions
+        .iter()
+        .map(|callee| callee.params.len())
+        .max()
+        .unwrap_or(0);
+    let scratch_roots = nodes
+        .saturating_mul(2)
+        .saturating_add(64)
+        .saturating_add(call_slots);
     let capacity = locals
         .saturating_add(1)
         .saturating_add(temp_roots)
@@ -1879,7 +1892,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let root_token = Variable::from_u32(locals as u32 + 3);
         let temp_var_base = locals as u32 + 4;
 
-        let (capacity, temp_roots, scratch_roots) = root_layout(function);
+        let (capacity, temp_roots, scratch_roots) = root_layout(function, program);
         let capacity = capacity.max(1);
         let bytes = capacity
             .checked_mul(8)
@@ -6648,14 +6661,18 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     /// arguments are evaluated left to right into a stack array and handed to
     /// `hydro_coroutine_new`/`hydro_generator_new`, which create the suspended
     /// object without running the body. Plain functions keep the direct
-    /// `__hydro_fn_N` call.
+    /// `__hydro_fn_N` call. Both paths pass a full argument list: omitted
+    /// trailing optional parameters carry their defaults.
     fn lower_direct_call(
         &mut self,
         id: FunctionId,
         args: &'a [Expr],
     ) -> Result<Value, CodegenError> {
-        let function = self
-            .program
+        // The function table outlives the mutable borrows taken while the
+        // arguments are lowered, so copy the `&'a Program` out of `self`
+        // first: `function` (and its `default_expr`s) stays usable afterwards.
+        let program = self.program;
+        let function = program
             .functions
             .get(id as usize)
             .ok_or_else(|| CodegenError::new(format!("call to unknown function id {id}")))?;
@@ -6663,14 +6680,6 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             return Err(CodegenError::new(format!(
                 "internal error: function '{}' has captures and needs an indirect call",
                 function.name
-            )));
-        }
-        if function.params.len() != args.len() {
-            let name = &function.name;
-            let expected = function.params.len();
-            let actual = args.len();
-            return Err(CodegenError::new(format!(
-                "call to function {name} expects {expected} arguments, got {actual}"
             )));
         }
         let deferred = function.is_async || function.is_generator;
@@ -6691,13 +6700,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             // Each argument is evaluated into the scratch region while later
             // arguments run; the argv buffer is scoped for the runtime call.
             let mark = self.scratch_mark();
-            let mut values = Vec::with_capacity(args.len());
-            for arg in args {
-                let value = self.lower_expr(arg)?;
-                self.scratch_push(value)?;
-                values.push(value);
-            }
-            let argv_slot = self.stack_array_slot(args.len(), "call arguments")?;
+            let mut values = Vec::with_capacity(function.params.len());
+            self.lower_direct_call_arguments(function, args, &mut values)?;
+            let argv_slot = self.stack_array_slot(values.len(), "call arguments")?;
             for (index, value) in values.iter().enumerate() {
                 self.builder
                     .ins()
@@ -6709,9 +6714,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             let reference = self.func_ref(wrapper);
             let entry = self.builder.ins().func_addr(self.ptr_ty, reference);
             let entry = self.pointer_to_i64(entry);
-            let argc = self.builder.ins().iconst(self.ptr_ty, args.len() as i64);
+            let argc = self.builder.ins().iconst(self.ptr_ty, values.len() as i64);
             let argv = self.builder.ins().stack_addr(self.ptr_ty, argv_slot, 0);
-            let scope = self.open_scope(argv, args.len())?;
+            let scope = self.open_scope(argv, values.len())?;
             let runtime_id = if is_async_generator {
                 self.runtime.async_generator_new
             } else if is_async {
@@ -6727,12 +6732,8 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         }
 
         let mark = self.scratch_mark();
-        let mut values = Vec::with_capacity(args.len());
-        for arg in args {
-            let value = self.lower_expr(arg)?;
-            self.scratch_push(value)?;
-            values.push(value);
-        }
+        let mut values = Vec::with_capacity(function.params.len());
+        self.lower_direct_call_arguments(function, args, &mut values)?;
         let target = *self
             .symbols
             .get(&id)
@@ -6748,6 +6749,84 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.scratch_release(mark)?;
         self.emit_exc_check()?;
         Ok(result)
+    }
+
+    /// Lowers the operands of a direct call and fills omitted defaults.
+    ///
+    /// A direct call may omit trailing optional parameters: they are supplied
+    /// here, in parameter order, after every provided argument has been
+    /// evaluated. A literal default is rebuilt from the IR constant; a
+    /// non-literal `default_expr` is lowered in the caller's scope, which is
+    /// where the function value's defaults are evaluated too. An omitted
+    /// parameter without any default is an internal arity error: the frontend
+    /// already rejects such a call.
+    ///
+    /// Every value is pushed onto the scratch region so it stays rooted while
+    /// the remaining operands (and the call itself) are lowered; the caller
+    /// releases its scratch mark.
+    fn lower_direct_call_arguments(
+        &mut self,
+        function: &'a Function,
+        provided: &'a [Expr],
+        values: &mut Vec<Value>,
+    ) -> Result<(), CodegenError> {
+        let name = &function.name;
+        let expected = function.params.len();
+        let omitted = function.params.get(provided.len()..).ok_or_else(|| {
+            CodegenError::new(format!(
+                "call to function {name} expects {expected} arguments, got {}",
+                provided.len()
+            ))
+        })?;
+        if let Some(param) = omitted
+            .iter()
+            .find(|param| param.default.is_none() && param.default_expr.is_none())
+        {
+            return Err(CodegenError::new(format!(
+                "call to function {name} expects {expected} arguments, got {} \
+                 (parameter '{}' has no default)",
+                provided.len(),
+                param.name
+            )));
+        }
+        for arg in provided {
+            let value = self.lower_expr(arg)?;
+            self.scratch_push(value)?;
+            values.push(value);
+        }
+        for param in omitted {
+            // A non-literal default is lowered through the regular expression
+            // path, which checks the exceptions it can raise itself. Only a
+            // literal default needs an explicit check (`Const::Global` loads a
+            // module global).
+            let (value, check) = match (&param.default_expr, &param.default) {
+                (Some(expression), _) => (self.lower_expr(expression)?, false),
+                (None, Some(default)) => (
+                    wrapper_const(
+                        self.module,
+                        &mut self.builder,
+                        self.ptr_ty,
+                        self.runtime,
+                        default,
+                    )?,
+                    true,
+                ),
+                (None, None) => {
+                    return Err(CodegenError::new(format!(
+                        "internal error: omitted parameter '{}' of '{}' has no default",
+                        param.name, function.name
+                    )))
+                }
+            };
+            // Root the default before the exception check: the check calls into
+            // the runtime, which may collect an unrooted heap value.
+            self.scratch_push(value)?;
+            if check {
+                self.emit_exc_check()?;
+            }
+            values.push(value);
+        }
+        Ok(())
     }
 
     /// `f(args..., name=value...)` for a function value.
@@ -8651,6 +8730,348 @@ mod tests {
         let object =
             crate::compile_object(&program).expect("direct call to an async function must lower");
         assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn direct_call_fills_omitted_literal_defaults() {
+        // `def f(a, b=2, c=3)` called as `f(1)`: both omitted trailing
+        // parameters are materialised from their literal defaults, in order,
+        // so the callee still receives one value per parameter slot.
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let param = |local: LocalId, name: &str, default: Option<Const>| Param {
+            local,
+            name: name.to_string(),
+            ty: Type::Int,
+            default,
+            default_expr: None,
+            kind: ParamKind::Positional,
+        };
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![LocalInfo {
+                name: "r".to_string(),
+                ty: Type::Any,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Assign {
+                    target: 0,
+                    value: Expr::new(
+                        ExprKind::Call {
+                            callee: Callee::Function(1),
+                            args: vec![int(1)],
+                        },
+                        Type::Any,
+                        1,
+                    ),
+                },
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let callee = Function {
+            name: "f".to_string(),
+            params: vec![
+                param(0, "a", None),
+                param(1, "b", Some(Const::Int(2))),
+                param(2, "c", Some(Const::Int(3))),
+            ],
+            capture_count: 0,
+            ret_ty: Type::Any,
+            locals: vec![
+                LocalInfo {
+                    name: "a".to_string(),
+                    ty: Type::Int,
+                },
+                LocalInfo {
+                    name: "b".to_string(),
+                    ty: Type::Int,
+                },
+                LocalInfo {
+                    name: "c".to_string(),
+                    ty: Type::Int,
+                },
+            ],
+            body: vec![Stmt::new(
+                StmtKind::Return(Some(Expr::new(ExprKind::Local(2), Type::Int, 2))),
+                2,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, callee],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program)
+            .expect("a direct call must fill omitted literal defaults");
+        assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn direct_call_fills_omitted_expression_default() {
+        // `def f(a, b=2 + 3)` called as `f(1)`: a non-literal default is
+        // lowered in the caller's scope to produce the missing operand.
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![LocalInfo {
+                name: "r".to_string(),
+                ty: Type::Any,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Assign {
+                    target: 0,
+                    value: Expr::new(
+                        ExprKind::Call {
+                            callee: Callee::Function(1),
+                            args: vec![int(1)],
+                        },
+                        Type::Any,
+                        1,
+                    ),
+                },
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let callee = Function {
+            name: "f".to_string(),
+            params: vec![
+                Param {
+                    local: 0,
+                    name: "a".to_string(),
+                    ty: Type::Int,
+                    default: None,
+                    default_expr: None,
+                    kind: ParamKind::Positional,
+                },
+                Param {
+                    local: 1,
+                    name: "b".to_string(),
+                    ty: Type::Int,
+                    default: None,
+                    default_expr: Some(Box::new(Expr::new(
+                        ExprKind::Bin {
+                            op: BinOp::Add,
+                            lhs: Box::new(int(2)),
+                            rhs: Box::new(int(3)),
+                        },
+                        Type::Int,
+                        1,
+                    ))),
+                    kind: ParamKind::Positional,
+                },
+            ],
+            capture_count: 0,
+            ret_ty: Type::Any,
+            locals: vec![
+                LocalInfo {
+                    name: "a".to_string(),
+                    ty: Type::Int,
+                },
+                LocalInfo {
+                    name: "b".to_string(),
+                    ty: Type::Int,
+                },
+            ],
+            body: vec![Stmt::new(
+                StmtKind::Return(Some(Expr::new(ExprKind::Local(1), Type::Int, 2))),
+                2,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, callee],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program)
+            .expect("a direct call must lower omitted expression defaults");
+        assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn generator_direct_call_fills_omitted_default() {
+        // The deferred path hands the runtime a full argv: `g(1)` for
+        // `def g(a, b=5)` must pass the default as well.
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![LocalInfo {
+                name: "g".to_string(),
+                ty: Type::Any,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Assign {
+                    target: 0,
+                    value: Expr::new(
+                        ExprKind::Call {
+                            callee: Callee::Function(1),
+                            args: vec![int(1)],
+                        },
+                        Type::Any,
+                        1,
+                    ),
+                },
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let generator = Function {
+            name: "g".to_string(),
+            params: vec![
+                Param {
+                    local: 0,
+                    name: "a".to_string(),
+                    ty: Type::Int,
+                    default: None,
+                    default_expr: None,
+                    kind: ParamKind::Positional,
+                },
+                Param {
+                    local: 1,
+                    name: "b".to_string(),
+                    ty: Type::Int,
+                    default: Some(Const::Int(5)),
+                    default_expr: None,
+                    kind: ParamKind::Positional,
+                },
+            ],
+            capture_count: 0,
+            ret_ty: Type::Any,
+            locals: vec![
+                LocalInfo {
+                    name: "a".to_string(),
+                    ty: Type::Int,
+                },
+                LocalInfo {
+                    name: "b".to_string(),
+                    ty: Type::Int,
+                },
+            ],
+            body: vec![Stmt::new(
+                StmtKind::Yield {
+                    value: Some(Expr::new(ExprKind::Local(1), Type::Int, 2)),
+                },
+                2,
+            )],
+            is_async: false,
+            is_generator: true,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, generator],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program)
+            .expect("a generator direct call must fill the omitted default");
+        assert!(!object.is_empty());
+    }
+
+    #[test]
+    fn direct_call_rejects_a_missing_required_argument() {
+        // `def f(a, b)` called as `f(1)`: an omitted parameter without a
+        // default must stay an arity error instead of reaching the callee.
+        let int = |value: i64| Expr::new(ExprKind::Const(Const::Int(value)), Type::Int, 1);
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![LocalInfo {
+                name: "r".to_string(),
+                ty: Type::Any,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Assign {
+                    target: 0,
+                    value: Expr::new(
+                        ExprKind::Call {
+                            callee: Callee::Function(1),
+                            args: vec![int(1)],
+                        },
+                        Type::Any,
+                        1,
+                    ),
+                },
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let callee = Function {
+            name: "f".to_string(),
+            params: vec![
+                Param {
+                    local: 0,
+                    name: "a".to_string(),
+                    ty: Type::Int,
+                    default: None,
+                    default_expr: None,
+                    kind: ParamKind::Positional,
+                },
+                Param {
+                    local: 1,
+                    name: "b".to_string(),
+                    ty: Type::Int,
+                    default: None,
+                    default_expr: None,
+                    kind: ParamKind::Positional,
+                },
+            ],
+            capture_count: 0,
+            ret_ty: Type::Any,
+            locals: vec![
+                LocalInfo {
+                    name: "a".to_string(),
+                    ty: Type::Int,
+                },
+                LocalInfo {
+                    name: "b".to_string(),
+                    ty: Type::Int,
+                },
+            ],
+            body: vec![Stmt::new(
+                StmtKind::Return(Some(Expr::new(ExprKind::Local(1), Type::Int, 2))),
+                2,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, callee],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let error = crate::compile_object(&program)
+            .expect_err("a missing required argument must be rejected");
+        let message = &error.message;
+        assert!(
+            message.contains("expects 2 arguments, got 1"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("has no default"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]

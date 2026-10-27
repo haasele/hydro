@@ -2064,6 +2064,7 @@ pub static ITERTOOLS: ModuleSpec = ModuleSpec {
         // keyword itself (`dynamic_keywords`).
         kw_dynamic("product", 0, usize::MAX, Type::List, &[]),
         f("takewhile", 2, 2, Type::List),
+        f("dropwhile", 2, 2, Type::List),
     ],
     constants: &[],
 };
@@ -4081,13 +4082,15 @@ mod tests {
             assert_eq!(combinator.ret, Type::List);
             assert!(!combinator.dynamic_keywords);
         }
-        assert_eq!(
-            (
-                function("itertools", "takewhile").unwrap().min_args,
-                function("itertools", "takewhile").unwrap().max_args
-            ),
-            (2, 2)
-        );
+        for name in ["takewhile", "dropwhile"] {
+            let predicate_combinator = function("itertools", name).unwrap();
+            assert_eq!(
+                (predicate_combinator.min_args, predicate_combinator.max_args),
+                (2, 2)
+            );
+            assert_eq!(predicate_combinator.ret, Type::List);
+            assert!(!predicate_combinator.dynamic_keywords);
+        }
     }
 
     #[test]

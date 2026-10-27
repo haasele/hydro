@@ -8,6 +8,14 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 `itertools.dropwhile`
+
+- `itertools.dropwhile(predicate, iterable)` returns a list with the
+  longest suffix that starts at the first element the predicate rejects. The
+  predicate runs only while the prefix is being skipped, so the first rejected
+  element and everything after it are emitted without further calls, matching
+  the observable behaviour of CPython's lazy iterator once consumed.
+
 ### Added — 2026-10-27 class-body unpacking assignments
 
 - A tuple/list unpacking assignment in a class body (`__add__, __radd__,
