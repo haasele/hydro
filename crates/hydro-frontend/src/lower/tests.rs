@@ -5238,15 +5238,11 @@ fn keyword_call_on_a_function_value_uses_the_runtime_binder() {
 }
 
 #[test]
-fn keyword_call_on_an_unknown_global_keeps_the_keyword_name() {
-    // A global with no static signature (a lambda binding, a conditional
-    // class, a name installed at runtime) is read from the module table and
-    // called through the runtime binder, never through a deferred call that
-    // would drop the keyword and raise.
+fn keyword_call_on_a_dynamic_callee_keeps_the_keyword_name() {
+    // A callee with no static signature is called through the runtime binder,
+    // never through a deferred call that would drop the keyword and raise.
     let source = "\
-def g(**kwargs):
-    return kwargs
-def h():
+def h(g):
     return g(a=1)
 ";
     let (hir, _, diags) = lower_source(source, &parse(source));
@@ -5262,8 +5258,8 @@ def h():
         panic!("expected a keyword call, got {:?}", value.kind);
     };
     assert!(
-        matches!(&callee.kind, HExprKind::GlobalGet { name, .. } if name == "g"),
-        "callee must be the runtime global, got {:?}",
+        matches!(&callee.kind, HExprKind::Local(_)),
+        "callee must be the runtime function value, got {:?}",
         callee.kind
     );
     assert_eq!(keywords.len(), 1);
