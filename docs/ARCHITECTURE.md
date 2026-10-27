@@ -817,7 +817,8 @@ Central specification in `hydro_ir::stdlib` (`MODULES` in
 #### Methods
 
 `hydro_method`/`hydro_method_kw` dispatch dynamically by receiver type.
-`str`: `upper`, `lower`, `strip`, `lstrip`, `rstrip`, `split` (0/1 arg),
+`str`: `upper`, `lower`, `strip`/`lstrip`/`rstrip` (0/1 arg: a char set or
+`None`), `split` (0/1 arg),
 `join`, `replace` (2/3 args), `startswith`, `endswith`, `find`, `count`,
 `isdigit`, `isalpha`, `isalnum`, `isspace`, `format`, `encode` (bytes).
 `list`: `append`, `extend`, `insert`, `remove`, `pop` (0/1 arg), `clear`,

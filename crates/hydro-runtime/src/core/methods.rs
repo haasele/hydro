@@ -2793,15 +2793,28 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
             value::str_alloc(s.to_lowercase())
         }
         "strip" | "lstrip" | "rstrip" => {
-            if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 1) {
                 return err;
             }
-            let trimmed = match method {
-                "strip" => s.trim(),
-                "lstrip" => s.trim_start(),
-                _ => s.trim_end(),
+            // `None` means "strip whitespace", mirroring CPython; a str is a
+            // set of characters, not a substring. The set is copied because a
+            // heap reference must not survive the allocation below.
+            let chars = if args.is_empty() || args[0] == NONE {
+                None
+            } else {
+                match value::as_str(args[0]) {
+                    Some(chars) => Some(chars.to_string()),
+                    None => {
+                        return type_error(format!("{method} arg must be None or str"));
+                    }
+                }
             };
-            value::str_alloc(trimmed.to_string())
+            let (left, right) = match method {
+                "lstrip" => (true, false),
+                "rstrip" => (false, true),
+                _ => (true, true),
+            };
+            value::str_alloc(strip_str(&s, chars.as_deref(), left, right))
         }
         "rjust" | "ljust" | "center" => {
             if let Some(err) = check_arity("str", method, args.len(), 1, 2) {
@@ -3400,6 +3413,36 @@ fn replace_bytes(data: &[u8], old: &[u8], new: &[u8], count: i64) -> Option<Vec<
     }
     out.extend_from_slice(&data[pos..]);
     Some(out)
+}
+
+/// Trims characters from both ends (`left`/`right`) using either the `chars`
+/// set or Unicode whitespace.
+fn strip_str(data: &str, chars: Option<&str>, left: bool, right: bool) -> String {
+    let Some(set) = chars else {
+        return match (left, right) {
+            (true, true) => data.trim(),
+            (true, false) => data.trim_start(),
+            _ => data.trim_end(),
+        }
+        .to_string();
+    };
+    let keep = |c: char| !set.contains(c);
+    let mut start = 0;
+    let mut end = data.len();
+    if left {
+        start = data
+            .char_indices()
+            .find(|&(_, c)| keep(c))
+            .map_or(data.len(), |(offset, _)| offset);
+    }
+    if right {
+        end = data[start..]
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| keep(c))
+            .map_or(start, |(offset, c)| start + offset + c.len_utf8());
+    }
+    data[start..end].to_string()
 }
 
 /// Trims bytes from both ends (`left`/`right`) using either `chars` or ASCII
@@ -6340,6 +6383,61 @@ mod tests {
         assert_eq!(text(invoke(padded, "lstrip", &[])), "Hi\u{2003}  ");
         assert_eq!(text(invoke(padded, "rstrip", &[])), "  \u{2003}Hi");
         assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn strip_character_sets() {
+        reset();
+        // The optional argument is a set of characters, not a substring.
+        let dotted = string("..hello..");
+        assert_eq!(text(invoke(dotted, "strip", &[string(".")])), "hello");
+        assert_eq!(text(invoke(dotted, "lstrip", &[string(".")])), "hello..");
+        assert_eq!(text(invoke(dotted, "rstrip", &[string(".")])), "..hello");
+        assert_eq!(
+            text(invoke(string("xyxhelloyxy"), "strip", &[string("xy")])),
+            "hello"
+        );
+        // Characters are matched whole, never byte-wise.
+        assert_eq!(
+            text(invoke(
+                string("\u{2003}\u{2003}data\u{2003}"),
+                "strip",
+                &[string("\u{2003}")]
+            )),
+            "data"
+        );
+        // An empty set strips nothing; `None` selects whitespace stripping.
+        assert_eq!(
+            text(invoke(string("  ab  "), "strip", &[string("")])),
+            "  ab  "
+        );
+        assert_eq!(text(invoke(string("  ab  "), "strip", &[NONE])), "ab");
+        assert_eq!(text(invoke(string("\t ab \n"), "lstrip", &[NONE])), "ab \n");
+        assert_eq!(
+            text(invoke(string("  ab  "), "rstrip", &[string(" ")])),
+            "  ab"
+        );
+        // Stripping a string made only of the set leaves an empty string.
+        assert_eq!(text(invoke(string("..."), "strip", &[string(".")])), "");
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn strip_argument_errors() {
+        reset();
+        invoke(string("ab"), "strip", &[int(1)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "strip arg must be None or str");
+
+        reset();
+        invoke(string("ab"), "lstrip", &[int(1)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "lstrip arg must be None or str");
+
+        reset();
+        invoke(string("ab"), "rstrip", &[string("."), string(".")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "rstrip() takes at most 1 argument (2 given)");
     }
 
     #[test]

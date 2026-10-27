@@ -276,6 +276,9 @@ fn annotation_accepts(expected: Type, got: Type) -> bool {
 enum ArgKind {
     Any,
     Str,
+    /// `str.strip`/`lstrip`/`rstrip` take an optional character set: either a
+    /// `str` or `None` (the latter meaning Unicode whitespace).
+    StrOrNone,
     Bytes,
     Int,
     /// `dict.update` operand: a mapping or any iterable of key/value pairs.
@@ -301,6 +304,7 @@ impl ArgKind {
         match self {
             ArgKind::Any => true,
             ArgKind::Str => got == Type::Str,
+            ArgKind::StrOrNone => matches!(got, Type::Str | Type::None),
             ArgKind::Bytes => got == Type::Bytes,
             ArgKind::Int => got == Type::Int || got == Type::BigInt || got == Type::Bool,
             // Detailed hashability is checked on the expression itself so
@@ -324,6 +328,7 @@ impl ArgKind {
         match self {
             ArgKind::Any => "Any",
             ArgKind::Str => "str",
+            ArgKind::StrOrNone => "str or None",
             ArgKind::Bytes => "bytes",
             ArgKind::Int => "int",
             ArgKind::MappingOrPairs => "mapping or iterable of pairs",
@@ -338,6 +343,9 @@ impl ArgKind {
         match self {
             ArgKind::Any | ArgKind::Hashable => None,
             ArgKind::Str => Some(Type::Str),
+            // `None` is also valid, so an unresolved argument cannot be
+            // narrowed to `str`.
+            ArgKind::StrOrNone => None,
             ArgKind::Bytes => Some(Type::Bytes),
             ArgKind::Int => Some(Type::Int),
             // A mapping and a pair iterable are both accepted, so an
@@ -381,9 +389,18 @@ impl MethodSig {
 const STR_METHODS: &[(&str, MethodSig)] = &[
     ("upper", MethodSig::new(0, 0, &[], Type::Str)),
     ("lower", MethodSig::new(0, 0, &[], Type::Str)),
-    ("strip", MethodSig::new(0, 0, &[], Type::Str)),
-    ("lstrip", MethodSig::new(0, 0, &[], Type::Str)),
-    ("rstrip", MethodSig::new(0, 0, &[], Type::Str)),
+    (
+        "strip",
+        MethodSig::new(0, 1, &[ArgKind::StrOrNone], Type::Str),
+    ),
+    (
+        "lstrip",
+        MethodSig::new(0, 1, &[ArgKind::StrOrNone], Type::Str),
+    ),
+    (
+        "rstrip",
+        MethodSig::new(0, 1, &[ArgKind::StrOrNone], Type::Str),
+    ),
     ("isdigit", MethodSig::new(0, 0, &[], Type::Bool)),
     ("isalpha", MethodSig::new(0, 0, &[], Type::Bool)),
     ("isalnum", MethodSig::new(0, 0, &[], Type::Bool)),

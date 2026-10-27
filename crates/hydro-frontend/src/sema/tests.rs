@@ -682,6 +682,37 @@ fn padding_method_signatures_are_registered() {
 }
 
 #[test]
+fn strip_method_signatures_are_registered() {
+    // The optional argument is a character set: a `str` or `None`.
+    let source = "a = 'x.y'.strip('.')\n\
+                  b = 'x.y'.lstrip(None)\n\
+                  c = 'x.y'.rstrip()\n\
+                  d = 'x.y'.rstrip('').lstrip(None).strip('.')\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    for index in 0..4 {
+        assert_eq!(assigned_type(&program, index), Type::Str, "index {index}");
+    }
+
+    let errors = check_errors("print('x'.strip('.', '.'))\n");
+    assert_eq!(
+        errors,
+        vec!["str.strip() takes 0 to 1 positional argument(s) (2 given)"]
+    );
+
+    let errors = check_errors("print('x'.lstrip(1))\n");
+    assert_eq!(
+        errors,
+        vec!["str.lstrip() argument 1 has wrong type: expected str or None, got int"]
+    );
+
+    let errors = check_errors("print('x'.rstrip(b'.'))\n");
+    assert_eq!(
+        errors,
+        vec!["str.rstrip() argument 1 has wrong type: expected str or None, got bytes"]
+    );
+}
+
+#[test]
 fn any_receiver_accepts_any_method() {
     let source = "def f(x: Any):\n    return x.nope(1, 2)\n";
     assert!(check_errors(source).is_empty());
