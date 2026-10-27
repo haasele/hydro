@@ -3545,6 +3545,26 @@ fn platform_node() -> String {
     String::new()
 }
 
+fn platform_processor() -> &'static str {
+    platform_machine()
+}
+
+/// `platform.uname()`: the six-field `uname_result` namedtuple.
+///
+/// The identity fields mirror the individual `platform` helpers, so
+/// `platform.uname().machine == platform.machine()` and the value unpacks in
+/// CPython's `system, node, release, version, machine, processor` order.
+fn platform_uname() -> i64 {
+    platform_uname_result([
+        ("system", platform_system().to_string()),
+        ("node", platform_node()),
+        ("release", platform_release()),
+        ("version", platform_version()),
+        ("machine", platform_machine().to_string()),
+        ("processor", platform_processor().to_string()),
+    ])
+}
+
 fn platform_call(function: &str) -> i64 {
     match function {
         "system" => value::str_from_bytes(platform_system().as_bytes()),
@@ -3560,7 +3580,8 @@ fn platform_call(function: &str) -> i64 {
         )),
         "python_version" => value::str_from_bytes(PYTHON_VERSION_STRING.as_bytes()),
         "python_implementation" => value::str_from_bytes(b"Hydro"),
-        "processor" => value::str_from_bytes(platform_machine().as_bytes()),
+        "processor" => value::str_from_bytes(platform_processor().as_bytes()),
+        "uname" => platform_uname(),
         _ => missing_attribute("platform", function),
     }
 }
@@ -6816,22 +6837,42 @@ fn os_uname() -> i64 {
 /// `__len__`/`__getitem__` methods make the value index like the tuple
 /// subclass CPython returns.
 fn uname_result(fields: [(&str, String); 5]) -> i64 {
-    // The marker base is what makes an ordinary class instance iterate in
-    // attribute order (`value::namedtuple_values`).
+    namedtuple_result(
+        &fields,
+        uname_len as *const () as usize,
+        uname_getitem as *const () as usize,
+    )
+}
+
+/// Builds the `platform.uname()` value: CPython's six-field `uname_result`.
+///
+/// The first five fields share the `os.uname()` identity; `processor` reports
+/// the same string as `platform.processor()`. Attribute access, iteration,
+/// `len()` and indexing all follow the namedtuple protocol.
+fn platform_uname_result(fields: [(&str, String); 6]) -> i64 {
+    namedtuple_result(
+        &fields,
+        platform_uname_len as *const () as usize,
+        platform_uname_getitem as *const () as usize,
+    )
+}
+
+/// Builds a namedtuple-shaped `uname_result` instance from `fields` in order.
+///
+/// The marker base is what makes an ordinary class instance iterate in
+/// attribute order (`value::namedtuple_values`); `len_fn` and `getitem_fn` are
+/// the tuple-protocol method bodies for the concrete field list.
+fn namedtuple_result(fields: &[(&str, String)], len_fn: usize, getitem_fn: usize) -> i64 {
     let marker = value::class_new("NamedTuple".to_string(), NONE, Vec::new());
     let roots = crate::heap::root_values(&[marker]);
     let methods = vec![
         (
             "__len__".to_string(),
-            value::function_new(uname_len as *const () as usize, 1, "__len__".to_string()),
+            value::function_new(len_fn, 1, "__len__".to_string()),
         ),
         (
             "__getitem__".to_string(),
-            value::function_new(
-                uname_getitem as *const () as usize,
-                2,
-                "__getitem__".to_string(),
-            ),
+            value::function_new(getitem_fn, 2, "__getitem__".to_string()),
         ),
     ];
     let class = value::class_new("uname_result".to_string(), marker, methods);
@@ -6839,7 +6880,7 @@ fn uname_result(fields: [(&str, String); 5]) -> i64 {
     let result = value::instance_new(class);
     crate::heap::root_values(&[result]);
     for (name, text) in fields {
-        let field = value::str_alloc(text);
+        let field = value::str_alloc(text.clone());
         value::instance_setattr(result, name.to_string(), field);
     }
     crate::heap::release_roots(roots);
@@ -6849,14 +6890,40 @@ fn uname_result(fields: [(&str, String); 5]) -> i64 {
 /// Field order of `uname_result`, matching CPython's `posix.uname_result`.
 const UNAME_FIELDS: [&str; 5] = ["sysname", "nodename", "release", "version", "machine"];
 
+/// Field order of `platform.uname_result`.
+const PLATFORM_UNAME_FIELDS: [&str; 6] = [
+    "system",
+    "node",
+    "release",
+    "version",
+    "machine",
+    "processor",
+];
+
 /// `uname_result.__len__`: always five fields.
 extern "C" fn uname_len(_argv: *const i64) -> i64 {
     // 5 always fits the tagged-integer range.
     value::encode_int(UNAME_FIELDS.len() as i64).expect("five is a tagged int")
 }
 
+/// `platform.uname_result.__len__`: always six fields.
+extern "C" fn platform_uname_len(_argv: *const i64) -> i64 {
+    // 6 always fits the tagged-integer range.
+    value::encode_int(PLATFORM_UNAME_FIELDS.len() as i64).expect("six is a tagged int")
+}
+
 /// `uname_result.__getitem__`: positional access and negative indices.
 extern "C" fn uname_getitem(argv: *const i64) -> i64 {
+    uname_field_at(argv, &UNAME_FIELDS)
+}
+
+/// `platform.uname_result.__getitem__`: positional access and negative indices.
+extern "C" fn platform_uname_getitem(argv: *const i64) -> i64 {
+    uname_field_at(argv, &PLATFORM_UNAME_FIELDS)
+}
+
+/// Shared `uname_result.__getitem__` body for one concrete field order.
+fn uname_field_at(argv: *const i64, fields: &[&str]) -> i64 {
     // SAFETY: a method call passes `(self, index)` in that order.
     let object = unsafe { *argv };
     let index_value = unsafe { *argv.add(1) };
@@ -6867,13 +6934,13 @@ extern "C" fn uname_getitem(argv: *const i64) -> i64 {
         );
     };
     let index = if index < 0 {
-        index + UNAME_FIELDS.len() as i64
+        index + fields.len() as i64
     } else {
         index
     };
     let Some(name) = usize::try_from(index)
         .ok()
-        .and_then(|position| UNAME_FIELDS.get(position).copied())
+        .and_then(|position| fields.get(position).copied())
     else {
         return exc::raise_with_message(INDEX_ERROR, "uname_result index out of range");
     };
@@ -10919,6 +10986,68 @@ mod tests {
             Some("Hydro")
         );
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn platform_uname_reports_the_platform_identity() {
+        exc::init();
+        let result = call("platform", "uname", &[]);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+
+        // The six fields hold the same identity as the individual helpers.
+        let expected = [
+            ("system", platform_system().to_string()),
+            ("node", platform_node()),
+            ("release", platform_release()),
+            ("version", platform_version()),
+            ("machine", platform_machine().to_string()),
+            ("processor", platform_processor().to_string()),
+        ];
+        for (name, text) in &expected {
+            let field = value::instance_attr(result, name)
+                .unwrap_or_else(|| panic!("missing platform.uname field {name}"));
+            assert_eq!(value::as_str(field), Some(text.as_str()), "field {name}");
+        }
+
+        // `platform.uname().<field> == platform.<field>()`.
+        for (field, function) in [
+            ("system", "system"),
+            ("node", "node"),
+            ("release", "release"),
+            ("version", "version"),
+            ("machine", "machine"),
+            ("processor", "processor"),
+        ] {
+            let attribute = value::instance_attr(result, field).expect(field);
+            let direct = call("platform", function, &[]);
+            assert_eq!(
+                value::as_str(attribute),
+                value::as_str(direct),
+                "uname.{field}"
+            );
+        }
+
+        // Iteration, `len()` and indexing use CPython's six-field order.
+        let fields = value::namedtuple_values(result).expect("platform uname fields");
+        assert_eq!(fields.len(), 6);
+        for (index, (name, _)) in expected.iter().enumerate() {
+            let attribute = value::instance_attr(result, name).expect(name);
+            assert_eq!(fields[index], attribute, "field {name} out of order");
+        }
+        assert_eq!(crate::core::builtins::len(result), int(6));
+        assert_eq!(
+            value::as_str(container::subscript(result, int(3))),
+            Some(platform_version().as_str())
+        );
+        assert_eq!(
+            value::as_str(container::subscript(result, int(-1))),
+            Some(platform_processor())
+        );
+        exc::init();
     }
 
     #[test]

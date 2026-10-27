@@ -225,8 +225,9 @@ no CPython is needed at runtime.
       (a synthetic generator function: the outermost iterable is evaluated at
       creation, the remaining clauses/filters and the element run per resume,
       and enclosing locals are capture parameters; an assignment expression
-      inside one is rejected because it would have to bind in the enclosing
-      frame). Cells are GC-traced; outer/inner mutations are shared, sibling
+      inside one is rejected unless its target is declared `global` in the
+      enclosing scope, because it would otherwise have to bind in the
+      enclosing frame). Cells are GC-traced; outer/inner mutations are shared, sibling
       closures share a cell, and loop-created closures get per-iteration cells.
       Tests cover mutation, `nonlocal`, missing-binding diagnostics, GC stress,
       JIT+AOT, laziness/partial consumption and exception propagation.

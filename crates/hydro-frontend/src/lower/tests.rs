@@ -13559,3 +13559,418 @@ fn generic_class_binding_is_mirrored_for_importers() {
         hir.functions[0].body
     );
 }
+
+/// Assert that `function` has no local slot named `name`: a `global`
+/// declaration binds only the runtime global table.
+fn assert_no_local_slot(function: &HFunction, name: &str) {
+    assert!(
+        !function.locals.iter().any(|local| local.name == name),
+        "`{name}` is declared global, so it must not get a local slot: {:?}",
+        function.locals
+    );
+}
+
+#[test]
+fn unpack_targets_declared_global_store_into_the_global_table() {
+    let source = "def f(value):\n    global a, b\n    a, b = value\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    assert_no_local_slot(f, "a");
+    let HStmtKind::Unpack { targets, .. } = &f.body[0].kind else {
+        panic!("expected an unpack statement, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(targets.len(), 2);
+    let HUnpackTarget::Global { module, name } = &targets[0] else {
+        panic!("expected a global target, got {:?}", targets[0]);
+    };
+    assert_eq!((module.as_str(), name.as_str()), ("__main__", "a"));
+    let HUnpackTarget::Global { module, name } = &targets[1] else {
+        panic!("expected a global target, got {:?}", targets[1]);
+    };
+    assert_eq!((module.as_str(), name.as_str()), ("__main__", "b"));
+
+    // The target survives into the IR, where codegen and the interpreter
+    // store through the runtime global table.
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+    let program = crate::sema::emit(&hir, &mut infer);
+    let f = program
+        .functions
+        .iter()
+        .find(|function| function.name == "f")
+        .expect("function f");
+    let targets = f
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            hydro_ir::StmtKind::Unpack { targets, .. } => Some(targets),
+            _ => None,
+        })
+        .expect("emitted unpack");
+    assert!(matches!(
+        targets[0],
+        hydro_ir::UnpackTarget::Global { ref module, ref name }
+            if module == "__main__" && name == "a"
+    ));
+    assert!(matches!(targets[1], hydro_ir::UnpackTarget::Name(_)));
+}
+
+#[test]
+fn starred_and_nested_unpack_targets_declared_global() {
+    let source = "def f(items):\n    global head, rest\n    head, *rest = items\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    assert_no_local_slot(f, "head");
+    assert_no_local_slot(f, "rest");
+    let targets = f
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Unpack { targets, .. } => Some(targets),
+            _ => None,
+        })
+        .expect("unpack statement");
+    let HUnpackTarget::Global { name, .. } = &targets[0] else {
+        panic!("expected a global target, got {:?}", targets[0]);
+    };
+    assert_eq!(name, "head");
+    let HUnpackTarget::Star(inner) = &targets[1] else {
+        panic!("expected a starred target, got {:?}", targets[1]);
+    };
+    let HUnpackTarget::Global { name, .. } = &**inner else {
+        panic!("expected a global starred target, got {inner:?}");
+    };
+    assert_eq!(name, "rest");
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+
+    // A nested container keeps its own level: every element binds the global.
+    let source = "def g(items):\n    global a, b, c\n    (a, b), *c = items\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let g = function(&hir, "g");
+    for name in ["a", "b", "c"] {
+        assert_no_local_slot(g, name);
+    }
+    let targets = g
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Unpack { targets, .. } => Some(targets),
+            _ => None,
+        })
+        .expect("unpack statement");
+    let HUnpackTarget::Nested(inner) = &targets[0] else {
+        panic!("expected a nested target, got {:?}", targets[0]);
+    };
+    let names: Vec<&str> = inner
+        .iter()
+        .map(|target| match target {
+            HUnpackTarget::Global { name, .. } => name.as_str(),
+            other => panic!("expected a global target, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+    let HUnpackTarget::Star(inner) = &targets[1] else {
+        panic!("expected a starred target, got {:?}", targets[1]);
+    };
+    assert!(matches!(
+        &**inner,
+        HUnpackTarget::Global { name, .. } if name == "c"
+    ));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn simple_annotated_and_chained_assignment_to_declared_globals() {
+    let source = "def f():\n\
+                  \x20   global x, y, z\n\
+                  \x20   x = 1\n\
+                  \x20   y: int = 2\n\
+                  \x20   x = z = 3\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    for name in ["x", "y", "z"] {
+        assert_no_local_slot(f, name);
+    }
+    let HStmtKind::GlobalSet { name, .. } = &f.body[0].kind else {
+        panic!("expected a global store, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(name, "x");
+    let HStmtKind::GlobalSet { name, .. } = &f.body[1].kind else {
+        panic!("expected a global store, got {:?}", f.body[1].kind);
+    };
+    assert_eq!(name, "y");
+    // The chained assignment stores the value once, then each target in
+    // source order; both targets here are declared global.
+    let HStmtKind::If { then_body, .. } = &f.body[2].kind else {
+        panic!(
+            "expected the chained-assignment wrapper, got {:?}",
+            f.body[2].kind
+        );
+    };
+    let names: Vec<&str> = then_body
+        .iter()
+        .filter_map(|stmt| match &stmt.kind {
+            HStmtKind::GlobalSet { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["x", "z"]);
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn augmented_assignment_to_a_declared_global_reads_and_stores_the_global() {
+    let source = "def f():\n    global counter\n    counter += 1\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    assert_no_local_slot(f, "counter");
+    let HStmtKind::GlobalSet {
+        module,
+        name,
+        value,
+    } = &f.body[0].kind
+    else {
+        panic!("expected a global store, got {:?}", f.body[0].kind);
+    };
+    assert_eq!((module.as_str(), name.as_str()), ("__main__", "counter"));
+    let HExprKind::Bin { lhs, .. } = &value.kind else {
+        panic!("expected the augmented value, got {:?}", value.kind);
+    };
+    assert!(matches!(
+        &lhs.kind,
+        HExprKind::GlobalGet { module, name }
+            if module == "__main__" && name == "counter"
+    ));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn for_statement_targets_declared_global_store_each_iteration() {
+    // Iterator form: the loop binds a hidden local and the body stores it.
+    let source = "def f(xs):\n    global item\n    for item in xs:\n        pass\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    assert_no_local_slot(f, "item");
+    let HStmtKind::ForEach { var, body, .. } = &f.body[0].kind else {
+        panic!("expected a for-each loop, got {:?}", f.body[0].kind);
+    };
+    assert!(
+        f.locals[*var as usize].name.starts_with("$for"),
+        "the loop needs a hidden iteration slot: {:?}",
+        f.locals
+    );
+    let HStmtKind::GlobalSet { name, value, .. } = &body[0].kind else {
+        panic!(
+            "expected a global store in the loop body, got {:?}",
+            body[0].kind
+        );
+    };
+    assert_eq!(name, "item");
+    assert!(matches!(&value.kind, HExprKind::Local(local) if local == var));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+
+    // `range()` keeps its dedicated form but still stores the global.
+    let source = "def g():\n    global i\n    for i in range(3):\n        pass\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let g = function(&hir, "g");
+    assert_no_local_slot(g, "i");
+    let HStmtKind::ForRange { var, body, .. } = &g.body[0].kind else {
+        panic!("expected a range loop, got {:?}", g.body[0].kind);
+    };
+    assert!(g.locals[*var as usize].name.starts_with("$for"));
+    assert!(matches!(
+        &body[0].kind,
+        HStmtKind::GlobalSet { name, .. } if name == "i"
+    ));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+
+    // An unpacking loop target carries the global targets into the unpack.
+    let source = "def h(pairs):\n    global a, b\n    for a, b in pairs:\n        pass\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let h = function(&hir, "h");
+    assert_no_local_slot(h, "a");
+    assert_no_local_slot(h, "b");
+    let HStmtKind::ForEach { body, .. } = &h.body[0].kind else {
+        panic!("expected a for-each loop, got {:?}", h.body[0].kind);
+    };
+    let HStmtKind::Unpack { targets, .. } = &body[0].kind else {
+        panic!(
+            "expected an unpack in the loop body, got {:?}",
+            body[0].kind
+        );
+    };
+    let names: Vec<&str> = targets
+        .iter()
+        .map(|target| match target {
+            HUnpackTarget::Global { name, .. } => name.as_str(),
+            other => panic!("expected a global target, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn async_for_target_declared_global_stores_each_awaited_item() {
+    let source = "async def f(it):\n    global item\n    async for item in it:\n        pass\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    assert_no_local_slot(f, "item");
+    assert!(
+        has_global_set(&f.body),
+        "the async-for desugaring must store the global: {:?}",
+        f.body
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn comprehension_targets_shadow_a_declared_global() {
+    // A comprehension target is local to the comprehension, so `global x`
+    // must not turn it into a global store or read.
+    let source = "def f():\n    global x\n    return [x for x in range(3)]\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    assert!(
+        !has_global_set(&f.body),
+        "a comprehension target is not a global store: {:?}",
+        f.body
+    );
+    let HStmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!("expected a return, got {:?}", f.body[0].kind);
+    };
+    let HExprKind::ListComp { element, clauses } = &value.kind else {
+        panic!("expected a list comprehension, got {:?}", value.kind);
+    };
+    let HCompTarget::Name(target) = &clauses[0].target else {
+        panic!(
+            "expected a comprehension name target, got {:?}",
+            clauses[0].target
+        );
+    };
+    assert!(
+        f.locals[*target as usize].name.starts_with("$comp"),
+        "the target binds a synthetic comprehension local: {:?}",
+        f.locals
+    );
+    assert!(
+        matches!(&element.kind, HExprKind::Local(local) if local == target),
+        "the element must read the comprehension local, got {:?}",
+        element.kind
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+
+    // The same holds for an unpacking comprehension target whose elements are
+    // declared global in the enclosing function.
+    let source = "def g(pairs):\n    global k, v\n    return [k for k, v in pairs]\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let g = function(&hir, "g");
+    let HStmtKind::Return(Some(value)) = &g.body[0].kind else {
+        panic!("expected a return, got {:?}", g.body[0].kind);
+    };
+    let HExprKind::ListComp { element, clauses } = &value.kind else {
+        panic!("expected a list comprehension, got {:?}", value.kind);
+    };
+    let HCompTarget::Unpack(targets) = &clauses[0].target else {
+        panic!(
+            "expected a comprehension unpack target, got {:?}",
+            clauses[0].target
+        );
+    };
+    for target in targets {
+        assert!(
+            matches!(target, HUnpackTarget::Name(_)),
+            "comprehension targets stay locals, got {target:?}"
+        );
+    }
+    assert!(matches!(&element.kind, HExprKind::Local(_)));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn assignment_expression_to_a_declared_global_stores_and_yields_the_value() {
+    let source = "def f():\n    global x\n    y = (x := 1)\n    return y\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    assert_no_local_slot(f, "x");
+    let HStmtKind::Assign { value, .. } = &f.body[0].kind else {
+        panic!("expected an assignment, got {:?}", f.body[0].kind);
+    };
+    let HExprKind::GlobalSet {
+        module,
+        name,
+        value,
+    } = &value.kind
+    else {
+        panic!("expected a global store expression, got {:?}", value.kind);
+    };
+    assert_eq!((module.as_str(), name.as_str()), ("__main__", "x"));
+    assert!(matches!(&value.kind, HExprKind::Const(Const::Int(1))));
+
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+    let program = crate::sema::emit(&hir, &mut infer);
+    let f = program
+        .functions
+        .iter()
+        .find(|function| function.name == "f")
+        .expect("function f");
+    let stored = f
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            hydro_ir::StmtKind::Assign { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("emitted assignment");
+    assert!(matches!(
+        &stored.kind,
+        hydro_ir::ExprKind::GlobalSet { module, name, .. }
+            if module == "__main__" && name == "x"
+    ));
+
+    // A generator expression frame writes the same global table.
+    let source = "def g():\n    global x\n    return (x := i for i in range(3))\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn global_unpack_target_binds_before_a_later_receiver_runs() {
+    // Python stores each target in source order, so a later receiver observes
+    // a value stored earlier in the same statement: `obj[g]` must see the new
+    // `g`. The target list already encodes that order, and the global target
+    // has no local slot in between.
+    let source = "def f(obj):\n    global g\n    g, obj[g] = (1, 2)\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    assert_no_local_slot(f, "g");
+    let HStmtKind::Unpack { targets, .. } = &f.body[0].kind else {
+        panic!("expected an unpack statement, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(targets.len(), 2);
+    assert!(matches!(
+        &targets[0],
+        HUnpackTarget::Global { name, .. } if name == "g"
+    ));
+    let HUnpackTarget::Subscript { index, .. } = &targets[1] else {
+        panic!("expected a subscript target, got {:?}", targets[1]);
+    };
+    assert!(
+        matches!(&index.kind, HExprKind::GlobalGet { name, .. } if name == "g"),
+        "the receiver reads the declared global, got {:?}",
+        index.kind
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}

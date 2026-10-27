@@ -125,6 +125,13 @@ pub enum HUnpackTarget {
     Name(LocalId),
     /// Bind through the closure cell stored in a local slot.
     Cell(LocalId),
+    /// `global name` target: store the element in the runtime global table of
+    /// this unit. A `global` declaration never creates a local slot, so the
+    /// element has no slot to go to.
+    Global {
+        module: String,
+        name: String,
+    },
     Attr {
         object: HExpr,
         name: String,
@@ -363,6 +370,9 @@ pub struct HCompClause {
 struct LoopTarget {
     /// Plain-name target, already resolved to its local slot.
     name: Option<LocalId>,
+    /// Plain-name target declared `global`: the loop binds a hidden local and
+    /// stores it into the runtime global table on every iteration.
+    global: Option<String>,
     /// Sequence target, unpacked from the item the loop binds.
     unpack: Option<Vec<HUnpackTarget>>,
 }
@@ -444,6 +454,14 @@ pub enum HExprKind {
     /// yield the value.
     NamedExpr {
         target: LocalId,
+        value: Box<HExpr>,
+    },
+    /// `(name := value)` where `name` is declared `global`: evaluate `value`,
+    /// store it in the runtime global table of this module and yield the
+    /// stored value. The name never has a local slot.
+    GlobalSet {
+        module: String,
+        name: String,
         value: Box<HExpr>,
     },
     Bin {
@@ -10400,6 +10418,16 @@ impl<'a> Lowerer<'a> {
     /// subscript. Container elements and stars are handled by the caller.
     fn unpack_single(&mut self, elem: &ast::Expr, fs: &mut FuncState) -> Option<HUnpackTarget> {
         match elem {
+            ast::Expr::Name(n) if fs.is_global(n.id.as_str()) => {
+                // `global name` has no local slot: the element is stored in the
+                // runtime global table when this target binds, keeping the
+                // left-to-right order of the other targets.
+                self.used_globals.insert(n.id.to_string());
+                Some(HUnpackTarget::Global {
+                    module: self.dunder_name.clone(),
+                    name: n.id.to_string(),
+                })
+            }
             ast::Expr::Name(n) => match fs.lookup(n.id.as_str()) {
                 Some(local) => Some(if fs.is_cell(local) {
                     HUnpackTarget::Cell(local)
@@ -11392,6 +11420,12 @@ impl<'a> Lowerer<'a> {
                 genexp_cells.insert(local);
             }
         }
+        // Names declared `global` in the enclosing scope are global inside the
+        // frame too, even when they are not free reads of the element (an
+        // assignment expression target, for example). Captured names still
+        // win: the frame's local table is consulted before its global table.
+        let mut globals = globals;
+        globals.extend(fs.globals.iter().cloned());
         let (fid_line, fid_col) = self.span(c.range);
         self.functions.push(HFunction {
             name: "<genexpr>".to_string(),
@@ -11552,6 +11586,11 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
+
+        // See `lower_generator_exp`: a `global` declaration of the enclosing
+        // scope stays global inside the helper frame.
+        let mut globals = globals;
+        globals.extend(fs.globals.iter().cloned());
 
         let mut cfs = FuncState {
             fid,
@@ -12070,30 +12109,41 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Resolve the target of a `for`/`async for` statement: a plain name
-    /// already bound in this scope, or a sequence of unpacking targets. Any
-    /// other target form is diagnosed here.
+    /// already bound in this scope, a plain name declared `global`, or a
+    /// sequence of unpacking targets. Any other target form is diagnosed here.
     fn resolve_loop_target(
         &mut self,
         target: &ast::Expr,
         fs: &mut FuncState,
     ) -> Option<LoopTarget> {
         let unpack = matches!(target, ast::Expr::Tuple(_) | ast::Expr::List(_));
+        let mut global = None;
         let name = match target {
-            ast::Expr::Name(n) => match fs.lookup(n.id.as_str()) {
-                Some(var) => Some(var),
-                None => {
-                    self.error_name(
-                        n.range,
-                        n.id.as_str(),
-                        fs,
-                        format!("for loop variable '{}' is not defined", n.id),
-                    );
-                    return None;
+            ast::Expr::Name(n) => {
+                if fs.is_global(n.id.as_str()) {
+                    // `global name` has no local slot: every iteration stores
+                    // the item into the runtime global table.
+                    self.used_globals.insert(n.id.to_string());
+                    global = Some(n.id.to_string());
+                    None
+                } else {
+                    match fs.lookup(n.id.as_str()) {
+                        Some(var) => Some(var),
+                        None => {
+                            self.error_name(
+                                n.range,
+                                n.id.as_str(),
+                                fs,
+                                format!("for loop variable '{}' is not defined", n.id),
+                            );
+                            return None;
+                        }
+                    }
                 }
-            },
+            }
             _ => None,
         };
-        if !unpack && name.is_none() {
+        if !unpack && name.is_none() && global.is_none() {
             self.error_at(
                 target.range(),
                 "for loop target must be a single name in Phase 2.0",
@@ -12105,7 +12155,11 @@ impl<'a> Lowerer<'a> {
         } else {
             None
         };
-        Some(LoopTarget { name, unpack })
+        Some(LoopTarget {
+            name,
+            global,
+            unpack,
+        })
     }
 
     /// Lower `for target in iterable:` (and its optional `else:`) to
@@ -12124,6 +12178,7 @@ impl<'a> Lowerer<'a> {
         let target_expr = target;
         let LoopTarget {
             name: var,
+            global: global_var,
             unpack: unpack_targets,
         } = self.resolve_loop_target(target, fs)?;
 
@@ -12139,43 +12194,66 @@ impl<'a> Lowerer<'a> {
 
         let Some(call) = range_call else {
             let iterable = self.expr(iter, fs);
-            let (var, cell_target, mut lowered_body) = match (var, unpack_targets) {
-                (Some(user_var), _) => {
-                    // A cell target is bound through a hidden slot: the cell
-                    // itself must stay in the user local.
-                    let (var, cell_assign) = if fs.is_cell(user_var) {
-                        let (temp, temp_expr) = self.for_temp(fs, target_expr.range());
-                        (temp, Some((user_var, temp_expr)))
-                    } else {
-                        (user_var, None)
-                    };
-                    fs.loop_depth += 1;
-                    let body = self.lower_block(loop_body, fs);
-                    fs.loop_depth -= 1;
-                    (var, cell_assign, body)
-                }
-                (None, Some(targets)) => {
-                    // `for a, b in xs` desugars to a loop over a hidden local
-                    // followed by a straight unpack of that local.
-                    let (var, value) = self.unpack_temp(fs, target_expr);
-                    let (tline, tcol) = self.span(target_expr.range());
-                    fs.loop_depth += 1;
-                    let mut body = Vec::with_capacity(loop_body.len() + 1);
-                    body.push(HStmt {
-                        kind: HStmtKind::Unpack { targets, value },
-                        line: tline,
-                        col: tcol,
-                    });
-                    body.extend(self.lower_block(loop_body, fs));
-                    fs.loop_depth -= 1;
-                    (var, None, body)
-                }
-                (None, None) => return None,
-            };
+            let (var, cell_target, global_target, mut lowered_body) =
+                match (var, global_var, unpack_targets) {
+                    (Some(user_var), _, _) => {
+                        // A cell target is bound through a hidden slot: the cell
+                        // itself must stay in the user local.
+                        let (var, cell_assign) = if fs.is_cell(user_var) {
+                            let (temp, temp_expr) = self.for_temp(fs, target_expr.range());
+                            (temp, Some((user_var, temp_expr)))
+                        } else {
+                            (user_var, None)
+                        };
+                        fs.loop_depth += 1;
+                        let body = self.lower_block(loop_body, fs);
+                        fs.loop_depth -= 1;
+                        (var, cell_assign, None, body)
+                    }
+                    (None, Some(name), None) => {
+                        // `global name`: the loop binds a hidden local and
+                        // stores it into the runtime global table on every
+                        // iteration, so the loop never allocates a local slot
+                        // for the name.
+                        let (var, value) = self.for_temp(fs, target_expr.range());
+                        fs.loop_depth += 1;
+                        let body = self.lower_block(loop_body, fs);
+                        fs.loop_depth -= 1;
+                        (var, None, Some((name, value)), body)
+                    }
+                    (None, None, Some(targets)) => {
+                        // `for a, b in xs` desugars to a loop over a hidden local
+                        // followed by a straight unpack of that local.
+                        let (var, value) = self.unpack_temp(fs, target_expr);
+                        let (tline, tcol) = self.span(target_expr.range());
+                        fs.loop_depth += 1;
+                        let mut body = Vec::with_capacity(loop_body.len() + 1);
+                        body.push(HStmt {
+                            kind: HStmtKind::Unpack { targets, value },
+                            line: tline,
+                            col: tcol,
+                        });
+                        body.extend(self.lower_block(loop_body, fs));
+                        fs.loop_depth -= 1;
+                        (var, None, None, body)
+                    }
+                    _ => return None,
+                };
             let mut body = self.loop_cell_inits(fs, loop_body, Some(target_expr), line, col);
             if let Some((target, value)) = cell_target {
                 body.push(HStmt {
                     kind: HStmtKind::CellAssign { target, value },
+                    line,
+                    col,
+                });
+            }
+            if let Some((name, value)) = global_target {
+                body.push(HStmt {
+                    kind: HStmtKind::GlobalSet {
+                        module: self.dunder_name.clone(),
+                        name,
+                        value,
+                    },
                     line,
                     col,
                 });
@@ -12203,12 +12281,22 @@ impl<'a> Lowerer<'a> {
             );
             return None;
         }
-        let var = var.expect("name target validated above");
-        let (var, cell_target) = if fs.is_cell(var) {
-            let (temp, temp_expr) = self.for_temp(fs, target_expr.range());
-            (temp, Some((var, temp_expr)))
-        } else {
-            (var, None)
+        let (var, cell_target, global_target) = match (var, global_var) {
+            (Some(user_var), _) => {
+                if fs.is_cell(user_var) {
+                    let (temp, temp_expr) = self.for_temp(fs, target_expr.range());
+                    (temp, Some((user_var, temp_expr)), None)
+                } else {
+                    (user_var, None, None)
+                }
+            }
+            (None, Some(name)) => {
+                // `global name`: the range loops over a hidden local and the
+                // body stores each value into the runtime global table.
+                let (temp, temp_expr) = self.for_temp(fs, target_expr.range());
+                (temp, None, Some((name, temp_expr)))
+            }
+            (None, None) => return None,
         };
 
         if fs.lookup("range").is_some() {
@@ -12270,6 +12358,17 @@ impl<'a> Lowerer<'a> {
         if let Some((target, value)) = cell_target {
             body.push(HStmt {
                 kind: HStmtKind::CellAssign { target, value },
+                line,
+                col,
+            });
+        }
+        if let Some((name, value)) = global_target {
+            body.push(HStmt {
+                kind: HStmtKind::GlobalSet {
+                    module: self.dunder_name.clone(),
+                    name,
+                    value,
+                },
                 line,
                 col,
             });
@@ -13055,12 +13154,13 @@ impl<'a> Lowerer<'a> {
         }
         let LoopTarget {
             name,
+            global: global_name,
             unpack: unpack_targets,
         } = self.resolve_loop_target(&s.target, fs)?;
         let iterable = self.expr(&s.iter, fs);
 
-        // A plain-name target receives the awaited value directly; cell and
-        // unpack targets need a hidden item slot first.
+        // A plain-name target receives the awaited value directly; cell,
+        // global and unpack targets need a hidden item slot first.
         let (item, item_ref) = match name {
             Some(local) if !fs.is_cell(local) => (
                 local,
@@ -13085,9 +13185,8 @@ impl<'a> Lowerer<'a> {
                 line,
                 col,
             }),
-            None => {
-                let local = name.expect("loop target validated above");
-                if fs.is_cell(local) {
+            None => match name {
+                Some(local) if fs.is_cell(local) => {
                     after_item.push(HStmt {
                         kind: HStmtKind::CellAssign {
                             target: local,
@@ -13097,7 +13196,22 @@ impl<'a> Lowerer<'a> {
                         col,
                     });
                 }
-            }
+                Some(_) => {}
+                None => {
+                    // `global name`: every iteration stores the awaited item
+                    // into the runtime global table.
+                    let name = global_name.expect("loop target validated above");
+                    after_item.push(HStmt {
+                        kind: HStmtKind::GlobalSet {
+                            module: self.dunder_name.clone(),
+                            name,
+                            value: item_ref,
+                        },
+                        line,
+                        col,
+                    });
+                }
+            },
         }
         after_item.extend(loop_body);
 
@@ -14266,12 +14380,22 @@ impl<'a> Lowerer<'a> {
                     return self.error_expr(e.range());
                 }
                 if fs.is_global(name) {
-                    self.error_at_code(
-                        n.range,
-                        codes::UNSUPPORTED,
-                        "assignment expression to a name declared global is not supported",
-                    );
-                    return self.error_expr(e.range());
+                    // `global name`: the assignment lands in the runtime global
+                    // table and yields the stored value. A generator frame can
+                    // write the table too, so this case is allowed there as
+                    // well; it has no local slot to bind.
+                    self.used_globals.insert(name.to_string());
+                    let value = self.expr(&n.value, fs);
+                    return HExpr {
+                        kind: HExprKind::GlobalSet {
+                            module: self.dunder_name.clone(),
+                            name: name.to_string(),
+                            value: Box::new(value),
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
                 }
                 if fs.genexp_frame {
                     // CPython binds the target in the enclosing function; a

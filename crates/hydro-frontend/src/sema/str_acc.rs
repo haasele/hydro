@@ -93,6 +93,8 @@ fn expr_use(expr: &Expr, local: LocalId) -> Use {
             };
             write.merge(expr_use(value, local))
         }
+        // A `global` target is a name-table write, not a local one.
+        ExprKind::GlobalSet { value, .. } => expr_use(value, local),
         ExprKind::StrBuilderNew { init } => expr_use(init, local),
         ExprKind::StrBuilderAppend { builder, value } => {
             expr_use(builder, local).merge(expr_use(value, local))
@@ -291,6 +293,7 @@ fn unpack_targets_use(targets: &[UnpackTarget], local: LocalId) -> Use {
 fn unpack_target_use(target: &UnpackTarget, local: LocalId) -> Use {
     match target {
         UnpackTarget::Name(id) | UnpackTarget::Cell(id) => local_use(*id, local),
+        UnpackTarget::Global { .. } => Use::none(),
         UnpackTarget::Star(inner) => unpack_target_use(inner, local),
         UnpackTarget::Nested(inner) => unpack_targets_use(inner, local),
         UnpackTarget::Attr { object, .. } => expr_use(object, local),

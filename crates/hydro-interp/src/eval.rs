@@ -59,6 +59,21 @@ impl Interp {
                 self.set_local(*target, value);
                 Ok(value)
             }
+            ExprKind::GlobalSet {
+                module,
+                name,
+                value,
+            } => {
+                let value = self.eval(value)?;
+                self.scratch_push(value);
+                let (module_ptr, module_len) = bytes(module);
+                let (name_ptr, name_len) = bytes(name);
+                let result =
+                    abi::hydro_global_set(module_ptr, module_len, name_ptr, name_len, value);
+                self.check(result)?;
+                self.sync_module_global(name, value);
+                Ok(value)
+            }
             ExprKind::StrBuilderNew { init } => {
                 let init = self.eval(init)?;
                 self.scratch_push(init);
@@ -1111,6 +1126,17 @@ impl Interp {
             UnpackTarget::Cell(id) => {
                 let cell = self.local(*id);
                 abi::hydro_cell_set(cell, value);
+            }
+            UnpackTarget::Global { module, name } => {
+                // `global name`: store the element in the runtime global table
+                // of the module, exactly like `StmtKind::GlobalSet`.
+                self.scratch_push(value);
+                let (module_ptr, module_len) = bytes(module);
+                let (name_ptr, name_len) = bytes(name);
+                let result =
+                    abi::hydro_global_set(module_ptr, module_len, name_ptr, name_len, value);
+                self.check(result)?;
+                self.sync_module_global(name, value);
             }
             UnpackTarget::Star(inner) => self.bind_unpack_target(inner, value)?,
             UnpackTarget::Nested(targets) => self.bind_unpack(targets, value)?,

@@ -8,6 +8,20 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — 2026-10-27 assignments to `global`-declared names
+
+- Every assignment target form now binds a name declared `global` through the
+  runtime global table instead of failing with "assignment to unknown name":
+  tuple/list unpacking (starred and nested targets included), `for` and
+  `async for` targets, annotated and chained assignments, and assignment
+  expressions. `(x := value)` with a `global` `x` stores the global and
+  yields the value, including inside a generator expression.
+- The stores keep Python's left-to-right order, so
+  `global g; g, obj[g] = 1, 2` writes `g` before `obj[g]` is evaluated.
+  `global` declarations never allocate a local slot, and a comprehension
+  target that shares the name still binds the comprehension's own scope, as
+  in CPython.
+
 ### Added — 2026-10-27 `range` subscripting and `set(iterable)`
 
 - `range` objects are subscriptable: `r[i]` returns `r.start + i * r.step`

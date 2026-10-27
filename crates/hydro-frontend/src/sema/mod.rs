@@ -1639,6 +1639,9 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
             }
             HUnpackTarget::Attr { object, .. } => self.check_expr(object, f),
+            // A `global` target stores a dynamically typed value into the
+            // runtime global table: there is no local slot to type.
+            HUnpackTarget::Global { .. } => {}
             HUnpackTarget::Subscript { object, index } => {
                 self.check_expr(object, f);
                 self.check_expr(index, f);
@@ -1853,6 +1856,12 @@ impl<'a> Checker<'a> {
                     let _ = self.inf.unify(slot, Ty::Concrete(Type::Any));
                 }
                 // The expression evaluates to the assigned value.
+                let _ = self.inf.unify(expr.ty, value.ty);
+            }
+            HExprKind::GlobalSet { value, .. } => {
+                // A module global is dynamically typed; the expression
+                // evaluates to the value it stored.
+                self.check_expr(value, f);
                 let _ = self.inf.unify(expr.ty, value.ty);
             }
             HExprKind::Bin { op, lhs, rhs } => {
@@ -4618,6 +4627,10 @@ fn emit_unpack_target(target: &HUnpackTarget, inf: &mut Infer) -> UnpackTarget {
     match target {
         HUnpackTarget::Name(id) => UnpackTarget::Name(*id),
         HUnpackTarget::Cell(id) => UnpackTarget::Cell(*id),
+        HUnpackTarget::Global { module, name } => UnpackTarget::Global {
+            module: module.clone(),
+            name: name.clone(),
+        },
         HUnpackTarget::Attr { object, name } => UnpackTarget::Attr {
             object: emit_expr(object, inf),
             name: name.clone(),
@@ -4659,6 +4672,15 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
         },
         HExprKind::NamedExpr { target, value } => ExprKind::NamedExpr {
             target: *target,
+            value: Box::new(emit_expr(value, inf)),
+        },
+        HExprKind::GlobalSet {
+            module,
+            name,
+            value,
+        } => ExprKind::GlobalSet {
+            module: module.clone(),
+            name: name.clone(),
             value: Box::new(emit_expr(value, inf)),
         },
         HExprKind::Bin { op, lhs, rhs } => ExprKind::Bin {

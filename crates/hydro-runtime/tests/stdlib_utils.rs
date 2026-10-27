@@ -38,6 +38,10 @@ fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
     hydro_method(obj, name.as_ptr(), name.len(), args.len(), args.as_ptr())
 }
 
+fn attr(obj: i64, name: &str) -> i64 {
+    hydro_getattr(obj, name.as_ptr(), name.len())
+}
+
 fn module(module: &str, function: &str, args: &[i64]) -> i64 {
     hydro_module_call(
         module.as_ptr(),
@@ -513,6 +517,41 @@ fn platform_values_are_native_and_nonempty() {
 
     let implementation = module("platform", "python_implementation", &[]);
     assert_str(implementation, "Hydro");
+}
+
+#[test]
+fn platform_uname_is_a_six_field_namedtuple() {
+    hydro_runtime_init();
+    let uname = module("platform", "uname", &[]);
+    assert_no_error();
+
+    // Each field matches the corresponding single-value accessor.
+    for (field, function) in [
+        ("system", "system"),
+        ("node", "node"),
+        ("release", "release"),
+        ("version", "version"),
+        ("machine", "machine"),
+        ("processor", "processor"),
+    ] {
+        let field_value = attr(uname, field);
+        let direct = module("platform", function, &[]);
+        assert_no_error();
+        assert!(
+            eq(field_value, direct),
+            "uname.{field} differs from platform.{function}()"
+        );
+    }
+
+    // Six fields in CPython's order, with tuple-style indexing.
+    assert_int(hydro_len(uname), 6);
+    let system = attr(uname, "system");
+    assert_no_error();
+    assert!(eq(hydro_subscript(uname, int(0)), system));
+    let processor = attr(uname, "processor");
+    assert_no_error();
+    assert!(eq(hydro_subscript(uname, int(-1)), processor));
+    assert_no_error();
 }
 
 // -------------------------------------------------------------------------

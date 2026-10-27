@@ -1480,6 +1480,7 @@ fn count_expr(expr: &Expr) -> usize {
         | ExprKind::GlobalGet { .. }
         | ExprKind::ExtensionAttr { .. } => 0,
         ExprKind::CellSet { value, .. } | ExprKind::NamedExpr { value, .. } => count_expr(value),
+        ExprKind::GlobalSet { value, .. } => count_expr(value),
         ExprKind::StrBuilderNew { init } => count_expr(init),
         ExprKind::StrBuilderAppend { builder, value } => count_expr(builder) + count_expr(value),
         ExprKind::StrBuilderFinish { builder } => count_expr(builder),
@@ -1636,7 +1637,7 @@ fn count_unpack_targets(targets: &[UnpackTarget]) -> usize {
 
 fn count_unpack_target(target: &UnpackTarget) -> usize {
     1 + match target {
-        UnpackTarget::Name(_) | UnpackTarget::Cell(_) => 0,
+        UnpackTarget::Name(_) | UnpackTarget::Cell(_) | UnpackTarget::Global { .. } => 0,
         UnpackTarget::Star(inner) => count_unpack_target(inner),
         UnpackTarget::Attr { object, .. } => count_expr(object),
         UnpackTarget::Subscript { object, index } => count_expr(object) + count_expr(index),
@@ -3793,6 +3794,28 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     self.define_var(var, value)?;
                 }
             }
+            UnpackTarget::Global { module, name } => {
+                // `global name`: the element has no receiver to evaluate and
+                // no local slot to fill, so it goes straight into the runtime
+                // global table of the module.
+                let module_args = self.module_name_args(module)?;
+                let name_args = self.module_name_args(name)?;
+                let mark = self.scratch_mark();
+                self.scratch_push(value)?;
+                let id = self.runtime.global_set;
+                let _ = self.call_rt(
+                    id,
+                    &[
+                        module_args.0,
+                        module_args.1,
+                        name_args.0,
+                        name_args.1,
+                        value,
+                    ],
+                )?;
+                self.scratch_release(mark)?;
+                self.emit_exc_check()?;
+            }
             UnpackTarget::Attr { object, name } => {
                 // Park the element while the receiver expression runs: the
                 // calls it may make can trigger a collection or raise.
@@ -4250,6 +4273,34 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let var = self.local_var(*target)?;
                 let value = self.lower_expr(value)?;
                 self.define_var(var, value)?;
+                Ok(value)
+            }
+            ExprKind::GlobalSet {
+                module,
+                name,
+                value,
+            } => {
+                // Store into the runtime global table and yield the stored
+                // value, so an assignment expression to a `global` name has
+                // the value of its right-hand side.
+                let module_args = self.module_name_args(module)?;
+                let name_args = self.module_name_args(name)?;
+                let mark = self.scratch_mark();
+                let value = self.lower_expr(value)?;
+                self.scratch_push(value)?;
+                let id = self.runtime.global_set;
+                let _ = self.call_rt(
+                    id,
+                    &[
+                        module_args.0,
+                        module_args.1,
+                        name_args.0,
+                        name_args.1,
+                        value,
+                    ],
+                )?;
+                self.scratch_release(mark)?;
+                self.emit_exc_check()?;
                 Ok(value)
             }
             // Internal string accumulator; the frontend only emits these for

@@ -793,7 +793,10 @@ Central specification in `hydro_ir::stdlib` (`MODULES` in
   `isatty()`. They are fresh GC-safe objects per resolution (no Hydro
   children) and expose no other attributes.
 - `platform`: `system`/`machine`/`release`/`version`/`node`/`platform`/
-  `python_version`, `python_implementation() == "Hydro"`.
+  `uname`/`python_version`, `python_implementation() == "Hydro"`.
+  `uname()` returns a six-field namedtuple-shaped value
+  (`system`/`node`/`release`/`version`/`machine`/`processor`) that
+  supports attribute access, iteration, `len()` and indexing.
 - `statistics`: `mean`/`fmean`/`median`/`pstdev`/`stdev` including error paths.
 - `pathlib`: native `Path` (`Path()`, `cwd()`, `home()`) with
   `exists`/`is_file`/`is_dir`, `read_text`/`write_text`, `read_bytes`/
@@ -998,6 +1001,15 @@ it. The cache is not a shared artifact store.
   `AttributeError`. Starred unpack targets (`a, *rest, b = value`) bind a
   fresh list of the middle elements through `hydro_unpack_star`; one star is
   allowed per sequence level, including inside a nested container target.
+- A name declared `global` in a function has no local slot: reads lower to
+  `GlobalGet`, and every target form stores through `GlobalSet` — simple,
+  annotated and chained assignments, augmented assignment (which reads
+  `GlobalGet` first), sequence unpacking (`UnpackTarget::Global`, bound in
+  source order so a later receiver observes the stored value), `for`/
+  `async for` targets (a hidden iteration slot plus one store per iteration)
+  and assignment expressions (`ExprKind::GlobalSet`, which yields the stored
+  value). A comprehension target of the same name still binds the
+  comprehension's synthetic local, as in CPython.
 - `functools.partial(func, *args, **kwargs)` keeps keyword names: the
   frontend forwards them through `hydro_module_call_kw`, the runtime stores
   `(name, value)` pairs in the partial and applies them at call time using

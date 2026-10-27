@@ -239,6 +239,9 @@ pub static PLATFORM: ModuleSpec = ModuleSpec {
         f("python_version", 0, 0, Type::Str),
         f("python_implementation", 0, 0, Type::Str),
         f("processor", 0, 0, Type::Str),
+        // `platform.uname()`: CPython's `uname_result` namedtuple with
+        // `system`/`node`/`release`/`version`/`machine`/`processor`.
+        f("uname", 0, 0, Type::Any),
     ],
     constants: &[],
 };
@@ -3569,6 +3572,11 @@ mod tests {
         assert_eq!((realpath.min_args, realpath.max_args), (1, 2));
         assert!(realpath.dynamic_keywords);
         assert_eq!(function("platform", "processor").unwrap().ret, Type::Str);
+        let uname = function("platform", "uname").expect("platform.uname");
+        assert_eq!(
+            (uname.min_args, uname.max_args, uname.ret),
+            (0, 0, Type::Any)
+        );
     }
 
     #[test]

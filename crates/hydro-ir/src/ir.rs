@@ -40,6 +40,10 @@ pub enum UnpackTarget {
     Name(LocalId),
     /// Bind through the closure cell stored in a local slot.
     Cell(LocalId),
+    /// Bind a module-level name in the runtime global table (`global name`
+    /// inside a function). The target has no local slot, so the element is
+    /// stored through `hydro_global_set` when the target binds.
+    Global { module: String, name: String },
     /// `*name = element`: `element` is a fresh list holding the elements the
     /// plain targets around it did not consume (`a, *rest, b = value`). At
     /// most one starred target is allowed per sequence level; a nested
@@ -128,6 +132,14 @@ pub enum ExprKind {
     /// operand exactly once.
     NamedExpr {
         target: LocalId,
+        value: Box<Expr>,
+    },
+    /// `(name := value)` where `name` is declared `global`. Evaluates `value`,
+    /// stores it in the runtime global table of `module` and yields the same
+    /// value. The name has no local slot.
+    GlobalSet {
+        module: String,
+        name: String,
         value: Box<Expr>,
     },
     /// Start of a proved string accumulator: allocates a mutable builder
