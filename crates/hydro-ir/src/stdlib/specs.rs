@@ -151,6 +151,12 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     f("truth", 1, 1, Type::Bool),
     // `operator.index(a)`: `a.__index__()`, or `a` itself for exact integers.
     f("index", 1, 1, Type::Int),
+    // `operator.getitem(a, b)`: the subscript `a[b]`.
+    f("getitem", 2, 2, Type::Any),
+    // `operator.setitem(a, b, v)`: the assignment `a[b] = v`, returning `None`.
+    f("setitem", 3, 3, Type::None),
+    // `operator.delitem(a, b)`: the deletion `del a[b]`, returning `None`.
+    f("delitem", 2, 2, Type::None),
     f("attrgetter", 1, usize::MAX, Type::Function),
     f("itemgetter", 1, usize::MAX, Type::Function),
 ];
@@ -3903,6 +3909,19 @@ mod tests {
         let index = function("operator", "index").expect("operator.index");
         assert_eq!((index.min_args, index.max_args), (1, 1));
         assert_eq!(index.ret, Type::Int);
+        let getitem = function("operator", "getitem").expect("operator.getitem");
+        assert_eq!((getitem.min_args, getitem.max_args), (2, 2));
+        assert_eq!(getitem.ret, Type::Any);
+        let setitem = function("operator", "setitem").expect("operator.setitem");
+        assert_eq!((setitem.min_args, setitem.max_args), (3, 3));
+        assert_eq!(setitem.ret, Type::None);
+        let delitem = function("operator", "delitem").expect("operator.delitem");
+        assert_eq!((delitem.min_args, delitem.max_args), (2, 2));
+        assert_eq!(delitem.ret, Type::None);
+        assert_eq!(
+            function("_operator", "getitem").map(|spec| spec.min_args),
+            Some(2)
+        );
         assert_eq!(
             function("_operator", "index").map(|spec| spec.min_args),
             Some(1)

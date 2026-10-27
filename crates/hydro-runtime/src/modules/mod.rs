@@ -4152,6 +4152,10 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
         }
         "itemgetter" => return value::item_getter_new(args.to_vec()),
         "index" => return operator_index(args[0]),
+        // The subscript protocols, exactly as the `[]` syntax performs them.
+        "getitem" => return container::subscript(args[0], args[1]),
+        "setitem" => return container::subscript_set(args[0], args[1], args[2]),
+        "delitem" => return container::delete_subscript(args[0], args[1]),
         _ => {}
     }
     let binary = match function {
@@ -9615,6 +9619,78 @@ mod tests {
             message(),
             "'float' object cannot be interpreted as an integer"
         );
+    }
+
+    #[test]
+    fn operator_getitem_setitem_delitem_drive_the_subscript_protocol() {
+        exc::init();
+        // Reads go through the same paths as `a[b]`: sequences, strings and
+        // mappings, including negative indices and missing keys' `KeyError`.
+        let list = value::list_new(vec![int(1), int(2), int(3)]);
+        assert_eq!(as_int(call("operator", "getitem", &[list, int(1)])), 2);
+        assert_eq!(as_int(call("operator", "getitem", &[list, int(-1)])), 3);
+        assert_eq!(
+            value::as_str(call("operator", "getitem", &[string("abc"), int(1)])),
+            Some("b")
+        );
+        let dict = value::dict_new(vec![(string("a"), int(4))]);
+        assert_eq!(as_int(call("operator", "getitem", &[dict, string("a")])), 4);
+
+        // Writes mutate the receiver in place and return `None`, exactly like
+        // the statement form.
+        assert_eq!(call("operator", "setitem", &[list, int(0), int(9)]), NONE);
+        assert_eq!(as_int(call("operator", "getitem", &[list, int(0)])), 9);
+        assert_eq!(
+            call("operator", "setitem", &[dict, string("b"), int(5)]),
+            NONE
+        );
+        assert_eq!(as_int(call("operator", "getitem", &[dict, string("b")])), 5);
+
+        // Deletions shrink the receiver and also return `None`.
+        assert_eq!(call("operator", "delitem", &[list, int(0)]), NONE);
+        assert_eq!(as_int(call("operator", "getitem", &[list, int(0)])), 2);
+        assert_eq!(call("operator", "delitem", &[dict, string("a")]), NONE);
+        assert!(!exc::pending());
+        let missing = call("operator", "getitem", &[dict, string("a")]);
+        assert_eq!(missing, NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::KEY_ERROR as i64);
+        assert_eq!(message(), "'a'");
+        exc::init();
+
+        // `_operator` is the same module table.
+        assert_eq!(as_int(call("_operator", "getitem", &[list, int(0)])), 2);
+        assert_eq!(call("_operator", "delitem", &[list, int(0)]), NONE);
+        assert_eq!(as_int(call("_operator", "getitem", &[list, int(0)])), 3);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn operator_subscript_errors_match_the_syntax() {
+        // A non-subscriptable receiver and an out-of-range index report the
+        // same messages as `a[b]`.
+        exc::init();
+        assert_eq!(call("operator", "getitem", &[int(1), int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "'int' object is not subscriptable");
+
+        exc::init();
+        let list = value::list_new(vec![int(1)]);
+        assert_eq!(call("operator", "getitem", &[list, int(3)]), NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::INDEX_ERROR as i64);
+        assert_eq!(message(), "list index out of range");
+
+        // Assignment and deletion on an immutable sequence fail like the
+        // statement form.
+        exc::init();
+        let tuple = value::tuple_new(vec![int(1)]);
+        assert_eq!(call("operator", "setitem", &[tuple, int(0), int(2)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "'tuple' object does not support item assignment");
+
+        exc::init();
+        assert_eq!(call("operator", "delitem", &[tuple, int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "'tuple' object does not support item deletion");
     }
 
     #[test]
