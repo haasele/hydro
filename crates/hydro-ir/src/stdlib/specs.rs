@@ -25,6 +25,11 @@ pub static MATH: ModuleSpec = ModuleSpec {
         // `gcd(*integers)`: CPython accepts any number of integers (zero
         // arguments return 0) and rejects floats.
         f("gcd", 0, usize::MAX, Type::Int),
+        // `prod(iterable, *, start=1)`: the result type follows the operands
+        // (`int`, promoted `BigInt`, `float`, or a sequence repeated by an
+        // integer start), so it stays dynamic. `start` is keyword-only, hence
+        // `dynamic_keywords` rather than a positional slot.
+        kw_dynamic("prod", 1, 1, Type::Any, &["iterable"]),
     ],
     constants: &[
         c("pi", Type::Float),
@@ -121,6 +126,8 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     f("le", 2, 2, Type::Bool),
     f("gt", 2, 2, Type::Bool),
     f("ge", 2, 2, Type::Bool),
+    // `operator.or_(a, b)`: bitwise/logical OR (`a | b`).
+    f("or_", 2, 2, Type::Any),
     f("neg", 1, 1, Type::Any),
     f("not_", 1, 1, Type::Bool),
     f("truth", 1, 1, Type::Bool),
@@ -473,6 +480,15 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // stores it for the whole process.
         f("getrecursionlimit", 0, 0, Type::Int),
         f("setrecursionlimit", 1, 1, Type::None),
+        // `sys._getframemodulename(depth=0)` reports the module name of a
+        // caller frame, and `sys._getframe(depth=0)` returns that frame.
+        // Hydro has no reified frame objects, so the first reports `None`
+        // (module metadata is unavailable) and the second raises instead of
+        // fabricating a frame.
+        kw("_getframemodulename", 0, 1, Type::Any, &["depth"]),
+        // `sys._getframe()` rejects keywords in CPython (it is C-level), so
+        // this stays positional-only.
+        f("_getframe", 0, 1, Type::Any),
     ],
     constants: &[
         c("argv", Type::List),
@@ -1025,7 +1041,24 @@ pub static ASYNCIO: ModuleSpec = ModuleSpec {
         // `from asyncio import TaskGroup; TaskGroup()` callable.
         f("TaskGroup", 0, 0, Type::Any),
     ],
-    constants: &[c("CancelledError", Type::Any)],
+    constants: &[
+        c("CancelledError", Type::Any),
+        // `from asyncio import coroutines` resolves the nested module; the
+        // attribute value is the native submodule itself.
+        c("coroutines", Type::Any),
+    ],
+};
+
+/// `asyncio.coroutines`: the coroutine-function marker submodule.
+///
+/// The only member the compatibility corpus reaches is `_is_coroutine`, the
+/// identity sentinel assigned to a callable's `_is_coroutine` attribute so
+/// `asyncio.iscoroutinefunction` recognises decorated coroutine functions.
+/// The runtime materialises one stable object for it.
+pub static ASYNCIO_COROUTINES: ModuleSpec = ModuleSpec {
+    name: "asyncio.coroutines",
+    functions: &[],
+    constants: &[c("_is_coroutine", Type::Any)],
 };
 
 /// `errno`: POSIX error numbers and the `errorcode` reverse mapping.
@@ -1644,7 +1677,11 @@ pub static TYPING: ModuleSpec = ModuleSpec {
         // is_class=False)`: the runtime returns the native class for the
         // attribute value and constructs instances through this call.
         kw_dynamic("ForwardRef", 0, 6, Type::Any, &[]),
-        f("get_type_hints", 0, 1, Type::Dict),
+        // `get_type_hints(obj, globalns=None, localns=None,
+        // include_extras=False, *, format=None)`: all keywords are parsed by
+        // the runtime so omitted leading scopes do not shift later ones.
+        kw_dynamic("get_type_hints", 0, 5, Type::Dict, &[]),
+        kw("_get_defaults", 1, 1, Type::Dict, &["func"]),
         f("get_args", 1, 1, Type::Tuple),
         // Import-time dependencies of `typing_extensions` on Python 3.14:
         // `get_origin` and `final` are assigned unconditionally, and
@@ -3249,6 +3286,9 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         f("isroutine", 1, 1, Type::Bool),
         f("isgeneratorfunction", 1, 1, Type::Bool),
         f("iscoroutinefunction", 1, 1, Type::Bool),
+        // `inspect.markcoroutinefunction(func)`: tags a callable so
+        // `iscoroutinefunction(func)` reports `True` without a code object.
+        kw("markcoroutinefunction", 1, 1, Type::Any, &["func"]),
         f("isasyncgenfunction", 1, 1, Type::Bool),
         f("isgenerator", 1, 1, Type::Bool),
         f("iscoroutine", 1, 1, Type::Bool),
@@ -3458,10 +3498,13 @@ mod tests {
         let typevar = function("typing", "TypeVar").unwrap();
         assert_eq!((typevar.min_args, typevar.max_args), (1, 3));
         assert_eq!(function("typing", "NewType").unwrap().min_args, 2);
-        assert_eq!(
-            function("typing", "get_type_hints").unwrap().ret,
-            Type::Dict
-        );
+        let hints = function("typing", "get_type_hints").unwrap();
+        assert_eq!(hints.ret, Type::Dict);
+        assert!(hints.dynamic_keywords);
+        assert_eq!(hints.max_args, 5);
+        let defaults = function("typing", "_get_defaults").expect("_get_defaults");
+        assert_eq!((defaults.min_args, defaults.max_args), (1, 1));
+        assert_eq!(defaults.ret, Type::Dict);
         assert_eq!(constant("typing", "TYPE_CHECKING").unwrap().ty, Type::Bool);
         for name in [
             "Any",
@@ -3793,6 +3836,13 @@ mod tests {
             function("operator", "attrgetter").unwrap().ret,
             Type::Function
         );
+        let bit_or = function("operator", "or_").expect("operator.or_");
+        assert_eq!((bit_or.min_args, bit_or.max_args), (2, 2));
+        assert_eq!(bit_or.ret, Type::Any);
+        assert_eq!(
+            function("_operator", "or_").map(|spec| spec.min_args),
+            Some(2)
+        );
         for name in [
             "_unwrap_partial",
             "_unwrap_partialmethod",
@@ -3860,6 +3910,52 @@ mod tests {
     }
 
     #[test]
+    fn math_prod_is_registered_with_a_keyword_only_start() {
+        let prod = function("math", "prod").expect("math.prod");
+        // `iterable` is the only positional slot; `start` is keyword-only.
+        assert_eq!((prod.min_args, prod.max_args), (1, 1));
+        assert_eq!(prod.ret, Type::Any);
+        assert!(prod.dynamic_keywords);
+        assert_eq!(prod.params, &["iterable"][..]);
+    }
+
+    #[test]
+    fn inspect_coroutine_markers_and_nested_asyncio_specs_are_declared() {
+        let marker = function("inspect", "markcoroutinefunction").expect("markcoroutinefunction");
+        assert_eq!((marker.min_args, marker.max_args), (1, 1));
+        assert_eq!(marker.params, &["func"][..]);
+        assert_eq!(marker.ret, Type::Any);
+        let predicate = function("inspect", "iscoroutinefunction").expect("iscoroutinefunction");
+        assert_eq!(predicate.ret, Type::Bool);
+
+        assert_eq!(
+            crate::stdlib::module("asyncio.coroutines")
+                .expect("asyncio.coroutines spec")
+                .name,
+            "asyncio.coroutines"
+        );
+        assert_eq!(
+            constant("asyncio.coroutines", "_is_coroutine")
+                .expect("_is_coroutine")
+                .ty,
+            Type::Any
+        );
+        // `from asyncio import coroutines` sees the nested module as a
+        // dynamically typed constant.
+        assert_eq!(
+            constant("asyncio", "coroutines")
+                .expect("asyncio.coroutines")
+                .ty,
+            Type::Any
+        );
+        // The nested module is a package submodule of `asyncio`.
+        assert_eq!(
+            crate::stdlib::module("asyncio").expect("asyncio spec").name,
+            "asyncio"
+        );
+    }
+
+    #[test]
     fn sys_registry_and_builtins_specs_are_declared() {
         for (name, ty) in [
             ("path", Type::List),
@@ -3890,6 +3986,20 @@ mod tests {
         let set_limit = function("sys", "setrecursionlimit").expect("setrecursionlimit");
         assert_eq!((set_limit.min_args, set_limit.max_args), (1, 1));
         assert_eq!(set_limit.ret, Type::None);
+        let frame_module = function("sys", "_getframemodulename").expect("_getframemodulename");
+        assert_eq!(
+            (
+                frame_module.min_args,
+                frame_module.max_args,
+                frame_module.ret
+            ),
+            (0, 1, Type::Any)
+        );
+        let frame = function("sys", "_getframe").expect("_getframe");
+        assert_eq!(
+            (frame.min_args, frame.max_args, frame.ret),
+            (0, 1, Type::Any)
+        );
         assert_eq!(
             crate::stdlib::module("builtins")
                 .expect("builtins spec")

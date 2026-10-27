@@ -33,6 +33,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::fiber::{self, FiberKind, WaitRequest};
 use crate::iter;
@@ -922,4 +923,24 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "TaskGroup" => task_group_new(),
         _ => missing_attribute(function),
     }
+}
+
+/// Materialises a constant of the nested `asyncio.coroutines` module.
+///
+/// `_is_coroutine` is an identity sentinel: decorated coroutine functions
+/// store it in their `_is_coroutine` attribute and
+/// `asyncio.iscoroutinefunction` (and the compatibility shims around
+/// `inspect.iscoroutinefunction`) compare with `is`. One cached plain object
+/// gives that comparison stable identity across reads.
+pub(crate) fn coroutines_constant(name: &str) -> Option<i64> {
+    if name != "_is_coroutine" {
+        return None;
+    }
+    let key = "asyncio.coroutines._is_coroutine";
+    if let Some(cached) = globals::registry_get(key) {
+        return Some(cached);
+    }
+    let sentinel = value::instance_new(value::object_class());
+    globals::registry_set(key, sentinel);
+    Some(sentinel)
 }

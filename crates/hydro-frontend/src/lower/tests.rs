@@ -537,6 +537,259 @@ fn relative_import_outside_a_package_is_rejected() {
     assert_eq!(diags[0].code, codes::UNSUPPORTED);
 }
 
+/// Builds the linked module the loader hands the lowerer for `name`.
+fn user_module(name: &str, exports: &[(&str, UserExport)]) -> UserModule {
+    UserModule {
+        name: name.to_string(),
+        exports: exports
+            .iter()
+            .map(|(member, export)| (member.to_string(), *export))
+            .collect(),
+        all: None,
+    }
+}
+
+/// Lowers `source` as the package submodule `pkg/sub.py` with `modules`
+/// linked and `late` naming the modules that are still initializing.
+fn lower_package_submodule<'a>(
+    source: &'a str,
+    infer: &'a mut Infer,
+    modules: Vec<UserModule>,
+    late: &[&str],
+) -> Lowerer<'a> {
+    let mut lowerer = Lowerer::new(source, "pkg/sub.py", infer);
+    lowerer.set_dunder_name("pkg.sub");
+    lowerer.set_package("pkg");
+    lowerer.set_user_modules(
+        modules
+            .into_iter()
+            .map(|module| (module.name.clone(), module))
+            .collect(),
+    );
+    lowerer.set_late_modules(late.iter().map(|name| name.to_string()).collect());
+    lowerer
+}
+
+#[test]
+fn relative_from_import_prefers_a_sibling_module() {
+    // `from . import sibling` names the file `pkg/sibling.py`, not an
+    // attribute of `pkg/__init__.py`, and the binding keeps that identity.
+    let source = "from . import sibling\nm = sibling\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lower_package_submodule(
+        source,
+        &mut infer,
+        vec![user_module("pkg", &[]), user_module("pkg.sibling", &[])],
+        &[],
+    );
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "m").kind {
+        HExprKind::ModuleRef { module } => assert_eq!(module, "pkg.sibling"),
+        other => panic!("expected the sibling module value, got {other:?}"),
+    }
+}
+
+#[test]
+fn relative_from_import_binds_a_sibling_package() {
+    // `pkg/sibling/__init__.py` is a package: the binding is the subpackage
+    // itself, so its exports link directly.
+    let source = "from . import sibling\nx = sibling.value()\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lower_package_submodule(
+        source,
+        &mut infer,
+        vec![
+            user_module("pkg", &[]),
+            user_module("pkg.sibling", &[("value", UserExport::Function(7))]),
+        ],
+        &[],
+    );
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "x").kind {
+        HExprKind::Call {
+            callee: Callee::Function(7),
+            args,
+        } => assert!(args.is_empty(), "{args:?}"),
+        other => panic!("expected the linked subpackage function, got {other:?}"),
+    }
+}
+
+#[test]
+fn relative_from_import_mixes_submodules_and_package_attributes() {
+    // A submodule name binds the module; every other name falls back to the
+    // package `__init__` exports, both functions and values.
+    let source = "from . import sibling, CONST, helper\nm = sibling\nc = CONST\ny = helper(1)\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lower_package_submodule(
+        source,
+        &mut infer,
+        vec![
+            user_module(
+                "pkg",
+                &[
+                    ("CONST", UserExport::Global),
+                    ("helper", UserExport::Function(3)),
+                ],
+            ),
+            user_module("pkg.sibling", &[]),
+        ],
+        &[],
+    );
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "m").kind {
+        HExprKind::ModuleRef { module } => assert_eq!(module, "pkg.sibling"),
+        other => panic!("expected the sibling module value, got {other:?}"),
+    }
+    match &assigned(&hir, "c").kind {
+        HExprKind::GlobalGet { module, name } => {
+            assert_eq!((module.as_str(), name.as_str()), ("pkg", "CONST"))
+        }
+        other => panic!("expected the package value, got {other:?}"),
+    }
+
+    // A linked package function may lower to either direct-call shape; both
+    // must resolve to the package's `helper` id with the one argument intact.
+    match &assigned(&hir, "y").kind {
+        HExprKind::Call {
+            callee: Callee::Function(3),
+            args,
+        } => assert_eq!(args.len(), 1),
+        HExprKind::CallKw {
+            callee,
+            args,
+            keywords,
+        } if matches!(&callee.kind, HExprKind::FunctionRef(3)) => {
+            assert_eq!(args.len(), 1);
+            assert!(keywords.is_empty(), "{keywords:?}");
+        }
+        other => panic!("expected the linked package function, got {other:?}"),
+    }
+}
+
+#[test]
+fn relative_from_import_keeps_aliases_on_their_submodules() {
+    // Multiple aliases in one statement keep their own module identity.
+    let source = "from . import sibling as sub, other\nx = sub\ny = other\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lower_package_submodule(
+        source,
+        &mut infer,
+        vec![
+            user_module("pkg", &[]),
+            user_module("pkg.sibling", &[]),
+            user_module("pkg.other", &[]),
+        ],
+        &[],
+    );
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    for (binding, expected) in [("x", "pkg.sibling"), ("y", "pkg.other")] {
+        match &assigned(&hir, binding).kind {
+            HExprKind::ModuleRef { module } => assert_eq!(module, expected),
+            other => panic!("expected the module value '{expected}', got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn relative_from_import_of_a_missing_name_reports_once() {
+    // Neither a submodule nor an export of the linked package: one
+    // diagnostic, and the binding is not also treated as a module.
+    let source = "from . import missing\n";
+    let mut infer = Infer::new();
+    let mut lowerer =
+        lower_package_submodule(source, &mut infer, vec![user_module("pkg", &[])], &[]);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(
+        hir.functions[0].body.is_empty(),
+        "{:?}",
+        hir.functions[0].body
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::ATTRIBUTE);
+    assert!(
+        diags[0].message.contains("'pkg'") && diags[0].message.contains("'missing'"),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn relative_from_import_binds_an_initializing_sibling_submodule() {
+    // NumPy's `numpy/_core/shape_base.py` imports `numeric` while `numeric`
+    // imports `shape_base` back: `numeric` has no linked unit, but it is a
+    // sibling submodule, so the binding must be the module itself — never a
+    // `pkg` attribute, which CPython would not consult either.
+    let source =
+        "from . import fromnumeric as _from_nx, numeric as _nx, overrides\na = _from_nx\nb = _nx\nc = overrides\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lower_package_submodule(
+        source,
+        &mut infer,
+        vec![
+            user_module("pkg", &[]),
+            user_module("pkg.fromnumeric", &[]),
+            user_module("pkg.overrides", &[]),
+        ],
+        &["pkg", "pkg.numeric"],
+    );
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    for (binding, expected) in [
+        ("a", "pkg.fromnumeric"),
+        ("b", "pkg.numeric"),
+        ("c", "pkg.overrides"),
+    ] {
+        match &assigned(&hir, binding).kind {
+            HExprKind::ModuleRef { module } => assert_eq!(module, expected),
+            other => panic!("expected the module value '{expected}', got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn relative_from_import_falls_back_to_a_late_package_attribute() {
+    // The package is still initializing, so its export table is unknown: the
+    // non-submodule name keeps the package attribute lookup through the
+    // runtime global table (the same binding the late branch produces).
+    let source = "from . import sibling, CONST\nm = sibling\nc = CONST\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lower_package_submodule(
+        source,
+        &mut infer,
+        vec![user_module("pkg.sibling", &[])],
+        &["pkg"],
+    );
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "m").kind {
+        HExprKind::ModuleRef { module } => assert_eq!(module, "pkg.sibling"),
+        other => panic!("expected the sibling module value, got {other:?}"),
+    }
+    match &assigned(&hir, "c").kind {
+        HExprKind::GlobalGet { module, name } => {
+            assert_eq!((module.as_str(), name.as_str()), ("pkg", "CONST"))
+        }
+        other => panic!("expected the late package attribute, got {other:?}"),
+    }
+}
+
 #[test]
 fn native_star_import_expands_spec_functions_and_constants() {
     let source = "from math import *\nx = sqrt(9)\ny = pi\n";
@@ -2258,6 +2511,147 @@ fn subscript_slice_lowers_with_optional_bounds() {
         panic!("expected a slice");
     };
     assert!(start.is_none() && stop.is_none() && step.is_none());
+}
+
+/// The `slice(start, stop, step)` call that a slice element of a subscript
+/// index lowers to. Returns the argument list.
+fn slice_value_args(expr: &HExpr) -> &[HExpr] {
+    let HExprKind::IndirectCall {
+        callee,
+        args,
+        star: None,
+    } = &expr.kind
+    else {
+        panic!("expected a slice value call, got {:?}", expr.kind);
+    };
+    assert!(
+        matches!(
+            &callee.kind,
+            HExprKind::ModuleAttr { module, name }
+                if module.as_str() == "builtins" && name.as_str() == "slice"
+        ),
+        "expected the builtins.slice class value, got {:?}",
+        callee.kind
+    );
+    args
+}
+
+#[test]
+fn subscript_tuple_slice_elements_build_slice_values() {
+    let source = "\
+a = [[1, 2], [3, 4]]
+x = a[:, 1]
+y = a[1, :]
+z = a[::2, ...]
+w = a[0:1]
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    // A tuple index carrying a slice is a dynamic key: sema leaves the
+    // verdict to the receiver instead of demanding an integer index.
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+
+    let HExprKind::Subscript { index, .. } = &assigned(&hir, "x").kind else {
+        panic!("expected a subscript, got {:?}", assigned(&hir, "x").kind);
+    };
+    let HExprKind::Tuple(elems) = &index.kind else {
+        panic!("expected a tuple index, got {:?}", index.kind);
+    };
+    assert_eq!(elems.len(), 2);
+    let args = slice_value_args(&elems[0]);
+    assert_eq!(args.len(), 3);
+    for arg in args {
+        assert!(
+            matches!(&arg.kind, HExprKind::Const(Const::None)),
+            "omitted bounds become None, got {:?}",
+            arg.kind
+        );
+    }
+    assert!(matches!(&elems[1].kind, HExprKind::Const(Const::Int(1))));
+
+    let HExprKind::Subscript { index, .. } = &assigned(&hir, "y").kind else {
+        panic!("expected a subscript, got {:?}", assigned(&hir, "y").kind);
+    };
+    let HExprKind::Tuple(elems) = &index.kind else {
+        panic!("expected a tuple index, got {:?}", index.kind);
+    };
+    assert!(matches!(&elems[0].kind, HExprKind::Const(Const::Int(1))));
+    assert_eq!(slice_value_args(&elems[1]).len(), 3);
+
+    let HExprKind::Subscript { index, .. } = &assigned(&hir, "z").kind else {
+        panic!("expected a subscript, got {:?}", assigned(&hir, "z").kind);
+    };
+    let HExprKind::Tuple(elems) = &index.kind else {
+        panic!("expected a tuple index, got {:?}", index.kind);
+    };
+    let args = slice_value_args(&elems[0]);
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(&args[1].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(&args[2].kind, HExprKind::Const(Const::Int(2))));
+    assert!(matches!(&elems[1].kind, HExprKind::Const(Const::Ellipsis)));
+
+    // A direct `a[start:stop:step]` keeps the native fast path.
+    assert!(matches!(&assigned(&hir, "w").kind, HExprKind::Slice { .. }));
+}
+
+#[test]
+fn slice_outside_a_subscript_is_rejected() {
+    // The parser only produces slice syntax inside a subscript, so build the
+    // illegal shape by lifting the parsed `1:2` node into a standalone
+    // assignment value.
+    let source = "a = 'abc'\nx = a[1:2]\n";
+    let mut module = parse(source);
+    let slice = match &module.body[1] {
+        ast::Stmt::Assign(assign) => match &*assign.value {
+            ast::Expr::Subscript(sub) => (*sub.slice).clone(),
+            other => panic!("expected a subscript, got {other:?}"),
+        },
+        other => panic!("expected an assignment, got {other:?}"),
+    };
+    let ast::Stmt::Assign(assign) = &mut module.body[1] else {
+        panic!("expected an assignment");
+    };
+    *assign.value = slice;
+    let (_, _, diags) = lower_source(source, &module);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(
+        diags[0].message,
+        "slice syntax is only supported inside a subscript"
+    );
+}
+
+#[test]
+fn sema_accepts_slice_tuple_indices_on_native_sequences() {
+    let source = "\
+s = 'abc'
+xs = [1, 2]
+t = (1, 2)
+raw = b'ab'
+a = s[:, 1]
+c = xs[:, 0]
+d = t[0, :]
+e = raw[::2, 0]
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+    // A dynamic key has no static result type: the runtime raises the
+    // CPython `TypeError` for the native sequences.
+    for name in ["a", "c", "d", "e"] {
+        assert_eq!(
+            infer.resolve(assigned(&hir, name).ty),
+            Ty::Concrete(Type::Any),
+            "{name}"
+        );
+    }
+
+    // A tuple index without a slice keeps the static integer check.
+    let source = "xs = [1, 2]\ny = xs[1, 2]\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let errors = crate::sema::check(&hir, &mut infer, "test.py").expect_err("expected errors");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].message, "list index must be int, not tuple");
 }
 
 #[test]

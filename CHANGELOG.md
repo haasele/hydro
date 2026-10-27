@@ -8,6 +8,60 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 NumPy-style slice subscripts
+
+- A slice is a legal element of a tuple/list subscript index
+  (`ary[:, 1]`, `ary[1, :]`, `ary[::2, ...]`): each `start:stop:step`
+  element lowers to a real `slice` value built from the cached
+  `builtins.slice` class, with `None` for every omitted bound. Direct
+  `ary[start:stop:step]` keeps its native fast path, and slice syntax
+  outside a subscript still reports `HYD0202`.
+- Sema treats a tuple index that carries a slice as a dynamic key for
+  list/str/bytes/tuple receivers, leaving the verdict to the runtime
+  `__getitem__` or native sequence check instead of reporting a static
+  integer-index diagnostic. User `__getitem__` methods receive the tuple
+  with the slice objects in it.
+
+### Added — 2026-10-27 pydantic/`typing_extensions` stdlib surface
+
+- `operator.or_` (and `_operator.or_`) implements bitwise OR for integers and
+  set union for sets through the shared binary-operator engine.
+- `typing.get_type_hints(obj, globalns=None, localns=None,
+  include_extras=False, *, format=None)` accepts the full CPython keyword set
+  and reports the annotations Hydro actually stores: a function's assigned
+  `__annotations__`, the MRO-merged class annotations, or a module's
+  `__annotations__`; string hints resolve against the supplied scopes and are
+  left as written when no scope exists. Non-annotation objects raise
+  `TypeError`.
+- `typing._get_defaults(func)` builds the name→default mapping from function
+  parameter metadata (positional, positional-only and keyword-only defaults).
+- `typing._ConcatenateGenericAlias(origin, args, *,
+  _typevar_types=..., _paramspec_tvars=...)` is now a real constructor: it
+  stores `__origin__`, `__args__`, both keyword-only metadata fields and
+  derives `__parameters__`, so `Concatenate`, `get_origin`, `get_args` and
+  `_is_param_expr` see a usable alias.
+- `inspect.markcoroutinefunction(func)` marks a callable (including a bound
+  method or `functools.partial` target) so `inspect.iscoroutinefunction`
+  reports `True` without a code object; native callables without writable
+  metadata raise a precise `AttributeError`.
+- `sys._getframemodulename(depth=0)` reports `None` (no frame provenance is
+  representable) and `sys._getframe(depth=0)` raises
+  `ValueError: call stack is not deep enough` instead of fabricating frames;
+  non-integer depths raise CPython's `TypeError`.
+- `asyncio.coroutines` is a registered native submodule exposing the stable
+  `_is_coroutine` identity sentinel, and nested native modules resolve through
+  their parent package attribute (`asyncio.coroutines`).
+
+### Added — 2026-10-27 `math.prod`
+
+- `math.prod(iterable, *, start=1)` multiplies every element through the
+  number protocol: tagged ints stay exact and promote to `BigInt`, a float
+  operand promotes the running product, sequences repeat by integer factors,
+  and `start` is keyword-only. Empty iterables return `start`; generators,
+  lists, tuples, ranges and other iterables are consumed lazily, and
+  non-iterables/non-multiplicable operands raise CPython-compatible
+  `TypeError`s.
+
 ### Added — 2026-10-26 general starred expressions
 
 - Starred unpacking targets now work at every sequence level

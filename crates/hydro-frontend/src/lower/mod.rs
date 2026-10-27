@@ -1590,7 +1590,9 @@ pub struct Lowerer<'a> {
     deferred_modules: HashSet<String>,
     /// User modules this unit imports but cannot link because they are still
     /// initializing. Their members are read late from the runtime global
-    /// table; see [`Lowerer::is_initializing_ancestor`].
+    /// table, and a name imported by `from pkg import name` binds the module
+    /// itself through the registry; see
+    /// [`Lowerer::is_initializing_ancestor`].
     late_modules: HashSet<String>,
     /// Base id for this unit's functions. Multi-module programs reserve a
     /// contiguous id range per module; single-source checks use `0`.
@@ -1719,6 +1721,11 @@ pub struct Lowerer<'a> {
     /// Resolve otherwise-unknown module-level names to `GlobalGet` while
     /// lowering a parameter default expression.
     in_default_expr: bool,
+    /// `start:stop:step` is legal only inside a subscript index. While such an
+    /// index lowers, the syntax becomes a real `slice` value
+    /// ([`Lowerer::slice_value_expr`]); everywhere else it keeps the
+    /// `HYD0202` diagnostic.
+    slice_value_allowed: bool,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -1800,6 +1807,7 @@ impl<'a> Lowerer<'a> {
             method_capture_scope: None,
             method_captures: HashMap::new(),
             in_default_expr: false,
+            slice_value_allowed: false,
             diags: Vec::new(),
         }
     }
@@ -1898,7 +1906,9 @@ impl<'a> Lowerer<'a> {
 
     /// Names user modules this unit imports without a direct link because they
     /// are still initializing (the loader records them). Their members are
-    /// bound late, through the runtime global table of the module.
+    /// bound late, through the runtime global table of the module; when the
+    /// name is a submodule of the imported package (`from . import sub`), the
+    /// binding is the module value, not a package attribute.
     pub fn set_late_modules(&mut self, modules: HashSet<String>) {
         self.late_modules = modules;
     }
@@ -3552,6 +3562,18 @@ impl<'a> Lowerer<'a> {
                         .insert(binding.to_string(), submodule);
                     continue;
                 }
+                // A sibling submodule that is initializing right now (it
+                // imported this unit, which imports it back) has no linked
+                // unit but keeps its module identity: bind the registry value.
+                // CPython tries the submodule file before any `pkg` attribute,
+                // so `from . import fromnumeric as _from_nx, numeric as _nx`
+                // inside a package makes `_nx` the `pkg.numeric` module even
+                // while `pkg.numeric` is still initializing.
+                if self.late_modules.contains(&submodule) {
+                    self.user_module_aliases
+                        .insert(binding.to_string(), submodule);
+                    continue;
+                }
                 // `from pkg import ext` may name a compiled extension
                 // submodule. Bind it to the shared object path so attribute
                 // access lowers to the lazy extension ABI; an incompatible
@@ -3608,6 +3630,22 @@ impl<'a> Lowerer<'a> {
                     None if self.may_defer_at(imported, nested) => {
                         self.record_deferred(binding, imported, Some(member));
                     }
+                    // The package is still initializing, so its exports are
+                    // not known yet: read the attribute from its module table
+                    // when the code runs, exactly like the branch below. This
+                    // is the `pkg` attribute fallback of `from . import name`
+                    // for a package that cannot be linked. A package that *is*
+                    // linked keeps its known export table, so a name that is
+                    // missing there is still an error.
+                    None if base.is_none()
+                        && (self.is_initializing_ancestor(imported)
+                            || self.late_modules.contains(imported)) =>
+                    {
+                        self.imported_user_globals.insert(
+                            binding.to_string(),
+                            (imported.to_string(), member.to_string()),
+                        );
+                    }
                     None => self.error_at_code(
                         alias.range,
                         codes::ATTRIBUTE,
@@ -3646,6 +3684,14 @@ impl<'a> Lowerer<'a> {
                 }
                 let submodule = format!("{imported}.{member}");
                 if self.user_modules.contains_key(&submodule) {
+                    self.user_module_aliases
+                        .insert(binding.to_string(), submodule);
+                    continue;
+                }
+                // `from . import sub` where `sub` is initializing right now:
+                // the submodule file wins over a `pkg` attribute (see the
+                // non-late branch above), so bind its module identity.
+                if self.late_modules.contains(&submodule) {
                     self.user_module_aliases
                         .insert(binding.to_string(), submodule);
                     continue;
@@ -7467,6 +7513,63 @@ impl<'a> Lowerer<'a> {
         self.builtin_expr(Builtin::Len, vec![subject.clone()], Type::Int, line, col)
     }
 
+    /// Lower a subscript index expression. Slice syntax is legal only here:
+    /// each `start:stop:step` element of a tuple or list index becomes a real
+    /// `slice` value (see [`Lowerer::slice_value_expr`]). A direct
+    /// `a[start:stop:step]` never reaches this helper: the caller keeps its
+    /// `HExprKind::Slice` fast path.
+    fn subscript_index_expr(&mut self, index: &ast::Expr, fs: &mut FuncState) -> HExpr {
+        let previous = std::mem::replace(&mut self.slice_value_allowed, true);
+        let lowered = self.expr(index, fs);
+        self.slice_value_allowed = previous;
+        lowered
+    }
+
+    /// Build the `slice(start, stop, step)` value for one `start:stop:step`
+    /// element of a subscript index (`a[:, 1]`, `a[::2, ...]`). CPython has no
+    /// expression form for a slice object, so the cached `builtins.slice`
+    /// class value is called with `None` for every omitted bound. The runtime
+    /// owns the resulting attributes (`start`, `stop`, `step`), `repr`,
+    /// equality and `indices`.
+    fn slice_value_expr(
+        &mut self,
+        slice: &ast::ExprSlice,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let callee = HExpr {
+            kind: HExprKind::ModuleAttr {
+                module: "builtins".to_string(),
+                name: "slice".to_string(),
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        };
+        // The bounds are ordinary expressions: a slice nested inside one is
+        // still outside a subscript, so it keeps the `HYD0202` diagnostic.
+        let previous = std::mem::replace(&mut self.slice_value_allowed, false);
+        let mut args = Vec::with_capacity(3);
+        for bound in [&slice.lower, &slice.upper, &slice.step] {
+            args.push(match bound {
+                Some(bound) => self.expr(bound, fs),
+                None => self.none_expr(line, col),
+            });
+        }
+        self.slice_value_allowed = previous;
+        HExpr {
+            kind: HExprKind::IndirectCall {
+                callee: Box::new(callee),
+                args,
+                star: None,
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        }
+    }
+
     fn int_const(&self, value: i64, line: u32, col: u32) -> HExpr {
         HExpr {
             kind: HExprKind::Const(Const::Int(value)),
@@ -9355,7 +9458,7 @@ impl<'a> Lowerer<'a> {
                     // Evaluation order matches Python: the right-hand side is
                     // already lowered, then the key.
                     let (line, col) = self.span(sub.range);
-                    let index = self.expr(&sub.slice, fs);
+                    let index = self.subscript_index_expr(&sub.slice, fs);
                     let module = HExpr {
                         kind: HExprKind::Const(Const::Str(self.dunder_name.clone())),
                         ty: Ty::Concrete(Type::Str),
@@ -9373,7 +9476,7 @@ impl<'a> Lowerer<'a> {
                     }));
                 }
                 let object = self.expr(&sub.value, fs);
-                let index = self.expr(&sub.slice, fs);
+                let index = self.subscript_index_expr(&sub.slice, fs);
                 Some(HStmtKind::SetSubscript {
                     object,
                     index,
@@ -9528,7 +9631,7 @@ impl<'a> Lowerer<'a> {
                     })
                 } else {
                     let object = self.expr(&sub.value, fs);
-                    let index = self.expr(&sub.slice, fs);
+                    let index = self.subscript_index_expr(&sub.slice, fs);
                     Some(HDeleteTarget::Subscript { object, index })
                 }
             }
@@ -9845,7 +9948,7 @@ impl<'a> Lowerer<'a> {
                     None
                 } else {
                     let object = self.expr(&sub.value, fs);
-                    let index = self.expr(&sub.slice, fs);
+                    let index = self.subscript_index_expr(&sub.slice, fs);
                     Some(HUnpackTarget::Subscript { object, index })
                 }
             }
@@ -10428,7 +10531,7 @@ impl<'a> Lowerer<'a> {
     ) -> Option<HStmt> {
         let op = self.aug_bin_op(s.op, s.range)?;
         let object = self.expr(&sub.value, fs);
-        let index = self.expr(&sub.slice, fs);
+        let index = self.subscript_index_expr(&sub.slice, fs);
         let (object_local, object_ref) = self.aug_temp(fs, sub.value.range());
         let (index_local, index_ref) = self.aug_temp(fs, sub.slice.range());
         let value = self.expr(&s.value, fs);
@@ -10641,7 +10744,7 @@ impl<'a> Lowerer<'a> {
                 },
                 ast::Expr::Subscript(sub) => HUnpackTarget::Subscript {
                     object: self.expr(&sub.value, fs),
-                    index: self.expr(&sub.slice, fs),
+                    index: self.subscript_index_expr(&sub.slice, fs),
                 },
                 ast::Expr::Starred(star) => {
                     let inner = match &*star.value {
@@ -10654,7 +10757,7 @@ impl<'a> Lowerer<'a> {
                         },
                         ast::Expr::Subscript(sub) => HUnpackTarget::Subscript {
                             object: self.expr(&sub.value, fs),
-                            index: self.expr(&sub.slice, fs),
+                            index: self.subscript_index_expr(&sub.slice, fs),
                         },
                         _ => HUnpackTarget::Name(self.comp_local(fs)),
                     };
@@ -13455,7 +13558,7 @@ impl<'a> Lowerer<'a> {
                     };
                 }
                 let object = self.expr(&s.value, fs);
-                let index = self.expr(&s.slice, fs);
+                let index = self.subscript_index_expr(&s.slice, fs);
                 let ty = self.infer.fresh();
                 HExpr {
                     kind: HExprKind::Subscript {
@@ -13468,6 +13571,11 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Expr::Slice(s) => {
+                if self.slice_value_allowed {
+                    // `a[1:2, :]`: a slice element of a subscript index is a
+                    // real `slice` object, not a standalone expression form.
+                    return self.slice_value_expr(s, fs, line, col);
+                }
                 self.error_at_code(
                     s.range,
                     codes::INDEX,

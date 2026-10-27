@@ -1330,7 +1330,11 @@ impl<'a> Checker<'a> {
     fn check_subscript_assignment(&mut self, object: &HExpr, index: &HExpr) {
         match self.inf.resolve(object.ty) {
             Ty::Concrete(Type::List) => {
-                self.check_int_index("list", index.ty, index.line, index.col);
+                // A slice-carrying tuple key is a dynamic key: the runtime
+                // `__setitem__`/native check reports the CPython error.
+                if !Self::index_has_slice(index) {
+                    self.check_int_index("list", index.ty, index.line, index.col);
+                }
             }
             Ty::Concrete(Type::Dict) | Ty::Concrete(Type::Any) => {}
             Ty::Var(_) => {
@@ -1502,6 +1506,25 @@ impl<'a> Checker<'a> {
                 );
             }
         }
+    }
+
+    /// True when a subscript index is a tuple or list literal carrying at
+    /// least one `slice` value. The lowering builds those elements by calling
+    /// the cached `builtins.slice` class (`a[1:2, :]`), never by a standalone
+    /// slice expression, so the callee shape identifies them.
+    fn index_has_slice(index: &HExpr) -> bool {
+        let elements = match &index.kind {
+            HExprKind::Tuple(elements) | HExprKind::List(elements) => elements,
+            _ => return false,
+        };
+        elements.iter().any(|element| match &element.kind {
+            HExprKind::IndirectCall { callee, .. } => matches!(
+                &callee.kind,
+                HExprKind::ModuleAttr { module, name }
+                    if module.as_str() == "builtins" && name.as_str() == "slice"
+            ),
+            _ => false,
+        })
     }
 
     fn check_int_index(&mut self, container: &str, index: Ty, line: u32, col: u32) {
@@ -1698,22 +1721,40 @@ impl<'a> Checker<'a> {
             HExprKind::Subscript { object, index } => {
                 self.check_expr(object, f);
                 self.check_expr(index, f);
+                // A tuple index carrying a slice (`a[:, 1]`, `a[1, :]`) is a
+                // NumPy-style key: the receiver's `__getitem__` (or the native
+                // sequence check for list/str/bytes/tuple) owns the verdict, so
+                // the static integer-index check is skipped and the result is
+                // dynamic.
+                let slice_index = Self::index_has_slice(index);
                 match self.inf.resolve(object.ty) {
                     Ty::Concrete(Type::List) => {
-                        self.check_int_index("list", index.ty, index.line, index.col);
+                        if !slice_index {
+                            self.check_int_index("list", index.ty, index.line, index.col);
+                        }
                         let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
                     }
                     Ty::Concrete(Type::Str) => {
-                        self.check_int_index("str", index.ty, index.line, index.col);
-                        let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Str));
+                        let _ = if slice_index {
+                            self.inf.unify(expr.ty, Ty::Concrete(Type::Any))
+                        } else {
+                            self.check_int_index("str", index.ty, index.line, index.col);
+                            self.inf.unify(expr.ty, Ty::Concrete(Type::Str))
+                        };
                     }
                     Ty::Concrete(Type::Bytes) => {
-                        self.check_int_index("bytes", index.ty, index.line, index.col);
-                        // Indexing a byte string yields an `int` byte value.
-                        let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Int));
+                        let _ = if slice_index {
+                            self.inf.unify(expr.ty, Ty::Concrete(Type::Any))
+                        } else {
+                            self.check_int_index("bytes", index.ty, index.line, index.col);
+                            // Indexing a byte string yields an `int` byte value.
+                            self.inf.unify(expr.ty, Ty::Concrete(Type::Int))
+                        };
                     }
                     Ty::Concrete(Type::Tuple) => {
-                        self.check_int_index("tuple", index.ty, index.line, index.col);
+                        if !slice_index {
+                            self.check_int_index("tuple", index.ty, index.line, index.col);
+                        }
                         let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
                     }
                     Ty::Concrete(Type::Dict) | Ty::Concrete(Type::Any) => {

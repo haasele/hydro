@@ -134,6 +134,7 @@ pub static MODULES: &[&ModuleSpec] = &[
     &SELECTORS,
     &SSL,
     &ASYNCIO,
+    &ASYNCIO_COROUTINES,
     &ERRNO,
     &UNITTEST,
     &PYTEST,

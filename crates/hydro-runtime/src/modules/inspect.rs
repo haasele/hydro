@@ -1959,14 +1959,61 @@ fn is_generator_function(obj: i64) -> bool {
     })
 }
 
+/// Attribute `inspect.markcoroutinefunction` writes on a callable whose code
+/// it cannot rewrite. CPython sets `CO_COROUTINE` on `__code__`; Hydro keeps
+/// no code object, so the marker lives in the function's attribute dictionary
+/// and [`is_coroutine_function`] treats it like the flag.
+const COROUTINE_FUNCTION_MARKER: &str = "__hydro_coroutine_function__";
+
 fn is_coroutine_function(obj: i64) -> bool {
     let target = flag_target(obj);
+    // The marker is authoritative: it is the code-free equivalent of
+    // `CO_COROUTINE`.
+    if value::function_attribute(target, COROUTINE_FUNCTION_MARKER).is_some_and(value::truthy) {
+        return true;
+    }
     if !is_user_function(target) {
         return false;
     }
     function_flags(target).is_some_and(|flags| {
         flags & value::FUNCTION_FLAG_ASYNC != 0 && flags & value::FUNCTION_FLAG_GENERATOR == 0
     })
+}
+
+/// `inspect.markcoroutinefunction(func)`: makes `iscoroutinefunction(func)`
+/// report `True` and returns the callable.
+///
+/// CPython rewrites the function's code flags. Hydro function values have no
+/// code object, so the equivalent marker is stored in the writable attribute
+/// surface. As in CPython, a bound method marks its underlying function. A
+/// callable without writable function metadata (a native/builtin function)
+/// raises a precise `AttributeError` instead of silently succeeding.
+fn mark_coroutine_function(obj: i64) -> i64 {
+    // Bound methods and `functools.partial` wrappers are marked on the
+    // underlying function, exactly like `iscoroutinefunction` looks through
+    // them.
+    let target = flag_target(obj);
+    if value::as_function(target).is_none() || !value::function_has_attributes(target) {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!(
+                "cannot mark {} as a coroutine function: the value has no writable \
+                 function metadata",
+                value::repr(obj)
+            ),
+        );
+    }
+    if !value::function_setattr(target, COROUTINE_FUNCTION_MARKER, TRUE) {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!(
+                "cannot mark {} as a coroutine function: the value has no writable \
+                 function metadata",
+                value::repr(obj)
+            ),
+        );
+    }
+    target
 }
 
 fn is_async_generator_function(obj: i64) -> bool {
@@ -3206,6 +3253,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         ),
         "isgeneratorfunction" => value::bool_value(is_generator_function(args[0])),
         "iscoroutinefunction" => value::bool_value(is_coroutine_function(args[0])),
+        "markcoroutinefunction" => mark_coroutine_function(args[0]),
         "isasyncgenfunction" => value::bool_value(is_async_generator_function(args[0])),
         "isgenerator" => {
             value::bool_value(fiber_kind_of(args[0]) == Some(crate::fiber::FiberKind::Generator))
@@ -3904,6 +3952,34 @@ mod tests {
             value::as_list(call("stack", &[])).map(|frames| frames.len()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn markcoroutinefunction_marks_without_a_code_object() {
+        exc::init();
+        let function = user_function("f", vec![param("x", ParamKind::Positional, None)], 0);
+        assert_eq!(call("iscoroutinefunction", &[function]), FALSE);
+        // The marker is set on the callable and returned as-is.
+        assert_eq!(call("markcoroutinefunction", &[function]), function);
+        assert_eq!(call("iscoroutinefunction", &[function]), TRUE);
+        assert!(!exc::pending());
+
+        // A bound method marks its underlying function, like CPython.
+        let class = value::class_new("C".to_string(), NONE, vec![("m".to_string(), function)]);
+        let instance = value::instance_new(class);
+        let bound = methods::getattr(instance, "m".as_ptr(), 1);
+        assert!(!exc::pending());
+        assert_eq!(call("markcoroutinefunction", &[bound]), function);
+        assert_eq!(call("iscoroutinefunction", &[bound]), TRUE);
+
+        // Native callables have no writable function metadata: the failure is
+        // explicit instead of a silent no-op.
+        exc::init();
+        let len = value::builtin_function_new(hydro_ir::Builtin::Len);
+        call("markcoroutinefunction", &[len]);
+        assert!(exc::pending());
+        assert_eq!(exc::pending_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        exc::clear();
     }
 
     #[test]

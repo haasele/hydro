@@ -252,11 +252,12 @@ struct LoadedModule {
     /// Units this module imports, in discovery order.
     deps: Vec<usize>,
     /// User modules this unit imports but cannot link directly: they are still
-    /// initializing when the unit is loaded (an ancestor package). The lowerer
-    /// binds their members late, through the runtime global table. A late
-    /// module has no dependency edge, so its initializer runs after this unit:
-    /// its members are readable only once the importing module's functions
-    /// run.
+    /// initializing when the unit is loaded (an ancestor package, or a module
+    /// that is importing this unit back). The lowerer binds their members late,
+    /// through the runtime global table, and binds the module itself — not a
+    /// package attribute — for `from . import sub`. A late module has no
+    /// dependency edge, so its initializer runs after this unit: its members
+    /// are readable only once the importing module's functions run.
     late: Vec<String>,
     /// Imports nested in functions, classes or compound bodies, recorded by
     /// the scan as `(module, member)` pairs. They are not linked: the lowerer
@@ -292,7 +293,8 @@ struct ImportScan {
 
 impl ImportScan {
     /// Records a module whose members the lowerer resolves through the runtime
-    /// global table instead of a direct link.
+    /// global table instead of a direct link, or — for a submodule named by
+    /// `from pkg import name` — the module value itself from the registry.
     fn record_late(&mut self, name: &str) {
         if !self.late.iter().any(|existing| existing == name) {
             self.late.push(name.to_string());
@@ -624,6 +626,33 @@ impl ModuleLoader {
         match self.load_named(name, importer_dir, module_root) {
             NamedLoad::Loaded(mut loaded) => loaded.pop(),
             NamedLoad::Missing | NamedLoad::Failed | NamedLoad::InProgress => None,
+        }
+    }
+
+    /// Probes the `pkg.name` submodule of a module-level `from pkg import name`.
+    ///
+    /// The import machinery tries `pkg.name` as a module file/package before
+    /// reading `name` as an attribute of `pkg`. When that file is initializing
+    /// right now (an import cycle: `pkg.name` imported this unit, which is
+    /// importing `pkg.name` back), no second unit is created but the name *is*
+    /// a submodule, so it is recorded for late binding: the lowerer binds the
+    /// module value itself — read through the registry once initialized —
+    /// instead of falling back to a `pkg` attribute that CPython would never
+    /// consult.
+    fn probe_submodule(
+        &mut self,
+        name: &str,
+        importer_dir: &Path,
+        module_root: &Path,
+        scan: &mut ImportScan,
+    ) -> Option<usize> {
+        match self.load_named(name, importer_dir, module_root) {
+            NamedLoad::Loaded(mut loaded) => loaded.pop(),
+            NamedLoad::InProgress => {
+                scan.record_late(name);
+                None
+            }
+            NamedLoad::Missing | NamedLoad::Failed => None,
         }
     }
 
@@ -1340,13 +1369,15 @@ impl ModuleLoader {
                         );
                     }
                     // `from pkg import sub` may name a submodule rather than
-                    // an attribute; load it when it exists.
+                    // an attribute; load it when it exists. A submodule that is
+                    // initializing right now stays a submodule binding (see
+                    // [`Self::probe_submodule`]), never a package attribute.
                     for alias in &s.names {
                         if alias.name.as_str() == "*" {
                             continue;
                         }
                         let full = format!("{module_name}.{}", alias.name);
-                        if let Some(index) = self.probe_named(&full, importer_dir, root) {
+                        if let Some(index) = self.probe_submodule(&full, importer_dir, root, scan) {
                             if !scan.deps.contains(&index) {
                                 scan.deps.push(index);
                             }
@@ -3647,6 +3678,49 @@ mod tests {
         assert!(
             mirrored,
             "the package body must mirror the function value for the late read"
+        );
+    }
+
+    #[test]
+    fn relative_from_import_binds_an_initializing_sibling_submodule() {
+        // `pkg.numeric` imports `pkg.shape`, which imports `pkg.numeric` back.
+        // CPython resolves `from . import numeric` through the import system,
+        // so the binding is the (partially initialized) module object, never a
+        // `pkg` attribute. NumPy's `numpy._core/shape_base.py` imports
+        // `numeric` exactly like this, while `numeric` imports `shape_base`.
+        let dir = TestDir::new("initializing-sibling");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(pkg.join("__init__.py"), "from . import numeric\n").expect("write package init");
+        fs::write(
+            pkg.join("numeric.py"),
+            "from . import shape\n\ndef value():\n    return 1\n",
+        )
+        .expect("write numeric");
+        fs::write(
+            pkg.join("shape.py"),
+            "from . import numeric\n\ndef get():\n    return numeric.value()\n",
+        )
+        .expect("write shape");
+        let main = dir.write("main.py", "from pkg.shape import get\nprint(get())\n");
+        let program = program(&main);
+
+        // `shape` initializes first (it is `numeric`'s dependency) and binds
+        // the still-initializing sibling by identity, not through `pkg`.
+        let shape = function_id(&program, "pkg.shape.<module>");
+        use hydro_ir::{ExprKind, StmtKind};
+        let stored = program.functions[shape as usize]
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                StmtKind::GlobalSet { name, value, .. } if name == "numeric" => Some(value),
+                _ => None,
+            })
+            .expect("shape must bind `numeric`");
+        assert!(
+            matches!(&stored.kind, ExprKind::ModuleRef { module } if module == "pkg.numeric"),
+            "the binding must be the module itself: {:?}",
+            stored.kind
         );
     }
 

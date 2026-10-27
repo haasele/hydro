@@ -1292,6 +1292,14 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if let Some(class) = zlib_mod::class_value(module, name) {
         return class;
     }
+    // A nested native module (`asyncio.coroutines`, `os.path`, ...) is an
+    // attribute of its parent package. Resolve it to the exact `sys.modules`
+    // entry so `import asyncio.coroutines` followed by
+    // `asyncio.coroutines._is_coroutine` keeps module identity.
+    let nested = format!("{module}.{name}");
+    if stdlib::module(&nested).is_some() {
+        return registry_lookup(&nested).unwrap_or_else(|| value::module_value(nested));
+    }
     if let Some(spec) = stdlib::function(module, name) {
         let module_name = stdlib::module(module).map(|m| m.name).unwrap_or("<module>");
         return value::native_function_new(module_name, spec.name, spec.max_args);
@@ -1572,6 +1580,7 @@ fn call_native_kw_at(
 /// names.
 fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
     match module {
+        "math" => math_call_kw(function, args, keywords),
         "functools" | "_functools" => functools_call_kw(function, args, keywords),
         "collections" | "_collections" => collections::call_kw(function, args, &keywords),
         "dataclasses" => dataclasses_call_kw(function, args, keywords),
@@ -2365,6 +2374,8 @@ fn constant_value(module: &str, name: &str) -> i64 {
             | "SUPPRESS"),
         ) => argparse::constant(name),
         ("asyncio", "CancelledError") => exc::exception_class(exc::CANCELLED_ERROR),
+        ("asyncio.coroutines", "_is_coroutine") => asyncio::coroutines_constant("_is_coroutine")
+            .unwrap_or_else(|| missing_attribute("asyncio.coroutines", "_is_coroutine")),
         ("socket", name) => socket::constant(name),
         ("select", name) => select::constant(name),
         ("selectors", name) => select::selectors_constant(name),
@@ -3209,8 +3220,71 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
             }
             value::bigint_new(result)
         }
+        // `prod(iterable, *, start=1)`: the number protocol decides the
+        // result type, so the start value (or the integer 1) is multiplied
+        // by each element. `start` is the only keyword.
+        "prod" => math_prod(args[0], ops::int_result(1)),
         _ => missing_attribute("math", function),
     }
+}
+
+/// Keyword-aware `math` dispatch: `prod` binds its keyword-only `start`.
+fn math_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    match function {
+        "prod" => {
+            let mut start = ops::int_result(1);
+            let mut bound = false;
+            for (name, value) in keywords {
+                if name != "start" {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("prod() got an unexpected keyword argument '{name}'"),
+                    );
+                }
+                if bound {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "prod() got multiple values for keyword argument 'start'",
+                    );
+                }
+                bound = true;
+                start = value;
+            }
+            math_prod(args[0], start)
+        }
+        _ => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("math.{function}() does not accept keyword arguments"),
+        ),
+    }
+}
+
+/// `math.prod(iterable, *, start=1)`: multiplies every element into `start`
+/// using Python's number protocol. Tagged ints stay exact and promote to
+/// `BigInt` on overflow, floats promote the running product to `float`, and
+/// any type with `__mul__`/`__rmul__` (or sequence repetition) follows the
+/// same rules as `*`. An empty iterable yields `start`.
+fn math_prod(iterable: i64, start: i64) -> i64 {
+    let iterator = iter::iter_new(iterable);
+    if failed() {
+        return NONE;
+    }
+    let mut product = start;
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if failed() {
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        product = ops::binop(ops::OP_MUL, product, item);
+        if failed() {
+            return NONE;
+        }
+    }
+    product
 }
 
 /// Greatest common divisor over exact magnitudes (`math.gcd` accepts
@@ -3394,6 +3468,7 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
         "le" => Some(ops::OP_LE),
         "gt" => Some(ops::OP_GT),
         "ge" => Some(ops::OP_GE),
+        "or_" => Some(ops::OP_BIT_OR),
         _ => None,
     };
     if let Some(op) = binary {
@@ -6077,6 +6152,8 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
         "excepthook" => sys_excepthook(args),
         "getrecursionlimit" => sys_getrecursionlimit(),
         "setrecursionlimit" => sys_setrecursionlimit(args),
+        "_getframemodulename" => sys_getframemodulename(args),
+        "_getframe" => sys_getframe(args),
         _ => missing_attribute("sys", function),
     }
 }
@@ -6139,6 +6216,59 @@ fn sys_setrecursionlimit(args: &[i64]) -> i64 {
     }
     RECURSION_LIMIT.store(limit, Ordering::Relaxed);
     NONE
+}
+
+/// `sys._getframemodulename(depth=0)`.
+///
+/// Hydro has no reified frame objects, so a caller's module name cannot be
+/// observed. `None` is the truthful answer (CPython also returns `None` when
+/// the stack is shallower than `depth`); an invalid depth is still rejected
+/// with CPython's `TypeError` instead of being ignored.
+fn sys_getframemodulename(args: &[i64]) -> i64 {
+    if let Some(&depth) = args.first() {
+        if let Err(raised) = frame_depth(depth) {
+            return raised;
+        }
+    }
+    NONE
+}
+
+/// Validates the optional `depth` argument of the `sys` frame APIs.
+///
+/// CPython converts the value to a C `int`: an integer that does not fit is an
+/// `OverflowError`, any other type a `TypeError` naming its type.
+fn frame_depth(depth: i64) -> Result<i64, i64> {
+    if let Some(depth) = value::as_integer(depth) {
+        return Ok(depth);
+    }
+    if value::to_bigint(depth).is_some() {
+        return Err(exc::raise_with_message(
+            OVERFLOW_ERROR,
+            "Python int too large to convert to C int",
+        ));
+    }
+    Err(exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "'{}' object cannot be interpreted as an integer",
+            value::type_name(depth)
+        ),
+    ))
+}
+
+/// `sys._getframe(depth=0)`.
+///
+/// A frame object cannot be represented, so instead of fabricating one the
+/// call fails exactly like CPython when the requested depth lies beyond the
+/// available stack: `ValueError: call stack is not deep enough`. The runtime
+/// keeps no Python stack frames, so every depth is beyond it.
+fn sys_getframe(args: &[i64]) -> i64 {
+    if let Some(&depth) = args.first() {
+        if let Err(raised) = frame_depth(depth) {
+            return raised;
+        }
+    }
+    exc::raise_with_message(VALUE_ERROR, "call stack is not deep enough")
 }
 
 /// `sys.excepthook(type, value, traceback)`: prints the exception's traceback
@@ -7753,6 +7883,26 @@ mod tests {
         crate::builtins::call(function, args.len(), args.as_ptr())
     }
 
+    /// Calls `module.function(...)` with keyword arguments, passing
+    /// `[name, value, ...]` pairs through the keyword-call ABI.
+    fn call_kw(module: &str, function: &str, args: &[i64], keywords: &[(&str, i64)]) -> i64 {
+        let mut words = Vec::with_capacity(keywords.len() * 2);
+        for (name, value) in keywords {
+            words.push(string(name));
+            words.push(*value);
+        }
+        module_call_kw(
+            module.as_ptr(),
+            module.len(),
+            function.as_ptr(),
+            function.len(),
+            args.len(),
+            args.as_ptr(),
+            keywords.len(),
+            words.as_ptr(),
+        )
+    }
+
     /// Number of native-call cache hits observed on this thread.
     fn cache_hits() -> usize {
         NATIVE_CACHE.with(|cache| cache.borrow().hits)
@@ -7977,6 +8127,250 @@ mod tests {
     }
 
     #[test]
+    fn math_prod_multiplies_numeric_iterables() {
+        exc::init();
+        // Empty input keeps the start value, which defaults to the exact int 1.
+        assert_eq!(as_int(call("math", "prod", &[value::list_new(vec![])])), 1);
+        assert_eq!(
+            as_int(call_kw(
+                "math",
+                "prod",
+                &[value::list_new(vec![])],
+                &[("start", int(5))]
+            )),
+            5
+        );
+
+        // Lists, tuples and an already-created iterator all work.
+        let range: Vec<i64> = (2..8).map(int).collect();
+        assert_eq!(
+            as_int(call("math", "prod", &[value::list_new(range.clone())])),
+            5040
+        );
+        assert_eq!(
+            as_int(call("math", "prod", &[value::tuple_new(range.clone())])),
+            5040
+        );
+        assert_eq!(
+            as_int(call(
+                "math",
+                "prod",
+                &[value::iter_new(value::list_new(range))]
+            )),
+            5040
+        );
+
+        // `start` multiplies too: 10 * 1 * ... * 9 = 3628800.
+        let one_to_nine: Vec<i64> = (1..10).map(int).collect();
+        assert_eq!(
+            as_int(call_kw(
+                "math",
+                "prod",
+                &[value::list_new(one_to_nine)],
+                &[("start", int(10))]
+            )),
+            3628800
+        );
+        // `iterable` may be passed by name as well.
+        assert_eq!(
+            as_int(call_kw(
+                "math",
+                "prod",
+                &[],
+                &[
+                    ("iterable", value::list_new(vec![int(2), int(3)])),
+                    ("start", int(4))
+                ]
+            )),
+            24
+        );
+
+        // A float operand promotes the running product, exactly like `*`.
+        let floats = value::list_new(vec![
+            value::float_new(1.0),
+            value::float_new(2.0),
+            value::float_new(3.0),
+        ]);
+        assert_eq!(as_float(call("math", "prod", &[floats])), 6.0);
+        let mixed = value::list_new(vec![
+            int(1),
+            int(2),
+            int(3),
+            value::float_new(4.0),
+            value::float_new(5.0),
+        ]);
+        assert_eq!(as_float(call("math", "prod", &[mixed])), 120.0);
+
+        // Tagged ints overflow into exact BigInts instead of wrapping.
+        let squared = call(
+            "math",
+            "prod",
+            &[value::list_new(vec![int(1 << 40), int(1 << 40)])],
+        );
+        assert_eq!(as_big(squared), BigInt::from(1u64) << 80);
+        let pow100 = big("1267650600228229401496703205376");
+        let square = call("math", "prod", &[value::list_new(vec![pow100, pow100])]);
+        assert_eq!(as_big(square), BigInt::from(1u64) << 200);
+
+        // Bools are integers, and a zero factor short-circuits to 0.
+        assert_eq!(
+            as_int(call("math", "prod", &[value::list_new(vec![TRUE, int(2)])])),
+            2
+        );
+        assert_eq!(
+            as_int(call(
+                "math",
+                "prod",
+                &[value::list_new(vec![int(0), int(2), int(3)])]
+            )),
+            0
+        );
+
+        // NaN and infinity follow float multiplication rules.
+        let nan = f64::NAN;
+        let nan_product = call(
+            "math",
+            "prod",
+            &[value::list_new(vec![int(1), value::float_new(nan), int(2)])],
+        );
+        assert!(as_float(nan_product).is_nan());
+        let infinite = call(
+            "math",
+            "prod",
+            &[value::list_new(vec![
+                int(2),
+                value::float_new(f64::INFINITY),
+                int(-3),
+            ])],
+        );
+        assert_eq!(as_float(infinite), f64::NEG_INFINITY);
+        let zero_times_infinity = call(
+            "math",
+            "prod",
+            &[value::list_new(vec![
+                value::float_new(0.0),
+                value::float_new(f64::INFINITY),
+            ])],
+        );
+        assert!(as_float(zero_times_infinity).is_nan());
+        assert!(!exc::pending());
+
+        // A function value resolved from the module dispatches identically.
+        let prod = get("math", "prod");
+        assert_eq!(
+            as_int(call_value(prod, &[value::list_new(vec![int(2), int(3)])])),
+            6
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn math_prod_follows_the_number_protocol_for_starts_and_sequences() {
+        exc::init();
+        // Odd but valid cases from CPython's own `test_prod`.
+        let start = string("ab");
+        assert_eq!(
+            call("math", "prod", &[value::list_new(vec![int(2), int(3)])]),
+            int(6)
+        );
+        let repeated = call_kw(
+            "math",
+            "prod",
+            &[value::list_new(vec![int(2), int(3)])],
+            &[("start", start)],
+        );
+        assert_eq!(value::to_string(repeated), "abababababab");
+        let list_start = value::list_new(vec![int(1), int(2)]);
+        let repeated_list = call_kw(
+            "math",
+            "prod",
+            &[value::list_new(vec![int(3)])],
+            &[("start", list_start)],
+        );
+        let repeated_values = value::as_list(repeated_list).expect("list result");
+        assert_eq!(repeated_values.len(), 6);
+        // An empty iterable returns the start object itself.
+        let identity_start = value::list_new(vec![int(7)]);
+        assert_eq!(
+            call_kw(
+                "math",
+                "prod",
+                &[value::list_new(vec![])],
+                &[("start", identity_start)]
+            ),
+            identity_start
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn math_prod_type_errors_match_cpython() {
+        exc::init();
+        // Non-iterable input.
+        assert_eq!(call("math", "prod", &[int(42)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "'int' object is not iterable");
+        exc::init();
+
+        // Two sequences cannot be multiplied together.
+        assert_eq!(
+            call(
+                "math",
+                "prod",
+                &[value::list_new(vec![string("a"), string("b")])]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "unsupported operand type(s) for *: 'str' and 'str'"
+        );
+        exc::init();
+        assert_eq!(
+            call(
+                "math",
+                "prod",
+                &[value::list_new(vec![
+                    value::list_new(vec![int(1)]),
+                    value::list_new(vec![int(2)]),
+                ])]
+            ),
+            NONE
+        );
+        assert_eq!(
+            message(),
+            "unsupported operand type(s) for *: 'list' and 'list'"
+        );
+        exc::init();
+
+        // Unknown keyword names are rejected, mirroring CPython.
+        assert_eq!(
+            call_kw(
+                "math",
+                "prod",
+                &[value::list_new(vec![int(1)])],
+                &[("foo", int(1))]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "prod() got an unexpected keyword argument 'foo'");
+        exc::init();
+
+        // A second positional argument is rejected: `start` is keyword-only.
+        assert_eq!(
+            call("math", "prod", &[value::list_new(vec![int(1)]), int(2)]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "math.prod() takes 1 arguments (2 given)");
+        exc::init();
+        assert_eq!(call("math", "prod", &[]), NONE);
+        assert_eq!(message(), "math.prod() takes 1 arguments (0 given)");
+    }
+
+    #[test]
     fn native_call_cache_hits_for_alternating_names() {
         exc::init();
         let module = "math";
@@ -8185,6 +8579,14 @@ mod tests {
         assert_eq!(call("operator", "le", &[int(2), int(2)]), TRUE);
         assert_eq!(call("operator", "gt", &[int(3), int(2)]), TRUE);
         assert_eq!(call("operator", "ge", &[int(2), int(3)]), FALSE);
+        // `or_` is bitwise `|` for integers and set union for sets.
+        assert_eq!(as_int(call("operator", "or_", &[int(6), int(3)])), 7);
+        assert_eq!(as_int(call("operator", "or_", &[int(0), int(5)])), 5);
+        let left = value::set_new(vec![int(1), int(2)]);
+        let right = value::set_new(vec![int(2), int(3)]);
+        let union = call("operator", "or_", &[left, right]);
+        let members = value::as_set(union).expect("set");
+        assert_eq!(members.len(), 3);
         assert_eq!(as_int(call("operator", "neg", &[int(5)])), -5);
         assert_eq!(call("operator", "not_", &[int(0)]), TRUE);
         assert_eq!(call("operator", "truth", &[int(0)]), FALSE);
@@ -8364,6 +8766,46 @@ mod tests {
         call_value(hook, &[NONE]);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         exc::init();
+    }
+
+    #[test]
+    fn sys_frame_apis_report_absence_instead_of_fabricating_frames() {
+        exc::init();
+        // No frame is representable, so no module name is observable; the
+        // result is the same `None` CPython reports beyond the stack depth.
+        assert_eq!(call("sys", "_getframemodulename", &[]), NONE);
+        assert_eq!(call("sys", "_getframemodulename", &[int(0)]), NONE);
+        assert_eq!(call("sys", "_getframemodulename", &[int(42)]), NONE);
+        assert!(!exc::pending());
+
+        // `_getframe` cannot return an invented frame: it fails with the
+        // precise CPython error for a depth beyond the available stack.
+        call("sys", "_getframe", &[]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+        call("sys", "_getframe", &[int(0)]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+
+        // Non-integer depths are rejected with CPython's TypeError, including
+        // an explicit `None` (only an omitted argument means depth 0).
+        for depth in [string("x"), NONE] {
+            call("sys", "_getframemodulename", &[depth]);
+            assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+            exc::clear();
+            call("sys", "_getframe", &[depth]);
+            assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+            exc::clear();
+        }
+        // The first-class function values expose the same behaviour.
+        let frame_module = get("sys", "_getframemodulename");
+        let frame = get("sys", "_getframe");
+        assert_eq!(value::type_name(frame_module), "function");
+        assert_eq!(call_value(frame_module, &[int(0)]), NONE);
+        assert!(!exc::pending());
+        call_value(frame, &[int(0)]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
     }
 
     #[test]
@@ -9492,6 +9934,32 @@ mod tests {
 
         exc::init();
         assert_eq!(call("asyncio", "current_task", &[]), NONE);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn asyncio_coroutines_submodule_exposes_identity_sentinel() {
+        exc::init();
+        // `import asyncio.coroutines` then `asyncio.coroutines` resolves to
+        // the exact `sys.modules` entry.
+        let submodule = get("asyncio", "coroutines");
+        assert_eq!(
+            value::as_module(submodule).map(|module| module.name()),
+            Some("asyncio.coroutines")
+        );
+        assert_eq!(registry_lookup("asyncio.coroutines"), Some(submodule));
+
+        // `_is_coroutine` is one stable object: shims compare it with `is`.
+        let sentinel = get("asyncio.coroutines", "_is_coroutine");
+        assert_eq!(sentinel, get("asyncio.coroutines", "_is_coroutine"));
+        assert_eq!(
+            get("asyncio.coroutines", "_is_coroutine"),
+            constant_value("asyncio.coroutines", "_is_coroutine")
+        );
+        // It is a plain object instance, not a shared interned value.
+        assert!(value::instance_class_value(sentinel).is_some());
+        let other = value::instance_new(value::object_class());
+        assert_ne!(sentinel, other);
         assert!(!exc::pending());
     }
 

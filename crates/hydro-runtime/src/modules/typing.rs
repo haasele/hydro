@@ -360,9 +360,107 @@ fn cached_class(name: &str) -> i64 {
     if let Some(cached) = crate::core::globals::registry_get(&key) {
         return cached;
     }
-    let class = value::class_new(name.to_string(), NONE, Vec::new());
+    let class = if name == "_ConcatenateGenericAlias" {
+        concatenate_generic_alias_class()
+    } else {
+        value::class_new(name.to_string(), NONE, Vec::new())
+    };
     crate::core::globals::registry_set(&key, class);
     class
+}
+
+/// `typing._ConcatenateGenericAlias`: a real alias value, not an inert
+/// placeholder.
+///
+/// CPython's class inherits `_GenericAlias`, whose constructor records the
+/// origin and the argument tuple. Some `typing_extensions` releases also pass
+/// `_typevar_types=(...)` and `_paramspec_tvars=True` as keyword-only
+/// arguments; the runtime accepts and stores them so such construction
+/// succeeds instead of raising `TypeError`. `__parameters__` is derived from
+/// the arguments through the same collector used by
+/// `_collect_type_vars`.
+fn concatenate_generic_alias_class() -> i64 {
+    let signature = vec![
+        value::ParamMeta {
+            name: "self".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "origin".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "args".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "kwargs".to_string(),
+            kind: ParamKind::KwArg,
+            default: Some(NONE),
+        },
+    ];
+    let init = value::native_function_new("typing", "_concatenate_generic_alias_init", usize::MAX);
+    value::function_set_signature(init, signature);
+    value::function_set_full_entry(
+        init,
+        concatenate_generic_alias_init_entry as *const () as usize,
+    );
+    value::class_new(
+        "_ConcatenateGenericAlias".to_string(),
+        NONE,
+        vec![("__init__".to_string(), init)],
+    )
+}
+
+/// Constructor body for [`concatenate_generic_alias_class`].
+extern "C" fn concatenate_generic_alias_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the class-call binder passes `self`, `origin`, `args`, then the
+    // `**kwargs` dict in signature order.
+    let instance = unsafe { *argv };
+    let origin = unsafe { *argv.add(1) };
+    let args = unsafe { *argv.add(2) };
+    let kwargs = unsafe { *argv.add(3) };
+    let args_tuple = if let Some(items) = value::as_tuple(args) {
+        value::tuple_new(items.to_vec())
+    } else if let Some(items) = value::as_list(args) {
+        value::tuple_new(items.to_vec())
+    } else {
+        value::tuple_new(vec![args])
+    };
+    let mut typevar_types = NONE;
+    let mut paramspec_tvars = FALSE;
+    if let Some(pairs) = value::as_dict(kwargs) {
+        for (key, item) in pairs {
+            let Some(keyword) = value::as_str(*key) else {
+                return type_error("keyword names must be str");
+            };
+            match keyword {
+                "_typevar_types" => typevar_types = *item,
+                "_paramspec_tvars" => {
+                    paramspec_tvars = value::bool_value(value::truthy(*item));
+                }
+                other => {
+                    return type_error(&format!(
+                        "_ConcatenateGenericAlias() got an unexpected keyword argument '{other}'"
+                    ))
+                }
+            }
+        }
+    }
+    let roots = heap::root_values(&[origin, args_tuple, typevar_types]);
+    let parameters = collect_type_vars(args_tuple);
+    let parameter_roots = heap::root_values(&[parameters]);
+    value::instance_setattr(instance, "__origin__".to_string(), origin);
+    value::instance_setattr(instance, "__args__".to_string(), args_tuple);
+    value::instance_setattr(instance, "_typevar_types".to_string(), typevar_types);
+    value::instance_setattr(instance, "_paramspec_tvars".to_string(), paramspec_tvars);
+    value::instance_setattr(instance, "__parameters__".to_string(), parameters);
+    heap::release_roots(parameter_roots);
+    heap::release_roots(roots);
+    NONE
 }
 
 /// A `frozenset`-shaped constant. Hydro has one set value type, so the
@@ -541,7 +639,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         // `NewType("Name", int)` is called like the underlying type in the
         // corpus, so the underlying type is the usable stand-in.
         "NewType" => args.get(1).copied().unwrap_or(NONE),
-        "get_type_hints" => value::dict_new(Vec::new()),
+        "get_type_hints" => get_type_hints(args, &[]),
+        "_get_defaults" => get_defaults(args.first().copied().unwrap_or(NONE)),
         "get_args" => alias_args(args.first().copied().unwrap_or(NONE)),
         "get_origin" => alias_origin(args.first().copied().unwrap_or(NONE)),
         // `@final` is a marker in this runtime: annotations are not enforced.
@@ -593,6 +692,8 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
         "dataclass_transform" => {
             value::identity_function_new("typing.dataclass_transform.<locals>.decorator")
         }
+        "get_type_hints" => get_type_hints(args, keywords),
+        "_get_defaults" => get_defaults(args.first().copied().unwrap_or(NONE)),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'typing' has no attribute '{function}'"),
@@ -762,6 +863,168 @@ fn type_repr(obj: i64) -> i64 {
         return value::str_alloc(function.name.clone());
     }
     value::str_alloc(value::repr(obj))
+}
+
+/// `typing.get_type_hints(obj, globalns=None, localns=None,
+/// include_extras=False, *, format=None)`.
+///
+/// Hydro stores annotations only when a program (or a compatibility module)
+/// assigns a function/class/module `__annotations__` mapping; the compiler
+/// consumes annotations itself and keeps no payload. The helper therefore
+/// reports the annotations that actually exist: for classes it merges the
+/// MRO base-first (later definitions win, like CPython), for functions it
+/// reads the assigned slot, and for modules it reads the module namespace.
+/// String annotations are resolved through the supplied scopes when one is
+/// given; without scope metadata the string is returned unchanged rather than
+/// evaluated against a fabricated namespace. `include_extras` and `format`
+/// are accepted for signature compatibility: Hydro does not model
+/// `Annotated` stripping or annotationlib formats.
+fn get_type_hints(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let params = ["obj", "globalns", "localns", "include_extras", "format"];
+    let Ok(slots) = bind_parameters("get_type_hints", &params, 0, args, keywords) else {
+        return NONE;
+    };
+    // Historical runtime behaviour (and the central spec's minimum): a call
+    // with no object reports "no annotations" instead of inventing one.
+    let Some(obj) = slots[0] else {
+        return value::dict_new(Vec::new());
+    };
+    let globalns = slots[1].unwrap_or(NONE);
+    let localns = slots[2].unwrap_or(NONE);
+    let hints = value::dict_new(Vec::new());
+    let roots = heap::root_values(&[hints, obj]);
+    let mut merged: Vec<(String, i64)> = Vec::new();
+    if let Some(state) = value::as_class(obj) {
+        let mut chain = state.mro.clone();
+        chain.reverse();
+        chain.push(obj);
+        for base in chain {
+            if let Some(value::ClassEntry::Attr(annotations)) =
+                value::class_lookup(base, "__annotations__")
+            {
+                if let Some(pairs) = value::as_dict(annotations) {
+                    for (name, annotation) in pairs {
+                        if let Some(name) = value::as_str(*name) {
+                            merged.push((name.to_string(), *annotation));
+                        }
+                    }
+                }
+            }
+        }
+    } else if value::as_function(obj).is_some() {
+        if let Some(annotations) = value::function_annotations(function_metadata_target(obj)) {
+            if let Some(pairs) = value::as_dict(annotations) {
+                for (name, annotation) in pairs {
+                    if let Some(name) = value::as_str(*name) {
+                        merged.push((name.to_string(), *annotation));
+                    }
+                }
+            }
+        }
+    } else if let Some(module) = value::as_module(obj) {
+        if let Some(annotations) = crate::core::globals::lookup(module.name(), "__annotations__") {
+            if let Some(pairs) = value::as_dict(annotations) {
+                for (name, annotation) in pairs {
+                    if let Some(name) = value::as_str(*name) {
+                        merged.push((name.to_string(), *annotation));
+                    }
+                }
+            }
+        }
+    } else {
+        let rendered = value::repr(obj);
+        heap::release_roots(roots);
+        return type_error(&format!("{rendered} does not have annotations"));
+    }
+    for (name, annotation) in merged {
+        let resolved = resolve_hint(annotation, globalns, localns);
+        if exc::pending() {
+            heap::release_roots(roots);
+            return NONE;
+        }
+        let key = value::str_alloc(name);
+        let entry_roots = heap::root_values(&[key, resolved]);
+        container::dict_set(hints, key, resolved);
+        heap::release_roots(entry_roots);
+    }
+    heap::release_roots(roots);
+    hints
+}
+
+/// Resolves one annotation value against the scopes `get_type_hints` was
+/// given. CPython uses a single dict for both scopes when only one is passed.
+fn resolve_hint(annotation: i64, globalns: i64, localns: i64) -> i64 {
+    let Some(text) = value::as_str(annotation) else {
+        return annotation;
+    };
+    if globalns == NONE && localns == NONE {
+        // No scope metadata: a string annotation cannot be evaluated without a
+        // compiler, so it is reported as written instead of guessed.
+        return annotation;
+    }
+    let (globals, locals) = if globalns == NONE {
+        (localns, localns)
+    } else if localns == NONE {
+        (globalns, globalns)
+    } else {
+        (globalns, localns)
+    };
+    match resolve_name(text, globals, locals) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => annotation,
+        Err(raised) => raised,
+    }
+}
+
+/// Resolves a bound method to the function whose metadata backs its
+/// `__code__`/`__defaults__`/`__annotations__` in CPython.
+fn function_metadata_target(obj: i64) -> i64 {
+    let Some(function) = value::as_function(obj) else {
+        return obj;
+    };
+    let value::FunctionBody::BoundMethod { receiver, method } = &function.body else {
+        return obj;
+    };
+    let class = value::instance_class_value(*receiver)
+        .or_else(|| value::as_class(*receiver).map(|_| *receiver));
+    let Some(class) = class else {
+        return obj;
+    };
+    match value::class_lookup(class, method) {
+        Some(value::ClassEntry::Method(_, target)) => target,
+        Some(value::ClassEntry::Attr(target)) if value::as_function(target).is_some() => target,
+        _ => obj,
+    }
+}
+
+/// `typing._get_defaults(func)`: the function's default arguments by name.
+///
+/// CPython builds this from `__defaults__` and `__kwdefaults__`; Hydro keeps
+/// the same information in every function value's parameter metadata, so
+/// parameter names with a recorded default (positional, positional-only and
+/// keyword-only alike) become the mapping. Callables without metadata report
+/// an empty mapping instead of failing.
+fn get_defaults(obj: i64) -> i64 {
+    let obj = function_metadata_target(obj);
+    let dict = value::dict_new(Vec::new());
+    let roots = heap::root_values(&[dict, obj]);
+    for param in value::function_signature(obj) {
+        if !matches!(
+            param.kind,
+            ParamKind::Positional | ParamKind::PosOnly | ParamKind::KwOnly
+        ) {
+            continue;
+        }
+        let Some(default) = param.default else {
+            continue;
+        };
+        let key = value::str_alloc(param.name.clone());
+        let entry_roots = heap::root_values(&[key, default]);
+        container::dict_set(dict, key, default);
+        heap::release_roots(entry_roots);
+    }
+    heap::release_roots(roots);
+    dict
 }
 
 /// `typing._eval_type(t, globalns, localns, ...)`: evaluates a `ForwardRef`
@@ -1194,7 +1457,9 @@ mod tests {
     #[test]
     fn introspection_helpers_return_empty_containers() {
         exc::init();
-        let hints = call("get_type_hints", &[text("f")]);
+        // A function with no assigned `__annotations__` reports no hints.
+        let function = value::identity_function_new("f");
+        let hints = call("get_type_hints", &[function]);
         assert_eq!(as_dict(hints).expect("dict").len(), 0);
         let empty = call("get_type_hints", &[]);
         assert_eq!(as_dict(empty).expect("dict").len(), 0);
@@ -1406,5 +1671,189 @@ mod tests {
         assert_eq!(collected.to_vec(), vec![param]);
         assert_eq!(call("_check_generic", &[class, parameters]), NONE);
         assert!(!exc::pending());
+    }
+
+    /// Looks up a string-keyed entry in a runtime dict.
+    fn dict_entry(dict: i64, name: &str) -> Option<i64> {
+        as_dict(dict)?
+            .iter()
+            .find_map(|(key, item)| (value::as_str(*key) == Some(name)).then_some(*item))
+    }
+
+    #[test]
+    fn get_type_hints_reads_stored_annotations_and_supplied_scopes() {
+        exc::init();
+        let class = constant("Any");
+        let function = value::identity_function_new("f");
+        let annotated = value::dict_new(vec![(text("x"), class), (text("y"), text("int"))]);
+        assert!(value::function_setattr(
+            function,
+            "__annotations__",
+            annotated
+        ));
+
+        // Without scope metadata, concrete annotations are reported unchanged
+        // and a string annotation stays a string instead of being guessed.
+        let hints = call("get_type_hints", &[function]);
+        assert!(!exc::pending());
+        assert_eq!(dict_entry(hints, "x"), Some(class));
+        assert_eq!(dict_entry(hints, "y").and_then(value::as_str), Some("int"));
+
+        // One scope dict is used for both globals and locals, resolving names.
+        let scope = value::dict_new(vec![(text("int"), class)]);
+        let resolved = call_kw(
+            "get_type_hints",
+            &[function],
+            &[("globalns".to_string(), scope)],
+        );
+        assert!(!exc::pending());
+        assert_eq!(dict_entry(resolved, "y"), Some(class));
+
+        // `include_extras` and `format` are accepted for signature parity.
+        let extras = call_kw(
+            "get_type_hints",
+            &[function],
+            &[
+                ("globalns".to_string(), scope),
+                ("include_extras".to_string(), TRUE),
+                ("format".to_string(), NONE),
+            ],
+        );
+        assert!(!exc::pending());
+        assert_eq!(dict_entry(extras, "y"), Some(class));
+
+        // A function with no annotations reports an empty mapping.
+        let plain = value::identity_function_new("plain");
+        let empty = call("get_type_hints", &[plain]);
+        assert!(!exc::pending());
+        assert_eq!(as_dict(empty).expect("dict").len(), 0);
+
+        // Class annotations are read from the class namespace.
+        let class_annotations = value::dict_new(vec![(text("field"), class)]);
+        let annotated_class = value::class_new_full(
+            "C".to_string(),
+            NONE,
+            Vec::new(),
+            vec![("__annotations__".to_string(), class_annotations)],
+        );
+        let class_hints = call("get_type_hints", &[annotated_class]);
+        assert!(!exc::pending());
+        assert_eq!(dict_entry(class_hints, "field"), Some(class));
+
+        // Unsupported objects fail like CPython instead of pretending to have
+        // annotations.
+        exc::init();
+        call("get_type_hints", &[value::encode_int(3).unwrap()]);
+        assert!(exc::pending());
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn get_defaults_maps_recorded_parameter_defaults() {
+        exc::init();
+        let two = value::encode_int(2).unwrap();
+        let five = value::encode_int(5).unwrap();
+        let function = value::identity_function_new("f");
+        value::function_set_signature(
+            function,
+            vec![
+                value::ParamMeta {
+                    name: "a".to_string(),
+                    kind: hydro_ir::ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "b".to_string(),
+                    kind: hydro_ir::ParamKind::Positional,
+                    default: Some(two),
+                },
+                value::ParamMeta {
+                    name: "c".to_string(),
+                    kind: hydro_ir::ParamKind::KwOnly,
+                    default: Some(five),
+                },
+                value::ParamMeta {
+                    name: "kw".to_string(),
+                    kind: hydro_ir::ParamKind::KwArg,
+                    default: Some(NONE),
+                },
+            ],
+        );
+        let defaults = call("_get_defaults", &[function]);
+        assert!(!exc::pending());
+        let entries = as_dict(defaults).expect("dict");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(dict_entry(defaults, "b"), Some(two));
+        assert_eq!(dict_entry(defaults, "c"), Some(five));
+        assert_eq!(dict_entry(defaults, "a"), None);
+        // Callables without parameter metadata report an empty mapping.
+        let empty = call("_get_defaults", &[text("not a function")]);
+        assert!(!exc::pending());
+        assert_eq!(as_dict(empty).expect("dict").len(), 0);
+    }
+
+    #[test]
+    fn concatenate_generic_alias_stores_origin_args_and_keyword_flags() {
+        exc::init();
+        let class = cached_class("_ConcatenateGenericAlias");
+        let origin = constant("Callable");
+        let parameter = call("ParamSpec", &[text("P")]);
+        let arguments = value::tuple_new(vec![constant("Any"), parameter]);
+        let typevar_types = value::tuple_new(vec![constant("Any")]);
+        let alias = crate::builtins::call_kw(
+            class,
+            2,
+            [origin, arguments].as_ptr(),
+            2,
+            [
+                text("_typevar_types"),
+                typevar_types,
+                text("_paramspec_tvars"),
+                TRUE,
+            ]
+            .as_ptr(),
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_class_value(alias),
+            Some(class),
+            "construction uses the cached alias class"
+        );
+        assert_eq!(value::instance_attr(alias, "__origin__"), Some(origin));
+        let stored = as_tuple(value::instance_attr(alias, "__args__").expect("__args__"))
+            .expect("args tuple");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[1], parameter);
+        assert_eq!(
+            value::instance_attr(alias, "_typevar_types"),
+            Some(typevar_types)
+        );
+        assert_eq!(value::instance_attr(alias, "_paramspec_tvars"), Some(TRUE));
+        // The parameters are the ParamSpec members of the arguments.
+        let parameters =
+            as_tuple(value::instance_attr(alias, "__parameters__").expect("__parameters__"))
+                .expect("parameters tuple");
+        assert_eq!(parameters.to_vec(), vec![parameter]);
+        // Both `_is_param_expr` spellings recognize the constructed alias.
+        assert_eq!(call("_is_param_expr", &[alias]), TRUE);
+        assert_eq!(
+            call("get_origin", &[alias]),
+            origin,
+            "get_origin reads the stored origin"
+        );
+
+        // Unknown keyword-only metadata is rejected, not ignored.
+        exc::init();
+        crate::builtins::call_kw(
+            class,
+            2,
+            [origin, arguments].as_ptr(),
+            1,
+            [text("bogus"), NONE].as_ptr(),
+        );
+        assert!(exc::pending());
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
     }
 }

@@ -518,6 +518,32 @@ assert os.path.join(\"a\", \"b\") == \"a/b\"
 }
 
 #[test]
+fn math_prod_matches_cpython() {
+    run_source(
+        "\
+import math
+
+assert math.prod([]) == 1
+assert math.prod([], start=5) == 5
+assert math.prod([1, 2, 3, 4, 5]) == 120
+assert math.prod(range(2, 8)) == 5040
+# Generators are consumed lazily by the same iteration path.
+assert math.prod(x for x in range(2, 8)) == 5040
+assert math.prod((x for x in range(2, 5)), start=2) == 48
+# A float operand promotes the running product.
+assert math.prod([1, 2, 3, 4.0, 5.0]) == 120.0
+assert math.prod([1.5, 2]) == 3.0
+# Exact integers promote to BigInt instead of overflowing.
+assert math.prod([2 ** 40, 2 ** 40]) == 2 ** 80
+# The start value participates in the multiplication protocol.
+assert math.prod([2, 3], start=10) == 60
+assert math.prod([2, 3], start=\"ab\") == \"abababababab\"
+assert math.prod([1, 0, 2, 3]) == 0
+",
+    );
+}
+
+#[test]
 fn user_module_initializers_run_once() {
     let _guard = guard();
     let unique = SystemTime::now()
@@ -586,6 +612,52 @@ try:
 except ValueError:
     caught = True
 assert caught
+",
+    );
+}
+
+#[test]
+fn slice_objects_reach_user_getitem() {
+    run_source(
+        "\
+class Grid:
+    def __init__(self):
+        self.seen = None
+
+    def __getitem__(self, index):
+        self.seen = index
+        return index
+
+grid = Grid()
+
+# `a[:, 1]`: a tuple key whose first element is a real slice object.
+key = grid[:, 1]
+assert isinstance(key, tuple)
+assert isinstance(key[0], slice)
+assert key[0].start is None
+assert key[0].stop is None
+assert key[0].step is None
+assert key[1] == 1
+assert grid.seen[0] == key[0]
+assert grid.seen[1] == 1
+
+# `a[::2, 3]`: omitted bounds stay None while the step is the given value.
+stepped = grid[::2, 3]
+assert stepped[0].start is None
+assert stepped[0].stop is None
+assert stepped[0].step == 2
+assert stepped[1] == 3
+
+# `a[1, :]`: the slice keeps a non-leading position in the tuple.
+first = grid[1, :]
+assert first[0] == 1
+assert first[1].start is None
+assert first[1].stop is None
+assert first[1].step is None
+
+# Slice values compare by bound, so the lowered and explicit forms match.
+assert stepped[0] == slice(None, None, 2)
+assert first[1] == slice(None, None, None)
 ",
     );
 }

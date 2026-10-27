@@ -412,6 +412,15 @@ built-in kinds), so the fallback never matches a user handler.
   (`xs[a:b:c] = iterable`) splices for `step == 1`, replaces the visited
   positions for extended slices (length mismatch → ValueError) and rejects
   immutable `str`/`bytes`/`tuple` targets (`TypeError`).
+- A slice is a legal element of a tuple/list subscript index
+  (`ary[:, 1]`, `ary[1, :]`, `ary[::2, ...]`, the NumPy-style key form):
+  each `start:stop:step` element lowers to a real `slice` object built by
+  the cached `builtins.slice` class, with `None` for every omitted bound,
+  and user `__getitem__` methods receive the tuple with the slice in
+  place. Sema treats such a key as dynamic for `list`/`str`/`bytes`/`tuple`
+  receivers and leaves the `TypeError` to the runtime; the direct
+  `s[a:b:c]` fast path is unchanged, and slice syntax outside a subscript
+  still reports `HYD0202`.
 - Tuples: immutable, indexing/slicing like lists, `len`, iteration,
   structural equality, `tuple + tuple` and `tuple * int`; representation
   `(1, 'a')`, singleton `(1,)`, empty `()`. Tuples of hashable elements are
