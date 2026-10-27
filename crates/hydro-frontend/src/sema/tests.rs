@@ -1,4 +1,5 @@
 use super::*;
+use crate::lower::HParam;
 use hydro_ir::ExcKind;
 
 fn empty_prog() -> LHir {
@@ -278,6 +279,113 @@ fn call_arity_uses_the_call_code() {
         diags[0].message.contains("missing required argument 'x'"),
         "{}",
         diags[0].message
+    );
+}
+
+/// A parameter of a synthetic signature.
+fn signature_param(name: &str, kind: ParamKind, default: Option<Const>) -> HParam {
+    HParam {
+        local: 0,
+        name: name.to_string(),
+        ty: Ty::Concrete(Type::Any),
+        default,
+        default_expr: None,
+        kind,
+    }
+}
+
+#[test]
+fn user_call_arity_allows_omitted_default_arguments() {
+    // Regression: `ntypes.obj2sctype(dtype)` forwards only the supplied
+    // positional arguments, and `default=None` must not be required.
+    let params = [
+        signature_param("rep", ParamKind::Positional, None),
+        signature_param("default", ParamKind::Positional, Some(Const::None)),
+    ];
+    let arity = CallArity::from_params("obj2sctype", &params, 0);
+    assert_eq!(arity.positional_error(1), None);
+    assert_eq!(
+        arity.positional_error(0),
+        Some("obj2sctype() missing required argument 'rep'".to_string())
+    );
+    assert_eq!(
+        arity.positional_error(3),
+        Some("obj2sctype() takes 2 positional argument(s) but 3 were given".to_string())
+    );
+}
+
+#[test]
+fn user_call_arity_excludes_closure_captures() {
+    let params = [
+        signature_param("captured", ParamKind::Positional, None),
+        signature_param("value", ParamKind::Positional, None),
+    ];
+    let arity = CallArity::from_params("f", &params, 1);
+    assert_eq!(arity.positional_error(1), None);
+    assert_eq!(
+        arity.positional_error(0),
+        Some("f() missing required argument 'value'".to_string())
+    );
+}
+
+#[test]
+fn user_call_arity_accepts_varargs_and_positional_only_names() {
+    let params = [
+        signature_param("a", ParamKind::PosOnly, None),
+        signature_param("rest", ParamKind::VarArg, None),
+    ];
+    let arity = CallArity::from_params("f", &params, 0);
+    assert_eq!(arity.positional_error(1), None);
+    assert_eq!(arity.positional_error(4), None);
+    assert_eq!(
+        arity.positional_error(0),
+        Some("f() missing required positional argument 'a'".to_string())
+    );
+}
+
+#[test]
+fn user_call_arity_checks_keyword_only_parameters() {
+    let params = [
+        signature_param("a", ParamKind::Positional, None),
+        signature_param("b", ParamKind::KwOnly, None),
+        signature_param("c", ParamKind::KwOnly, Some(Const::Int(1))),
+    ];
+    let arity = CallArity::from_params("f", &params, 0);
+    assert_eq!(arity.keyword_error(1, &["b"]), None);
+    assert_eq!(arity.keyword_error(1, &["b", "c"]), None);
+    assert_eq!(
+        arity.keyword_error(1, &["c"]),
+        Some("f() missing required keyword-only argument 'b'".to_string())
+    );
+    // A required positional parameter may also arrive as a keyword.
+    assert_eq!(arity.keyword_error(0, &["a", "b"]), None);
+    assert_eq!(
+        arity.keyword_error(0, &["b"]),
+        Some("f() missing required argument 'a'".to_string())
+    );
+}
+
+#[test]
+fn user_call_accepts_omitted_defaults_end_to_end() {
+    assert!(check_errors("def f(a, b=None):\n    return a\nf(1)\n").is_empty());
+    assert!(check_errors("def f(a, *args):\n    return a\nf(1, 2, 3)\n").is_empty());
+    assert!(check_errors("def f(a, *, b=2):\n    return a\nf(1)\n").is_empty());
+    assert!(check_errors("def f(a, *, b=2):\n    return a\nf(1, b=3)\n").is_empty());
+}
+
+#[test]
+fn user_call_rejects_missing_required_arguments_end_to_end() {
+    let errors = check_errors("def f(a, b=None):\n    return a\nf()\n");
+    assert_eq!(
+        errors,
+        vec!["f() missing required argument 'a'"],
+        "{errors:?}"
+    );
+    let errors = check_errors("def f(a, *, b):\n    return a\nf(1)\n");
+    assert_eq!(
+        errors,
+        vec!["f() missing required keyword-only argument 'b'"],
+        "{errors:?}"
     );
 }
 

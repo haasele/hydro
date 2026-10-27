@@ -13,12 +13,12 @@ use hydro_ir::stdlib;
 use hydro_ir::{
     BinOp, Builtin, Callee, ClassAttr, ClassMethod, CompClause, CompTarget, Const, DeleteTarget,
     Expr as IrExpr, ExprKind, Function as IrFunction, Handler as IrHandler, LocalInfo, Param,
-    Program, Stmt as IrStmt, StmtKind, Type, UnOp, UnpackTarget,
+    ParamKind, Program, Stmt as IrStmt, StmtKind, Type, UnOp, UnpackTarget,
 };
 
 use crate::diag::{self, codes, Diagnostic};
 use crate::lower::{
-    HCompClause, HCompTarget, HDeleteTarget, HExpr, HExprKind, HFunction, HStmt, HStmtKind,
+    HCompClause, HCompTarget, HDeleteTarget, HExpr, HExprKind, HFunction, HParam, HStmt, HStmtKind,
     HUnpackTarget, LHir,
 };
 
@@ -787,6 +787,129 @@ fn simple_expr_end(expr: &HExpr, f: &HFunction) -> Option<u32> {
         _ => return None,
     };
     Some(expr.col.saturating_add(u32::try_from(width).ok()?))
+}
+
+/// Statically known binding requirements of a user function at a call site.
+///
+/// A call reaches the checker in one of two shapes. The binder in `lower`
+/// fills every parameter slot of a direct call (literal/non-literal defaults,
+/// the `*args` list, keyword-only values and the `**kwargs` dict), while a
+/// cross-module export call forwards exactly the positional arguments of the
+/// source. A positionally supplied call therefore fills at least the required
+/// positional parameters and at most one slot per parameter, and parameters
+/// that carry a default are never required.
+struct CallArity {
+    name: String,
+    /// Parameters bound from the positional stream, in signature order:
+    /// name, binding kind and whether a default can fill it.
+    positional: Vec<(String, ParamKind, bool)>,
+    /// Keyword-only parameters: name and whether a default can fill it.
+    kwonly: Vec<(String, bool)>,
+    has_vararg: bool,
+    /// Number of parameter slots after the closure captures.
+    slots: usize,
+}
+
+impl CallArity {
+    /// Signature of a function of this unit; closure captures are not
+    /// arguments, so they are not part of the signature.
+    fn of(function: &HFunction) -> CallArity {
+        CallArity::from_params(&function.name, &function.params, function.capture_count)
+    }
+
+    fn from_params(name: &str, params: &[HParam], capture_count: usize) -> CallArity {
+        let params = &params[capture_count.min(params.len())..];
+        let mut arity = CallArity {
+            name: name.to_string(),
+            positional: Vec::new(),
+            kwonly: Vec::new(),
+            has_vararg: false,
+            slots: params.len(),
+        };
+        for param in params {
+            // A default, literal or not, makes the parameter optional; the
+            // binder evaluates it when the argument is omitted.
+            let optional = param.default.is_some() || param.default_expr.is_some();
+            match param.kind {
+                ParamKind::Positional | ParamKind::PosOnly => {
+                    arity
+                        .positional
+                        .push((param.name.clone(), param.kind, optional));
+                }
+                ParamKind::KwOnly => arity.kwonly.push((param.name.clone(), optional)),
+                ParamKind::VarArg => arity.has_vararg = true,
+                // `**kwargs` accepts every keyword name; it constrains neither
+                // the positional arity nor the required parameters.
+                ParamKind::KwArg => {}
+            }
+        }
+        arity
+    }
+
+    fn missing_message(&self, param: &str, kind: ParamKind) -> String {
+        let label = match kind {
+            ParamKind::PosOnly => "positional argument",
+            ParamKind::KwOnly => "keyword-only argument",
+            _ => "argument",
+        };
+        format!("{}() missing required {} '{}'", self.name, label, param)
+    }
+
+    /// Diagnostic for a call that supplies only positional arguments, or
+    /// `None` when the call is acceptable.
+    ///
+    /// Keyword-only parameters do not gate this shape: a direct call always
+    /// carries their slots (the binder filled defaults or reported the
+    /// omission), and a cross-module call cannot name them at all. Only the
+    /// required positional parameters and the slot count bound the call.
+    fn positional_error(&self, given: usize) -> Option<String> {
+        for (index, (param, kind, optional)) in self.positional.iter().enumerate() {
+            if *optional || index < given {
+                continue;
+            }
+            return Some(self.missing_message(param, *kind));
+        }
+        if self.has_vararg || given <= self.slots {
+            return None;
+        }
+        Some(format!(
+            "{}() takes {} positional argument(s) but {} were given",
+            self.name, self.slots, given
+        ))
+    }
+
+    /// Diagnostic for a call that carries keyword arguments, or `None` when
+    /// the call is acceptable.
+    ///
+    /// `given` counts the positional arguments and `keywords` the supplied
+    /// keyword names. A required parameter is satisfied by either stream; a
+    /// positional-only parameter only by the positional one.
+    fn keyword_error(&self, given: usize, keywords: &[&str]) -> Option<String> {
+        let bound_positionally = given.min(self.positional.len());
+        for (index, (param, kind, optional)) in self.positional.iter().enumerate() {
+            if *optional || index < bound_positionally {
+                continue;
+            }
+            if *kind != ParamKind::PosOnly && keywords.contains(&param.as_str()) {
+                continue;
+            }
+            return Some(self.missing_message(param, *kind));
+        }
+        for (param, optional) in &self.kwonly {
+            if !optional && !keywords.contains(&param.as_str()) {
+                return Some(self.missing_message(param, ParamKind::KwOnly));
+            }
+        }
+        if self.has_vararg || given <= self.positional.len() {
+            return None;
+        }
+        Some(format!(
+            "{}() takes {} positional argument(s) but {} were given",
+            self.name,
+            self.positional.len(),
+            given
+        ))
+    }
 }
 
 struct Checker<'a> {
@@ -1999,6 +2122,24 @@ impl<'a> Checker<'a> {
                 for (_, value) in keywords {
                     self.check_expr(value, f);
                 }
+                // A call through the function value of a known function still
+                // binds the same signature: a required parameter is satisfied
+                // by a positional argument or by a keyword of its name.
+                let arity = match &callee.kind {
+                    HExprKind::FunctionRef(id) => {
+                        self.prog.functions.get(*id as usize).map(CallArity::of)
+                    }
+                    _ => None,
+                };
+                if let Some(arity) = arity {
+                    let names = keywords
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>();
+                    if let Some(message) = arity.keyword_error(args.len(), &names) {
+                        self.error_code(expr.line, expr.col, codes::CALL, message);
+                    }
+                }
                 self.force_any(expr.ty);
             }
             HExprKind::CallFull {
@@ -2108,27 +2249,22 @@ impl<'a> Checker<'a> {
         match callee {
             Callee::Function(id) => {
                 let id = *id;
-                let (name, params, ret_ty, is_coroutine) = {
+                let (arity, params, ret_ty, is_coroutine) = {
                     let function = &self.prog.functions[id as usize];
+                    let captures = function.capture_count.min(function.params.len());
                     (
-                        function.name.clone(),
-                        function.params.iter().map(|p| p.ty).collect::<Vec<_>>(),
+                        CallArity::of(function),
+                        function.params[captures..]
+                            .iter()
+                            .map(|p| p.ty)
+                            .collect::<Vec<_>>(),
                         function.ret_ty,
                         function.is_async || function.is_generator,
                     )
                 };
-                if args.len() != params.len() {
-                    self.error_code(
-                        expr.line,
-                        expr.col,
-                        codes::CALL,
-                        format!(
-                            "{}() takes {} positional argument(s) but {} were given",
-                            name,
-                            params.len(),
-                            args.len()
-                        ),
-                    );
+                let name = &arity.name;
+                if let Some(message) = arity.positional_error(args.len()) {
+                    self.error_code(expr.line, expr.col, codes::CALL, message);
                 }
                 for (index, arg) in args.iter().enumerate() {
                     if let Some(param_ty) = params.get(index) {
