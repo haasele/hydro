@@ -1719,7 +1719,11 @@ pub static TYPING: ModuleSpec = ModuleSpec {
         kw("cast", 2, 2, Type::Any, &["typ", "val"]),
         f("runtime_checkable", 1, 1, Type::Any),
         f("overload", 1, 1, Type::Any),
-        f("TypeVar", 1, 3, Type::Any),
+        // `TypeVar(name, *constraints, *, bound=None, covariant=False,
+        // contravariant=False, infer_variance=False, default=NoDefault,
+        // module=None)`: only the name is a named positional parameter; the
+        // constraint run and the keyword flags are parsed by the runtime.
+        kw_dynamic("TypeVar", 1, usize::MAX, Type::Any, &["name"]),
         f("NewType", 2, 2, Type::Any),
         // `ForwardRef(arg, *, module=None, owner=None, is_argument=True,
         // is_class=False)`: the runtime returns the native class for the
@@ -3617,7 +3621,10 @@ mod tests {
         assert_eq!(function("typing", "runtime_checkable").unwrap().max_args, 1);
         assert_eq!(function("typing", "overload").unwrap().min_args, 1);
         let typevar = function("typing", "TypeVar").unwrap();
-        assert_eq!((typevar.min_args, typevar.max_args), (1, 3));
+        assert_eq!(typevar.min_args, 1);
+        assert_eq!(typevar.max_args, usize::MAX, "constraints are variadic");
+        assert!(typevar.dynamic_keywords, "bound/covariant/... are keywords");
+        assert_eq!(typevar.params, &["name"][..]);
         assert_eq!(function("typing", "NewType").unwrap().min_args, 2);
         let hints = function("typing", "get_type_hints").unwrap();
         assert_eq!(hints.ret, Type::Dict);

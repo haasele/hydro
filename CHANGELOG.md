@@ -8,6 +8,20 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 `typing.TypeVar` type parameters
+
+- `typing.TypeVar` is a real cached class: `TypeVar(name, *constraints, *,
+  bound=None, covariant=False, contravariant=False, infer_variance=False,
+  default=None, module=None)` allocates a fresh instance per call with
+  `__name__`, `__constraints__` (a tuple), `__bound__`, the variance flags,
+  `__default__` and `__module__` attributes and a `~name` representation.
+  The `name` must be a string, `covariant`/`contravariant` together raise
+  `ValueError: Bivariant types are not supported.`, and unknown keywords are
+  rejected. Instances participate in `_collect_type_vars`, and the keyword
+  surface is registered in the static spec so typed code such as NumPy's
+  `TypeVar("_T_co", covariant=True)` compiles. This unblocks the NumPy
+  imports that previously saw `TypeVar` return `None`.
+
 ### Added — 2026-10-27 `functools.cached_property` and `math.log2`
 
 - `functools.cached_property` is a real non-data descriptor: `__get__` calls

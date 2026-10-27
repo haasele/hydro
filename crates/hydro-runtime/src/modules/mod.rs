@@ -11699,7 +11699,11 @@ mod tests {
         let payload = string("payload");
         let any = get("typing", "Any");
         assert_eq!(call("typing", "cast", &[any, payload]), payload);
-        assert_eq!(call("typing", "TypeVar", &[string("T")]), NONE);
+        let typevar = call("typing", "TypeVar", &[string("T")]);
+        assert_eq!(
+            value::instance_attr(typevar, "__name__").and_then(value::as_str),
+            Some("T")
+        );
         assert_eq!(
             value::as_dict(call("typing", "get_type_hints", &[]))
                 .expect("dict value")

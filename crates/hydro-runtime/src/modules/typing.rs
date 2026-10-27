@@ -10,10 +10,16 @@
 //! semantics are attached; annotations themselves are not evaluated.
 //! `TYPE_CHECKING` is `False`, which keeps guarded imports from running.
 //!
+//! `TypeVar`, `ParamSpec` and `TypeVarTuple` are real type-parameter objects:
+//! each call allocates a fresh instance carrying the CPython attribute set
+//! (`__name__`, `__constraints__`, `__bound__`, the variance flags,
+//! `__default__`, `__module__`) and a `~name` representation.
+//!
 //! Most class constants allocate a fresh class per access, matching CPython's
-//! stable identity semantics closely enough for subclassing. `ForwardRef` is
-//! the exception: it is a generation-cached class because `isinstance` checks
-//! and construction must share one identity.
+//! stable identity semantics closely enough for subclassing. `ForwardRef`,
+//! `TypeVar`, `ParamSpec` and `TypeVarTuple` are the exceptions: they are
+//! cached classes because `isinstance` checks and construction must share one
+//! identity.
 //!
 //! Two runtime helpers from CPython 3.14's `typing` are implemented for
 //! `annotationlib`:
@@ -33,6 +39,7 @@ use hydro_ir::ParamKind;
 use crate::container;
 use crate::exc::{
     self, ATTRIBUTE_ERROR, DEPRECATION_WARNING, NAME_ERROR, NOT_IMPLEMENTED_ERROR, TYPE_ERROR,
+    VALUE_ERROR,
 };
 use crate::heap;
 use crate::methods;
@@ -58,11 +65,12 @@ pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
     }
     match name {
         "ForwardRef" => Some(forward_ref_class()),
-        // `ParamSpec` and `TypeVarTuple` are declared as module functions so
-        // calls lower as module calls, but the attribute value itself is the
-        // cached class (`isinstance`, `from typing import ParamSpec` and
-        // subclassing all need it).
+        // `ParamSpec`, `TypeVar` and `TypeVarTuple` are declared as module
+        // functions so calls lower as module calls, but the attribute value
+        // itself is the cached class (`isinstance`, `from typing import
+        // ParamSpec` and subclassing all need it).
         "ParamSpec" | "TypeVarTuple" => Some(typevar_like_class(name)),
+        "TypeVar" => Some(typevar_class()),
         _ => None,
     }
 }
@@ -597,6 +605,193 @@ extern "C" fn typevar_like_repr_entry(argv: *const i64) -> i64 {
     typevar_like_repr(unsafe { *argv })
 }
 
+/// The cached `TypeVar` class.
+///
+/// CPython creates a fresh type variable on every call. The class is shared so
+/// `isinstance(t, TypeVar)` and `from typing import TypeVar` keep working,
+/// while each construction allocates its own instance and attributes.
+fn typevar_class() -> i64 {
+    let key = "typing.TypeVar";
+    if let Some(cached) = crate::core::globals::registry_get(key) {
+        return cached;
+    }
+    let signature = vec![
+        value::ParamMeta {
+            name: "self".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "name".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "constraints".to_string(),
+            kind: ParamKind::VarArg,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "kwargs".to_string(),
+            kind: ParamKind::KwArg,
+            default: Some(NONE),
+        },
+    ];
+    let init = value::native_function_new("typing", "_typevar_init", usize::MAX);
+    value::function_set_signature(init, signature);
+    value::function_set_full_entry(init, typevar_init_entry as *const () as usize);
+    let repr = value::native_function_new("typing", "_typevar_repr", usize::MAX);
+    value::function_set_signature(
+        repr,
+        vec![value::ParamMeta {
+            name: "self".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        }],
+    );
+    value::function_set_full_entry(repr, typevar_repr_entry as *const () as usize);
+    let class = value::class_new(
+        "TypeVar".to_string(),
+        NONE,
+        vec![
+            ("__init__".to_string(), init),
+            ("__repr__".to_string(), repr),
+        ],
+    );
+    crate::core::globals::registry_set(key, class);
+    class
+}
+
+/// `TypeVar.__init__(self, name, *constraints, **kwargs)`.
+///
+/// The class-call binder passes `constraints` as a list (`*args`) and the
+/// keyword flags as a dict (`**kwargs`).
+extern "C" fn typevar_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the class-call binder passes one slot per declared parameter.
+    let instance = unsafe { *argv };
+    let name = unsafe { *argv.add(1) };
+    let constraints = unsafe { *argv.add(2) };
+    let kwargs = unsafe { *argv.add(3) };
+    populate_type_var(instance, name, constraints, kwargs)
+}
+
+/// Stores CPython's type-variable attributes on a fresh instance.
+fn populate_type_var(instance: i64, name: i64, constraints: i64, kwargs: i64) -> i64 {
+    let Some(name_text) = value::as_str(name) else {
+        return type_error(&format!(
+            "TypeVar() argument 'name' must be str, not {}",
+            value::type_name(name)
+        ));
+    };
+    let name_text = name_text.to_string();
+    // Constraints arrive as a list from `*args`; the attribute is a tuple.
+    let constraints: Vec<i64> = value::as_list(constraints)
+        .or_else(|| value::as_tuple(constraints))
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    let mut bound = NONE;
+    let mut covariant = false;
+    let mut contravariant = false;
+    let mut infer_variance = false;
+    let mut default = NONE;
+    let mut module = None;
+    if let Some(pairs) = value::as_dict(kwargs) {
+        for (key, item) in pairs {
+            let Some(keyword) = value::as_str(*key) else {
+                return type_error("keyword names must be str");
+            };
+            match keyword {
+                "bound" => bound = *item,
+                "covariant" => covariant = value::truthy(*item),
+                "contravariant" => contravariant = value::truthy(*item),
+                "infer_variance" => infer_variance = value::truthy(*item),
+                "default" => default = *item,
+                "module" => module = Some(*item),
+                other => {
+                    return type_error(&format!(
+                        "TypeVar() got an unexpected keyword argument '{other}'"
+                    ))
+                }
+            }
+        }
+    }
+    if covariant && contravariant {
+        return exc::raise_with_message(VALUE_ERROR, "Bivariant types are not supported.");
+    }
+    let name_value = value::str_alloc(name_text);
+    let name_roots = heap::root_values(&[instance, name_value, bound, default]);
+    let module = module.unwrap_or_else(|| value::str_alloc("typing".to_string()));
+    let module_roots = heap::root_values(&[module]);
+    let constraints = value::tuple_new(constraints);
+    let constraint_roots = heap::root_values(&[constraints]);
+    for (name, item) in [
+        ("__name__", name_value),
+        ("__constraints__", constraints),
+        ("__bound__", bound),
+        ("__covariant__", value::bool_value(covariant)),
+        ("__contravariant__", value::bool_value(contravariant)),
+        ("__infer_variance__", value::bool_value(infer_variance)),
+        ("__default__", default),
+        ("__module__", module),
+    ] {
+        value::instance_setattr(instance, name.to_string(), item);
+    }
+    heap::release_roots(constraint_roots);
+    heap::release_roots(module_roots);
+    heap::release_roots(name_roots);
+    NONE
+}
+
+/// `repr(TypeVar('T')) == '~T'`.
+fn typevar_repr(instance: i64) -> i64 {
+    let name = value::instance_attr(instance, "__name__")
+        .and_then(value::as_str)
+        .unwrap_or("?");
+    value::str_alloc(format!("~{name}"))
+}
+
+extern "C" fn typevar_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` first.
+    typevar_repr(unsafe { *argv })
+}
+
+/// `typing.TypeVar(name, *constraints, *, bound=None, covariant=False,
+/// contravariant=False, infer_variance=False, default=None, module=None)`
+/// through the module-call path.
+fn new_typevar(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let mut name = args.first().copied();
+    let mut extra: Vec<(i64, i64)> = Vec::new();
+    for (keyword, item) in keywords {
+        if keyword == "name" {
+            if name.is_some() {
+                return type_error("TypeVar() got multiple values for argument 'name'");
+            }
+            name = Some(*item);
+        } else {
+            extra.push((value::str_alloc(keyword.clone()), *item));
+        }
+    }
+    let Some(name) = name else {
+        return type_error("TypeVar() missing required argument 'name'");
+    };
+    let constraints = args.get(1..).unwrap_or_default().to_vec();
+    let constraints = value::list_new(constraints);
+    let roots = heap::root_values(&[name, constraints]);
+    let kwargs = value::dict_new(extra);
+    let kwargs_roots = heap::root_values(&[kwargs]);
+    let instance = value::instance_new(typevar_class());
+    let slots = [instance, name, constraints, kwargs];
+    let instance_roots = heap::root_values(&slots);
+    let result = typevar_init_entry(slots.as_ptr());
+    heap::release_roots(instance_roots);
+    heap::release_roots(kwargs_roots);
+    heap::release_roots(roots);
+    if exc::pending() {
+        return result;
+    }
+    instance
+}
+
 /// Materialises the module constant `name`.
 pub(crate) fn constant(name: &str) -> i64 {
     if name == "TYPE_CHECKING" {
@@ -634,8 +829,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         // CPython's signature is `cast(typ, val)`; the value argument wins.
         "cast" => args.get(1).copied().unwrap_or(NONE),
         "runtime_checkable" | "overload" => args.first().copied().unwrap_or(NONE),
-        // Type variables are annotations only; the frontend ignores the value.
-        "TypeVar" => NONE,
+        // `TypeVar` carries the full type-parameter attribute set; the
+        // frontend still consumes annotations itself, but the value is real
+        // enough for `repr`/attribute introspection.
+        "TypeVar" => new_typevar(args, &[]),
         // `NewType("Name", int)` is called like the underlying type in the
         // corpus, so the underlying type is the usable stand-in.
         "NewType" => args.get(1).copied().unwrap_or(NONE),
@@ -684,6 +881,7 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
         "_deprecation_warning_for_no_type_params_passed" => no_type_params(args, keywords),
         "evaluate_forward_ref" => evaluate_forward_ref(args, keywords),
         "ParamSpec" | "TypeVarTuple" => new_typevar_like(function, args, keywords),
+        "TypeVar" => new_typevar(args, keywords),
         "_tp_cache" => tp_cache(args, keywords),
         "_type_convert" => type_convert(args, keywords),
         "_type_check" => type_check(args, keywords),
@@ -1146,7 +1344,8 @@ fn generic_class_getitem(args: &[i64]) -> i64 {
 }
 
 /// `typing._collect_type_vars`/`_collect_parameters`: flat collection of
-/// `ParamSpec`/`TypeVarTuple` members, recursing into tuples and lists.
+/// `TypeVar`/`ParamSpec`/`TypeVarTuple` members, recursing into tuples and
+/// lists.
 fn collect_type_vars(value_arg: i64) -> i64 {
     let mut collected: Vec<i64> = Vec::new();
     collect_type_vars_into(value_arg, &mut collected, 0);
@@ -1171,7 +1370,8 @@ fn collect_type_vars_into(value_arg: i64, collected: &mut Vec<i64>, depth: usize
     }
     let class = value::instance_class_value(value_arg);
     if (class == Some(typevar_like_class("ParamSpec"))
-        || class == Some(typevar_like_class("TypeVarTuple")))
+        || class == Some(typevar_like_class("TypeVarTuple"))
+        || class == Some(typevar_class()))
         && !collected.contains(&value_arg)
     {
         collected.push(value_arg);
@@ -1442,16 +1642,130 @@ mod tests {
     }
 
     #[test]
-    fn decorators_are_identity_and_typevar_is_none() {
+    fn decorators_are_identity_and_typevar_attributes_are_stored() {
         exc::init();
         let function = text("f");
         assert_eq!(call("runtime_checkable", &[function]), function);
         assert_eq!(call("overload", &[function]), function);
-        assert_eq!(call("TypeVar", &[text("T")]), NONE);
-        assert_eq!(call("TypeVar", &[text("T"), text("int")]), NONE);
         // `NewType` stands in for the underlying type so calls work.
         assert_eq!(call("NewType", &[text("TaskID"), function]), function);
+
+        let plain = call("TypeVar", &[text("T")]);
         assert!(!exc::pending());
+        assert_eq!(value::instance_class_value(plain), Some(typevar_class()));
+        assert_eq!(
+            value::instance_attr(plain, "__name__").and_then(value::as_str),
+            Some("T")
+        );
+        assert_eq!(
+            as_tuple(value::instance_attr(plain, "__constraints__").expect("__constraints__"))
+                .expect("tuple")
+                .len(),
+            0
+        );
+        assert_eq!(value::instance_attr(plain, "__bound__"), Some(NONE));
+        assert_eq!(value::instance_attr(plain, "__covariant__"), Some(FALSE));
+        assert_eq!(
+            value::instance_attr(plain, "__contravariant__"),
+            Some(FALSE)
+        );
+        assert_eq!(
+            value::instance_attr(plain, "__infer_variance__"),
+            Some(FALSE)
+        );
+        assert_eq!(value::instance_attr(plain, "__default__"), Some(NONE));
+        assert_eq!(
+            value::instance_attr(plain, "__module__").and_then(value::as_str),
+            Some("typing")
+        );
+        assert_eq!(value::as_str(typevar_repr(plain)), Some("~T"));
+
+        // CPython allocates a fresh type variable per call.
+        let again = call("TypeVar", &[text("T")]);
+        assert_ne!(again, plain);
+        assert!(!exc::pending());
+
+        // Positional arguments after the name are constraints.
+        let constrained = call("TypeVar", &[text("K"), text("int"), text("str")]);
+        assert!(!exc::pending());
+        let constraints = as_tuple(
+            value::instance_attr(constrained, "__constraints__").expect("__constraints__"),
+        )
+        .expect("tuple");
+        assert_eq!(constraints.len(), 2);
+        assert_eq!(value::as_str(constraints[0]), Some("int"));
+        assert_eq!(value::as_str(constraints[1]), Some("str"));
+
+        // Keyword-only flags are stored as given.
+        let parameter = call_kw(
+            "TypeVar",
+            &[text("V")],
+            &[
+                ("bound".to_string(), text("int")),
+                ("covariant".to_string(), TRUE),
+                ("infer_variance".to_string(), TRUE),
+                ("default".to_string(), text("str")),
+                ("module".to_string(), text("app")),
+            ],
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_attr(parameter, "__bound__").and_then(value::as_str),
+            Some("int")
+        );
+        assert_eq!(value::instance_attr(parameter, "__covariant__"), Some(TRUE));
+        assert_eq!(
+            value::instance_attr(parameter, "__contravariant__"),
+            Some(FALSE)
+        );
+        assert_eq!(
+            value::instance_attr(parameter, "__infer_variance__"),
+            Some(TRUE)
+        );
+        assert_eq!(
+            value::instance_attr(parameter, "__default__").and_then(value::as_str),
+            Some("str")
+        );
+        assert_eq!(
+            value::instance_attr(parameter, "__module__").and_then(value::as_str),
+            Some("app")
+        );
+
+        // `name` may be keyword-passed by the module binder.
+        let named = call_kw("TypeVar", &[], &[("name".to_string(), text("N"))]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_attr(named, "__name__").and_then(value::as_str),
+            Some("N")
+        );
+    }
+
+    #[test]
+    fn typevar_validates_name_and_variance() {
+        exc::init();
+        call("TypeVar", &[value::encode_int(1).unwrap()]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+        call("TypeVar", &[]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+        // Both variance flags are rejected together.
+        call_kw(
+            "TypeVar",
+            &[text("T")],
+            &[
+                ("covariant".to_string(), TRUE),
+                ("contravariant".to_string(), TRUE),
+            ],
+        );
+        assert_eq!(exc::pending_tag(), crate::exc::VALUE_ERROR as i64);
+        exc::clear();
+        call_kw("TypeVar", &[text("T")], &[("bogus".to_string(), NONE)]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+        call_kw("TypeVar", &[text("T")], &[("name".to_string(), text("S"))]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
     }
 
     #[test]
