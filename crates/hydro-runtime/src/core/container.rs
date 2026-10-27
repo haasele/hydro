@@ -1015,6 +1015,13 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
             );
         }
     }
+    // Builtin class values are function values at runtime (`tuple`, `list`,
+    // ...), so their generic subscription (`tuple[int, ...]`, `list[str]`)
+    // is resolved before the class path. A non-generic builtin (`print[int]`)
+    // falls through to the usual `TypeError`.
+    if let Some(alias) = crate::modules::typing::builtin_generic_subscript(obj, index) {
+        return alias;
+    }
     // Generic aliases (`typing.Tuple[int]`, `list[str]`) and ordinary classes
     // are treated as subscriptable: Hydro has no generic substitution, so the
     // class value itself is the alias. User code that evaluates a typing alias

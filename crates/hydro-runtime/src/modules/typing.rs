@@ -10,6 +10,14 @@
 //! semantics are attached; annotations themselves are not evaluated.
 //! `TYPE_CHECKING` is `False`, which keeps guarded imports from running.
 //!
+//! The generic builtin classes (`tuple`, `list`, `dict`, `set`, `frozenset`
+//! and `type`) are function values at runtime, so their subscription
+//! (`tuple[int, ...]`, `list[str]`, `dict[str, int]`, `type[int]`) is served
+//! by [`builtin_generic_subscript`]: it builds a `_GenericAlias` carrying
+//! `__origin__`/`__args__` and rendering like CPython's `types.GenericAlias`
+//! (`tuple[int, ...]`). Any other builtin value (`print[int]`) still raises
+//! `TypeError`.
+//!
 //! `TypeVar`, `ParamSpec` and `TypeVarTuple` are real type-parameter objects:
 //! each call allocates a fresh instance carrying the CPython attribute set
 //! (`__name__`, `__constraints__`, `__bound__`, the variance flags,
@@ -44,7 +52,7 @@
 
 use std::sync::{LazyLock, Mutex};
 
-use hydro_ir::ParamKind;
+use hydro_ir::{Builtin, ParamKind};
 
 use crate::container;
 use crate::exc::{
@@ -377,13 +385,117 @@ fn cached_class(name: &str) -> i64 {
     if let Some(cached) = crate::core::globals::registry_get(&key) {
         return cached;
     }
-    let class = if name == "_ConcatenateGenericAlias" {
-        concatenate_generic_alias_class()
-    } else {
-        value::class_new(name.to_string(), NONE, Vec::new())
+    let class = match name {
+        "_ConcatenateGenericAlias" => concatenate_generic_alias_class(),
+        "_GenericAlias" => generic_alias_class(),
+        _ => value::class_new(name.to_string(), NONE, Vec::new()),
     };
     crate::core::globals::registry_set(&key, class);
     class
+}
+
+/// `typing._GenericAlias`: an alias value carrying `__origin__`/`__args__`
+/// and rendering like CPython's aliases (`tuple[int, ...]`, `Vector[int]`).
+///
+/// The same class backs builtin generic subscriptions (`list[str]`,
+/// `dict[str, int]`, `type[int]`); see [`builtin_generic_subscript`].
+fn generic_alias_class() -> i64 {
+    let render = |name: &'static str| {
+        let function = value::native_function_new("typing", name, usize::MAX);
+        value::function_set_signature(
+            function,
+            vec![value::ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            }],
+        );
+        value::function_set_full_entry(function, generic_alias_repr_entry as *const () as usize);
+        function
+    };
+    value::class_new(
+        "_GenericAlias".to_string(),
+        NONE,
+        vec![
+            // `str(list[int])` and `repr(list[int])` are both `list[int]`,
+            // like CPython, so interpolation and `print` agree.
+            ("__repr__".to_string(), render("_generic_alias_repr")),
+            ("__str__".to_string(), render("_generic_alias_str")),
+        ],
+    )
+}
+
+/// Body of `_GenericAlias.__repr__`/`__str__`: `argv[0]` is the alias.
+extern "C" fn generic_alias_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the class-call binder passes `self` first (declared signature).
+    let instance = unsafe { *argv };
+    value::str_alloc(generic_alias_text(instance, 0))
+}
+
+/// Nesting rendered by [`generic_alias_text`] before the remaining arguments
+/// are elided as `...`; guards against pathological alias graphs.
+const MAX_ALIAS_REPR_DEPTH: usize = 16;
+
+/// Renders an alias as `origin[arg, ...]`, or just `origin` without
+/// arguments.
+fn generic_alias_text(instance: i64, depth: usize) -> String {
+    let origin = value::instance_attr(instance, "__origin__").unwrap_or(NONE);
+    let origin_text = alias_origin_text(origin);
+    let Some(args) = value::instance_attr(instance, "__args__").and_then(value::as_tuple) else {
+        return origin_text;
+    };
+    if args.is_empty() {
+        return origin_text;
+    }
+    let mut rendered = String::with_capacity(origin_text.len() + 2);
+    rendered.push_str(&origin_text);
+    rendered.push('[');
+    for (position, arg) in args.iter().enumerate() {
+        if position > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(&alias_arg_text(*arg, depth + 1));
+    }
+    rendered.push(']');
+    rendered
+}
+
+/// Name of an alias origin: a class or builtin name, otherwise the origin's
+/// own `repr` (a PEP 695 alias renders as its name).
+fn alias_origin_text(origin: i64) -> String {
+    if let Some(name) = value::class_display_name(origin) {
+        return name.to_string();
+    }
+    if let Some(function) = value::as_function(origin) {
+        return function.name.clone();
+    }
+    value::repr(origin)
+}
+
+/// One alias argument, spelled the way CPython's `types.GenericAlias` repr
+/// does: type values by name (`int`, not `<class 'int'>`), nested aliases
+/// recursively, `...` for the variadic parameter, and `repr` otherwise.
+fn alias_arg_text(arg: i64, depth: usize) -> String {
+    if depth > MAX_ALIAS_REPR_DEPTH {
+        return "...".to_string();
+    }
+    if value::instance_class_value(arg) == Some(cached_class("_GenericAlias")) {
+        return generic_alias_text(arg, depth);
+    }
+    if let Some(name) = value::class_display_name(arg) {
+        return name.to_string();
+    }
+    if let Some(function) = value::as_function(arg) {
+        return function.name.clone();
+    }
+    // Hydro materialises the `...` literal as `None` (see
+    // `Const::Ellipsis`), so the variadic parameter arrives as `None`; it is
+    // the only `None` a type argument carries in practice, and CPython spells
+    // that slot `...`.
+    if arg == NONE {
+        return "...".to_string();
+    }
+    value::repr(arg)
 }
 
 /// `typing._ConcatenateGenericAlias`: a real alias value, not an inert
@@ -1594,7 +1706,9 @@ fn generic_class_getitem(args: &[i64]) -> i64 {
     generic_alias_of(cls, parameters)
 }
 
-/// Builds a `typing._GenericAlias` with `origin` and `parameters`.
+/// Builds a `typing._GenericAlias` with `origin` and `parameters` (one
+/// argument when `parameters` is not a tuple). Shared by the `typing` alias
+/// constructors and [`builtin_generic_subscript`].
 fn generic_alias_of(origin: i64, parameters: i64) -> i64 {
     let items: Vec<i64> = match value::as_tuple(parameters) {
         Some(items) => items.to_vec(),
@@ -1609,6 +1723,45 @@ fn generic_alias_of(origin: i64, parameters: i64) -> i64 {
     value::instance_setattr(instance, "__args__".to_string(), args_tuple);
     heap::release_roots(roots);
     instance
+}
+
+/// Builtin class values that accept type parameters: CPython serves
+/// `tuple[int, ...]`, `list[str]`, `dict[str, int]`, `set[T]`,
+/// `frozenset[T]` and `type[T]` through `__class_getitem__`.
+fn is_generic_builtin(builtin: Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Tuple
+            | Builtin::List
+            | Builtin::Dict
+            | Builtin::Set
+            | Builtin::Frozenset
+            | Builtin::Type
+    )
+}
+
+/// `tuple[int, ...]` and friends: a builtin class value subscribed with type
+/// parameters. Returns `None` for any other value, so non-generic builtins
+/// (`print[int]`) keep raising `TypeError`.
+///
+/// The bare names lower to `FunctionBody::Builtin`; the `builtins` module
+/// attribute (`builtins.list[int]`) is a native function over the same
+/// constructor. CPython builds a `types.GenericAlias`; Hydro's aliases carry
+/// the same `__origin__`/`__args__` attributes as the `typing` aliases, so
+/// `typing.get_origin`/`get_args` and `repr` agree with them.
+pub(crate) fn builtin_generic_subscript(obj: i64, index: i64) -> Option<i64> {
+    let function = value::as_function(obj)?;
+    let generic = match &function.body {
+        value::FunctionBody::Builtin(builtin) => is_generic_builtin(*builtin),
+        value::FunctionBody::Native { module, name } if *module == "builtins" => {
+            Builtin::from_name(name).is_some_and(is_generic_builtin)
+        }
+        _ => false,
+    };
+    if !generic {
+        return None;
+    }
+    Some(generic_alias_of(obj, index))
 }
 
 /// `typing._collect_type_vars`/`_collect_parameters`: flat collection of
@@ -1900,6 +2053,82 @@ mod tests {
         let class = value::class_new("Plain".to_string(), NONE, Vec::new());
         assert_eq!(crate::core::container::subscript(class, index), class);
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn builtin_classes_subscribe_into_generic_aliases() {
+        exc::init();
+        let tuple_type = value::builtin_function_new(Builtin::Tuple);
+        let list_type = value::builtin_function_new(Builtin::List);
+        let dict_type = value::builtin_function_new(Builtin::Dict);
+        let type_type = value::builtin_function_new(Builtin::Type);
+        let int_type = value::builtin_function_new(Builtin::Int);
+        let str_type = value::builtin_function_new(Builtin::Str);
+
+        // `tuple[int, ...]`: the multi-operand index arrives as a tuple, and
+        // Hydro's `...` literal is `None`.
+        let variadic =
+            crate::core::container::subscript(tuple_type, value::tuple_new(vec![int_type, NONE]));
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(value::repr(variadic), "tuple[int, ...]");
+        // `print(alias)` and interpolation go through `str`.
+        assert_eq!(value::to_string(variadic), "tuple[int, ...]");
+        assert_eq!(
+            value::instance_attr(variadic, "__origin__"),
+            Some(tuple_type)
+        );
+        let expected_args = value::instance_attr(variadic, "__args__").expect("__args__");
+        assert_eq!(
+            as_tuple(expected_args).map(|items| items.to_vec()),
+            Some(vec![int_type, NONE])
+        );
+        // `typing.get_origin`/`get_args` read the same attributes back.
+        assert_eq!(call("get_origin", &[variadic]), tuple_type);
+        assert_eq!(call("get_args", &[variadic]), expected_args);
+
+        // `list[str]`: a single operand becomes a one-element argument tuple.
+        let listed = crate::core::container::subscript(list_type, str_type);
+        assert_eq!(value::repr(listed), "list[str]");
+        assert_eq!(
+            value::instance_attr(listed, "__args__")
+                .and_then(as_tuple)
+                .map(|items| items.to_vec()),
+            Some(vec![str_type])
+        );
+
+        // `dict[str, int]`.
+        let mapped = crate::core::container::subscript(
+            dict_type,
+            value::tuple_new(vec![str_type, int_type]),
+        );
+        assert_eq!(value::repr(mapped), "dict[str, int]");
+
+        // `type[int]`.
+        let typed = crate::core::container::subscript(type_type, int_type);
+        assert_eq!(value::repr(typed), "type[int]");
+        assert_eq!(call("get_origin", &[typed]), type_type);
+
+        // An alias nests as an argument of another alias.
+        let nested = crate::core::container::subscript(list_type, variadic);
+        assert_eq!(value::repr(nested), "list[tuple[int, ...]]");
+        let deep =
+            crate::core::container::subscript(dict_type, value::tuple_new(vec![str_type, nested]));
+        assert_eq!(value::repr(deep), "dict[str, list[tuple[int, ...]]]");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn non_generic_builtins_stay_unsubscriptable() {
+        exc::init();
+        // `print` is a function value at runtime and takes no type parameters.
+        let print_type = value::builtin_function_new(Builtin::Print);
+        assert_eq!(
+            crate::core::container::subscript(print_type, text("int")),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "'function' object is not subscriptable");
+        exc::clear();
     }
 
     #[test]

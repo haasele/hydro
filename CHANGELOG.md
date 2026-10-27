@@ -8,6 +8,20 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — 2026-10-27 Builtin generic subscription
+
+- `tuple[int, ...]`, `list[str]`, `dict[str, int]`, `set[T]`, `frozenset[T]`
+  and `type[T]` type-check and evaluate, instead of reporting
+  `HYD0202: 'function' object is not subscriptable` (CPython serves these
+  through `__class_getitem__`; NumPy's `type _Shape = tuple[int, ...]`
+  needs it). The static result is dynamic and the subscript operands are
+  unconstrained; the runtime builds a `_GenericAlias` carrying
+  `__origin__`/`__args__` — read back by `typing.get_origin`/`get_args` —
+  whose `repr`/`str` is `tuple[int, ...]`-style, nesting included. Any other
+  builtin value (`print[int]`) still raises
+  `TypeError: 'function' object is not subscriptable`, and non-generic
+  `typing` placeholder classes keep their previous behaviour.
+
 ### Added — 2026-10-27 PEP 695 `type` alias statements
 
 - `type X = expr` and `type X[T] = expr` are real bindings instead of an

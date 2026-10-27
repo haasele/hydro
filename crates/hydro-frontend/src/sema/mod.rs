@@ -518,6 +518,26 @@ fn is_builtin_class_value(builtin: Builtin) -> bool {
     )
 }
 
+/// Whether the HIR value of `builtin` is a class that accepts type
+/// parameters (`tuple[int, ...]`, `list[str]`, `dict[str, int]`, `set[T]`,
+/// `frozenset[T]`, `type[T]`).
+///
+/// CPython serves these through `__class_getitem__`; Hydro has no generic
+/// substitution, so the subscription only has to typecheck (the runtime
+/// builds an alias value) and any other builtin class value keeps rejecting
+/// `builtin[...]` with `'function' object is not subscriptable`.
+fn is_generic_builtin(builtin: Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Tuple
+            | Builtin::List
+            | Builtin::Dict
+            | Builtin::Set
+            | Builtin::Frozenset
+            | Builtin::Type
+    )
+}
+
 /// Result type of the class-level methods Hydro models on builtin class
 /// values. Every other class-level method is dispatched at runtime, so a
 /// missing entry only means "dynamic result", not "unknown attribute".
@@ -1956,6 +1976,18 @@ impl<'a> Checker<'a> {
                 // the static integer-index check is skipped and the result is
                 // dynamic.
                 let slice_index = Self::index_has_slice(index);
+                // A builtin class value is a function at runtime, but the
+                // generic ones accept type parameters in annotations
+                // (`tuple[int, ...]`, `list[str]`). Hydro has no generic
+                // substitution: the runtime builds an alias value, so the
+                // result is dynamic and the index operands are unconstrained.
+                if matches!(
+                    &object.kind,
+                    HExprKind::BuiltinRef(builtin) if is_generic_builtin(*builtin)
+                ) {
+                    let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
+                    return;
+                }
                 match self.inf.resolve(object.ty) {
                     Ty::Concrete(Type::List) => {
                         if !slice_index {

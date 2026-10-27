@@ -1360,6 +1360,31 @@ fn functions_do_not_support_arithmetic_or_subscripts() {
 }
 
 #[test]
+fn generic_builtin_subscripts_typecheck_dynamically() {
+    // The generic builtin classes take type parameters in annotations. Hydro
+    // has no generic substitution, so the alias value is dynamic; the operand
+    // types are unconstrained (`...` is the variadic parameter).
+    let source = "a = tuple[int, ...]\n\
+                  b = list[str]\n\
+                  c = dict[str, int]\n\
+                  d = type[int]\n\
+                  e = list[tuple[int, str]]\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    for index in 0..5 {
+        assert_eq!(assigned_type(&program, index), Type::Any);
+    }
+    // A non-generic builtin class value keeps rejecting the subscription.
+    assert_eq!(
+        check_errors("x = print[int]\n"),
+        vec!["'function' object is not subscriptable"]
+    );
+    // The reported failure: a PEP 695 alias whose value subscripts a generic
+    // builtin class.
+    crate::check_source("type Shape = tuple[int, ...]\n", "test.py")
+        .expect("generic alias value typechecks");
+}
+
+#[test]
 fn bytes_operators_and_indexing_are_typed() {
     let source = "a = b'ab'\n\
                       b = a[0]\n\
