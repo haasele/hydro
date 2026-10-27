@@ -24,6 +24,7 @@ use crate::value::{self, NONE};
 pub(crate) const MODULE: &str = "importlib.machinery";
 
 const SPEC_INIT: &str = "_spec_init";
+const MODULE_SPEC: &str = "_module_spec";
 const SOURCE_INIT: &str = "_source_init";
 const SOURCE_GET_FILENAME: &str = "_source_get_filename";
 const SOURCE_CREATE_MODULE: &str = "_source_create_module";
@@ -46,6 +47,7 @@ const FROZEN_INVALIDATE: &str = "_frozen_invalidate_caches";
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         SPEC_INIT => spec_init(args),
+        MODULE_SPEC => module_spec(args),
         SOURCE_INIT => source_init(args),
         SOURCE_GET_FILENAME => get_filename(args),
         SOURCE_CREATE_MODULE => create_module(args),
@@ -411,10 +413,13 @@ fn set_spec_fields(
         locations.unwrap_or(NONE),
     );
     // CPython's `parent` is the package the module lives in; a package is its
-    // own parent.
-    let parent = match name.rsplit_once('.') {
-        Some((parent, _)) if !is_package => parent.to_string(),
-        _ => name.to_string(),
+    // own parent, and a top-level (non-package) module has no package.
+    let parent = if is_package {
+        name.to_string()
+    } else {
+        name.rsplit_once('.')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_default()
     };
     value::instance_setattr(spec, "parent".to_string(), value::str_alloc(parent));
     value::instance_setattr(
@@ -507,6 +512,40 @@ pub(crate) fn set_package_locations(spec: i64, dirs: Vec<String>) {
     let name = spec_name(spec).unwrap_or_default();
     value::instance_setattr(spec, "parent".to_string(), str_value(name));
     crate::heap::release_roots(roots);
+}
+
+/// `_module_spec(name, origin, is_package)`: the `ModuleSpec` a compiled unit
+/// publishes as `__spec__`.
+///
+/// `origin` is the unit's `__file__` (or `None` when no path is known);
+/// `is_package` marks a package `__init__.py`, whose search location is the
+/// directory holding it. A file-backed module gets a real `SourceFileLoader`,
+/// so `__loader__` is `__spec__.loader` and `spec.loader.path` names the
+/// compiled source.
+fn module_spec(args: &[i64]) -> i64 {
+    let Some(name) = value::as_str(args[0]) else {
+        return exc::raise_with_message(TYPE_ERROR, "_module_spec() argument 'name' must be str");
+    };
+    let origin = value::as_str(args[1]).map(str::to_string);
+    let is_package = value::truthy(args[2]);
+    let loader = match origin.as_deref() {
+        Some(path) => source_loader(name, path),
+        None => builtin_importer_class(),
+    };
+    let search_locations = if is_package {
+        Some(
+            origin
+                .as_deref()
+                .and_then(|path| Path::new(path).parent())
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .into_iter()
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let has_location = origin.is_some();
+    new_spec(name, loader, origin, search_locations, has_location)
 }
 
 /// Whether `value` is a `ModuleSpec` (or a subclass) instance.
@@ -773,6 +812,76 @@ mod tests {
         crate::container::list_append(source, suffix);
         assert!(items(constant("SOURCE_SUFFIXES")).contains(&".pyi".to_string()));
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn compiled_module_specs_describe_the_unit() {
+        exc::init();
+        let source = "/tmp/hydro/pkg/mod.py";
+        let spec = call(
+            "_module_spec",
+            &[
+                value::str_alloc("pkg.mod".to_string()),
+                value::str_alloc(source.to_string()),
+                value::bool_value(false),
+            ],
+        );
+        assert!(!exc::pending());
+        assert_eq!(spec_name(spec).as_deref(), Some("pkg.mod"));
+        assert_eq!(spec_origin(spec).as_deref(), Some(source));
+        assert!(spec_has_location(spec));
+        assert_eq!(spec_search_locations(spec), None);
+        // A submodule lives in its parent package.
+        assert_eq!(
+            value::instance_attr(spec, "parent").and_then(value::as_str),
+            Some("pkg")
+        );
+        // The loader is the real source loader for the compiled file, so
+        // `__loader__ is __spec__.loader` and its path names the source.
+        let loader = value::instance_attr(spec, "loader").expect("loader");
+        assert_eq!(
+            value::class_display_name(value::instance_class_value(loader).expect("loader class")),
+            Some("SourceFileLoader")
+        );
+        assert_eq!(
+            value::instance_attr(loader, "path").and_then(value::as_str),
+            Some(source)
+        );
+
+        // A package is its own parent and publishes its directory.
+        let pkg_source = "/tmp/hydro/pkg/__init__.py";
+        let pkg = call(
+            "_module_spec",
+            &[
+                value::str_alloc("pkg".to_string()),
+                value::str_alloc(pkg_source.to_string()),
+                value::bool_value(true),
+            ],
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_attr(pkg, "parent").and_then(value::as_str),
+            Some("pkg")
+        );
+        assert_eq!(
+            spec_search_locations(pkg),
+            Some(vec!["/tmp/hydro/pkg".to_string()])
+        );
+
+        // A top-level module has no parent package.
+        let top = call(
+            "_module_spec",
+            &[
+                value::str_alloc("top".to_string()),
+                value::str_alloc("/tmp/hydro/top.py".to_string()),
+                value::bool_value(false),
+            ],
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_attr(top, "parent").and_then(value::as_str),
+            Some("")
+        );
     }
 
     #[test]

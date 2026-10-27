@@ -117,9 +117,20 @@ pub(crate) fn native_spec(name: &str) -> i64 {
     found_spec(&FoundSpec {
         name: name.to_string(),
         origin: None,
-        search_locations: None,
+        search_locations: native_search_locations(name),
         loader: LoaderKind::Builtin,
     })
+}
+
+/// Search locations of a native package: `Some(empty)` when the central
+/// table declares submodules, so `ModuleSpec.parent` reports the package
+/// itself (matching `module.__package__` for native modules).
+fn native_search_locations(name: &str) -> Option<Vec<String>> {
+    let prefix = format!("{name}.");
+    hydro_ir::stdlib::MODULES
+        .iter()
+        .any(|spec| spec.name.starts_with(&prefix))
+        .then(Vec::new)
 }
 
 fn found_spec(found: &FoundSpec) -> i64 {
@@ -133,7 +144,7 @@ pub(crate) fn resolve_module(name: &str) -> Option<FoundSpec> {
         return Some(FoundSpec {
             name: name.to_string(),
             origin: None,
-            search_locations: None,
+            search_locations: native_search_locations(name),
             loader: LoaderKind::Builtin,
         });
     }

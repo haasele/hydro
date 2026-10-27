@@ -8,6 +8,19 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 module `__spec__` metadata
+
+- Every compiled unit publishes CPython's module metadata: `__spec__` is a real
+  `importlib.machinery.ModuleSpec` carrying the unit's dotted `name`, `parent`
+  package, `origin` (its `__file__`), a real `SourceFileLoader` and, for a
+  package, `submodule_search_locations`. `__loader__` is that spec's loader,
+  `__package__` is its `parent` and `__file__` its origin, all mirrored into the
+  runtime module globals so importers can read them. Pydantic's
+  `__spec__.parent` accesses no longer fail with a missing `__spec__`, and an
+  explicit assignment in the module body still overrides the injected value.
+- `ModuleSpec.parent` follows CPython for top-level modules (the empty string),
+  while native packages now report themselves as packages.
+
 ### Fixed — 2026-10-27 `super().__init__` starred operands
 
 - `super().__init__(message, *args, since=...)` keeps the positional operands,

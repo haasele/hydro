@@ -726,6 +726,16 @@ third argument.
   `__doc__ = ...` still wins. References from functions and
   methods are detected too. Each binding is an `Assign` plus the matching
   `GlobalSet`, so functions read it with `GlobalGet`.
+  An imported unit also publishes `__spec__`, `__loader__`, `__package__`
+  and `__file__`. `__spec__` is a real `importlib.machinery.ModuleSpec`
+  built at runtime by the private `importlib.machinery._module_spec` helper:
+  it carries the unit's dotted `name`, its `parent` package (`""` for a
+  top-level module, its own name for a package), `origin` (the same path as
+  `__file__`), a `SourceFileLoader` and, for a package, its
+  `submodule_search_locations`. `__loader__` is read from that spec's
+  `loader` (so `__loader__ is __spec__.loader` holds) and `__package__` is
+  the spec's parent. A module-level assignment to any of them still wins,
+  as in CPython.
   There is no general runtime module object or `sys.modules`; stdlib module
   values are a native `module` kind, and `errno` exposes a synthetic
   `__dict__` for compatibility.

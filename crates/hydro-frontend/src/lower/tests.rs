@@ -9606,6 +9606,24 @@ fn imported_units_mirror_their_import_bindings() {
     let diags = std::mem::take(&mut lowerer.diags);
     drop(lowerer);
     assert!(diags.is_empty(), "{diags:?}");
+    // Mirrored metadata globals store a read of the local that produced the
+    // value, so follow the local back to its initializer.
+    fn local_initializer<'a>(body: &'a [HStmt], value: &'a HExpr) -> &'a HExpr {
+        let local = match &value.kind {
+            HExprKind::Local(local) => Some(*local),
+            _ => None,
+        };
+        let Some(local) = local else {
+            return value;
+        };
+        body.iter()
+            .find_map(|stmt| match &stmt.kind {
+                HStmtKind::Assign { target, value } if *target == local => Some(value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("local {local} must be assigned: {value:?}"))
+    }
+    let module_body = &hir.functions[0].body;
     // Multiple bindings from one statement are wrapped in an `if True:` block
     // so they keep the import statement's position.
     let mut stores: Vec<&HStmt> = Vec::new();
@@ -9659,6 +9677,54 @@ fn imported_units_mirror_their_import_bindings() {
                 assert!(
                     matches!(&value.kind, HExprKind::Local(_)),
                     "unexpected __doc__ binding: {value:?}"
+                );
+            }
+            // Every imported unit publishes its module metadata too; the
+            // global mirrors the initializer of the local that holds it.
+            "__spec__" => {
+                let spec = local_initializer(module_body, value);
+                assert!(
+                    matches!(
+                        &spec.kind,
+                        HExprKind::ModuleCall { module, function, .. }
+                            if module == "importlib.machinery" && function == "_module_spec"
+                    ),
+                    "unexpected __spec__ binding: {spec:?}"
+                );
+            }
+            "__loader__" => {
+                let loader = local_initializer(module_body, value);
+                let HExprKind::GetAttr { object, name } = &loader.kind else {
+                    panic!("unexpected __loader__ binding: {loader:?}");
+                };
+                assert_eq!(name, "loader");
+                // CPython keeps `__loader__ is __spec__.loader`: the object
+                // read here must be the module's `ModuleSpec`.
+                let spec = local_initializer(module_body, object);
+                assert!(
+                    matches!(
+                        &spec.kind,
+                        HExprKind::ModuleCall { module, function, .. }
+                            if module == "importlib.machinery" && function == "_module_spec"
+                    ),
+                    "unexpected __loader__ spec: {spec:?}"
+                );
+            }
+            "__package__" => {
+                let package = local_initializer(module_body, value);
+                assert!(
+                    matches!(
+                        &package.kind,
+                        HExprKind::Const(Const::Str(value)) if value.is_empty()
+                    ),
+                    "unexpected __package__ binding: {package:?}"
+                );
+            }
+            "__file__" => {
+                let file = local_initializer(module_body, value);
+                assert!(
+                    matches!(&file.kind, HExprKind::Const(Const::Str(_))),
+                    "unexpected __file__ binding: {file:?}"
                 );
             }
             other => panic!("unexpected mirrored binding '{other}'"),

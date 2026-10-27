@@ -2264,11 +2264,13 @@ impl<'a> Lowerer<'a> {
         }
         self.module_local_names = module_locals.keys().cloned().collect();
 
-        // 4. Module dunders are module globals: the module body assigns a
+        //    Module dunders are module globals: the module body assigns a
         //    local and mirrors it into the runtime global table, so functions
-        //    read the value with a `GlobalGet`. Only names the unit actually
-        //    loads are injected (method bodies included), so units that never
-        //    reference them gain no statements.
+        //    read the value with a `GlobalGet`. `__name__`, `__file__` and
+        //    `__doc__` are injected when the unit loads them (an imported unit
+        //    always publishes its name and docstring); `__spec__`,
+        //    `__loader__` and `__package__` are built for every imported unit
+        //    so its metadata is readable through the module value.
         let dunder_inits = self.lower_dunder_bindings(module, &mut module_locals);
 
         // 5. Function bodies (all signatures are already registered). Class
@@ -3170,16 +3172,26 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Bind the module dunders this unit loads: `__name__` (the full dotted
-    /// module name, `__main__` for the entry), `__file__` and `__doc__`.
-    /// Each binding becomes an `Assign` of a constant followed by the matching
-    /// `GlobalSet`, so functions and methods of the unit can read it with a
-    /// `GlobalGet`. Nothing is emitted for a dunder the unit never loads,
-    /// except `__name__` and `__doc__` of an imported unit: storing `__name__`
-    /// is what registers the module in the runtime globals store (so the module
-    /// registry can resolve compiled modules, including empty and dotted
-    /// submodules, by name), and storing `__doc__` lets an importer resolve
-    /// `from module import __doc__` (CPython gives every module a `__doc__`,
-    /// `None` when it has no docstring).
+    /// module name, `__main__` for the entry), `__file__`, `__doc__`,
+    /// `__spec__`, `__loader__` and `__package__`. Each binding becomes an
+    /// `Assign` of the value followed by the matching `GlobalSet`, so
+    /// functions and methods of the unit can read it with a `GlobalGet`.
+    /// Nothing is emitted for a dunder the unit never loads, except the
+    /// metadata every importable unit publishes: `__name__` and `__doc__`
+    /// (see below), plus `__spec__`, `__loader__`, `__package__` and
+    /// `__file__`, exactly like CPython's module globals.
+    ///
+    /// `__spec__` is a real `importlib.machinery.ModuleSpec` whose `name`,
+    /// `parent`, `origin` and `submodule_search_locations` describe this unit;
+    /// `__loader__` is that spec's loader (identity holds) and `__package__`
+    /// is its `parent`. A user assignment later in the body overrides the
+    /// injected value, exactly as in CPython.
+    ///
+    /// Storing `__name__` is what registers the module in the runtime globals
+    /// store (so the module registry can resolve compiled modules, including
+    /// empty and dotted submodules, by name), and storing `__doc__` lets an
+    /// importer resolve `from module import __doc__` (CPython gives every
+    /// module a `__doc__`, `None` when it has no docstring).
     ///
     /// A `from other import __doc__` binding re-exports another module's
     /// docstring (NumPy's `numpy/lib/array_utils.py` does exactly that). CPython
@@ -3193,16 +3205,8 @@ impl<'a> Lowerer<'a> {
         module: &ast::ModModule,
         module_locals: &mut HashMap<String, LocalId>,
     ) -> Vec<HStmt> {
-        let bindings: Vec<(&'static str, Const)> = vec![
-            ("__name__", Const::Str(self.dunder_name.clone())),
-            ("__file__", Const::Str(self.filename.to_string())),
-            (
-                "__doc__",
-                module_docstring(&module.body)
-                    .map(Const::Str)
-                    .unwrap_or(Const::None),
-            ),
-        ];
+        let mut inits = Vec::new();
+        let body = &module.body;
         // The docstring of another module replaces this unit's own: the import
         // binding wins for every read. Only a top-level import binds the module
         // global (a function-local import shadows just that function). A
@@ -3223,82 +3227,206 @@ impl<'a> Lowerer<'a> {
         let self_imported_docstring =
             docstring_source.is_some_and(|(module, _)| module == &self.dunder_name);
 
-        let mut inits = Vec::new();
-        for (name, value) in bindings {
-            if name == "__doc__" && imported_docstring {
-                continue;
-            }
-            // Only imported units register in the runtime module registry.
-            // The entry module and REPL fragments are `__main__` and have no
-            // importer, so they keep the historical conditional binding.
-            let registers_module =
-                name == "__name__" && self.mirror_all_globals && self.dunder_name != "__main__";
-            // Imported units also publish `__doc__`: an importer may read it
-            // without this unit ever referencing it. REPL fragments are not
-            // imported, so they keep the conditional binding. A package that
-            // imports its own `__doc__` needs the binding too.
-            let exports_docstring = name == "__doc__"
-                && ((self.mirror_all_globals && !self.session_mode) || self_imported_docstring);
-            if !registers_module
-                && !exports_docstring
-                && !module_references_name(&module.body, name)
-                && !self.template_loads_name(name)
-            {
-                continue;
-            }
-            let ty = Ty::Concrete(value.ty());
-            let local = match module_locals.get(name) {
-                Some(&local) => {
-                    // A user assignment may already have claimed the slot;
-                    // pin it to the injected value's type.
-                    let slot = self.functions[0].locals[local as usize].ty;
-                    let _ = self.infer.unify(slot, ty);
-                    local
-                }
-                None => {
-                    let local = self.functions[0].locals.len() as LocalId;
-                    self.functions[0].locals.push(HLocal {
-                        name: name.to_string(),
-                        ty,
-                    });
-                    module_locals.insert(name.to_string(), local);
-                    self.module_local_names.insert(name.to_string());
-                    local
-                }
-            };
-            // Functions read the value through the runtime global table.
-            self.global_names.insert(name.to_string());
-            self.used_globals.insert(name.to_string());
-            let read = HExpr {
-                kind: HExprKind::Local(local),
-                ty,
-                line: 1,
-                col: 1,
-            };
-            inits.push(HStmt {
-                kind: HStmtKind::Assign {
-                    target: local,
-                    value: HExpr {
-                        kind: HExprKind::Const(value),
-                        ty,
+        // Imported units publish the metadata globals CPython installs on
+        // every module, so an importer can read `pkg.mod.__spec__` without the
+        // unit ever naming it. REPL fragments are not imported and keep the
+        // conditional binding.
+        let exports_metadata = self.mirror_all_globals && !self.session_mode;
+        // A package `__init__.py` is its own package (`package == name`);
+        // every other unit lives in its parent package (empty at top level).
+        let is_package = !self.package.is_empty() && self.package == self.dunder_name;
+
+        // `__spec__` must be bound before `__loader__` can be derived from it.
+        // Deriving both from one ModuleSpec keeps `__loader__ is
+        // __spec__.loader` true, like CPython. A unit that only reads
+        // `__loader__` still allocates the spec in a hidden local, but does
+        // not publish a `__spec__` global it would otherwise claim to export.
+        let spec_requested = exports_metadata || self.dunder_loads(body, "__spec__");
+        let spec_needed = spec_requested || self.dunder_loads(body, "__loader__");
+        let spec_local = if spec_requested {
+            let local = self.dunder_local(module_locals, "__spec__", Ty::Concrete(Type::Any));
+            let value = self.module_spec_expr(is_package);
+            inits.push(Self::dunder_assign(local, value));
+            inits.push(self.dunder_global_set("__spec__", local, Ty::Concrete(Type::Any)));
+            Some(local)
+        } else if spec_needed {
+            // `__loader__`-only read: keep the spec out of the module
+            // namespace, the way CPython's loader sets `__loader__` too.
+            let local = self.functions[0].locals.len() as LocalId;
+            self.functions[0].locals.push(HLocal {
+                name: "$spec".to_string(),
+                ty: Ty::Concrete(Type::Any),
+            });
+            let value = self.module_spec_expr(is_package);
+            inits.push(Self::dunder_assign(local, value));
+            Some(local)
+        } else {
+            None
+        };
+
+        if exports_metadata || self.dunder_loads(body, "__loader__") {
+            let local = self.dunder_local(module_locals, "__loader__", Ty::Concrete(Type::Any));
+            // `__loader__` is the spec's loader object; the spec is always
+            // allocated when this branch runs.
+            let value = HExpr {
+                kind: HExprKind::GetAttr {
+                    object: Box::new(HExpr {
+                        kind: HExprKind::Local(spec_local.expect("spec bound for __loader__")),
+                        ty: Ty::Concrete(Type::Any),
                         line: 1,
                         col: 1,
-                    },
+                    }),
+                    name: "loader".to_string(),
                 },
+                ty: Ty::Concrete(Type::Any),
                 line: 1,
                 col: 1,
-            });
-            inits.push(HStmt {
-                kind: HStmtKind::GlobalSet {
-                    module: self.dunder_name.clone(),
-                    name: name.to_string(),
-                    value: read,
-                },
-                line: 1,
-                col: 1,
-            });
+            };
+            inits.push(Self::dunder_assign(local, value));
+            inits.push(self.dunder_global_set("__loader__", local, Ty::Concrete(Type::Any)));
         }
+
+        if exports_metadata || self.dunder_loads(body, "__package__") {
+            let local = self.dunder_local(module_locals, "__package__", Ty::Concrete(Type::Str));
+            let value = Self::dunder_const(Const::Str(self.package.clone()));
+            inits.push(Self::dunder_assign(local, value));
+            inits.push(self.dunder_global_set("__package__", local, Ty::Concrete(Type::Str)));
+        }
+
+        if exports_metadata || self.dunder_loads(body, "__file__") {
+            let local = self.dunder_local(module_locals, "__file__", Ty::Concrete(Type::Str));
+            let value = Self::dunder_const(Const::Str(self.filename.to_string()));
+            inits.push(Self::dunder_assign(local, value));
+            inits.push(self.dunder_global_set("__file__", local, Ty::Concrete(Type::Str)));
+        }
+
+        // Only imported units register in the runtime module registry. The
+        // entry module and REPL fragments are `__main__` and have no importer,
+        // so they keep the historical conditional binding.
+        let registers_module = self.mirror_all_globals && self.dunder_name != "__main__";
+        if registers_module || self.dunder_loads(body, "__name__") {
+            let local = self.dunder_local(module_locals, "__name__", Ty::Concrete(Type::Str));
+            let value = Self::dunder_const(Const::Str(self.dunder_name.clone()));
+            inits.push(Self::dunder_assign(local, value));
+            inits.push(self.dunder_global_set("__name__", local, Ty::Concrete(Type::Str)));
+        }
+
+        // Imported units also publish `__doc__`: an importer may read it
+        // without this unit ever referencing it. REPL fragments are not
+        // imported, so they keep the conditional binding. A package that
+        // imports its own `__doc__` needs the binding too.
+        let exports_docstring = exports_metadata || self_imported_docstring;
+        if !imported_docstring && (exports_docstring || self.dunder_loads(body, "__doc__")) {
+            let local = self.dunder_local(module_locals, "__doc__", Ty::Concrete(Type::Any));
+            let value = Self::dunder_const(
+                module_docstring(&module.body)
+                    .map(Const::Str)
+                    .unwrap_or(Const::None),
+            );
+            inits.push(Self::dunder_assign(local, value));
+            inits.push(self.dunder_global_set("__doc__", local, Ty::Concrete(Type::Any)));
+        }
+
         inits
+    }
+
+    /// Whether this unit's source (or one of its templates) reads `name`.
+    fn dunder_loads(&self, body: &[ast::Stmt], name: &str) -> bool {
+        module_references_name(body, name) || self.template_loads_name(name)
+    }
+
+    /// Declares (or reuses) the module local of an injected dunder and marks
+    /// it as a runtime global, so functions read it with a `GlobalGet` and
+    /// importers resolve it in the global table.
+    fn dunder_local(
+        &mut self,
+        module_locals: &mut HashMap<String, LocalId>,
+        name: &str,
+        ty: Ty,
+    ) -> LocalId {
+        let local = match module_locals.get(name) {
+            Some(&local) => {
+                // A user assignment may already have claimed the slot; pin it
+                // to the injected value's type.
+                let slot = self.functions[0].locals[local as usize].ty;
+                let _ = self.infer.unify(slot, ty);
+                local
+            }
+            None => {
+                let local = self.functions[0].locals.len() as LocalId;
+                self.functions[0].locals.push(HLocal {
+                    name: name.to_string(),
+                    ty,
+                });
+                module_locals.insert(name.to_string(), local);
+                self.module_local_names.insert(name.to_string());
+                local
+            }
+        };
+        // Functions read the value through the runtime global table.
+        self.global_names.insert(name.to_string());
+        self.used_globals.insert(name.to_string());
+        local
+    }
+
+    fn dunder_assign(local: LocalId, value: HExpr) -> HStmt {
+        HStmt {
+            kind: HStmtKind::Assign {
+                target: local,
+                value,
+            },
+            line: 1,
+            col: 1,
+        }
+    }
+
+    fn dunder_global_set(&self, name: &str, local: LocalId, ty: Ty) -> HStmt {
+        HStmt {
+            kind: HStmtKind::GlobalSet {
+                module: self.dunder_name.clone(),
+                name: name.to_string(),
+                value: HExpr {
+                    kind: HExprKind::Local(local),
+                    ty,
+                    line: 1,
+                    col: 1,
+                },
+            },
+            line: 1,
+            col: 1,
+        }
+    }
+
+    fn dunder_const(value: Const) -> HExpr {
+        let ty = Ty::Concrete(value.ty());
+        HExpr {
+            kind: HExprKind::Const(value),
+            ty,
+            line: 1,
+            col: 1,
+        }
+    }
+
+    /// The `ModuleSpec` of this unit, built at runtime by
+    /// `importlib.machinery._module_spec`: the dotted name, the `__file__`
+    /// path and whether the unit is a package `__init__.py`.
+    fn module_spec_expr(&self, is_package: bool) -> HExpr {
+        let arg = |value: Const| Self::dunder_const(value);
+        HExpr {
+            kind: HExprKind::ModuleCall {
+                module: "importlib.machinery".to_string(),
+                function: "_module_spec".to_string(),
+                args: vec![
+                    arg(Const::Str(self.dunder_name.clone())),
+                    arg(Const::Str(self.filename.to_string())),
+                    arg(Const::Bool(is_package)),
+                ],
+                keywords: Vec::new(),
+            },
+            ty: Ty::Concrete(Type::Any),
+            line: 1,
+            col: 1,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -4263,9 +4391,12 @@ impl<'a> Lowerer<'a> {
         if let Some(&id) = self.fn_ids.get(name) {
             return Some(UserExport::Function(id));
         }
-        // Every module has a `__doc__` (the docstring, or `None`): the dunder
-        // binding in the module body publishes it in the global table.
-        if name == "__doc__" {
+        // Every module has the identity dunders: the dunder binding in the
+        // module body publishes them in the global table.
+        if matches!(
+            name,
+            "__doc__" | "__name__" | "__spec__" | "__loader__" | "__package__" | "__file__"
+        ) {
             return Some(UserExport::Global);
         }
         self.global_names

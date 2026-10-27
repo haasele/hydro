@@ -2917,6 +2917,237 @@ mod tests {
         assert!(found, "the entry module must read helper.VALUE");
     }
 
+    /// Value stored into the runtime global table by the initializer of
+    /// `module` for `name`.
+    fn initializer_global(program: &Program, module: &str, name: &str) -> hydro_ir::Expr {
+        use hydro_ir::StmtKind;
+        let function = function_id(program, &format!("{module}.<module>"));
+        program.functions[function as usize]
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                StmtKind::GlobalSet {
+                    name: stored,
+                    value,
+                    ..
+                } if stored == name => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{module} must publish the `{name}` global"))
+    }
+
+    /// Follows a mirrored global's value when it merely reads the local that
+    /// produced it, returning the expression assigned to that local.
+    fn resolved_initializer(
+        program: &Program,
+        module: &str,
+        expr: hydro_ir::Expr,
+    ) -> hydro_ir::Expr {
+        use hydro_ir::{ExprKind, StmtKind};
+        let local = match &expr.kind {
+            ExprKind::Local(local) => Some(*local),
+            _ => None,
+        };
+        let Some(local) = local else {
+            return expr;
+        };
+        let function = function_id(program, &format!("{module}.<module>"));
+        program.functions[function as usize]
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                StmtKind::Assign { target, value } if *target == local => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{module} must assign its mirrored local {local:?}"))
+    }
+
+    /// The `(name, origin, is_package)` arguments of a unit's `__spec__`
+    /// binding.
+    fn module_spec_arguments(program: &Program, module: &str) -> (String, String, bool) {
+        use hydro_ir::{Const, ExprKind};
+        let spec = resolved_initializer(
+            program,
+            module,
+            initializer_global(program, module, "__spec__"),
+        );
+        let ExprKind::ModuleCall {
+            module: native,
+            function,
+            args,
+            ..
+        } = &spec.kind
+        else {
+            panic!(
+                "{module}.__spec__ must be built by ModuleSpec machinery: {:?}",
+                spec.kind
+            );
+        };
+        assert_eq!(native, "importlib.machinery");
+        assert_eq!(function, "_module_spec");
+        let constant = |index: usize| match &args[index].kind {
+            ExprKind::Const(value) => value,
+            other => panic!("spec argument {index} must be constant: {other:?}"),
+        };
+        let name = match constant(0) {
+            Const::Str(name) => name.clone(),
+            other => panic!("spec name must be a str: {other:?}"),
+        };
+        let origin = match constant(1) {
+            Const::Str(origin) => origin.clone(),
+            other => panic!("spec origin must be a str: {other:?}"),
+        };
+        let is_package = match constant(2) {
+            Const::Bool(value) => *value,
+            other => panic!("spec package flag must be a bool: {other:?}"),
+        };
+        (name, origin, is_package)
+    }
+
+    /// Asserts `module.__loader__` is read from the same `__spec__` object, so
+    /// the CPython identity `__loader__ is __spec__.loader` holds.
+    fn assert_loader_is_spec_loader(program: &Program, module: &str) {
+        use hydro_ir::ExprKind;
+        let loader = resolved_initializer(
+            program,
+            module,
+            initializer_global(program, module, "__loader__"),
+        );
+        let ExprKind::GetAttr { object, name } = &loader.kind else {
+            panic!(
+                "{module}.__loader__ must come from the spec: {:?}",
+                loader.kind
+            );
+        };
+        assert_eq!(name, "loader");
+        let ExprKind::Local(local) = &object.kind else {
+            panic!(
+                "__loader__ must read the `__spec__` local: {:?}",
+                object.kind
+            );
+        };
+        let function = function_id(program, &format!("{module}.<module>"));
+        assert_eq!(
+            program.functions[function as usize].local(*local).name,
+            "__spec__"
+        );
+    }
+
+    #[test]
+    fn package_init_publishes_spec_metadata() {
+        let dir = TestDir::new("spec-package");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(pkg.join("__init__.py"), "VALUE = 1\n").expect("write package init");
+        let main = dir.write("main.py", "import pkg\nprint(pkg.VALUE)\n");
+        let program = program(&main);
+
+        let (name, origin, is_package) = module_spec_arguments(&program, "pkg");
+        assert_eq!(name, "pkg");
+        assert!(
+            Path::new(&origin).ends_with(Path::new("pkg").join("__init__.py")),
+            "unexpected origin: {origin}"
+        );
+        assert!(is_package, "a package __init__.py is its own package");
+
+        // `__package__` is the spec's parent (the package itself) and
+        // `__file__` is the spec's origin.
+        let package = resolved_initializer(
+            &program,
+            "pkg",
+            initializer_global(&program, "pkg", "__package__"),
+        );
+        assert!(
+            matches!(
+                &package.kind,
+                hydro_ir::ExprKind::Const(hydro_ir::Const::Str(value)) if value.as_str() == "pkg"
+            ),
+            "{:?}",
+            package.kind
+        );
+        let file = resolved_initializer(
+            &program,
+            "pkg",
+            initializer_global(&program, "pkg", "__file__"),
+        );
+        assert!(
+            matches!(
+                &file.kind,
+                hydro_ir::ExprKind::Const(hydro_ir::Const::Str(value)) if value == &origin
+            ),
+            "{:?}",
+            file.kind
+        );
+        assert_loader_is_spec_loader(&program, "pkg");
+    }
+
+    #[test]
+    fn submodule_publishes_parent_package_metadata() {
+        let dir = TestDir::new("spec-submodule");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(pkg.join("__init__.py"), "").expect("write package init");
+        fs::write(pkg.join("mod.py"), "VALUE = 2\n").expect("write submodule");
+        let main = dir.write("main.py", "import pkg.mod\nprint(pkg.mod.VALUE)\n");
+        let program = program(&main);
+
+        let (name, origin, is_package) = module_spec_arguments(&program, "pkg.mod");
+        assert_eq!(name, "pkg.mod");
+        assert!(
+            Path::new(&origin).ends_with(Path::new("pkg").join("mod.py")),
+            "unexpected origin: {origin}"
+        );
+        assert!(!is_package, "a plain module is not a package");
+
+        let package = resolved_initializer(
+            &program,
+            "pkg.mod",
+            initializer_global(&program, "pkg.mod", "__package__"),
+        );
+        assert!(
+            matches!(
+                &package.kind,
+                hydro_ir::ExprKind::Const(hydro_ir::Const::Str(value)) if value.as_str() == "pkg"
+            ),
+            "{:?}",
+            package.kind
+        );
+        assert_loader_is_spec_loader(&program, "pkg.mod");
+    }
+
+    #[test]
+    fn top_level_module_publishes_empty_package() {
+        let dir = TestDir::new("spec-top-level");
+        dir.write("top.py", "VALUE = 3\n");
+        let main = dir.write("main.py", "import top\nprint(top.VALUE)\n");
+        let program = program(&main);
+
+        let (name, origin, is_package) = module_spec_arguments(&program, "top");
+        assert_eq!(name, "top");
+        assert!(
+            Path::new(&origin).ends_with("top.py"),
+            "unexpected origin: {origin}"
+        );
+        assert!(!is_package, "a top-level module is not a package");
+
+        // CPython gives a top-level module an empty `__package__` (its
+        // `ModuleSpec.parent` is the empty string).
+        let package = resolved_initializer(
+            &program,
+            "top",
+            initializer_global(&program, "top", "__package__"),
+        );
+        assert!(
+            matches!(
+                &package.kind,
+                hydro_ir::ExprKind::Const(hydro_ir::Const::Str(value)) if value.is_empty()
+            ),
+            "{:?}",
+            package.kind
+        );
+        assert_loader_is_spec_loader(&program, "top");
+    }
+
     #[test]
     fn imported_module_bodies_run_once_as_initializers() {
         let dir = TestDir::new("side-effect");

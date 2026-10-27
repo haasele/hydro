@@ -2369,6 +2369,9 @@ pub static IMPORTLIB_MACHINERY: ModuleSpec = ModuleSpec {
     name: "importlib.machinery",
     functions: &[
         f("_spec_init", 3, 6, Type::None),
+        // `_module_spec(name, origin, is_package)`: the `ModuleSpec` binding
+        // every compiled unit publishes as `__spec__`.
+        f("_module_spec", 3, 3, Type::Any),
         f("_source_init", 3, 3, Type::None),
         f("_source_get_filename", 2, 2, Type::Str),
         f("_source_create_module", 2, 2, Type::Any),
@@ -4972,6 +4975,9 @@ mod tests {
                 .max_args,
             4
         );
+        let module_spec = function("importlib.machinery", "_module_spec").expect("_module_spec");
+        assert_eq!((module_spec.min_args, module_spec.max_args), (3, 3));
+        assert_eq!(module_spec.ret, Type::Any);
         for name in ["SOURCE_SUFFIXES", "BYTECODE_SUFFIXES", "EXTENSION_SUFFIXES"] {
             assert_eq!(
                 constant("importlib.machinery", name).unwrap().ty,
