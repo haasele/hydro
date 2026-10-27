@@ -64,8 +64,8 @@ use hydro_ir::{Builtin, ParamKind};
 
 use crate::container;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, DEPRECATION_WARNING, NAME_ERROR, NOT_IMPLEMENTED_ERROR, TYPE_ERROR,
-    VALUE_ERROR,
+    self, ASSERTION_ERROR, ATTRIBUTE_ERROR, DEPRECATION_WARNING, NAME_ERROR, NOT_IMPLEMENTED_ERROR,
+    TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::methods;
@@ -1209,6 +1209,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         // CPython's signature is `cast(typ, val)`; the value argument wins.
         "cast" => args.get(1).copied().unwrap_or(NONE),
+        // `assert_never(arg, /)` marks unreachable code: it always raises.
+        "assert_never" => assert_never(args.first().copied().unwrap_or(NONE)),
         "runtime_checkable" | "overload" => args.first().copied().unwrap_or(NONE),
         // `TypeVar` carries the full type-parameter attribute set; the
         // frontend still consumes annotations itself, but the value is real
@@ -1280,6 +1282,23 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
             &format!("module 'typing' has no attribute '{function}'"),
         ),
     }
+}
+
+/// `typing.assert_never(arg, /)`: the branch this call sits in is statically
+/// unreachable, so reaching it is a bug. Raises `AssertionError` with the
+/// argument's `repr`, truncated to `_ASSERT_NEVER_REPR_MAX_LENGTH` characters
+/// exactly like CPython.
+fn assert_never(arg: i64) -> i64 {
+    let limit = usize::try_from(ASSERT_NEVER_REPR_MAX_LENGTH).unwrap_or(usize::MAX);
+    let mut value = value::repr(arg);
+    if let Some((cut, _)) = value.char_indices().nth(limit) {
+        value.truncate(cut);
+        value.push_str("...");
+    }
+    exc::raise_with_message(
+        ASSERTION_ERROR,
+        &format!("Expected code to be unreachable, but got: {value}"),
+    )
 }
 
 /// Binds positional arguments plus keyword pairs for a fixed parameter list.
@@ -2274,6 +2293,48 @@ mod tests {
         // The type argument is ignored even when it is a nested alias.
         assert_eq!(call("cast", &[NONE, NONE]), NONE);
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn assert_never_always_raises_assertion_error() {
+        exc::init();
+        call("assert_never", &[text("boom")]);
+        assert_eq!(exc::pending_tag(), crate::exc::ASSERTION_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "Expected code to be unreachable, but got: 'boom'"
+        );
+        exc::clear();
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn assert_never_truncates_the_rendered_argument() {
+        exc::init();
+        // `repr` adds the surrounding quotes, so a 101-character string is one
+        // over the limit and keeps only its first 100 rendered characters.
+        let long = text(&"x".repeat(101));
+        let rendered = format!("'{long_repr}'", long_repr = "x".repeat(101));
+        let limit = ASSERT_NEVER_REPR_MAX_LENGTH as usize;
+        let expected = format!(
+            "Expected code to be unreachable, but got: {}...",
+            &rendered[..limit]
+        );
+        call("assert_never", &[long]);
+        assert_eq!(exc::pending_tag(), crate::exc::ASSERTION_ERROR as i64);
+        assert_eq!(pending_message(), expected);
+
+        // Exactly at the limit nothing is truncated.
+        exc::clear();
+        let short = text(&"y".repeat(limit - 2));
+        let short_repr = format!("'{}'", "y".repeat(limit - 2));
+        assert_eq!(short_repr.chars().count(), limit);
+        call("assert_never", &[short]);
+        assert_eq!(
+            pending_message(),
+            format!("Expected code to be unreachable, but got: {short_repr}")
+        );
+        exc::clear();
     }
 
     #[test]

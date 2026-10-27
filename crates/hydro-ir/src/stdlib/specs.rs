@@ -1723,6 +1723,9 @@ pub static TYPING: ModuleSpec = ModuleSpec {
     name: "typing",
     functions: &[
         kw("cast", 2, 2, Type::Any, &["typ", "val"]),
+        // `assert_never(arg, /)`: marks a statically unreachable branch and
+        // always raises `AssertionError`, so the call never produces a value.
+        f("assert_never", 1, 1, Type::Never),
         f("runtime_checkable", 1, 1, Type::Any),
         f("overload", 1, 1, Type::Any),
         // `TypeVar(name, *constraints, *, bound=None, covariant=False,
@@ -3639,6 +3642,13 @@ mod tests {
             &["typ", "val"][..]
         );
         assert_eq!(function("typing", "cast").unwrap().min_args, 2);
+        let assert_never = function("typing", "assert_never").expect("assert_never");
+        assert_eq!(
+            (assert_never.min_args, assert_never.max_args),
+            (1, 1),
+            "assert_never(arg, /) takes exactly one argument"
+        );
+        assert_eq!(assert_never.ret, Type::Never, "assert_never never returns");
         assert_eq!(function("typing", "runtime_checkable").unwrap().max_args, 1);
         assert_eq!(function("typing", "overload").unwrap().min_args, 1);
         let typevar = function("typing", "TypeVar").unwrap();
