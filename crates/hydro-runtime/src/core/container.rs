@@ -774,6 +774,32 @@ pub(crate) fn set_operation(op: SetOp, a: i64, b: i64) -> Option<i64> {
     Some(result)
 }
 
+/// Inclusion comparison kinds for set-like values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SetOrdering {
+    /// `a < b`: every element of `a` is in `b`, and the sets differ.
+    ProperSubset,
+    /// `a <= b`: every element of `a` is in `b`.
+    Subset,
+}
+
+/// `a < b` / `a <= b` over sets and `dict_keys`/`dict_items` views.
+///
+/// Returns `None` when either operand is not set-like, so the caller keeps its
+/// generic comparison behaviour (`dict_values` and non-containers).
+pub(crate) fn set_inclusion(a: i64, b: i64, ordering: SetOrdering) -> Option<bool> {
+    if !is_set_like(a) || !is_set_like(b) {
+        return None;
+    }
+    let left = set_like_elements(a)?;
+    let right = set_like_elements(b)?;
+    let subset = left.iter().all(|item| set_contains(&right, *item));
+    Some(match ordering {
+        SetOrdering::Subset => subset,
+        SetOrdering::ProperSubset => subset && left.len() != right.len(),
+    })
+}
+
 // Dict operations over a pair table
 
 /// Position of `key` in a pair table (`O(1)` for [`DictData`], a scan for the

@@ -1697,9 +1697,28 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         return attribute_error(obj, &attr);
     }
     if value::as_set(obj).is_some() {
-        // Native bound method values cover read-only set operations used as
-        // callbacks (`_SINGLE_CELLS.issuperset` in rich).
-        if matches!(attr.as_str(), "issubset" | "issuperset") {
+        // Native bound method values let set methods be passed as callbacks
+        // (`_SINGLE_CELLS.issuperset` in rich) as well as called.
+        if matches!(
+            attr.as_str(),
+            "add"
+                | "remove"
+                | "discard"
+                | "pop"
+                | "clear"
+                | "copy"
+                | "update"
+                | "union"
+                | "intersection"
+                | "difference"
+                | "symmetric_difference"
+                | "intersection_update"
+                | "difference_update"
+                | "symmetric_difference_update"
+                | "issubset"
+                | "issuperset"
+                | "isdisjoint"
+        ) {
             return value::bound_method_new(obj, attr);
         }
         return attribute_error(obj, &attr);
@@ -4483,79 +4502,126 @@ fn tuple_method(obj: i64, method: &str, args: &[i64]) -> i64 {
 
 // set
 
-/// `s.issuperset(other)` / `s.issubset(other)` for iterable operands.
-fn set_relation(obj: i64, other: i64, superset: bool) -> i64 {
-    let Some(items) = value::as_set(obj) else {
-        return attribute_error(obj, "issuperset");
-    };
-    let receiver = items.to_vec();
-    if superset {
-        match iterable_elements(other) {
-            Ok(elements) => {
-                if elements
-                    .into_iter()
-                    .all(|item| container::set_contains(&receiver, item))
-                {
-                    value::TRUE
-                } else {
-                    value::FALSE
-                }
-            }
-            Err(err) => err,
+/// Calls `visit` with every element of `iterable`. `visit` returns `Ok(true)`
+/// to continue, `Ok(false)` to stop early (a matching element already decided
+/// the result), or `Err` to propagate a raised exception. Iteration errors
+/// become `Err` with the pending-exception value.
+fn for_each_element(
+    iterable: i64,
+    mut visit: impl FnMut(i64) -> Result<bool, i64>,
+) -> Result<(), i64> {
+    let iterator = crate::iter::iter_of(iterable);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    loop {
+        let mut item = NONE;
+        let status = crate::iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return Err(NONE);
         }
-    } else {
-        let other_items = match value::as_set(other)
-            .or_else(|| value::as_list(other))
-            .or_else(|| value::as_tuple(other))
-        {
-            Some(items) => items.to_vec(),
-            None => {
-                return type_error(format!(
-                    "'{}' object is not iterable",
-                    value::type_name(other)
-                ))
-            }
-        };
-        if receiver
-            .iter()
-            .all(|item| container::set_contains(&other_items, *item))
-        {
-            value::TRUE
-        } else {
-            value::FALSE
+        if status == 0 {
+            return Ok(());
+        }
+        if !visit(item)? {
+            return Ok(());
         }
     }
 }
 
-/// Extracts iteration values for set relations. Characters of a string and
-/// byte values are materialised one at a time; each temporary stays live on
-/// the caller's stack while the membership check runs.
-fn iterable_elements(value: i64) -> Result<Vec<i64>, i64> {
-    if let Some(items) = value::as_list(value)
-        .or_else(|| value::as_tuple(value))
-        .or_else(|| value::as_set(value))
-    {
-        return Ok(items.to_vec());
+/// A fresh `set` holding the current elements of `obj` (`set.copy`).
+fn copy_set(obj: i64) -> i64 {
+    let result = value::set_new(Vec::new());
+    if let Some(items) = value::as_set(obj) {
+        for &item in items {
+            container::insert_set_item(result, item);
+        }
     }
-    if let Some(text) = value::as_str(value) {
-        return Ok(text
-            .chars()
-            .map(|ch| value::str_alloc(ch.to_string()))
-            .collect());
+    result
+}
+
+/// A fresh `set` built from any iterable operand. Every element must be
+/// hashable; the result is a heap object, so a generator operand may allocate
+/// (`yield`) during the build without losing the elements already read.
+fn set_operand(operand: i64) -> Result<i64, i64> {
+    let result = value::set_new(Vec::new());
+    for_each_element(operand, |item| {
+        if let Some(err) = check_hashable(item) {
+            return Err(err);
+        }
+        container::insert_set_item(result, item);
+        Ok(true)
+    })?;
+    Ok(result)
+}
+
+/// Inserts every element of `operand` into `target` (`set.update` semantics).
+/// Elements are inserted as they are read, so a failing iterator leaves the
+/// earlier elements in place, as in CPython.
+fn set_update_from(target: i64, operand: i64) -> Result<(), i64> {
+    for_each_element(operand, |item| {
+        if let Some(err) = check_hashable(item) {
+            return Err(err);
+        }
+        container::insert_set_item(target, item);
+        Ok(true)
+    })
+}
+
+/// Restricts `target` to the elements contained in every operand
+/// (`intersection`/`intersection_update` semantics).
+fn set_intersect_into(target: i64, operands: &[i64]) -> Option<i64> {
+    for &operand in operands {
+        let other = match set_operand(operand) {
+            Ok(other) => other,
+            Err(err) => return Some(err),
+        };
+        let other_items = value::as_set(other).unwrap_or_default().to_vec();
+        if let Some(mut items) = value::set_items_mut(target) {
+            items.retain(|item| container::set_contains(&other_items, *item));
+        }
     }
-    if let Some(bytes) = value::as_bytes(value) {
-        return Ok(bytes
-            .iter()
-            .map(|byte| crate::ops::int_result(*byte as i64))
-            .collect());
+    None
+}
+
+/// Removes from `target` every element contained in an operand
+/// (`difference`/`difference_update` semantics).
+fn set_difference_into(target: i64, operands: &[i64]) -> Option<i64> {
+    for &operand in operands {
+        let other = match set_operand(operand) {
+            Ok(other) => other,
+            Err(err) => return Some(err),
+        };
+        let other_items = value::as_set(other).unwrap_or_default().to_vec();
+        if let Some(mut items) = value::set_items_mut(target) {
+            items.retain(|item| !container::set_contains(&other_items, *item));
+        }
     }
-    if let Some(pairs) = value::as_dict(value) {
-        return Ok(pairs.iter().map(|(key, _)| *key).collect());
+    None
+}
+
+/// Flips membership in `target` for every element of `operand`
+/// (`symmetric_difference`/`symmetric_difference_update` semantics).
+fn set_symmetric_difference_into(target: i64, operand: i64) -> Option<i64> {
+    let other = match set_operand(operand) {
+        Ok(other) => other,
+        Err(err) => return Some(err),
+    };
+    let other_items = value::as_set(other).unwrap_or_default().to_vec();
+    if let Some(mut items) = value::set_items_mut(target) {
+        for &item in &other_items {
+            match container::set_find(items.as_slice(), item) {
+                Some(index) => {
+                    items.remove(index);
+                }
+                None => {
+                    items.push(item);
+                    crate::heap::write_barrier_edge(target, item);
+                }
+            }
+        }
     }
-    Err(type_error(format!(
-        "'{}' object is not iterable",
-        value::type_name(value)
-    )))
+    None
 }
 
 fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
@@ -4601,71 +4667,133 @@ fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             }
             NONE
         }
+        "pop" => {
+            if let Some(err) = check_arity("set", method, args.len(), 0, 0) {
+                return err;
+            }
+            let Some(mut items) = value::set_items_mut(obj) else {
+                return attribute_error(obj, method);
+            };
+            match items.pop() {
+                Some(item) => item,
+                None => {
+                    drop(items);
+                    exc::raise_with_message(KEY_ERROR, "pop from an empty set")
+                }
+            }
+        }
         "copy" => {
             if let Some(err) = check_arity("set", method, args.len(), 0, 0) {
                 return err;
             }
-            let result = value::set_new(Vec::new());
-            // Read the receiver after allocating so it stays a root.
-            if let Some(items) = value::as_set(obj) {
-                for &item in items {
-                    container::insert_set_item(result, item);
+            copy_set(obj)
+        }
+        "update" => {
+            for &operand in args {
+                if let Err(err) = set_update_from(obj, operand) {
+                    return err;
+                }
+            }
+            NONE
+        }
+        "union" => {
+            let result = copy_set(obj);
+            for &operand in args {
+                if let Err(err) = set_update_from(result, operand) {
+                    return err;
                 }
             }
             result
+        }
+        "intersection" | "intersection_update" => {
+            let target = if method == "intersection" {
+                copy_set(obj)
+            } else {
+                obj
+            };
+            match set_intersect_into(target, args) {
+                Some(err) => err,
+                None if method == "intersection" => target,
+                None => NONE,
+            }
+        }
+        "difference" | "difference_update" => {
+            let target = if method == "difference" {
+                copy_set(obj)
+            } else {
+                obj
+            };
+            match set_difference_into(target, args) {
+                Some(err) => err,
+                None if method == "difference" => target,
+                None => NONE,
+            }
+        }
+        "symmetric_difference" | "symmetric_difference_update" => {
+            if let Some(err) = check_arity("set", method, args.len(), 1, 1) {
+                return err;
+            }
+            let target = if method == "symmetric_difference" {
+                copy_set(obj)
+            } else {
+                obj
+            };
+            match set_symmetric_difference_into(target, args[0]) {
+                Some(err) => err,
+                None if method == "symmetric_difference" => target,
+                None => NONE,
+            }
         }
         "issuperset" | "issubset" => {
             if let Some(err) = check_arity("set", method, args.len(), 1, 1) {
                 return err;
             }
-            set_relation(obj, args[0], method == "issuperset")
+            let other = match set_operand(args[0]) {
+                Ok(other) => other,
+                Err(err) => return err,
+            };
+            let Some(receiver) = value::as_set(obj) else {
+                return attribute_error(obj, method);
+            };
+            let other_items = value::as_set(other).unwrap_or_default();
+            let result = if method == "issuperset" {
+                other_items
+                    .iter()
+                    .all(|item| container::set_contains(receiver, *item))
+            } else {
+                receiver
+                    .iter()
+                    .all(|item| container::set_contains(other_items, *item))
+            };
+            value::bool_value(result)
         }
-        "union" => {
+        "isdisjoint" => {
             if let Some(err) = check_arity("set", method, args.len(), 1, 1) {
                 return err;
             }
-            let other = args[0];
-            let supported = value::as_set(other).is_some()
-                || value::as_list(other).is_some()
-                || value::as_tuple(other).is_some();
-            if !supported {
-                return type_error(format!(
-                    "'{}' object is not iterable",
-                    value::type_name(other)
-                ));
-            }
-            let invalid = if let Some(items) = value::as_set(other) {
-                check_hashable_items(items)
-            } else if let Some(items) = value::as_list(other) {
-                check_hashable_items(items)
-            } else {
-                value::as_tuple(other).and_then(check_hashable_items)
+            let Some(receiver) = value::as_set(obj) else {
+                return attribute_error(obj, method);
             };
-            if let Some(err) = invalid {
-                return err;
+            // The receiver is copied because the operand may be a generator
+            // that mutates it; its elements stay reachable through `obj`.
+            let receiver = receiver.to_vec();
+            let mut disjoint = true;
+            // Hashability is checked per element and the scan stops at the
+            // first shared element, so later operands are never examined.
+            let outcome = for_each_element(args[0], |item| {
+                if let Some(err) = check_hashable(item) {
+                    return Err(err);
+                }
+                if container::set_contains(&receiver, item) {
+                    disjoint = false;
+                    return Ok(false);
+                }
+                Ok(true)
+            });
+            match outcome {
+                Ok(()) => value::bool_value(disjoint),
+                Err(err) => err,
             }
-            // Allocate first; `obj` and `other` are read below and therefore
-            // stay live roots across the allocation.
-            let result = value::set_new(Vec::new());
-            if let Some(items) = value::as_set(obj) {
-                for &item in items {
-                    container::insert_set_item(result, item);
-                }
-            }
-            if let Some(items) = value::as_set(other) {
-                for &item in items {
-                    container::insert_set_item(result, item);
-                }
-            } else if let Some(items) = value::as_list(other) {
-                for &item in items {
-                    container::insert_set_item(result, item);
-                }
-            } else if let Some(items) = value::as_tuple(other) {
-                for &item in items {
-                    container::insert_set_item(result, item);
-                }
-            }
-            result
         }
         _ => attribute_error(obj, method),
     }
@@ -4881,11 +5009,6 @@ fn dict_update_from_pairs(obj: i64, source: i64) -> i64 {
 /// `iterator`, a bytes-like mutable/view value, or a tuple containing one).
 fn check_hashable(key: i64) -> Option<i64> {
     container::unhashable_name(key).map(|name| type_error(container::unhashable_message(name)))
-}
-
-/// Returns the pending `TypeError` for the first unhashable element.
-fn check_hashable_items(items: &[i64]) -> Option<i64> {
-    items.iter().find_map(|&item| check_hashable(item))
 }
 
 // lock (`_thread.allocate_lock()`)
@@ -7228,6 +7351,249 @@ mod tests {
         invoke(base, "bogus", &[]);
         assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
         assert_eq!(message(), "'set' object has no attribute 'bogus'");
+    }
+
+    #[test]
+    fn set_union_is_variadic_and_accepts_any_iterable() {
+        reset();
+        let base = set(&[int(1), int(2)]);
+        let empty = invoke(base, "union", &[]);
+        assert_eq!(value::as_set(empty), Some(&[int(1), int(2)][..]));
+        assert_ne!(empty, base);
+
+        let union = invoke(
+            base,
+            "union",
+            &[
+                list(&[int(2), int(3)]),
+                tuple(&[int(4)]),
+                dict(&[(int(9), int(0))]),
+                string("ab"),
+            ],
+        );
+        assert!(container::set_like_equal(
+            value::as_set(union).unwrap_or(&[]),
+            &[
+                int(1),
+                int(2),
+                int(3),
+                int(4),
+                int(9),
+                string("a"),
+                string("b")
+            ],
+        ));
+        assert_eq!(value::as_set(base), Some(&[int(1), int(2)][..]));
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn set_update_mutates_in_place_variadically() {
+        reset();
+        let s = set(&[int(1)]);
+        assert_eq!(
+            invoke(
+                s,
+                "update",
+                &[
+                    list(&[int(2), int(1)]),
+                    tuple(&[int(3)]),
+                    dict(&[(int(4), int(0))]),
+                    string("x"),
+                ],
+            ),
+            NONE
+        );
+        assert!(container::set_like_equal(
+            value::as_set(s).unwrap_or(&[]),
+            &[int(1), int(2), int(3), int(4), string("x")],
+        ));
+        // No operands is a no-op.
+        invoke(s, "update", &[]);
+        assert_eq!(value::as_set(s).map(|items| items.len()), Some(5));
+        assert!(!crate::exc::pending());
+
+        // Elements are inserted before the unhashable one is reported.
+        let partial = set(&[]);
+        crate::exc::clear();
+        invoke(partial, "update", &[list(&[int(7), list(&[])])]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "unhashable type: 'list'");
+        assert_eq!(value::as_set(partial), Some(&[int(7)][..]));
+
+        crate::exc::clear();
+        invoke(s, "update", &[int(1)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "'int' object is not iterable");
+    }
+
+    #[test]
+    fn set_intersection_and_difference_are_variadic() {
+        reset();
+        let base = set(&[int(1), int(2), int(3), int(4)]);
+        let intersection = invoke(
+            base,
+            "intersection",
+            &[
+                list(&[int(3), int(2), int(9)]),
+                tuple(&[int(2), int(3), int(5)]),
+            ],
+        );
+        assert_eq!(value::as_set(intersection), Some(&[int(2), int(3)][..]));
+        // No operands returns a copy of the receiver.
+        let copied = invoke(base, "intersection", &[]);
+        assert_eq!(
+            value::as_set(copied),
+            Some(&[int(1), int(2), int(3), int(4)][..])
+        );
+        assert_ne!(copied, base);
+
+        let difference = invoke(
+            base,
+            "difference",
+            &[list(&[int(1)]), tuple(&[int(3)]), string("")],
+        );
+        assert_eq!(value::as_set(difference), Some(&[int(2), int(4)][..]));
+        let difference_copy = invoke(base, "difference", &[]);
+        assert_eq!(
+            value::as_set(difference_copy).map(|items| items.len()),
+            Some(4)
+        );
+        assert_eq!(
+            value::as_set(base),
+            Some(&[int(1), int(2), int(3), int(4)][..])
+        );
+        assert!(!crate::exc::pending());
+
+        // In-place variants mutate the receiver and return None.
+        let target = set(&[int(1), int(2), int(3)]);
+        assert_eq!(
+            invoke(
+                target,
+                "intersection_update",
+                &[list(&[int(2), int(3), int(4)])],
+            ),
+            NONE
+        );
+        assert_eq!(value::as_set(target), Some(&[int(2), int(3)][..]));
+        invoke(target, "difference_update", &[set(&[int(3)])]);
+        assert_eq!(value::as_set(target), Some(&[int(2)][..]));
+        // No operands leaves the receiver untouched.
+        invoke(target, "intersection_update", &[]);
+        invoke(target, "difference_update", &[]);
+        assert_eq!(value::as_set(target), Some(&[int(2)][..]));
+
+        // Operand elements must be hashable.
+        crate::exc::clear();
+        invoke(base, "intersection", &[list(&[list(&[])])]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "unhashable type: 'list'");
+    }
+
+    #[test]
+    fn set_symmetric_difference_creates_and_updates() {
+        reset();
+        let base = set(&[int(1), int(2)]);
+        let result = invoke(base, "symmetric_difference", &[list(&[int(2), int(3)])]);
+        assert_eq!(value::as_set(result), Some(&[int(1), int(3)][..]));
+        assert_eq!(value::as_set(base), Some(&[int(1), int(2)][..]));
+
+        let target = set(&[int(1), int(2)]);
+        assert_eq!(
+            invoke(
+                target,
+                "symmetric_difference_update",
+                &[set(&[int(2), int(3)])],
+            ),
+            NONE
+        );
+        assert_eq!(value::as_set(target), Some(&[int(1), int(3)][..]));
+        assert!(!crate::exc::pending());
+
+        crate::exc::clear();
+        invoke(base, "symmetric_difference", &[]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "set.symmetric_difference() takes exactly one argument (0 given)"
+        );
+
+        crate::exc::clear();
+        invoke(base, "symmetric_difference_update", &[set(&[]), set(&[])]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "set.symmetric_difference_update() takes exactly one argument (2 given)"
+        );
+    }
+
+    #[test]
+    fn set_pop_removes_one_element_and_empty_raises() {
+        reset();
+        let s = set(&[int(1), int(2)]);
+        assert_eq!(invoke(s, "pop", &[]), int(2));
+        assert_eq!(value::as_set(s), Some(&[int(1)][..]));
+        assert_eq!(invoke(s, "pop", &[]), int(1));
+        assert_eq!(value::as_set(s).map(|items| items.is_empty()), Some(true));
+        assert!(!crate::exc::pending());
+
+        invoke(s, "pop", &[]);
+        assert_eq!(error_tag(), crate::exc::KEY_ERROR as i64);
+        assert_eq!(message(), "pop from an empty set");
+    }
+
+    #[test]
+    fn set_methods_are_available_as_bound_values() {
+        reset();
+        let s = set(&[int(1)]);
+        let update = getattr(s, b"update".as_ptr(), 6);
+        assert!(!crate::exc::pending());
+        let args = [list(&[int(2)])];
+        assert_eq!(crate::builtins::call(update, 1, args.as_ptr()), NONE);
+        assert_eq!(value::as_set(s), Some(&[int(1), int(2)][..]));
+
+        let isdisjoint = getattr(s, b"isdisjoint".as_ptr(), 10);
+        let other = [set(&[int(9)])];
+        assert_eq!(crate::builtins::call(isdisjoint, 1, other.as_ptr()), TRUE);
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn set_relations_accept_any_iterable() {
+        reset();
+        let base = set(&[int(1), int(2)]);
+        assert_eq!(
+            invoke(base, "issubset", &[list(&[int(1), int(2), int(3)])]),
+            TRUE
+        );
+        assert_eq!(invoke(base, "issubset", &[tuple(&[int(1)])]), FALSE);
+        assert_eq!(invoke(base, "issuperset", &[set(&[int(1)])]), TRUE);
+        assert_eq!(
+            invoke(base, "issuperset", &[list(&[int(1), int(3)])]),
+            FALSE
+        );
+        assert_eq!(
+            invoke(set(&[string("a")]), "issubset", &[string("ab")]),
+            TRUE
+        );
+        assert_eq!(invoke(base, "isdisjoint", &[list(&[int(3), int(4)])]), TRUE);
+        assert_eq!(invoke(base, "isdisjoint", &[set(&[int(3), int(2)])]), FALSE);
+        // A shared element stops the scan before later unhashable ones.
+        assert_eq!(
+            invoke(base, "isdisjoint", &[list(&[int(2), list(&[])])]),
+            FALSE
+        );
+        assert!(!crate::exc::pending());
+
+        crate::exc::clear();
+        invoke(base, "issubset", &[list(&[list(&[])])]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "unhashable type: 'list'");
+
+        crate::exc::clear();
+        invoke(base, "isdisjoint", &[int(1)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "'int' object is not iterable");
     }
 
     #[test]

@@ -8,6 +8,23 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 CPython set methods and comparisons
+
+- Sets implement the full CPython method surface. `update(*others)` mutates in
+  place over any number of iterables and returns `None`; `union`,
+  `intersection` and `difference` are variadic and return new sets, with
+  `intersection_update` and `difference_update` mutating; the
+  `symmetric_difference`/`symmetric_difference_update` pair takes exactly one
+  operand. `pop()` removes and returns one element (empty sets raise
+  `KeyError: pop from an empty set`), and `copy`, `add`, `remove`, `discard`
+  and `clear` keep their CPython behaviour. Every operand goes through the
+  iterator protocol (ranges, strings, dict keys, generators), each element is
+  checked for hashability as it is read, and `issubset`/`issuperset`/
+  `isdisjoint` accept any iterable. `<`, `<=`, `>` and `>=` compare sets (and
+  `dict_keys`/`dict_items` views) by inclusion, with non-set operands keeping
+  the usual `TypeError`. All set methods are also available as bound method
+  values.
+
 ### Added — 2026-10-27 PEP 560 `__mro_entries__` class bases
 
 - Class creation accepts non-class bases with a `__mro_entries__` hook and

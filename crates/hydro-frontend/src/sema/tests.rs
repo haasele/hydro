@@ -1132,13 +1132,17 @@ fn set_indexing_and_assignment_are_rejected() {
 
 #[test]
 fn set_methods_return_the_documented_types() {
-    let source = "s = {1}\na = s.add(2)\nb = s.remove(1)\nc = s.discard(9)\nd = s.clear()\ne = s.copy()\nf = s.union([2, 3])\ng = s.union((2,))\nh = s.union({2})\n";
+    let source = "s = {1}\na = s.add(2)\nb = s.remove(1)\nc = s.discard(9)\nd = s.clear()\ne = s.copy()\nf = s.union([2, 3], (4,), {5})\ng = s.union((2,))\nh = s.union({2})\ni = s.update([2])\nj = s.pop()\nk = s.intersection([1], {2})\nl = s.difference([1])\nm = s.symmetric_difference([1])\nn = s.intersection_update([1])\no = s.difference_update([1])\np = s.symmetric_difference_update([1])\nq = s.issubset([1])\nr = s.issuperset([1])\nt = s.isdisjoint([2])\n";
     let program = crate::check_source(source, "test.py").expect("valid program");
-    for index in 1..5 {
+    for index in [1, 2, 3, 4, 9, 14, 15, 16] {
         assert_eq!(assigned_type(&program, index), Type::None);
     }
-    for index in 5..9 {
+    for index in [5, 6, 7, 8, 11, 12, 13] {
         assert_eq!(assigned_type(&program, index), Type::Set);
+    }
+    assert_eq!(assigned_type(&program, 10), Type::Any);
+    for index in [17, 18, 19] {
+        assert_eq!(assigned_type(&program, index), Type::Bool);
     }
 }
 
@@ -1154,12 +1158,27 @@ fn set_method_arguments_are_checked() {
     );
     assert_eq!(
         check_errors("s = {1}\ns.union(1)\n"),
-        vec!["set.union() argument 1 has wrong type: expected set, list or tuple, got int"]
+        vec!["set.union() argument 1 has wrong type: expected iterable, got int"]
+    );
+    assert_eq!(
+        check_errors("s = {1}\ns.symmetric_difference()\n"),
+        vec!["set.symmetric_difference() takes 1 positional argument(s) (0 given)"]
     );
     assert_eq!(
         check_errors("s = {1}\ns.add()\n"),
         vec!["set.add() takes 1 positional argument(s) (0 given)"]
     );
+}
+
+#[test]
+fn set_comparisons_return_bool() {
+    let source = "a = {1} < {1, 2}\nb = {1} <= {1}\nc = {1} > {2}\nd = {1} >= {1}\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    for index in 0..4 {
+        assert_eq!(assigned_type(&program, index), Type::Bool);
+    }
+    assert_eq!(op_result(BinOp::Lt, Type::Set, Type::Set), Some(Type::Bool));
+    assert_eq!(op_result(BinOp::Lt, Type::Set, Type::Int), None);
 }
 
 #[test]

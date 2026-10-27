@@ -1382,6 +1382,24 @@ fn compare(op: u32, a: i64, b: i64) -> i64 {
         // Bytes compare lexicographically by unsigned byte value.
         return ordered_result(op, Some(x.cmp(y)));
     }
+    // Sets and `dict_keys`/`dict_items` views order by inclusion: `<`/`<=`
+    // compare the left operand as a subset of the right, `>`/`>=` mirror the
+    // operands. Other operands keep the generic type error below.
+    if matches!(op, OP_LT | OP_LE | OP_GT | OP_GE) {
+        let (left, right) = if matches!(op, OP_LT | OP_LE) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let ordering = if matches!(op, OP_LT | OP_GT) {
+            container::SetOrdering::ProperSubset
+        } else {
+            container::SetOrdering::Subset
+        };
+        if let Some(result) = container::set_inclusion(left, right, ordering) {
+            return value::bool_value(result);
+        }
+    }
     // Tuples and lists compare lexicographically, with recursive element
     // ordering (Python's sequence comparison).
     if matches!(op, OP_LT | OP_LE | OP_GT | OP_GE) {
@@ -2050,6 +2068,27 @@ mod tests {
             pending_message(),
             "unsupported operand type(s) for +: 'set' and 'set'"
         );
+    }
+
+    #[test]
+    fn set_comparisons_compare_by_inclusion() {
+        exc::init();
+        let small = set(&[int(1), int(2)]);
+        let big = set(&[int(1), int(2), int(3)]);
+        assert_eq!(binop(OP_LT, small, big), TRUE);
+        assert_eq!(binop(OP_LE, small, big), TRUE);
+        assert_eq!(binop(OP_LT, small, small), FALSE);
+        assert_eq!(binop(OP_LE, small, small), TRUE);
+        assert_eq!(binop(OP_GT, big, small), TRUE);
+        assert_eq!(binop(OP_GE, big, small), TRUE);
+        assert_eq!(binop(OP_GT, small, small), FALSE);
+        assert_eq!(binop(OP_GE, small, small), TRUE);
+        // Disjoint sets are not ordered either way.
+        assert_eq!(binop(OP_LT, set(&[int(1)]), set(&[int(2)])), FALSE);
+        assert_eq!(binop(OP_GE, set(&[int(1)]), set(&[int(2)])), FALSE);
+        // A non-set operand keeps the generic type error.
+        assert_eq!(binop(OP_LT, small, int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
     }
 
     #[test]

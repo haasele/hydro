@@ -287,11 +287,9 @@ enum ArgKind {
     MappingOrPairs,
     /// Any value Python can hash: containers are rejected recursively.
     Hashable,
-    /// `set.union` accepts a set, list or tuple.
-    SetIterable,
-    /// Any type whose values can be iterated: `str.join`/`bytes.join` and
-    /// `list.extend` accept every iterable, not just lists (CPython iterates
-    /// the argument).
+    /// Any type whose values can be iterated: `str.join`/`bytes.join`,
+    /// `list.extend` and the set methods (`union`, `update`, ...) accept every
+    /// iterable, not just lists (CPython iterates the argument).
     Iterable,
 }
 
@@ -310,7 +308,6 @@ impl ArgKind {
             // Detailed hashability is checked on the expression itself so
             // tuples with unhashable elements are rejected recursively.
             ArgKind::Hashable => true,
-            ArgKind::SetIterable => matches!(got, Type::Set | Type::List | Type::Tuple),
             ArgKind::MappingOrPairs | ArgKind::Iterable => matches!(
                 got,
                 Type::List
@@ -333,7 +330,6 @@ impl ArgKind {
             ArgKind::Int => "int",
             ArgKind::MappingOrPairs => "mapping or iterable of pairs",
             ArgKind::Hashable => "hashable",
-            ArgKind::SetIterable => "set, list or tuple",
             ArgKind::Iterable => "iterable",
         }
     }
@@ -351,7 +347,6 @@ impl ArgKind {
             // A mapping and a pair iterable are both accepted, so an
             // unresolved argument cannot be narrowed to either shape.
             ArgKind::MappingOrPairs => None,
-            ArgKind::SetIterable => Some(Type::Set),
             // Lists are the common `join` operand; keep the previous
             // narrowing so later list operations on the same unresolved
             // variable are still checked.
@@ -585,11 +580,54 @@ const SET_METHODS: &[(&str, MethodSig)] = &[
         "discard",
         MethodSig::new(1, 1, &[ArgKind::Hashable], Type::None),
     ),
+    ("pop", MethodSig::new(0, 0, &[], Type::Any)),
     ("clear", MethodSig::new(0, 0, &[], Type::None)),
     ("copy", MethodSig::new(0, 0, &[], Type::Set)),
+    // `update(*others)` takes any number of iterables (CPython's variadic
+    // signature); only the leading operand can be kind-checked here.
+    (
+        "update",
+        MethodSig::new(0, usize::MAX, &[ArgKind::Iterable], Type::None),
+    ),
     (
         "union",
-        MethodSig::new(1, 1, &[ArgKind::SetIterable], Type::Set),
+        MethodSig::new(0, usize::MAX, &[ArgKind::Iterable], Type::Set),
+    ),
+    (
+        "intersection",
+        MethodSig::new(0, usize::MAX, &[ArgKind::Iterable], Type::Set),
+    ),
+    (
+        "difference",
+        MethodSig::new(0, usize::MAX, &[ArgKind::Iterable], Type::Set),
+    ),
+    (
+        "symmetric_difference",
+        MethodSig::new(1, 1, &[ArgKind::Iterable], Type::Set),
+    ),
+    (
+        "intersection_update",
+        MethodSig::new(0, usize::MAX, &[ArgKind::Iterable], Type::None),
+    ),
+    (
+        "difference_update",
+        MethodSig::new(0, usize::MAX, &[ArgKind::Iterable], Type::None),
+    ),
+    (
+        "symmetric_difference_update",
+        MethodSig::new(1, 1, &[ArgKind::Iterable], Type::None),
+    ),
+    (
+        "issubset",
+        MethodSig::new(1, 1, &[ArgKind::Iterable], Type::Bool),
+    ),
+    (
+        "issuperset",
+        MethodSig::new(1, 1, &[ArgKind::Iterable], Type::Bool),
+    ),
+    (
+        "isdisjoint",
+        MethodSig::new(1, 1, &[ArgKind::Iterable], Type::Bool),
     ),
 ];
 
@@ -720,6 +758,7 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
                 || (a == Type::Bytes && b == Type::Bytes)
                 || (a == Type::Tuple && b == Type::Tuple)
                 || (a == Type::List && b == Type::List)
+                || (a == Type::Set && b == Type::Set)
             {
                 Some(Type::Bool)
             } else {
@@ -4575,6 +4614,7 @@ impl<'a> Checker<'a> {
                     || known == Type::Bytes
                     || known == Type::Tuple
                     || known == Type::List
+                    || known == Type::Set
             }
             BinOp::Add => {
                 known.is_numeric()

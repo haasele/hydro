@@ -443,7 +443,13 @@ built-in kinds), so the fallback never matches a user handler.
   structural equality and `repr` (`{1, 2}`, empty `set()`); unhashable
   elements → TypeError. `set(iterable)`/`frozenset(iterable)` consume any
   iterable through the iterator protocol (ranges, bytes, iterators,
-  generators).
+  generators). Set methods mirror CPython: `add`, `remove`, `discard`, `pop`,
+  `clear` and `copy`; variadic `update`, `union`, `intersection` and
+  `difference` with their `_update` forms; `symmetric_difference` and
+  `symmetric_difference_update` with exactly one operand; and
+  `issubset`/`issuperset`/`isdisjoint`. Every operand accepts any iterable,
+  and `<`/`<=`/`>`/`>=` compare by inclusion (proper and non-proper
+  subset).
 - `range(...)` is a value (`range` object, iteration/len/membership/repr,
   integer indexing with negative wrap and `IndexError` outside the range, and
   slicing that returns a range); `list()`/`dict()`/`sum()`/`enumerate()`/

@@ -3105,7 +3105,7 @@ mod tests {
             &[text("int")],
             &[("module".to_string(), text("mod"))],
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending(), "{}", pending_message());
         assert_eq!(
             value::instance_class_value(forward).and_then(value::class_display_name),
             Some("ForwardRef")
