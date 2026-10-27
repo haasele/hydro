@@ -16275,7 +16275,8 @@ impl<'a> Lowerer<'a> {
             }
         }
         // `super().__init__(...)` keeps the dedicated initializer helper: it
-        // binds keyword arguments against the base signature directly.
+        // forwards positional, starred, keyword and `**mapping` operands to the
+        // base signature through the runtime method binder.
         if let ast::Expr::Attribute(attribute) = &*call.func {
             if attribute.attr.as_str() == "__init__" {
                 if let ast::Expr::Call(super_call) = &*attribute.value {
@@ -16307,31 +16308,23 @@ impl<'a> Lowerer<'a> {
                                 line,
                                 col,
                             };
-                            let mut args = Vec::with_capacity(call.args.len());
-                            for arg in &call.args {
-                                args.push(self.expr(arg, fs));
-                            }
-                            let mut keywords = Vec::with_capacity(call.keywords.len());
-                            for keyword in &call.keywords {
-                                let Some(identifier) = &keyword.arg else {
-                                    self.error_at_code(
-                                        keyword.value.range(),
-                                        codes::UNSUPPORTED,
-                                        "super().__init__(**kwargs) is not supported",
-                                    );
-                                    continue;
-                                };
-                                keywords
-                                    .push((identifier.to_string(), self.expr(&keyword.value, fs)));
-                            }
+                            // The operand groups stay intact: the runtime
+                            // method ABI flattens a trailing `*star` and a
+                            // `**mapping` before `$super_init` binds the base
+                            // signature, exactly like `obj.method(...)`.
+                            let Some((args, star, keywords, double_star)) =
+                                self.call_operands(call, fs)
+                            else {
+                                return self.error_expr(call.range);
+                            };
                             return HExpr {
                                 kind: HExprKind::MethodCall {
                                     object: Box::new(receiver),
                                     method: "$super_init".to_string(),
                                     args,
-                                    star: None,
+                                    star: star.map(Box::new),
                                     keywords,
-                                    double_star: None,
+                                    double_star: double_star.map(Box::new),
                                 },
                                 ty: self.infer.fresh(),
                                 line,

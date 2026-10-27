@@ -13269,6 +13269,146 @@ class C(A, B):
 }
 
 #[test]
+fn super_init_accepts_a_trailing_star_and_keywords() {
+    let source = "\
+class Warnings:
+    def __init__(self, message, *args, since=(2, 0)):
+        self.message = message
+        self.args = args
+        self.since = since
+class DeprecatedWarning(Warnings):
+    def __init__(self, message, *args):
+        super().__init__(message, *args, since=(2, 0))
+";
+    let hir = lower_ok(source);
+    let init = function(&hir, "DeprecatedWarning.__init__");
+    let value = init
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Expr(value) => Some(value),
+            _ => None,
+        })
+        .expect("initializer call");
+    let HExprKind::MethodCall {
+        object,
+        method,
+        args,
+        star,
+        keywords,
+        double_star,
+    } = &value.kind
+    else {
+        panic!("expected a method call, got {:?}", value.kind);
+    };
+    assert!(matches!(&object.kind, HExprKind::Local(_)));
+    assert_eq!(method, "$super_init");
+    assert_eq!(args.len(), 1);
+    assert!(matches!(&args[0].kind, HExprKind::Local(_)));
+    assert!(matches!(
+        star.as_deref().map(|star| &star.kind),
+        Some(HExprKind::Local(_))
+    ));
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "since");
+    assert!(double_star.is_none());
+}
+
+#[test]
+fn super_init_accepts_a_double_star_mapping() {
+    let source = "\
+class Base:
+    def __init__(self, message, since=(2, 0)):
+        self.message = message
+        self.since = since
+class Derived(Base):
+    def __init__(self, message, **kwargs):
+        super().__init__(message, **kwargs)
+";
+    let hir = lower_ok(source);
+    let init = function(&hir, "Derived.__init__");
+    let value = init
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Expr(value) => Some(value),
+            _ => None,
+        })
+        .expect("initializer call");
+    let HExprKind::MethodCall {
+        args,
+        star,
+        keywords,
+        double_star,
+        method,
+        ..
+    } = &value.kind
+    else {
+        panic!("expected a method call, got {:?}", value.kind);
+    };
+    assert_eq!(method, "$super_init");
+    assert_eq!(args.len(), 1);
+    assert!(star.is_none());
+    assert!(keywords.is_empty());
+    assert!(matches!(
+        double_star.as_deref().map(|value| &value.kind),
+        Some(HExprKind::Local(_))
+    ));
+}
+
+#[test]
+fn super_init_rejects_unsupported_star_shapes() {
+    // Python allows several starred operands, but the runtime method ABI has a
+    // single star slot; the position is diagnosed instead of being dropped.
+    for (source, message) in [
+        (
+            "class Base:\n    def __init__(self, *args):\n        pass\nclass Derived(Base):\n    def __init__(self, a, b):\n        super().__init__(*a, b)\n",
+            "cannot follow a starred argument",
+        ),
+        (
+            "class Base:\n    def __init__(self, *args):\n        pass\nclass Derived(Base):\n    def __init__(self, a, b):\n        super().__init__(*a, *b)\n",
+            "only one starred argument",
+        ),
+    ] {
+        let (_, _, diags) = lower_source(source, &parse(source));
+        assert_eq!(diags.len(), 1, "{source}: {diags:?}");
+        assert!(
+            diags[0].message.contains(message),
+            "{source}: {}",
+            diags[0].message
+        );
+    }
+}
+
+#[test]
+fn method_calls_keep_star_and_double_star_operand_groups() {
+    let source = "\
+def f(obj, xs, kw):
+    return obj.m(1, *xs, **kw)
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let HStmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!("expected a return, got {:?}", f.body[0].kind);
+    };
+    let HExprKind::MethodCall {
+        args,
+        star,
+        keywords,
+        double_star,
+        ..
+    } = &value.kind
+    else {
+        panic!("expected a method call, got {:?}", value.kind);
+    };
+    assert_eq!(args.len(), 1);
+    assert!(star.is_some());
+    assert!(keywords.is_empty());
+    assert!(double_star.is_some());
+}
+
+#[test]
 fn decorated_functions_keep_name_access_and_indirect_calls() {
     let source = "\
 def deco(tag):

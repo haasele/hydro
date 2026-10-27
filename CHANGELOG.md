@@ -8,6 +8,17 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — 2026-10-27 `super().__init__` starred operands
+
+- `super().__init__(message, *args, since=...)` keeps the positional operands,
+  the single trailing `*star`, the named keywords and the optional `**mapping`
+  in the `$super_init` method call, so the runtime method binder flattens them
+  before the base initializer binds its signature. The shape used by
+  pydantic's `warnings.py` deprecation hierarchy no longer reports the generic
+  "starred expressions are not supported" diagnostic; two starred operands or
+  a positional operand after the star keep a precise call-site diagnostic
+  because the method ABI has a single star slot.
+
 ### Added — 2026-10-27 first-class module values
 
 - A module alias is an ordinary value: `import math`, `import helper` and

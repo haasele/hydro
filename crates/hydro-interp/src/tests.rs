@@ -1142,3 +1142,51 @@ assert built.extra == {'_typevar_types': 'X'}
 "#,
     );
 }
+
+#[test]
+fn super_init_and_method_calls_expand_starred_operands() {
+    run_source(
+        r#"
+class Warnings:
+    def __init__(self, message, *args, since=(2, 0), expected_removal=(3, 0)):
+        self.message = message
+        self.args = args
+        self.since = since
+        self.expected_removal = expected_removal
+
+class DeprecatedWarning(Warnings):
+    def __init__(self, message, *args, **kwargs):
+        super().__init__(message, *args, **kwargs)
+
+w = DeprecatedWarning('gone', 1, 2, since=(2, 1))
+assert w.message == 'gone'
+assert len(w.args) == 2
+assert w.args[0] == 1
+assert w.args[1] == 2
+assert w.since == (2, 1)
+assert w.expected_removal == (3, 0)
+
+# The same runtime binder expands `obj.m(*xs, **kw)`.
+class Collector:
+    def record(self, first, *rest, tag=None, **extra):
+        return (first, rest, tag, extra)
+
+c = Collector()
+xs = (1, 2, 3)
+kw = {'tag': 'x', 'extra': 9}
+result = c.record(*xs, **kw)
+assert result[0] == 1
+assert len(result[1]) == 2
+assert result[1][0] == 2
+assert result[1][1] == 3
+assert result[2] == 'x'
+assert result[3] == {'extra': 9}
+
+other = c.record(0, *xs[1:], tag='y')
+assert other[0] == 0
+assert len(other[1]) == 2
+assert other[2] == 'y'
+assert other[3] == {}
+"#,
+    );
+}
