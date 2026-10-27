@@ -156,6 +156,9 @@ pub struct SessionCompiler {
     /// Whether each loader unit writes its own namespace at runtime, indexed
     /// like `loader.units` (see [`UserModule::dynamic_globals`]).
     dynamic_units: Vec<bool>,
+    /// Compiled-extension paths each loader unit star-imports, indexed like
+    /// `loader.units` (see [`UserModule::extension_stars`]).
+    extension_star_units: Vec<Vec<String>>,
     /// Class constructors exported by earlier units, keyed by module and
     /// class name, so a later fragment can bind an imported class call.
     class_registry: HashMap<(String, String), (FunctionId, CallSignature)>,
@@ -203,6 +206,7 @@ impl SessionCompiler {
             loader: ModuleLoader::default(),
             exports: Vec::new(),
             dynamic_units: Vec::new(),
+            extension_star_units: Vec::new(),
             class_registry: HashMap::new(),
             function_registry: HashMap::new(),
             functions: Vec::new(),
@@ -291,6 +295,7 @@ impl SessionCompiler {
         let unit_count = self.loader.units.len();
         self.exports.resize(unit_count, HashMap::new());
         self.dynamic_units.resize(unit_count, false);
+        self.extension_star_units.resize(unit_count, Vec::new());
         let first_new_unit = self.lowered_units;
         let mut initializers: Vec<FunctionId> = Vec::new();
         let mut entry_main: Option<FunctionId> = None;
@@ -342,6 +347,7 @@ impl SessionCompiler {
                         exports: self.exports[dep_index].clone(),
                         all: lower::module_all_names(&dep.module.body),
                         dynamic_globals: self.dynamic_units[dep_index],
+                        extension_stars: self.extension_star_units[dep_index].clone(),
                     },
                 );
             }
@@ -353,6 +359,7 @@ impl SessionCompiler {
                         exports: HashMap::new(),
                         all: None,
                         dynamic_globals: false,
+                        extension_stars: Vec::new(),
                     });
             }
             lowerer.set_user_modules(user_modules);
@@ -367,6 +374,7 @@ impl SessionCompiler {
             let mut hir = lowerer.lower_module(&unit.module);
             let exported = lowerer.exported_names();
             let dynamic_globals = lowerer.exports_dynamic_globals();
+            let extension_stars = lowerer.exported_extension_stars();
             let exported_classes = lowerer.exported_class_signatures();
             let exported_functions = lowerer.exported_function_signatures();
             let lower_diags = std::mem::take(&mut lowerer.diags);
@@ -386,6 +394,7 @@ impl SessionCompiler {
             }
             self.exports[index] = exported;
             self.dynamic_units[index] = dynamic_globals;
+            self.extension_star_units[index] = extension_stars;
 
             if !is_entry {
                 // Same stable identity scheme as a whole-file check: imported
@@ -467,6 +476,7 @@ impl SessionCompiler {
         self.loader.namespaces.truncate(snapshot.namespaces);
         self.exports.truncate(snapshot.exports);
         self.dynamic_units.truncate(snapshot.exports);
+        self.extension_star_units.truncate(snapshot.exports);
         self.lowered_units = snapshot.lowered_units;
         self.functions.truncate(snapshot.functions);
         self.class_registry = snapshot.class_registry;

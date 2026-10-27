@@ -2048,6 +2048,10 @@ fn lower_modules(
     // Whether each unit installs names into its own namespace at runtime;
     // importers of such a module bind unknown members late.
     let mut dynamic_units: Vec<bool> = vec![false; units.len()];
+    // Compiled-extension paths each unit star-imports (directly or through a
+    // star-imported module); importers inherit them so unknown members bind to
+    // lazy extension reads.
+    let mut extension_star_units: Vec<Vec<String>> = vec![Vec::new(); units.len()];
     let mut initializers: Vec<FunctionId> = Vec::new();
     let mut entry_main = 0;
     let mut class_registry: HashMap<(String, String), (FunctionId, lower::CallSignature)> =
@@ -2095,6 +2099,7 @@ fn lower_modules(
                     exports: exports[dep_index].clone(),
                     all: effective_module_all(units, &exports, dep_index, &mut HashSet::new()),
                     dynamic_globals: dynamic_units[dep_index],
+                    extension_stars: extension_star_units[dep_index].clone(),
                 },
             );
         }
@@ -2108,6 +2113,7 @@ fn lower_modules(
                     exports: HashMap::new(),
                     all: None,
                     dynamic_globals: false,
+                    extension_stars: Vec::new(),
                 });
         }
         lowerer.set_user_modules(user_modules);
@@ -2126,6 +2132,7 @@ fn lower_modules(
         let mut hir = lowerer.lower_module(&unit.module);
         let exported = lowerer.exported_names();
         let dynamic_globals = lowerer.exports_dynamic_globals();
+        let extension_stars = lowerer.exported_extension_stars();
         let exported_classes = lowerer.exported_class_signatures();
         let exported_functions = lowerer.exported_function_signatures();
         let lower_diags = std::mem::take(&mut lowerer.diags);
@@ -2144,6 +2151,7 @@ fn lower_modules(
 
         exports[index] = exported;
         dynamic_units[index] = dynamic_globals;
+        extension_star_units[index] = extension_stars;
         if index != entry_index {
             // Imported units keep one identity per unit: the module body and
             // every nested function are namespaced by the dotted module name,
@@ -2622,6 +2630,67 @@ mod tests {
                 .iter()
                 .all(|function| !function.name.contains("absent")),
             "a deferred branch module must not be compiled"
+        );
+    }
+
+    #[test]
+    fn star_import_propagates_dynamic_namespace_metadata_between_units() {
+        // `dynamicmod` appends nothing to its literal `__all__` but installs
+        // names with `globals()[...] = ...`. `middle` star-imports it and
+        // `consumer` star-imports `middle`, so the dynamic metadata must
+        // propagate across both hops; `consumer` then lowers an unresolved
+        // star-imported name to a read of its own global table instead of a
+        // compile error.
+        let dir = TestDir::new("dynamic-star-metadata");
+        dir.write(
+            "dynamicmod.py",
+            "namespace = globals()\nnamespace['INJECTED'] = 1\n__all__ = []\n",
+        );
+        dir.write("middle.py", "from dynamicmod import *\n");
+        dir.write(
+            "consumer.py",
+            "from middle import *\n\ndef read():\n    return INJECTED\n",
+        );
+        let main = dir.write("main.py", "import consumer\nprint(consumer.read())\n");
+        let program = program(&main);
+
+        use hydro_ir::ExprKind;
+        let read = function_id(&program, "consumer.read");
+        assert!(
+            matches!(
+                &returned_expression(&program, read).kind,
+                ExprKind::GlobalGet { module, name }
+                    if module == "consumer" && name == "INJECTED"
+            ),
+            "expected the importer's dynamic global read, got {:?}",
+            returned_expression(&program, read).kind
+        );
+    }
+
+    #[test]
+    fn star_imported_extension_metadata_reaches_importers_between_units() {
+        // `umath.py` is `from ._multiarray_umath import *`; the extension
+        // path is not in its static export table. `numeric.py` imports a
+        // missing umath member directly and star-imports umath; `main.py`
+        // then imports `NAN` from numeric, which numeric only has through the
+        // inherited extension star. Every hop requires the lowerer metadata to
+        // travel through the loader-sized UserModule table (a missing fallback
+        // is a compile diagnostic).
+        let dir = TestDir::new("extension-star-metadata");
+        dir.add_extension("_multiarray_umath.abi3.so");
+        dir.write("umath.py", "from _multiarray_umath import *\n");
+        dir.write(
+            "numeric.py",
+            "from umath import PINF\nfrom umath import *\nvalue = NAN\n",
+        );
+        let main = dir.write("main.py", "from numeric import NAN\nprint(NAN)\n");
+        let program = program(&main);
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name == "numeric.<module>"),
+            "numeric must compile against the propagated extension namespace"
         );
     }
 

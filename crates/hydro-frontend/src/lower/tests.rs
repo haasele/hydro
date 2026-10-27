@@ -381,6 +381,7 @@ fn module_level_try_import_binds_a_preloaded_submodule() {
             exports: HashMap::from([("value".to_string(), UserExport::Function(9))]),
             all: None,
             dynamic_globals: false,
+            extension_stars: Vec::new(),
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -446,6 +447,7 @@ fn module_level_conditional_imports_bind_top_level_and_defer_absent_modules() {
             exports: HashMap::from([("value".to_string(), UserExport::Function(9))]),
             all: None,
             dynamic_globals: false,
+            extension_stars: Vec::new(),
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -549,6 +551,7 @@ fn user_module(name: &str, exports: &[(&str, UserExport)]) -> UserModule {
             .collect(),
         all: None,
         dynamic_globals: false,
+        extension_stars: Vec::new(),
     }
 }
 
@@ -558,6 +561,20 @@ fn user_module(name: &str, exports: &[(&str, UserExport)]) -> UserModule {
 fn dynamic_user_module(name: &str, exports: &[(&str, UserExport)]) -> UserModule {
     UserModule {
         dynamic_globals: true,
+        ..user_module(name, exports)
+    }
+}
+
+/// Like [`user_module`], for a module that star-imported the compiled
+/// extension at `path` (directly or through another star import), so its
+/// static export table cannot enumerate the extension namespace.
+fn extension_star_user_module(
+    name: &str,
+    exports: &[(&str, UserExport)],
+    path: &str,
+) -> UserModule {
+    UserModule {
+        extension_stars: vec![path.to_string()],
         ..user_module(name, exports)
     }
 }
@@ -838,6 +855,7 @@ fn user_star_import_exports_public_names_only() {
             ]),
             all: None,
             dynamic_globals: false,
+            extension_stars: Vec::new(),
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -865,6 +883,7 @@ fn user_star_import_exports_public_names_only() {
             exports: HashMap::from([("_private".to_string(), UserExport::Global)]),
             all: None,
             dynamic_globals: false,
+            extension_stars: Vec::new(),
         },
     )]));
     let _ = lowerer.lower_module(&parse(source));
@@ -893,6 +912,7 @@ fn user_star_import_honors_a_literal_all() {
             ]),
             all: Some(vec!["keep".to_string()]),
             dynamic_globals: false,
+            extension_stars: Vec::new(),
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -919,6 +939,7 @@ fn user_star_import_honors_a_literal_all() {
             ]),
             all: Some(vec!["keep".to_string()]),
             dynamic_globals: false,
+            extension_stars: Vec::new(),
         },
     )]));
     let _ = lowerer.lower_module(&parse(source));
@@ -928,6 +949,226 @@ fn user_star_import_honors_a_literal_all() {
         diags
             .iter()
             .any(|diag| diag.code == codes::NAME && diag.message.contains("'drop'")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn missing_member_of_an_extension_star_module_binds_the_extension() {
+    // `numeric.py` does `from .umath import NAN, PINF`; `umath` itself is
+    // `from ._multiarray_umath import *`. Those names are not in umath's
+    // static export table, so each member must become a lazy read of the
+    // extension namespace instead of a "does not export" error.
+    let path = "/tmp/_multiarray_umath.abi3.so";
+    let source = "from umath import NAN, PINF\nx = NAN\ny = PINF\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "numeric.py", &mut infer);
+    lowerer.set_dunder_name("numeric");
+    lowerer.set_user_modules(HashMap::from([(
+        "umath".to_string(),
+        extension_star_user_module("umath", &[], path),
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    assert!(lowerer.exported_extension_stars().is_empty());
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    for (binding, member) in [("x", "NAN"), ("y", "PINF")] {
+        match &assigned(&hir, binding).kind {
+            HExprKind::ExtensionAttr {
+                path: got_path,
+                member: got_member,
+            } => assert_eq!((got_path.as_str(), got_member.as_str()), (path, member)),
+            other => panic!("expected extension attribute '{member}', got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn star_import_propagates_extension_stars_through_multiple_modules() {
+    // `umath` re-exports the `_multiarray_umath` namespace and `numeric`
+    // star-imports umath. The extension path must survive that second star
+    // import, so unresolved names in `numeric` still bind to the extension.
+    // Statically known exports of umath keep their direct binding.
+    let path = "/tmp/_multiarray_umath.abi3.so";
+    let source = "from umath import *\ns = sin\nx = NAN\ny = invert\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "numeric.py", &mut infer);
+    lowerer.set_dunder_name("numeric");
+    lowerer.set_user_modules(HashMap::from([(
+        "umath".to_string(),
+        extension_star_user_module("umath", &[("sin", UserExport::Function(4))], path),
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let stars = lowerer.exported_extension_stars();
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(stars, vec![path.to_string()]);
+    assert!(matches!(
+        &assigned(&hir, "s").kind,
+        HExprKind::FunctionRef(4)
+    ));
+    for (binding, member) in [("x", "NAN"), ("y", "invert")] {
+        match &assigned(&hir, binding).kind {
+            HExprKind::ExtensionAttr {
+                path: got_path,
+                member: got_member,
+            } => assert_eq!((got_path.as_str(), got_member.as_str()), (path, member)),
+            other => panic!("expected extension attribute '{member}', got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn star_import_propagates_dynamic_globals() {
+    // `numerictypes` installs type aliases through `globals()[key] = ...`,
+    // so its export table is incomplete. `numeric` star-imports it and must
+    // inherit the dynamic flag: an unresolved name becomes a runtime read of
+    // numeric's own global table.
+    let source = "from numerictypes import *\nx = GENERIC_TYPE\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "numeric.py", &mut infer);
+    lowerer.set_dunder_name("numeric");
+    lowerer.set_user_modules(HashMap::from([(
+        "numerictypes".to_string(),
+        dynamic_user_module("numerictypes", &[]),
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let dynamic = lowerer.exports_dynamic_globals();
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(dynamic, "the importer inherits the dynamic namespace");
+    assert!(
+        matches!(
+            &assigned(&hir, "x").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "numeric" && name == "GENERIC_TYPE"
+        ),
+        "expected a dynamic global read, got {:?}",
+        assigned(&hir, "x").kind
+    );
+}
+
+#[test]
+fn missing_member_of_a_dynamic_module_reads_its_global_table() {
+    // A direct import names the source module, so the fallback reads that
+    // module's global table rather than the importer's.
+    let source = "from numerictypes import generic\nx = generic\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "numeric.py", &mut infer);
+    lowerer.set_dunder_name("numeric");
+    lowerer.set_user_modules(HashMap::from([(
+        "numerictypes".to_string(),
+        dynamic_user_module("numerictypes", &[]),
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            &assigned(&hir, "x").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "numerictypes" && name == "generic"
+        ),
+        "expected the source module's dynamic global read, got {:?}",
+        assigned(&hir, "x").kind
+    );
+}
+
+#[test]
+fn star_import_all_filtering_survives_dynamic_propagation() {
+    // A literal `__all__` still selects the statically bound names. A name
+    // outside it is not copied by the star import; with a dynamic source the
+    // importer falls back to its own global table instead of linking it.
+    let source = "from numerictypes import *\nx = keep\ny = dropped\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "numeric.py", &mut infer);
+    lowerer.set_dunder_name("numeric");
+    lowerer.set_user_modules(HashMap::from([(
+        "numerictypes".to_string(),
+        UserModule {
+            all: Some(vec!["keep".to_string()]),
+            ..dynamic_user_module(
+                "numerictypes",
+                &[
+                    ("keep", UserExport::Function(2)),
+                    ("dropped", UserExport::Function(3)),
+                ],
+            )
+        },
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "x").kind,
+        HExprKind::FunctionRef(2)
+    ));
+    assert!(
+        matches!(
+            &assigned(&hir, "y").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "numeric" && name == "dropped"
+        ),
+        "a name filtered out of `__all__` must not link, got {:?}",
+        assigned(&hir, "y").kind
+    );
+}
+
+#[test]
+fn propagated_dynamic_globals_do_not_shadow_explicit_definitions() {
+    // The dynamic fallback only applies to names with no static binding:
+    // a module-level definition and a parameter still resolve locally.
+    let source = "from numerictypes import *\ngeneric = 3\nx = generic\n\ndef use(generic):\n    return generic\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "numeric.py", &mut infer);
+    lowerer.set_dunder_name("numeric");
+    lowerer.set_user_modules(HashMap::from([(
+        "numerictypes".to_string(),
+        dynamic_user_module("numerictypes", &[]),
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(&assigned(&hir, "x").kind, HExprKind::Local(_)),
+        "the module-level definition must win, got {:?}",
+        assigned(&hir, "x").kind
+    );
+    let body = function_body(&hir, "use");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return, got {:?}", body[0].kind);
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::Local(_)),
+        "the parameter must win, got {:?}",
+        value.kind
+    );
+}
+
+#[test]
+fn star_import_of_an_ordinary_module_keeps_unknown_name_errors() {
+    // Without extension stars or dynamic globals neither fallback applies:
+    // a name the source never exports is still a compile error.
+    let source = "from helper import *\nx = add(1, 2)\ny = missing\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "main.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "helper".to_string(),
+        user_module("helper", &[("add", UserExport::Function(1))]),
+    )]));
+    let _hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(
+        diags
+            .iter()
+            .any(|diag| diag.code == codes::NAME && diag.message.contains("'missing'")),
         "{diags:?}"
     );
 }
@@ -1080,6 +1321,7 @@ fn user_star_import_is_mirrored_into_module_globals() {
             ]),
             all: None,
             dynamic_globals: false,
+            extension_stars: Vec::new(),
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -8434,6 +8676,7 @@ fn module_alias_lowers_to_a_first_class_module_value() {
             exports: HashMap::new(),
             all: None,
             dynamic_globals: false,
+            extension_stars: Vec::new(),
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -8461,6 +8704,7 @@ fn lowerer_with_user_module<'a>(
             exports,
             all: None,
             dynamic_globals: false,
+            extension_stars: Vec::new(),
         },
     )]));
     lowerer

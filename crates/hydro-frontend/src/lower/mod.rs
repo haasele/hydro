@@ -1428,6 +1428,13 @@ pub struct UserModule {
     /// instead of a compile-time "does not export" error. Modules that never
     /// touch their namespace keep the static diagnostics.
     pub dynamic_globals: bool,
+    /// Compiled-extension paths whose namespaces this unit star-imported,
+    /// directly or through another module's `from <module> import *`. The
+    /// extension's namespace cannot be enumerated at compile time, so a name
+    /// that is missing from [`Self::exports`] may still exist there: an
+    /// importer binds it to a lazy extension member read instead of reporting
+    /// a missing export.
+    pub extension_stars: Vec<String>,
 }
 
 /// Returns the literal `__all__` of a module body, if there is one.
@@ -1966,6 +1973,13 @@ impl<'a> Lowerer<'a> {
     /// [`UserModule::dynamic_globals`].
     pub fn exports_dynamic_globals(&self) -> bool {
         self.dynamic_module_globals
+    }
+
+    /// Compiled-extension paths this unit star-imported, directly or through
+    /// another module's star import. Importers use them to resolve members
+    /// that are absent from [`Self::exported_names`] as lazy extension reads.
+    pub fn exported_extension_stars(&self) -> Vec<String> {
+        self.extension_stars.clone()
     }
 
     /// Names this unit exports to importers: top-level functions plus every
@@ -3635,6 +3649,18 @@ impl<'a> Lowerer<'a> {
                         .and_then(|module| module.exports.get(member))
                         .copied()
                 };
+                // A module that star-imported a compiled extension exposes
+                // names its static export table cannot enumerate. A missing
+                // member is therefore a lazy extension read, not an error.
+                // The first star path wins, matching the module-level
+                // fallback for unresolved names in the extension-star unit.
+                let source_extension = if self_package {
+                    self.extension_stars.first().cloned()
+                } else {
+                    base.as_ref()
+                        .and_then(|module| module.extension_stars.first())
+                        .cloned()
+                };
                 match export {
                     Some(UserExport::Function(id)) => {
                         self.imported_user_functions.insert(binding.to_string(), id);
@@ -3644,6 +3670,11 @@ impl<'a> Lowerer<'a> {
                             binding.to_string(),
                             (imported.to_string(), member.to_string()),
                         );
+                    }
+                    None if source_extension.is_some() => {
+                        let path = source_extension.clone().expect("checked by the guard");
+                        self.imported_extension_members
+                            .insert(binding.to_string(), (path, member.to_string()));
                     }
                     // The package itself installs names at runtime
                     // (`globals()[...] = ...`), so a `from . import name`
@@ -3969,6 +4000,21 @@ impl<'a> Lowerer<'a> {
                 // Filtered by the `__all__` check above; anonymous
                 // (`__all__` absent) names are all exports.
                 None => {}
+            }
+        }
+        // A star import copies the source module's runtime namespace. Names
+        // the source installs dynamically, or attributes of an extension it
+        // star-imported, are invisible to the static export table but become
+        // names of this unit too. Record both so an unresolved name here
+        // lowers to a runtime global read or a lazy extension member read
+        // instead of a compile error. Explicit local bindings are resolved
+        // before either fallback, so they still win.
+        if module.dynamic_globals {
+            self.dynamic_module_globals = true;
+        }
+        for path in &module.extension_stars {
+            if !self.extension_stars.iter().any(|existing| existing == path) {
+                self.extension_stars.push(path.clone());
             }
         }
     }
