@@ -8,6 +8,19 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 PEP 562 module `__getattr__`/`__dir__`
+
+- A compiled user module that defines module-level `__getattr__` now resolves
+  missing attributes dynamically: `from module import name` for a name absent
+  from the static export table binds a runtime module-attribute read, and the
+  runtime module value checks the module globals first and then calls
+  `__getattr__(name)`. A hook that raises `AttributeError` propagates it, and
+  `dir(module)` calls a module-level `__dir__` and sorts its result. Pydantic's
+  `_dynamic_imports` map behind `__getattr__` can now provide `BaseModel` and
+  the rest of its dynamic surface. `from module import *` still copies only
+  `__all__`/statically known names, and nested relative imports inside
+  `__getattr__` keep working through the usual loader preloading rule.
+
 ### Added — 2026-10-27 module `__spec__` metadata
 
 - Every compiled unit publishes CPython's module metadata: `__spec__` is a real

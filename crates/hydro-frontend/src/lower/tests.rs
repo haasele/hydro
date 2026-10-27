@@ -385,6 +385,7 @@ fn module_level_try_import_binds_a_preloaded_submodule() {
             all: None,
             dynamic_globals: false,
             extension_stars: Vec::new(),
+            module_getattr: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -451,6 +452,7 @@ fn module_level_conditional_imports_bind_top_level_and_defer_absent_modules() {
             all: None,
             dynamic_globals: false,
             extension_stars: Vec::new(),
+            module_getattr: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -555,6 +557,7 @@ fn user_module(name: &str, exports: &[(&str, UserExport)]) -> UserModule {
         all: None,
         dynamic_globals: false,
         extension_stars: Vec::new(),
+        module_getattr: false,
     }
 }
 
@@ -564,6 +567,15 @@ fn user_module(name: &str, exports: &[(&str, UserExport)]) -> UserModule {
 fn dynamic_user_module(name: &str, exports: &[(&str, UserExport)]) -> UserModule {
     UserModule {
         dynamic_globals: true,
+        ..user_module(name, exports)
+    }
+}
+
+/// Like [`user_module`], for a module that defines PEP 562 `__getattr__`, so
+/// a missing member may resolve at runtime.
+fn getattr_user_module(name: &str, exports: &[(&str, UserExport)]) -> UserModule {
+    UserModule {
+        module_getattr: true,
         ..user_module(name, exports)
     }
 }
@@ -859,6 +871,7 @@ fn user_star_import_exports_public_names_only() {
             all: None,
             dynamic_globals: false,
             extension_stars: Vec::new(),
+            module_getattr: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -887,6 +900,7 @@ fn user_star_import_exports_public_names_only() {
             all: None,
             dynamic_globals: false,
             extension_stars: Vec::new(),
+            module_getattr: false,
         },
     )]));
     let _ = lowerer.lower_module(&parse(source));
@@ -916,6 +930,7 @@ fn user_star_import_honors_a_literal_all() {
             all: Some(vec!["keep".to_string()]),
             dynamic_globals: false,
             extension_stars: Vec::new(),
+            module_getattr: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -943,6 +958,7 @@ fn user_star_import_honors_a_literal_all() {
             all: Some(vec!["keep".to_string()]),
             dynamic_globals: false,
             extension_stars: Vec::new(),
+            module_getattr: false,
         },
     )]));
     let _ = lowerer.lower_module(&parse(source));
@@ -952,6 +968,116 @@ fn user_star_import_honors_a_literal_all() {
         diags
             .iter()
             .any(|diag| diag.code == codes::NAME && diag.message.contains("'drop'")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn pep562_module_getattr_is_detected_as_unit_metadata() {
+    let source = "\
+def __getattr__(name):
+    raise AttributeError(name)\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    let _ = lowerer.lower_module(&parse(source));
+    assert!(lowerer.exports_module_getattr());
+
+    let without_getattr = "\
+def __dir__():
+    return ['dynamic']\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(without_getattr, "test.py", &mut infer);
+    let _ = lowerer.lower_module(&parse(without_getattr));
+    assert!(!lowerer.exports_module_getattr());
+}
+
+#[test]
+fn pep562_getattr_module_binds_a_missing_import_to_a_module_attribute() {
+    // Pydantic exposes `BaseModel` through a `_dynamic_imports` map behind
+    // module `__getattr__`; the static export table cannot see it.
+    let source = "from dynamic import BaseModel\nvalue = BaseModel\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "dynamic".to_string(),
+        getattr_user_module("dynamic", &[]),
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "value").kind,
+        HExprKind::ModuleAttr { module, name }
+            if module == "dynamic" && name == "BaseModel"
+    ));
+}
+
+#[test]
+fn pep562_getattr_module_call_reads_the_attribute_at_call_time() {
+    let source = "from dynamic import model_factory\nvalue = model_factory(1)\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "dynamic".to_string(),
+        getattr_user_module("dynamic", &[]),
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    let value = assigned(&hir, "value");
+    let HExprKind::CallKw { callee, .. } = &value.kind else {
+        panic!("expected a runtime call, got {value:?}");
+    };
+    assert!(matches!(
+        &callee.kind,
+        HExprKind::ModuleAttr { module, name }
+            if module == "dynamic" && name == "model_factory"
+    ));
+}
+
+#[test]
+fn pep562_getattr_module_attribute_read_uses_the_module_value() {
+    // `dynamic.BaseModel` is a plain attribute read of a module value; a
+    // missing static export goes through the runtime namespace (and then
+    // `__getattr__`) without needing an importer-side flag.
+    let source = "import dynamic\nvalue = dynamic.BaseModel\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "dynamic".to_string(),
+        user_module("dynamic", &[]),
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "value").kind,
+        HExprKind::ModuleAttr { module, name }
+            if module == "dynamic" && name == "BaseModel"
+    ));
+}
+
+#[test]
+fn pep562_star_import_still_binds_only_static_names() {
+    // A star import copies the static namespace/`__all__`; names that only
+    // `__getattr__` can provide are not invented as local bindings.
+    let source = "from dynamic import *\nvalue = BaseModel\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "dynamic".to_string(),
+        getattr_user_module("dynamic", &[]),
+    )]));
+    let _ = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(
+        diags
+            .iter()
+            .any(|diag| diag.code == codes::NAME && diag.message.contains("'BaseModel'")),
         "{diags:?}"
     );
 }
@@ -1325,6 +1451,7 @@ fn user_star_import_is_mirrored_into_module_globals() {
             all: None,
             dynamic_globals: false,
             extension_stars: Vec::new(),
+            module_getattr: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -9215,6 +9342,7 @@ fn module_alias_lowers_to_a_first_class_module_value() {
             all: None,
             dynamic_globals: false,
             extension_stars: Vec::new(),
+            module_getattr: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -9451,6 +9579,7 @@ fn lowerer_with_user_module<'a>(
             all: None,
             dynamic_globals: false,
             extension_stars: Vec::new(),
+            module_getattr: false,
         },
     )]));
     lowerer

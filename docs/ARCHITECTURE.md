@@ -710,9 +710,16 @@ third argument.
   `from . import name` inside a dynamic package `__init__.py` alike. Modules
   that never touch their namespace keep the compile-time "does not export"
   diagnostic. Module-level bindings are also mirrored into the runtime global
-  table, so importers read them regardless of lowering order. All units end
-  up in one `Program`; JIT and AOT execute the same code (AOT embeds the
-  modules into the binary).
+  table, so importers read them regardless of lowering order. A module-level
+  PEP 562 `__getattr__` is recorded in the unit's `UserModule` metadata: a
+  `from module import name` that the static export table does not list binds a
+  runtime module-attribute read instead of the "does not export" diagnostic,
+  and the runtime module value checks the global table first and then calls
+  `__getattr__(name)` (an `AttributeError` from the hook propagates). A
+  module-level `__dir__` makes `dir(module)` call it and sort the returned
+  names; `from module import *` still copies only `__all__`/static names. All
+  units end up in one `Program`; JIT and AOT execute the same code (AOT embeds
+  the modules into the binary).
 - `__name__` is a module body local and is injected only if the unit
   reads it: `"__main__"` for the entry file, otherwise the module name. An
   imported unit always stores it, which is what registers the module in the

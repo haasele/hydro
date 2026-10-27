@@ -1561,6 +1561,11 @@ pub struct UserModule {
     /// importer binds it to a lazy extension member read instead of reporting
     /// a missing export.
     pub extension_stars: Vec<String>,
+    /// The unit defines a module-level PEP 562 `__getattr__`, so an attribute
+    /// that is missing from [`Self::exports`] (and from the runtime global
+    /// table) is resolved by calling it. An importer binds such a name to a
+    /// runtime module-attribute read instead of reporting a missing export.
+    pub module_getattr: bool,
 }
 
 /// Returns the literal `__all__` of a module body, if there is one.
@@ -1697,6 +1702,11 @@ pub struct Lowerer<'a> {
     /// `from X import value [as g]` bindings of user module globals (classes
     /// and constants): name -> (module full name, exported name).
     imported_user_globals: HashMap<String, (String, String)>,
+    /// Bindings in [`Self::imported_user_globals`] that were resolved through
+    /// the source module's PEP 562 `__getattr__`. Reading one emits a
+    /// module-attribute fetch (which consults the runtime global table and
+    /// then calls `__getattr__`) instead of a global-table read.
+    imported_user_getattrs: HashSet<String>,
     /// `from . import name` bindings inside a package `__init__.py` that refer
     /// to this unit's own functions; resolved after signatures are registered.
     pending_self_imports: Vec<(String, String, TextRange)>,
@@ -1772,6 +1782,10 @@ pub struct Lowerer<'a> {
     /// [`Self::global_names`] but tracked separately so a session-global read
     /// can be distinguished from a name this fragment binds itself.
     session_globals: HashSet<String>,
+    /// The unit defines a module-level PEP 562 `__getattr__`; importers may
+    /// resolve missing attributes through it. Set while lowering from
+    /// [`Self::module_def_names`].
+    module_getattr: bool,
     /// The module body manipulates its namespace through `globals()`/`vars()`
     /// (directly or through an alias), so names it installs are invisible to
     /// the static binding scan. An otherwise unresolved module-level read then
@@ -1903,6 +1917,7 @@ impl<'a> Lowerer<'a> {
             user_modules: HashMap::new(),
             imported_user_functions: HashMap::new(),
             imported_user_globals: HashMap::new(),
+            imported_user_getattrs: HashSet::new(),
             pending_self_imports: Vec::new(),
             pending_self_stars: Vec::new(),
             module_all: None,
@@ -1922,6 +1937,7 @@ impl<'a> Lowerer<'a> {
             mirror_all_globals: false,
             session_mode: false,
             session_globals: HashSet::new(),
+            module_getattr: false,
             dynamic_module_globals: false,
             imported_functions: HashMap::new(),
             imported_constants: HashMap::new(),
@@ -2101,6 +2117,11 @@ impl<'a> Lowerer<'a> {
         self.dynamic_module_globals
     }
 
+    /// Whether the unit defines a module-level PEP 562 `__getattr__`.
+    pub fn exports_module_getattr(&self) -> bool {
+        self.module_getattr
+    }
+
     /// Compiled-extension paths this unit star-imported, directly or through
     /// another module's star import. Importers use them to resolve members
     /// that are absent from [`Self::exported_names`] as lazy extension reads.
@@ -2177,7 +2198,15 @@ impl<'a> Lowerer<'a> {
         self.module_all = module_all_names(&module.body);
         self.module_def_names.clear();
         collect_module_def_names(&module.body, &mut self.module_def_names);
-        collect_global_names(&module.body, &mut self.global_names);
+        let mut module_globals = HashSet::new();
+        collect_global_names(&module.body, &mut module_globals);
+        // PEP 562 hooks are ordinary module-level bindings: a `def` or an
+        // assignment of a callable. Record them before imports are collected
+        // so `from . import name` inside a package that defines `__getattr__`
+        // binds the missing name to a runtime module-attribute read.
+        self.module_getattr =
+            self.module_def_names.contains("__getattr__") || module_globals.contains("__getattr__");
+        self.global_names.extend(module_globals);
         // Functions may read module globals, so those names must be mirrored
         // even when the assignment is lowered before the function body. Scan
         // the function and method bodies up front; this also keeps the entry
@@ -3717,7 +3746,58 @@ impl<'a> Lowerer<'a> {
             return !self.top_level_imports.contains(binding);
         }
         self.top_level_imports.insert(binding.to_string());
+        // A module-level import can also install the PEP 562 `__getattr__` hook.
+        if binding == "__getattr__" {
+            self.module_getattr = true;
+        }
         true
+    }
+
+    /// Binds `from <module> import <member>` to a runtime read of the source
+    /// module's global table.
+    fn bind_user_global(&mut self, binding: &str, module: &str, member: &str) {
+        self.imported_user_globals.insert(
+            binding.to_string(),
+            (module.to_string(), member.to_string()),
+        );
+        self.imported_user_getattrs.remove(binding);
+    }
+
+    /// Binds `from <module> import <member>` to a runtime module-attribute
+    /// fetch, so a missing global falls back to the module's PEP 562
+    /// `__getattr__`.
+    fn bind_user_getattr(&mut self, binding: &str, module: &str, member: &str) {
+        self.imported_user_globals.insert(
+            binding.to_string(),
+            (module.to_string(), member.to_string()),
+        );
+        self.imported_user_getattrs.insert(binding.to_string());
+    }
+
+    /// The value of a name bound by `from <module> import <name>`.
+    ///
+    /// A binding resolved through the source module's PEP 562 `__getattr__`
+    /// reads the attribute from the module at use time; every other user
+    /// global binding is a plain read of the source module's global table.
+    fn imported_user_global_expr(&self, name: &str, line: u32, col: u32) -> Option<HExpr> {
+        let (module, exported) = self.imported_user_globals.get(name)?;
+        let kind = if self.imported_user_getattrs.contains(name) {
+            HExprKind::ModuleAttr {
+                module: module.clone(),
+                name: exported.clone(),
+            }
+        } else {
+            HExprKind::GlobalGet {
+                module: module.clone(),
+                name: exported.clone(),
+            }
+        };
+        Some(HExpr {
+            kind,
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        })
     }
 
     /// Records a name bound by a nested import that could not be linked.
@@ -3911,6 +3991,9 @@ impl<'a> Lowerer<'a> {
                 if !self.claim_import_binding(binding, nested) {
                     continue;
                 }
+                // A later binding of the same name replaces an earlier one,
+                // including an earlier `__getattr__` resolution.
+                self.imported_user_getattrs.remove(binding);
                 // `from pkg import sub` binds the submodule itself.
                 let submodule = format!("{imported}.{member}");
                 if self.user_modules.contains_key(&submodule) {
@@ -3980,15 +4063,24 @@ impl<'a> Lowerer<'a> {
                         self.imported_user_functions.insert(binding.to_string(), id);
                     }
                     Some(UserExport::Global) => {
-                        self.imported_user_globals.insert(
-                            binding.to_string(),
-                            (imported.to_string(), member.to_string()),
-                        );
+                        self.bind_user_global(binding, imported, member);
                     }
                     None if source_extension.is_some() => {
                         let path = source_extension.clone().expect("checked by the guard");
                         self.imported_extension_members
                             .insert(binding.to_string(), (path, member.to_string()));
+                    }
+                    // The module defines PEP 562 `__getattr__`: a member its
+                    // static export table does not list may still resolve at
+                    // runtime. Bind a module-attribute read, which consults
+                    // the runtime global table first and then calls
+                    // `__getattr__` (raising `AttributeError` when that does
+                    // not provide the name).
+                    None if self_package && self.module_getattr => {
+                        self.bind_user_getattr(binding, imported, member);
+                    }
+                    None if base.as_ref().is_some_and(|module| module.module_getattr) => {
+                        self.bind_user_getattr(binding, imported, member);
                     }
                     // The package itself installs names at runtime
                     // (`globals()[...] = ...`), so a `from . import name`
@@ -3997,10 +4089,7 @@ impl<'a> Lowerer<'a> {
                     // when the code runs. A missing value raises at runtime,
                     // exactly like CPython.
                     None if self_package && self.dynamic_module_globals => {
-                        self.imported_user_globals.insert(
-                            binding.to_string(),
-                            (imported.to_string(), member.to_string()),
-                        );
+                        self.bind_user_global(binding, imported, member);
                     }
                     // Same rule for a linked dependency that writes its
                     // namespace at runtime: the static export table is
@@ -4008,10 +4097,7 @@ impl<'a> Lowerer<'a> {
                     // global table. Ordinary modules keep the compile-time
                     // "does not export" diagnostic below.
                     None if base.as_ref().is_some_and(|module| module.dynamic_globals) => {
-                        self.imported_user_globals.insert(
-                            binding.to_string(),
-                            (imported.to_string(), member.to_string()),
-                        );
+                        self.bind_user_global(binding, imported, member);
                     }
                     None if self_package && !nested => {
                         // `from . import missing` inside a module-level
@@ -4042,10 +4128,7 @@ impl<'a> Lowerer<'a> {
                         && (self.is_initializing_ancestor(imported)
                             || self.late_modules.contains(imported)) =>
                     {
-                        self.imported_user_globals.insert(
-                            binding.to_string(),
-                            (imported.to_string(), member.to_string()),
-                        );
+                        self.bind_user_global(binding, imported, member);
                     }
                     None => self.error_at_code(
                         alias.range,
@@ -4083,6 +4166,7 @@ impl<'a> Lowerer<'a> {
                 if !self.claim_import_binding(binding, nested) {
                     continue;
                 }
+                self.imported_user_getattrs.remove(binding);
                 let submodule = format!("{imported}.{member}");
                 if self.user_modules.contains_key(&submodule) {
                     self.user_module_aliases
@@ -4119,10 +4203,7 @@ impl<'a> Lowerer<'a> {
                         }
                     }
                     ExtensionLookup::Missing => {
-                        self.imported_user_globals.insert(
-                            binding.to_string(),
-                            (imported.to_string(), member.to_string()),
-                        );
+                        self.bind_user_global(binding, imported, member);
                     }
                 }
             }
@@ -4285,6 +4366,7 @@ impl<'a> Lowerer<'a> {
             if !self.claim_import_binding(&name, nested) {
                 continue;
             }
+            self.imported_user_getattrs.remove(&name);
             let submodule = format!("{module_name}.{name}");
             if self.user_modules.contains_key(&submodule) {
                 self.user_module_aliases
@@ -4307,8 +4389,7 @@ impl<'a> Lowerer<'a> {
                         .push(StarBinding::UserFunction { name, function: id });
                 }
                 Some(UserExport::Global) => {
-                    self.imported_user_globals
-                        .insert(name.clone(), (module_name.to_string(), name.clone()));
+                    self.bind_user_global(&name, module_name, &name);
                     self.star_bindings.entry(statement).or_default().push(
                         StarBinding::UserGlobal {
                             name,
@@ -4361,6 +4442,7 @@ impl<'a> Lowerer<'a> {
                 if !self.claim_import_binding(&name, false) {
                     continue;
                 }
+                self.imported_user_getattrs.remove(&name);
                 match self.self_export(&name) {
                     Some(UserExport::Function(id)) => {
                         self.imported_user_functions.insert(name.clone(), id);
@@ -4370,14 +4452,12 @@ impl<'a> Lowerer<'a> {
                             .push(StarBinding::UserFunction { name, function: id });
                     }
                     Some(UserExport::Global) => {
-                        self.imported_user_globals
-                            .insert(name.clone(), (self.dunder_name.clone(), name.clone()));
-                        self.star_bindings.entry(statement).or_default().push(
-                            StarBinding::UserGlobal {
-                                name,
-                                module: self.dunder_name.clone(),
-                            },
-                        );
+                        let module = self.dunder_name.clone();
+                        self.bind_user_global(&name, &module, &name);
+                        self.star_bindings
+                            .entry(statement)
+                            .or_default()
+                            .push(StarBinding::UserGlobal { name, module });
                     }
                     None => {}
                 }
@@ -4421,21 +4501,29 @@ impl<'a> Lowerer<'a> {
     /// this package `__init__.py` itself.
     fn resolve_self_imports(&mut self) {
         for (binding, member, range) in std::mem::take(&mut self.pending_self_imports) {
+            self.imported_user_getattrs.remove(&binding);
             match self.self_export(&member) {
                 Some(UserExport::Function(id)) => {
                     self.imported_user_functions.insert(binding, id);
                 }
                 Some(UserExport::Global) => {
-                    self.imported_user_globals
-                        .insert(binding, (self.dunder_name.clone(), member));
+                    let module = self.dunder_name.clone();
+                    self.bind_user_global(&binding, &module, &member);
+                }
+                // The package defines PEP 562 `__getattr__`: the name may be
+                // resolved when the code runs, through the package's module
+                // value.
+                None if self.module_getattr => {
+                    let module = self.dunder_name.clone();
+                    self.bind_user_getattr(&binding, &module, &member);
                 }
                 // The package installs names into its own namespace at
                 // runtime, so a name it does not define statically is still a
                 // legal attribute: read it from the package's global table
                 // when the code runs.
                 None if self.dynamic_module_globals => {
-                    self.imported_user_globals
-                        .insert(binding, (self.dunder_name.clone(), member));
+                    let module = self.dunder_name.clone();
+                    self.bind_user_global(&binding, &module, &member);
                 }
                 None => self.error_at_code(
                     range,
@@ -4610,7 +4698,7 @@ impl<'a> Lowerer<'a> {
                     line,
                     col,
                 }
-            } else if let Some((module, name)) = self.imported_user_globals.get(&binding).cloned() {
+            } else if let Some((module, _)) = self.imported_user_globals.get(&binding).cloned() {
                 // A member of a module that is still initializing (an
                 // ancestor package, or a module reached through an import
                 // cycle) cannot be read yet: its initializer runs after this
@@ -4623,12 +4711,8 @@ impl<'a> Lowerer<'a> {
                 if self.is_initializing_ancestor(&module) || self.late_modules.contains(&module) {
                     continue;
                 }
-                HExpr {
-                    kind: HExprKind::GlobalGet { module, name },
-                    ty: Ty::Concrete(Type::Any),
-                    line,
-                    col,
-                }
+                self.imported_user_global_expr(&binding, line, col)
+                    .expect("checked imported user global")
             } else if let Some(module) = self.user_module_aliases.get(&binding).cloned() {
                 self.module_ref_expr(&module, line, col)
             } else if let Some((module, function)) = self.imported_functions.get(&binding).copied()
@@ -10783,6 +10867,7 @@ impl<'a> Lowerer<'a> {
         existed |= self.imported_constants.remove(name).is_some();
         existed |= self.imported_user_functions.remove(name).is_some();
         existed |= self.imported_user_globals.remove(name).is_some();
+        existed |= self.imported_user_getattrs.remove(name);
         existed |= self.deferred_imports.remove(name).is_some();
         existed
     }
@@ -14297,16 +14382,8 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
-                } else if let Some((module, exported)) = self.imported_user_globals.get(name) {
-                    HExpr {
-                        kind: HExprKind::GlobalGet {
-                            module: module.clone(),
-                            name: exported.clone(),
-                        },
-                        ty: Ty::Concrete(Type::Any),
-                        line,
-                        col,
-                    }
+                } else if let Some(value) = self.imported_user_global_expr(name, line, col) {
+                    value
                 } else if let Some((module, function)) = self.imported_functions.get(name).copied()
                 {
                     HExpr {
@@ -17019,17 +17096,8 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        if let Some((module, exported)) = self.imported_user_globals.get(name).cloned() {
-            let (callee_line, callee_col) = self.span(name_expr.range);
-            let callee = HExpr {
-                kind: HExprKind::GlobalGet {
-                    module: module.clone(),
-                    name: exported.clone(),
-                },
-                ty: Ty::Concrete(Type::Any),
-                line: callee_line,
-                col: callee_col,
-            };
+        let (callee_line, callee_col) = self.span(name_expr.range);
+        if let Some(callee) = self.imported_user_global_expr(name, callee_line, callee_col) {
             if call.keywords.is_empty() {
                 if let Some(signature) = self.resolve_class(name).map(|(_, signature)| signature) {
                     let params = signature.params.len().saturating_sub(1);
@@ -18127,16 +18195,8 @@ impl<'a> Lowerer<'a> {
                 col,
             });
         }
-        if let Some((module, exported)) = self.imported_user_globals.get(name) {
-            return Some(HExpr {
-                kind: HExprKind::GlobalGet {
-                    module: module.clone(),
-                    name: exported.clone(),
-                },
-                ty: Ty::Concrete(Type::Any),
-                line,
-                col,
-            });
+        if let Some(value) = self.imported_user_global_expr(name, line, col) {
+            return Some(value);
         }
         if !self.global_names.contains(name) {
             return None;

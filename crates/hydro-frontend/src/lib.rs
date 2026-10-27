@@ -2048,6 +2048,10 @@ fn lower_modules(
     // Whether each unit installs names into its own namespace at runtime;
     // importers of such a module bind unknown members late.
     let mut dynamic_units: Vec<bool> = vec![false; units.len()];
+    // PEP 562 hooks each unit defines, so importers bind a missing member to a
+    // runtime module-attribute fetch. `dir(module)` reads the `__dir__` global
+    // at runtime, so it needs no compile-time metadata.
+    let mut getattr_units: Vec<bool> = vec![false; units.len()];
     // Compiled-extension paths each unit star-imports (directly or through a
     // star-imported module); importers inherit them so unknown members bind to
     // lazy extension reads.
@@ -2100,6 +2104,7 @@ fn lower_modules(
                     all: effective_module_all(units, &exports, dep_index, &mut HashSet::new()),
                     dynamic_globals: dynamic_units[dep_index],
                     extension_stars: extension_star_units[dep_index].clone(),
+                    module_getattr: getattr_units[dep_index],
                 },
             );
         }
@@ -2114,6 +2119,7 @@ fn lower_modules(
                     all: None,
                     dynamic_globals: false,
                     extension_stars: Vec::new(),
+                    module_getattr: false,
                 });
         }
         lowerer.set_user_modules(user_modules);
@@ -2132,6 +2138,7 @@ fn lower_modules(
         let mut hir = lowerer.lower_module(&unit.module);
         let exported = lowerer.exported_names();
         let dynamic_globals = lowerer.exports_dynamic_globals();
+        let module_getattr = lowerer.exports_module_getattr();
         let extension_stars = lowerer.exported_extension_stars();
         let exported_classes = lowerer.exported_class_signatures();
         let exported_functions = lowerer.exported_function_signatures();
@@ -2151,6 +2158,7 @@ fn lower_modules(
 
         exports[index] = exported;
         dynamic_units[index] = dynamic_globals;
+        getattr_units[index] = module_getattr;
         extension_star_units[index] = extension_stars;
         if index != entry_index {
             // Imported units keep one identity per unit: the module body and
@@ -3570,6 +3578,110 @@ mod tests {
         assert!(
             diags.iter().any(|diag| diag.message.contains("'drop'")),
             "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn pep562_getattr_module_resolves_missing_members_at_runtime() {
+        // Pydantic 2.x exposes `BaseModel` through a `_dynamic_imports` map
+        // behind module `__getattr__`; the static export table cannot see it.
+        let dir = TestDir::new("pep562-dynamic");
+        dir.write(
+            "dynamic.py",
+            r#"_dynamic_imports = {'BaseModel': 'dynamic_models'}
+
+def __getattr__(name):
+    if name not in _dynamic_imports:
+        raise AttributeError(f"module 'dynamic' has no attribute {name!r}")
+
+    from importlib import import_module
+    return import_module(_dynamic_imports[name])
+"#,
+        );
+        dir.write("dynamic_models.py", "class BaseModel:\n    pass\n");
+        let main = dir.write(
+            "main.py",
+            "from dynamic import BaseModel\nvalue = BaseModel\n",
+        );
+        let program = program(&main);
+
+        use hydro_ir::{ExprKind, StmtKind};
+        let entry = program.main_function();
+        let value = entry
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                StmtKind::Assign { target, value } if entry.local(*target).name == "value" => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("entry assigns value");
+        assert!(
+            matches!(
+                &value.kind,
+                ExprKind::ModuleAttr { module, name }
+                    if module == "dynamic" && name == "BaseModel"
+            ),
+            "the missing member must be read from the module value, got {:?}",
+            value.kind
+        );
+    }
+
+    #[test]
+    fn pep562_getattr_nested_relative_import_loads_the_submodule() {
+        // `__getattr__` implementations import their helper lazily
+        // (`from . import _impl`). A declaration-only site-packages submodule
+        // is preloaded, so the hook body can link the submodule by name.
+        let _env = env_lock();
+        let dir = TestDir::new("pep562-nested");
+        let site = dir.path.join("site-packages");
+        fs::create_dir_all(site.join("pkg")).expect("create package");
+        fs::write(
+            site.join("pkg").join("__init__.py"),
+            "\
+def __getattr__(name):
+    from . import _impl
+    return getattr(_impl, name)
+",
+        )
+        .expect("write package init");
+        fs::write(
+            site.join("pkg").join("_impl.py"),
+            "class BaseModel:\n    pass\n",
+        )
+        .expect("write submodule");
+        let main = dir.write("main.py", "from pkg import BaseModel\nvalue = BaseModel\n");
+
+        let _guard = EnvVar::set("HYDRO_SITE_PACKAGES", site.as_os_str());
+        let program = program(&main);
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name == "pkg._impl.<module>"),
+            "the nested relative import must load `pkg._impl`"
+        );
+
+        use hydro_ir::{ExprKind, StmtKind};
+        let entry = program.main_function();
+        let value = entry
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                StmtKind::Assign { target, value } if entry.local(*target).name == "value" => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("entry assigns value");
+        assert!(
+            matches!(
+                &value.kind,
+                ExprKind::ModuleAttr { module, name } if module == "pkg" && name == "BaseModel"
+            ),
+            "the missing member must be read from the package value, got {:?}",
+            value.kind
         );
     }
 

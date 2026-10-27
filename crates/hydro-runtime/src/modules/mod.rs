@@ -1459,7 +1459,86 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if let Some(value) = globals::lookup(module, name) {
         return value;
     }
+    // PEP 562: a compiled user module may install a module-level
+    // `__getattr__`, which CPython calls with the missing attribute name. The
+    // name is only a fallback: the globals lookup above always wins.
+    if let Some(value) = call_module_getattr(module, name) {
+        return value;
+    }
     missing_attribute(module, name)
+}
+
+/// Calls the module-level `__getattr__` of a compiled user module, if any.
+///
+/// Native modules have no PEP 562 hook, so they never reach the globals store.
+/// The hook receives the attribute name as a string; its result (including a
+/// raised `AttributeError`) is returned unchanged. Returns `None` when the
+/// module defines no hook.
+fn call_module_getattr(module: &str, name: &str) -> Option<i64> {
+    if stdlib::module(module).is_some() {
+        return None;
+    }
+    let hook = globals::lookup(module, "__getattr__")?;
+    let argument = value::str_alloc(name.to_string());
+    let roots = crate::heap::root_values(&[argument]);
+    let result = crate::builtins::call(hook, 1, &argument as *const i64);
+    crate::heap::release_roots(roots);
+    Some(result)
+}
+
+/// `dir(module)` for a compiled user module that defines PEP 562 `__dir__`.
+///
+/// Returns the hook's result converted to a sorted, deduplicated `list` of
+/// strings. `None` means the module has no `__dir__`, so the caller enumerates
+/// the module namespace instead.
+pub(crate) fn module_dir_value(module: &str) -> Option<i64> {
+    if stdlib::module(module).is_some() {
+        return None;
+    }
+    let hook = globals::lookup(module, "__dir__")?;
+    let result = crate::builtins::call(hook, 0, std::ptr::null());
+    if exc::pending() {
+        return Some(NONE);
+    }
+    let roots = crate::heap::root_values(&[result]);
+    let iterator = iter::iter_new(result);
+    if exc::pending() {
+        crate::heap::release_roots(roots);
+        return Some(NONE);
+    }
+    let mut names = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return Some(NONE);
+        }
+        if status == 0 {
+            break;
+        }
+        match value::as_str(item) {
+            Some(name) => names.push(name.to_string()),
+            None => {
+                crate::heap::release_roots(roots);
+                return Some(exc::raise_with_message(
+                    TYPE_ERROR,
+                    "dir() return value must contain strings",
+                ));
+            }
+        }
+    }
+    crate::heap::release_roots(roots);
+    names.sort_unstable();
+    names.dedup();
+    let list = value::list_new(Vec::new());
+    for name in names {
+        let text = value::str_alloc(name);
+        let roots = crate::heap::root_values(&[text]);
+        container::list_append(list, text);
+        crate::heap::release_roots(roots);
+    }
+    Some(list)
 }
 
 /// `module.__package__` for a native module: a module with registered
@@ -11757,6 +11836,87 @@ mod tests {
         assert_eq!(get("helper", "missing"), NONE);
         assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
         assert_eq!(message(), "module 'helper' has no attribute 'missing'");
+    }
+
+    extern "C" fn pep562_getattr(argv: *const i64) -> i64 {
+        // SAFETY: a one-argument wrapper receives a one-element buffer.
+        let name = unsafe { *argv };
+        let Some(name) = value::as_str(name) else {
+            return exc::raise_with_message(ATTRIBUTE_ERROR, "attribute name must be a string");
+        };
+        // Pydantic-style dispatch: a module global maps dynamic names to the
+        // submodule that provides them.
+        let Some(map) = globals::lookup("dynamic", "_dynamic_imports") else {
+            return exc::raise_with_message(ATTRIBUTE_ERROR, "dynamic imports are missing");
+        };
+        let Some(entries) = value::as_dict(map) else {
+            return exc::raise_with_message(ATTRIBUTE_ERROR, "dynamic imports are not a dict");
+        };
+        for (key, target) in entries {
+            if value::as_str(*key) == Some(name) {
+                return *target;
+            }
+        }
+        exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("module 'dynamic' has no attribute '{name}'"),
+        )
+    }
+
+    #[test]
+    fn module_getattr_resolves_missing_attributes_through_pep562() {
+        globals::reset();
+        exc::init();
+        let hook = value::function_new(
+            pep562_getattr as *const () as usize,
+            1,
+            "__getattr__".to_string(),
+        );
+        globals::set("dynamic", "__getattr__", hook);
+        globals::set("dynamic", "plain", int(7));
+        let key = string("BaseModel");
+        let key_roots = crate::heap::root_values(&[key]);
+        let target = string("model");
+        let roots = crate::heap::root_values(&[key, target]);
+        let imports = value::dict_new(vec![(key, target)]);
+        crate::heap::release_roots(roots);
+        crate::heap::release_roots(key_roots);
+        globals::set("dynamic", "_dynamic_imports", imports);
+
+        // The module namespace wins over `__getattr__`.
+        assert_eq!(get("dynamic", "plain"), int(7));
+        assert!(!exc::pending());
+        // A missing name resolves through the hook with the string argument,
+        // matching pydantic's `_dynamic_imports` map.
+        assert_eq!(value::as_str(get("dynamic", "BaseModel")), Some("model"));
+        assert!(!exc::pending());
+
+        // A name the hook refuses stays an AttributeError.
+        assert_eq!(get("dynamic", "missing"), NONE);
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+    }
+
+    extern "C" fn pep562_dir(_argv: *const i64) -> i64 {
+        value::list_new(vec![string("zeta"), string("alpha"), string("alpha")])
+    }
+
+    #[test]
+    fn dir_calls_a_module_dir_hook() {
+        globals::reset();
+        exc::init();
+        let hook = value::function_new(pep562_dir as *const () as usize, 0, "__dir__".to_string());
+        globals::set("dynamic_dir", "__dir__", hook);
+        // Names outside the hook result are hidden, like a custom `__dir__`.
+        globals::set("dynamic_dir", "hidden", int(1));
+        let module = module_value_by_name("dynamic_dir");
+        let result = crate::builtins::call_builtin(hydro_ir::Builtin::Dir, 1, [module].as_ptr());
+        assert!(!exc::pending());
+        let names: Vec<&str> = value::as_list(result)
+            .expect("dir() returns a list")
+            .iter()
+            .filter_map(|item| value::as_str(*item))
+            .collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
     }
 
     #[test]

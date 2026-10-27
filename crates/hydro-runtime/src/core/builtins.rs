@@ -3278,8 +3278,13 @@ fn dir_value(object: i64) -> i64 {
                 }
             }
             None => {
-                // Compiled user module: the globals side store plus any names
-                // bound dynamically through its `globals()` view.
+                // Compiled user module: a PEP 562 `__dir__` wins over the
+                // namespace enumeration, exactly like CPython's `dir()`.
+                if let Some(result) = modules::module_dir_value(&module_name) {
+                    return result;
+                }
+                // Otherwise the globals side store plus any names bound
+                // dynamically through its `globals()` view.
                 names.extend(globals::names(&module_name));
                 names.extend(globals::view_names(&module_name));
             }
