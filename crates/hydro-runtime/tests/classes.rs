@@ -519,3 +519,83 @@ fn unreachable_instance_cycle_is_collected() {
     );
     assert_eq!(hydro_exc_pending(), 0);
 }
+
+#[test]
+fn generic_class_subscript_builds_a_typing_alias() {
+    hydro_runtime_init();
+    // A PEP 695 class publishes its runtime parameter tuple as the class
+    // attribute `__type_params__` (the frontend stores it through this ABI).
+    let parameter = text("T");
+    let params = hydro_tuple_new(1, [parameter].as_ptr());
+    let attr_names = [text("__type_params__")];
+    let attr_values = [params];
+    let generic = hydro_class_new(
+        "Box".as_ptr(),
+        3,
+        hydro_none(),
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+        1,
+        attr_names.as_ptr(),
+        attr_values.as_ptr(),
+    );
+    assert_no_error();
+    let int_class = hydro_class_new(
+        "int".as_ptr(),
+        3,
+        hydro_none(),
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
+    );
+    assert_no_error();
+
+    // `Box[int]` is a `_GenericAlias` over the class, not the class itself.
+    let alias = hydro_subscript(generic, int_class);
+    assert_no_error();
+    assert_ne!(alias, generic, "a generic class specializes into an alias");
+    assert_eq!(getattr(alias, "__origin__"), generic);
+    let args = getattr(alias, "__args__");
+    // Exactly one argument, and it is the operand.
+    assert_eq!(hydro_unpack(args, 1), hydro_none());
+    assert_no_error();
+    assert_eq!(hydro_subscript(args, int(0)), int_class);
+    assert_no_error();
+    // The parameters of a specialized alias are the ones the arguments bind.
+    let parameters = getattr(alias, "__parameters__");
+    assert_eq!(hydro_unpack(parameters, 0), hydro_none());
+    assert_no_error();
+    assert_str(hydro_to_str(alias), "Box[int]");
+
+    // A class without `__type_params__` keeps the previous behaviour: the
+    // class value itself is the alias.
+    let plain = class("Plain", hydro_none(), &[]);
+    assert_eq!(hydro_subscript(plain, int_class), plain);
+    assert_no_error();
+
+    // `class Child(Box[int])`: the base is specialized to its origin, so the
+    // alias never reaches the MRO, and the parameters are inherited.
+    let child = hydro_class_new(
+        "Child".as_ptr(),
+        5,
+        alias,
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
+    );
+    assert_no_error();
+    assert_eq!(getattr(child, "__type_params__"), params);
+    let inherited = hydro_subscript(child, int_class);
+    assert_no_error();
+    assert_eq!(getattr(inherited, "__origin__"), child);
+}

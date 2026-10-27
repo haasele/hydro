@@ -13101,3 +13101,347 @@ fn type_alias_binding_is_mirrored_for_importers() {
         hir.functions[0].body
     );
 }
+
+/// Name of the hidden local a lowered expression reads, when it is one.
+fn hidden_local_name<'a>(hir: &'a LHir, expr: &HExpr) -> Option<&'a str> {
+    match &expr.kind {
+        HExprKind::Local(local) => Some(&hir.functions[0].locals[*local as usize].name),
+        _ => None,
+    }
+}
+
+/// `typing.<function>` calls found in the value expressions of `stmts` and of
+/// every nested block, depth-first, with their first argument when it is a
+/// string constant (a PEP 695 parameter name).
+fn type_param_calls(stmts: &[HStmt], out: &mut Vec<(String, String)>) {
+    for stmt in stmts {
+        match &stmt.kind {
+            HStmtKind::Assign { value, .. } => {
+                if let HExprKind::ModuleCall {
+                    module,
+                    function,
+                    args,
+                    ..
+                } = &value.kind
+                {
+                    let name = match args.first().map(|arg| &arg.kind) {
+                        Some(HExprKind::Const(Const::Str(name))) => name.clone(),
+                        _ => String::new(),
+                    };
+                    out.push((format!("{module}.{function}"), name));
+                }
+            }
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                type_param_calls(then_body, out);
+                type_param_calls(else_body, out);
+            }
+            HStmtKind::While {
+                body, else_body, ..
+            }
+            | HStmtKind::ForRange {
+                body, else_body, ..
+            }
+            | HStmtKind::ForEach {
+                body, else_body, ..
+            } => {
+                type_param_calls(body, out);
+                type_param_calls(else_body, out);
+            }
+            HStmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                type_param_calls(body, out);
+                for handler in handlers {
+                    type_param_calls(&handler.body, out);
+                }
+                type_param_calls(else_body, out);
+                type_param_calls(finally_body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn generic_class_publishes_type_params_and_scopes_them() {
+    let source = "class Box[T]:\n    value = T\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let body = &hir.functions[0].body;
+    assert_eq!(
+        body.len(),
+        1,
+        "the parameter setup and the class share one statement: {body:?}"
+    );
+    let HStmtKind::If { then_body, .. } = &body[0].kind else {
+        panic!("a generic class lowers through an `if True:` block: {body:?}");
+    };
+    // First statement: the TypeVar value in a hidden local.
+    let HStmtKind::Assign { value, .. } = &then_body[0].kind else {
+        panic!("expected the type-parameter setup: {then_body:?}");
+    };
+    let (module, function, args) = alias_constructor(value);
+    assert_eq!((module, function), ("typing", "TypeVar"));
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::Str(name)) if name == "T"));
+
+    // The class statement publishes the real parameter tuple.
+    let HStmtKind::ClassDef {
+        name, attributes, ..
+    } = &then_body[1].kind
+    else {
+        panic!("expected the class statement: {then_body:?}");
+    };
+    assert_eq!(name, "Box");
+    let params = attributes
+        .iter()
+        .find(|(attribute, _)| attribute == "__type_params__")
+        .map(|(_, value)| value)
+        .expect("__type_params__ attribute");
+    let HExprKind::Tuple(items) = &params.kind else {
+        panic!("`__type_params__` must be a tuple: {params:?}");
+    };
+    assert_eq!(items.len(), 1);
+    let hidden = hidden_local_name(&hir, &items[0]).expect("the tuple holds the hidden local");
+    assert!(
+        hidden.starts_with("$typeparam"),
+        "unexpected local name: {hidden}"
+    );
+
+    // The class-body expression reads the same hidden local, so the parameter
+    // is in scope inside the body.
+    let attribute = attributes
+        .iter()
+        .find(|(attribute, _)| attribute == "value")
+        .map(|(_, value)| value)
+        .expect("value attribute");
+    assert_eq!(hidden_local_name(&hir, attribute), Some(hidden));
+
+    // The parameter is scoped to the class statement.
+    let leaked = "class Box[T]:\n    value = T\nleaked = T\n";
+    let (_, _, diags) = lower_source(leaked, &parse(leaked));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::NAME);
+
+    // It is not a module local either.
+    assert!(
+        !hir.functions[0]
+            .locals
+            .iter()
+            .any(|local| local.name == "T"),
+        "a type parameter must not get an ordinary local slot"
+    );
+}
+
+#[test]
+fn generic_class_type_parameter_forms_lower() {
+    let source = "\
+class Base:
+    pass
+class Limited[T: Base](Base[T]):
+    pass
+class Variadic[*Ts]:
+    pass
+class Handler[**P]:
+    pass
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let body = &hir.functions[0].body;
+    assert!(
+        matches!(&body[0].kind, HStmtKind::ClassDef { name, .. } if name == "Base"),
+        "an ordinary class is unchanged: {body:?}"
+    );
+    // The bounded parameter carries `bound=` and is in scope in the base list.
+    let HStmtKind::If { then_body, .. } = &body[1].kind else {
+        panic!("expected the generic class block: {body:?}");
+    };
+    let HStmtKind::Assign { value, .. } = &then_body[0].kind else {
+        panic!("expected the bound setup: {then_body:?}");
+    };
+    let (_, function, args) = alias_constructor(value);
+    assert_eq!(function, "TypeVar");
+    let HExprKind::ModuleCall { keywords, .. } = &value.kind else {
+        panic!("expected a TypeVar call: {value:?}");
+    };
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "bound");
+    // The bound names the base class, resolved in the enclosing scope.
+    assert_eq!(hidden_local_name(&hir, &keywords[0].1), Some("Base"));
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::Str(name)) if name == "T"));
+    let HStmtKind::ClassDef {
+        bases, attributes, ..
+    } = &then_body[1].kind
+    else {
+        panic!("expected the class statement: {then_body:?}");
+    };
+    assert_eq!(bases.len(), 1);
+    let HExprKind::Subscript { index, .. } = &bases[0].kind else {
+        panic!("expected `Base[T]` as the base: {:?}", bases[0].kind);
+    };
+    let hidden = hidden_local_name(&hir, index).expect("the base reads the parameter local");
+    assert!(
+        hidden.starts_with("$typeparam"),
+        "unexpected local: {hidden}"
+    );
+    assert!(attributes
+        .iter()
+        .any(|(attribute, _)| attribute == "__type_params__"));
+
+    // Variadic and parametric parameter lists are real runtime values.
+    let mut calls = Vec::new();
+    type_param_calls(body, &mut calls);
+    assert_eq!(
+        calls,
+        vec![
+            ("typing.TypeVar".to_string(), "T".to_string()),
+            ("typing.TypeVarTuple".to_string(), "Ts".to_string()),
+            ("typing.ParamSpec".to_string(), "P".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn generic_class_with_a_decorator_applies_it_after_the_class() {
+    let source = "\
+def deco(cls):
+    return cls
+@deco
+class Box[T]:
+    pass
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let body = &hir.functions[0].body;
+    let decorator_temp = body
+        .iter()
+        .position(|stmt| match &stmt.kind {
+            HStmtKind::Assign { target, .. } => hir.functions[0].locals[*target as usize]
+                .name
+                .starts_with("$decor"),
+            _ => false,
+        })
+        .expect("the decorator expression is evaluated first");
+    let class_block = body
+        .iter()
+        .position(|stmt| match &stmt.kind {
+            HStmtKind::If { then_body, .. } => then_body.iter().any(
+                |inner| matches!(&inner.kind, HStmtKind::ClassDef { name, .. } if name == "Box"),
+            ),
+            _ => false,
+        })
+        .expect("the class statement runs in its parameter block");
+    assert!(
+        decorator_temp < class_block,
+        "decorators evaluate before the class statement: {body:?}"
+    );
+    let HStmtKind::If { then_body, .. } = &body[class_block].kind else {
+        unreachable!()
+    };
+    let HStmtKind::ClassDef { attributes, .. } = &then_body[1].kind else {
+        panic!("expected the class statement: {then_body:?}");
+    };
+    assert!(attributes
+        .iter()
+        .any(|(attribute, _)| attribute == "__type_params__"));
+    // The binding is the decorator's result, applied to the built class.
+    let decorated = assigned(&hir, "Box");
+    assert!(
+        matches!(&decorated.kind, HExprKind::IndirectCall { .. }),
+        "expected the decorator call: {decorated:?}"
+    );
+}
+
+#[test]
+fn nested_generic_classes_publish_their_own_type_params() {
+    let source = "\
+class Outer[T]:
+    x = T
+    class Inner[U]:
+        pass
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let body = &hir.functions[0].body;
+    let mut calls = Vec::new();
+    type_param_calls(body, &mut calls);
+    assert_eq!(
+        calls,
+        vec![
+            ("typing.TypeVar".to_string(), "T".to_string()),
+            ("typing.TypeVar".to_string(), "U".to_string()),
+        ]
+    );
+    // Both classes publish their parameters: the dynamic outer body stores
+    // its tuple in the namespace, and the nested class carries the attribute.
+    assert!(sets_namespace_key(body, "__type_params__"), "{body:?}");
+    assert!(sets_namespace_key(body, "Inner"), "{body:?}");
+    // The outer body expression (`x = T`) reads the outer parameter local.
+    let mut read_outer = false;
+    fn scan(stmts: &[HStmt], locals: &[HLocal], read_outer: &mut bool) {
+        for stmt in stmts {
+            match &stmt.kind {
+                HStmtKind::SetSubscript { index, value, .. } => {
+                    if matches!(&index.kind, HExprKind::Const(Const::Str(name)) if name == "x") {
+                        if let HExprKind::Local(local) = &value.kind {
+                            *read_outer |= locals[*local as usize].name.starts_with("$typeparam");
+                        }
+                    }
+                }
+                HStmtKind::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    scan(then_body, locals, read_outer);
+                    scan(else_body, locals, read_outer);
+                }
+                HStmtKind::While {
+                    body, else_body, ..
+                }
+                | HStmtKind::ForRange {
+                    body, else_body, ..
+                }
+                | HStmtKind::ForEach {
+                    body, else_body, ..
+                } => {
+                    scan(body, locals, read_outer);
+                    scan(else_body, locals, read_outer);
+                }
+                _ => {}
+            }
+        }
+    }
+    scan(body, &hir.functions[0].locals, &mut read_outer);
+    assert!(
+        read_outer,
+        "the dynamic class body must read the parameter: {body:?}"
+    );
+}
+
+#[test]
+fn generic_class_binding_is_mirrored_for_importers() {
+    let source = "class Box[T]:\n    pass\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "helper.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        binds_module_global(&hir.functions[0].body, "Box"),
+        "the parameter block must mirror the class binding: {:?}",
+        hir.functions[0].body
+    );
+}

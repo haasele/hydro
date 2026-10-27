@@ -8,6 +8,45 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 PEP 695 generic classes
+
+- `class C[T]:` (including `[T: Bound]`, `[*Ts]` and `[**P]`) is no longer
+  rejected with `HYD0002: type parameters are not supported yet`. The
+  parameter list is evaluated before the class header into real
+  `TypeVar`/`TypeVarTuple`/`ParamSpec` values, and the parameters are in scope
+  in the bases, the header keywords and the class body (annotations
+  included) — the class body can read `T` directly — without leaking past the
+  statement. A bound is evaluated in source order, so `class C[T, U: T]`
+  works. The class statement and its setup form one `if True:` block, so a
+  conditional or decorated class still executes as a single statement.
+- The class publishes the runtime tuple as `__type_params__` (a real class
+  attribute on the static path, a namespace entry on the runtime path, after
+  the body has run like CPython).
+- `C[int]` now returns a real `typing._GenericAlias` with `__origin__` = `C`
+  and `__args__` = `(int,)` instead of collapsing to the class value;
+  `__parameters__` is derived from the arguments (`C[int].__parameters__ ==
+  ()`, `C[T].__parameters__ == (T,)`), and `repr`/`str`, `typing.get_origin`
+  and `typing.get_args` agree with CPython. Non-generic classes keep their
+  previous (tolerant) subscript behaviour.
+- Class creation specializes a generic alias base to its origin, so
+  `class D(C[int])` subclasses `C` instead of raising `TypeError`, and a
+  subclass inherits its base's `__type_params__` like CPython's inherited
+  `__class_getitem__`.
+- Nested generic classes each scope and publish their own parameters, and
+  class decorators are evaluated before the class statement and applied to
+  the built class, as before.
+
+### Added — 2026-10-27 PEP 688 `collections.abc.Buffer`
+
+- `collections.abc.Buffer` is a real `abc.ABCMeta` class: `__buffer__` is
+  abstract (`__abstractmethods__` reports it), `register` records working
+  virtual subclasses, and `__subclasshook__` is present. `isinstance`/
+  `issubclass` reproduce CPython's structural rule, so `bytes`, `bytearray`,
+  `memoryview` and classes declaring `__buffer__` match without an explicit
+  edge; the builtin type spellings (`issubclass(bytes, Buffer)`) are accepted
+  too. Anything else stays a non-match, and calling the abstract body raises
+  `NotImplementedError`.
+
 ### Fixed — 2026-10-27 Builtin generic subscription
 
 - `tuple[int, ...]`, `list[str]`, `dict[str, int]`, `set[T]`, `frozenset[T]`

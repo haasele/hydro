@@ -814,3 +814,83 @@ else:
 "#,
     );
 }
+
+#[test]
+fn pep695_generic_classes_scope_and_publish_type_parameters() {
+    run_source(
+        r#"
+class Marker:
+    pass
+
+class Box[T]:
+    value = T
+
+# The parameter list is a real runtime tuple on the class.
+assert isinstance(Box.__type_params__, tuple)
+assert len(Box.__type_params__) == 1
+assert Box.__type_params__[0].__name__ == 'T'
+# The body sees the parameter itself (the hidden local, not a module name).
+assert Box.value.__name__ == 'T'
+
+# `Box[int]` is a generic alias over the class.
+alias = Box[int]
+assert alias is not Box
+assert alias.__origin__ is Box
+assert len(alias.__args__) == 1
+assert len(alias.__parameters__) == 0
+assert str(alias) == 'Box[int]'
+
+# Multi-parameter specialization keeps the argument order.
+class Pair[K, V]:
+    pass
+
+pair = Pair[str, int]
+assert pair.__origin__ is Pair
+assert len(pair.__args__) == 2
+assert str(pair) == 'Pair[str, int]'
+
+# A bound is an ordinary expression over the enclosing scope.
+class Bounded[T: Marker]:
+    pass
+
+assert Bounded.__type_params__[0].__bound__ is Marker
+
+# Variadic and parametric parameter lists allocate their runtime objects.
+class Variadic[*Ts]:
+    pass
+
+class Parametric[**P]:
+    pass
+
+assert Variadic.__type_params__[0].__name__ == 'Ts'
+assert Parametric.__type_params__[0].__name__ == 'P'
+
+# Subclassing a specialization uses the origin and inherits the parameters.
+class Derived(Box[int]):
+    pass
+
+assert Derived[int].__origin__ is Derived
+assert len(Derived.__type_params__) == 1
+
+def deco(cls):
+    return cls
+
+@deco
+class Decorated[T]:
+    pass
+
+assert Decorated.__type_params__[0].__name__ == 'T'
+
+# Nested generic classes scope their parameters independently.
+class Outer[T]:
+    value = T
+
+    class Inner[U]:
+        value = U
+
+assert Outer.__type_params__[0].__name__ == 'T'
+assert Outer.Inner.__type_params__[0].__name__ == 'U'
+assert Outer.Inner.value.__name__ == 'U'
+"#,
+    );
+}

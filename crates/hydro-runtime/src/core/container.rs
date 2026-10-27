@@ -1033,6 +1033,11 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
         if let Some(union) = crate::modules::types::union_subscript(obj, index) {
             return union;
         }
+        // A PEP 695 generic class (`class C[T]`) builds a real
+        // `typing._GenericAlias` carrying `__origin__`/`__args__`.
+        if let Some(alias) = crate::modules::typing::generic_class_subscript(obj, index) {
+            return alias;
+        }
         return obj;
     }
     type_error(format!(

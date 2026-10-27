@@ -33,6 +33,14 @@
 //! eagerly (Hydro has no lazy annotation scope), which is the documented
 //! limitation.
 //!
+//! PEP 695 generic classes work through the same machinery: a
+//! `class C[T]:` statement stores its parameter tuple as `__type_params__` on
+//! the class, and `C[int]` builds a `_GenericAlias` over the class through
+//! [`generic_class_subscript`], so `get_origin`/`get_args`/`__parameters__`
+//! and the alias repr agree with CPython. Class creation specializes such an
+//! alias base to its origin (`class D(C[int])`), and a subclass inherits the
+//! parameters like CPython's inherited `__class_getitem__`.
+//!
 //! Most class constants allocate a fresh class per access, matching CPython's
 //! stable identity semantics closely enough for subclassing. `ForwardRef`,
 //! `TypeAliasType`, `TypeVar`, `ParamSpec` and `TypeVarTuple` are the
@@ -1708,19 +1716,26 @@ fn generic_class_getitem(args: &[i64]) -> i64 {
 
 /// Builds a `typing._GenericAlias` with `origin` and `parameters` (one
 /// argument when `parameters` is not a tuple). Shared by the `typing` alias
-/// constructors and [`builtin_generic_subscript`].
+/// constructors, [`builtin_generic_subscript`] and
+/// [`generic_class_subscript`].
+///
+/// CPython's `_GenericAlias.__init__` derives `__parameters__` from the
+/// arguments, so `C[int]` reports no parameters while `C[T]` keeps `T`.
 fn generic_alias_of(origin: i64, parameters: i64) -> i64 {
     let items: Vec<i64> = match value::as_tuple(parameters) {
         Some(items) => items.to_vec(),
         None => vec![parameters],
     };
     let class = cached_class("_GenericAlias");
-    let origins = [origin, value::tuple_new(items), class];
-    let roots = heap::root_values(&origins);
+    let args_tuple = value::tuple_new(items);
+    let roots = heap::root_values(&[origin, args_tuple, class]);
+    let collected = collect_type_vars(args_tuple);
+    let parameter_roots = heap::root_values(&[collected]);
     let instance = value::instance_new(class);
-    let args_tuple = origins[1];
     value::instance_setattr(instance, "__origin__".to_string(), origin);
     value::instance_setattr(instance, "__args__".to_string(), args_tuple);
+    value::instance_setattr(instance, "__parameters__".to_string(), collected);
+    heap::release_roots(parameter_roots);
     heap::release_roots(roots);
     instance
 }
@@ -1762,6 +1777,45 @@ pub(crate) fn builtin_generic_subscript(obj: i64, index: i64) -> Option<i64> {
         return None;
     }
     Some(generic_alias_of(obj, index))
+}
+
+/// `C[int]` for a PEP 695 generic class (`class C[T]: ...`).
+///
+/// The frontend stores the runtime parameter tuple as the class attribute
+/// `__type_params__`, and CPython serves the subscription through
+/// `Generic.__class_getitem__`, which builds a `typing._GenericAlias` whose
+/// origin is the class. `None` means "not a generic class": the caller keeps
+/// its existing tolerance (the class value itself), so ordinary classes stay
+/// subscriptable without changing their meaning.
+///
+/// The lookup follows the MRO like ordinary attribute access: CPython's
+/// `__class_getitem__`/`__type_params__` are inherited, so a subclass of a
+/// generic class specializes its base's parameters.
+pub(crate) fn generic_class_subscript(class: i64, index: i64) -> Option<i64> {
+    let params = match value::class_lookup(class, "__type_params__")? {
+        value::ClassEntry::Attr(params) => params,
+        value::ClassEntry::Method(..) => return None,
+    };
+    if value::as_tuple(params)?.is_empty() {
+        return None;
+    }
+    Some(generic_alias_of(class, index))
+}
+
+/// The origin of a `typing._GenericAlias` value (`C` in `C[int]`), or `None`
+/// for every other value.
+///
+/// Class creation uses it so a specialized base keeps its origin, like
+/// CPython's `class D(C[int])`.
+pub(crate) fn generic_alias_origin(v: i64) -> Option<i64> {
+    // Read the instance class before touching the cache: this helper runs
+    // while `_GenericAlias` itself is being constructed, and looking the
+    // cached class up unconditionally would recurse into class creation.
+    let class = value::instance_class_value(v)?;
+    if class != cached_class("_GenericAlias") {
+        return None;
+    }
+    value::instance_attr(v, "__origin__")
 }
 
 /// `typing._collect_type_vars`/`_collect_parameters`: flat collection of
@@ -2114,6 +2168,86 @@ mod tests {
         let deep =
             crate::core::container::subscript(dict_type, value::tuple_new(vec![str_type, nested]));
         assert_eq!(value::repr(deep), "dict[str, list[tuple[int, ...]]]");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn generic_class_subscript_builds_an_alias_over_the_class() {
+        exc::init();
+        // `class Box[T]: ...` publishes the runtime parameter tuple as
+        // `__type_params__`; the frontend's static and dynamic class paths both
+        // store it as a class attribute.
+        let parameter = call("TypeVar", &[text("T")]);
+        assert!(!exc::pending());
+        let class = value::class_new_full(
+            "Box".to_string(),
+            NONE,
+            Vec::new(),
+            vec![(
+                "__type_params__".to_string(),
+                value::tuple_new(vec![parameter]),
+            )],
+        );
+        let int_class = value::class_new("int".to_string(), NONE, Vec::new());
+
+        // `Box[int]` is a `_GenericAlias` carrying origin, arguments and the
+        // parameters derived from those arguments.
+        let alias = crate::core::container::subscript(class, int_class);
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(
+            value::instance_class_value(alias),
+            Some(cached_class("_GenericAlias"))
+        );
+        assert_eq!(value::instance_attr(alias, "__origin__"), Some(class));
+        assert_eq!(
+            value::instance_attr(alias, "__args__")
+                .and_then(as_tuple)
+                .map(|items| items.to_vec()),
+            Some(vec![int_class])
+        );
+        assert_eq!(
+            value::instance_attr(alias, "__parameters__")
+                .and_then(as_tuple)
+                .map(|items| items.len()),
+            Some(0),
+            "`Box[int]` binds its parameter"
+        );
+        assert_eq!(value::repr(alias), "Box[int]");
+        assert_eq!(call("get_origin", &[alias]), class);
+        let stored_args = value::instance_attr(alias, "__args__").expect("__args__");
+        assert_eq!(call("get_args", &[alias]), stored_args);
+
+        // Specializing with a type parameter keeps it as a parameter.
+        let specialized = crate::core::container::subscript(class, parameter);
+        assert_eq!(
+            value::instance_attr(specialized, "__parameters__")
+                .and_then(as_tuple)
+                .map(|items| items.to_vec()),
+            Some(vec![parameter])
+        );
+        assert_eq!(value::repr(specialized), "Box[~T]");
+
+        // A subclass inherits the parameters, like CPython's inherited
+        // `__class_getitem__`.
+        let subclass = value::class_new("Derived".to_string(), class, Vec::new());
+        let inherited = crate::core::container::subscript(subclass, int_class);
+        assert_eq!(
+            value::instance_attr(inherited, "__origin__"),
+            Some(subclass)
+        );
+
+        // `class Child(Box[int])`: class creation specializes the base to its
+        // origin instead of rejecting the alias.
+        let child = value::class_new("Child".to_string(), alias, Vec::new());
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(value::class_display_name(child), Some("Child"));
+        let base = as_class(child).map(|state| state.base).unwrap_or(NONE);
+        assert_eq!(value::class_display_name(base), Some("Box"));
+
+        // A class without `__type_params__` keeps the existing tolerance: the
+        // class value itself is the alias.
+        let plain = value::class_new("Plain".to_string(), NONE, Vec::new());
+        assert_eq!(crate::core::container::subscript(plain, int_class), plain);
         assert!(!exc::pending());
     }
 

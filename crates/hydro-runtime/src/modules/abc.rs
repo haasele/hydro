@@ -295,6 +295,17 @@ fn abstractmethod(args: &[i64]) -> i64 {
     function
 }
 
+/// Marks a runtime-native function as abstract.
+///
+/// Python code spells this as `@abstractmethod`; native methods installed on
+/// an `ABCMeta` class (such as `collections.abc.Buffer.__buffer__`) are marked
+/// through this entry point so `__abstractmethods__` reports them.
+pub(crate) fn mark_abstract(function: i64) {
+    if !is_abstract(function) {
+        add_abstract(function);
+    }
+}
+
 fn is_abstract(v: i64) -> bool {
     abstract_markers().is_some_and(|markers| markers.contains(&v))
 }

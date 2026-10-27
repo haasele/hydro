@@ -5373,6 +5373,15 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
         return Ok(false);
     }
     if value::as_class(subclass).is_none() {
+        // Hydro spells native types (`bytes`, `memoryview`, …) as builtin
+        // function values rather than class objects. `Buffer` accepts those
+        // spellings, matching `issubclass(bytes, Buffer)` in CPython.
+        if value::as_class(class).is_some()
+            && crate::modules::collections_abc::is_buffer_class(class)
+            && crate::modules::collections_abc::is_native_buffer_type(subclass)
+        {
+            return Ok(true);
+        }
         return Err(SubclassError::Subclass);
     }
     if value::is_object_class(class) {
@@ -5398,6 +5407,15 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
     // exception ancestor for the tag relationship (so `class E(ValueError)` is
     // a subclass of `Exception`).
     if value::class_mro(subclass).contains(&class) {
+        return Ok(true);
+    }
+    // `collections.abc.Buffer`'s structural hook: a class declaring
+    // `__buffer__` (or a native exporter) is a subclass without an explicit
+    // edge, matching CPython's `__subclasshook__`. A registered virtual
+    // subclass that declares no `__buffer__` still falls through below.
+    if crate::modules::collections_abc::is_buffer_class(class)
+        && crate::modules::collections_abc::buffer_subclass_supported(subclass)
+    {
         return Ok(true);
     }
     // Concrete classes registered through `ABCMeta.register` are virtual
@@ -5553,6 +5571,13 @@ fn instance_of(value: i64, class: i64) -> bool {
     // registry is empty unless an ABC was used, so this is one atomic load in
     // the common case.
     if crate::modules::abc::is_virtual_instance(value, class) {
+        return true;
+    }
+    // `collections.abc.Buffer`'s structural hook: native buffer exporters and
+    // instances whose class declares `__buffer__` match without an edge.
+    if crate::modules::collections_abc::is_buffer_class(class)
+        && crate::modules::collections_abc::buffer_instance_supported(value)
+    {
         return true;
     }
     // Classes are instances of their metaclass (the cached `type` class when no

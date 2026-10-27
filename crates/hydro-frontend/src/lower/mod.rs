@@ -851,6 +851,9 @@ struct ClassEmission<'a> {
     target: LocalId,
     /// Whether the module global table receives the finished class value.
     mirror_globals: bool,
+    /// Runtime `__type_params__` tuple for a PEP 695 generic class, already
+    /// evaluated in the enclosing scope. `None` for an ordinary class.
+    type_params: Option<&'a HExpr>,
     line: u32,
     col: u32,
 }
@@ -5241,9 +5244,6 @@ impl<'a> Lowerer<'a> {
                 decorators.push(index);
             }
         }
-        if !s.type_params.is_empty() {
-            self.error_at(s.range, "type parameters are not supported yet");
-        }
         let mut metaclass = None;
         let mut keywords = Vec::new();
         for (index, keyword) in s.keywords.iter().enumerate() {
@@ -7100,54 +7100,12 @@ impl<'a> Lowerer<'a> {
         };
         let alias_name = target.id.to_string();
         let mut setup: Vec<HStmt> = Vec::new();
-        let mut type_params: Vec<HExpr> = Vec::new();
-        // Restores `fs.type_param_locals` after the value is lowered.
-        let mut saved: Vec<(String, Option<LocalId>)> = Vec::new();
-        for param in &s.type_params {
-            let param_name = type_param_name(param).to_string();
-            let (local, _) = self.hidden_temp(fs, "$typeparam", Type::Any);
-            let previous = fs.type_param_locals.insert(param_name.clone(), local);
-            saved.push((param_name.clone(), previous));
-            let param_value = match param {
-                ast::TypeParam::TypeVar(v) => {
-                    let mut keywords = Vec::new();
-                    if let Some(bound) = &v.bound {
-                        // The bound is an ordinary expression evaluated in
-                        // the alias scope; earlier parameters are visible.
-                        keywords.push(("bound".to_string(), self.expr(bound, fs)));
-                    }
-                    self.type_param_call("TypeVar", &param_name, keywords, line, col)
-                }
-                ast::TypeParam::ParamSpec(_) => {
-                    self.type_param_call("ParamSpec", &param_name, Vec::new(), line, col)
-                }
-                ast::TypeParam::TypeVarTuple(_) => {
-                    self.type_param_call("TypeVarTuple", &param_name, Vec::new(), line, col)
-                }
-            };
-            setup.push(HStmt {
-                kind: HStmtKind::Assign {
-                    target: local,
-                    value: param_value,
-                },
-                line,
-                col,
-            });
-            type_params.push(self.local_read(fs, local, Ty::Concrete(Type::Any), line, col));
-        }
+        let (type_params, saved) =
+            self.begin_type_params(&s.type_params, fs, &mut setup, line, col);
 
         let value = self.expr(&s.value, fs);
 
-        for (name, previous) in saved.into_iter().rev() {
-            match previous {
-                Some(local) => {
-                    fs.type_param_locals.insert(name, local);
-                }
-                None => {
-                    fs.type_param_locals.remove(&name);
-                }
-            }
-        }
+        Self::end_type_params(fs, saved);
 
         let alias_value = HExpr {
             kind: HExprKind::ModuleCall {
@@ -7161,12 +7119,7 @@ impl<'a> Lowerer<'a> {
                         col,
                     },
                     value,
-                    HExpr {
-                        kind: HExprKind::Tuple(type_params),
-                        ty: Ty::Concrete(Type::Tuple),
-                        line,
-                        col,
-                    },
+                    type_params,
                     HExpr {
                         kind: HExprKind::Const(Const::Str(self.dunder_name.clone())),
                         ty: Ty::Concrete(Type::Str),
@@ -7190,6 +7143,83 @@ impl<'a> Lowerer<'a> {
         }
         setup.push(store);
         Some(if_true_block(setup, line, col))
+    }
+
+    /// Evaluate one PEP 695 type parameter list in the current scope.
+    ///
+    /// Each parameter becomes a hidden local holding the runtime
+    /// `TypeVar`/`ParamSpec`/`TypeVarTuple` value, and its name is installed in
+    /// [`FuncState::type_param_locals`] so the definition that owns the list
+    /// (a type-alias value, a class base or a class body) resolves it like
+    /// CPython's annotation scope, shadowing every enclosing binding. Bounds
+    /// are ordinary expressions evaluated in source order, so an earlier
+    /// parameter is visible in a later one (`class C[T, U: T]`).
+    ///
+    /// `setup` receives the assignments in source order; the returned tuple
+    /// expression is the `__type_params__` value. Pass the second return value
+    /// to [`Self::end_type_params`] once the owning definition is lowered.
+    fn begin_type_params(
+        &mut self,
+        params: &[ast::TypeParam],
+        fs: &mut FuncState,
+        setup: &mut Vec<HStmt>,
+        line: u32,
+        col: u32,
+    ) -> (HExpr, Vec<(String, Option<LocalId>)>) {
+        let mut type_params: Vec<HExpr> = Vec::with_capacity(params.len());
+        let mut saved: Vec<(String, Option<LocalId>)> = Vec::with_capacity(params.len());
+        for param in params {
+            let param_name = type_param_name(param).to_string();
+            let (local, _) = self.hidden_temp(fs, "$typeparam", Type::Any);
+            let previous = fs.type_param_locals.insert(param_name.clone(), local);
+            saved.push((param_name.clone(), previous));
+            let param_value = match param {
+                ast::TypeParam::TypeVar(v) => {
+                    let mut keywords = Vec::new();
+                    if let Some(bound) = &v.bound {
+                        keywords.push(("bound".to_string(), self.expr(bound, fs)));
+                    }
+                    self.type_param_call("TypeVar", &param_name, keywords, line, col)
+                }
+                ast::TypeParam::ParamSpec(_) => {
+                    self.type_param_call("ParamSpec", &param_name, Vec::new(), line, col)
+                }
+                ast::TypeParam::TypeVarTuple(_) => {
+                    self.type_param_call("TypeVarTuple", &param_name, Vec::new(), line, col)
+                }
+            };
+            setup.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: local,
+                    value: param_value,
+                },
+                line,
+                col,
+            });
+            type_params.push(self.local_read(fs, local, Ty::Concrete(Type::Any), line, col));
+        }
+        let tuple = HExpr {
+            kind: HExprKind::Tuple(type_params),
+            ty: Ty::Concrete(Type::Tuple),
+            line,
+            col,
+        };
+        (tuple, saved)
+    }
+
+    /// Undo [`Self::begin_type_params`], so the parameter names are no longer
+    /// visible after the owning definition.
+    fn end_type_params(fs: &mut FuncState, saved: Vec<(String, Option<LocalId>)>) {
+        for (name, previous) in saved.into_iter().rev() {
+            match previous {
+                Some(local) => {
+                    fs.type_param_locals.insert(name, local);
+                }
+                None => {
+                    fs.type_param_locals.remove(&name);
+                }
+            }
+        }
     }
 
     /// `typing.<function>("<name>")` for one PEP 695 type parameter.
@@ -8686,6 +8716,7 @@ impl<'a> Lowerer<'a> {
             name,
             target,
             mirror_globals: mirror,
+            type_params,
             line,
             col,
         } = emission;
@@ -8860,6 +8891,25 @@ impl<'a> Lowerer<'a> {
         let body = self.lower_block(&s.body, fs);
         fs.class_ns = previous;
         statements.extend(body);
+        // CPython publishes `__type_params__` after the body has run, so a
+        // class-body binding of the same name never wins. The namespace is a
+        // plain dict, so the value has to be stored explicitly.
+        if let Some(params) = type_params {
+            statements.push(HStmt {
+                kind: HStmtKind::SetSubscript {
+                    object: ns_ref.clone(),
+                    index: HExpr {
+                        kind: HExprKind::Const(Const::Str("__type_params__".to_string())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    },
+                    value: params.clone(),
+                },
+                line,
+                col,
+            });
+        }
         let class_value = HExpr {
             kind: HExprKind::Call {
                 callee: Callee::Builtin(Builtin::ClassFromNamespace),
@@ -8923,6 +8973,7 @@ impl<'a> Lowerer<'a> {
         s: &ast::StmtClassDef,
         plan: &ClassPlan,
         fs: &mut FuncState,
+        type_params: Option<&HExpr>,
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
@@ -8944,6 +8995,7 @@ impl<'a> Lowerer<'a> {
                 name: &name,
                 target,
                 mirror_globals: true,
+                type_params,
                 line,
                 col,
             },
@@ -9294,6 +9346,12 @@ impl<'a> Lowerer<'a> {
     /// method) is registered here, when its statement runs, because its
     /// methods may close over the enclosing locals. A class inside another
     /// class body is stored in that body's namespace.
+    ///
+    /// A PEP 695 header (`class C[T]`, `[T: Bound]`, `[*Ts]`, `[**P]`)
+    /// evaluates its type parameters before the header and publishes them as
+    /// `__type_params__`; the whole statement lowers as one `if True:` block,
+    /// so the parameters are visible to the bases, the header keywords and the
+    /// body but not after the class statement.
     fn lower_class_stmt(
         &mut self,
         s: &ast::StmtClassDef,
@@ -9317,8 +9375,66 @@ impl<'a> Lowerer<'a> {
                 return None;
             }
         };
+        if s.type_params.is_empty() {
+            return self.lower_class_statement(s, &plan, fs, None, line, col);
+        }
+        // PEP 695: the parameter list is evaluated in the enclosing scope
+        // before the class header, and the parameters stay visible to the
+        // bases, the header keywords and the body (annotations included),
+        // exactly like a generic type alias. The setup assignments and the
+        // class statement share one `if True:` block, which keeps this a
+        // single lowered statement.
+        let mut setup: Vec<HStmt> = Vec::new();
+        let (type_params, saved) =
+            self.begin_type_params(&s.type_params, fs, &mut setup, line, col);
+        let statement = self.lower_class_statement(s, &plan, fs, Some(&type_params), line, col);
+        Self::end_type_params(fs, saved);
+        setup.push(statement?);
+        // `push_lowered_stmt` mirrors a bare `ClassDef`; the wrapper hides it,
+        // so the fast static path mirrors its module binding here. The dynamic
+        // path and the extra-keyword path emit their own mirror.
+        if fs.is_module && !plan.dynamic && plan.keywords.is_empty() {
+            let name = s.name.to_string();
+            if self.mirror_all_globals || self.used_globals.contains(&name) {
+                if let Some(target) = fs.lookup(&name) {
+                    let ty = self.functions[fs.fid as usize]
+                        .locals
+                        .get(target as usize)
+                        .map(|local| local.ty)
+                        .unwrap_or(Ty::Concrete(Type::Any));
+                    setup.push(HStmt {
+                        kind: HStmtKind::GlobalSet {
+                            module: self.dunder_name.clone(),
+                            name,
+                            value: HExpr {
+                                kind: HExprKind::Local(target),
+                                ty,
+                                line,
+                                col,
+                            },
+                        },
+                        line,
+                        col,
+                    });
+                }
+            }
+        }
+        Some(if_true_block(setup, line, col))
+    }
+
+    /// Lower one class statement whose type parameters (if any) have already
+    /// been evaluated into `type_params`.
+    fn lower_class_statement(
+        &mut self,
+        s: &ast::StmtClassDef,
+        plan: &ClassPlan,
+        fs: &mut FuncState,
+        type_params: Option<&HExpr>,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
         if fs.class_ns.is_some() {
-            return self.lower_class_in_class_body(s, &plan, fs, line, col);
+            return self.lower_class_in_class_body(s, plan, fs, type_params, line, col);
         }
         let name = s.name.to_string();
         let Some(target) = fs.lookup(&name) else {
@@ -9332,22 +9448,23 @@ impl<'a> Lowerer<'a> {
         };
         if fs.is_module {
             if plan.dynamic {
-                return self.lower_dynamic_class_stmt(s, &plan, fs, line, col);
+                return self.lower_dynamic_class_stmt(s, plan, fs, type_params, line, col);
             }
             return self.lower_static_class_def(
                 fs,
                 ClassEmission {
                     class: s,
-                    plan: &plan,
+                    plan,
                     name: &name,
                     target,
                     mirror_globals: false,
+                    type_params,
                     line,
                     col,
                 },
             );
         }
-        self.lower_nested_class_stmt(s, &plan, fs, target, line, col)
+        self.lower_nested_class_stmt(s, plan, fs, target, type_params, line, col)
     }
 
     /// Register a class statement that appears inside a function or a method.
@@ -9382,12 +9499,14 @@ impl<'a> Lowerer<'a> {
     /// The class object is built in the statement's local slot, then the class
     /// decorators are applied bottom-up. A class bound to a closure cell is
     /// stored through the cell, like any other assignment in that scope.
+    #[allow(clippy::too_many_arguments)]
     fn lower_nested_class_stmt(
         &mut self,
         s: &ast::StmtClassDef,
         plan: &ClassPlan,
         fs: &mut FuncState,
         target: LocalId,
+        type_params: Option<&HExpr>,
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
@@ -9406,6 +9525,7 @@ impl<'a> Lowerer<'a> {
                 name: &name,
                 target: bind_target,
                 mirror_globals: false,
+                type_params,
                 line,
                 col,
             },
@@ -9458,6 +9578,7 @@ impl<'a> Lowerer<'a> {
             plan,
             name,
             target,
+            type_params,
             line,
             col,
             ..
@@ -9520,6 +9641,12 @@ impl<'a> Lowerer<'a> {
                 attributes.push((attribute.clone(), value));
             }
             self.class_attr_scopes.pop();
+            // CPython publishes the PEP 695 parameter list on the class after
+            // the body has run, so a class-body binding of the same name never
+            // wins.
+            if let Some(params) = type_params {
+                attributes.push(("__type_params__".to_string(), params.clone()));
+            }
             attributes
         };
         if plan.keywords.is_empty() {
@@ -9640,6 +9767,7 @@ impl<'a> Lowerer<'a> {
         s: &ast::StmtClassDef,
         plan: &ClassPlan,
         fs: &mut FuncState,
+        type_params: Option<&HExpr>,
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
@@ -9656,6 +9784,7 @@ impl<'a> Lowerer<'a> {
                     name: &name,
                     target,
                     mirror_globals: false,
+                    type_params,
                     line,
                     col,
                 },
@@ -9669,6 +9798,7 @@ impl<'a> Lowerer<'a> {
                     name: &name,
                     target,
                     mirror_globals: false,
+                    type_params,
                     line,
                     col,
                 },
@@ -20990,18 +21120,35 @@ fn class_free_names(c: &ast::StmtClassDef) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let empty = HashSet::new();
+    // PEP 695 parameters are in scope for the header keywords, the base list
+    // and the class-body expressions. A bound is evaluated in source order, so
+    // a later parameter's bound sees the earlier parameters. Decorators and
+    // method bodies are resolved in the enclosing scope, never against the
+    // parameter scope, so they are walked without these names shadowed. A
+    // class without type parameters walks the same names in the same order as
+    // before.
+    let mut header_scope = HashSet::new();
+    for param in &c.type_params {
+        if let ast::TypeParam::TypeVar(v) = param {
+            if let Some(bound) = &v.bound {
+                walk_free_expr(bound, &header_scope, &mut out, &mut seen);
+            }
+        }
+        header_scope.insert(type_param_name(param).to_string());
+    }
     for base in &c.bases {
-        walk_free_expr(base, &empty, &mut out, &mut seen);
+        walk_free_expr(base, &header_scope, &mut out, &mut seen);
     }
     for keyword in &c.keywords {
-        walk_free_expr(&keyword.value, &empty, &mut out, &mut seen);
+        walk_free_expr(&keyword.value, &header_scope, &mut out, &mut seen);
     }
     for decorator in &c.decorator_list {
         walk_free_expr(decorator, &empty, &mut out, &mut seen);
     }
     let mut names = Vec::new();
     collect_names(&c.body, &mut names, true);
-    let bound: HashSet<String> = names.into_iter().collect();
+    let mut bound: HashSet<String> = names.into_iter().collect();
+    bound.extend(header_scope.iter().cloned());
     for stmt in &c.body {
         match stmt {
             ast::Stmt::FunctionDef(f) => {

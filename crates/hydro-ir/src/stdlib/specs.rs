@@ -2709,11 +2709,18 @@ pub static TOKEN: ModuleSpec = ModuleSpec {
 /// `collections.abc` module imports every name from here.
 pub static _COLLECTIONS_ABC: ModuleSpec = ModuleSpec {
     name: "_collections_abc",
-    // Native body of the `register` method installed on every ABC class. The
-    // name is underscore-hidden from `import *` and the method raises
-    // `NotImplementedError`; virtual subclass registration is not emulated.
-    functions: &[f("_abc_register", 1, 1, Type::None)],
+    // Native bodies of the `register` method installed on every ABC class and
+    // of `Buffer`'s `__buffer__`/`__subclasshook__`. The names are
+    // underscore-hidden from `import *`; `register` raises
+    // `NotImplementedError` because virtual subclass registration is not
+    // emulated, and `Buffer`'s methods implement PEP 688.
+    functions: &[
+        f("_abc_register", 1, 1, Type::None),
+        f("_abc_buffer", 2, 2, Type::Any),
+        f("_abc_buffer_subclasshook", 2, 2, Type::Bool),
+    ],
     constants: &[
+        c("Buffer", Type::Any),
         c("Awaitable", Type::Any),
         c("AsyncIterable", Type::Any),
         c("AsyncIterator", Type::Any),
@@ -2749,6 +2756,7 @@ pub static COLLECTIONS_ABC: ModuleSpec = ModuleSpec {
     functions: &[],
     constants: &[
         c("abc", Type::Any),
+        c("Buffer", Type::Any),
         c("Awaitable", Type::Any),
         c("AsyncIterable", Type::Any),
         c("AsyncIterator", Type::Any),
@@ -4339,6 +4347,7 @@ mod tests {
     #[test]
     fn collections_abc_gc_atexit_and_site_specs_are_registered() {
         let required = [
+            "Buffer",
             "Iterable",
             "Iterator",
             "Sized",
@@ -4361,9 +4370,12 @@ mod tests {
         for module in ["collections.abc", "_collections_abc"] {
             let spec = crate::stdlib::module(module).unwrap();
             if module == "_collections_abc" {
-                // Internal `register` method body only.
-                assert_eq!(spec.functions.len(), 1);
-                assert!(function(module, "_abc_register").is_some());
+                // Native method bodies: the generic `register` plus Buffer's
+                // `__buffer__` and `__subclasshook__`.
+                assert_eq!(spec.functions.len(), 3);
+                for name in ["_abc_register", "_abc_buffer", "_abc_buffer_subclasshook"] {
+                    assert!(function(module, name).is_some(), "{name}");
+                }
             } else {
                 assert!(spec.functions.is_empty());
             }

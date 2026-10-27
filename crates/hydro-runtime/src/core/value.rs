@@ -4701,6 +4701,12 @@ pub(crate) fn normalize_class_base(v: i64) -> i64 {
             return native_class("type");
         }
     }
+    // `class D(C[int])`: a PEP 695 specialization is a
+    // `typing._GenericAlias`. CPython subclasses the origin (`C`), so the
+    // alias itself never reaches the C3 merge.
+    if let Some(origin) = crate::modules::typing::generic_alias_origin(v) {
+        return origin;
+    }
     v
 }
 

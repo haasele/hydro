@@ -65,6 +65,30 @@ fn class(name: &str, base: i64) -> i64 {
     )
 }
 
+/// Creates a class with the given normal methods (`kind` 0).
+fn class_with_methods(name: &str, base: i64, methods: &[(&str, i64)]) -> i64 {
+    let names: Vec<i64> = methods.iter().map(|(name, _)| text(name)).collect();
+    let funcs: Vec<i64> = methods.iter().map(|(_, function)| *function).collect();
+    let kinds: Vec<i64> = methods.iter().map(|_| int(0)).collect();
+    let (names_ptr, funcs_ptr, kinds_ptr) = if methods.is_empty() {
+        (std::ptr::null(), std::ptr::null(), std::ptr::null())
+    } else {
+        (names.as_ptr(), funcs.as_ptr(), kinds.as_ptr())
+    };
+    hydro_class_new(
+        name.as_ptr(),
+        name.len(),
+        base,
+        methods.len(),
+        names_ptr,
+        funcs_ptr,
+        kinds_ptr,
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
+    )
+}
+
 fn empty_dict() -> i64 {
     hydro_dict_new(0, std::ptr::null(), std::ptr::null())
 }
@@ -284,6 +308,7 @@ fn collections_abc_classes_and_inheritance_checks() {
     let mapping = module_get("collections.abc", "Mapping");
     assert_same(mapping, module_get("_collections_abc", "Mapping"));
     for name in [
+        "Buffer",
         "Iterable",
         "Iterator",
         "Sized",
@@ -346,6 +371,102 @@ fn collections_abc_classes_and_inheritance_checks() {
 
     module_get("collections.abc", "Missing");
     assert_error_tag(ATTRIBUTE_ERROR);
+}
+
+#[test]
+fn buffer_is_a_real_abc_with_a_structural_hook() {
+    let _guard = test_guard();
+    hydro_runtime_init();
+
+    let buffer = module_get("collections.abc", "Buffer");
+    assert_no_error();
+    assert_same(buffer, module_get("_collections_abc", "Buffer"));
+    assert_str(hydro_getattr(buffer, b"__name__".as_ptr(), 8), "Buffer");
+
+    // Native exporters satisfy the structural hook, unrelated values do not.
+    let bytes = hydro_bytes_new(b"abc".as_ptr(), 3);
+    let bytearray = hydro_bytearray_new(b"abc".as_ptr(), 3);
+    let view = hydro_memoryview_new(bytes);
+    for exporter in [bytes, bytearray, view] {
+        assert_true(module("builtins", "isinstance", &[exporter, buffer]));
+    }
+    for other in [
+        int(1),
+        text("x"),
+        hydro_list_new(0, std::ptr::null()),
+        empty_dict(),
+    ] {
+        assert_false(module("builtins", "isinstance", &[other, buffer]));
+    }
+    // Native exporter type spellings are class-like targets for Buffer.
+    for name in ["bytes", "bytearray", "memoryview"] {
+        let native = hydro_builtin_function(name.as_ptr(), name.len());
+        assert_true(module("builtins", "issubclass", &[native, buffer]));
+    }
+
+    // Explicit inheritance uses the ordinary class chain.
+    let subclass = class("MyBuffer", buffer);
+    let instance = hydro_instance_new(subclass);
+    assert_true(module("builtins", "isinstance", &[instance, buffer]));
+    assert_true(module("builtins", "issubclass", &[subclass, buffer]));
+
+    // Structural `__subclasshook__` behaviour: a class declaring `__buffer__`
+    // matches without inheriting from Buffer, and so do its instances.
+    let method = module_get("gc", "collect");
+    assert_no_error();
+    let duck = class_with_methods("Duck", hydro_none(), &[("__buffer__", method)]);
+    assert_true(module("builtins", "issubclass", &[duck, buffer]));
+    assert_true(module(
+        "builtins",
+        "isinstance",
+        &[hydro_instance_new(duck), buffer],
+    ));
+    let plain = class("Plain", hydro_none());
+    assert_false(module("builtins", "issubclass", &[plain, buffer]));
+    assert_false(module(
+        "builtins",
+        "isinstance",
+        &[hydro_instance_new(plain), buffer],
+    ));
+
+    // The classmethod itself reports the same answer.
+    let args = [duck];
+    assert_true(hydro_method(
+        buffer,
+        b"__subclasshook__".as_ptr(),
+        16,
+        1,
+        args.as_ptr(),
+    ));
+    let args = [plain];
+    assert_false(hydro_method(
+        buffer,
+        b"__subclasshook__".as_ptr(),
+        16,
+        1,
+        args.as_ptr(),
+    ));
+
+    // `Buffer` is an `ABCMeta` class: `register` records a real edge, and
+    // `__abstractmethods__` reports the abstract `__buffer__` hook.
+    let registered = class("Registered", hydro_none());
+    let args = [registered];
+    let result = hydro_method(buffer, b"register".as_ptr(), 8, 1, args.as_ptr());
+    assert_same(result, registered);
+    assert_true(module(
+        "builtins",
+        "isinstance",
+        &[hydro_instance_new(registered), buffer],
+    ));
+    assert_true(module("builtins", "issubclass", &[registered, buffer]));
+    let abstract_methods = hydro_getattr(buffer, b"__abstractmethods__".as_ptr(), 19);
+    assert_no_error();
+    assert_int(hydro_len(abstract_methods), 1);
+
+    // The abstract body raises instead of fabricating a buffer.
+    let args = [view, int(0)];
+    hydro_method(buffer, b"__buffer__".as_ptr(), 10, 2, args.as_ptr());
+    assert_error_tag(NOT_IMPLEMENTED_ERROR);
 }
 
 // -------------------------------------------------------------------------
