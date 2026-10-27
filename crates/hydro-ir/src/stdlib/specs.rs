@@ -1710,9 +1710,15 @@ pub static DATETIME: ModuleSpec = ModuleSpec {
 };
 
 /// `typing`: annotation placeholders. The runtime values are inert (`None`,
-/// `False`, or empty classes); the frontend consumes annotations itself. Class
-/// bases (`Generic`, `NamedTuple`, `Protocol`) are exposed as constants so a
-/// class definition can subclass them.
+/// `False`, or empty classes) except for the real `TypeVar`/`ParamSpec`/
+/// `TypeVarTuple`/`TypeAliasType`/`ForwardRef` classes; the frontend consumes
+/// annotations itself. Class bases (`Generic`, `NamedTuple`, `Protocol`) are
+/// exposed as constants so a class definition can subclass them.
+///
+/// `_type_alias_new` is Hydro's lowering target for a PEP 695
+/// `type X = expr` statement: the frontend evaluates the value and the
+/// runtime builds a real `typing.TypeAliasType` instance from
+/// `(name, value, type_params, module)`.
 pub static TYPING: ModuleSpec = ModuleSpec {
     name: "typing",
     functions: &[
@@ -1770,6 +1776,9 @@ pub static TYPING: ModuleSpec = ModuleSpec {
         f("_is_param_expr", 1, 1, Type::Bool),
         kw_dynamic("_deduplicate", 1, 1, Type::Any, &[]),
         f("_generic_class_getitem", 2, 2, Type::Any),
+        // PEP 695 lowering target: `type X = expr` becomes
+        // `_type_alias_new(name, value, type_params, module)`.
+        f("_type_alias_new", 4, 4, Type::Any),
         f("_collect_type_vars", 1, 1, Type::Tuple),
         f("_collect_parameters", 1, 1, Type::Tuple),
         f("_check_generic", 2, 3, Type::None),

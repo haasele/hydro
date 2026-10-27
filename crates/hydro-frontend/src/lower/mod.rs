@@ -907,6 +907,12 @@ struct FuncState {
     /// active bindings (nested comprehensions can bind the same name). An
     /// assignment expression may not rebind one of them.
     comp_shadowed: HashMap<String, usize>,
+    /// Type parameters of the PEP 695 type alias whose value expression is
+    /// being lowered (`type X[T] = list[T]`). They are hidden locals holding
+    /// the runtime `TypeVar`/`ParamSpec`/`TypeVarTuple` values and shadow
+    /// every enclosing binding, like CPython's annotation scope. Empty outside
+    /// a type-alias value.
+    type_param_locals: HashMap<String, LocalId>,
     /// Names declared `global` in this function scope. They never get a local
     /// slot: reads lower to `GlobalGet` and writes to `GlobalSet`.
     globals: HashSet<String>,
@@ -2165,6 +2171,7 @@ impl<'a> Lowerer<'a> {
             cells: HashSet::new(),
             cell_aliases: HashSet::new(),
             comp_shadowed: HashMap::new(),
+            type_param_locals: HashMap::new(),
             globals: HashSet::new(),
             loop_depth: 0,
             in_lambda: false,
@@ -5927,6 +5934,7 @@ impl<'a> Lowerer<'a> {
             cells: HashSet::new(),
             cell_aliases: HashSet::new(),
             comp_shadowed: HashMap::new(),
+            type_param_locals: HashMap::new(),
             globals: HashSet::new(),
             loop_depth: 0,
             in_lambda: false,
@@ -6076,6 +6084,7 @@ impl<'a> Lowerer<'a> {
             cells: HashSet::new(),
             cell_aliases: HashSet::new(),
             comp_shadowed: HashMap::new(),
+            type_param_locals: HashMap::new(),
             globals: HashSet::new(),
             loop_depth: 0,
             in_lambda: false,
@@ -6250,6 +6259,7 @@ impl<'a> Lowerer<'a> {
             cells,
             cell_aliases,
             comp_shadowed: HashMap::new(),
+            type_param_locals: HashMap::new(),
             globals,
             loop_depth: 0,
             in_lambda: false,
@@ -7050,13 +7060,163 @@ impl<'a> Lowerer<'a> {
                 return None;
             }
             ast::Stmt::Match(s) => return self.lower_match(s, fs, line, col),
-            ast::Stmt::TypeAlias(s) => {
-                self.error_at(s.range, "type aliases are not supported in Phase 1");
-                return None;
-            }
+            ast::Stmt::TypeAlias(s) => return self.lower_type_alias(s, fs, line, col),
             ast::Stmt::TryStar(s) => return self.lower_try_star(s, fs, line, col),
         };
         Some(HStmt { kind, line, col })
+    }
+
+    // ------------------------------------------------------------------
+    // PEP 695 type alias statements
+    // ------------------------------------------------------------------
+
+    /// Lower `type X = expr` / `type X[T] = expr`.
+    ///
+    /// The statement binds a real `typing.TypeAliasType` instance in the
+    /// current scope (module local mirrored to the global table, function
+    /// local/cell, or class namespace). The value expression is evaluated
+    /// eagerly — Hydro has no lazy annotation scope — through the runtime
+    /// `typing._type_alias_new(name, value, type_params, module)` helper.
+    ///
+    /// Each type parameter becomes a hidden local holding the runtime
+    /// `TypeVar`/`ParamSpec`/`TypeVarTuple` value, so the value expression and
+    /// later bounds see one identity per parameter (`type X[T, U: T]`); the
+    /// setup runs in the same `if True:` block as the binding, which keeps a
+    /// single lowered statement.
+    fn lower_type_alias(
+        &mut self,
+        s: &ast::StmtTypeAlias,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let ast::Expr::Name(target) = &*s.name else {
+            self.error_at_code(
+                s.name.range(),
+                codes::DECL,
+                "type alias name must be a simple name",
+            );
+            return None;
+        };
+        let alias_name = target.id.to_string();
+        let mut setup: Vec<HStmt> = Vec::new();
+        let mut type_params: Vec<HExpr> = Vec::new();
+        // Restores `fs.type_param_locals` after the value is lowered.
+        let mut saved: Vec<(String, Option<LocalId>)> = Vec::new();
+        for param in &s.type_params {
+            let param_name = type_param_name(param).to_string();
+            let (local, _) = self.hidden_temp(fs, "$typeparam", Type::Any);
+            let previous = fs.type_param_locals.insert(param_name.clone(), local);
+            saved.push((param_name.clone(), previous));
+            let param_value = match param {
+                ast::TypeParam::TypeVar(v) => {
+                    let mut keywords = Vec::new();
+                    if let Some(bound) = &v.bound {
+                        // The bound is an ordinary expression evaluated in
+                        // the alias scope; earlier parameters are visible.
+                        keywords.push(("bound".to_string(), self.expr(bound, fs)));
+                    }
+                    self.type_param_call("TypeVar", &param_name, keywords, line, col)
+                }
+                ast::TypeParam::ParamSpec(_) => {
+                    self.type_param_call("ParamSpec", &param_name, Vec::new(), line, col)
+                }
+                ast::TypeParam::TypeVarTuple(_) => {
+                    self.type_param_call("TypeVarTuple", &param_name, Vec::new(), line, col)
+                }
+            };
+            setup.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: local,
+                    value: param_value,
+                },
+                line,
+                col,
+            });
+            type_params.push(self.local_read(fs, local, Ty::Concrete(Type::Any), line, col));
+        }
+
+        let value = self.expr(&s.value, fs);
+
+        for (name, previous) in saved.into_iter().rev() {
+            match previous {
+                Some(local) => {
+                    fs.type_param_locals.insert(name, local);
+                }
+                None => {
+                    fs.type_param_locals.remove(&name);
+                }
+            }
+        }
+
+        let alias_value = HExpr {
+            kind: HExprKind::ModuleCall {
+                module: "typing".to_string(),
+                function: "_type_alias_new".to_string(),
+                args: vec![
+                    HExpr {
+                        kind: HExprKind::Const(Const::Str(alias_name)),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    },
+                    value,
+                    HExpr {
+                        kind: HExprKind::Tuple(type_params),
+                        ty: Ty::Concrete(Type::Tuple),
+                        line,
+                        col,
+                    },
+                    HExpr {
+                        kind: HExprKind::Const(Const::Str(self.dunder_name.clone())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    },
+                ],
+                keywords: Vec::new(),
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        };
+        let store = HStmt {
+            kind: self.lower_store(&s.name, alias_value, fs)?,
+            line,
+            col,
+        };
+        if setup.is_empty() {
+            return Some(store);
+        }
+        setup.push(store);
+        Some(if_true_block(setup, line, col))
+    }
+
+    /// `typing.<function>("<name>")` for one PEP 695 type parameter.
+    fn type_param_call(
+        &self,
+        function: &str,
+        name: &str,
+        keywords: Vec<(String, HExpr)>,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        HExpr {
+            kind: HExprKind::ModuleCall {
+                module: "typing".to_string(),
+                function: function.to_string(),
+                args: vec![HExpr {
+                    kind: HExprKind::Const(Const::Str(name.to_string())),
+                    ty: Ty::Concrete(Type::Str),
+                    line,
+                    col,
+                }],
+                keywords,
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -7657,9 +7817,20 @@ impl<'a> Lowerer<'a> {
     /// `slice` value (see [`Lowerer::slice_value_expr`]). A direct
     /// `a[start:stop:step]` never reaches this helper: the caller keeps its
     /// `HExprKind::Slice` fast path.
+    ///
+    /// A lone starred index (`a[*xs]`) parses as a bare `Starred`, not as a
+    /// one-element tuple, so it is lowered through [`Lowerer::tuple_with_star`]
+    /// exactly like `(*xs,)`: the unpacked sequence becomes the whole index
+    /// tuple. Tuple indices carrying a star (`a[1, *xs]`) reach the same
+    /// helper from the ordinary `Tuple` expression path.
     fn subscript_index_expr(&mut self, index: &ast::Expr, fs: &mut FuncState) -> HExpr {
         let previous = std::mem::replace(&mut self.slice_value_allowed, true);
-        let lowered = self.expr(index, fs);
+        let lowered = if matches!(index, ast::Expr::Starred(_)) {
+            let (line, col) = self.span(index.range());
+            self.tuple_with_star(std::slice::from_ref(index), fs, line, col)
+        } else {
+            self.expr(index, fs)
+        };
         self.slice_value_allowed = previous;
         lowered
     }
@@ -11072,6 +11243,7 @@ impl<'a> Lowerer<'a> {
             cells: genexp_cells.clone(),
             cell_aliases: genexp_cells,
             comp_shadowed: HashMap::new(),
+            type_param_locals: HashMap::new(),
             globals,
             loop_depth: 0,
             in_lambda: fs.in_lambda,
@@ -11217,6 +11389,7 @@ impl<'a> Lowerer<'a> {
             cells: frame_cells.clone(),
             cell_aliases: frame_cells,
             comp_shadowed: HashMap::new(),
+            type_param_locals: HashMap::new(),
             globals,
             loop_depth: 0,
             in_lambda: fs.in_lambda,
@@ -13094,6 +13267,14 @@ impl<'a> Lowerer<'a> {
                     // template side table; it is never a variable.
                     return self.template_expr(range, fs, line, col);
                 }
+                // Inside `type X[T] = ...` the alias's type parameters are
+                // visible in the value expression (and in later bounds),
+                // shadowing every enclosing binding like CPython's annotation
+                // scope.
+                if let Some(&local) = fs.type_param_locals.get(name) {
+                    let ty = self.infer.fresh();
+                    return self.local_read(fs, local, ty, line, col);
+                }
                 // A dynamic class body keeps its namespace in a runtime dict;
                 // every name bound anywhere in the body reads from it first
                 // (CPython's `LOAD_NAME` order), before module bindings and
@@ -14201,6 +14382,7 @@ impl<'a> Lowerer<'a> {
             cells: cell_alias_locals.clone(),
             cell_aliases: cell_alias_locals,
             comp_shadowed: HashMap::new(),
+            type_param_locals: HashMap::new(),
             globals: HashSet::new(),
             loop_depth: 0,
             in_lambda: true,
@@ -18940,6 +19122,7 @@ fn body_has_yield(stmts: &[ast::Stmt]) -> bool {
         ast::Stmt::Assign(s) => expr_has_yield(&s.value) || s.targets.iter().any(expr_has_yield),
         ast::Stmt::AugAssign(s) => expr_has_yield(&s.target) || expr_has_yield(&s.value),
         ast::Stmt::AnnAssign(s) => s.value.as_deref().is_some_and(expr_has_yield),
+        ast::Stmt::TypeAlias(s) => expr_has_yield(&s.value),
         ast::Stmt::Return(s) => s.value.as_deref().is_some_and(expr_has_yield),
         ast::Stmt::Delete(s) => s.targets.iter().any(expr_has_yield),
         ast::Stmt::Raise(s) => {
@@ -19178,6 +19361,11 @@ fn collect_global_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
             ast::Stmt::AnnAssign(s) => {
                 if s.value.is_some() {
                     collect_target_bound_names(&s.target, out);
+                }
+            }
+            ast::Stmt::TypeAlias(s) => {
+                if let ast::Expr::Name(name) = &*s.name {
+                    out.insert(name.id.to_string());
                 }
             }
             ast::Stmt::ClassDef(s) => {
@@ -19571,6 +19759,11 @@ fn collect_scope_mutations(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
                     out.extend(targets.iter().cloned());
                 }
             }
+            ast::Stmt::TypeAlias(s) => {
+                if let ast::Expr::Name(name) = &*s.name {
+                    out.insert(name.id.to_string());
+                }
+            }
             ast::Stmt::AugAssign(s) => {
                 if let ast::Expr::Name(name) = &*s.target {
                     out.insert(name.id.to_string());
@@ -19801,6 +19994,16 @@ fn collect_lambda_needed(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
                 if let Some(value) = &s.value {
                     collect_lambda_needed_expr(value, out);
                 }
+            }
+            ast::Stmt::TypeAlias(s) => {
+                for param in &s.type_params {
+                    if let ast::TypeParam::TypeVar(v) = param {
+                        if let Some(bound) = &v.bound {
+                            collect_lambda_needed_expr(bound, out);
+                        }
+                    }
+                }
+                collect_lambda_needed_expr(&s.value, out);
             }
             ast::Stmt::AugAssign(s) => {
                 collect_lambda_needed_target(&s.target, out);
@@ -20227,6 +20430,27 @@ fn global_assignment_targets(stmt: &ast::Stmt, h: &HStmt) -> Vec<(String, LocalI
             ast::Expr::Name(name) => vec![(name.id.to_string(), *target)],
             _ => Vec::new(),
         },
+        // A type alias binds a real value too. A generic alias
+        // (`type X[T] = ...`) sets up its type parameters first and lowers as
+        // `if True:` with the final store last, so both shapes are covered.
+        (ast::Stmt::TypeAlias(s), HStmtKind::Assign { target, .. }) => {
+            type_alias_global_target(s, *target)
+        }
+        (ast::Stmt::TypeAlias(s), HStmtKind::If { then_body, .. }) => match then_body.last() {
+            Some(HStmt {
+                kind: HStmtKind::Assign { target, .. },
+                ..
+            }) => type_alias_global_target(s, *target),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// The module-global binding created by a lowered `type` statement.
+fn type_alias_global_target(s: &ast::StmtTypeAlias, target: LocalId) -> Vec<(String, LocalId)> {
+    match &*s.name {
+        ast::Expr::Name(name) => vec![(name.id.to_string(), target)],
         _ => Vec::new(),
     }
 }
@@ -20476,6 +20700,15 @@ fn literal_pattern_key(expr: &ast::Expr) -> Option<String> {
     }
 }
 
+/// Name introduced by one PEP 695 type parameter (`T`, `*Ts`, `**P`).
+fn type_param_name(param: &ast::TypeParam) -> &str {
+    match param {
+        ast::TypeParam::TypeVar(p) => p.name.as_str(),
+        ast::TypeParam::ParamSpec(p) => p.name.as_str(),
+        ast::TypeParam::TypeVarTuple(p) => p.name.as_str(),
+    }
+}
+
 fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool) {
     for stmt in stmts {
         match stmt {
@@ -20503,6 +20736,11 @@ fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool)
             ast::Stmt::AnnAssign(s) => {
                 if s.value.is_some() {
                     collect_target_names(&s.target, out);
+                }
+            }
+            ast::Stmt::TypeAlias(s) => {
+                if let ast::Expr::Name(name) = &*s.name {
+                    out.push(name.id.to_string());
                 }
             }
             ast::Stmt::For(s) => {
@@ -20602,6 +20840,21 @@ fn walk_free_stmts(
                 if let Some(value) = &s.value {
                     walk_free_expr(value, shadowed, out, seen);
                 }
+            }
+            // A `type X[T] = ...` statement loads the names of its value and
+            // of every parameter bound; the parameters are local to the alias
+            // value, never captures of the enclosing function.
+            ast::Stmt::TypeAlias(s) => {
+                let mut alias_scope = shadowed.clone();
+                for param in &s.type_params {
+                    alias_scope.insert(type_param_name(param).to_string());
+                    if let ast::TypeParam::TypeVar(v) = param {
+                        if let Some(bound) = &v.bound {
+                            walk_free_expr(bound, shadowed, out, seen);
+                        }
+                    }
+                }
+                walk_free_expr(&s.value, &alias_scope, out, seen);
             }
             ast::Stmt::AugAssign(s) => {
                 walk_free_target(&s.target, shadowed, out, seen);

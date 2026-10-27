@@ -26,8 +26,27 @@ pub(crate) fn iter_new(obj: i64) -> i64 {
         if let Some(value::ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
             value::class_lookup(instance.class, "__iter__")
         {
-            let arguments = [obj];
-            let result = crate::core::builtins::call(function, 1, arguments.as_ptr());
+            // A native method (`typing.TypeVarTuple.__iter__`, for example)
+            // carries parameter metadata and a uniform full-argv trampoline
+            // instead of a callable body, so `builtins::call` would dispatch it
+            // through the module table and miss the trampoline. Bind it through
+            // the shared method binder like every other native method.
+            let result = if !value::function_signature(function).is_empty()
+                && value::function_full_entry(function) != 0
+            {
+                crate::core::methods::call_user_method(
+                    obj,
+                    instance.class,
+                    hydro_ir::MethodKind::Normal,
+                    function,
+                    "__iter__",
+                    &[],
+                    &[],
+                )
+            } else {
+                let arguments = [obj];
+                crate::core::builtins::call(function, 1, arguments.as_ptr())
+            };
             if exc::pending() {
                 return value::NONE;
             }

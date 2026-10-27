@@ -690,12 +690,18 @@ pub(crate) fn is_union(v: i64) -> bool {
 }
 
 /// Values accepted as union members: classes, `None` (standing for
-/// `NoneType`), existing unions and function values. Function values act as
-/// types in this runtime (`isinstance(x, f)` consults the builtin/native name,
-/// and `types.FunctionType` is itself a module function), so both operand
-/// orders of `A | B` used by annotation aliases work.
+/// `NoneType`), existing unions, function values and PEP 695 type aliases.
+/// Function values act as types in this runtime (`isinstance(x, f)` consults
+/// the builtin/native name, and `types.FunctionType` is itself a module
+/// function), so both operand orders of `A | B` used by annotation aliases
+/// work. `typing.TypeAliasType` instances join so an alias defined with
+/// `type X = ...` composes into a union exactly like the class it names.
 fn is_union_member(v: i64) -> bool {
-    value::as_class(v).is_some() || v == NONE || value::as_function(v).is_some() || is_union(v)
+    value::as_class(v).is_some()
+        || v == NONE
+        || value::as_function(v).is_some()
+        || is_union(v)
+        || crate::modules::typing::is_type_alias_value(v)
 }
 
 /// Appends `value_arg` to `out`, flattening tuple input and the `__args__` of

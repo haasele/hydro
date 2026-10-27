@@ -1367,7 +1367,9 @@ fn undefined_name_without_a_close_match_has_no_help() {
 
 #[test]
 fn unsupported_construct_sets_the_span_and_help() {
-    let source = "type X = int\n";
+    // Complex literals are still rejected by `const_expr`; the diagnostic
+    // starts at the expression's own first column.
+    let source = "1j\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, codes::UNSUPPORTED);
@@ -2852,6 +2854,167 @@ w = a[0:1]
 
     // A direct `a[start:stop:step]` keeps the native fast path.
     assert!(matches!(&assigned(&hir, "w").kind, HExprKind::Slice { .. }));
+}
+
+/// Split the tuple concatenation that a starred subscript index lowers to.
+/// Returns the literal prefix elements in source order and the `tuple(...)`
+/// operand that unpacks the starred value.
+///
+/// The lowering left-nests one `BinOp::Add` per chunk: `a[0, *xs]` becomes
+/// `(Tuple([]) + Tuple([0])) + tuple(xs)`, so the literal prefix spans every
+/// tuple on the left spine, not just the outermost left operand.
+fn starred_index_concat(expr: &HExpr) -> (Vec<&HExpr>, &HExpr) {
+    let HExprKind::Bin {
+        op: BinOp::Add,
+        lhs,
+        rhs,
+    } = &expr.kind
+    else {
+        panic!("expected tuple concatenation, got {:?}", expr.kind);
+    };
+    assert!(
+        matches!(
+            &rhs.kind,
+            HExprKind::Call {
+                callee: Callee::Builtin(Builtin::Tuple),
+                args,
+            } if args.len() == 1
+        ),
+        "expected the unpacked operand copied through tuple(), got {:?}",
+        rhs.kind
+    );
+    let mut prefix = Vec::new();
+    prefix_tuple_chunks(lhs, &mut prefix);
+    (prefix, rhs)
+}
+
+/// Collect the elements of the literal tuple chunks along the left spine of a
+/// tuple concatenation, in source order: the leftmost chunk is the deepest.
+fn prefix_tuple_chunks<'a>(expr: &'a HExpr, out: &mut Vec<&'a HExpr>) {
+    match &expr.kind {
+        HExprKind::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => {
+            prefix_tuple_chunks(lhs, out);
+            prefix_tuple_chunks(rhs, out);
+        }
+        HExprKind::Tuple(elements) => out.extend(elements.iter()),
+        _ => panic!("expected a literal tuple chunk, got {:?}", expr.kind),
+    }
+}
+
+#[test]
+fn starred_subscript_index_unpacks_the_whole_index() {
+    // `a[*xs]` parses as a bare starred operand; `a[*xs,]` wraps it in a
+    // one-element tuple. Both are the same index tuple `tuple(xs)`.
+    let source = "\
+xs = (1, 2)
+a = {}
+x = a[*xs]
+y = a[0, *xs]
+z = a[*xs,]
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let HExprKind::Subscript { index, .. } = &assigned(&hir, "x").kind else {
+        panic!("expected a subscript, got {:?}", assigned(&hir, "x").kind);
+    };
+    let (prefix, unpacked) = starred_index_concat(index);
+    assert!(
+        prefix.is_empty(),
+        "a leading star starts from an empty tuple, got {prefix:?}"
+    );
+    let HExprKind::Call { args, .. } = &unpacked.kind else {
+        panic!("expected a tuple() call, got {:?}", unpacked.kind);
+    };
+    assert!(
+        matches!(&args[0].kind, HExprKind::Local(_)),
+        "the starred operand is the lowered name, got {:?}",
+        args[0].kind
+    );
+
+    let HExprKind::Subscript { index, .. } = &assigned(&hir, "y").kind else {
+        panic!("expected a subscript, got {:?}", assigned(&hir, "y").kind);
+    };
+    let (prefix, _) = starred_index_concat(index);
+    assert_eq!(prefix.len(), 1);
+    assert!(matches!(&prefix[0].kind, HExprKind::Const(Const::Int(0))));
+
+    let HExprKind::Subscript { index, .. } = &assigned(&hir, "z").kind else {
+        panic!("expected a subscript, got {:?}", assigned(&hir, "z").kind);
+    };
+    let (prefix, _) = starred_index_concat(index);
+    assert!(
+        prefix.is_empty(),
+        "the trailing comma does not add an element, got {prefix:?}"
+    );
+}
+
+#[test]
+fn starred_subscript_index_keeps_plain_and_slice_tuple_indices() {
+    let source = "\
+xs = (1, 2)
+a = {}
+p = a[0, 1]
+q = a[:, *xs]
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    // A tuple index without a star stays one literal tuple.
+    let HExprKind::Subscript { index, .. } = &assigned(&hir, "p").kind else {
+        panic!("expected a subscript, got {:?}", assigned(&hir, "p").kind);
+    };
+    let HExprKind::Tuple(elements) = &index.kind else {
+        panic!("expected a plain tuple index, got {:?}", index.kind);
+    };
+    assert_eq!(elements.len(), 2);
+    assert!(matches!(&elements[0].kind, HExprKind::Const(Const::Int(0))));
+    assert!(matches!(&elements[1].kind, HExprKind::Const(Const::Int(1))));
+
+    // Slice elements next to a star still become real slice values.
+    let HExprKind::Subscript { index, .. } = &assigned(&hir, "q").kind else {
+        panic!("expected a subscript, got {:?}", assigned(&hir, "q").kind);
+    };
+    let (prefix, _) = starred_index_concat(index);
+    assert_eq!(prefix.len(), 1);
+    let args = slice_value_args(prefix[0]);
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(&args[1].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(&args[2].kind, HExprKind::Const(Const::None)));
+}
+
+#[test]
+fn starred_subscript_assignment_and_delete_targets_unpack_the_index() {
+    let source = "\
+xs = (0, 1)
+a = {}
+a[*xs] = 1
+del a[*xs]
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let HStmtKind::SetSubscript { index, .. } = &hir.functions[0].body[2].kind else {
+        panic!(
+            "expected a subscript store, got {:?}",
+            hir.functions[0].body[2].kind
+        );
+    };
+    let (prefix, _) = starred_index_concat(index);
+    assert!(prefix.is_empty());
+
+    let HStmtKind::Delete { targets } = &hir.functions[0].body[3].kind else {
+        panic!("expected a delete, got {:?}", hir.functions[0].body[3].kind);
+    };
+    let [HDeleteTarget::Subscript { index, .. }] = targets.as_slice() else {
+        panic!("expected one subscript deletion, got {targets:?}");
+    };
+    let (prefix, _) = starred_index_concat(index);
+    assert!(prefix.is_empty());
 }
 
 #[test]
@@ -12724,4 +12887,217 @@ fn annotationlib_lowers_without_diagnostics() {
     let module = parse(&source);
     let (_, _, diags) = lower_source(&source, &module);
     assert!(diags.is_empty(), "{diags:?}");
+}
+
+/// True when `stmts` or a nested block stores `key` into a namespace dict.
+fn sets_namespace_key(stmts: &[HStmt], key: &str) -> bool {
+    stmts.iter().any(|stmt| match &stmt.kind {
+        HStmtKind::SetSubscript { index, .. } => {
+            matches!(&index.kind, HExprKind::Const(Const::Str(name)) if name == key)
+        }
+        HStmtKind::If {
+            then_body,
+            else_body,
+            ..
+        } => sets_namespace_key(then_body, key) || sets_namespace_key(else_body, key),
+        HStmtKind::While {
+            body, else_body, ..
+        }
+        | HStmtKind::ForRange {
+            body, else_body, ..
+        }
+        | HStmtKind::ForEach {
+            body, else_body, ..
+        } => sets_namespace_key(body, key) || sets_namespace_key(else_body, key),
+        HStmtKind::Try {
+            body,
+            handlers,
+            else_body,
+            finally_body,
+        } => {
+            sets_namespace_key(body, key)
+                || handlers
+                    .iter()
+                    .any(|handler| sets_namespace_key(&handler.body, key))
+                || sets_namespace_key(else_body, key)
+                || sets_namespace_key(finally_body, key)
+        }
+        _ => false,
+    })
+}
+
+/// The `_type_alias_new` call of a lowered `type` statement.
+fn alias_constructor(expr: &HExpr) -> (&str, &str, &[HExpr]) {
+    match &expr.kind {
+        HExprKind::ModuleCall {
+            module,
+            function,
+            args,
+            ..
+        } => (module.as_str(), function.as_str(), args.as_slice()),
+        other => panic!("expected a module call, got {other:?}"),
+    }
+}
+
+#[test]
+fn type_alias_statement_binds_a_runtime_alias() {
+    let source = "type Shape = tuple[int, ...]\n\
+                  def area(shape: Shape) -> Shape:\n    return shape\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let (module, function, args) = alias_constructor(assigned(&hir, "Shape"));
+    assert_eq!((module, function), ("typing", "_type_alias_new"));
+    assert_eq!(args.len(), 4);
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::Str(name)) if name == "Shape"));
+    // The value is the runtime-evaluated annotation expression.
+    assert!(matches!(&args[1].kind, HExprKind::Subscript { .. }));
+    assert!(matches!(&args[2].kind, HExprKind::Tuple(params) if params.is_empty()));
+    assert!(matches!(&args[3].kind, HExprKind::Const(Const::Str(module)) if module == "__main__"));
+
+    // The alias is usable in annotations: they lower to no statements, so the
+    // function body is exactly its `return`.
+    let body = function_body(&hir, "area");
+    assert_eq!(body.len(), 1, "{body:?}");
+    assert!(matches!(&body[0].kind, HStmtKind::Return(Some(_))));
+}
+
+#[test]
+fn generic_type_alias_sets_up_type_parameters_and_binds_the_alias() {
+    let source = "type Vector[T] = list[T]\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let body = &hir.functions[0].body;
+    let HStmtKind::If { then_body, .. } = &body[0].kind else {
+        panic!("a generic alias lowers through an `if True:` block: {body:?}");
+    };
+    // First statement: the TypeVar value in a hidden local.
+    let HStmtKind::Assign { value, .. } = &then_body[0].kind else {
+        panic!("expected the type-parameter setup: {then_body:?}");
+    };
+    let (module, function, args) = alias_constructor(value);
+    assert_eq!((module, function), ("typing", "TypeVar"));
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::Str(name)) if name == "T"));
+
+    // Last statement: the alias itself, with the parameter tuple.
+    let HStmtKind::Assign { value, .. } = &then_body.last().unwrap().kind else {
+        panic!("the alias binding must be last: {then_body:?}");
+    };
+    let (_, function, args) = alias_constructor(value);
+    assert_eq!(function, "_type_alias_new");
+    assert!(matches!(&args[2].kind, HExprKind::Tuple(params) if params.len() == 1));
+
+    // The value reads the hidden type-parameter local rather than a module
+    // binding of `T`.
+    let HExprKind::Subscript { index, .. } = &args[1].kind else {
+        panic!("expected the alias value subscript: {:?}", args[1].kind);
+    };
+    let HExprKind::Local(local) = &index.kind else {
+        panic!("`list[T]` must read the type-parameter local: {index:?}");
+    };
+    assert!(
+        hir.functions[0].locals[*local as usize]
+            .name
+            .starts_with("$typeparam"),
+        "unexpected local name: {}",
+        hir.functions[0].locals[*local as usize].name
+    );
+
+    // The parameter name is scoped to the alias.
+    let (_, _, diags) = lower_source(
+        "type Vector[T] = list[T]\nleaked = T\n",
+        &parse("type Vector[T] = list[T]\nleaked = T\n"),
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::NAME);
+}
+
+#[test]
+fn type_alias_type_parameter_bound_and_variadic_forms_lower() {
+    let source = "type Vector[T: int] = list[T]\n\
+                  type Pairs[*Ts] = tuple[*Ts]\n\
+                  type Handler[**P] = None\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let body = &hir.functions[0].body;
+    // Bounded parameter: the TypeVar call carries `bound=`.
+    let HStmtKind::If { then_body, .. } = &body[0].kind else {
+        panic!("expected the assignment to install the class");
+    };
+    let HStmtKind::Assign { value, .. } = &then_body[0].kind else {
+        panic!("expected the type-parameter setup: {then_body:?}");
+    };
+    let HExprKind::ModuleCall { keywords, .. } = &value.kind else {
+        panic!("expected a TypeVar call: {value:?}");
+    };
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "bound");
+
+    // Variadic and parametric parameters are real runtime type parameters.
+    let mut functions: Vec<&str> = Vec::new();
+    for stmt in body {
+        let HStmtKind::If { then_body, .. } = &stmt.kind else {
+            continue;
+        };
+        let HStmtKind::Assign { value, .. } = &then_body[0].kind else {
+            continue;
+        };
+        if let HExprKind::ModuleCall { function, .. } = &value.kind {
+            functions.push(function.as_str());
+        }
+    }
+    assert_eq!(functions, ["TypeVar", "TypeVarTuple", "ParamSpec"]);
+}
+
+#[test]
+fn type_alias_in_a_function_binds_a_local_slot() {
+    let source = "def build():\n    type Pair = tuple[int, int]\n    return Pair\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let function = hir
+        .functions
+        .iter()
+        .find(|function| function.name == "build")
+        .expect("build");
+    let HStmtKind::Assign { target, value } = &function.body[0].kind else {
+        panic!(
+            "expected a local alias assignment: {:?}",
+            function.body[0].kind
+        );
+    };
+    assert_eq!(function.locals[*target as usize].name, "Pair");
+    let (module, function_name, _) = alias_constructor(value);
+    assert_eq!((module, function_name), ("typing", "_type_alias_new"));
+}
+
+#[test]
+fn type_alias_in_a_class_body_binds_through_the_namespace() {
+    let source = "class Registry:\n    type Entry = dict[str, int]\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        sets_namespace_key(&hir.functions[0].body, "Entry"),
+        "the alias must bind in the class namespace: {:?}",
+        hir.functions[0].body
+    );
+}
+
+#[test]
+fn type_alias_binding_is_mirrored_for_importers() {
+    let source = "type Shape = str\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "helper.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        binds_module_global(&hir.functions[0].body, "Shape"),
+        "an imported unit must mirror the alias: {:?}",
+        hir.functions[0].body
+    );
 }

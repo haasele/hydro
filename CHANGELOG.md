@@ -8,6 +8,32 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 PEP 695 `type` alias statements
+
+- `type X = expr` and `type X[T] = expr` are real bindings instead of an
+  `HYD0002` rejection. Lowering evaluates the value through the runtime
+  `typing._type_alias_new(name, value, type_params, module)` helper and stores
+  a real `typing.TypeAliasType` instance in the current scope: a module global
+  (mirrored into the runtime global table for importers), a function
+  local/cell, or a dynamic class namespace.
+- `typing.TypeAliasType` is now a real cached class with the CPython 3.14
+  attribute surface (`__name__`, `__value__`, `__type_params__`,
+  `__parameters__`, `__module__`), `repr(alias) == alias.__name__`, and
+  `__getitem__` that builds a `_GenericAlias` (`Vector[int].__origin__` is the
+  alias) while a non-generic alias raises `TypeError: Only generic type
+  aliases are subscriptable`. Aliases are accepted as `types.UnionType`
+  members, so
+  `X | None` composes.
+- Every type-parameter form lowers to its runtime object: `T` (with an
+  optional `: bound` passed as the `TypeVar` keyword), `*Ts`
+  (`TypeVarTuple`) and `**P` (`ParamSpec`). The parameters are scoped to the
+  alias value through hidden locals, and `TypeVarTuple` is iterable
+  (`Unpack[Ts]`) so `tuple[*Ts]` evaluates.
+- The value is evaluated eagerly; Hydro has no lazy annotation scope, so an
+  alias whose value cannot be computed when its statement runs reports the
+  same diagnostic a plain expression would. Annotations still consume the
+  alias name only as a hint, as before.
+
 ### Fixed — 2026-10-27 Stub function bodies accept return annotations
 
 - A body that only declares a stub — `...`, optionally behind a docstring, or

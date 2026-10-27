@@ -13,13 +13,23 @@
 //! `TypeVar`, `ParamSpec` and `TypeVarTuple` are real type-parameter objects:
 //! each call allocates a fresh instance carrying the CPython attribute set
 //! (`__name__`, `__constraints__`, `__bound__`, the variance flags,
-//! `__default__`, `__module__`) and a `~name` representation.
+//! `__default__`, `__module__`) and a `~name` representation. A
+//! `TypeVarTuple` is iterable like CPython's, yielding `Unpack[Ts]`, so a
+//! starred subscript in an alias value evaluates.
+//!
+//! `TypeAliasType` is a real class too: it backs PEP 695 `type X = expr`
+//! statements. Lowering allocates one instance per statement with `__name__`,
+//! `__value__`, `__type_params__`, `__parameters__` and `__module__`;
+//! `repr` is the alias name, a generic alias is subscriptable, and
+//! `types.UnionType` accepts an alias as a `|` member. The value is evaluated
+//! eagerly (Hydro has no lazy annotation scope), which is the documented
+//! limitation.
 //!
 //! Most class constants allocate a fresh class per access, matching CPython's
 //! stable identity semantics closely enough for subclassing. `ForwardRef`,
-//! `TypeVar`, `ParamSpec` and `TypeVarTuple` are the exceptions: they are
-//! cached classes because `isinstance` checks and construction must share one
-//! identity.
+//! `TypeAliasType`, `TypeVar`, `ParamSpec` and `TypeVarTuple` are the
+//! exceptions: they are cached classes because `isinstance` checks and
+//! construction must share one identity.
 //!
 //! Two runtime helpers from CPython 3.14's `typing` are implemented for
 //! `annotationlib`:
@@ -284,7 +294,6 @@ const CLASSES: &[&str] = &[
     "Tuple",
     "Type",
     "TypeAlias",
-    "TypeAliasType",
     "TypeForm",
     "TypeGuard",
     "TypeIs",
@@ -530,16 +539,62 @@ fn typevar_like_class(name: &str) -> i64 {
         }],
     );
     value::function_set_full_entry(repr, typevar_like_repr_entry as *const () as usize);
-    let class = value::class_new(
-        name.to_string(),
-        NONE,
-        vec![
-            ("__init__".to_string(), init),
-            ("__repr__".to_string(), repr),
-        ],
-    );
+    let mut methods = vec![
+        ("__init__".to_string(), init),
+        ("__repr__".to_string(), repr),
+    ];
+    if name == "TypeVarTuple" {
+        // CPython's `TypeVarTuple` is iterable: iterating it yields
+        // `Unpack[Ts]`. That is what makes a variadic alias value such as
+        // `type X[*Ts] = tuple[*Ts]` evaluate (`tuple[*Ts]` evaluates the
+        // starred operand through `tuple()`), and the same protocol serves
+        // runtime-evaluated PEP 646 annotations.
+        let iter = value::native_function_new("typing", "_typevar_tuple_iter", usize::MAX);
+        value::function_set_signature(
+            iter,
+            vec![value::ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            }],
+        );
+        value::function_set_full_entry(iter, typevar_tuple_iter_entry as *const () as usize);
+        methods.push(("__iter__".to_string(), iter));
+    }
+    let class = value::class_new(name.to_string(), NONE, methods);
     crate::core::globals::registry_set(&key, class);
     class
+}
+
+/// `TypeVarTuple.__iter__`: yields the single member `Unpack[Ts]`.
+extern "C" fn typevar_tuple_iter_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` first.
+    let this = unsafe { *argv };
+    // The caller's argument buffer is not a GC root, so root the receiver
+    // before the first allocation (`constant` builds the `Unpack` class).
+    let roots = heap::root_values(&[this]);
+    let unpack = constant("Unpack");
+    if exc::pending() {
+        heap::release_roots(roots);
+        return unpack;
+    }
+    let unpack_roots = heap::root_values(&[unpack]);
+    // `typing.Unpack[Ts]` is a class subscript, which yields the class value.
+    let item = crate::core::container::subscript(unpack, this);
+    if exc::pending() {
+        heap::release_roots(unpack_roots);
+        heap::release_roots(roots);
+        return item;
+    }
+    let item_roots = heap::root_values(&[item]);
+    let items = value::tuple_new(vec![item]);
+    let items_roots = heap::root_values(&[items]);
+    let iter = crate::core::iter::iter_new(items);
+    heap::release_roots(items_roots);
+    heap::release_roots(item_roots);
+    heap::release_roots(unpack_roots);
+    heap::release_roots(roots);
+    iter
 }
 
 /// `ParamSpec(name, *, bound=None, covariant=False, contravariant=False,
@@ -792,6 +847,209 @@ fn new_typevar(args: &[i64], keywords: &[(String, i64)]) -> i64 {
     instance
 }
 
+/// `typing.TypeAliasType` (PEP 695) as a real class value.
+///
+/// Hydro lowers `type X = expr` eagerly, so an alias instance carries the
+/// evaluated value instead of re-evaluating it on first attribute access. The
+/// attribute surface matches CPython 3.14 (`__name__`, `__value__`,
+/// `__type_params__`, `__parameters__`, `__module__`), `repr` is the alias
+/// name, and `__getitem__` builds a generic alias for a generic `type X[T]` so
+/// `X[int]` yields an alias carrying `__origin__`/`__args__`. Subscripting a
+/// non-generic alias raises CPython's `TypeError`.
+fn type_alias_type_class() -> i64 {
+    let key = "typing.TypeAliasType";
+    if let Some(cached) = crate::core::globals::registry_get(key) {
+        return cached;
+    }
+    let self_param = || value::ParamMeta {
+        name: "self".to_string(),
+        kind: ParamKind::Positional,
+        default: None,
+    };
+    let signature = vec![
+        self_param(),
+        value::ParamMeta {
+            name: "name".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "value".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "kwargs".to_string(),
+            kind: ParamKind::KwArg,
+            default: Some(NONE),
+        },
+    ];
+    let init = value::native_function_new("typing", "_type_alias_type_init", usize::MAX);
+    value::function_set_signature(init, signature);
+    value::function_set_full_entry(init, init_type_alias_type as *const () as usize);
+    let repr = value::native_function_new("typing", "_type_alias_type_repr", usize::MAX);
+    value::function_set_signature(repr, vec![self_param()]);
+    value::function_set_full_entry(repr, type_alias_type_repr_entry as *const () as usize);
+    let getitem = value::native_function_new("typing", "_type_alias_type_getitem", usize::MAX);
+    value::function_set_signature(
+        getitem,
+        vec![
+            self_param(),
+            value::ParamMeta {
+                name: "parameters".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+        ],
+    );
+    value::function_set_full_entry(getitem, type_alias_type_getitem_entry as *const () as usize);
+    let class = value::class_new(
+        "TypeAliasType".to_string(),
+        NONE,
+        vec![
+            ("__init__".to_string(), init),
+            ("__repr__".to_string(), repr),
+            ("__getitem__".to_string(), getitem),
+        ],
+    );
+    crate::core::globals::registry_set(key, class);
+    class
+}
+
+/// True when `v` is a `typing.TypeAliasType` instance (a PEP 695 alias).
+///
+/// `types.UnionType` accepts aliases as `|` members; the check reads the
+/// cached class from the registry so an ordinary instance never allocates it.
+pub(crate) fn is_type_alias_value(v: i64) -> bool {
+    let Some(class) = value::instance_class_value(v) else {
+        return false;
+    };
+    crate::core::globals::registry_get("typing.TypeAliasType") == Some(class)
+}
+
+/// `TypeAliasType(name, value, *, type_params=(), module=...)`.
+///
+/// `module` is Hydro-specific: CPython derives the defining module from the
+/// caller frame, which a native class cannot inspect, so the lowering passes
+/// the compilation unit's name explicitly. A direct CPython-shaped call falls
+/// back to the entry module.
+extern "C" fn init_type_alias_type(argv: *const i64) -> i64 {
+    // SAFETY: the class-call binder passes one slot per declared parameter.
+    let instance = unsafe { *argv };
+    let name = unsafe { *argv.add(1) };
+    let value_arg = unsafe { *argv.add(2) };
+    let kwargs = unsafe { *argv.add(3) };
+    let mut type_params = value::tuple_new(Vec::new());
+    let mut module = NONE;
+    if let Some(pairs) = value::as_dict(kwargs) {
+        for (key, item) in pairs {
+            let Some(keyword) = value::as_str(*key) else {
+                return type_error("keyword names must be str");
+            };
+            match keyword {
+                "type_params" => type_params = *item,
+                "module" => module = *item,
+                other => {
+                    return type_error(&format!(
+                        "typealias() got an unexpected keyword argument '{other}'"
+                    ))
+                }
+            }
+        }
+    }
+    let roots = heap::root_values(&[instance, name, value_arg, type_params, module]);
+    let result = populate_type_alias(instance, name, value_arg, type_params, module);
+    heap::release_roots(roots);
+    result
+}
+
+/// Stores the CPython `TypeAliasType` attributes on a fresh instance.
+fn populate_type_alias(
+    instance: i64,
+    name: i64,
+    value_arg: i64,
+    type_params: i64,
+    module: i64,
+) -> i64 {
+    let Some(name_text) = value::as_str(name) else {
+        return type_error(&format!(
+            "typealias() argument 'name' must be str, not {}",
+            value::type_name(name)
+        ));
+    };
+    let name = value::str_alloc(name_text.to_string());
+    if value::as_tuple(type_params).is_none() {
+        return type_error("type_params must be a tuple");
+    }
+    let module = if value::as_str(module).is_some() {
+        module
+    } else if module == NONE {
+        value::str_alloc("__main__".to_string())
+    } else {
+        return type_error(&format!(
+            "typealias() argument 'module' must be str, not {}",
+            value::type_name(module)
+        ));
+    };
+    let roots = heap::root_values(&[instance, name, value_arg, type_params, module]);
+    for (attribute, item) in [
+        ("__name__", name),
+        ("__value__", value_arg),
+        ("__type_params__", type_params),
+        ("__parameters__", type_params),
+        ("__module__", module),
+    ] {
+        value::instance_setattr(instance, attribute.to_string(), item);
+    }
+    heap::release_roots(roots);
+    NONE
+}
+
+/// `typing._type_alias_new(name, value, type_params, module)`: the lowering
+/// target for `type X = expr` / `type X[T] = expr`.
+fn new_type_alias(args: &[i64]) -> i64 {
+    let name = args.first().copied().unwrap_or(NONE);
+    let value_arg = args.get(1).copied().unwrap_or(NONE);
+    let type_params = args.get(2).copied().unwrap_or(NONE);
+    let module = args.get(3).copied().unwrap_or(NONE);
+    let instance = value::instance_new(type_alias_type_class());
+    let roots = heap::root_values(&[instance, name, value_arg, type_params, module]);
+    let result = populate_type_alias(instance, name, value_arg, type_params, module);
+    heap::release_roots(roots);
+    if exc::pending() {
+        return result;
+    }
+    instance
+}
+
+/// `repr(alias) == alias.__name__` (CPython 3.14).
+extern "C" fn type_alias_type_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` first.
+    let instance = unsafe { *argv };
+    match value::instance_attr(instance, "__name__") {
+        Some(name) if value::as_str(name).is_some() => name,
+        _ => value::str_alloc("TypeAliasType".to_string()),
+    }
+}
+
+extern "C" fn type_alias_type_getitem_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` then the index operand.
+    let instance = unsafe { *argv };
+    let parameters = unsafe { *argv.add(1) };
+    type_alias_getitem(instance, parameters)
+}
+
+/// `alias[parameters]`: only a generic alias (`type X[T] = ...`) accepts one.
+fn type_alias_getitem(alias: i64, parameters: i64) -> i64 {
+    let generic = value::instance_attr(alias, "__type_params__")
+        .and_then(value::as_tuple)
+        .is_some_and(|items| !items.is_empty());
+    if !generic {
+        return type_error("Only generic type aliases are subscriptable");
+    }
+    generic_alias_of(alias, parameters)
+}
+
 /// Materialises the module constant `name`.
 pub(crate) fn constant(name: &str) -> i64 {
     if name == "TYPE_CHECKING" {
@@ -799,6 +1057,9 @@ pub(crate) fn constant(name: &str) -> i64 {
     }
     if name == "ForwardRef" {
         return forward_ref_class();
+    }
+    if name == "TypeAliasType" {
+        return type_alias_type_class();
     }
     if name == "ParamSpec" || name == "TypeVarTuple" {
         return typevar_like_class(name);
@@ -833,6 +1094,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         // frontend still consumes annotations itself, but the value is real
         // enough for `repr`/attribute introspection.
         "TypeVar" => new_typevar(args, &[]),
+        // Lowering target for a PEP 695 `type X = expr` statement.
+        "_type_alias_new" => new_type_alias(args),
         // `NewType("Name", int)` is called like the underlying type in the
         // corpus, so the underlying type is the usable stand-in.
         "NewType" => args.get(1).copied().unwrap_or(NONE),
@@ -1328,16 +1591,21 @@ fn deduplicate(args: &[i64], keywords: &[(String, i64)]) -> i64 {
 fn generic_class_getitem(args: &[i64]) -> i64 {
     let cls = args.first().copied().unwrap_or(NONE);
     let parameters = args.get(1).copied().unwrap_or(NONE);
+    generic_alias_of(cls, parameters)
+}
+
+/// Builds a `typing._GenericAlias` with `origin` and `parameters`.
+fn generic_alias_of(origin: i64, parameters: i64) -> i64 {
     let items: Vec<i64> = match value::as_tuple(parameters) {
         Some(items) => items.to_vec(),
         None => vec![parameters],
     };
     let class = cached_class("_GenericAlias");
-    let origins = [cls, value::tuple_new(items), class];
+    let origins = [origin, value::tuple_new(items), class];
     let roots = heap::root_values(&origins);
     let instance = value::instance_new(class);
     let args_tuple = origins[1];
-    value::instance_setattr(instance, "__origin__".to_string(), cls);
+    value::instance_setattr(instance, "__origin__".to_string(), origin);
     value::instance_setattr(instance, "__args__".to_string(), args_tuple);
     heap::release_roots(roots);
     instance
@@ -1581,6 +1849,10 @@ mod tests {
         value::str_alloc(s.to_string())
     }
 
+    fn pending_message() -> String {
+        value::to_string(exc::pending_value())
+    }
+
     #[test]
     fn type_checking_is_false() {
         exc::init();
@@ -1765,6 +2037,168 @@ mod tests {
         exc::clear();
         call_kw("TypeVar", &[text("T")], &[("name".to_string(), text("S"))]);
         assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn type_alias_type_stores_attributes_and_reprs_as_its_name() {
+        exc::init();
+        let class = constant("TypeAliasType");
+        assert_eq!(
+            as_class(class).map(|state| state.name.clone()).as_deref(),
+            Some("TypeAliasType")
+        );
+        // Cached: `isinstance` targets and construction share one identity.
+        assert_eq!(constant("TypeAliasType"), class);
+        assert!(!exc::pending());
+
+        let value = constant("Tuple");
+        let empty = value::tuple_new(Vec::new());
+        let alias = call(
+            "_type_alias_new",
+            &[text("Shape"), value, empty, text("__main__")],
+        );
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(value::instance_class_value(alias), Some(class));
+        assert_eq!(
+            value::instance_attr(alias, "__name__").and_then(value::as_str),
+            Some("Shape")
+        );
+        assert_eq!(value::instance_attr(alias, "__value__"), Some(value));
+        assert_eq!(
+            value::instance_attr(alias, "__type_params__")
+                .and_then(as_tuple)
+                .map(|items| items.len()),
+            Some(0)
+        );
+        assert_eq!(
+            value::instance_attr(alias, "__parameters__")
+                .and_then(as_tuple)
+                .map(|items| items.len()),
+            Some(0)
+        );
+        assert_eq!(
+            value::instance_attr(alias, "__module__").and_then(value::as_str),
+            Some("__main__")
+        );
+        assert_eq!(value::repr(alias), "Shape");
+
+        // A non-generic alias rejects subscription like CPython.
+        let class_int = value::class_new("int".to_string(), NONE, Vec::new());
+        let rejected = crate::core::container::subscript(alias, class_int);
+        assert_eq!(rejected, NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "Only generic type aliases are subscriptable"
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn generic_type_alias_is_subscriptable_and_composes_into_unions() {
+        exc::init();
+        let param = call("TypeVar", &[text("T")]);
+        assert!(!exc::pending());
+        let params = value::tuple_new(vec![param]);
+        let tuple_class = constant("Tuple");
+        let alias = call(
+            "_type_alias_new",
+            &[text("Vector"), tuple_class, params, text("pkg")],
+        );
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(
+            value::instance_attr(alias, "__type_params__")
+                .and_then(as_tuple)
+                .map(|items| items.to_vec()),
+            Some(vec![param])
+        );
+        assert_eq!(
+            value::instance_attr(alias, "__module__").and_then(value::as_str),
+            Some("pkg")
+        );
+
+        // `Vector[int]` is a `_GenericAlias` over the alias value.
+        let class_int = value::class_new("int".to_string(), NONE, Vec::new());
+        let specialized = crate::core::container::subscript(alias, class_int);
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(value::instance_attr(specialized, "__origin__"), Some(alias));
+        assert_eq!(
+            value::instance_attr(specialized, "__args__")
+                .and_then(as_tuple)
+                .map(|items| items.to_vec()),
+            Some(vec![class_int])
+        );
+
+        // A PEP 695 alias is a union member on either operand side.
+        let union = crate::modules::types::union_binary_or(alias, class_int).expect("union");
+        assert_eq!(value::repr(union), "Vector | int");
+        let union = crate::modules::types::union_binary_or(class_int, alias).expect("union");
+        assert_eq!(value::repr(union), "int | Vector");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn type_alias_constructor_validates_name_type_params_and_module() {
+        exc::init();
+        let class = constant("TypeAliasType");
+        let instance = value::instance_new(class);
+        let empty = value::tuple_new(Vec::new());
+        let bad_name = populate_type_alias(
+            instance,
+            value::encode_int(1).expect("int"),
+            NONE,
+            empty,
+            NONE,
+        );
+        assert_eq!(bad_name, NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "typealias() argument 'name' must be str, not int"
+        );
+        exc::clear();
+
+        let bad_params = populate_type_alias(instance, text("X"), NONE, NONE, NONE);
+        assert_eq!(bad_params, NONE);
+        assert_eq!(pending_message(), "type_params must be a tuple");
+        exc::clear();
+
+        // `_type_alias_new` defaults `__module__` to the entry module.
+        let alias = call("_type_alias_new", &[text("X"), NONE, empty, NONE]);
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(
+            value::instance_attr(alias, "__module__").and_then(value::as_str),
+            Some("__main__")
+        );
+    }
+
+    #[test]
+    fn type_var_tuple_is_iterable_and_yields_unpack() {
+        exc::init();
+        let tuple_var = call("TypeVarTuple", &[text("Ts")]);
+        assert!(!exc::pending());
+        let iter = crate::core::iter::iter_of(tuple_var);
+        let first = crate::core::iter::next_value(iter, NONE, false);
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(value::class_display_name(first), Some("Unpack"));
+        let end = crate::core::iter::next_value(iter, NONE, true);
+        assert!(!exc::pending());
+        assert_eq!(end, NONE);
+        // `tuple[*Ts]` lowers to `tuple(Ts)`, so the conversion consumes the
+        // same iteration protocol and produces the one-element member tuple.
+        let converted = crate::core::builtins::tuple_from(tuple_var);
+        assert!(!exc::pending(), "{:?}", pending_message());
+        let converted_items = as_tuple(converted).expect("tuple");
+        assert_eq!(converted_items.len(), 1);
+        assert_eq!(
+            value::class_display_name(converted_items[0]),
+            Some("Unpack")
+        );
+        // `ParamSpec` is not iterable, like CPython's.
+        let param = call("ParamSpec", &[text("P")]);
+        crate::core::iter::iter_of(param);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         exc::clear();
     }
 
