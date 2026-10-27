@@ -1988,16 +1988,24 @@ pub(crate) struct DescriptorState {
     pub(crate) deleter: i64,
 }
 
-/// State of a module value: its import name. The value holds no Hydro
-/// children; attribute access goes through `crate::modules`.
+/// State of a module value: its import name and, for a compiled extension
+/// module, the shared-object path attribute reads dispatch through. The value
+/// holds no Hydro children; attribute access goes through `crate::modules`.
 pub(crate) struct ModuleState {
     pub(crate) name: String,
+    /// Canonical shared-object path for an extension module.
+    pub(crate) path: Option<String>,
 }
 
 impl ModuleState {
     /// The module's import name, e.g. `"errno"`.
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The shared-object path when this value is a compiled extension module.
+    pub(crate) fn path(&self) -> Option<&str> {
+        self.path.as_deref()
     }
 }
 
@@ -5256,7 +5264,24 @@ pub(crate) fn class_new_multi_abi(
 
 /// Allocates a module value rendering as `<module 'name'>`.
 pub(crate) fn module_value(name: String) -> i64 {
-    alloc(KIND_MODULE, ObjData::Module(ModuleState { name }))
+    alloc(
+        KIND_MODULE,
+        ObjData::Module(ModuleState { name, path: None }),
+    )
+}
+
+/// Allocates a module value for a compiled extension module.
+///
+/// `name` is the import name reported by `__name__`; `path` is the canonical
+/// shared object the runtime loads on attribute access.
+pub(crate) fn extension_module_value(name: String, path: String) -> i64 {
+    alloc(
+        KIND_MODULE,
+        ObjData::Module(ModuleState {
+            name,
+            path: Some(path),
+        }),
+    )
 }
 
 /// Allocates an instance of `class` with an empty attribute table.

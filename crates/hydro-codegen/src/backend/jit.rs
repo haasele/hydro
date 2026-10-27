@@ -100,6 +100,7 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         hydro_math_floor_sqrt_int,
         hydro_module_get,
         hydro_module_value,
+        hydro_extension_module_value,
         hydro_deferred_import,
         hydro_global_get,
         hydro_global_set,

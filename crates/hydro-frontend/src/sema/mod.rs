@@ -2397,7 +2397,7 @@ impl<'a> Checker<'a> {
                     self.force_any(expr.ty);
                 }
             }
-            HExprKind::ModuleRef { .. } => {
+            HExprKind::ModuleRef { .. } | HExprKind::ExtensionModuleRef { .. } => {
                 // A module value has no static type; attributes read from it
                 // are resolved at runtime.
                 self.force_any(expr.ty);
@@ -5118,6 +5118,10 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
         },
         HExprKind::ModuleRef { module } => ExprKind::ModuleRef {
             module: module.clone(),
+        },
+        HExprKind::ExtensionModuleRef { module, path } => ExprKind::ExtensionModuleRef {
+            module: module.clone(),
+            path: path.clone(),
         },
         HExprKind::GlobalGet { module, name } => ExprKind::GlobalGet {
             module: module.clone(),

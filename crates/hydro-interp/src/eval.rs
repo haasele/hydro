@@ -186,6 +186,13 @@ impl Interp {
                 let value = abi::hydro_module_value(ptr, len);
                 self.check(value)
             }
+            ExprKind::ExtensionModuleRef { module, path } => {
+                let (name_ptr, name_len) = bytes(module);
+                let (path_ptr, path_len) = bytes(path);
+                let value =
+                    abi::hydro_extension_module_value(name_ptr, name_len, path_ptr, path_len);
+                self.check(value)
+            }
             ExprKind::DeferredImport { module, member } => {
                 let (module_ptr, module_len) = bytes(module);
                 let (member_ptr, member_len) = bytes(member.as_deref().unwrap_or(""));

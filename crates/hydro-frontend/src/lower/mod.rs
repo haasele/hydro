@@ -560,6 +560,13 @@ pub enum HExprKind {
     ModuleRef {
         module: String,
     },
+    /// A compiled extension module used as a value (`m = ext`,
+    /// `getattr(ext, ...)`). `path` is the shared object resolved by the
+    /// frontend; the runtime module object keeps it for attribute reads.
+    ExtensionModuleRef {
+        module: String,
+        path: String,
+    },
     /// Name bound by a nested import that was not linked at compile time.
     /// Evaluating it raises `RuntimeError` from the runtime helper.
     DeferredImport {
@@ -1053,6 +1060,16 @@ pub(crate) enum ExtensionLookup {
     Incompatible { path: PathBuf, reason: String },
     /// No shared object with a supported suffix exists.
     Missing,
+}
+
+/// A compiled extension module bound by an import.
+///
+/// `module` is the import name reported by `__name__`; `path` is the canonical
+/// shared object the runtime loads on demand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExtensionAlias {
+    pub(crate) module: String,
+    pub(crate) path: String,
 }
 
 /// Looks up a compiled extension for `name` in `dir`.
@@ -1668,9 +1685,9 @@ pub struct Lowerer<'a> {
     module_aliases: HashMap<String, &'static ModuleSpec>,
     /// `import X [as Y]` bindings of user modules: alias -> module name.
     user_module_aliases: HashMap<String, String>,
-    /// `import ext [as e]` bindings of compiled extensions: alias -> shared
-    /// object path (canonical absolute).
-    extension_aliases: HashMap<String, String>,
+    /// `import ext [as e]` bindings of compiled extensions: alias -> module
+    /// import name and canonical shared object path.
+    extension_aliases: HashMap<String, ExtensionAlias>,
     /// `from ext import member [as x]` bindings: name -> (path, member).
     imported_extension_members: HashMap<String, (String, String)>,
     /// User modules visible to this unit, keyed by the name in the import.
@@ -3628,8 +3645,13 @@ impl<'a> Lowerer<'a> {
                     );
                     return;
                 }
-                self.extension_aliases
-                    .insert(binding.to_string(), path.to_string_lossy().into_owned());
+                self.extension_aliases.insert(
+                    binding.to_string(),
+                    ExtensionAlias {
+                        module: module.to_string(),
+                        path: path.to_string_lossy().into_owned(),
+                    },
+                );
                 return;
             }
             ExtensionLookup::Incompatible { path, reason } => {
@@ -3787,8 +3809,13 @@ impl<'a> Lowerer<'a> {
                 // runtime import failure is catchable.
                 match self.find_extension(&submodule) {
                     ExtensionLookup::Found(path) => {
-                        self.extension_aliases
-                            .insert(binding.to_string(), path.to_string_lossy().into_owned());
+                        self.extension_aliases.insert(
+                            binding.to_string(),
+                            ExtensionAlias {
+                                module: submodule.clone(),
+                                path: path.to_string_lossy().into_owned(),
+                            },
+                        );
                         continue;
                     }
                     ExtensionLookup::Incompatible { path, reason } => {
@@ -3948,8 +3975,13 @@ impl<'a> Lowerer<'a> {
                 // non-late branch does.
                 match self.find_extension(&submodule) {
                     ExtensionLookup::Found(path) => {
-                        self.extension_aliases
-                            .insert(binding.to_string(), path.to_string_lossy().into_owned());
+                        self.extension_aliases.insert(
+                            binding.to_string(),
+                            ExtensionAlias {
+                                module: submodule.clone(),
+                                path: path.to_string_lossy().into_owned(),
+                            },
+                        );
                     }
                     ExtensionLookup::Incompatible { path, reason } => {
                         if self.may_defer_at(imported, nested) {
@@ -4622,7 +4654,9 @@ impl<'a> Lowerer<'a> {
         if fs.lookup(name.id.as_str()).is_some() {
             return None;
         }
-        self.extension_aliases.get(name.id.as_str()).cloned()
+        self.extension_aliases
+            .get(name.id.as_str())
+            .map(|alias| alias.path.clone())
     }
 
     /// Lowers `ext.member(...)` / `member(...)` for a compiled extension.
@@ -4897,21 +4931,6 @@ impl<'a> Lowerer<'a> {
             range,
             codes::ATTRIBUTE,
             format!("module '{}' has no attribute '{}'", module.name, member),
-        );
-    }
-
-    fn error_module_value(&mut self, range: TextRange, name: &str) {
-        let (line, col, end_col) = self.span_range(range);
-        self.diags.push(
-            Diagnostic::new(
-                self.filename,
-                line,
-                col,
-                format!("module values are not supported yet: '{name}' is a module"),
-            )
-            .with_code(codes::UNSUPPORTED)
-            .with_span(end_col)
-            .with_help("use an attribute or call a module function instead"),
         );
     }
 
@@ -14190,8 +14209,7 @@ impl<'a> Lowerer<'a> {
                         col,
                     }
                 } else if let Some(module) = self.module_aliases.get(name).copied() {
-                    // A stdlib module is a first-class runtime value; user and
-                    // extension modules are still rejected.
+                    // A stdlib module is a first-class runtime value.
                     HExpr {
                         kind: HExprKind::ModuleRef {
                             module: module.name.to_string(),
@@ -14213,9 +14231,20 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
-                } else if self.extension_aliases.contains_key(name) {
-                    self.error_module_value(n.range, name);
-                    self.error_expr(e.range())
+                } else if let Some(alias) = self.extension_aliases.get(name) {
+                    // A compiled extension module is a first-class runtime
+                    // value: the runtime module object keeps the shared-object
+                    // path, so `getattr(ext, name)`, identity and attribute
+                    // reads all resolve through the extension ABI.
+                    HExpr {
+                        kind: HExprKind::ExtensionModuleRef {
+                            module: alias.module.clone(),
+                            path: alias.path.clone(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
                 } else if let Some(binding) = self.deferred_imports.get(name) {
                     let module = binding.module.clone();
                     let member = binding.member.clone();
@@ -14575,9 +14604,11 @@ impl<'a> Lowerer<'a> {
                     if let Some(expr) = self.module_spec_attr_expr(module, member, line, col) {
                         return expr;
                     }
-                    if module.name == "os" && member == "path" {
-                        self.error_module_value(a.range, "os.path");
-                        return self.error_expr(e.range());
+                    // A nested native module (`os.path`, `collections.abc`)
+                    // is itself a first-class module value.
+                    let nested = format!("{}.{}", module.name, member);
+                    if let Some(spec) = stdlib::module(&nested) {
+                        return self.module_ref_expr(spec.name, line, col);
                     }
                     self.error_unknown_member(a.range, module, member);
                     return self.error_expr(e.range());
@@ -16977,7 +17008,11 @@ impl<'a> Lowerer<'a> {
             || self.user_module_aliases.contains_key(name)
             || self.extension_aliases.contains_key(name)
         {
-            self.error_module_value(name_expr.range, name);
+            self.error_at_code(
+                name_expr.range,
+                codes::CALL,
+                "'module' object is not callable".to_string(),
+            );
             return self.error_expr(call.range);
         }
 

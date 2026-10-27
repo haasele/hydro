@@ -2377,6 +2377,65 @@ pub(crate) fn registry_lookup(name: &str) -> Option<i64> {
         .find_map(|(key, value)| (value::as_str(*key) == Some(name)).then_some(*value))
 }
 
+/// Module object for `name`, cached in `sys.modules`.
+///
+/// Repeated materialisations of a module value (`m = errno`, `getattr(errno,
+/// ...)`) return the same object, matching CPython's module identity. A module
+/// that is not registered yet is inserted so later `sys.modules` reads and
+/// materialisations observe the same value.
+pub(crate) fn module_value_by_name(name: &str) -> i64 {
+    if let Some(existing) = registry_lookup(name) {
+        return existing;
+    }
+    let module = value::module_value(name.to_string());
+    publish_module(name, module);
+    module
+}
+
+/// Module object for a compiled extension module, cached by import name.
+///
+/// The value keeps `path`, so attribute reads dispatch through
+/// [`extension::get`] while identity and `sys.modules` membership match the
+/// other module kinds.
+pub(crate) fn extension_module_value(name: &str, path: &str) -> i64 {
+    if let Some(existing) = registry_lookup(name) {
+        return existing;
+    }
+    let module = value::extension_module_value(name.to_string(), path.to_string());
+    publish_module(name, module);
+    module
+}
+
+/// Inserts a freshly materialised module into the cached `sys.modules` dict.
+fn publish_module(name: &str, module: i64) {
+    // The freshly allocated value is not reachable from generated code yet;
+    // root it across the registry lookup, key allocation and insert.
+    let module_root = crate::heap::root_values(&[module]);
+    let modules = sys_modules();
+    if !registry_contains(modules, name) {
+        let key = value::str_alloc(name.to_string());
+        let insert_roots = crate::heap::root_values(&[key]);
+        container::dict_set(modules, key, module);
+        crate::heap::release_roots(insert_roots);
+    }
+    crate::heap::release_roots(module_root);
+}
+
+/// Resolves `module.name` for a module value, including extension modules.
+///
+/// A plain module keeps the native/user dispatch of [`module_get_by_name`].
+/// An extension module resolves the attribute through the shared-object path
+/// stored in the value, so `getattr(ext, n)` and `ext.n` behave identically.
+pub(crate) fn module_attr(module: &value::ModuleState, name: &str) -> i64 {
+    if name == "__name__" {
+        return value::str_alloc(module.name().to_string());
+    }
+    if let Some(path) = module.path() {
+        return extension::get(path.as_ptr(), path.len(), name.as_ptr(), name.len());
+    }
+    module_get_by_name(module.name(), name)
+}
+
 /// Module value of the nested `collections.abc` module, shared by the
 /// `collections.abc` and `collections.abc.abc` constant spellings so both
 /// resolve to the exact `sys.modules` entry.

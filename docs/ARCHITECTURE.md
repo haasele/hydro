@@ -224,6 +224,10 @@ i64  hydro_module_call_kw(const uint8_t* module, size_t module_len,
 i64  hydro_module_get(const uint8_t* module, size_t module_len,
                     const uint8_t* name, size_t name_len);
 i64  hydro_module_value(const uint8_t* module, size_t module_len);
+                     // canonical sys.modules entry for the import name
+i64  hydro_extension_module_value(const uint8_t* module, size_t module_len,
+                                 const uint8_t* path, size_t path_len);
+                     // extension module value; attributes read through path
 i64  hydro_deferred_import(const uint8_t* module, size_t module_len,
                          const uint8_t* member, size_t member_len);
                      // resolves an already-initialized module global when
@@ -1290,7 +1294,9 @@ with a C-variadic `PyArg_ParseTuple`; the frontend resolves sibling
 `.so`/`.abi3.so` files at compile time and lowers `ext.member(...)`/
 `from ext import member` to `Callee::Extension`/`ExprKind::ExtensionAttr`;
 `hydro_extension_call`/`hydro_extension_get` load and cache modules lazily
-(`modules/extension.rs`). Scalars, strings, bytes, floats, lists, tuples and
+(`modules/extension.rs`); `hydro_extension_module_value` materializes the
+module itself as a first-class value, so aliases can be stored, passed to
+`getattr`/`hasattr` and compared by identity. Scalars, strings, bytes, floats, lists, tuples and
 dicts convert recursively in both directions (bounded copies); capsules and
 read-only contiguous bytes buffers are supported. Extension discovery includes
 sibling files, `HYDRO_EXTENSION_PATH`, `PYTHONPATH`, `HYDRO_SITE_PACKAGES` and

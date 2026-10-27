@@ -234,6 +234,16 @@ pub enum ExprKind {
     ModuleRef {
         module: String,
     },
+    /// Reference to a compiled CPython extension module as a value
+    /// (`import ext as e`, then `getattr(e, ...)` or `m = e`).
+    ///
+    /// `module` is the import name and `path` the shared object resolved by
+    /// the frontend. Codegen materializes a runtime module object that keeps
+    /// the path, so attributes are resolved through the extension ABI.
+    ExtensionModuleRef {
+        module: String,
+        path: String,
+    },
     /// Name bound by an import nested inside a function/class/compound body
     /// that was not linked at compile time. Evaluating it calls the runtime
     /// `hydro_deferred_import` helper, which raises `RuntimeError`: Hydro cannot

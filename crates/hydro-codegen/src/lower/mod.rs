@@ -207,6 +207,8 @@ struct Runtime {
     math_floor_sqrt_int: FuncId,
     module_get: FuncId,
     module_value: FuncId,
+    /// Materializes a compiled extension module value (import name + path).
+    extension_module_value: FuncId,
     deferred_import: FuncId,
     global_get: FuncId,
     global_set: FuncId,
@@ -542,6 +544,13 @@ impl Runtime {
             )?,
             // `name_len` is a `size_t` in the ABI: pointer-width.
             module_value: declare_runtime(module, "hydro_module_value", &[ptr, ptr], Some(i64t))?,
+            // Import name and shared-object path, each a pointer/length pair.
+            extension_module_value: declare_runtime(
+                module,
+                "hydro_extension_module_value",
+                &[ptr, ptr, ptr, ptr],
+                Some(i64t),
+            )?,
             // Module name and optional member, each a pointer/length pair. The
             // helper always raises, so it never binds a real value.
             deferred_import: declare_runtime(
@@ -1489,6 +1498,7 @@ fn count_expr(expr: &Expr) -> usize {
         | ExprKind::BuiltinRef(_)
         | ExprKind::ExceptionClass(_)
         | ExprKind::ModuleRef { .. }
+        | ExprKind::ExtensionModuleRef { .. }
         | ExprKind::DeferredImport { .. }
         | ExprKind::ModuleAttr { .. }
         | ExprKind::GlobalGet { .. }
@@ -4644,6 +4654,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 keywords,
             } => self.lower_module_call(module, function, args, keywords),
             ExprKind::ModuleRef { module } => self.lower_module_ref(module),
+            ExprKind::ExtensionModuleRef { module, path } => {
+                self.lower_extension_module_ref(module, path)
+            }
             ExprKind::DeferredImport { module, member } => {
                 self.lower_deferred_import(module, member.as_deref())
             }
@@ -5625,6 +5638,26 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
         let id = self.runtime.module_value;
         let result = self.call_rt(id, &[name_ptr, name_len])?;
+        self.emit_exc_check()?;
+        Ok(result)
+    }
+
+    /// Lower an extension module used as a value to
+    /// `hydro_extension_module_value(name, path)`.
+    fn lower_extension_module_ref(
+        &mut self,
+        module: &str,
+        path: &str,
+    ) -> Result<Value, CodegenError> {
+        // Empty names still get a valid, non-null pointer to a one-byte slot.
+        let (name_slot, name_len) = make_bytes_slot(&mut self.builder, module.as_bytes())?;
+        let name_ptr = self.builder.ins().stack_addr(self.ptr_ty, name_slot, 0);
+        let name_len = self.builder.ins().iconst(self.ptr_ty, name_len as i64);
+        let (path_slot, path_len) = make_bytes_slot(&mut self.builder, path.as_bytes())?;
+        let path_ptr = self.builder.ins().stack_addr(self.ptr_ty, path_slot, 0);
+        let path_len = self.builder.ins().iconst(self.ptr_ty, path_len as i64);
+        let id = self.runtime.extension_module_value;
+        let result = self.call_rt(id, &[name_ptr, name_len, path_ptr, path_len])?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -9823,6 +9856,24 @@ mod tests {
         assert!(
             runtime_call_sites(&object, "hydro_module_value") > 0,
             "the module value must reference hydro_module_value"
+        );
+    }
+
+    #[test]
+    fn extension_module_ref_lowers_to_hydro_extension_module_value() {
+        let program = program_assigning(Expr::new(
+            ExprKind::ExtensionModuleRef {
+                module: "mod_ext".to_string(),
+                path: "/tmp/mod_ext.abi3.so".to_string(),
+            },
+            Type::Any,
+            1,
+        ));
+        let object = crate::compile_object(&program)
+            .expect("an extension module value must lower to object code");
+        assert!(
+            runtime_call_sites(&object, "hydro_extension_module_value") > 0,
+            "the extension module value must reference hydro_extension_module_value"
         );
     }
 

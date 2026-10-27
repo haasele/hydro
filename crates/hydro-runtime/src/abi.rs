@@ -1115,7 +1115,8 @@ pub extern "C" fn hydro_global_get(
 
 /// `module_name` used as a value (`getattr(module_name, attribute)`).
 ///
-/// Materialises a module object from the import name; its attributes are
+/// Materialises the runtime module object for an import name, reusing the
+/// `sys.modules` entry so every read shares one identity. Its attributes are
 /// resolved on demand by `hydro_getattr`/`getattr`. An empty or malformed name
 /// raises `TypeError` and returns `None`.
 #[no_mangle]
@@ -1123,7 +1124,32 @@ pub extern "C" fn hydro_module_value(name_ptr: *const c_uchar, name_len: usize) 
     let Some(name) = required_name(name_ptr, name_len) else {
         return exc::raise_with_message(exc::TYPE_ERROR, "module name must be a non-empty string");
     };
-    value::module_value(name)
+    modules::module_value_by_name(&name)
+}
+
+/// `extension_module_name` used as a value (`import ext as e; getattr(e, n)`).
+///
+/// Materialises a module object that keeps the compiled shared-object `path`;
+/// attribute reads dispatch through the extension ABI. The value is cached
+/// under its import name, so repeated reads and `sys.modules` share identity.
+/// Empty or malformed buffers raise `TypeError`.
+#[no_mangle]
+pub extern "C" fn hydro_extension_module_value(
+    name_ptr: *const c_uchar,
+    name_len: usize,
+    path_ptr: *const c_uchar,
+    path_len: usize,
+) -> i64 {
+    let (Some(name), Some(path)) = (
+        required_name(name_ptr, name_len),
+        required_name(path_ptr, path_len),
+    ) else {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "extension module name and path must be non-empty strings",
+        );
+    };
+    modules::extension_module_value(&name, &path)
 }
 
 /// Name bound by a function-local import that was not linked at compile time.
@@ -2136,6 +2162,41 @@ mod tests {
         assert_eq!(hydro_hasattr(math, b"tau".as_ptr(), 3), hydro_true());
         assert_eq!(hydro_hasattr(math, b"nope".as_ptr(), 4), hydro_false());
         assert_eq!(hydro_exc_pending(), 0);
+    }
+
+    #[test]
+    fn module_values_share_identity_and_extensions_keep_their_name() {
+        hydro_runtime_init();
+
+        // Every materialisation of a module value returns the same
+        // `sys.modules` object, including a read through `sys.modules`.
+        let first = hydro_module_value(b"math".as_ptr(), 4);
+        let second = hydro_module_value(b"math".as_ptr(), 4);
+        assert_eq!(first, second);
+        assert_eq!(
+            value::as_module(first).map(|module| module.name()),
+            Some("math")
+        );
+        let modules = hydro_module_get(b"sys".as_ptr(), 3, b"modules".as_ptr(), 7);
+        let key = hydro_str_new(b"math".as_ptr(), 4);
+        assert_eq!(hydro_subscript(modules, key), first);
+
+        // Extension module values are cached under their import name and keep
+        // the shared-object path for attribute reads.
+        let name = b"pkg._ext";
+        let path = b"/tmp/_ext.abi3.so";
+        let ext =
+            hydro_extension_module_value(name.as_ptr(), name.len(), path.as_ptr(), path.len());
+        let again =
+            hydro_extension_module_value(name.as_ptr(), name.len(), path.as_ptr(), path.len());
+        assert_eq!(ext, again);
+        assert_eq!(hydro_exc_pending(), 0);
+        let reported = hydro_getattr(ext, b"__name__".as_ptr(), 8);
+        assert_eq!(value::as_str(reported), Some("pkg._ext"));
+        assert_eq!(
+            value::as_module(ext).and_then(|module| module.path()),
+            Some("/tmp/_ext.abi3.so")
+        );
     }
 
     fn make_list(items: &[i64]) -> i64 {

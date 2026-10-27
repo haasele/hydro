@@ -187,11 +187,14 @@ fn from_os_path_import_lowers_to_module_calls() {
 }
 
 #[test]
-fn os_path_value_is_rejected() {
+fn os_path_value_is_a_first_class_module() {
     let source = "import os\np = os.path\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert!(diags[0].message.contains("os"), "{diags:?}");
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "p").kind,
+        HExprKind::ModuleRef { module } if module == "os.path"
+    ));
 }
 
 #[test]
@@ -8754,14 +8757,25 @@ fn missing_extension_module_still_diagnoses() {
 }
 
 #[test]
-fn extension_alias_used_as_value_is_rejected() {
+fn extension_alias_used_as_value_is_a_module() {
     let dir = ExtensionDir::new("alias-value");
-    dir.add_extension("mod_ext.abi3.so");
+    let so = dir.add_extension("mod_ext.abi3.so");
+    let expected_path = fs::canonicalize(&so)
+        .expect("canonical extension path")
+        .to_string_lossy()
+        .into_owned();
     let source = "import mod_ext as ext\nx = ext\n";
-    let (_, _, diags) = lower_source_in(&dir.path, source);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::UNSUPPORTED);
-    assert!(diags[0].message.contains("'ext' is a module"), "{diags:?}");
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "x").kind {
+        HExprKind::ExtensionModuleRef { module, path } => {
+            assert_eq!(
+                (module.as_str(), path.as_str()),
+                ("mod_ext", expected_path.as_str())
+            );
+        }
+        other => panic!("expected an extension module value, got {other:?}"),
+    }
 }
 
 #[test]
@@ -9211,6 +9225,214 @@ fn module_alias_lowers_to_a_first_class_module_value() {
         HExprKind::ModuleRef { module } => assert_eq!(module, "helper"),
         other => panic!("expected a module reference, got {other:?}"),
     }
+}
+
+#[test]
+fn extension_module_alias_is_a_first_class_value() {
+    // `import mod_ext as ext` binds a real module object: it can be passed to
+    // `getattr` (with and without a default), stored, put in a container,
+    // returned and compared for identity.
+    let dir = ExtensionDir::new("module-value");
+    let so = dir.add_extension("mod_ext.abi3.so");
+    let expected_path = fs::canonicalize(&so)
+        .expect("canonical extension path")
+        .to_string_lossy()
+        .into_owned();
+
+    let source = r#"import mod_ext as ext
+value = getattr(ext, "tag", None)
+stored = ext
+box = [ext]
+def returned():
+    return ext
+same = ext is ext
+"#;
+    let (hir, mut infer, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let HExprKind::Call { callee, args } = &assigned(&hir, "value").kind else {
+        panic!(
+            "expected a getattr call, got {:?}",
+            assigned(&hir, "value").kind
+        );
+    };
+    assert_eq!(*callee, Callee::Builtin(Builtin::Getattr));
+    assert_eq!(args.len(), 3);
+    match &args[0].kind {
+        HExprKind::ExtensionModuleRef { module, path } => {
+            assert_eq!(
+                (module.as_str(), path.as_str()),
+                ("mod_ext", expected_path.as_str())
+            );
+        }
+        other => panic!("expected an extension module value, got {other:?}"),
+    }
+
+    match &assigned(&hir, "stored").kind {
+        HExprKind::ExtensionModuleRef { module, path } => {
+            assert_eq!(
+                (module.as_str(), path.as_str()),
+                ("mod_ext", expected_path.as_str()),
+                "`stored = ext` must bind the module value"
+            );
+        }
+        other => panic!("expected a module value, got {other:?}"),
+    }
+
+    let HExprKind::List(items) = &assigned(&hir, "box").kind else {
+        panic!(
+            "expected a list literal, got {:?}",
+            assigned(&hir, "box").kind
+        );
+    };
+    assert!(matches!(
+        &items[0].kind,
+        HExprKind::ExtensionModuleRef { module, .. } if module == "mod_ext"
+    ));
+
+    let HStmtKind::Return(Some(value)) = &function_body(&hir, "returned")[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(matches!(
+        &value.kind,
+        HExprKind::ExtensionModuleRef { module, .. } if module == "mod_ext"
+    ));
+
+    assert!(matches!(
+        &assigned(&hir, "same").kind,
+        HExprKind::Bin { op: BinOp::Is, .. }
+    ));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn user_module_values_store_return_and_compare_by_identity() {
+    // A compiled user module is equally ordinary: storing it, returning it
+    // from a function and comparing two reads must all lower to module values.
+    let source = r#"import helper
+stored = helper
+box = (helper,)
+def returned():
+    return helper
+def same(a, b):
+    return a is b
+"#;
+    let mut infer = Infer::new();
+    let mut lowerer = lowerer_with_user_module(source, &mut infer, "helper", HashMap::new());
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    assert!(matches!(
+        &assigned(&hir, "stored").kind,
+        HExprKind::ModuleRef { module } if module == "helper"
+    ));
+    let HExprKind::Tuple(items) = &assigned(&hir, "box").kind else {
+        panic!(
+            "expected a tuple literal, got {:?}",
+            assigned(&hir, "box").kind
+        );
+    };
+    assert!(matches!(
+        &items[0].kind,
+        HExprKind::ModuleRef { module } if module == "helper"
+    ));
+
+    let returned = function_body(&hir, "returned");
+    let HStmtKind::Return(Some(value)) = &returned[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(matches!(
+        &value.kind,
+        HExprKind::ModuleRef { module } if module == "helper"
+    ));
+    let same = function_body(&hir, "same");
+    let HStmtKind::Return(Some(value)) = &same[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(matches!(&value.kind, HExprKind::Bin { op: BinOp::Is, .. }));
+}
+
+#[test]
+fn native_module_value_keeps_its_identity_in_expressions() {
+    // `m = errno; same = m is errno` keeps both operands as module values; the
+    // runtime registry returns one object for both reads.
+    let source = "import errno\nm = errno\nsame = m is errno\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "m").kind,
+        HExprKind::ModuleRef { module } if module == "errno"
+    ));
+    let HExprKind::Bin { op, lhs, rhs } = &assigned(&hir, "same").kind else {
+        panic!(
+            "expected an identity comparison, got {:?}",
+            assigned(&hir, "same").kind
+        );
+    };
+    assert_eq!(*op, BinOp::Is);
+    let HExprKind::Local(local) = &lhs.kind else {
+        panic!("expected a read of the module variable, got {:?}", lhs.kind);
+    };
+    assert_eq!(hir.functions[0].locals[*local as usize].name, "m");
+    assert!(matches!(
+        &rhs.kind,
+        HExprKind::ModuleRef { module } if module == "errno"
+    ));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn nested_native_module_is_a_first_class_value() {
+    // `os.path` is a module in its own right: using it as a value must bind
+    // the nested module, not report that modules are unsupported.
+    let source = "import os\np = os.path\nq = os.path.join\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "p").kind,
+        HExprKind::ModuleRef { module } if module == "os.path"
+    ));
+    assert!(matches!(
+        &assigned(&hir, "q").kind,
+        HExprKind::ModuleAttr { module, name }
+            if module == "os.path" && name == "join"
+    ));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn dynamic_attribute_read_on_a_module_variable_is_getattr() {
+    // Once a module is stored in a variable, `m.attr` cannot use the static
+    // module path: it lowers to the dynamic attribute read.
+    let source = "import helper\nm = helper\ndef read():\n    return m.value\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lowerer_with_user_module(source, &mut infer, "helper", HashMap::new());
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = function_body(&hir, "read");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    let HExprKind::GetAttr { object, name } = &value.kind else {
+        panic!("expected a dynamic attribute read, got {:?}", value.kind);
+    };
+    assert_eq!(name, "value");
+    let reads_module_value = matches!(
+        &object.kind,
+        HExprKind::GlobalGet { module, name } if module == "__main__" && name == "m"
+    ) || matches!(
+        &object.kind,
+        HExprKind::ModuleRef { module } if module == "helper"
+    );
+    assert!(
+        reads_module_value,
+        "expected the stored module value, got {:?}",
+        object.kind
+    );
 }
 
 /// Builds a lowerer whose only visible user module is `name` with `exports`.

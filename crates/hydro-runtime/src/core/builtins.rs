@@ -4333,13 +4333,10 @@ fn getattr_builtin(object: i64, name: i64) -> i64 {
             ),
         );
     };
-    if let Some(module) = value::as_module(object) {
-        modules::module_get_by_name(module.name(), name)
-    } else {
-        // `methods::getattr` also dispatches the exception attribute surface
-        // (`args`, `__cause__`, ...), so there is a single lookup path.
-        methods::getattr(object, name.as_ptr(), name.len())
-    }
+    // `methods::getattr` dispatches module values (including compiled
+    // extensions), the exception attribute surface (`args`, `__cause__`, ...)
+    // and every other receiver through a single lookup path.
+    methods::getattr(object, name.as_ptr(), name.len())
 }
 
 fn builtin_arity_error(name: &str, expected: &str, argc: usize) -> i64 {
@@ -7164,6 +7161,15 @@ mod tests {
             pending_message(),
             "module 'math' has no attribute 'missing'"
         );
+
+        // The three-argument form returns the default for a missing module
+        // attribute instead of propagating the AttributeError.
+        exc::init();
+        assert_eq!(
+            builtin_call(Builtin::Getattr, &[math, string("missing"), int(7)]),
+            int(7)
+        );
+        assert!(!exc::pending());
 
         exc::init();
         let namespace = value::namespace_new(vec![("answer".to_string(), int(42))]);

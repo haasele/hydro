@@ -8,6 +8,20 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 first-class module values
+
+- A module alias is an ordinary value: `import math`, `import helper` and
+  `import ext as e` can be stored, returned, put in containers, passed to
+  `getattr`/`hasattr` and compared with `is`. Native, compiled user and
+  compiled extension modules all materialize through the runtime module
+  registry, so repeated reads share the `sys.modules` identity.
+- `hydro_module_value` returns the canonical `sys.modules` entry, and the new
+  `hydro_extension_module_value` materializes an extension module value that
+  keeps its shared-object path, so `getattr(pdc, 'build_info', None)` and a
+  later `pdc.build_profile` resolve through the extension ABI.
+- Nested native modules (`os.path`, `collections.abc`) are module values
+  themselves rather than an unsupported expression.
+
 ### Added — 2026-10-27 type class methods and docstring-only stubs
 
 - `type.__new__`, `type.__call__`, `type.__subclasscheck__`,

@@ -247,6 +247,7 @@ fn expr_use(expr: &Expr, local: LocalId) -> Use {
         | ExprKind::BuiltinRef(_)
         | ExprKind::ExceptionClass(_)
         | ExprKind::ModuleRef { .. }
+        | ExprKind::ExtensionModuleRef { .. }
         | ExprKind::DeferredImport { .. }
         | ExprKind::ModuleAttr { .. }
         | ExprKind::GlobalGet { .. }

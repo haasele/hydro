@@ -65,7 +65,7 @@ pub(crate) fn call(
         return result;
     }
     if let Some(module) = value::as_module(obj) {
-        let function = modules::module_get_by_name(module.name(), &method);
+        let function = modules::module_attr(module, &method);
         if exc::pending() {
             return NONE;
         }
@@ -1159,6 +1159,13 @@ pub(crate) fn call_kw(
         Err(err) => return err,
     };
     if let Some(module) = value::as_module(obj) {
+        if module.path().is_some() {
+            let function = modules::module_attr(module, &method);
+            if exc::pending() {
+                return NONE;
+            }
+            return builtins::call_kw(function, argc, argv, kwargc, kw_argv);
+        }
         let module_name = module.name();
         return modules::module_call_kw(
             module_name.as_ptr(),
@@ -1476,7 +1483,7 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         return attribute;
     }
     if let Some(module) = value::as_module(obj) {
-        return crate::modules::module_get_by_name(module.name(), &attr);
+        return crate::modules::module_attr(module, &attr);
     }
     // Function metadata: the generated code stores the bare definition name,
     // so `f.__name__`/`f.__qualname__` report it and `__doc__` stays `None`
