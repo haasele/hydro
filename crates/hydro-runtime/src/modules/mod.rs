@@ -1473,6 +1473,9 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if let Some(class) = inspect::class_value(module, name) {
         return class;
     }
+    if let Some(class) = socket::class_value(module, name) {
+        return class;
+    }
     // `_struct.Struct` and `_struct.error` are declared as functions/constants
     // so calls lower as module calls; the runtime values are real classes (the
     // class protocol and `isinstance` need them).
@@ -1920,7 +1923,7 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "collections" | "_collections" => collections::call_kw(function, args, &keywords),
         "dataclasses" => dataclasses_call_kw(function, args, keywords),
         "argparse" => argparse::call_kw(function, args, &keywords),
-        "socket" => socket::call_kw(function, args, keywords),
+        "socket" | "_socket" => socket::call_kw(module, function, args, keywords),
         "ssl" => socket::ssl_call_kw(function, args, keywords),
         "select" => select::call_kw(function, args, keywords),
         "pytest" => pytest::call_kw(function, args, keywords),
@@ -2399,7 +2402,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "_collections" => collections::call(function, args),
         "collections" => collections::call(function, args),
         "re" => re::call(function, args),
-        "socket" => socket::call(function, args),
+        "socket" | "_socket" => socket::call(module, function, args),
         "select" => select::call(function, args),
         "selectors" => select::selectors_call(function, args),
         "ssl" => socket::ssl_call(function, args),
@@ -3054,7 +3057,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("asyncio", "CancelledError") => exc::exception_class(exc::CANCELLED_ERROR),
         ("asyncio.coroutines", "_is_coroutine") => asyncio::coroutines_constant("_is_coroutine")
             .unwrap_or_else(|| missing_attribute("asyncio.coroutines", "_is_coroutine")),
-        ("socket", name) => socket::constant(name),
+        ("socket" | "_socket", name) => socket::constant(module, name),
         ("select", name) => select::constant(name),
         ("selectors", name) => select::selectors_constant(name),
         ("ssl", name) => socket::ssl_constant(name),

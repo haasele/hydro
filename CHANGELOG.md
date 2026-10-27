@@ -8,6 +8,20 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 native `_socket` accelerator alias
+
+- `import _socket` resolves to a real native module with the same surface as
+  `socket`: the module-level functions (`socket`, `create_connection`,
+  `gethostname`, `socketpair`, `getaddrinfo`, `gethostbyname`, `inet_pton`,
+  `inet_ntop`), every option/protocol constant, and the class spellings
+  `SocketType`, `error`, `gaierror` and `timeout`. Calls dispatch to the
+  existing socket implementation and missing attributes still raise
+  `AttributeError`, so pydantic's `getattr(_socket, "CAPI", None)` is `None`
+  without a fabricated CAPI capsule. `SocketType` is the cached class `type()`
+  reports for a socket, so `type(s) is _socket.SocketType`, `isinstance` and
+  construction through the class all work; the exception names alias the
+  tagged `OSError` class every socket failure raises.
+
 ### Added — 2026-10-27 `type.__dict__` and its `__annotations__` descriptor
 
 - The `type` metaclass value exposes a real `__dict__` mapping instead of an

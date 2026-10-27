@@ -130,6 +130,7 @@ pub static MODULES: &[&ModuleSpec] = &[
     &_WEAKREF,
     &RE,
     &SOCKET,
+    &_SOCKET,
     &SELECT,
     &SELECTORS,
     &SSL,

@@ -1963,6 +1963,12 @@ pub(crate) fn call_kw(
                 return result;
             }
         }
+        // `socket.SocketType`/`socket.socket` is the cached class `type()`
+        // reports for sockets; its constructor is the socket factory, with
+        // `family`/`type`/`proto` bound by name.
+        if value::class_display_name(class) == Some("socket") && value::socket_class() == class {
+            return crate::modules::socket::call_kw("socket", "socket", &args, keywords);
+        }
         let instance = value::instance_new(class);
         let Some((kind, init)) = value::class_member(class, "__init__") else {
             if !args.is_empty() || !keywords.is_empty() {
@@ -2940,6 +2946,18 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
             unsafe { std::slice::from_raw_parts(argv, argc) }
         };
         return slice_new(args);
+    }
+    // `socket.SocketType`/`socket.socket` is the cached class `type()` reports
+    // for sockets; calling it runs the socket factory instead of allocating a
+    // blank instance.
+    if native_name == Some("socket") && value::socket_class() == class {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: argc > 0 implies a non-null, readable buffer.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        return crate::modules::socket::call("socket", "socket", args);
     }
     // The `datetime` value classes are cached native classes whose instances
     // carry the date/time fields as attributes. Calling the class value runs
@@ -5728,6 +5746,9 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
         // and `isinstance(m, re.Match)` hold without a class instance.
         "Pattern" => value::as_pattern(value).is_some(),
         "Match" => value::as_match(value).is_some(),
+        // `socket.SocketType` is the cached class `type()` reports for a
+        // socket object, so `isinstance(s, socket.SocketType)` holds.
+        "socket" => value::as_socket(value).is_some(),
         // `types.FunctionType`: every function value (`def`, lambda,
         // builtin/bound/native) reports the cached `function` type name.
         "function" => value::as_function(value).is_some(),

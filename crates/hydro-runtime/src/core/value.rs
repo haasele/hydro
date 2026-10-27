@@ -6701,6 +6701,12 @@ pub(crate) fn match_class() -> i64 {
     native_class("Match")
 }
 
+/// The cached class a socket object reports from `type()`, i.e. the value
+/// `socket.SocketType`/`_socket.SocketType` must resolve to.
+pub(crate) fn socket_class() -> i64 {
+    native_class("socket")
+}
+
 /// Cached native `object` class: the root of Hydro's value hierarchy.
 ///
 /// `isinstance(x, object_class())` is true for every Hydro value, and every

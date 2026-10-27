@@ -810,8 +810,11 @@ Central specification in `hydro_ir::stdlib` (`MODULES` in
   `std::net`: `socket`, `create_connection`, `bind`, `listen`, `accept`,
   `connect`, `send`/`sendall`, `recv`, `close`, `settimeout`, `gettimeout`,
   `shutdown`, `setsockopt`/`getsockopt`, `getsockname`/`getpeername`.
-  Blocking calls park the thread for the GC. No TLS/UDP/`select`
-  and no `socket.timeout` class (timeout → `OSError`).
+  Blocking calls park the thread for the GC. `_socket` is the same native
+  module (pydantic/typing_extensions import it); `socket.error`,
+  `socket.gaierror` and `socket.timeout` all alias the tagged `OSError` class
+  every socket failure raises, and no CPython `CAPI` capsule is exposed
+  (`getattr(_socket, "CAPI", None)` is `None`).
 - `random`: global SplitMix64 PRNG and seedable `Random(seed=...)` with
   `seed`/`random`/`randint`/`randrange`/`choice`/`uniform`/`shuffle`/
   `getrandbits`; `getrandbits(k)` returns an exact non-negative `k`-bit

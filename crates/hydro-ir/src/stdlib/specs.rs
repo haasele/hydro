@@ -941,45 +941,71 @@ pub static COLLECTIONS: ModuleSpec = ModuleSpec {
     constants: &[c("abc", Type::Any)],
 };
 
+/// Shared function table of `socket` and its `_socket` accelerator alias.
+const SOCKET_FUNCTIONS: &[FunctionSpec] = &[
+    // The runtime binds these keyword names itself, so the spec keeps the
+    // parameter list empty (the frontend still validates the arity).
+    kw_dynamic("socket", 0, 3, Type::Any, &[]),
+    kw_dynamic("create_connection", 0, 2, Type::Any, &[]),
+    f("gethostname", 0, 0, Type::Str),
+    f("socketpair", 0, 3, Type::Any),
+    f("getaddrinfo", 2, 6, Type::List),
+    f("gethostbyname", 1, 1, Type::Str),
+    f("inet_pton", 2, 2, Type::Bytes),
+    f("inet_ntop", 2, 2, Type::Str),
+];
+
+/// Shared constants: the option/protocol numbers plus the class spellings.
+///
+/// `SocketType` is the class `type()` reports for a socket; `error`,
+/// `gaierror` and `timeout` are exception classes. Hydro has one tagged
+/// `OSError` family for socket failures (including resolver and timeout
+/// errors), so all three names resolve to that class.
+const SOCKET_CONSTANTS: &[ConstantSpec] = &[
+    c("AF_UNSPEC", Type::Int),
+    c("AF_UNIX", Type::Int),
+    c("AF_INET", Type::Int),
+    c("AF_INET6", Type::Int),
+    c("SOCK_STREAM", Type::Int),
+    c("SOCK_DGRAM", Type::Int),
+    c("SOCK_NONBLOCK", Type::Int),
+    c("SOCK_CLOEXEC", Type::Int),
+    c("SOL_SOCKET", Type::Int),
+    c("SO_REUSEADDR", Type::Int),
+    c("SO_REUSEPORT", Type::Int),
+    c("SO_ERROR", Type::Int),
+    c("IPPROTO_IP", Type::Int),
+    c("IPPROTO_TCP", Type::Int),
+    c("IPPROTO_UDP", Type::Int),
+    c("SHUT_RD", Type::Int),
+    c("SHUT_WR", Type::Int),
+    c("SHUT_RDWR", Type::Int),
+    c("MSG_OOB", Type::Int),
+    c("MSG_PEEK", Type::Int),
+    c("MSG_DONTWAIT", Type::Int),
+    c("MSG_WAITALL", Type::Int),
+    c("MSG_NOSIGNAL", Type::Int),
+    c("SocketType", Type::Any),
+    c("error", Type::Any),
+    c("gaierror", Type::Any),
+    c("timeout", Type::Any),
+];
+
 pub static SOCKET: ModuleSpec = ModuleSpec {
     name: "socket",
-    functions: &[
-        // The runtime binds these keyword names itself, so the spec keeps the
-        // parameter list empty (the frontend still validates the arity).
-        kw_dynamic("socket", 0, 3, Type::Any, &[]),
-        kw_dynamic("create_connection", 0, 2, Type::Any, &[]),
-        f("gethostname", 0, 0, Type::Str),
-        f("socketpair", 0, 3, Type::Any),
-        f("getaddrinfo", 2, 6, Type::List),
-        f("gethostbyname", 1, 1, Type::Str),
-        f("inet_pton", 2, 2, Type::Bytes),
-        f("inet_ntop", 2, 2, Type::Str),
-    ],
-    constants: &[
-        c("AF_UNSPEC", Type::Int),
-        c("AF_UNIX", Type::Int),
-        c("AF_INET", Type::Int),
-        c("AF_INET6", Type::Int),
-        c("SOCK_STREAM", Type::Int),
-        c("SOCK_DGRAM", Type::Int),
-        c("SOCK_NONBLOCK", Type::Int),
-        c("SOCK_CLOEXEC", Type::Int),
-        c("SOL_SOCKET", Type::Int),
-        c("SO_REUSEADDR", Type::Int),
-        c("SO_REUSEPORT", Type::Int),
-        c("SO_ERROR", Type::Int),
-        c("IPPROTO_IP", Type::Int),
-        c("IPPROTO_TCP", Type::Int),
-        c("IPPROTO_UDP", Type::Int),
-        c("SHUT_RD", Type::Int),
-        c("SHUT_WR", Type::Int),
-        c("SHUT_RDWR", Type::Int),
-        c("MSG_OOB", Type::Int),
-        c("MSG_PEEK", Type::Int),
-        c("MSG_DONTWAIT", Type::Int),
-        c("MSG_WAITALL", Type::Int),
-        c("MSG_NOSIGNAL", Type::Int),
-    ],
+    functions: SOCKET_FUNCTIONS,
+    constants: SOCKET_CONSTANTS,
+};
+
+/// `_socket`: CPython's C accelerator.
+///
+/// pydantic/typing_extensions import it directly (`import _socket;
+/// getattr(_socket, "CAPI", None)`), so it is a real native module with the
+/// same surface as `socket` and no fake `CAPI` capsule.
+pub static _SOCKET: ModuleSpec = ModuleSpec {
+    name: "_socket",
+    functions: SOCKET_FUNCTIONS,
+    constants: SOCKET_CONSTANTS,
 };
 
 /// `select`: readiness on descriptors without external dependencies.
@@ -5044,5 +5070,56 @@ mod tests {
                 .ret,
             Type::Bytes
         );
+    }
+
+    #[test]
+    fn socket_accelerator_alias_mirrors_the_socket_spec() {
+        let socket = crate::stdlib::module("socket").expect("socket spec");
+        let accelerator = crate::stdlib::module("_socket").expect("_socket spec");
+        assert_eq!(accelerator.name, "_socket");
+
+        // Same functions, same arities and return types.
+        assert_eq!(accelerator.functions.len(), socket.functions.len());
+        for spec in socket.functions {
+            let mirrored = function("_socket", spec.name).expect(spec.name);
+            assert_eq!(
+                (mirrored.min_args, mirrored.max_args, mirrored.ret),
+                (spec.min_args, spec.max_args, spec.ret),
+                "{}",
+                spec.name
+            );
+            assert_eq!(mirrored.params, spec.params, "{}", spec.name);
+            assert_eq!(
+                mirrored.dynamic_keywords, spec.dynamic_keywords,
+                "{}",
+                spec.name
+            );
+        }
+
+        // Same constants, including the class spellings pydantic probes.
+        assert_eq!(accelerator.constants.len(), socket.constants.len());
+        for name in [
+            "AF_INET",
+            "SOCK_STREAM",
+            "SOCK_DGRAM",
+            "IPPROTO_TCP",
+            "SocketType",
+            "error",
+            "gaierror",
+            "timeout",
+        ] {
+            assert!(
+                constant("_socket", name).is_some(),
+                "_socket.{name} is declared"
+            );
+        }
+        for spec in socket.constants {
+            assert_eq!(
+                constant("_socket", spec.name).expect(spec.name).ty,
+                spec.ty,
+                "{}",
+                spec.name
+            );
+        }
     }
 }

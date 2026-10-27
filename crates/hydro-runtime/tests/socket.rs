@@ -633,3 +633,91 @@ fn context_manager_enter_and_exit() {
     assert_eq!(method(socket, "recv", &[int(1)]), hydro_none());
     clear_error();
 }
+
+#[test]
+fn accelerator_alias_exposes_the_socket_surface() {
+    let _guard = guard();
+    hydro_runtime_init();
+
+    // Constants resolve through the accelerator spelling with the same value.
+    for name in [
+        "AF_INET",
+        "AF_INET6",
+        "SOCK_STREAM",
+        "SOCK_DGRAM",
+        "SOL_SOCKET",
+        "SO_REUSEADDR",
+        "SHUT_RDWR",
+        "IPPROTO_TCP",
+    ] {
+        assert!(
+            eq(module_get("_socket", name), module_get("socket", name)),
+            "{name}"
+        );
+        assert_no_error();
+    }
+
+    // Calls dispatch to the same implementation: a socket created through
+    // `_socket.socket` binds, reports its address and closes normally.
+    let socket = module("_socket", "socket", &[]);
+    assert_no_error();
+    let port = bind_loopback(socket);
+    assert!(port > 0);
+
+    // `SocketType` is the class `type()` reports for a socket, so identity and
+    // `isinstance` work through the accelerator alias.
+    let socket_type = module_get("_socket", "SocketType");
+    assert_no_error();
+    assert!(eq(socket_type, module_get("socket", "SocketType")));
+    assert_no_error();
+    let type_fn = hydro_builtin_function(b"type".as_ptr(), 4);
+    let actual_class = hydro_call(type_fn, 1, [socket].as_ptr());
+    assert_no_error();
+    assert!(eq(actual_class, socket_type));
+    let isinstance_fn = hydro_builtin_function(b"isinstance".as_ptr(), 10);
+    assert_eq!(
+        hydro_call(
+            isinstance_fn,
+            2,
+            [socket, module_get("_socket", "SocketType")].as_ptr()
+        ),
+        hydro_true()
+    );
+    assert_no_error();
+    assert_eq!(method(socket, "close", &[]), hydro_none());
+    assert_no_error();
+
+    // The class value itself constructs a socket, like `SocketType()`.
+    let made = hydro_call(socket_type, 0, std::ptr::null());
+    assert_no_error();
+    assert_eq!(method(made, "close", &[]), hydro_none());
+    assert_no_error();
+
+    // The other module-level helpers reach the socket implementation.
+    let host = module("_socket", "gethostname", &[]);
+    assert_no_error();
+    assert!(decode(hydro_len(hydro_to_str(host))) > 0);
+    assert!(eq(
+        module("_socket", "inet_pton", &[int(2), text("127.0.0.1")]),
+        module("socket", "inet_pton", &[int(2), text("127.0.0.1")])
+    ));
+    assert_no_error();
+
+    // pydantic's probe: `getattr(_socket, "CAPI", None)` is `None` because
+    // Hydro exposes no CPython CAPI capsule.
+    let module_value = hydro_module_value(b"_socket".as_ptr(), 7);
+    assert_no_error();
+    let getattr_fn = hydro_builtin_function(b"getattr".as_ptr(), 7);
+    let capi = hydro_call(
+        getattr_fn,
+        3,
+        [module_value, text("CAPI"), hydro_none()].as_ptr(),
+    );
+    assert_no_error();
+    assert_eq!(capi, hydro_none());
+
+    // Without a default the miss still raises `AttributeError`.
+    assert_eq!(module_get("_socket", "CAPI"), hydro_none());
+    assert_eq!(hydro_exc_pending(), 1);
+    hydro_exc_clear();
+}

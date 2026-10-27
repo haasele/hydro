@@ -1057,8 +1057,8 @@ fn inet_ntop(args: &[i64]) -> i64 {
     }
 }
 
-/// Module-level function dispatch.
-pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
+/// Module-level function dispatch shared by `socket` and `_socket`.
+pub(crate) fn call(module: &str, function: &str, args: &[i64]) -> i64 {
     match function {
         "socket" => construct(args),
         "create_connection" => create_connection(args),
@@ -1073,14 +1073,19 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "inet_ntop" => inet_ntop(args),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
-            &format!("module 'socket' has no attribute '{function}'"),
+            &format!("module '{module}' has no attribute '{function}'"),
         ),
     }
 }
 
 /// Keyword-aware module calls: `socket.socket(family=..., type=..., proto=...)`
 /// and `socket.create_connection(address=..., timeout=...)`.
-pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+pub(crate) fn call_kw(
+    module: &str,
+    function: &str,
+    args: &[i64],
+    keywords: Vec<(String, i64)>,
+) -> i64 {
     let mut bound = args.to_vec();
     for (name, item) in keywords {
         let index = match (function, name.as_str()) {
@@ -1091,7 +1096,7 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
             ("create_connection", "timeout") => 1,
             _ => {
                 return type_error(&format!(
-                    "socket.{function}() got an unexpected keyword argument '{name}'"
+                    "{module}.{function}() got an unexpected keyword argument '{name}'"
                 ))
             }
         };
@@ -1100,16 +1105,16 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
         }
         if bound[index] != NONE {
             return type_error(&format!(
-                "socket.{function}() got multiple values for argument '{name}'"
+                "{module}.{function}() got multiple values for argument '{name}'"
             ));
         }
         bound[index] = item;
     }
-    call(function, &bound)
+    call(module, function, &bound)
 }
 
-/// Module-level constants.
-pub(crate) fn constant(name: &str) -> i64 {
+/// Module-level constants shared by `socket` and `_socket`.
+pub(crate) fn constant(module: &str, name: &str) -> i64 {
     match name {
         "AF_UNSPEC" => encode_int(AF_UNSPEC),
         "AF_UNIX" => encode_int(AF_UNIX),
@@ -1136,8 +1141,26 @@ pub(crate) fn constant(name: &str) -> i64 {
         "MSG_NOSIGNAL" => encode_int(16384),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
-            &format!("module 'socket' has no attribute '{name}'"),
+            &format!("module '{module}' has no attribute '{name}'"),
         ),
+    }
+}
+
+/// Class values exported by `socket` and `_socket`.
+///
+/// `socket`/`SocketType` resolve to the cached class `type()` reports for a
+/// socket object, so identity, `isinstance` and construction through the
+/// class all work. Hydro has a single tagged `OSError` family for socket
+/// failures (including resolution and timeout errors), so `error`,
+/// `gaierror` and `timeout` all resolve to that class.
+pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
+    if !matches!(module, "socket" | "_socket") {
+        return None;
+    }
+    match name {
+        "socket" | "SocketType" => Some(value::socket_class()),
+        "error" | "gaierror" | "timeout" => Some(exc::exception_class(OS_ERROR)),
+        _ => None,
     }
 }
 
