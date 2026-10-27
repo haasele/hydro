@@ -841,7 +841,10 @@ struct ClassPlan {
     methods: Vec<PlannedMethod>,
     /// Class attribute name and the index of its assignment in the class
     /// body. Values are lowered when the class statement itself is lowered.
-    /// Only the static path collects attributes.
+    /// Only the static path collects attributes. One statement can contribute
+    /// several entries: every name of a chained assignment (`a = b = value`)
+    /// gets an entry with the same index, and they share the single
+    /// evaluation of the right-hand side.
     attributes: Vec<(String, usize)>,
     /// True when the class body executes statements the static plan cannot
     /// express (`del`, `if`, `for`, `with`, `try`, `raise`, calls, …). Such a
@@ -5450,77 +5453,96 @@ impl<'a> Lowerer<'a> {
                 continue;
             }
             if let ast::Stmt::Assign(assign) = stmt {
-                let [ast::Expr::Name(target)] = assign.targets.as_slice() else {
-                    self.error_at(assign.range, "class attribute target must be a name");
-                    continue;
-                };
-                let name = target.id.to_string();
-                if !seen.insert(name.clone()) {
-                    self.error_at_code(
-                        target.range,
-                        codes::DECL,
-                        format!("duplicate class member '{class}.{name}'"),
-                    );
-                    continue;
+                // `a = b = value` binds every name to the same value; the
+                // right-hand side is evaluated once, in source order with the
+                // other class attributes. `class_body_needs_namespace` sends
+                // every other target shape to the runtime namespace path.
+                let mut names = Vec::with_capacity(assign.targets.len());
+                for target in &assign.targets {
+                    let ast::Expr::Name(target) = target else {
+                        self.error_at(assign.range, "class attribute target must be a name");
+                        continue;
+                    };
+                    names.push(target);
                 }
-                // `__sub__ = difference` aliases an earlier method of the same
-                // class body. The alias must behave exactly like the method
-                // (receiver binding included), so it becomes another entry in
-                // the method table instead of a frozen attribute value.
-                if let ast::Expr::Name(value) = &*assign.value {
-                    if let Some(method) = methods
-                        .iter()
-                        .find(|method| method.name.as_str() == value.id.as_str())
-                        .cloned()
-                    {
-                        methods.push(PlannedMethod {
-                            name,
-                            function: method.function,
-                            start: None,
-                            kind: method.kind,
-                            decorators: method.decorators,
-                        });
+                // A name repeated inside one chain (`a = a = 1`) binds the
+                // same value twice in CPython; the plan registers it once.
+                let mut chained = HashSet::new();
+                for target in names {
+                    let name = target.id.to_string();
+                    if !chained.insert(name.clone()) {
                         continue;
                     }
-                }
-                // `name = classmethod(method)` / `staticmethod(...)` /
-                // `property(method)` over an earlier method of this class
-                // keeps the method's function id and only changes its binding
-                // kind. Any other argument (a class value such as
-                // `classmethod(GenericAlias)`, an imported callable, or a
-                // multi-argument property) stays a class attribute whose value
-                // the runtime wraps in the corresponding descriptor object.
-                if let ast::Expr::Call(call) = &*assign.value {
-                    if call.keywords.is_empty() && call.args.len() == 1 {
-                        if let (ast::Expr::Name(callee), ast::Expr::Name(argument)) =
-                            (&*call.func, &call.args[0])
+                    if !seen.insert(name.clone()) {
+                        self.error_at_code(
+                            target.range,
+                            codes::DECL,
+                            format!("duplicate class member '{class}.{name}'"),
+                        );
+                        continue;
+                    }
+                    // `__sub__ = difference` aliases an earlier method of the
+                    // same class body. The alias must behave exactly like the
+                    // method (receiver binding included), so it becomes
+                    // another entry in the method table instead of a frozen
+                    // attribute value. A chained alias registers one method
+                    // entry per name, all sharing the function id.
+                    if let ast::Expr::Name(value) = &*assign.value {
+                        if let Some(method) = methods
+                            .iter()
+                            .find(|method| method.name.as_str() == value.id.as_str())
+                            .cloned()
                         {
-                            let kind = match callee.id.as_str() {
-                                "classmethod" => Some(MethodKind::Classmethod),
-                                "staticmethod" => Some(MethodKind::Staticmethod),
-                                "property" => Some(MethodKind::Property),
-                                _ => None,
-                            };
-                            if let Some(kind) = kind {
-                                if let Some(method) = methods
-                                    .iter()
-                                    .find(|method| method.name.as_str() == argument.id.as_str())
-                                    .cloned()
-                                {
-                                    methods.push(PlannedMethod {
-                                        name,
-                                        function: method.function,
-                                        start: None,
-                                        kind,
-                                        decorators: method.decorators,
-                                    });
-                                    continue;
+                            methods.push(PlannedMethod {
+                                name,
+                                function: method.function,
+                                start: None,
+                                kind: method.kind,
+                                decorators: method.decorators,
+                            });
+                            continue;
+                        }
+                    }
+                    // `name = classmethod(method)` / `staticmethod(...)` /
+                    // `property(method)` over an earlier method of this class
+                    // keeps the method's function id and only changes its
+                    // binding kind. Any other argument (a class value such as
+                    // `classmethod(GenericAlias)`, an imported callable, or a
+                    // multi-argument property) stays a class attribute whose
+                    // value the runtime wraps in the corresponding descriptor
+                    // object.
+                    if let ast::Expr::Call(call) = &*assign.value {
+                        if call.keywords.is_empty() && call.args.len() == 1 {
+                            if let (ast::Expr::Name(callee), ast::Expr::Name(argument)) =
+                                (&*call.func, &call.args[0])
+                            {
+                                let kind = match callee.id.as_str() {
+                                    "classmethod" => Some(MethodKind::Classmethod),
+                                    "staticmethod" => Some(MethodKind::Staticmethod),
+                                    "property" => Some(MethodKind::Property),
+                                    _ => None,
+                                };
+                                if let Some(kind) = kind {
+                                    if let Some(method) = methods
+                                        .iter()
+                                        .find(|method| method.name.as_str() == argument.id.as_str())
+                                        .cloned()
+                                    {
+                                        methods.push(PlannedMethod {
+                                            name,
+                                            function: method.function,
+                                            start: None,
+                                            kind,
+                                            decorators: method.decorators,
+                                        });
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     }
+                    attributes.push((name, idx));
                 }
-                attributes.push((name, idx));
                 continue;
             }
             let (method, range) = match stmt {
@@ -6734,13 +6756,8 @@ impl<'a> Lowerer<'a> {
             }
             ast::Stmt::AugAssign(s) => {
                 if let ast::Expr::Subscript(sub) = &*s.target {
-                    if matches!(&*sub.slice, ast::Expr::Slice(_)) {
-                        self.error_at_code(
-                            sub.slice.range(),
-                            codes::INDEX,
-                            "augmented slice assignment is not supported yet",
-                        );
-                        return None;
+                    if let ast::Expr::Slice(slice) = &*sub.slice {
+                        return self.lower_aug_slice(s, sub, slice, fs, line, col);
                     }
                     return self.lower_aug_subscript(s, sub, fs, line, col);
                 }
@@ -9676,7 +9693,7 @@ impl<'a> Lowerer<'a> {
                 )
             })
             .collect();
-        let attributes = {
+        let (attributes, prelude) = {
             self.class_attr_scopes.push(HashMap::new());
             // Class-body expressions can read methods and method aliases that
             // were created earlier in the body; the value is the function
@@ -9694,18 +9711,52 @@ impl<'a> Lowerer<'a> {
                     );
                 }
             }
+            // A chained assignment (`a = b = value`) shares one right-hand
+            // side among several names. Such a body evaluates every class
+            // attribute into a hidden local, in declaration order, so the
+            // shared value runs exactly once and the class statement only
+            // publishes the parked values. Without a chain the values stay
+            // inline in the class statement.
+            let chained = plan
+                .attributes
+                .windows(2)
+                .any(|pair| pair[0].1 == pair[1].1);
+            let mut prelude: Vec<HStmt> = Vec::new();
             let mut attributes = Vec::with_capacity(plan.attributes.len());
+            let mut cached: Option<(usize, HExpr)> = None;
             for (attribute, index) in &plan.attributes {
                 // The value expression is evaluated when the class statement
                 // runs, in declaration order, and may refer to attributes
-                // declared before it.
-                let value = match &s.body[*index] {
-                    ast::Stmt::Assign(assign) => self.expr(&assign.value, fs),
-                    ast::Stmt::AnnAssign(assign) => match assign.value.as_deref() {
-                        Some(value) => self.expr(value, fs),
-                        None => self.error_expr(assign.range),
-                    },
-                    other => self.error_expr(other.range()),
+                // declared before it. Names of one chained assignment share
+                // the single evaluation of their statement.
+                let value = match &cached {
+                    Some((cached_index, value)) if cached_index == index => value.clone(),
+                    _ => {
+                        let value = match &s.body[*index] {
+                            ast::Stmt::Assign(assign) => self.expr(&assign.value, fs),
+                            ast::Stmt::AnnAssign(assign) => match assign.value.as_deref() {
+                                Some(value) => self.expr(value, fs),
+                                None => self.error_expr(assign.range),
+                            },
+                            other => self.error_expr(other.range()),
+                        };
+                        let value = if chained {
+                            let (temp, temp_ref) = self.hidden_temp(fs, "$classattr", Type::Any);
+                            prelude.push(HStmt {
+                                kind: HStmtKind::Assign {
+                                    target: temp,
+                                    value,
+                                },
+                                line,
+                                col,
+                            });
+                            temp_ref
+                        } else {
+                            value
+                        };
+                        cached = Some((*index, value.clone()));
+                        value
+                    }
                 };
                 if let Some(scope) = self.class_attr_scopes.last_mut() {
                     scope.insert(attribute.clone(), value.clone());
@@ -9719,9 +9770,9 @@ impl<'a> Lowerer<'a> {
             if let Some(params) = type_params {
                 attributes.push(("__type_params__".to_string(), params.clone()));
             }
-            attributes
+            (attributes, prelude)
         };
-        if plan.keywords.is_empty() {
+        if plan.keywords.is_empty() && prelude.is_empty() {
             return Some(HStmt {
                 kind: HStmtKind::ClassDef {
                     target,
@@ -9735,11 +9786,11 @@ impl<'a> Lowerer<'a> {
                 col,
             });
         }
-        // A header with extra keywords runs through a statement block so the
-        // operand evaluation order is CPython's: every base expression, then
-        // every keyword value in source order. The class object is built from
-        // the parked values afterwards (attributes still evaluate inside the
-        // class statement, after the header). The wrapper keeps the sequence a
+        // A header with extra keywords, or a body with parked attribute
+        // values, runs through a statement block so the operand evaluation
+        // order is CPython's: every base expression, then every keyword value
+        // in source order, then the class body (its parked attribute values
+        // were lowered in declaration order). The wrapper keeps the sequence a
         // single HIR statement.
         let mut statements = Vec::new();
         let mut base_refs = Vec::with_capacity(bases.len());
@@ -9789,6 +9840,9 @@ impl<'a> Lowerer<'a> {
                 metaclass = Some(temp_ref);
             }
         }
+        // The body's parked attribute values run after the header operands
+        // and before the class statement publishes them.
+        statements.extend(prelude);
         statements.push(HStmt {
             kind: HStmtKind::ClassDef {
                 target,
@@ -11110,6 +11164,103 @@ impl<'a> Lowerer<'a> {
             else_body: Vec::new(),
         };
         Some(HStmt { kind, line, col })
+    }
+
+    /// Lower `target[start:stop:step] op= value`.
+    ///
+    /// Python evaluates the sliced object, then the bounds in source order,
+    /// then the right-hand side, each exactly once. The object and every
+    /// bound (an omitted bound is the `None` sentinel) are therefore stored in
+    /// hidden `$augN` locals; the slice read and the write both use those
+    /// locals, so a side-effecting operand runs once. The read slice is the
+    /// left operand of the operator, and the updated value is written back
+    /// through [`HStmtKind::SetSlice`], which splices an iterable right-hand
+    /// side into a list/bytearray and calls a user object's `__setitem__` with
+    /// the `slice` object at runtime. HIR statements cannot be nested
+    /// arbitrarily, so the generated statements are wrapped in the same
+    /// `if True:` block as the other augmented-assignment desugarings.
+    fn lower_aug_slice(
+        &mut self,
+        s: &ast::StmtAugAssign,
+        sub: &ast::ExprSubscript,
+        slice: &ast::ExprSlice,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let op = self.aug_bin_op(s.op, s.range)?;
+        let object = self.expr(&sub.value, fs);
+        let (object_local, object_ref) = self.aug_temp(fs, sub.value.range());
+        let mut bounds = Vec::with_capacity(3);
+        for bound in [&slice.lower, &slice.upper, &slice.step] {
+            let value = match bound {
+                Some(bound) => self.expr(bound, fs),
+                None => self.none_expr(line, col),
+            };
+            let range = bound
+                .as_ref()
+                .map(|bound| bound.range())
+                .unwrap_or(slice.range);
+            let (local, reference) = self.aug_temp(fs, range);
+            bounds.push((local, value, reference));
+        }
+        let value = self.expr(&s.value, fs);
+        let [start, stop, step] = bounds.as_slice() else {
+            unreachable!("a slice always has three bound slots");
+        };
+        // Clone the parked references before the bound assignments consume the
+        // list; the read and the write share them.
+        let (start, stop, step) = (start.2.clone(), stop.2.clone(), step.2.clone());
+        let read = HExpr {
+            kind: HExprKind::Slice {
+                object: Box::new(object_ref.clone()),
+                start: Some(Box::new(start.clone())),
+                stop: Some(Box::new(stop.clone())),
+                step: Some(Box::new(step.clone())),
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        };
+        let updated = HExpr {
+            kind: HExprKind::Bin {
+                op,
+                lhs: Box::new(read),
+                rhs: Box::new(value),
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        };
+        let mk_stmt = |kind| HStmt { kind, line, col };
+        let mut then_body = Vec::with_capacity(5);
+        then_body.push(mk_stmt(HStmtKind::Assign {
+            target: object_local,
+            value: object,
+        }));
+        for (local, value, _) in bounds {
+            then_body.push(mk_stmt(HStmtKind::Assign {
+                target: local,
+                value,
+            }));
+        }
+        then_body.push(mk_stmt(HStmtKind::SetSlice {
+            object: object_ref,
+            start: Some(Box::new(start)),
+            stop: Some(Box::new(stop)),
+            step: Some(Box::new(step)),
+            value: updated,
+        }));
+        Some(mk_stmt(HStmtKind::If {
+            cond: HExpr {
+                kind: HExprKind::Const(Const::Bool(true)),
+                ty: Ty::Concrete(Type::Bool),
+                line,
+                col,
+            },
+            then_body,
+            else_body: Vec::new(),
+        }))
     }
 
     /// Create a synthetic `$compN` local for a comprehension target. The local
@@ -18711,14 +18862,23 @@ fn class_body_blocks(stmt: &ast::Stmt) -> Vec<&[ast::Stmt]> {
 /// Whether a class body needs the runtime-namespace path.
 ///
 /// The static plan can express method definitions, field declarations,
-/// docstrings, `pass` and plain assignments (evaluated in declaration order).
-/// Anything else — `del`, control flow, calls, `raise`, imports — executes
-/// statements and therefore needs the dynamic namespace.
+/// docstrings, `pass` and plain assignments of names (evaluated in declaration
+/// order, ahead of the class statement so a chained right-hand side runs
+/// once). Anything else — `del`, control flow, calls, `raise`, imports, and
+/// assignments storing through an attribute, subscript or unpacking target —
+/// executes statements and therefore needs the dynamic namespace.
 fn class_body_needs_namespace(body: &[ast::Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         ast::Stmt::Pass(_) => false,
         ast::Stmt::Expr(expr) => !is_docstring_expr(&expr.value),
-        ast::Stmt::Assign(_) | ast::Stmt::AnnAssign(_) => false,
+        // Only a plain name target is a frozen class attribute of the static
+        // plan; `obj.attr = ...`, `d[key] = ...` and `a, b = ...` write at
+        // runtime through the namespace `dict`.
+        ast::Stmt::Assign(assign) => assign
+            .targets
+            .iter()
+            .any(|target| !matches!(target, ast::Expr::Name(_))),
+        ast::Stmt::AnnAssign(_) => false,
         ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => false,
         _ => true,
     })

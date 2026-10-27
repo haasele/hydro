@@ -3222,14 +3222,90 @@ fn slice_assignment_with_an_attribute_receiver_lowers() {
 }
 
 #[test]
-fn augmented_slice_assignment_is_rejected() {
-    let source = "xs = [1, 2, 3]\nxs[0:1] += [9]\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(
-        diags[0].message,
-        "augmented slice assignment is not supported yet"
+fn augmented_slice_assignment_desugars_with_single_evaluation_temps() {
+    // `xs[start:stop] += [9]` reads the slice once, applies the operator and
+    // writes the updated value back. The object and every bound are parked in
+    // hidden locals so a side-effecting operand runs exactly once; the
+    // omitted step keeps the `None` sentinel.
+    let source = "\
+xs = [1, 2, 3]
+xs[0:1] += [9]
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let locals = &hir.functions[0].locals;
+    let then_body = subscript_augassign_block(&hir);
+    assert_eq!(then_body.len(), 5, "{then_body:?}");
+
+    let mut temps = Vec::new();
+    for (offset, expected) in ["$aug0", "$aug1", "$aug2", "$aug3"].iter().enumerate() {
+        let HStmtKind::Assign { target, .. } = &then_body[offset].kind else {
+            panic!(
+                "expected a parked operand assignment, got {:?}",
+                then_body[offset].kind
+            );
+        };
+        assert_eq!(locals[*target as usize].name, *expected);
+        temps.push(*target);
+    }
+    // `xs` is read into the receiver temp; the bounds are the literal start,
+    // the literal stop and the `None` step.
+    let HStmtKind::Assign { value: object, .. } = &then_body[0].kind else {
+        unreachable!()
+    };
+    assert!(
+        matches!(&object.kind, HExprKind::Local(id) if locals[*id as usize].name == "xs"),
+        "{:?}",
+        object.kind
     );
+    let HStmtKind::Assign { value: start, .. } = &then_body[1].kind else {
+        unreachable!()
+    };
+    assert!(matches!(&start.kind, HExprKind::Const(Const::Int(0))));
+    let HStmtKind::Assign { value: stop, .. } = &then_body[2].kind else {
+        unreachable!()
+    };
+    assert!(matches!(&stop.kind, HExprKind::Const(Const::Int(1))));
+    let HStmtKind::Assign { value: step, .. } = &then_body[3].kind else {
+        unreachable!()
+    };
+    assert!(matches!(&step.kind, HExprKind::Const(Const::None)));
+
+    let HStmtKind::SetSlice {
+        object: set_object,
+        start: set_start,
+        stop: set_stop,
+        step: set_step,
+        value,
+    } = &then_body[4].kind
+    else {
+        panic!("expected a slice store, got {:?}", then_body[4].kind);
+    };
+    assert_eq!(local_of(set_object), temps[0]);
+    assert_eq!(local_of(set_start.as_ref().expect("start")), temps[1]);
+    assert_eq!(local_of(set_stop.as_ref().expect("stop")), temps[2]);
+    assert_eq!(local_of(set_step.as_ref().expect("step")), temps[3]);
+
+    let HExprKind::Bin { op, lhs, rhs } = &value.kind else {
+        panic!("expected a bin op, got {:?}", value.kind);
+    };
+    assert_eq!(*op, BinOp::Add);
+    assert!(matches!(&rhs.kind, HExprKind::List(items) if items.len() == 1));
+    let HExprKind::Slice {
+        object: read_object,
+        start: read_start,
+        stop: read_stop,
+        step: read_step,
+    } = &lhs.kind
+    else {
+        panic!("expected a slice read, got {:?}", lhs.kind);
+    };
+    assert_eq!(local_of(read_object), temps[0]);
+    assert_eq!(local_of(read_start.as_ref().expect("start")), temps[1]);
+    assert_eq!(local_of(read_stop.as_ref().expect("stop")), temps[2]);
+    assert_eq!(local_of(read_step.as_ref().expect("step")), temps[3]);
+
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 
 /// `d[k] op= v` becomes `if True: $aug0 = d; $aug1 = k; $aug0[$aug1] = $aug0[$aug1] op v`
@@ -5772,6 +5848,121 @@ fn class_attributes_are_frozen_in_the_class_statement() {
     };
     assert_eq!(emitted.len(), 2);
     assert_eq!(emitted[0].name, "mark");
+}
+
+#[test]
+fn chained_class_attribute_assignment_binds_every_name_to_one_value() {
+    // `a = b = c = value()` evaluates the right-hand side once, ahead of the
+    // class statement, and every name publishes the same parked value. The
+    // next attribute reads the earlier names through that value.
+    let source = "\
+def value():
+    return 1
+class C:
+    a = b = c = value()
+    d = a + b
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let locals = &hir.functions[0].locals;
+    let block = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::If { then_body, .. }
+                if then_body.iter().any(
+                    |inner| matches!(&inner.kind, HStmtKind::ClassDef { name, .. } if name == "C"),
+                ) =>
+            {
+                Some(then_body)
+            }
+            _ => None,
+        })
+        .expect("class C should be wrapped with its parked values");
+    assert_eq!(block.len(), 3, "{block:?}");
+    let HStmtKind::Assign { target: shared, .. } = &block[0].kind else {
+        panic!(
+            "expected the shared value assignment, got {:?}",
+            block[0].kind
+        );
+    };
+    assert_eq!(locals[*shared as usize].name, "$classattr0");
+    assert!(
+        matches!(
+            &block[0].kind,
+            HStmtKind::Assign { value, .. }
+                if matches!(
+                    &value.kind,
+                    HExprKind::Call { .. } | HExprKind::IndirectCall { .. }
+                )
+        ),
+        "the right-hand side runs in one statement: {:?}",
+        block[0].kind
+    );
+    let HStmtKind::Assign {
+        target: derived, ..
+    } = &block[1].kind
+    else {
+        panic!(
+            "expected the derived attribute assignment, got {:?}",
+            block[1].kind
+        );
+    };
+    assert_eq!(locals[*derived as usize].name, "$classattr1");
+    let HStmtKind::ClassDef { attributes, .. } = &block[2].kind else {
+        panic!("expected a class statement, got {:?}", block[2].kind);
+    };
+    let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["a", "b", "c", "d"]);
+    for (_, value) in &attributes[..3] {
+        assert_eq!(local_of(value), *shared, "{value:?}");
+    }
+    assert_eq!(local_of(&attributes[3].1), *derived);
+    // The derived attribute is parked like the shared one, so the sum itself
+    // lives in the second prelude statement and `d` only publishes it. Both
+    // operands resolve `a` and `b` to the one parked value.
+    let HStmtKind::Assign { value: sum, .. } = &block[1].kind else {
+        panic!(
+            "expected the derived attribute assignment, got {:?}",
+            block[1].kind
+        );
+    };
+    let HExprKind::Bin { lhs, rhs, .. } = &sum.kind else {
+        panic!(
+            "expected `a + b` to add the parked value, got {:?}",
+            sum.kind
+        );
+    };
+    assert_eq!(local_of(lhs), *shared);
+    assert_eq!(local_of(rhs), *shared);
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn chained_class_assignment_uses_the_namespace_on_the_dynamic_path() {
+    // A class body with a non-name assignment target runs against the runtime
+    // namespace, where a chain stores each name from one shared value.
+    let source = "\
+class C:
+    items = [1, 2]
+    items[0] = 9
+    a = b = items
+";
+    let module = parse(source);
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    let hir = lowerer.lower_module(&module);
+    let diags = std::mem::take(&mut lowerer.diags);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        class_plan(&lowerer, &module, "C").dynamic,
+        "a subscript target needs the runtime namespace"
+    );
+    drop(lowerer);
+    let a = namespace_store(&hir.functions[0].body, "a").expect("namespace store for a");
+    let b = namespace_store(&hir.functions[0].body, "b").expect("namespace store for b");
+    assert_eq!(local_of(a), local_of(b));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 
 #[test]

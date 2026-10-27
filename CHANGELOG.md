@@ -8,6 +8,28 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 chained class attributes and augmented slice assignment
+
+- Chained assignment inside a class body (`c = coef = coefficients = coeffs`)
+  binds every name as a class attribute. The right-hand side is evaluated
+  exactly once and before the class object is built; the static class path
+  parks every attribute value in source order (so a chained value runs once and
+  parked reads still see earlier attributes), and a name that aliases an
+  earlier method becomes a method entry for every target. Class bodies that
+  store through an attribute, subscript or unpacking target now execute
+  against the runtime class namespace instead of being rejected, so
+  `obj.attr = ...`, `d[key] = ...` and `a, b = ...` work in a class body.
+- Augmented slice assignment (`xs[a:b] += v`, `xs[::2] -= v`, …) lowers for
+  lists, `bytearray`, `memoryview` and user objects. The sliced object, every
+  bound and the right-hand side are evaluated once each, in Python's order
+  (object, start, stop, step, right-hand side); the read slice is the left
+  operand of the operator and the updated value is written back through
+  `StmtKind::SetSlice`, so a step-1 list/bytearray slice splices any iterable
+  and an extended slice keeps its length rule. `hydro_slice`/
+  `hydro_slice_set` now pass a real `slice` object to a user instance's
+  `__getitem__`/`__setitem__`, matching CPython's sequence protocol, while
+  immutable `str`/`bytes`/`tuple` targets still raise `TypeError`.
+
 ### Fixed — 2026-10-27 gradual method dispatch and `dict.update`
 
 - A missing builtin method on a value whose receiver is not written out

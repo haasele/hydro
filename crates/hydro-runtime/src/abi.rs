@@ -1239,18 +1239,21 @@ pub extern "C" fn hydro_delete_subscript(obj: i64, index: i64) -> i64 {
     container::delete_subscript(obj, index)
 }
 
-/// `object[start:stop:step]` for lists, strings and tuples. A tagged `None` in any
-/// bound position means the argument was omitted. Errors are reported
-/// through the pending exception and yield `None`.
+/// `object[start:stop:step]` for lists, strings, tuples, bytes-likes and user
+/// instances (through `__getitem__` with a real `slice` object). A tagged
+/// `None` in any bound position means the argument was omitted. Errors are
+/// reported through the pending exception and yield `None`.
 #[no_mangle]
 pub extern "C" fn hydro_slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
     container::slice(obj, start, stop, step)
 }
 
-/// `object[start:stop:step] = value` for lists. A tagged `None` in any bound
-/// position means the argument was omitted. The right-hand side may be any
-/// iterable; a step of 1 splices it in, an extended slice requires a matching
-/// length (`ValueError`). Strings, bytes and tuples are immutable (`TypeError`).
+/// `object[start:stop:step] = value` for lists, `bytearray`, `memoryview` and
+/// user instances (through `__setitem__` with a real `slice` object). A tagged
+/// `None` in any bound position means the argument was omitted. The right-hand
+/// side may be any iterable; a step of 1 splices it in, an extended slice
+/// requires a matching length (`ValueError`). Strings, bytes and tuples are
+/// immutable (`TypeError`).
 /// Returns `None`; errors are reported through the pending exception.
 #[no_mangle]
 pub extern "C" fn hydro_slice_set(

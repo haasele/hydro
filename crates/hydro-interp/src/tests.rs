@@ -774,6 +774,171 @@ assert first[1] == slice(None, None, None)
 }
 
 #[test]
+fn augmented_slice_assignment_reads_and_writes_the_slice() {
+    run_source(
+        "\
+xs = [1, 2, 3, 4]
+xs[1:3] += [9, 9]
+assert xs == [1, 2, 3, 9, 9, 4]
+
+# A step-1 slice of a list splices any iterable; an extended slice requires the
+# replaced positions to keep their count.
+ys = [0, 1, 2, 3]
+ys[::2] += []
+assert ys == [0, 1, 2, 3]
+
+zs = [0, 1, 2, 3, 4, 5]
+zs[1:5:2] += []
+assert zs == [0, 1, 2, 3, 4, 5]
+
+ba = bytearray(b'abcd')
+ba[1:3] += b'xy'
+assert ba == bytearray(b'abcxyd')
+
+ba2 = bytearray(b'abcde')
+ba2[::2] += b''
+assert ba2 == bytearray(b'abcde')
+
+# The object, the bounds and the right-hand side run exactly once each, in
+# Python's order: object, start, stop, step, right-hand side.
+order = []
+lists = [[1, 2]]
+
+def target():
+    order.append('object')
+    return lists[0]
+
+def bound(tag, value):
+    order.append(tag)
+    return value
+
+def rhs():
+    order.append('rhs')
+    return [9]
+
+target()[bound('start', 0):bound('stop', 1)] += rhs()
+assert order == ['object', 'start', 'stop', 'rhs']
+assert lists[0] == [1, 9, 2]
+
+# A user object receives real `slice` objects from both dunders.
+class Box:
+    def __init__(self):
+        self.items = [1, 2, 3, 4]
+        self.log = []
+
+    def __getitem__(self, index):
+        self.log.append(('get', index))
+        return self.items[index.start:index.stop:index.step]
+
+    def __setitem__(self, index, value):
+        self.log.append(('set', index))
+        self.items[index.start:index.stop:index.step] = value
+
+box = Box()
+box[1:3] += [9]
+assert box.items == [1, 2, 3, 9, 4]
+assert len(box.log) == 2
+assert box.log[0][0] == 'get'
+assert box.log[1][0] == 'set'
+assert isinstance(box.log[0][1], slice)
+assert isinstance(box.log[1][1], slice)
+assert box.log[0][1].start == 1
+assert box.log[0][1].stop == 3
+assert box.log[0][1].step is None
+assert box.log[1][1].start == 1
+assert box.log[1][1].stop == 3
+assert box.log[1][1].step is None
+
+# Immutable sequence types still reject the write.
+try:
+    text = 'abc'
+    text[0:1] += 'x'
+    assert False
+except TypeError:
+    pass
+
+try:
+    pair = (1, 2)
+    pair[0:1] += (9,)
+    assert False
+except TypeError:
+    pass
+",
+    );
+}
+
+#[test]
+fn chained_assignment_in_class_bodies_binds_every_name() {
+    run_source(
+        "\
+order = []
+calls = []
+
+def value():
+    calls.append(1)
+    return [1, 2]
+
+def traced(tag):
+    order.append(tag)
+    return tag
+
+# The right-hand side runs once and every name receives the same object.
+class C:
+    a = b = c = value()
+    d = a
+
+assert calls == [1]
+assert C.a == [1, 2]
+assert C.a is C.b
+assert C.b is C.c
+assert C.d is C.a
+
+# Parked values still run in source order with the other class attributes.
+class Ordered:
+    first = traced('first')
+    x = y = traced('shared')
+    last = traced('last')
+
+assert order == ['first', 'shared', 'last']
+assert Ordered.x == 'shared'
+assert Ordered.y == 'shared'
+assert Ordered.last == 'last'
+
+# A chained alias of a method binds the same function under every name.
+class Aliased:
+    def greet(self):
+        return 'hi'
+
+    hello = salute = greet
+
+assert Aliased().hello() == 'hi'
+assert Aliased().salute() == 'hi'
+
+# A class body that also stores through a subscript runs against the runtime
+# namespace, where a chain writes each name from one shared value.
+class E:
+    xs = [1, 2]
+    xs[0] = 9
+
+assert E.xs == [9, 2]
+
+def build(flag):
+    class Inner:
+        if flag:
+            p = q = 1
+        else:
+            p = q = 2
+    return Inner
+
+assert build(True).p == 1
+assert build(True).q == 1
+assert build(False).p == 2
+assert build(False).q == 2
+",
+    );
+}
+
+#[test]
 fn functools_cached_property_and_math_log2_are_real() {
     run_source(
         r#"

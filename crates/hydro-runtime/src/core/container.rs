@@ -1270,13 +1270,15 @@ enum SliceError {
     Step,
 }
 
-/// `object[start:stop:step]` for lists, strings, tuples, bytes-likes and
-/// ranges.
+/// `object[start:stop:step]` for lists, strings, tuples, bytes-likes, ranges
+/// and user instances.
 ///
 /// `start`, `stop` and `step` are tagged values; [`NONE`] means the argument
 /// was omitted. Python's `slice.indices` rules are reproduced exactly
 /// (clamping and negative bounds); the result is always a new object. A range
-/// slice is a new range (CPython returns a range, not a list).
+/// slice is a new range (CPython returns a range, not a list). A user
+/// instance goes through its `__getitem__` with a real `slice` object, so the
+/// sequence protocol sees exactly what CPython passes.
 pub(crate) fn slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
     if let Some((range_start, range_stop, range_step)) = value::as_range(obj) {
         let len = value::range_len(range_start, range_stop, range_step);
@@ -1383,6 +1385,9 @@ pub(crate) fn slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
         }
         return value::bytes_new(out);
     }
+    if let Some(result) = instance_slice_get(obj, start, stop, step) {
+        return result;
+    }
     if value::as_dict(obj).is_some() {
         // Python has no slice keys, and a `slice` is unhashable.
         return type_error(unhashable_message("slice"));
@@ -1393,7 +1398,57 @@ pub(crate) fn slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
     ))
 }
 
-/// `object[start:stop:step] = value` for lists.
+/// `obj[start:stop:step]` for a user instance that defines `__getitem__`.
+///
+/// The protocol receives a real `slice` object carrying the three bounds, so a
+/// class implementing the sequence protocol (or an extension wrapping an array
+/// library) sees exactly what CPython passes. Returns `None` when `obj` is not
+/// an instance with a `__getitem__` method, letting [`slice`] report its usual
+/// error.
+fn instance_slice_get(obj: i64, start: i64, stop: i64, step: i64) -> Option<i64> {
+    let entry = value::as_instance(obj)
+        .and_then(|state| value::class_lookup(state.class, "__getitem__"))?;
+    if !matches!(entry, value::ClassEntry::Method(_, _)) {
+        return None;
+    }
+    // The slice object and the bounds must survive the user call, which may
+    // allocate and collect.
+    let bounds = crate::heap::root_values(&[start, stop, step]);
+    let index = crate::core::builtins::slice_new(&[start, stop, step]);
+    let roots = crate::heap::root_values(&[index]);
+    let args = [index];
+    let result =
+        crate::core::methods::call(obj, b"__getitem__".as_ptr(), 11, args.len(), args.as_ptr());
+    crate::heap::release_roots(roots);
+    crate::heap::release_roots(bounds);
+    Some(result)
+}
+
+/// `obj[start:stop:step] = value` for a user instance that defines
+/// `__setitem__`. The call receives a real `slice` object, matching CPython's
+/// item-assignment protocol. Returns `None` when `obj` is not an instance with
+/// a `__setitem__` method so [`slice_set`] reports its usual error.
+fn instance_slice_set(obj: i64, start: i64, stop: i64, step: i64, new_value: i64) -> Option<i64> {
+    let entry = value::as_instance(obj)
+        .and_then(|state| value::class_lookup(state.class, "__setitem__"))?;
+    if !matches!(entry, value::ClassEntry::Method(_, _)) {
+        return None;
+    }
+    // The slice object, the bounds and the right-hand side must survive the
+    // user call, which may allocate and collect.
+    let bounds = crate::heap::root_values(&[start, stop, step, new_value]);
+    let index = crate::core::builtins::slice_new(&[start, stop, step]);
+    let roots = crate::heap::root_values(&[index]);
+    let args = [index, new_value];
+    let result =
+        crate::core::methods::call(obj, b"__setitem__".as_ptr(), 11, args.len(), args.as_ptr());
+    crate::heap::release_roots(roots);
+    crate::heap::release_roots(bounds);
+    Some(result)
+}
+
+/// `object[start:stop:step] = value` for lists, `bytearray`, `memoryview` and
+/// user instances.
 ///
 /// `start`, `stop` and `step` are tagged values; [`NONE`] means the argument
 /// was omitted. Bounds follow Python's `slice.indices` exactly. A `step` of 1
@@ -1402,7 +1457,8 @@ pub(crate) fn slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
 /// values as there are positions, otherwise `ValueError`.
 ///
 /// Strings, bytes and tuples are immutable (`TypeError`); a dict reports the
-/// unhashable `slice` key like a slice read. The right-hand side may be any
+/// unhashable `slice` key like a slice read. A user instance goes through its
+/// `__setitem__` with a real `slice` object. The right-hand side may be any
 /// iterable and is materialised before the target is changed, so
 /// `xs[:] = xs` works. Every inserted edge publishes a GC insertion barrier
 /// while the list is locked. Returns `None`; errors are reported through the
@@ -1498,6 +1554,9 @@ pub(crate) fn slice_set(obj: i64, start: i64, stop: i64, step: i64, new_value: i
             target[position] = byte;
         }
         return NONE;
+    }
+    if let Some(result) = instance_slice_set(obj, start, stop, step, new_value) {
+        return result;
     }
     if value::as_list(obj).is_none() {
         if value::as_dict(obj).is_some() || value::as_defaultdict(obj).is_some() {

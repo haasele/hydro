@@ -1028,7 +1028,12 @@ it. The cache is not a shared artifact store.
 - **Lowering:** `with`/`async with` become nested `try/finally` with
   `__enter__`/`__exit__`; async managers bind `__aenter__`/`__aexit__`
   through awaited method calls. Augmented subscript assignment
-  (`a[i] += x`) evaluates object and index exactly once into `$aug` locals.
+  (`a[i] += x`) evaluates object and index exactly once into `$aug` locals;
+  augmented slice assignment (`a[i:j:k] += x`) parks the object and all three
+  bounds the same way, reads `a[i:j:k]` once, applies the operator and writes
+  the result back through `SetSlice`, so the runtime can splice a list or
+  `bytearray` slice and call a user object's `__setitem__` with a real
+  `slice` value.
   `async for` lowers to `__aiter__()` plus a `while` loop that awaits
   `__anext__()` and catches `StopAsyncIteration`.
 - **User modules:** imports emit no IR statements; the loader replaces
