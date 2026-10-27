@@ -5514,7 +5514,11 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
             .map(|view| view.kind.type_name() == name)
             .unwrap_or(false),
         "list" => value::as_list(value).is_some(),
-        "dict" => value::as_dict(value).is_some() || value::as_defaultdict(value).is_some(),
+        "dict" => {
+            value::as_dict(value).is_some()
+                || value::as_defaultdict(value).is_some()
+                || crate::modules::collections::is_counter_instance(value)
+        }
         "tuple" => {
             value::as_tuple(value).is_some()
                 || crate::modules::collections::is_namedtuple_instance(value)

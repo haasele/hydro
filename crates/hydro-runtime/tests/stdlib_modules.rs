@@ -483,3 +483,151 @@ fn regex_compile_honours_case_multiline_and_dotall_flags() {
     module("re", "compile", &[text("a"), text("x")]);
     expect_error(TYPE_ERROR);
 }
+
+// -------------------------------------------------------------------------
+// collections.Counter
+// -------------------------------------------------------------------------
+
+fn module_kw(module_name: &str, function: &str, args: &[i64], keywords: &[(&str, i64)]) -> i64 {
+    let mut pairs = Vec::with_capacity(keywords.len() * 2);
+    for (key, value) in keywords {
+        pairs.push(text(key));
+        pairs.push(*value);
+    }
+    hydro_module_call_kw(
+        module_name.as_ptr(),
+        module_name.len(),
+        function.as_ptr(),
+        function.len(),
+        args.len(),
+        args.as_ptr(),
+        keywords.len(),
+        pairs.as_ptr(),
+    )
+}
+
+/// `Counter({key: count, ...})` through the mapping constructor.
+fn counter_items(counts: &[(&str, i64)]) -> i64 {
+    let keys: Vec<i64> = counts.iter().map(|(key, _)| text(key)).collect();
+    let values: Vec<i64> = counts.iter().map(|(_, count)| int(*count)).collect();
+    let source = hydro_dict_new(keys.len(), keys.as_ptr(), values.as_ptr());
+    module("collections", "Counter", &[source])
+}
+
+#[test]
+fn counter_counts_iterables_and_reads_missing_keys_as_zero() {
+    hydro_runtime_init();
+    let counts = [text("a"), text("b"), text("a")];
+    let c = module("collections", "Counter", &[list(&counts)]);
+    assert_no_error();
+    assert_str(hydro_to_str(c), "Counter({'a': 2, 'b': 1})");
+    assert_int(hydro_subscript(c, text("a")), 2);
+    assert_int(hydro_subscript(c, text("z")), 0);
+    assert_int(hydro_len(c), 2);
+    assert_true(hydro_binop(13, text("a"), c)); // OP_IN
+    assert_eq!(hydro_binop(14, text("z"), c), hydro_true()); // OP_NOT_IN
+
+    // Instance-defined `__setitem__`/`__delitem__` return None and must not
+    // leave a pending exception (the dunder lookup used to miss the method).
+    assert_none(hydro_subscript_set(c, text("z"), int(4)));
+    assert_int(hydro_subscript(c, text("z")), 4);
+    assert_int(hydro_len(c), 3);
+    assert_none(hydro_delete_subscript(c, text("z")));
+    assert_int(hydro_len(c), 2);
+}
+
+#[test]
+fn counter_mapping_and_keyword_constructors_add_counts() {
+    hydro_runtime_init();
+    let counts = counter_items(&[("x", 2), ("y", 1)]);
+    assert_none(hydro_subscript_set(counts, text("x"), int(5)));
+    assert_int(hydro_subscript(counts, text("x")), 5);
+
+    let keywords = [("a", int(2)), ("b", int(1))];
+    let c = module_kw("collections", "Counter", &[], &keywords);
+    assert_no_error();
+    assert_str(hydro_to_str(c), "Counter({'a': 2, 'b': 1})");
+
+    // A positional iterable and keyword counts combine additively.
+    let words = [text("a")];
+    let combined = module_kw("collections", "Counter", &[list(&words)], &keywords);
+    assert_no_error();
+    assert_int(hydro_subscript(combined, text("a")), 3);
+}
+
+#[test]
+fn counter_update_subtract_elements_and_most_common() {
+    hydro_runtime_init();
+    let c = counter_items(&[("a", 2), ("b", 1)]);
+    assert_no_error();
+
+    let extra = [text("a"), text("c")];
+    method(c, "update", &[list(&extra)]);
+    assert_no_error();
+    assert_str(hydro_to_str(c), "Counter({'a': 3, 'b': 1, 'c': 1})");
+    method(c, "subtract", &[list(&[text("b"), text("b")])]);
+    assert_no_error();
+    assert_int(hydro_subscript(c, text("b")), -1);
+    assert_int(method(c, "total", &[]), 3);
+
+    let elements = method(c, "elements", &[]);
+    assert_no_error();
+    assert_str(
+        hydro_to_str(hydro_list_from(elements)),
+        "['a', 'a', 'a', 'c']",
+    );
+
+    let common = method(c, "most_common", &[]);
+    assert_no_error();
+    assert_str(hydro_to_str(common), "[('a', 3), ('c', 1), ('b', -1)]");
+    let top = method(c, "most_common", &[int(1)]);
+    assert_no_error();
+    assert_str(hydro_to_str(top), "[('a', 3)]");
+
+    let copied = method(c, "copy", &[]);
+    assert_no_error();
+    assert_str(hydro_to_str(copied), "Counter({'a': 3, 'b': -1, 'c': 1})");
+    method(copied, "clear", &[]);
+    assert_no_error();
+    assert_str(hydro_to_str(copied), "Counter()");
+}
+
+#[test]
+fn counter_arithmetic_and_multiset_equality() {
+    hydro_runtime_init();
+    let left = counter_items(&[("a", 2), ("b", 1)]);
+    let right = counter_items(&[("a", 1), ("c", 1)]);
+    assert_no_error();
+
+    let sum = hydro_binop(0, left, right); // OP_ADD
+    assert_no_error();
+    assert_str(hydro_to_str(sum), "Counter({'a': 3, 'b': 1, 'c': 1})");
+
+    let difference = hydro_binop(1, left, right); // OP_SUB
+    assert_no_error();
+    assert_str(hydro_to_str(difference), "Counter({'a': 1, 'b': 1})");
+
+    assert_eq!(
+        hydro_binop(7, left, counter_items(&[("b", 1), ("a", 2)])),
+        hydro_true()
+    );
+    assert_eq!(hydro_binop(7, left, right), hydro_false());
+    assert_eq!(hydro_binop(8, left, right), hydro_true());
+}
+
+#[test]
+fn counter_class_value_reports_dict_subclassing() {
+    hydro_runtime_init();
+    let class = module_get("collections", "Counter");
+    assert_no_error();
+    let words = [text("a"), text("a"), text("b")];
+    let args = [list(&words)];
+    let c = hydro_call(class, args.len(), args.as_ptr());
+    assert_no_error();
+    assert_str(hydro_to_str(c), "Counter({'a': 2, 'b': 1})");
+
+    let isinstance = builtin("isinstance");
+    let dict = builtin("dict");
+    let checked = [c, dict];
+    assert_true(hydro_call(isinstance, checked.len(), checked.as_ptr()));
+}

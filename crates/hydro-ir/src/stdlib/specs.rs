@@ -845,6 +845,10 @@ pub static COLLECTIONS: ModuleSpec = ModuleSpec {
         // positional-only in CPython, so the keywords are data keys and the
         // dynamic-keyword flag preserves them.
         kw_dynamic("OrderedDict", 0, 1, Type::Any, &[]),
+        // `Counter(iterable_or_mapping=None, /, **kwds)`: like `OrderedDict`,
+        // `iterable` is positional-only and every keyword becomes a counted
+        // element.
+        kw_dynamic("Counter", 0, 1, Type::Any, &[]),
         // `namedtuple(typename, field_names, *, rename=False, defaults=None,
         // module=None)` returns a tuple-like class. The declared keywords let
         // the frontend fold them into the constructor's positional slots.
@@ -2289,14 +2293,15 @@ pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
-/// `_collections`: accelerator alias table for `collections`. `defaultdict`
-/// and `OrderedDict` are implemented; `deque` is deliberately absent instead
-/// of being faked.
+/// `_collections`: accelerator alias table for `collections`. `defaultdict`,
+/// `OrderedDict` and `Counter` are implemented; `deque` is deliberately absent
+/// instead of being faked.
 pub static _COLLECTIONS: ModuleSpec = ModuleSpec {
     name: "_collections",
     functions: &[
         kw("defaultdict", 1, 1, Type::Any, &["default_factory"]),
         kw_dynamic("OrderedDict", 0, 1, Type::Any, &[]),
+        kw_dynamic("Counter", 0, 1, Type::Any, &[]),
     ],
     constants: &[],
 };
@@ -4247,6 +4252,10 @@ mod tests {
         assert_eq!((ordered.min_args, ordered.max_args), (0, 1));
         assert!(ordered.dynamic_keywords);
         assert!(function("_collections", "OrderedDict").is_some());
+        let counter = function("collections", "Counter").unwrap();
+        assert_eq!((counter.min_args, counter.max_args), (0, 1));
+        assert!(counter.dynamic_keywords);
+        assert!(function("_collections", "Counter").is_some());
 
         for name in [
             "collect",

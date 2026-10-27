@@ -460,7 +460,13 @@ pub(crate) fn instance_method_call(instance: i64, name: &str, args: &[i64]) -> O
 /// generic path reuses it so `s += value` behaves exactly like `s + value`.
 pub(crate) fn add(a: i64, b: i64) -> i64 {
     if let Some(result) = instance_dunder_binop(a, b, "__add__", "__radd__") {
-        return result;
+        // Both dunders declined: Python's operator protocol raises instead of
+        // leaking the `NotImplemented` singleton to user code.
+        return if result == value::NOT_IMPLEMENTED && !exc::pending() {
+            arithmetic_type_error("+", a, b)
+        } else {
+            result
+        };
     }
     if needs_bigint(a, b) {
         return big_add(a, b);
@@ -539,7 +545,16 @@ pub(crate) fn add(a: i64, b: i64) -> i64 {
     arithmetic_type_error("+", a, b)
 }
 
-fn sub(a: i64, b: i64) -> i64 {
+/// `a - b` with full Python semantics (`__sub__`/`__rsub__`, big integers,
+/// numeric promotion). Mirrors [`add`].
+pub(crate) fn sub(a: i64, b: i64) -> i64 {
+    if let Some(result) = instance_dunder_binop(a, b, "__sub__", "__rsub__") {
+        return if result == value::NOT_IMPLEMENTED && !exc::pending() {
+            arithmetic_type_error("-", a, b)
+        } else {
+            result
+        };
+    }
     if needs_bigint(a, b) {
         return big_sub(a, b);
     }

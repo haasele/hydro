@@ -5,10 +5,13 @@
 //! factory once, inserts the result and returns it. A `None` factory raises
 //! `KeyError`, matching CPython.
 
+use std::cmp::Ordering;
+
 use crate::container;
 use crate::core::globals;
 use crate::core::iter;
 use crate::core::methods;
+use crate::core::ops;
 use crate::exc::{self, ATTRIBUTE_ERROR, INDEX_ERROR, KEY_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::heap;
 use crate::value::{self, FunctionBody, ParamMeta, FALSE, NONE};
@@ -35,8 +38,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     if let Some(method) = function.strip_prefix("OrderedDict.") {
         return ordereddict_method(method, args);
     }
+    if let Some(method) = function.strip_prefix("Counter.") {
+        return counter_method(method, args);
+    }
     match function {
         "OrderedDict" => ordereddict_new(args, &[]),
+        "Counter" => counter_new(args, &[]),
         "defaultdict" => {
             let factory = args.first().copied().unwrap_or(NONE);
             if factory != NONE && value::as_function(factory).is_none() {
@@ -56,10 +63,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 }
 
 /// Keyword-aware dispatch: `OrderedDict(**items)` keeps the keyword names as
-/// keys. No other `collections` constructor accepts dynamic keywords.
+/// keys and `Counter(**kwds)` counts them. No other `collections` constructor
+/// accepts dynamic keywords.
 pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     match function {
         "OrderedDict" => ordereddict_new(args, keywords),
+        "Counter" => counter_new(args, keywords),
         _ => type_error(&format!(
             "collections.{function}() does not accept keyword arguments"
         )),
@@ -858,6 +867,816 @@ fn ordereddict_method(name: &str, args: &[i64]) -> i64 {
 }
 
 // -------------------------------------------------------------------------
+// `collections.Counter`
+// -------------------------------------------------------------------------
+
+/// Instance attribute holding the counter's `(element, count)` dict.
+const COUNTER_DATA_ATTR: &str = "\u{0}counter_data";
+
+/// Identity-stable `collections.Counter` class.
+///
+/// `Counter` is a `dict` subclass: the class derives from the cached native
+/// `dict` class, so `isinstance(Counter(), dict)` follows the dict ancestry.
+/// The counts live in an instance-owned dict, which keeps insertion order and
+/// key hashing identical to `dict`.
+pub(crate) fn counter_class() -> i64 {
+    if let Some(cached) = globals::registry_get("collections.Counter.class") {
+        return cached;
+    }
+    let base = value::type_class(value::dict_new(Vec::new()));
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::with_capacity(28);
+    for (name, qualified, arity) in [
+        ("__init__", "Counter.__init__", usize::MAX),
+        ("__getitem__", "Counter.__getitem__", 2),
+        ("__missing__", "Counter.__missing__", 2),
+        ("__setitem__", "Counter.__setitem__", 3),
+        ("__delitem__", "Counter.__delitem__", 2),
+        ("__iter__", "Counter.__iter__", 1),
+        ("__len__", "Counter.__len__", 1),
+        ("__contains__", "Counter.__contains__", 2),
+        ("__eq__", "Counter.__eq__", 2),
+        ("__ne__", "Counter.__ne__", 2),
+        ("__add__", "Counter.__add__", 2),
+        ("__sub__", "Counter.__sub__", 2),
+        ("__repr__", "Counter.__repr__", 1),
+        ("__str__", "Counter.__str__", 1),
+        ("get", "Counter.get", 3),
+        ("keys", "Counter.keys", 1),
+        ("values", "Counter.values", 1),
+        ("items", "Counter.items", 1),
+        ("update", "Counter.update", 2),
+        ("subtract", "Counter.subtract", 2),
+        ("elements", "Counter.elements", 1),
+        ("most_common", "Counter.most_common", 2),
+        ("total", "Counter.total", 1),
+        ("copy", "Counter.copy", 1),
+        ("clear", "Counter.clear", 1),
+        ("pop", "Counter.pop", 3),
+        ("popitem", "Counter.popitem", 1),
+        ("setdefault", "Counter.setdefault", 3),
+    ] {
+        methods.push((
+            name.to_string(),
+            value::native_function_new("collections", qualified, arity),
+            MethodKind::Normal,
+        ));
+    }
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new_full("Counter".to_string(), base, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set("collections.Counter.class", class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// The counts dict of a `Counter` (or subclass) instance.
+fn counter_data(obj: i64) -> Option<i64> {
+    let class = value::instance_class_value(obj)?;
+    if !value::is_subclass_of(class, counter_class()) {
+        return None;
+    }
+    value::instance_attr(obj, COUNTER_DATA_ATTR)
+}
+
+/// Whether `v` is a `Counter` instance, for the `dict` `isinstance` check.
+///
+/// Uses the cached class (never creating it) so `isinstance(x, dict)` stays
+/// cheap for values that have nothing to do with counters.
+pub(crate) fn is_counter_instance(v: i64) -> bool {
+    let Some(class) = value::instance_class_value(v) else {
+        return false;
+    };
+    let Some(counter) = globals::registry_get("collections.Counter.class") else {
+        return false;
+    };
+    value::is_subclass_of(class, counter)
+}
+
+/// Snapshot of a counter's `(element, count)` pairs in insertion order.
+fn counter_pairs(obj: i64) -> Vec<(i64, i64)> {
+    counter_data(obj)
+        .and_then(value::as_dict)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default()
+}
+
+/// Replaces the counts dict, preserving the order of `pairs`.
+fn counter_store(obj: i64, pairs: Vec<(i64, i64)>) {
+    let data = value::dict_new(pairs);
+    value::instance_setattr(obj, COUNTER_DATA_ATTR.to_string(), data);
+}
+
+/// Allocates a counter of `class` holding `pairs` in order.
+fn counter_alloc(class: i64, pairs: Vec<(i64, i64)>) -> i64 {
+    let data = value::dict_new(pairs);
+    let roots = heap::root_values(std::slice::from_ref(&data));
+    let instance = value::instance_new(class);
+    value::instance_setattr(instance, COUNTER_DATA_ATTR.to_string(), data);
+    heap::release_roots(roots);
+    instance
+}
+
+/// Allocates a `Counter` (not a subclass) holding `pairs`.
+fn counter_from_pairs(pairs: Vec<(i64, i64)>) -> i64 {
+    counter_alloc(counter_class(), pairs)
+}
+
+fn counter_zero() -> i64 {
+    value::encode_int(0).unwrap_or(NONE)
+}
+
+fn counter_find(pairs: &[(i64, i64)], key: i64) -> Option<i64> {
+    container::dict_find(pairs, key).map(|position| pairs[position].1)
+}
+
+/// Count of `key`, with `0` for a missing key.
+fn counter_count(obj: i64, key: i64) -> i64 {
+    counter_data(obj)
+        .and_then(value::as_dict)
+        .and_then(|pairs| counter_find(pairs, key))
+        .unwrap_or_else(counter_zero)
+}
+
+fn counter_insert(obj: i64, key: i64, count: i64) {
+    let Some(data) = counter_data(obj) else {
+        return;
+    };
+    if let Some(mut pairs) = value::dict_pairs_mut(data) {
+        container::dict_insert_barrier(data, &mut *pairs, key, count);
+    }
+}
+
+/// Adds `delta` to `key`'s count. `false` means an exception is pending.
+fn counter_bump(obj: i64, key: i64, delta: i64) -> bool {
+    let current = counter_count(obj, key);
+    let next = ops::add(current, delta);
+    if exc::pending() {
+        return false;
+    }
+    counter_insert(obj, key, next);
+    true
+}
+
+/// The `(key, value)` pairs of a mapping source, or `None` for an iterable.
+fn counter_mapping(source: i64) -> Option<Vec<(i64, i64)>> {
+    if value::instance_class_value(source).is_some() {
+        if let Some(data) = counter_data(source) {
+            return value::as_dict(data).map(|pairs| pairs.to_vec());
+        }
+        if let Some(data) = ordereddict_data(source) {
+            return value::as_dict(data).map(|pairs| pairs.to_vec());
+        }
+    }
+    if let Some(pairs) = value::as_dict(source) {
+        return Some(pairs.to_vec());
+    }
+    value::as_defaultdict(source).map(|(pairs, _)| pairs.to_vec())
+}
+
+/// Merges a mapping's counts into `obj`: `update` adds, `subtract` removes.
+fn counter_merge_mapping(obj: i64, pairs: &[(i64, i64)], subtract: bool) -> bool {
+    for &(key, count) in pairs {
+        let current = counter_count(obj, key);
+        let next = if subtract {
+            ops::sub(current, count)
+        } else {
+            ops::add(current, count)
+        };
+        if exc::pending() {
+            return false;
+        }
+        counter_insert(obj, key, next);
+    }
+    true
+}
+
+/// `update`/`subtract` body. `false` means an exception is pending.
+fn counter_update_counts(obj: i64, source: i64, subtract: bool) -> bool {
+    if let Some(pairs) = counter_mapping(source) {
+        return counter_merge_mapping(obj, &pairs, subtract);
+    }
+    let iterator = iter::iter_of(source);
+    if exc::pending() {
+        return false;
+    }
+    let delta = if subtract {
+        value::encode_int(-1).unwrap_or(NONE)
+    } else {
+        value::encode_int(1).unwrap_or(NONE)
+    };
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return false;
+        }
+        if status == 0 {
+            break;
+        }
+        if let Some(name) = container::unhashable_name(item) {
+            type_error(&container::unhashable_message(name));
+            return false;
+        }
+        if !counter_bump(obj, item, delta) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether count `v` is greater than zero; `None` means an exception.
+fn counter_positive(v: i64) -> Option<bool> {
+    if let Some(count) = value::as_integer(v) {
+        return Some(count > 0);
+    }
+    let result = ops::binop(ops::OP_GT, v, counter_zero());
+    if exc::pending() {
+        return None;
+    }
+    Some(value::truthy(result))
+}
+
+/// Whether count `v` is less than zero; `None` means an exception.
+fn counter_negative(v: i64) -> Option<bool> {
+    if let Some(count) = value::as_integer(v) {
+        return Some(count < 0);
+    }
+    let result = ops::binop(ops::OP_LT, v, counter_zero());
+    if exc::pending() {
+        return None;
+    }
+    Some(value::truthy(result))
+}
+
+/// Descending order of two counts (the order `most_common` wants).
+fn counter_count_order(a: i64, b: i64) -> Option<Ordering> {
+    if container::equals(a, b) {
+        return Some(Ordering::Equal);
+    }
+    let result = ops::binop(ops::OP_GT, a, b);
+    if exc::pending() {
+        return None;
+    }
+    if value::truthy(result) {
+        Some(Ordering::Less)
+    } else {
+        Some(Ordering::Greater)
+    }
+}
+
+/// `Counter.__init__`: clears the counts and applies the optional source.
+fn counter_init(args: &[i64]) -> i64 {
+    let Some(&obj) = args.first() else {
+        return type_error("Counter.__init__() missing self");
+    };
+    let Some(class) = value::instance_class_value(obj) else {
+        return type_error("Counter.__init__() requires a Counter instance");
+    };
+    if !value::is_subclass_of(class, counter_class()) {
+        return type_error(&format!(
+            "descriptor '__init__' for 'Counter' objects doesn't apply to a '{}' object",
+            value::type_name_of(obj)
+        ));
+    }
+    counter_store(obj, Vec::new());
+    if let Some(&source) = args.get(1) {
+        if !counter_update_counts(obj, source, false) {
+            return NONE;
+        }
+    }
+    NONE
+}
+
+/// `Counter(iterable_or_mapping=None, /, **kwds)`.
+fn counter_new(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let instance = counter_from_pairs(Vec::new());
+    let roots = heap::root_values(std::slice::from_ref(&instance));
+    if let Some(&source) = args.first() {
+        if !counter_update_counts(instance, source, false) {
+            heap::release_roots(roots);
+            return NONE;
+        }
+    }
+    if !keywords.is_empty() {
+        let mut pairs: Vec<(i64, i64)> = Vec::with_capacity(keywords.len());
+        let mut live: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+        for (name, value) in keywords {
+            let key = value::str_alloc(name.clone());
+            live.push(key);
+            live.push(*value);
+            pairs.push((key, *value));
+        }
+        let keyword_roots = heap::root_values(&live);
+        let merged = counter_merge_mapping(instance, &pairs, false);
+        heap::release_roots(keyword_roots);
+        if !merged {
+            heap::release_roots(roots);
+            return NONE;
+        }
+    }
+    heap::release_roots(roots);
+    instance
+}
+
+fn counter_receiver(method: &str, args: &[i64]) -> Result<(i64, i64), i64> {
+    let Some(&obj) = args.first() else {
+        return Err(type_error(&format!(
+            "Counter.{method}() missing required argument 'self'"
+        )));
+    };
+    match counter_data(obj) {
+        Some(data) => Ok((obj, data)),
+        None => Err(type_error(&format!(
+            "descriptor '{method}' for 'Counter' objects doesn't apply to a '{}' object",
+            value::type_name_of(obj)
+        ))),
+    }
+}
+
+fn counter_key(args: &[i64], method: &str) -> Result<i64, i64> {
+    let Some(&key) = args.get(1) else {
+        return Err(type_error(&format!(
+            "Counter.{method}() missing required argument 'key'"
+        )));
+    };
+    if let Some(err) = check_hashable(key) {
+        return Err(err);
+    }
+    Ok(key)
+}
+
+/// `keys()`/`values()`/`items()` from the counts snapshot.
+fn counter_items(args: &[i64], name: &str) -> i64 {
+    let Ok((obj, _)) = counter_receiver(name, args) else {
+        return crate::exc::pending_value();
+    };
+    view_list(name, counter_pairs(obj))
+}
+
+/// `c + other` / `c - other`: the combined positive counts of two counters.
+fn counter_arith(obj: i64, other: i64, subtract: bool) -> i64 {
+    if counter_data(other).is_none() {
+        return value::NOT_IMPLEMENTED;
+    }
+    let mark = heap::root_values(&[]);
+    let left = counter_pairs(obj);
+    let right = counter_pairs(other);
+    let mut live: Vec<i64> = Vec::with_capacity((left.len() + right.len()) * 2);
+    for &(key, count) in left.iter().chain(right.iter()) {
+        live.push(key);
+        live.push(count);
+    }
+    heap::root_values(&live);
+    let result = counter_from_pairs(Vec::new());
+    heap::root_values(std::slice::from_ref(&result));
+    let zero = counter_zero();
+    for &(key, count) in &left {
+        let existing = counter_find(&right, key).unwrap_or(zero);
+        let combined = if subtract {
+            ops::sub(count, existing)
+        } else {
+            ops::add(count, existing)
+        };
+        if exc::pending() {
+            heap::release_roots(mark);
+            return NONE;
+        }
+        if counter_positive(combined) == Some(true) {
+            counter_insert(result, key, combined);
+        }
+        if exc::pending() {
+            heap::release_roots(mark);
+            return NONE;
+        }
+    }
+    for &(key, count) in &right {
+        if container::dict_find(&left, key).is_some() {
+            continue;
+        }
+        let keep = if subtract {
+            counter_negative(count)
+        } else {
+            counter_positive(count)
+        };
+        match keep {
+            None => {
+                heap::release_roots(mark);
+                return NONE;
+            }
+            Some(true) => {
+                // `other`'s negative counts turn into positive counts on
+                // subtraction.
+                let kept = if subtract {
+                    let negated = ops::sub(zero, count);
+                    if exc::pending() {
+                        heap::release_roots(mark);
+                        return NONE;
+                    }
+                    negated
+                } else {
+                    count
+                };
+                counter_insert(result, key, kept);
+            }
+            Some(false) => {}
+        }
+    }
+    heap::release_roots(mark);
+    result
+}
+
+/// `c == other`: multiset equality for counters, dict equality otherwise.
+fn counter_equals(obj: i64, other: i64) -> i64 {
+    let Some(data) = counter_data(obj) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    let Some(left) = value::as_dict(data) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    if let Some(right_data) = counter_data(other) {
+        let Some(right) = value::as_dict(right_data) else {
+            return value::bool_value(false);
+        };
+        // A missing key counts as zero, so `Counter({'a': 0}) == Counter()`.
+        let equal = left.iter().all(|&(key, count)| {
+            counter_find(right, key).is_none_or(|other| container::equals(count, other))
+        }) && right.iter().all(|&(key, count)| {
+            counter_find(left, key).is_none_or(|other| container::equals(count, other))
+        });
+        return value::bool_value(equal);
+    }
+    if value::as_dict(other).is_some() || value::as_defaultdict(other).is_some() {
+        return value::bool_value(container::equals(data, other));
+    }
+    value::NOT_IMPLEMENTED
+}
+
+/// `repr(c)` / `str(c)`: `Counter({element: count, ...})`, like `dict`.
+fn counter_repr(obj: i64) -> i64 {
+    let pairs = counter_pairs(obj);
+    let class_name = value::instance_class_name(obj)
+        .unwrap_or("Counter")
+        .to_string();
+    if pairs.is_empty() {
+        return value::str_alloc(format!("{class_name}()"));
+    }
+    let roots = heap::root_values(
+        &pairs
+            .iter()
+            .flat_map(|&(key, count)| [key, count])
+            .collect::<Vec<_>>(),
+    );
+    let rendered: Vec<String> = pairs
+        .iter()
+        .map(|&(key, count)| format!("{}: {}", value::repr(key), value::repr(count)))
+        .collect();
+    heap::release_roots(roots);
+    value::str_alloc(format!("{class_name}({{{}}})", rendered.join(", ")))
+}
+
+/// `c.most_common(n=None)`: pairs ordered by descending count, ties in
+/// insertion order.
+fn counter_most_common(args: &[i64]) -> i64 {
+    let Ok((obj, _)) = counter_receiver("most_common", args) else {
+        return crate::exc::pending_value();
+    };
+    let requested = args.get(1).copied().unwrap_or(NONE);
+    let limit = if requested == NONE {
+        None
+    } else {
+        match value::as_integer(requested) {
+            Some(count) => Some(count),
+            None => {
+                return type_error(&format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    value::type_name(requested)
+                ));
+            }
+        }
+    };
+    let mark = heap::root_values(&[]);
+    let mut pairs = counter_pairs(obj);
+    let live: Vec<i64> = pairs
+        .iter()
+        .flat_map(|&(key, count)| [key, count])
+        .collect();
+    heap::root_values(&live);
+    let mut failure = false;
+    pairs.sort_by(|a, b| {
+        if failure {
+            return Ordering::Equal;
+        }
+        match counter_count_order(a.1, b.1) {
+            Some(order) => order,
+            None => {
+                failure = true;
+                Ordering::Equal
+            }
+        }
+    });
+    if failure {
+        heap::release_roots(mark);
+        return NONE;
+    }
+    if let Some(limit) = limit {
+        if limit <= 0 {
+            pairs.clear();
+        } else if (limit as usize) < pairs.len() {
+            pairs.truncate(limit as usize);
+        }
+    }
+    let result = value::list_new(Vec::new());
+    heap::root_values(std::slice::from_ref(&result));
+    for (key, count) in pairs {
+        let pair = value::tuple_new(vec![key, count]);
+        if let Some(mut items) = value::list_items_mut(result) {
+            items.push(pair);
+            crate::heap::write_barrier_edge(result, pair);
+        }
+    }
+    heap::release_roots(mark);
+    result
+}
+
+/// `c.elements()`: each element repeated by its positive count.
+fn counter_elements(args: &[i64]) -> i64 {
+    let Ok((obj, _)) = counter_receiver("elements", args) else {
+        return crate::exc::pending_value();
+    };
+    let mark = heap::root_values(&[]);
+    let pairs = counter_pairs(obj);
+    let live: Vec<i64> = pairs
+        .iter()
+        .flat_map(|&(key, count)| [key, count])
+        .collect();
+    heap::root_values(&live);
+    let items = value::list_new(Vec::new());
+    heap::root_values(std::slice::from_ref(&items));
+    for (key, count) in pairs {
+        let Some(repeat) = value::as_integer(count) else {
+            heap::release_roots(mark);
+            return type_error(&format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(count)
+            ));
+        };
+        for _ in 0..repeat.max(0) {
+            if let Some(mut stored) = value::list_items_mut(items) {
+                stored.push(key);
+                crate::heap::write_barrier_edge(items, key);
+            }
+        }
+    }
+    let iterator = iter::iter_new(items);
+    heap::release_roots(mark);
+    iterator
+}
+
+/// `c.total()`: the sum of the counts.
+fn counter_total(args: &[i64]) -> i64 {
+    let Ok((obj, _)) = counter_receiver("total", args) else {
+        return crate::exc::pending_value();
+    };
+    let mut total = counter_zero();
+    for (_, count) in counter_pairs(obj) {
+        total = ops::add(total, count);
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    total
+}
+
+/// Implements the native `Counter` method bodies.
+fn counter_method(name: &str, args: &[i64]) -> i64 {
+    match name {
+        "__init__" => counter_init(args),
+        "__getitem__" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let key = match counter_key(args, name) {
+                Ok(key) => key,
+                Err(err) => return err,
+            };
+            counter_data(obj)
+                .and_then(value::as_dict)
+                .and_then(|pairs| counter_find(pairs, key))
+                .unwrap_or_else(counter_zero)
+        }
+        "__missing__" => {
+            let Ok((_, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            counter_zero()
+        }
+        "__setitem__" => {
+            if counter_receiver(name, args).is_err() {
+                return crate::exc::pending_value();
+            }
+            let (Some(&key), Some(&count)) = (args.get(1), args.get(2)) else {
+                return type_error("Counter.__setitem__() requires a key and a count");
+            };
+            if let Some(err) = check_hashable(key) {
+                return err;
+            }
+            counter_insert(args[0], key, count);
+            NONE
+        }
+        "__delitem__" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let key = match counter_key(args, name) {
+                Ok(key) => key,
+                Err(err) => return err,
+            };
+            let mut pairs = counter_pairs(obj);
+            match container::dict_find(&pairs, key) {
+                Some(position) => {
+                    pairs.remove(position);
+                    counter_store(obj, pairs);
+                    NONE
+                }
+                None => exc::raise_with_message(KEY_ERROR, &value::repr(key)),
+            }
+        }
+        "__iter__" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let keys: Vec<i64> = counter_pairs(obj).into_iter().map(|(key, _)| key).collect();
+            iter::iter_new(value::list_new(keys))
+        }
+        "__len__" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            value::encode_int(counter_pairs(obj).len() as i64).unwrap_or(NONE)
+        }
+        "__contains__" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let Some(&key) = args.get(1) else {
+                return value::bool_value(false);
+            };
+            if let Some(err) = check_hashable(key) {
+                return err;
+            }
+            let found = counter_data(obj)
+                .and_then(value::as_dict)
+                .and_then(|pairs| container::dict_find(pairs, key))
+                .is_some();
+            value::bool_value(found)
+        }
+        "__eq__" => {
+            let (Some(&obj), Some(&other)) = (args.first(), args.get(1)) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            counter_equals(obj, other)
+        }
+        "__ne__" => {
+            let (Some(&obj), Some(&other)) = (args.first(), args.get(1)) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let equal = counter_equals(obj, other);
+            if exc::pending() || equal == value::NOT_IMPLEMENTED {
+                return equal;
+            }
+            value::bool_value(!value::truthy(equal))
+        }
+        "__add__" | "__sub__" => {
+            let (Some(&obj), Some(&other)) = (args.first(), args.get(1)) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            counter_arith(obj, other, name == "__sub__")
+        }
+        "__repr__" | "__str__" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            counter_repr(obj)
+        }
+        "get" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let key = match counter_key(args, name) {
+                Ok(key) => key,
+                Err(err) => return err,
+            };
+            match counter_data(obj)
+                .and_then(value::as_dict)
+                .and_then(|pairs| counter_find(pairs, key))
+            {
+                Some(count) => count,
+                None => args.get(2).copied().unwrap_or(NONE),
+            }
+        }
+        "keys" | "values" | "items" => counter_items(args, name),
+        "update" | "subtract" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let Some(&source) = args.get(1) else {
+                return NONE;
+            };
+            if !counter_update_counts(obj, source, name == "subtract") {
+                return NONE;
+            }
+            NONE
+        }
+        "elements" => counter_elements(args),
+        "most_common" => counter_most_common(args),
+        "total" => counter_total(args),
+        "copy" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let class = value::instance_class_value(obj).unwrap_or_else(counter_class);
+            let mark = heap::root_values(&[]);
+            let pairs = counter_pairs(obj);
+            let live: Vec<i64> = pairs
+                .iter()
+                .flat_map(|&(key, count)| [key, count])
+                .collect();
+            heap::root_values(&live);
+            let result = counter_alloc(class, pairs);
+            heap::release_roots(mark);
+            result
+        }
+        "clear" => {
+            if counter_receiver(name, args).is_err() {
+                return crate::exc::pending_value();
+            }
+            counter_store(args[0], Vec::new());
+            NONE
+        }
+        "pop" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let key = match counter_key(args, name) {
+                Ok(key) => key,
+                Err(err) => return err,
+            };
+            let mut pairs = counter_pairs(obj);
+            match container::dict_find(&pairs, key) {
+                Some(position) => {
+                    let (_, count) = pairs.remove(position);
+                    counter_store(obj, pairs);
+                    count
+                }
+                None => {
+                    if args.len() > 2 {
+                        args[2]
+                    } else {
+                        exc::raise_with_message(KEY_ERROR, &value::repr(key))
+                    }
+                }
+            }
+        }
+        "popitem" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let mut pairs = counter_pairs(obj);
+            let Some((key, count)) = pairs.pop() else {
+                return exc::raise_with_message(KEY_ERROR, "dictionary is empty");
+            };
+            let pair = value::tuple_new(vec![key, count]);
+            counter_store(obj, pairs);
+            pair
+        }
+        "setdefault" => {
+            let Ok((obj, _)) = counter_receiver(name, args) else {
+                return crate::exc::pending_value();
+            };
+            let key = match counter_key(args, name) {
+                Ok(key) => key,
+                Err(err) => return err,
+            };
+            if let Some(existing) = counter_data(obj)
+                .and_then(value::as_dict)
+                .and_then(|pairs| counter_find(pairs, key))
+            {
+                return existing;
+            }
+            let default = args.get(2).copied().unwrap_or(NONE);
+            counter_insert(obj, key, default);
+            default
+        }
+        _ => exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("'Counter' object has no attribute '{name}'"),
+        ),
+    }
+}
+
+// -------------------------------------------------------------------------
 // `collections.namedtuple`
 // -------------------------------------------------------------------------
 
@@ -1563,5 +2382,318 @@ mod ordereddict_tests {
             pairs(seeded),
             vec![("x".to_string(), 7), ("y".to_string(), 7)]
         );
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    fn int(n: i64) -> i64 {
+        value::encode_int(n).expect("representable")
+    }
+
+    fn text(s: &str) -> i64 {
+        value::str_alloc(s.to_string())
+    }
+
+    fn number(v: i64) -> i64 {
+        value::as_integer(v).expect("integer")
+    }
+
+    fn string(v: i64) -> String {
+        value::as_str(v).expect("string").to_string()
+    }
+
+    fn words(items: &[&str]) -> i64 {
+        value::list_new(items.iter().map(|item| text(item)).collect())
+    }
+
+    fn counter(items: &[&str]) -> i64 {
+        call("Counter", &[words(items)])
+    }
+
+    fn method(instance: i64, name: &str, args: &[i64]) -> i64 {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(instance);
+        argv.extend_from_slice(args);
+        call(&format!("Counter.{name}"), &argv)
+    }
+
+    fn pairs(instance: i64) -> Vec<(String, i64)> {
+        let result = method(instance, "items", &[]);
+        value::as_list(result)
+            .expect("items list")
+            .iter()
+            .map(|&pair| {
+                let tuple = value::as_tuple(pair).expect("pair tuple");
+                (string(tuple[0]), number(tuple[1]))
+            })
+            .collect()
+    }
+
+    fn drain(iterator: i64) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let mut item = NONE;
+            if iter::iter_next(iterator, &mut item) == 0 {
+                break;
+            }
+            assert!(!exc::pending());
+            out.push(string(item));
+        }
+        out
+    }
+
+    #[test]
+    fn constructor_counts_iterables_and_preserves_order() {
+        exc::init();
+        let c = counter(&["b", "a", "b", "c", "b"]);
+        assert!(!exc::pending());
+        assert_eq!(
+            pairs(c),
+            vec![
+                ("b".to_string(), 3),
+                ("a".to_string(), 1),
+                ("c".to_string(), 1)
+            ]
+        );
+        assert_eq!(number(method(c, "__len__", &[])), 3);
+        assert_eq!(number(method(c, "__getitem__", &[text("b")])), 3);
+        // A missing key reads as zero and is not inserted.
+        assert_eq!(number(method(c, "__getitem__", &[text("z")])), 0);
+        assert_eq!(pairs(c).len(), 3);
+        assert_eq!(method(c, "__contains__", &[text("a")]), value::TRUE);
+        assert_eq!(
+            method(c, "__contains__", &[text("z")]),
+            value::bool_value(false)
+        );
+        assert_eq!(method(c, "__missing__", &[text("z")]), int(0));
+        assert_eq!(drain(method(c, "__iter__", &[])), vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn mapping_constructor_and_keywords_add_counts() {
+        exc::init();
+        let seed = value::dict_new(vec![(text("a"), int(2)), (text("b"), int(-1))]);
+        let c = counter_new(&[seed], &[]);
+        assert_eq!(pairs(c), vec![("a".to_string(), 2), ("b".to_string(), -1)]);
+
+        let keywords = [("a".to_string(), int(1)), ("c".to_string(), int(4))];
+        let combined = counter_new(&[words(&["a", "a"])], &keywords);
+        assert!(!exc::pending());
+        assert_eq!(
+            pairs(combined),
+            vec![("a".to_string(), 3), ("c".to_string(), 4)]
+        );
+    }
+
+    #[test]
+    fn item_assignment_update_subtract_and_total() {
+        exc::init();
+        let c = counter(&["a", "a", "b"]);
+        method(c, "__setitem__", &[text("d"), int(5)]);
+        assert_eq!(
+            pairs(c),
+            vec![
+                ("a".to_string(), 2),
+                ("b".to_string(), 1),
+                ("d".to_string(), 5)
+            ]
+        );
+        method(c, "__delitem__", &[text("d")]);
+        assert_eq!(pairs(c).len(), 2);
+        method(c, "__delitem__", &[text("missing")]);
+        assert!(exc::pending());
+        assert_eq!(exc::pending_tag(), KEY_ERROR as i64);
+        exc::clear();
+
+        method(c, "update", &[words(&["a", "c"])]);
+        assert_eq!(
+            pairs(c),
+            vec![
+                ("a".to_string(), 3),
+                ("b".to_string(), 1),
+                ("c".to_string(), 1)
+            ]
+        );
+        method(c, "subtract", &[words(&["b", "b"])]);
+        assert_eq!(
+            pairs(c),
+            vec![
+                ("a".to_string(), 3),
+                ("b".to_string(), -1),
+                ("c".to_string(), 1)
+            ]
+        );
+        assert_eq!(number(method(c, "total", &[])), 3);
+
+        let empty = counter(&[]);
+        assert_eq!(number(method(empty, "total", &[])), 0);
+    }
+
+    #[test]
+    fn elements_and_most_common_follow_counts_and_insertion_order() {
+        exc::init();
+        let c = counter(&["b", "a", "b", "c", "b"]);
+        assert_eq!(
+            drain(method(c, "elements", &[])),
+            vec!["b", "b", "b", "a", "c"]
+        );
+
+        let all = method(c, "most_common", &[]);
+        let rendered: Vec<(String, i64)> = value::as_list(all)
+            .expect("most_common list")
+            .iter()
+            .map(|&pair| {
+                let tuple = value::as_tuple(pair).expect("pair tuple");
+                (string(tuple[0]), number(tuple[1]))
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("b".to_string(), 3),
+                ("a".to_string(), 1),
+                ("c".to_string(), 1)
+            ]
+        );
+
+        let top = method(c, "most_common", &[int(1)]);
+        let top = value::as_list(top).expect("most_common list");
+        assert_eq!(top.len(), 1);
+        let pair = value::as_tuple(top[0]).expect("pair tuple");
+        assert_eq!(string(pair[0]), "b");
+
+        let zero = method(c, "most_common", &[int(0)]);
+        assert!(value::as_list(zero).expect("list").is_empty());
+        let negative = method(c, "most_common", &[int(-3)]);
+        assert!(value::as_list(negative).expect("list").is_empty());
+    }
+
+    #[test]
+    fn addition_and_subtraction_keep_positive_counts() {
+        exc::init();
+        let left = counter(&["a", "a", "b"]);
+        let right = counter(&["a", "c"]);
+
+        let sum = method(left, "__add__", &[right]);
+        assert_eq!(
+            pairs(sum),
+            vec![
+                ("a".to_string(), 3),
+                ("b".to_string(), 1),
+                ("c".to_string(), 1)
+            ]
+        );
+
+        let difference = method(left, "__sub__", &[right]);
+        assert_eq!(
+            pairs(difference),
+            vec![("a".to_string(), 1), ("b".to_string(), 1)]
+        );
+
+        let cancelled = method(left, "__sub__", &[counter(&["a", "a"])]);
+        assert_eq!(pairs(cancelled), vec![("b".to_string(), 1)]);
+
+        // Negative counts on the right become positive counts.
+        let negative = counter_new(&[value::dict_new(vec![(text("z"), int(-2))])], &[]);
+        let combined = method(counter(&["y"]), "__sub__", &[negative]);
+        assert_eq!(
+            pairs(combined),
+            vec![("y".to_string(), 1), ("z".to_string(), 2)]
+        );
+
+        // A non-counter operand reports `NotImplemented`.
+        assert_eq!(
+            method(left, "__add__", &[value::list_new(Vec::new())]),
+            value::NOT_IMPLEMENTED
+        );
+    }
+
+    #[test]
+    fn equality_uses_multiset_semantics_and_dict_fallback() {
+        exc::init();
+        let c = counter(&["a", "a", "b"]);
+        assert_eq!(
+            method(c, "__eq__", &[counter(&["b", "a", "a"])]),
+            value::TRUE
+        );
+        assert_eq!(
+            method(c, "__eq__", &[counter(&["a", "b"])]),
+            value::bool_value(false)
+        );
+        // A zero count equals a missing key against another counter...
+        let zeroed = counter_new(&[value::dict_new(vec![(text("a"), int(0))])], &[]);
+        assert_eq!(method(zeroed, "__eq__", &[counter(&[])]), value::TRUE);
+        // ... but not against a plain dict, which compares item for item.
+        assert_eq!(
+            method(zeroed, "__eq__", &[value::dict_new(Vec::new())]),
+            value::bool_value(false)
+        );
+        assert_eq!(
+            method(
+                c,
+                "__eq__",
+                &[value::dict_new(vec![
+                    (text("a"), int(2)),
+                    (text("b"), int(1))
+                ])]
+            ),
+            value::TRUE
+        );
+        assert_eq!(
+            method(c, "__ne__", &[counter(&["a", "a", "b"])]),
+            value::bool_value(false)
+        );
+        assert_eq!(method(c, "__eq__", &[int(1)]), value::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn copy_repr_and_dict_membership() {
+        exc::init();
+        let c = counter(&["a", "a", "b"]);
+        assert_eq!(
+            value::repr(c),
+            "Counter({'a': 2, 'b': 1})",
+            "repr uses the counter representation"
+        );
+        assert_eq!(value::to_string(c), "Counter({'a': 2, 'b': 1})");
+        assert_eq!(
+            value::repr(counter(&[])),
+            "Counter()",
+            "empty counters render like dicts"
+        );
+
+        let copied = method(c, "copy", &[]);
+        assert_eq!(pairs(copied), pairs(c));
+        method(copied, "__setitem__", &[text("c"), int(9)]);
+        assert_eq!(pairs(c).len(), 2, "copy must not share counts");
+
+        method(copied, "clear", &[]);
+        assert!(pairs(copied).is_empty());
+
+        let key = text("a");
+        assert_eq!(number(method(c, "get", &[key])), 2);
+        assert_eq!(method(c, "get", &[text("z")]), NONE);
+        assert_eq!(method(c, "get", &[text("z"), int(7)]), int(7));
+        assert_eq!(method(c, "setdefault", &[text("z"), int(4)]), int(4));
+        assert_eq!(number(method(c, "get", &[text("z")])), 4);
+        let popped = method(c, "pop", &[text("z")]);
+        assert_eq!(number(popped), 4);
+        let popped_default = method(c, "pop", &[text("z"), int(0)]);
+        assert_eq!(number(popped_default), 0);
+
+        // `Counter` is a `dict` subclass.
+        let dict_function = value::builtin_function_new(hydro_ir::Builtin::Dict);
+        assert_eq!(
+            crate::core::builtins::isinstance(c, dict_function),
+            value::TRUE
+        );
+        assert!(value::is_subclass_of(
+            counter_class(),
+            value::type_class(value::dict_new(Vec::new()))
+        ));
+        assert_eq!(value::type_name_of(c), "Counter");
     }
 }

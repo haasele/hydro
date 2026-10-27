@@ -963,6 +963,120 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         "collections.OrderedDict.clear",
         native_member("OrderedDict.clear", 1, 1),
     ),
+    // Native methods of `collections.Counter`. Like `OrderedDict`, the values
+    // carry `FunctionBody::Native` names, so each one needs an arity spec.
+    (
+        "collections.Counter.__init__",
+        native_member("Counter.__init__", 1, 2),
+    ),
+    (
+        "collections.Counter.__getitem__",
+        native_member("Counter.__getitem__", 2, 2),
+    ),
+    (
+        "collections.Counter.__missing__",
+        native_member("Counter.__missing__", 2, 2),
+    ),
+    (
+        "collections.Counter.__setitem__",
+        native_member("Counter.__setitem__", 3, 3),
+    ),
+    (
+        "collections.Counter.__delitem__",
+        native_member("Counter.__delitem__", 2, 2),
+    ),
+    (
+        "collections.Counter.__iter__",
+        native_member("Counter.__iter__", 1, 1),
+    ),
+    (
+        "collections.Counter.__len__",
+        native_member("Counter.__len__", 1, 1),
+    ),
+    (
+        "collections.Counter.__contains__",
+        native_member("Counter.__contains__", 2, 2),
+    ),
+    (
+        "collections.Counter.__eq__",
+        native_member("Counter.__eq__", 2, 2),
+    ),
+    (
+        "collections.Counter.__ne__",
+        native_member("Counter.__ne__", 2, 2),
+    ),
+    (
+        "collections.Counter.__add__",
+        native_member("Counter.__add__", 2, 2),
+    ),
+    (
+        "collections.Counter.__sub__",
+        native_member("Counter.__sub__", 2, 2),
+    ),
+    (
+        "collections.Counter.__repr__",
+        native_member("Counter.__repr__", 1, 1),
+    ),
+    (
+        "collections.Counter.__str__",
+        native_member("Counter.__str__", 1, 1),
+    ),
+    (
+        "collections.Counter.get",
+        native_member("Counter.get", 2, 3),
+    ),
+    (
+        "collections.Counter.keys",
+        native_member("Counter.keys", 1, 1),
+    ),
+    (
+        "collections.Counter.values",
+        native_member("Counter.values", 1, 1),
+    ),
+    (
+        "collections.Counter.items",
+        native_member("Counter.items", 1, 1),
+    ),
+    (
+        "collections.Counter.update",
+        native_member("Counter.update", 1, 2),
+    ),
+    (
+        "collections.Counter.subtract",
+        native_member("Counter.subtract", 1, 2),
+    ),
+    (
+        "collections.Counter.elements",
+        native_member("Counter.elements", 1, 1),
+    ),
+    (
+        "collections.Counter.most_common",
+        native_member("Counter.most_common", 1, 2),
+    ),
+    (
+        "collections.Counter.total",
+        native_member("Counter.total", 1, 1),
+    ),
+    (
+        "collections.Counter.copy",
+        native_member("Counter.copy", 1, 1),
+    ),
+    (
+        "collections.Counter.clear",
+        native_member("Counter.clear", 1, 1),
+    ),
+    (
+        "collections.Counter.pop",
+        native_member("Counter.pop", 2, 3),
+    ),
+    (
+        "collections.Counter.popitem",
+        native_member("Counter.popitem", 1, 1),
+    ),
+    (
+        "collections.Counter.setdefault",
+        native_member("Counter.setdefault", 2, 3),
+    ),
     // Native methods of the `functools._singledispatchmethod_get` class.
     (
         "functools._singledispatchmethod_get.__init__",
@@ -1240,7 +1354,7 @@ fn module_get_named(module: &str, name: &str) -> i64 {
         }
     }
     // `_collections` is the accelerator alias of `collections`; both names
-    // must expose the same `defaultdict`/`OrderedDict` objects.
+    // must expose the same `defaultdict`/`OrderedDict`/`Counter` objects.
     if matches!(module, "collections" | "_collections") {
         match name {
             "defaultdict" => return collections::defaultdict_function(),
@@ -1248,6 +1362,7 @@ fn module_get_named(module: &str, name: &str) -> i64 {
             // value is the cached class: `isinstance` and method binding need
             // a class, exactly like `io.StringIO`.
             "OrderedDict" => return collections::ordereddict_class(),
+            "Counter" => return collections::counter_class(),
             _ => {}
         }
     }

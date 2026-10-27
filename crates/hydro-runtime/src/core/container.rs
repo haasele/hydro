@@ -1123,7 +1123,7 @@ pub(crate) fn subscript_set(obj: i64, index: i64, new_value: i64) -> i64 {
             return crate::core::methods::call(
                 obj,
                 b"__setitem__".as_ptr(),
-                12,
+                11,
                 args.len(),
                 args.as_ptr(),
             );
