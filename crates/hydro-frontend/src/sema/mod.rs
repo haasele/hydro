@@ -1008,9 +1008,15 @@ impl<'a> Checker<'a> {
                 );
             }
         } else {
-            match f.ret_ty {
-                Ty::Concrete(declared) => {
-                    if self.inf.unify(f.ret_ty, Ty::Concrete(Type::None)).is_err() {
+            // A stub body (`...` or `pass`) returns `None` at runtime, so a
+            // non-`None` return annotation on it states the contract its
+            // implementations honour (typing protocols, abstract
+            // placeholders) rather than a missing return value. An
+            // unannotated stub used as a value still reports below.
+            let declared_stub = matches!(f.ret_ty, Ty::Concrete(_)) && Self::is_stub_body(&f.body);
+            if self.inf.unify(f.ret_ty, Ty::Concrete(Type::None)).is_err() && !declared_stub {
+                match f.ret_ty {
+                    Ty::Concrete(declared) => {
                         self.error_code(
                             f.line,
                             f.col,
@@ -1022,9 +1028,7 @@ impl<'a> Checker<'a> {
                             ),
                         );
                     }
-                }
-                Ty::Var(_) => {
-                    if self.inf.unify(f.ret_ty, Ty::Concrete(Type::None)).is_err() {
+                    Ty::Var(_) => {
                         self.error_code(
                             f.line,
                             f.col,
@@ -1037,6 +1041,44 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// The constant of an expression statement that is a lone literal.
+    fn literal_stmt(stmt: &HStmt) -> Option<&Const> {
+        match &stmt.kind {
+            HStmtKind::Expr(expr) => match &expr.kind {
+                HExprKind::Const(constant) => Some(constant),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether a statement is a stub marker: `pass` or an expression holding
+    /// only `...`.
+    fn is_stub_marker(stmt: &HStmt) -> bool {
+        match &stmt.kind {
+            HStmtKind::Pass => true,
+            _ => matches!(Self::literal_stmt(stmt), Some(Const::Ellipsis)),
+        }
+    }
+
+    /// Whether a body only declares a stub: an optional docstring followed by
+    /// `pass` or `...` (a typing stub or an abstract placeholder).
+    ///
+    /// Lowering keeps the markers as statements, so detection works on the
+    /// HIR. At runtime such a body returns `None`; the declared return type
+    /// describes what an implementation must return.
+    fn is_stub_body(body: &[HStmt]) -> bool {
+        let mut stmts = body;
+        // A leading string literal is the docstring, not code.
+        if let Some(Const::Str(_)) = stmts.first().and_then(|stmt| Self::literal_stmt(stmt)) {
+            stmts = &stmts[1..];
+        }
+        match stmts {
+            [stmt] => Self::is_stub_marker(stmt),
+            _ => false,
         }
     }
 

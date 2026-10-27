@@ -2968,3 +2968,72 @@ fn bytes_percent_formatting_is_accepted() {
     );
     assert!(check_errors("def f(v):\n    return b'%d' % v\n").is_empty());
 }
+
+#[test]
+fn stub_bodies_accept_return_annotations() {
+    for source in [
+        "def f() -> int: ...\n",
+        "def f() -> int:\n    ...\n",
+        "def f() -> int:\n    pass\n",
+        "def f() -> int:\n    \"\"\"Doc.\"\"\"\n    ...\n",
+        "def f() -> int:\n    'Doc.'\n    pass\n",
+        "def f() -> list:\n    ...\n",
+        "async def f() -> int:\n    ...\n",
+    ] {
+        assert!(check_errors(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn protocol_method_stubs_typecheck() {
+    let source = "\
+class Proto:
+    def size(self) -> int: ...
+    def entries(self) -> int:
+        \"\"\"Number of entries.\"\"\"
+        ...
+";
+    assert!(check_errors(source).is_empty());
+}
+
+#[test]
+fn non_stub_bodies_still_report_a_missing_return() {
+    let expected = "function 'f' is declared to return int, but has no return value";
+    for source in [
+        // A real body with no `return`.
+        "def f() -> int:\n    x = 1\n",
+        "def f() -> int:\n    print(1)\n",
+        // A docstring alone is a no-op implementation, not a stub marker.
+        "def f() -> int:\n    \"\"\"Doc.\"\"\"\n",
+        // `...` mixed with real code is not a stub declaration either.
+        "def f() -> int:\n    ...\n    x = 1\n",
+        "def f() -> int:\n    x = 1\n    ...\n",
+    ] {
+        let diags = check_diags(source);
+        assert_eq!(diags.len(), 1, "{source}: {diags:?}");
+        assert_eq!(diags[0].code, codes::CONTROL, "{source}");
+        assert_eq!(diags[0].message, expected, "{source}");
+    }
+}
+
+#[test]
+fn unannotated_stubs_used_as_values_still_report() {
+    // Only a declared return type makes a stub body a promise; without one the
+    // result type is inferred from its uses, and a `None` body cannot satisfy
+    // them.
+    let diags =
+        check_diags("def take(x: int) -> int:\n    return x\n\ndef f():\n    ...\n\ntake(f())\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::CONTROL);
+    assert_eq!(
+        diags[0].message,
+        "function 'f' has no return value but is used as a value-returning function"
+    );
+}
+
+#[test]
+fn stub_bodies_keep_their_declared_return_type() {
+    let program = crate::check_source("def f() -> int: ...\nprint(f())\n", "test.py")
+        .expect("a stub body typechecks");
+    assert_eq!(program_function(&program, "f").ret_ty, Type::Int);
+}

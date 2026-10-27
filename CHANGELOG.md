@@ -8,6 +8,17 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — 2026-10-27 Stub function bodies accept return annotations
+
+- A body that only declares a stub — `...`, optionally behind a docstring, or
+  `pass` (an abstract placeholder) — no longer reports `HYD0104` for a missing
+  return value when it carries a declared return type, so NumPy's typing
+  protocols (`def __len__(self) -> int: ...`) type-check. The body still
+  evaluates to `None`; the annotation states the contract its implementations
+  honour. A real body without a `return`, a docstring alone, `...` mixed with
+  other statements, and an unannotated stub used as a value still report the
+  diagnostic.
+
 ### Added — 2026-10-27 `typing.TypeVar` type parameters
 
 - `typing.TypeVar` is a real cached class: `TypeVar(name, *constraints, *,
