@@ -1056,10 +1056,14 @@ pub static SSL: ModuleSpec = ModuleSpec {
 pub static RE: ModuleSpec = ModuleSpec {
     name: "re",
     functions: &[
-        f("search", 2, 2, Type::Any),
-        f("match", 2, 2, Type::Any),
-        f("fullmatch", 2, 2, Type::Any),
-        f("findall", 2, 2, Type::List),
+        // `search`/`match`/`fullmatch(pattern, string, flags=0)` and
+        // `findall(pattern, string, flags=0)`: the optional trailing flags
+        // argument is positional (`re.search(pat, text, re.I)`), which the
+        // runtime forwards to the regex builder.
+        f("search", 2, 3, Type::Any),
+        f("match", 2, 3, Type::Any),
+        f("fullmatch", 2, 3, Type::Any),
+        f("findall", 2, 3, Type::List),
         f("sub", 3, 4, Type::Str),
         f("split", 2, 3, Type::List),
         f("escape", 1, 1, Type::Str),
@@ -1827,6 +1831,26 @@ pub static TYPING: ModuleSpec = ModuleSpec {
         f("_collect_parameters", 1, 1, Type::Tuple),
         f("_check_generic", 2, 3, Type::None),
         f("_overload_dummy", 0, usize::MAX, Type::Any),
+        // `typing_extensions` takes `get_overloads`/`clear_overloads` from
+        // `typing` when they exist (Python 3.11+). They read and reset the
+        // registry filled by `@overload`.
+        f("get_overloads", 1, 1, Type::List),
+        f("clear_overloads", 0, 0, Type::None),
+        // `disjoint_base(cls)` marks a class for the 3.15 inheritance check.
+        // Hydro keeps no compiler flag, so the decorator returns the class.
+        f("disjoint_base", 1, 1, Type::Any),
+        // CPython's private `_ConcatenateGenericAlias(origin, args, *,
+        // _typevar_types, _paramspec_tvars)`. The attribute value is the real
+        // alias class (see `typing::class_value`); declaring the call form
+        // lets `typing_extensions`' fallback path construct it with the
+        // keyword-only metadata instead of failing on an unknown keyword.
+        kw_dynamic(
+            "_ConcatenateGenericAlias",
+            2,
+            2,
+            Type::Any,
+            &["origin", "args"],
+        ),
     ],
     constants: &[
         c("TYPE_CHECKING", Type::Bool),
@@ -2405,8 +2429,23 @@ pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
         f("_exitstack_push", 2, 2, Type::Any),
         kw_dynamic("_exitstack_callback", 2, usize::MAX, Type::Any, &[]),
         f("_exitstack_pop_all", 1, 1, Type::Any),
+        // The `AbstractContextManager`/`AbstractAsyncContextManager` protocol
+        // bodies. `typing_extensions` imports both classes for its
+        // `ContextManager`/`AsyncContextManager` aliases; the methods are the
+        // CPython definitions (enter hands back the manager, exit never
+        // suppresses, the subclass hook answers structurally).
+        f("_abstract_cm_enter", 1, 1, Type::Any),
+        f("_abstract_cm_exit", 4, 4, Type::None),
+        f("_abstract_cm_subclasshook", 2, 2, Type::Any),
+        f("_abstract_acm_aenter", 1, 1, Type::Any),
+        f("_abstract_acm_aexit", 4, 4, Type::None),
+        f("_abstract_acm_subclasshook", 2, 2, Type::Any),
     ],
-    constants: &[],
+    constants: &[
+        // Real class values at runtime; see `contextlib_class_value`.
+        c("AbstractContextManager", Type::Any),
+        c("AbstractAsyncContextManager", Type::Any),
+    ],
 };
 
 /// `_collections`: accelerator alias table for `collections`. `defaultdict`,
@@ -3638,6 +3677,23 @@ mod tests {
         let callback = function("contextlib", "_exitstack_callback").expect("callback");
         assert_eq!((callback.min_args, callback.max_args), (2, usize::MAX));
         assert!(callback.dynamic_keywords);
+
+        // The abstract protocol classes `typing_extensions` imports for its
+        // `ContextManager`/`AsyncContextManager` aliases.
+        for name in ["AbstractContextManager", "AbstractAsyncContextManager"] {
+            assert_eq!(constant("contextlib", name).expect(name).ty, Type::Any);
+        }
+        for (name, min, max) in [
+            ("_abstract_cm_enter", 1, 1),
+            ("_abstract_cm_exit", 4, 4),
+            ("_abstract_cm_subclasshook", 2, 2),
+            ("_abstract_acm_aenter", 1, 1),
+            ("_abstract_acm_aexit", 4, 4),
+            ("_abstract_acm_subclasshook", 2, 2),
+        ] {
+            let spec = function("contextlib", name).expect(name);
+            assert_eq!((spec.min_args, spec.max_args), (min, max), "{name}");
+        }
     }
 
     #[test]
@@ -3875,6 +3931,32 @@ mod tests {
         }
         assert_eq!(function("typing", "ParamSpec").unwrap().min_args, 1);
         assert_eq!(function("typing", "TypeVarTuple").unwrap().min_args, 1);
+        // `typing_extensions` takes the 3.11 overload introspection helpers
+        // when they exist, and uses `disjoint_base` when the runtime has it.
+        let get_overloads = function("typing", "get_overloads").expect("get_overloads");
+        assert_eq!(
+            (
+                get_overloads.min_args,
+                get_overloads.max_args,
+                get_overloads.ret
+            ),
+            (1, 1, Type::List)
+        );
+        let clear_overloads = function("typing", "clear_overloads").expect("clear_overloads");
+        assert_eq!((clear_overloads.min_args, clear_overloads.max_args), (0, 0));
+        assert_eq!(
+            function("typing", "disjoint_base")
+                .expect("disjoint_base")
+                .max_args,
+            1
+        );
+        // The private alias constructor is declared as a callable with the
+        // keyword-only metadata names, while its attribute value stays the
+        // real class.
+        let alias = function("typing", "_ConcatenateGenericAlias").expect("alias ctor");
+        assert_eq!((alias.min_args, alias.max_args), (2, 2));
+        assert!(alias.dynamic_keywords);
+        assert_eq!(alias.params, &["origin", "args"][..]);
     }
 
     #[test]
@@ -4231,6 +4313,21 @@ mod tests {
         // `compile(pattern, flags=0)` takes the optional flag argument.
         let compile = function("re", "compile").expect("re.compile");
         assert_eq!((compile.min_args, compile.max_args), (1, 2));
+        // `re.search(pat, text, re.I)`: the flags argument is positional on
+        // every matching entry point (`findall` has included it since 3.11).
+        for (name, ret) in [
+            ("search", Type::Any),
+            ("match", Type::Any),
+            ("fullmatch", Type::Any),
+            ("findall", Type::List),
+        ] {
+            let spec = function("re", name).expect(name);
+            assert_eq!(
+                (spec.min_args, spec.max_args, spec.ret),
+                (2, 3, ret),
+                "{name}"
+            );
+        }
         let finditer = function("re", "finditer").expect("re.finditer");
         assert_eq!((finditer.min_args, finditer.max_args), (2, 3));
         assert_eq!(finditer.params, &["pattern", "string", "flags"][..]);

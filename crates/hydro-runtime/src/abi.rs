@@ -926,7 +926,9 @@ pub extern "C" fn hydro_call_star_kw(
     crate::core::builtins::call_star_kw(function, argc, argv, star, kwargc, kw_argv, star_map)
 }
 
-/// `f(*args, **kwargs)` at a call site the frontend could not bind statically.
+/// A call whose operands the frontend could not bind: the runtime callable has
+/// no keyword slot (a compiled extension member, or a coroutine/generator with
+/// a dynamic signature).
 ///
 /// The generated code evaluates the callee and every operand (in source
 /// order) before calling this helper, so side effects still happen; the helper
@@ -941,7 +943,7 @@ pub extern "C" fn hydro_deferred_call(argc: usize, argv: *const i64) -> i64 {
     let _ = (argc, argv);
     exc::raise_with_message(
         exc::RUNTIME_ERROR,
-        "dynamic call with starred or double-star arguments is not supported",
+        "this callable does not accept keyword arguments at runtime",
     )
 }
 

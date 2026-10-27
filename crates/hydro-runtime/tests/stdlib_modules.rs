@@ -307,6 +307,33 @@ fn regex_search_findall_and_sub() {
 }
 
 #[test]
+fn regex_module_functions_accept_positional_flags() {
+    hydro_runtime_init();
+    // `re.search(pattern, string, flags)` — pandas passes `re.I` as the third
+    // positional argument; the flag must reach the compiler instead of being
+    // ignored.
+    let insensitive = module_get("re", "I");
+    let found = module("re", "search", &[text("abc"), text("xABCx"), insensitive]);
+    assert_true(hydro_bool(found));
+
+    // Without the flag the same pattern does not match.
+    let exact = module("re", "search", &[text("abc"), text("xABCx")]);
+    assert_none(exact);
+
+    // `match`/`fullmatch`/`findall` share the trailing flags slot.
+    let anchored = module("re", "match", &[text("abc"), text("ABCx"), insensitive]);
+    assert_true(hydro_bool(anchored));
+    let complete = module("re", "fullmatch", &[text("abc"), text("ABC"), insensitive]);
+    assert_true(hydro_bool(complete));
+    let all = module(
+        "re",
+        "findall",
+        &[text("[a-z]+"), text("AB cd"), insensitive],
+    );
+    assert_str(hydro_to_str(all), "['AB', 'cd']");
+}
+
+#[test]
 fn regex_finditer_returns_match_objects_with_spans() {
     hydro_runtime_init();
     let matches = module("re", "finditer", &[text("[0-9]+"), text("a1b22")]);

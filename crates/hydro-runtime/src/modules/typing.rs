@@ -58,6 +58,7 @@
 //!   non-name expression raises a tagged `NotImplementedError` when the helper
 //!   is actually called (attribute lookup always succeeds).
 
+use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use hydro_ir::{Builtin, ParamKind};
@@ -70,6 +71,50 @@ use crate::exc::{
 use crate::heap;
 use crate::methods;
 use crate::value::{self, FALSE, NONE, TRUE};
+
+/// `@overload` stubs registered for `typing.get_overloads`.
+///
+/// CPython keys the registry by `(filename, qualname, firstlineno)` from the
+/// decorated function's code object. Hydro functions carry no code provenance,
+/// so the key is `(__module__ if assigned, __qualname__)`; overloads and their
+/// implementation share the definition name, which is exactly the lookup
+/// `get_overloads(implementation)` performs. Entries are rooted so the
+/// collector cannot free a stub that only the registry names, and the
+/// generation tag discards values from an earlier heap.
+struct OverloadRegistry {
+    generation: u64,
+    entries: HashMap<(String, String), Vec<i64>>,
+}
+
+static OVERLOADS: LazyLock<Mutex<OverloadRegistry>> = LazyLock::new(|| {
+    Mutex::new(OverloadRegistry {
+        generation: 0,
+        entries: HashMap::new(),
+    })
+});
+
+/// Locks the registry, dropping entries that name a previous heap generation.
+fn overload_registry() -> std::sync::MutexGuard<'static, OverloadRegistry> {
+    let mut registry = OVERLOADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = heap::generation();
+    if registry.generation != generation {
+        registry.entries.clear();
+        registry.generation = generation;
+    }
+    registry
+}
+
+/// Registry key of a function value: its assigned `__module__` plus
+/// `__qualname__` (the definition name when no qualname was assigned).
+fn overload_key(function: i64) -> (String, String) {
+    let module = value::function_module(function)
+        .and_then(value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    (module, value::function_qualname(function))
+}
 
 /// Generation-tagged cache for the native `ForwardRef` class.
 struct ForwardRefState {
@@ -97,6 +142,11 @@ pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
         // ParamSpec` and subclassing all need it).
         "ParamSpec" | "TypeVarTuple" => Some(typevar_like_class(name)),
         "TypeVar" => Some(typevar_class()),
+        // The call form is declared as a module function so keyword calls
+        // lower as module calls, but the attribute value must stay the real
+        // class: `isinstance(x, typing._ConcatenateGenericAlias)` and
+        // `super(typing._ConcatenateGenericAlias, self)` both need it.
+        "_ConcatenateGenericAlias" => Some(cached_class("_ConcatenateGenericAlias")),
         _ => None,
     }
 }
@@ -598,6 +648,98 @@ extern "C" fn concatenate_generic_alias_init_entry(argv: *const i64) -> i64 {
     heap::release_roots(parameter_roots);
     heap::release_roots(roots);
     NONE
+}
+
+/// Module-call form of `typing._ConcatenateGenericAlias(origin, args, *,
+/// _typevar_types, _paramspec_tvars)`.
+///
+/// `typing_extensions` reaches the class through the module (`typing._ConcatenateGenericAlias`)
+/// and through its local alias, so the keyword-bearing call must work when it
+/// lowers as a module call as well. The native class call path binds the
+/// arguments, so both spellings share one validation: the `__init__` body
+/// above accepts the two keyword-only metadata names and rejects everything
+/// else with CPython's `TypeError`.
+fn concatenate_generic_alias_new(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let class = cached_class("_ConcatenateGenericAlias");
+    let class_roots = heap::root_values(&[class]);
+    // Keyword names are freshly allocated strings; root each one before the
+    // next allocation can trigger a collection.
+    let mut words: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+    let mut name_roots: Vec<usize> = Vec::with_capacity(keywords.len());
+    for (name, keyword) in keywords {
+        let key = value::str_alloc(name.clone());
+        name_roots.push(heap::root_values(&[key]));
+        words.push(key);
+        words.push(*keyword);
+    }
+    let result = crate::builtins::call_kw(
+        class,
+        args.len(),
+        args.as_ptr(),
+        keywords.len(),
+        words.as_ptr(),
+    );
+    for start in name_roots.into_iter().rev() {
+        heap::release_roots(start);
+    }
+    heap::release_roots(class_roots);
+    result
+}
+
+/// `typing.overload(func)`: records an overload stub and returns the callable.
+///
+/// CPython replaces the decorated function with an `_overload_dummy`
+/// placeholder; Hydro returns the function itself so a direct call still
+/// works, while the registry (the observable state) matches CPython's.
+fn overload(func: i64) -> i64 {
+    if value::as_function(func).is_some() {
+        let key = overload_key(func);
+        // The registry is Rust-side memory the collector cannot scan; keep the
+        // stub alive exactly like a module global.
+        heap::add_thread_root(func);
+        overload_registry()
+            .entries
+            .entry(key)
+            .or_default()
+            .push(func);
+    }
+    func
+}
+
+/// `typing.get_overloads(func)`: the stubs registered for `func`'s name.
+fn get_overloads(func: i64) -> i64 {
+    if value::as_function(func).is_none() {
+        return exc::raise_with_message(TYPE_ERROR, "get_overloads() argument must be a function");
+    }
+    let key = overload_key(func);
+    let entries = {
+        let registry = overload_registry();
+        registry.entries.get(&key).cloned().unwrap_or_default()
+    };
+    value::list_new(entries)
+}
+
+/// `typing.clear_overloads()`: forgets every registered stub.
+///
+/// The stubs' conservative roots stay installed (the globals store keeps
+/// replaced values rooted too), so this can never free a function a compiled
+/// module still names.
+fn clear_overloads() -> i64 {
+    overload_registry().entries.clear();
+    NONE
+}
+
+/// `typing.disjoint_base(cls)` (PEP 800): a marker decorator.
+///
+/// CPython 3.15 records a flag on the class so the compiler can reject
+/// incompatible diamond inheritance; Hydro has no such compiler flag, and the
+/// decorator returns the class unchanged, as both CPython's implementation and
+/// `typing_extensions`' fallback do.
+fn disjoint_base(cls: i64) -> i64 {
+    if value::as_class(cls).is_none() {
+        return type_error("disjoint_base() argument must be a class");
+    }
+    cls
 }
 
 /// A `frozenset`-shaped constant. Hydro has one set value type, so the
@@ -1211,7 +1353,14 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "cast" => args.get(1).copied().unwrap_or(NONE),
         // `assert_never(arg, /)` marks unreachable code: it always raises.
         "assert_never" => assert_never(args.first().copied().unwrap_or(NONE)),
-        "runtime_checkable" | "overload" => args.first().copied().unwrap_or(NONE),
+        "runtime_checkable" => args.first().copied().unwrap_or(NONE),
+        // `@overload` records the stub for `get_overloads`; the callable is
+        // returned so a direct call still reaches the annotated body.
+        "overload" => overload(args.first().copied().unwrap_or(NONE)),
+        "get_overloads" => get_overloads(args.first().copied().unwrap_or(NONE)),
+        "clear_overloads" => clear_overloads(),
+        "disjoint_base" => disjoint_base(args.first().copied().unwrap_or(NONE)),
+        "_ConcatenateGenericAlias" => concatenate_generic_alias_new(args, &[]),
         // `TypeVar` carries the full type-parameter attribute set; the
         // frontend still consumes annotations itself, but the value is real
         // enough for `repr`/attribute introspection.
@@ -1262,6 +1411,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 /// Keyword-aware dispatch.
 pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     match function {
+        "_ConcatenateGenericAlias" => concatenate_generic_alias_new(args, keywords),
         "ForwardRef" => new_forward_ref(args, keywords),
         "_deprecation_warning_for_no_type_params_passed" => no_type_params(args, keywords),
         "evaluate_forward_ref" => evaluate_forward_ref(args, keywords),
@@ -3025,6 +3175,85 @@ mod tests {
             [text("bogus"), NONE].as_ptr(),
         );
         assert!(exc::pending());
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn module_call_form_builds_the_concatenate_alias() {
+        exc::init();
+        let origin = constant("Callable");
+        let parameter = call("ParamSpec", &[text("P")]);
+        let arguments = value::tuple_new(vec![constant("Any"), parameter]);
+        let typevar_types = value::tuple_new(vec![constant("Any")]);
+        let alias = call_kw(
+            "_ConcatenateGenericAlias",
+            &[origin, arguments],
+            &[
+                ("_typevar_types".to_string(), typevar_types),
+                ("_paramspec_tvars".to_string(), TRUE),
+            ],
+        );
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::instance_class_value(alias),
+            Some(cached_class("_ConcatenateGenericAlias"))
+        );
+        assert_eq!(value::instance_attr(alias, "__origin__"), Some(origin));
+        assert_eq!(
+            value::instance_attr(alias, "_typevar_types"),
+            Some(typevar_types)
+        );
+        assert_eq!(value::instance_attr(alias, "_paramspec_tvars"), Some(TRUE));
+
+        // The module entry defers to the same class constructor, which rejects
+        // an unknown keyword instead of dropping it.
+        exc::init();
+        let _ = call_kw(
+            "_ConcatenateGenericAlias",
+            &[origin, arguments],
+            &[("bogus".to_string(), NONE)],
+        );
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        assert!(pending_message().contains("unexpected keyword argument 'bogus'"));
+        exc::clear();
+    }
+
+    #[test]
+    fn overload_registry_reports_and_clears() {
+        exc::init();
+        let first = value::native_function_new("pydantic", "validate", 1);
+        let second = value::native_function_new("pydantic", "validate", 1);
+        // `@overload` returns the callable it registered.
+        assert_eq!(call("overload", &[first]), first);
+        assert_eq!(call("overload", &[second]), second);
+        let listed = call("get_overloads", &[first]);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::as_list(listed).map(|items| items.to_vec()),
+            Some(vec![first, second])
+        );
+
+        assert_eq!(call("clear_overloads", &[]), NONE);
+        let cleared = call("get_overloads", &[first]);
+        assert_eq!(value::as_list(cleared).map(|items| items.len()), Some(0));
+
+        // A non-function argument is a `TypeError`, like `func.__code__`
+        // access failing in CPython.
+        exc::init();
+        let _ = call("get_overloads", &[NONE]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn disjoint_base_is_a_class_marker() {
+        exc::init();
+        let class = value::class_new("Node".to_string(), NONE, Vec::new());
+        assert_eq!(call("disjoint_base", &[class]), class);
+        assert!(!exc::pending());
+        exc::init();
+        let _ = call("disjoint_base", &[NONE]);
         assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
         exc::clear();
     }

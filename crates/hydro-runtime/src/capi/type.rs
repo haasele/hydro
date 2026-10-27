@@ -727,8 +727,42 @@ pub(crate) static mut TRACEBACK_TYPE: TypeObject = TypeObject::builtin(
 pub(crate) static mut OBJECT_ALIAS_TYPE: TypeObject =
     TypeObject::builtin(c"object".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
 
+/// `types.GenericAlias`, the type of the objects `Py_GenericAlias` returns.
+/// Its `tp_repr`, `tp_str`, `__origin__` and `__args__` are provided by
+/// `capi::mod` from the payload.
+#[export_name = "PyGenericAlias_Type"]
+pub(crate) static mut GENERIC_ALIAS_TYPE: TypeObject = TypeObject::builtin(
+    c"types.GenericAlias".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE,
+);
+
+/// `PySeqIter_Type`, the concrete iterator `PySeqIter_New` returns. CPython
+/// exports this type object; the host sets `tp_iter`/`tp_iternext` once the
+/// metatype graph is ready.
+#[export_name = "PySeqIter_Type"]
+pub(crate) static mut SEQITER_TYPE: TypeObject = TypeObject::builtin(
+    c"iterator".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE,
+);
+
+/// `contextvars.ContextVar`, created by `PyContextVar_New`.
+pub(crate) static mut CONTEXT_VAR_TYPE: TypeObject = TypeObject::builtin(
+    c"contextvars.ContextVar".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE,
+);
+
+/// `contextvars.Token`, returned by `PyContextVar_Set`.
+pub(crate) static mut CONTEXT_TOKEN_TYPE: TypeObject = TypeObject::builtin(
+    c"contextvars.Token".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE,
+);
+
 /// Every static builtin type, used to patch the metatype link.
-fn builtin_type_pointers() -> [*mut TypeObject; 37] {
+fn builtin_type_pointers() -> [*mut TypeObject; 41] {
     [
         ptr::addr_of_mut!(TYPE_TYPE),
         ptr::addr_of_mut!(OBJECT_TYPE),
@@ -767,6 +801,10 @@ fn builtin_type_pointers() -> [*mut TypeObject; 37] {
         ptr::addr_of_mut!(DICT_PROXY_TYPE),
         ptr::addr_of_mut!(TRACEBACK_TYPE),
         ptr::addr_of_mut!(OBJECT_ALIAS_TYPE),
+        ptr::addr_of_mut!(GENERIC_ALIAS_TYPE),
+        ptr::addr_of_mut!(SEQITER_TYPE),
+        ptr::addr_of_mut!(CONTEXT_VAR_TYPE),
+        ptr::addr_of_mut!(CONTEXT_TOKEN_TYPE),
     ]
 }
 
@@ -810,6 +848,10 @@ pub(crate) fn ensure_builtin_types() {
         let bytes_procs: &'static PyBufferProcs = &super::buffer::BYTES_BUFFER_PROCS;
         (*ptr::addr_of_mut!(BYTES_TYPE)).tp_as_buffer =
             bytes_procs as *const PyBufferProcs as *mut PyBufferProcs;
+        let seq_iterator = ptr::addr_of_mut!(SEQITER_TYPE);
+        (*seq_iterator).tp_iter = super::PyObject_SelfIter as *const () as usize;
+        (*seq_iterator).tp_iternext = super::seqiter_next as *const () as usize;
+        (*ptr::addr_of_mut!(MEMORYVIEW_TYPE)).tp_as_buffer = super::memoryview_buffer_procs();
         super::patch_constant_types();
     });
 }
@@ -3605,6 +3647,13 @@ pub(crate) fn object_length(object: *mut ShimObject) -> isize {
     if let Some(kind) = super::kind_ref(object) {
         match kind {
             super::ShimKind::Dict(pairs) => return super::py_ssize_of(pairs.len()),
+            super::ShimKind::DictProxy { dict } => {
+                if let Some(super::ShimKind::Dict(pairs)) =
+                    super::kind_ref(*dict as *mut ShimObject)
+                {
+                    return super::py_ssize_of(pairs.len());
+                }
+            }
             super::ShimKind::List(items) | super::ShimKind::Tuple(items) => {
                 return super::py_ssize_of(items.len())
             }
@@ -3620,6 +3669,37 @@ pub(crate) fn object_length(object: *mut ShimObject) -> isize {
     sequence_length_of(object)
 }
 
+/// Reads `index` from a builtin list/tuple payload, returning a new reference.
+fn builtin_sequence_item(items: &[usize], index: i64, kind: &str) -> *mut ShimObject {
+    let length = items.len() as i64;
+    let resolved = if index < 0 { index + length } else { index };
+    if resolved < 0 || resolved >= length {
+        super::set_error(format!("IndexError: {kind} index out of range"));
+        return ptr::null_mut();
+    }
+    let item = items[resolved as usize] as *mut ShimObject;
+    if item.is_null() {
+        super::set_error(format!("SystemError: {kind} item is uninitialized"));
+        return ptr::null_mut();
+    }
+    inc_ref(item);
+    item
+}
+
+/// Fetches `index` through the sequence protocol without boxing an integer key.
+///
+/// Builtin lists and tuples do not publish a `PySequenceMethods` suite, so
+/// their payload is read directly; every other object goes through `sq_item`.
+pub(crate) fn sequence_item_at(object: *mut ShimObject, index: isize) -> *mut ShimObject {
+    if let Some(super::ShimKind::List(items)) = super::kind_ref(object) {
+        return builtin_sequence_item(items, index as i64, "list");
+    }
+    if let Some(super::ShimKind::Tuple(items)) = super::kind_ref(object) {
+        return builtin_sequence_item(items, index as i64, "tuple");
+    }
+    PySequence_GetItem(object, index)
+}
+
 /// Fetches an item through `mp_subscript` or `sq_item`.
 pub(crate) fn object_getitem(object: *mut ShimObject, key: *mut ShimObject) -> *mut ShimObject {
     if object.is_null() || key.is_null() {
@@ -3628,6 +3708,15 @@ pub(crate) fn object_getitem(object: *mut ShimObject, key: *mut ShimObject) -> *
     }
     if let Some(kind) = super::kind_ref(object) {
         match kind {
+            super::ShimKind::DictProxy { dict } => {
+                let item = super::PyDict_GetItem(*dict as *mut ShimObject, key);
+                if item.is_null() {
+                    super::set_error(format!("KeyError: {}", super::shim_repr(key)));
+                } else {
+                    inc_ref(item);
+                }
+                return item;
+            }
             super::ShimKind::Dict(_) => {
                 let item = super::PyDict_GetItem(object, key);
                 if item.is_null() {
@@ -3645,19 +3734,7 @@ pub(crate) fn object_getitem(object: *mut ShimObject, key: *mut ShimObject) -> *
                         return ptr::null_mut();
                     }
                 };
-                let length = items.len() as i64;
-                let resolved = if index < 0 { index + length } else { index };
-                if resolved < 0 || resolved >= length {
-                    super::set_error("IndexError: list index out of range");
-                    return ptr::null_mut();
-                }
-                let item = items[resolved as usize] as *mut ShimObject;
-                if item.is_null() {
-                    super::set_error("SystemError: list item is uninitialized");
-                    return ptr::null_mut();
-                }
-                inc_ref(item);
-                return item;
+                return builtin_sequence_item(items, index, "list");
             }
             super::ShimKind::Tuple(items) => {
                 let index = match super::as_int(key) {
@@ -3667,19 +3744,7 @@ pub(crate) fn object_getitem(object: *mut ShimObject, key: *mut ShimObject) -> *
                         return ptr::null_mut();
                     }
                 };
-                let length = items.len() as i64;
-                let resolved = if index < 0 { index + length } else { index };
-                if resolved < 0 || resolved >= length {
-                    super::set_error("IndexError: tuple index out of range");
-                    return ptr::null_mut();
-                }
-                let item = items[resolved as usize] as *mut ShimObject;
-                if item.is_null() {
-                    super::set_error("SystemError: tuple item is uninitialized");
-                    return ptr::null_mut();
-                }
-                inc_ref(item);
-                return item;
+                return builtin_sequence_item(items, index, "tuple");
             }
             _ => {}
         }

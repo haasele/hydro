@@ -72,7 +72,7 @@ fn range_index(starts: &[u32], cp: u32) -> usize {
         .saturating_sub(1)
 }
 
-fn category_of(ch: char) -> &'static str {
+pub(crate) fn category_of(ch: char) -> &'static str {
     let index = range_index(CATEGORY_STARTS, ch as u32);
     CATEGORY_NAMES[CATEGORY_IDS[index] as usize]
 }
@@ -331,7 +331,7 @@ fn lookup_name(text: &str) -> Option<char> {
         .and_then(|&(cp, _)| char::from_u32(cp))
 }
 
-fn numeric_entry(cp: u32) -> Option<(i8, i8, i64, i64)> {
+pub(crate) fn numeric_entry(cp: u32) -> Option<(i8, i8, i64, i64)> {
     let index = NUM_KEYS.binary_search(&cp).ok()?;
     Some((
         NUM_DIGITS[index],

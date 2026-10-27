@@ -1402,6 +1402,9 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if let Some(class) = typing::class_value(module, name) {
         return class;
     }
+    if let Some(class) = contextlib_class_value(module, name) {
+        return class;
+    }
     if let Some(class) = types::class_value(module, name) {
         return class;
     }
@@ -2794,7 +2797,132 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // The `@dataclass` decorator is expanded by the frontend; the runtime
         // value only has to exist for the import.
         ("dataclasses", "dataclass") => NONE,
+        ("contextlib", name) => contextlib_class_value("contextlib", name)
+            .unwrap_or_else(|| missing_attribute("contextlib", name)),
         _ => missing_attribute(module, name),
+    }
+}
+
+/// `contextlib.AbstractContextManager` / `AbstractAsyncContextManager`.
+///
+/// CPython defines both as `abc.ABC` subclasses that implement the protocol
+/// (enter hands the manager back, exit never suppresses) and answer
+/// `__subclasshook__` structurally. `typing_extensions` imports them as the
+/// origins of its `ContextManager`/`AsyncContextManager` aliases, so the
+/// module attributes must be real classes rather than callables.
+pub(crate) fn contextlib_class_value(module: &str, name: &str) -> Option<i64> {
+    if module != "contextlib" {
+        return None;
+    }
+    match name {
+        "AbstractContextManager" => Some(abstract_manager_class(false)),
+        "AbstractAsyncContextManager" => Some(abstract_manager_class(true)),
+        _ => None,
+    }
+}
+
+/// Returns (creating on first use) one of the two abstract manager classes.
+///
+/// The classes inherit `abc.ABC`, so `ABC.register` records real virtual
+/// subclasses, and they carry CPython's concrete protocol bodies. The
+/// `__subclasshook__` classmethod answers the structural check directly; the
+/// builtin `issubclass` path does not consult user hooks, so structural
+/// results are reachable through the hook (and through registration) rather
+/// than being assumed by `issubclass`.
+fn abstract_manager_class(asynchronous: bool) -> i64 {
+    let key = if asynchronous {
+        "contextlib.AbstractAsyncContextManager.class"
+    } else {
+        "contextlib.AbstractContextManager.class"
+    };
+    if let Some(cached) = globals::registry_get(key) {
+        return cached;
+    }
+    let class_name = if asynchronous {
+        "AbstractAsyncContextManager"
+    } else {
+        "AbstractContextManager"
+    };
+    let (enter_name, exit_name, enter_function, exit_function) = if asynchronous {
+        (
+            "__aenter__",
+            "__aexit__",
+            "_abstract_acm_aenter",
+            "_abstract_acm_aexit",
+        )
+    } else {
+        (
+            "__enter__",
+            "__exit__",
+            "_abstract_cm_enter",
+            "_abstract_cm_exit",
+        )
+    };
+    let hook_function = if asynchronous {
+        "_abstract_acm_subclasshook"
+    } else {
+        "_abstract_cm_subclasshook"
+    };
+    let base = abc::constant("ABC");
+    if exc::pending() {
+        return NONE;
+    }
+    let enter = value::native_function_new("contextlib", enter_function, 1);
+    let exit = value::native_function_new("contextlib", exit_function, 4);
+    let hook = value::native_function_new("contextlib", hook_function, 2);
+    // `__slots__ = ()`, as in CPython's definition.
+    let slots = value::tuple_new(Vec::new());
+    let roots = heap::root_values(&[base, enter, exit, hook, slots]);
+    let methods = vec![
+        (enter_name.to_string(), enter, hydro_ir::MethodKind::Normal),
+        (exit_name.to_string(), exit, hydro_ir::MethodKind::Normal),
+        (
+            "__subclasshook__".to_string(),
+            hook,
+            hydro_ir::MethodKind::Classmethod,
+        ),
+    ];
+    let attrs = vec![("__slots__".to_string(), slots)];
+    let class = value::class_new_multi(class_name.to_string(), vec![base], NONE, methods, attrs);
+    if !exc::pending() {
+        let class_roots = heap::root_values(&[class]);
+        globals::registry_set(key, class);
+        heap::release_roots(class_roots);
+    }
+    heap::release_roots(roots);
+    class
+}
+
+/// `AbstractContextManager.__subclasshook__(cls, candidate)` and its async
+/// spelling: `True` when the candidate defines every protocol method, else
+/// `NotImplemented` (CPython's `_check_methods` contract).
+fn abstract_manager_subclasshook(args: &[i64], asynchronous: bool) -> i64 {
+    let name = if asynchronous {
+        "AbstractAsyncContextManager"
+    } else {
+        "AbstractContextManager"
+    };
+    let Some(&candidate) = args.get(1) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name}.__subclasshook__() takes 2 arguments"),
+        );
+    };
+    if value::as_class(candidate).is_none() {
+        return value::NOT_IMPLEMENTED;
+    }
+    let required: [&str; 2] = if asynchronous {
+        ["__aenter__", "__aexit__"]
+    } else {
+        ["__enter__", "__exit__"]
+    };
+    if required
+        .iter()
+        .all(|&method| value::class_lookup(candidate, method).is_some())
+    {
+        TRUE
+    } else {
+        value::NOT_IMPLEMENTED
     }
 }
 
@@ -2896,6 +3024,15 @@ fn contextlib_call(function: &str, args: &[i64]) -> i64 {
             None => missing_attribute("contextlib", function),
         },
         "_exitstack_pop_all" => exitstack_pop_all(args[0]),
+        // `AbstractContextManager`/`AbstractAsyncContextManager` bodies.
+        // Enter hands the manager back and exit returns `None`, so the block
+        // exception keeps propagating; the async spellings are synchronous
+        // native methods (Hydro's native method layer has no suspension
+        // point), which matches what the coroutine would return.
+        "_abstract_cm_enter" | "_abstract_acm_aenter" => args.first().copied().unwrap_or(NONE),
+        "_abstract_cm_exit" | "_abstract_acm_aexit" => NONE,
+        "_abstract_cm_subclasshook" => abstract_manager_subclasshook(args, false),
+        "_abstract_acm_subclasshook" => abstract_manager_subclasshook(args, true),
         _ => missing_attribute("contextlib", function),
     }
 }
@@ -14761,6 +14898,62 @@ mod tests {
         assert_ne!(moved, empty);
         assert_eq!(stack_callback_count(moved), 0);
         assert_eq!(stack_callback_count(empty), 0);
+    }
+
+    #[test]
+    fn contextlib_abstract_manager_classes_expose_the_protocol() {
+        exc::init();
+        let manager = get("contextlib", "AbstractContextManager");
+        assert_eq!(
+            value::class_display_name(manager),
+            Some("AbstractContextManager")
+        );
+        // CPython's concrete bodies: `__enter__` returns the manager and
+        // `__exit__` returns None, so block exceptions propagate.
+        let instance = value::instance_new(manager);
+        assert_eq!(method(instance, "__enter__", &[]), instance);
+        assert_eq!(method(instance, "__exit__", &[NONE, NONE, NONE]), NONE);
+        assert!(!exc::pending(), "{}", message());
+
+        // The structural hook accepts a class defining both protocol methods
+        // and reports NotImplemented for one that does not.
+        let enter = value::native_function_new("fixture", "enter", 1);
+        let exit = value::native_function_new("fixture", "exit", 4);
+        let complete = value::class_new(
+            "Complete".to_string(),
+            NONE,
+            vec![
+                ("__enter__".to_string(), enter),
+                ("__exit__".to_string(), exit),
+            ],
+        );
+        assert_eq!(
+            method(manager, "__subclasshook__", &[complete]),
+            value::TRUE
+        );
+        let partial = value::class_new("Partial".to_string(), NONE, Vec::new());
+        assert_eq!(
+            method(manager, "__subclasshook__", &[partial]),
+            value::NOT_IMPLEMENTED
+        );
+
+        // The async spelling carries the awaitable protocol names and is
+        // imported by `typing_extensions` as the `AsyncContextManager` origin.
+        let asynchronous = get("contextlib", "AbstractAsyncContextManager");
+        assert_eq!(
+            value::class_display_name(asynchronous),
+            Some("AbstractAsyncContextManager")
+        );
+        let asynchronous_instance = value::instance_new(asynchronous);
+        assert_eq!(
+            method(asynchronous_instance, "__aenter__", &[]),
+            asynchronous_instance
+        );
+        assert_eq!(
+            method(asynchronous_instance, "__aexit__", &[NONE, NONE, NONE]),
+            NONE
+        );
+        assert!(!exc::pending(), "{}", message());
     }
 
     #[test]

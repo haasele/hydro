@@ -5223,13 +5223,108 @@ fn keyword_call_on_a_function_value_uses_the_runtime_binder() {
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
     let g = function(&hir, "g");
-    assert!(matches!(
-        &g.body[0].kind,
-        HStmtKind::Return(Some(HExpr {
-            kind: HExprKind::CallKw { .. },
-            ..
-        }))
-    ));
+    let HStmtKind::Return(Some(value)) = &g.body[0].kind else {
+        panic!("expected a return, got {:?}", g.body[0].kind);
+    };
+    let HExprKind::CallKw {
+        callee, keywords, ..
+    } = &value.kind
+    else {
+        panic!("expected a keyword call, got {:?}", value.kind);
+    };
+    assert!(matches!(&callee.kind, HExprKind::Local(_)));
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "a");
+}
+
+#[test]
+fn keyword_call_on_an_unknown_global_keeps_the_keyword_name() {
+    // A global with no static signature (a lambda binding, a conditional
+    // class, a name installed at runtime) is read from the module table and
+    // called through the runtime binder, never through a deferred call that
+    // would drop the keyword and raise.
+    let source = "\
+def g(**kwargs):
+    return kwargs
+def h():
+    return g(a=1)
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let h = function(&hir, "h");
+    let HStmtKind::Return(Some(value)) = &h.body[0].kind else {
+        panic!("expected a return, got {:?}", h.body[0].kind);
+    };
+    let HExprKind::CallKw {
+        callee, keywords, ..
+    } = &value.kind
+    else {
+        panic!("expected a keyword call, got {:?}", value.kind);
+    };
+    assert!(
+        matches!(&callee.kind, HExprKind::GlobalGet { name, .. } if name == "g"),
+        "callee must be the runtime global, got {:?}",
+        callee.kind
+    );
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "a");
+}
+
+#[test]
+fn double_star_forwarding_keeps_the_mapping_operand() {
+    let source = "\
+def g(f, kwargs):
+    return f(1, **kwargs)
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let g = function(&hir, "g");
+    let HStmtKind::Return(Some(value)) = &g.body[0].kind else {
+        panic!("expected a return, got {:?}", g.body[0].kind);
+    };
+    let HExprKind::CallFull {
+        args,
+        star,
+        keywords,
+        double_star,
+        ..
+    } = &value.kind
+    else {
+        panic!("expected a full call, got {:?}", value.kind);
+    };
+    assert_eq!(args.len(), 1);
+    assert!(star.is_none());
+    assert!(keywords.is_empty());
+    assert!(double_star.is_some());
+}
+
+#[test]
+fn starred_call_with_keywords_keeps_both_operand_groups() {
+    let source = "\
+def g(f, args):
+    return f(*args, b=2)
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let g = function(&hir, "g");
+    let HStmtKind::Return(Some(value)) = &g.body[0].kind else {
+        panic!("expected a return, got {:?}", g.body[0].kind);
+    };
+    let HExprKind::CallFull {
+        args,
+        star,
+        keywords,
+        double_star,
+        ..
+    } = &value.kind
+    else {
+        panic!("expected a full call, got {:?}", value.kind);
+    };
+    assert!(args.is_empty());
+    assert!(star.is_some());
+    assert!(double_star.is_none());
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "b");
 }
 
 #[test]
@@ -9215,6 +9310,59 @@ fn known_user_module_members_keep_their_static_path() {
             assert_eq!((module.as_str(), name.as_str()), ("helper", "VALUE"))
         }
         other => panic!("expected a module global read, got {other:?}"),
+    }
+}
+
+#[test]
+fn user_module_member_keyword_calls_bind_at_runtime() {
+    // A statically known member called with keywords binds through the
+    // member's runtime value: the function reference for a function export,
+    // the module-qualified global for a value export. The keyword names must
+    // survive instead of being dropped by a deferred call.
+    let source = "\
+import helper
+x = helper.add(1, addend=2)
+y = helper.make(value=3)
+";
+    let mut infer = Infer::new();
+    let mut lowerer = lowerer_with_user_module(
+        source,
+        &mut infer,
+        "helper",
+        HashMap::from([
+            ("add".to_string(), UserExport::Function(1)),
+            ("make".to_string(), UserExport::Global),
+        ]),
+    );
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    match &assigned(&hir, "x").kind {
+        HExprKind::CallKw {
+            callee,
+            args,
+            keywords,
+        } => {
+            assert!(matches!(&callee.kind, HExprKind::FunctionRef(1)));
+            assert_eq!(args.len(), 1);
+            assert_eq!(keywords.len(), 1);
+            assert_eq!(keywords[0].0, "addend");
+        }
+        other => panic!("expected a keyword call on the function, got {other:?}"),
+    }
+    match &assigned(&hir, "y").kind {
+        HExprKind::CallKw {
+            callee, keywords, ..
+        } => {
+            assert!(matches!(
+                &callee.kind,
+                HExprKind::GlobalGet { module, name } if module == "helper" && name == "make"
+            ));
+            assert_eq!(keywords.len(), 1);
+            assert_eq!(keywords[0].0, "value");
+        }
+        other => panic!("expected a keyword call on the global, got {other:?}"),
     }
 }
 
@@ -13358,6 +13506,77 @@ if True:
         })
     }
     assert!(has_class(&hir.functions[0].body));
+}
+
+#[test]
+fn conditional_module_class_constructors_bind_at_runtime() {
+    // A class defined inside module-level control flow is created only when
+    // that block runs, so its constructor calls must not bind a compile-time
+    // `__init__` signature. `typing_extensions` defines its 3.9 alias fallback
+    // in a dead `if not hasattr(typing, 'Concatenate')` branch and calls it
+    // with keyword-only arguments its `__init__` does not declare; the call
+    // has to reach the runtime class instead of being rejected statically.
+    let source = "\
+if True:
+    class C:
+        def __init__(self, origin, args):
+            self.origin = origin
+
+
+def make():
+    return C(1, (2,), _typevar_types=(int,))
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let make = hir
+        .functions
+        .iter()
+        .find(|function| function.name == "make")
+        .expect("make must be lowered");
+    fn has_call_kw(stmts: &[HStmt]) -> bool {
+        stmts.iter().any(|stmt| match &stmt.kind {
+            HStmtKind::Return(Some(value)) => match &value.kind {
+                HExprKind::CallKw {
+                    callee, keywords, ..
+                } => {
+                    matches!(&callee.kind, HExprKind::GlobalGet { name, .. } if name == "C")
+                        && keywords.iter().any(|(name, _)| name == "_typevar_types")
+                }
+                _ => false,
+            },
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => has_call_kw(then_body) || has_call_kw(else_body),
+            HStmtKind::While {
+                body, else_body, ..
+            }
+            | HStmtKind::ForRange {
+                body, else_body, ..
+            }
+            | HStmtKind::ForEach {
+                body, else_body, ..
+            } => has_call_kw(body) || has_call_kw(else_body),
+            HStmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                has_call_kw(body)
+                    || handlers.iter().any(|handler| has_call_kw(&handler.body))
+                    || has_call_kw(else_body)
+                    || has_call_kw(finally_body)
+            }
+            _ => false,
+        })
+    }
+    assert!(
+        has_call_kw(&make.body),
+        "the conditional class constructor must lower as a runtime keyword call: {:?}",
+        make.body
+    );
 }
 
 #[test]

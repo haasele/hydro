@@ -2330,6 +2330,15 @@ impl<'a> Lowerer<'a> {
                     if !top_level {
                         // The class object is created only when the enclosing
                         // block runs, so it binds through the global table.
+                        // Constructor calls must observe that runtime binding:
+                        // a static `__init__` signature would bind this
+                        // branch's class even when the block never runs.
+                        // `typing_extensions` defines its 3.9 alias fallback
+                        // in a dead `if not hasattr(typing, 'Concatenate')`
+                        // branch and calls it with newer keyword-only
+                        // arguments, which the static binder would reject.
+                        self.class_inits.remove(&name);
+                        self.class_signatures.remove(&name);
                         self.global_names.insert(name.clone());
                         self.used_globals.insert(name);
                     }
@@ -4693,8 +4702,10 @@ impl<'a> Lowerer<'a> {
     ///
     /// Statically linked functions link directly; classes and other
     /// module-level values are read from the runtime global table and called
-    /// indirectly. A member the export table does not know becomes a dynamic
-    /// module-attribute call, so runtime-provided names keep working.
+    /// indirectly. A call with keywords goes through the member's runtime
+    /// value so the keyword names reach the runtime binder. A member the
+    /// export table does not know becomes a dynamic module-attribute call, so
+    /// runtime-provided names keep working.
     fn user_module_call(
         &mut self,
         module: &UserModule,
@@ -4714,12 +4725,30 @@ impl<'a> Lowerer<'a> {
             return self.lower_dynamic_call(call, fs, line, col);
         };
         if !call.keywords.is_empty() {
-            self.error_at_code(
-                call.range,
-                codes::CALL,
-                "keyword arguments are not supported for user-defined functions",
-            );
-            return self.error_expr(call.range);
+            // Keywords bind through the member's runtime value: an exported
+            // function keeps its final id as a function reference, and an
+            // exported module-level value is read from the module table. Both
+            // reach the runtime binder, which keeps the keyword names and
+            // reports an unmatched one instead of dropping it.
+            let (callee_line, callee_col) = self.span(call.func.range());
+            let callee = match export {
+                UserExport::Function(id) => HExpr {
+                    kind: HExprKind::FunctionRef(id),
+                    ty: Ty::Concrete(Type::Function),
+                    line: callee_line,
+                    col: callee_col,
+                },
+                UserExport::Global => HExpr {
+                    kind: HExprKind::GlobalGet {
+                        module: module.name.clone(),
+                        name: member.to_string(),
+                    },
+                    ty: Ty::Concrete(Type::Any),
+                    line: callee_line,
+                    col: callee_col,
+                },
+            };
+            return self.lower_dynamic_callee_call(callee, call, fs, line, col);
         }
         match export {
             UserExport::Function(id) => {
@@ -16227,8 +16256,8 @@ impl<'a> Lowerer<'a> {
         // A starred positional or `**kwargs` operand can only be expanded at
         // runtime. Receiver method calls with a single starred operand keep
         // their dedicated ABI (`hydro_method_star`); the other shapes lower to
-        // the general starred-call ABI, or to a deferred call when they
-        // cannot be represented (keywords, `**`).
+        // the general starred-call ABI, which preserves every keyword name
+        // (`CallFull` with the callee evaluated first).
         if call_has_dynamic_arguments(call) {
             // `cls(*args, ...)` inside a classmethod: the runtime class is
             // fixed, so the dynamic constructor binder can still expand the
@@ -16361,17 +16390,15 @@ impl<'a> Lowerer<'a> {
                     );
                 }
                 if let Some(module) = self.resolve_user_module(&attr.value, fs) {
-                    // A statically linked member of a user function keeps the
-                    // existing keyword restriction. An unknown member is a
-                    // runtime lookup, so the general dynamic call path binds
-                    // its keywords and starred operands.
-                    if !call.keywords.is_empty() && module.exports.contains_key(attr.attr.as_str())
-                    {
-                        return self.lower_deferred_call(call, fs, line, col);
-                    }
+                    // A statically linked member keeps its static path; a
+                    // member call with keywords binds through the member's
+                    // runtime value (see `user_module_call`).
                     return self.user_module_call(&module, attr.attr.as_str(), call, fs, line, col);
                 }
                 if let Some(path) = self.resolve_extension_alias(&attr.value, fs) {
+                    // The extension shim ABI passes positional operands only,
+                    // so a keyword call has no binding to reach; it stays
+                    // deferred and raises at runtime.
                     if !call.keywords.is_empty() {
                         return self.lower_deferred_call(call, fs, line, col);
                     }
@@ -16711,13 +16738,16 @@ impl<'a> Lowerer<'a> {
                     return self.error_expr(call.range);
                 }
             }
+            if call_has_dynamic_arguments(call) {
+                return self.lower_dynamic_call(call, fs, line, col);
+            }
             let Some(args) = self.plain_call_args(call, fs) else {
                 return self.error_expr(call.range);
             };
             let mut keywords = Vec::with_capacity(call.keywords.len());
             for keyword in &call.keywords {
                 let Some(keyword_name) = keyword.arg.as_ref() else {
-                    return self.lower_deferred_call(call, fs, line, col);
+                    return self.lower_dynamic_call(call, fs, line, col);
                 };
                 keywords.push((keyword_name.to_string(), self.expr(&keyword.value, fs)));
             }
@@ -16841,7 +16871,8 @@ impl<'a> Lowerer<'a> {
         }
 
         if let Some((path, member)) = self.imported_extension_members.get(name).cloned() {
-            // The extension ABI has no keyword binding.
+            // The extension shim ABI has no keyword binding, so a keyword
+            // call has to stay deferred (positional shapes call directly).
             if !call.keywords.is_empty() {
                 return self.lower_deferred_call(call, fs, line, col);
             }
@@ -16919,6 +16950,10 @@ impl<'a> Lowerer<'a> {
             });
             if dynamic_fiber {
                 if !call.keywords.is_empty() {
+                    // The runtime creates a suspended fiber from positional
+                    // arguments only and binds the signature on first resume,
+                    // so a keyword call has no slot to reach; it stays
+                    // deferred and raises at runtime.
                     return self.lower_deferred_call(call, fs, line, col);
                 }
                 let Some(args) = self.plain_call_args(call, fs) else {
@@ -17095,15 +17130,11 @@ impl<'a> Lowerer<'a> {
                 };
             }
             // A module-level value (class or function) whose signature is not
-            // statically known. Keyword binding (notably constructor kwargs)
-            // is not part of this phase: compile the call and report it at
-            // runtime instead of the call site.
-            if !call.keywords.is_empty() {
-                return self.lower_deferred_call(call, fs, line, col);
-            }
-            let Some(args) = self.plain_call_args(call, fs) else {
-                return self.error_expr(call.range);
-            };
+            // statically known: the call binds through the value read at
+            // runtime from the module globals, so keyword names reach the
+            // runtime binder rather than being dropped. This covers a class
+            // created by a conditional block (its constructor signature is not
+            // known here) and any callable global without static metadata.
             self.used_globals.insert(name.to_string());
             let (callee_line, callee_col) = self.span(name_expr.range);
             let callee = HExpr {
@@ -17115,16 +17146,7 @@ impl<'a> Lowerer<'a> {
                 line: callee_line,
                 col: callee_col,
             };
-            return HExpr {
-                kind: HExprKind::IndirectCall {
-                    callee: Box::new(callee),
-                    args,
-                    star: None,
-                },
-                ty: self.infer.fresh(),
-                line,
-                col,
-            };
+            return self.lower_dynamic_callee_call(callee, call, fs, line, col);
         }
 
         if let Some(kind) = ExcKind::from_class_name(name) {
@@ -17174,6 +17196,8 @@ impl<'a> Lowerer<'a> {
         }
 
         if let Some(path) = self.extension_stars.first().cloned() {
+            // A lazily resolved extension member (star import) keeps the same
+            // keyword limitation as a statically imported one.
             if !call.keywords.is_empty() {
                 return self.lower_deferred_call(call, fs, line, col);
             }
@@ -17277,7 +17301,8 @@ impl<'a> Lowerer<'a> {
     /// value and finally the `**mapping`. The IR keeps those operand groups in
     /// order and codegen forwards them to the runtime flattener, which raises
     /// `TypeError` for a non-mapping `**` operand, a non-`str` key or a key
-    /// bound twice.
+    /// bound twice. Keyword names are kept in every shape (`f(x=1)` and
+    /// `f(*args, x=1)`), so the callee sees the same binding Python would.
     fn lower_dynamic_call(
         &mut self,
         call: &ast::ExprCall,
@@ -17286,6 +17311,28 @@ impl<'a> Lowerer<'a> {
         col: u32,
     ) -> HExpr {
         let callee = self.starred_callee(&call.func, fs);
+        self.lower_dynamic_callee_call(callee, call, fs, line, col)
+    }
+
+    /// Lower `callee(...)` for an already lowered callee through the runtime
+    /// call protocol, preserving the source operand groups.
+    ///
+    /// The callee is built first and the generated call evaluates it before
+    /// the operands; only the operands are lowered here, in Python order. The
+    /// narrowest node that expresses the operands exactly is used:
+    /// `IndirectCall` without keywords, `CallKw` with named keywords only, and
+    /// `CallFull` as soon as a starred or double-star operand needs runtime
+    /// flattening. Keyword names are never dropped, so the runtime binder can
+    /// reject an unknown or duplicate name instead of the call silently
+    /// losing it.
+    fn lower_dynamic_callee_call(
+        &mut self,
+        callee: HExpr,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
         let Some((args, star, keywords, double_star)) = self.call_operands(call, fs) else {
             return self.error_expr(call.range);
         };
@@ -17376,6 +17423,13 @@ impl<'a> Lowerer<'a> {
     /// operands (including each starred operand's iterable), then keyword
     /// values, left to right; the IR keeps that order and the runtime raises
     /// `RuntimeError` when the call executes.
+    ///
+    /// Ordinary dynamic calls no longer use this node: they lower to
+    /// `IndirectCall`/`CallKw`/`CallFull` so keyword names survive. Only two
+    /// runtime-limited shapes remain: an extension member called with
+    /// keywords (the extension shim ABI has no keyword slot) and a
+    /// coroutine/generator with a dynamic signature called with keywords (the
+    /// runtime builds the fiber from positional arguments only).
     fn lower_deferred_call(
         &mut self,
         call: &ast::ExprCall,

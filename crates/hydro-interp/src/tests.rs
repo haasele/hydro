@@ -1091,3 +1091,54 @@ assert Outer.Inner.value.__name__ == 'U'
 "#,
     );
 }
+
+#[test]
+fn dynamic_calls_preserve_keyword_names() {
+    // A callee that is only known at runtime (`f(...)` on a parameter) must
+    // forward every keyword name, alone, after `*args`, and through `**`.
+    run_source(
+        r#"
+def target(a, b, c=0, **extra):
+    return (a, b, c, extra)
+
+def call_keyword(f):
+    return f(1, 2, c=3, extra=4)
+
+def call_mapping(f, mapping):
+    return f(1, 2, **mapping)
+
+def call_starred(f, args, mapping):
+    return f(*args, **mapping)
+
+def call_starred_keyword(f, args):
+    return f(*args, c=7)
+
+def forward(f, **kwargs):
+    return f(1, 2, **kwargs)
+
+assert call_keyword(target) == (1, 2, 3, {'extra': 4})
+assert call_mapping(target, {'c': 5, 'extra': 6}) == (1, 2, 5, {'extra': 6})
+assert call_starred(target, (1, 2), {'c': 7}) == (1, 2, 7, {})
+assert call_starred_keyword(target, (1, 2)) == (1, 2, 7, {})
+assert forward(target, c=8) == (1, 2, 8, {})
+
+# A class created by a conditional block is only bound at runtime, so its
+# constructor call keeps its keywords (the shape typing_extensions uses for
+# its 3.9 alias fallback).
+if True:
+    class C:
+        def __init__(self, origin, args, **kwargs):
+            self.origin = origin
+            self.args = args
+            self.extra = kwargs
+
+def make():
+    return C(1, (2,), _typevar_types='X')
+
+built = make()
+assert built.origin == 1
+assert built.args == (2,)
+assert built.extra == {'_typevar_types': 'X'}
+"#,
+    );
+}

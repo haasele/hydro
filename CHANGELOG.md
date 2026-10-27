@@ -8,6 +8,46 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 pydantic import surfaces (typing/contextlib/re)
+
+- `typing.get_overloads`/`typing.clear_overloads` operate on a real
+  `@overload` registry: stubs are keyed by `(__module__, __qualname__)`, kept
+  alive as runtime roots, and discarded when the heap generation changes.
+  `overload` also returns its callable (the existing identity behaviour), so
+  the registry is the observable state.
+- `typing.disjoint_base(cls)` is a real marker decorator that returns the
+  class (non-classes raise `TypeError`), so `typing_extensions` takes it when
+  present.
+- `typing._ConcatenateGenericAlias` is callable as a module entry with the
+  keyword-only `_typevar_types`/`_paramspec_tvars` metadata, while its module
+  attribute stays the cached alias class (`isinstance`/`super` keep working).
+- Classes defined inside module-level control flow no longer enter the static
+  constructor tables (`class_inits`/`class_signatures`); their constructor
+  calls bind at runtime, the same rule conditional functions already follow.
+  This removes the false "unexpected keyword" diagnostic `typing_extensions`
+  hit on its dead 3.9 `_ConcatenateGenericAlias` fallback.
+- `contextlib.AbstractContextManager` and `AbstractAsyncContextManager` are
+  real `abc.ABC` classes with CPython's concrete protocol bodies
+  (`__enter__`/`__aenter__` return the manager, `__exit__`/`__aexit__` return
+  `None`) and a structural `__subclasshook__`; `typing_extensions` obtains
+  them as its `ContextManager`/`AsyncContextManager` origins.
+- `re.search`/`re.match`/`re.fullmatch`/`re.findall` accept the third
+  positional `flags` argument (`re.search(pat, text, re.I)`, pandas'
+  spelling) and the module functions forward it to the regex builder instead
+  of ignoring it.
+
+### Fixed — 2026-10-27 dynamic call keyword binding
+
+- A call on a callee that is only known at runtime (`f(x=1)` on a parameter,
+  a module global without a static signature, a function or value exported by
+  a user module, and any `*args`/`**kwargs` combination) keeps every keyword
+  name. It lowers to `IndirectCall`/`CallKw`/`CallFull` instead of
+  `DeferredCall`, whose runtime entry only raised, so a conditional class
+  constructor such as `C(1, (2,), _typevar_types=...)` binds its keywords at
+  runtime. Extension-module members called with keywords and
+  coroutine/generator calls with a dynamic signature stay deferred: their
+  runtime ABIs have no keyword slot.
+
 ### Added — 2026-10-27 `itertools.dropwhile`
 
 - `itertools.dropwhile(predicate, iterable)` returns a list with the

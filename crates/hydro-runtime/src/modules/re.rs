@@ -649,12 +649,19 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                         Ok(text) => text,
                         Err(err) => return err,
                     };
+                    // `re.search(pattern, string, flags=0)`: CPython's
+                    // trailing positional flags argument (`pandas` passes
+                    // `re.I` this way).
+                    let flags = match flags_argument(args.get(2).copied()) {
+                        Ok(flags) => flags,
+                        Err(err) => return err,
+                    };
                     match_mode(
                         &source,
                         &text,
                         function == "fullmatch",
                         function != "search",
-                        0,
+                        flags,
                     )
                 }
                 "findall" => {
@@ -662,7 +669,11 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                         Ok(text) => text,
                         Err(err) => return err,
                     };
-                    findall(&source, &text, 0)
+                    let flags = match flags_argument(args.get(2).copied()) {
+                        Ok(flags) => flags,
+                        Err(err) => return err,
+                    };
+                    findall(&source, &text, flags)
                 }
                 "finditer" => {
                     let text = match text_argument(args[1], "string") {

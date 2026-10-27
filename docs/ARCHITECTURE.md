@@ -1347,8 +1347,11 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   metaclasses, the general descriptor protocol, `except*`,
   `bytearray`/`memoryview`; other `super()` forms; class namespace immutable. Multiple inheritance is approximated
   by the first base (additional bases are ignored). General dynamic calls
-  combine at most one `*` operand; `*args` plus `**kwargs` together still
-  need a deferred call, while class constructors can bind `**mapping`.
+  combine at most one `*` operand, and `*args`/`**kwargs` (with named
+  keywords) forward through the runtime binder; compiled extension members
+  called with keywords and coroutine/generator calls with a dynamic
+  signature remain unsupported at runtime. Class constructors can bind
+  `**mapping`.
 - **Closures:** captured bindings are by value unless the outer function
   mutates them (or a descendant declares `nonlocal`), in which case the
   binding lives in a traced heap cell shared with every closure; lambdas close
