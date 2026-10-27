@@ -164,9 +164,10 @@ pub(crate) const KIND_SUPER: u32 = 44;
 /// the class value (identity for `type`/`isinstance`) and the native
 /// `ExcData` payload the exception machinery operates on.
 pub(crate) const KIND_EXC_INSTANCE: u32 = 45;
-/// `classmethod`/`staticmethod`/`property` descriptor value. Wraps any
-/// callable or class value; the wrapped value and the optional property
-/// setter/deleter are traced GC edges.
+/// `classmethod`/`staticmethod`/`property` descriptor value, or the
+/// `type.__annotations__` getset descriptor. Wraps any callable or class
+/// value; the wrapped value and the optional property setter/deleter are
+/// traced GC edges.
 pub(crate) const KIND_DESCRIPTOR: u32 = 46;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
@@ -1963,6 +1964,9 @@ pub(crate) enum DescriptorKind {
     Staticmethod,
     /// `property(getter[, setter[, deleter]])`: calls the getter on access.
     Property,
+    /// The `type.__dict__["__annotations__"]` getset descriptor: `__get__`
+    /// reports a class's own annotations and `__set__` replaces them.
+    TypeAnnotations,
 }
 
 impl DescriptorKind {
@@ -1972,12 +1976,14 @@ impl DescriptorKind {
             DescriptorKind::Classmethod => "classmethod",
             DescriptorKind::Staticmethod => "staticmethod",
             DescriptorKind::Property => "property",
+            DescriptorKind::TypeAnnotations => "getset_descriptor",
         }
     }
 }
 
 /// Payload of a built-in descriptor value created by the `classmethod`,
-/// `staticmethod` or `property` builtins.
+/// `staticmethod` or `property` builtins, or the `type.__annotations__`
+/// getset descriptor.
 ///
 /// The target may be any callable or class value. `setter`/`deleter` are only
 /// meaningful for `property` and are `NONE` when absent.
@@ -4663,6 +4669,11 @@ pub(crate) fn property_new(getter: i64, setter: i64, deleter: i64) -> i64 {
     descriptor_new(DescriptorKind::Property, getter, setter, deleter)
 }
 
+/// The `type.__dict__["__annotations__"]` getset descriptor.
+pub(crate) fn annotations_descriptor_new() -> i64 {
+    descriptor_new(DescriptorKind::TypeAnnotations, NONE, NONE, NONE)
+}
+
 /// Borrows a built-in descriptor payload.
 pub(crate) fn as_descriptor(v: i64) -> Option<&'static DescriptorState> {
     if !is_heap(v) {
@@ -6461,10 +6472,38 @@ thread_local! {
     /// classes are heap objects and are registered as GC roots; the cache is
     /// cleared by the runtime reset before the heap is freed.
     static TYPE_CLASS_CACHE: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
+    /// Cached `type` metadata built on first use: the `__dict__` mapping, the
+    /// `__annotations__` descriptor it holds and the `type.__annotations__`
+    /// mapping. Registered as GC roots and cleared with the class cache, so a
+    /// reset never leaves a dangling entry behind.
+    static TYPE_METADATA: RefCell<[Option<i64>; 3]> = const { RefCell::new([None; 3]) };
 }
 
+/// Cache slot of `type.__dict__`.
+const TYPE_NAMESPACE_SLOT: usize = 0;
+/// Cache slot of `type.__dict__["__annotations__"]`.
+const TYPE_ANNOTATIONS_DESCRIPTOR_SLOT: usize = 1;
+/// Cache slot of `type.__annotations__`.
+const TYPE_ANNOTATIONS_SLOT: usize = 2;
+
+/// Reads one [`TYPE_METADATA`] slot.
+fn type_metadata(slot: usize) -> Option<i64> {
+    TYPE_METADATA.with(|cache| cache.borrow()[slot])
+}
+
+/// Publishes one [`TYPE_METADATA`] slot and keeps the value alive for as long
+/// as the cache entry exists.
+fn set_type_metadata(slot: usize, value: i64) {
+    crate::heap::add_thread_root(value);
+    TYPE_METADATA.with(|cache| cache.borrow_mut()[slot] = Some(value));
+}
+
+/// Drops the per-thread `type` caches: the native classes `type()` hands out
+/// and the `type.__dict__`/`type.__annotations__` metadata built on demand.
+/// Called before the heap is freed, so no cached value outlives its objects.
 pub(crate) fn clear_type_class_cache() {
     TYPE_CLASS_CACHE.with(|cache| cache.borrow_mut().clear());
+    TYPE_METADATA.with(|cache| *cache.borrow_mut() = [None; 3]);
 }
 
 /// Cached native class named `name`, created (and registered as a collector
@@ -6556,6 +6595,98 @@ fn type_native_class() -> i64 {
 /// Cached native `type` class, creating it on first use.
 pub(crate) fn native_type_class() -> i64 {
     native_class("type")
+}
+
+/// `type.__annotations__`: the `type` builtin's own annotation mapping,
+/// created (and cached) on first access so repeated reads share one object.
+pub(crate) fn type_annotations() -> i64 {
+    if let Some(annotations) = type_metadata(TYPE_ANNOTATIONS_SLOT) {
+        return annotations;
+    }
+    let annotations = dict_new(Vec::new());
+    set_type_metadata(TYPE_ANNOTATIONS_SLOT, annotations);
+    annotations
+}
+
+/// Replaces `type.__annotations__`.
+pub(crate) fn set_type_annotations(annotations: i64) {
+    set_type_metadata(TYPE_ANNOTATIONS_SLOT, annotations);
+}
+
+/// The singleton `type.__dict__["__annotations__"]` getset descriptor.
+pub(crate) fn annotations_descriptor() -> i64 {
+    if let Some(descriptor) = type_metadata(TYPE_ANNOTATIONS_DESCRIPTOR_SLOT) {
+        return descriptor;
+    }
+    let descriptor = annotations_descriptor_new();
+    set_type_metadata(TYPE_ANNOTATIONS_DESCRIPTOR_SLOT, descriptor);
+    descriptor
+}
+
+/// Annotations declared in `class`'s own namespace, as reported by
+/// `type.__dict__["__annotations__"].__get__(class)`.
+///
+/// Like CPython 3.10+, the empty mapping for a class without annotations is
+/// created lazily on first access and stored on the class, so repeated reads
+/// return the same dictionary. Returns `None` when `class` is not a class.
+pub(crate) fn class_annotations(class: i64) -> Option<i64> {
+    as_class(class)?;
+    match own_class_lookup(class, "__annotations__") {
+        Some(ClassEntry::Attr(value)) => return Some(value),
+        // A method-style entry is not an annotation mapping; never shadow it.
+        Some(ClassEntry::Method(_, _)) => return None,
+        None => {}
+    }
+    let annotations = dict_new(Vec::new());
+    let roots = crate::heap::root_values(&[annotations]);
+    class_set_attr(class, "__annotations__".to_string(), annotations);
+    crate::heap::release_roots(roots);
+    Some(annotations)
+}
+
+/// `type.__dict__`: the mapping holding the metaclass operations and the
+/// `__annotations__` descriptor.
+///
+/// The mapping is built once per run, so `type.__dict__ is type.__dict__`
+/// holds like CPython's read-only mapping proxy.
+pub(crate) fn type_namespace(type_value: i64) -> i64 {
+    if let Some(namespace) = type_metadata(TYPE_NAMESPACE_SLOT) {
+        return namespace;
+    }
+    // The mapping is rooted for the whole build, so a collection triggered by
+    // one entry's allocation cannot drop an entry stored earlier.
+    let namespace = dict_new(Vec::new());
+    let namespace_roots = crate::heap::root_values(&[namespace]);
+    for name in [
+        "__new__",
+        "__call__",
+        "__subclasscheck__",
+        "__instancecheck__",
+        "__hash__",
+        "__repr__",
+        "__prepare__",
+        "__getattribute__",
+        "mro",
+        "__annotations__",
+        "__name__",
+        "__mro__",
+    ] {
+        let key = str_alloc(name.to_string());
+        let key_roots = crate::heap::root_values(&[key]);
+        let value = match name {
+            "__annotations__" => annotations_descriptor(),
+            "__name__" => str_alloc("type".to_string()),
+            "__mro__" => tuple_new(vec![native_type_class(), object_class()]),
+            _ => bound_method_new(type_value, name.to_string()),
+        };
+        let pair_roots = crate::heap::root_values(&[key, value]);
+        crate::container::dict_set(namespace, key, value);
+        crate::heap::release_roots(pair_roots);
+        crate::heap::release_roots(key_roots);
+    }
+    set_type_metadata(TYPE_NAMESPACE_SLOT, namespace);
+    crate::heap::release_roots(namespace_roots);
+    namespace
 }
 
 /// The cached class a compiled `re.Pattern` reports from `type()`, i.e. the
@@ -6861,6 +6992,9 @@ pub(crate) fn exc_instance_repr(state: &ExcInstanceState) -> String {
 pub(crate) fn descriptor_repr(state: &DescriptorState) -> String {
     if state.kind == DescriptorKind::Property {
         return "<property object>".to_string();
+    }
+    if state.kind == DescriptorKind::TypeAnnotations {
+        return "<attribute '__annotations__' of 'type' objects>".to_string();
     }
     let inner = if let Some(function) = as_function(state.target) {
         format!("<function {}>", function.name)

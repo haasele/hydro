@@ -498,9 +498,13 @@ fn is_data_descriptor(entry: &value::ClassEntry) -> bool {
         value::ClassEntry::Method(_, _) => false,
         value::ClassEntry::Attr(value) => {
             if let Some(state) = value::as_descriptor(*value) {
-                // Only `property` is a data descriptor; `classmethod` and
-                // `staticmethod` are non-data descriptors.
-                return state.kind == value::DescriptorKind::Property;
+                // `property` and the `type.__annotations__` getset descriptor
+                // are data descriptors; `classmethod` and `staticmethod` are
+                // non-data descriptors.
+                return matches!(
+                    state.kind,
+                    value::DescriptorKind::Property | value::DescriptorKind::TypeAnnotations
+                );
             }
             descriptor_method(*value, "__set__").is_some()
                 || descriptor_method(*value, "__delete__").is_some()
@@ -573,6 +577,11 @@ fn bind_builtin_descriptor(
             }
             call_receiver_callable(state.target, instance, owner, "property", &[])
         }
+        value::DescriptorKind::TypeAnnotations => {
+            // Class access through a namespace: report the owner's own
+            // annotations, never a fabricated value.
+            value::class_annotations(owner).unwrap_or(NONE)
+        }
     }
 }
 
@@ -605,11 +614,15 @@ fn call_receiver_callable(
     builtins::call(target, call_args.len(), call_args.as_ptr())
 }
 
-/// Methods of a built-in descriptor value: `property.getter/setter/deleter`.
+/// Methods of a built-in descriptor value: `property.getter/setter/deleter`
+/// and the `type.__annotations__` getset descriptor's `__get__`/`__set__`.
 fn descriptor_value_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     let Some(state) = value::as_descriptor(obj) else {
         return attribute_error(obj, method);
     };
+    if state.kind == value::DescriptorKind::TypeAnnotations {
+        return annotations_descriptor_method(obj, method, args);
+    }
     if state.kind != value::DescriptorKind::Property {
         return attribute_error(obj, method);
     }
@@ -628,11 +641,73 @@ fn descriptor_value_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// `type.__dict__["__annotations__"].__get__(owner[, instance])` and
+/// `.__set__(owner, annotations)`.
+///
+/// `__get__` reports the owner's own annotation dictionary (created empty on
+/// first access, like CPython 3.10+) and raises `AttributeError` for a
+/// non-class owner rather than fabricating a mapping. The `type` builtin
+/// itself resolves to its own `__annotations__` slot.
+fn annotations_descriptor_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    match method {
+        "__get__" => {
+            if let Some(err) = check_arity("getset_descriptor", method, args.len(), 1, 2) {
+                return err;
+            }
+            // `__get__(owner)` and `__get__(instance, owner)`: the owner class
+            // is the explicit second argument, or the first argument when that
+            // is itself a class (the form `annotationlib` uses).
+            let (instance, owner) = if args.len() == 1 {
+                (args[0], NONE)
+            } else {
+                (args[0], args[1])
+            };
+            let target = if value::as_class(owner).is_some() {
+                owner
+            } else if value::as_class(instance).is_some() {
+                instance
+            } else if is_builtin_type_type(instance) {
+                return value::type_annotations();
+            } else {
+                return exc::raise_with_message(ATTRIBUTE_ERROR, "__annotations__");
+            };
+            match value::class_annotations(target) {
+                Some(annotations) => annotations,
+                None => exc::raise_with_message(ATTRIBUTE_ERROR, "__annotations__"),
+            }
+        }
+        "__set__" => {
+            if let Some(err) = check_arity("getset_descriptor", method, args.len(), 2, 2) {
+                return err;
+            }
+            let (owner, annotations) = (args[0], args[1]);
+            if value::as_dict(annotations).is_none() {
+                return type_error(format!(
+                    "__annotations__ must be set to a dictionary, not a '{}'",
+                    value::type_name(annotations)
+                ));
+            }
+            if is_builtin_type_type(owner) {
+                value::set_type_annotations(annotations);
+                return NONE;
+            }
+            if value::class_set_attr(owner, "__annotations__".to_string(), annotations) {
+                return NONE;
+            }
+            type_error(format!(
+                "descriptor '__annotations__' for 'type' objects doesn't apply to a '{}' object",
+                value::type_name(owner)
+            ))
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
 /// Calls `value.__get__(instance, owner)` when the object implements the
 /// descriptor protocol. `None` means "not a descriptor".
 fn descriptor_get(value: i64, instance: i64, owner: i64) -> Option<i64> {
-    // Built-in `classmethod`/`staticmethod`/`property` values have their own
-    // binding rules.
+    // Built-in `classmethod`/`staticmethod`/`property`/getset descriptor
+    // values have their own binding rules.
     if let Some(state) = value::as_descriptor(value) {
         return Some(bind_builtin_descriptor(value, state, instance, owner));
     }
@@ -1502,23 +1577,22 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         }
         // The `type` metaclass exposes its C-level class operations as
         // attributes; metaclasses assign them into their own namespace
-        // (`__instancecheck__ = type.__instancecheck__`).
+        // (`__instancecheck__ = type.__instancecheck__`). `type.__dict__` is
+        // the class namespace those entries live in and `__annotations__` is
+        // the builtin's own annotation mapping.
         if matches!(
             &function.body,
             value::FunctionBody::Builtin(hydro_ir::Builtin::Type)
-        ) && matches!(
-            attr.as_str(),
-            "__new__"
-                | "__call__"
-                | "__subclasscheck__"
-                | "__instancecheck__"
-                | "__hash__"
-                | "__repr__"
-                | "__prepare__"
-                | "__getattribute__"
-                | "mro"
         ) {
-            return value::bound_method_new(obj, attr);
+            match attr.as_str() {
+                "__dict__" => return value::type_namespace(obj),
+                "__annotations__" => return value::type_annotations(),
+                "__new__" | "__call__" | "__subclasscheck__" | "__instancecheck__" | "__hash__"
+                | "__repr__" | "__prepare__" | "__getattribute__" | "mro" => {
+                    return value::bound_method_new(obj, attr)
+                }
+                _ => {}
+            }
         }
         if let value::FunctionBody::Partial {
             function: target,
@@ -1786,9 +1860,13 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     }
     if let Some(state) = value::as_descriptor(obj) {
         // `property` exposes `getter`/`setter`/`deleter` returning new
-        // property objects; the other descriptor kinds have no methods.
+        // property objects; the `type.__annotations__` getset descriptor
+        // exposes the descriptor protocol itself.
         return match attr.as_str() {
             "getter" | "setter" | "deleter" if state.kind == value::DescriptorKind::Property => {
+                value::bound_method_new(obj, attr)
+            }
+            "__get__" | "__set__" if state.kind == value::DescriptorKind::TypeAnnotations => {
                 value::bound_method_new(obj, attr)
             }
             _ => attribute_error(obj, &attr),
@@ -1917,6 +1995,18 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
                 ));
             }
             _ => {}
+        }
+        // The `type` builtin carries the class annotations slot that every
+        // other builtin does not have: `type.__annotations__ = {...}`.
+        if is_builtin_type_type(obj) && attr == "__annotations__" {
+            if value::as_dict(new_value).is_none() {
+                return type_error(format!(
+                    "__annotations__ must be set to a dictionary, not a '{}'",
+                    value::type_name(new_value)
+                ));
+            }
+            value::set_type_annotations(new_value);
+            return NONE;
         }
         if value::function_setattr(obj, &attr, new_value) {
             return NONE;
@@ -7834,6 +7924,135 @@ mod tests {
             }
             _ => panic!("partial_new must keep a class target as a partial"),
         }
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn type_dict_exposes_class_namespace_and_annotations() {
+        reset();
+        let type_builtin = value::builtin_function_new(hydro_ir::Builtin::Type);
+        let read = |obj: i64, name: &str| getattr(obj, name.as_ptr(), name.len());
+
+        let namespace = read(type_builtin, "__dict__");
+        let entries = value::as_dict(namespace)
+            .expect("type.__dict__ must be a real mapping")
+            .to_vec();
+        let entry = |name: &str| {
+            entries
+                .iter()
+                .find(|(key, _)| value::as_str(*key) == Some(name))
+                .map(|(_, value)| *value)
+                .unwrap_or_else(|| panic!("type.__dict__ is missing {name}"))
+        };
+
+        // Every metaclass operation the `type` attribute surface exposes is a
+        // callable entry in the namespace.
+        for name in [
+            "__new__",
+            "__call__",
+            "__subclasscheck__",
+            "__instancecheck__",
+            "__hash__",
+            "__repr__",
+            "__prepare__",
+            "__getattribute__",
+            "mro",
+        ] {
+            assert!(
+                value::as_function(entry(name)).is_some(),
+                "type.__dict__[{name}] must be callable"
+            );
+        }
+        assert_eq!(text(entry("__name__")), "type");
+        let mro = value::as_tuple(entry("__mro__")).expect("__mro__ must be a tuple");
+        assert!(mro.iter().any(|&class| value::is_type_class(class)));
+
+        // `__annotations__` is a getset descriptor, not the annotations dict.
+        let descriptor = entry("__annotations__");
+        assert_eq!(
+            value::as_descriptor(descriptor).map(|state| state.kind),
+            Some(value::DescriptorKind::TypeAnnotations)
+        );
+        assert_eq!(
+            value::to_string(descriptor),
+            "<attribute '__annotations__' of 'type' objects>"
+        );
+
+        // The namespace is stable across reads, like CPython's mappingproxy.
+        assert_eq!(read(type_builtin, "__dict__"), namespace);
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn type_annotations_descriptor_gets_and_sets_class_annotations() {
+        reset();
+        let type_builtin = value::builtin_function_new(hydro_ir::Builtin::Type);
+        let read = |obj: i64, name: &str| getattr(obj, name.as_ptr(), name.len());
+
+        let namespace = read(type_builtin, "__dict__");
+        let descriptor = value::as_dict(namespace)
+            .expect("type.__dict__")
+            .iter()
+            .find(|(key, _)| value::as_str(*key) == Some("__annotations__"))
+            .map(|(_, value)| *value)
+            .expect("type.__dict__['__annotations__']");
+        let getter = read(descriptor, "__get__");
+        let setter = read(descriptor, "__set__");
+        let get = |owner: i64| crate::builtins::call(getter, 1, [owner].as_ptr());
+
+        // A class without annotations reports an empty dict that is created
+        // once and reused, like CPython 3.10+.
+        let bare = value::class_new("Bare".to_string(), NONE, Vec::new());
+        let empty = get(bare);
+        assert!(value::as_dict(empty).is_some_and(<[(i64, i64)]>::is_empty));
+        assert_eq!(get(bare), empty, "the empty mapping must be stable");
+        assert_eq!(read(bare, "__annotations__"), empty);
+
+        // Annotations declared in the class body are returned unchanged.
+        let declared = dict(&[(string("x"), int(1))]);
+        let annotated = value::class_new_full(
+            "Annotated".to_string(),
+            NONE,
+            Vec::new(),
+            vec![("__annotations__".to_string(), declared)],
+        );
+        assert_eq!(get(annotated), declared);
+        // The two-argument form `__get__(instance, owner)` uses the owner.
+        assert_eq!(
+            crate::builtins::call(getter, 2, [bare, annotated].as_ptr()),
+            declared
+        );
+
+        // A non-class owner reports AttributeError instead of a fake mapping.
+        crate::builtins::call(getter, 1, [int(1)].as_ptr());
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        crate::exc::clear();
+
+        // `__set__` replaces the class's mapping.
+        let replacement = dict(&[(string("y"), int(2))]);
+        assert_eq!(
+            crate::builtins::call(setter, 2, [annotated, replacement].as_ptr()),
+            NONE
+        );
+        assert_eq!(get(annotated), replacement);
+        assert_eq!(read(annotated, "__annotations__"), replacement);
+        assert!(!crate::exc::pending());
+
+        // A non-dict value is rejected, like CPython's setter.
+        crate::builtins::call(setter, 2, [annotated, int(1)].as_ptr());
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert!(message().contains("__annotations__ must be set to a dictionary"));
+        crate::exc::clear();
+
+        // `type.__annotations__` reads and writes the builtin's own mapping.
+        let own = read(type_builtin, "__annotations__");
+        assert!(value::as_dict(own).is_some_and(<[(i64, i64)]>::is_empty));
+        assert_eq!(read(type_builtin, "__annotations__"), own);
+        assert_eq!(
+            super::setattr(type_builtin, b"__annotations__".as_ptr(), 15, replacement),
+            NONE
+        );
+        assert_eq!(read(type_builtin, "__annotations__"), replacement);
         assert!(!crate::exc::pending());
     }
 }

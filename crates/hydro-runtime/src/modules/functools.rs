@@ -902,6 +902,10 @@ fn descriptor_protocol_get(obj: i64, instance: i64, owner: i64) -> Option<i64> {
                     crate::core::builtins::call(state.target, 1, call_args.as_mut_ptr())
                 }
             }
+            // `type.__annotations__`: report the owner's own annotations.
+            value::DescriptorKind::TypeAnnotations => {
+                value::class_annotations(owner).unwrap_or(NONE)
+            }
         });
     }
     let class = value::instance_class_value(obj)?;

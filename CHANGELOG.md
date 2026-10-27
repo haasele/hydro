@@ -8,6 +8,24 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 `type.__dict__` and its `__annotations__` descriptor
+
+- The `type` metaclass value exposes a real `__dict__` mapping instead of an
+  `AttributeError`. Its namespace carries the class operations
+  (`__new__`, `__call__`, `__subclasscheck__`, `__instancecheck__`, `__hash__`,
+  `__repr__`, `__prepare__`, `__getattribute__`, `mro`) as their callable
+  values, `__name__` as `"type"`, `__mro__` as a tuple of the native `type`
+  and `object` classes, and `__annotations__` as a getset descriptor. The
+  mapping is built once per run, so `type.__dict__ is type.__dict__` holds.
+- The `type.__dict__["__annotations__"]` descriptor implements `__get__`
+  (one owner argument or `(instance, owner)`) returning the owner class's own
+  annotations dictionary, created empty on first access like CPython 3.10+,
+  and raising `AttributeError` for a non-class owner instead of fabricating a
+  value. `__set__(owner, mapping)` replaces the class's annotations.
+  `type.__annotations__` itself is readable and assignable, so
+  `annotationlib._BASE_GET_ANNOTATIONS` and pydantic's `_get_annotations`
+  resolve class annotations without failing at import time.
+
 ### Added — 2026-10-27 PEP 562 module `__getattr__`/`__dir__`
 
 - A compiled user module that defines module-level `__getattr__` now resolves

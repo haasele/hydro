@@ -1914,7 +1914,10 @@ fn object_is_method_descriptor(obj: i64) -> bool {
         return false;
     }
     if let Some(descriptor) = value::as_descriptor(obj) {
-        return descriptor.kind != DescriptorKind::Property;
+        return !matches!(
+            descriptor.kind,
+            DescriptorKind::Property | DescriptorKind::TypeAnnotations
+        );
     }
     let Some(class) = type_object_of(obj) else {
         return false;
@@ -1929,7 +1932,10 @@ fn object_is_data_descriptor(obj: i64) -> bool {
         return false;
     }
     if let Some(descriptor) = value::as_descriptor(obj) {
-        return descriptor.kind == DescriptorKind::Property;
+        return matches!(
+            descriptor.kind,
+            DescriptorKind::Property | DescriptorKind::TypeAnnotations
+        );
     }
     let Some(class) = type_object_of(obj) else {
         return false;

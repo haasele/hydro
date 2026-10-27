@@ -382,6 +382,8 @@ fn value_is_abstract(item: i64) -> bool {
         DescriptorKind::Classmethod | DescriptorKind::Staticmethod => {
             is_abstract(descriptor.target)
         }
+        // The `type.__annotations__` getset descriptor wraps no function.
+        DescriptorKind::TypeAnnotations => false,
     }
 }
 
