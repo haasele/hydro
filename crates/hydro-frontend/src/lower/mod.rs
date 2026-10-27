@@ -843,8 +843,9 @@ struct ClassPlan {
     /// body. Values are lowered when the class statement itself is lowered.
     /// Only the static path collects attributes. One statement can contribute
     /// several entries: every name of a chained assignment (`a = b = value`)
-    /// gets an entry with the same index, and they share the single
-    /// evaluation of the right-hand side.
+    /// and every name bound by an unpacking target (`a, b = value`) gets an
+    /// entry with the same index, and they share the single evaluation of the
+    /// right-hand side.
     attributes: Vec<(String, usize)>,
     /// True when the class body executes statements the static plan cannot
     /// express (`del`, `if`, `for`, `with`, `try`, `raise`, calls, …). Such a
@@ -5271,13 +5272,14 @@ impl<'a> Lowerer<'a> {
     /// Validate a class header/body and register every method signature.
     ///
     /// The static class body may contain method definitions, class attributes
-    /// (`name = value`, `name: type = value`), dataclass/NamedTuple field
-    /// declarations (`name: type` without a value), `pass` and a docstring;
-    /// anything else (control flow, calls, nested classes, ...) makes the body
-    /// execute at runtime against a namespace dict. A body registered inside a
-    /// function or with a runtime method decorator always takes that runtime
-    /// path. The returned plan is used to lower the class statement and its
-    /// method bodies later.
+    /// (`name = value`, `a, b = value`, `name: type = value`),
+    /// dataclass/NamedTuple field declarations (`name: type` without a value),
+    /// `pass` and a docstring; anything else (control flow, nested classes,
+    /// stores into an attribute or subscript, ...) makes the body execute at
+    /// runtime against a namespace dict. A body registered inside a function
+    /// or with a runtime method decorator always takes that runtime path. The
+    /// returned plan is used to lower the class statement and its method
+    /// bodies later.
     fn register_class<'s>(&mut self, s: &'s ast::StmtClassDef) -> ClassPlan {
         let class = s.name.to_string();
         self.class_names.insert(class.clone());
@@ -5453,32 +5455,52 @@ impl<'a> Lowerer<'a> {
                 continue;
             }
             if let ast::Stmt::Assign(assign) = stmt {
-                // `a = b = value` binds every name to the same value; the
-                // right-hand side is evaluated once, in source order with the
-                // other class attributes. `class_body_needs_namespace` sends
-                // every other target shape to the runtime namespace path.
-                let mut names = Vec::with_capacity(assign.targets.len());
+                // `a = b = value` binds every name to the same value and
+                // `a, b = value` unpacks it into several names; the right-hand
+                // side is evaluated once, in source order with the other class
+                // attributes. `class_body_needs_namespace` sends every other
+                // target shape to the runtime namespace path.
+                let mut names: Vec<(&ast::Identifier, TextRange, bool)> =
+                    Vec::with_capacity(assign.targets.len());
                 for target in &assign.targets {
-                    let ast::Expr::Name(target) = target else {
-                        self.error_at(assign.range, "class attribute target must be a name");
-                        continue;
-                    };
-                    names.push(target);
+                    match target {
+                        ast::Expr::Name(target) => {
+                            names.push((&target.id, target.range, true));
+                        }
+                        ast::Expr::Tuple(_) | ast::Expr::List(_) => {
+                            let mut bound = Vec::new();
+                            collect_ordered_target_names(target, &mut bound);
+                            for name in bound {
+                                names.push((name, target.range(), false));
+                            }
+                        }
+                        other => {
+                            self.error_at(other.range(), "class attribute target must be a name");
+                        }
+                    }
                 }
-                // A name repeated inside one chain (`a = a = 1`) binds the
-                // same value twice in CPython; the plan registers it once.
+                // A name repeated inside one statement (`a = a = 1`,
+                // `a, a = value`) binds the same slot twice in CPython; the
+                // plan registers it once.
                 let mut chained = HashSet::new();
-                for target in names {
-                    let name = target.id.to_string();
+                for (target_name, target_range, direct) in names {
+                    let name = target_name.to_string();
                     if !chained.insert(name.clone()) {
                         continue;
                     }
                     if !seen.insert(name.clone()) {
                         self.error_at_code(
-                            target.range,
+                            target_range,
                             codes::DECL,
                             format!("duplicate class member '{class}.{name}'"),
                         );
+                        continue;
+                    }
+                    // Only a direct `name = ...` can alias a method or wrap it
+                    // in a binding decorator; a name bound by an unpacking
+                    // target receives one element of the sequence.
+                    if !direct {
+                        attributes.push((name, idx));
                         continue;
                     }
                     // `__sub__ = difference` aliases an earlier method of the
@@ -9712,56 +9734,74 @@ impl<'a> Lowerer<'a> {
                 }
             }
             // A chained assignment (`a = b = value`) shares one right-hand
-            // side among several names. Such a body evaluates every class
-            // attribute into a hidden local, in declaration order, so the
-            // shared value runs exactly once and the class statement only
-            // publishes the parked values. Without a chain the values stay
-            // inline in the class statement.
-            let chained = plan
+            // side among several names and an unpacking target (`a, b =
+            // value`) splits it, so one statement publishes several
+            // attributes. Such a body evaluates every class attribute into a
+            // hidden local, in declaration order, so each right-hand side runs
+            // exactly once (before the class statement runs) and the class
+            // statement only publishes the parked values. Without one of
+            // those shapes the values stay inline in the class statement.
+            let parked = plan
                 .attributes
                 .windows(2)
-                .any(|pair| pair[0].1 == pair[1].1);
+                .any(|pair| pair[0].1 == pair[1].1)
+                || plan.attributes.iter().any(|(_, index)| {
+                    matches!(
+                        &s.body[*index],
+                        ast::Stmt::Assign(assign)
+                            if assign
+                                .targets
+                                .iter()
+                                .any(|target| !matches!(target, ast::Expr::Name(_)))
+                    )
+                });
             let mut prelude: Vec<HStmt> = Vec::new();
             let mut attributes = Vec::with_capacity(plan.attributes.len());
-            let mut cached: Option<(usize, HExpr)> = None;
-            for (attribute, index) in &plan.attributes {
-                // The value expression is evaluated when the class statement
-                // runs, in declaration order, and may refer to attributes
-                // declared before it. Names of one chained assignment share
-                // the single evaluation of their statement.
-                let value = match &cached {
-                    Some((cached_index, value)) if cached_index == index => value.clone(),
-                    _ => {
-                        let value = match &s.body[*index] {
-                            ast::Stmt::Assign(assign) => self.expr(&assign.value, fs),
-                            ast::Stmt::AnnAssign(assign) => match assign.value.as_deref() {
-                                Some(value) => self.expr(value, fs),
-                                None => self.error_expr(assign.range),
-                            },
-                            other => self.error_expr(other.range()),
+            let mut start = 0;
+            while start < plan.attributes.len() {
+                // Every attribute an assignment publishes carries the same
+                // statement index, so consecutive entries form one group whose
+                // values come from a single evaluation.
+                let index = plan.attributes[start].1;
+                let end = start
+                    + plan.attributes[start..]
+                        .iter()
+                        .take_while(|(_, other)| *other == index)
+                        .count();
+                let values = match &s.body[index] {
+                    ast::Stmt::Assign(assign) => self.lower_class_body_assignment(
+                        assign,
+                        parked,
+                        &mut prelude,
+                        fs,
+                        line,
+                        col,
+                    ),
+                    ast::Stmt::AnnAssign(assign) => {
+                        let value = match assign.value.as_deref() {
+                            Some(value) => self.expr(value, fs),
+                            None => self.error_expr(assign.range),
                         };
-                        let value = if chained {
-                            let (temp, temp_ref) = self.hidden_temp(fs, "$classattr", Type::Any);
-                            prelude.push(HStmt {
-                                kind: HStmtKind::Assign {
-                                    target: temp,
-                                    value,
-                                },
-                                line,
-                                col,
-                            });
-                            temp_ref
-                        } else {
-                            value
-                        };
-                        cached = Some((*index, value.clone()));
-                        value
+                        let value =
+                            self.park_class_attribute(value, parked, &mut prelude, fs, line, col);
+                        HashMap::from([(plan.attributes[start].0.clone(), value)])
                     }
+                    other => HashMap::from([(
+                        plan.attributes[start].0.clone(),
+                        self.error_expr(other.range()),
+                    )]),
                 };
-                if let Some(scope) = self.class_attr_scopes.last_mut() {
-                    scope.insert(attribute.clone(), value.clone());
+                for (attribute, _) in &plan.attributes[start..end] {
+                    let value = values
+                        .get(attribute)
+                        .cloned()
+                        .unwrap_or_else(|| self.error_expr(s.body[index].range()));
+                    if let Some(scope) = self.class_attr_scopes.last_mut() {
+                        scope.insert(attribute.clone(), value.clone());
+                    }
+                    attributes.push((attribute.clone(), value));
                 }
-                attributes.push((attribute.clone(), value));
+                start = end;
             }
             self.class_attr_scopes.pop();
             // CPython publishes the PEP 695 parameter list on the class after
@@ -9879,6 +9919,167 @@ impl<'a> Lowerer<'a> {
             });
         }
         Some(if_true_block(statements, line, col))
+    }
+
+    /// Evaluate one static class-body assignment statement and return the value
+    /// each of its published names binds.
+    ///
+    /// Python evaluates the right-hand side once and then binds the targets
+    /// left to right. A chained assignment (`a = b = value`) parks the value in
+    /// one hidden local shared by every name; a tuple/list target unpacking
+    /// (`a, b = value`) parks it once and splits it into one hidden local per
+    /// bound name. `prelude` receives the statements in source order, so the
+    /// class statement afterwards publishes exactly the values the body
+    /// computed, in declaration order.
+    fn lower_class_body_assignment(
+        &mut self,
+        assign: &ast::StmtAssign,
+        parked: bool,
+        prelude: &mut Vec<HStmt>,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HashMap<String, HExpr> {
+        let value = self.expr(&assign.value, fs);
+        // A statement that binds more than one name, or that unpacks, always
+        // parks its right-hand side: every store then reads the single value
+        // Python computed.
+        let shared = parked
+            || assign.targets.len() > 1
+            || assign
+                .targets
+                .iter()
+                .any(|target| !matches!(target, ast::Expr::Name(_)));
+        let value = self.park_class_attribute(value, shared, prelude, fs, line, col);
+        let mut values = HashMap::new();
+        for target in &assign.targets {
+            match target {
+                ast::Expr::Name(name) => {
+                    values.insert(name.id.to_string(), value.clone());
+                }
+                ast::Expr::Tuple(_) | ast::Expr::List(_) => {
+                    let mut targets = Vec::new();
+                    let mut bound = Vec::new();
+                    self.class_unpack_elements(
+                        match target {
+                            ast::Expr::Tuple(tuple) => tuple.elts.as_slice(),
+                            ast::Expr::List(list) => list.elts.as_slice(),
+                            _ => unreachable!("container checked above"),
+                        },
+                        fs,
+                        &mut targets,
+                        &mut bound,
+                    );
+                    prelude.push(HStmt {
+                        kind: HStmtKind::Unpack {
+                            targets,
+                            value: value.clone(),
+                        },
+                        line,
+                        col,
+                    });
+                    values.extend(bound);
+                }
+                other => {
+                    self.error_at(other.range(), "class attribute target must be a name");
+                }
+            }
+        }
+        values
+    }
+
+    /// Park one class-attribute value in a hidden local when the body evaluates
+    /// its attributes ahead of the class statement (see [`Self::lower_static_class_def`]).
+    fn park_class_attribute(
+        &mut self,
+        value: HExpr,
+        parked: bool,
+        prelude: &mut Vec<HStmt>,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        if !parked {
+            return value;
+        }
+        let (temp, temp_ref) = self.hidden_temp(fs, "$classattr", Type::Any);
+        prelude.push(HStmt {
+            kind: HStmtKind::Assign {
+                target: temp,
+                value,
+            },
+            line,
+            col,
+        });
+        temp_ref
+    }
+
+    /// Build the unpacking targets of a static class-body assignment.
+    ///
+    /// Every name leaf binds a fresh hidden local, recorded in `bound` in the
+    /// left-to-right order Python binds it, and `targets` keeps the nested and
+    /// starred shape so the runtime checks the element count and binds exactly
+    /// like CPython.
+    fn class_unpack_elements(
+        &mut self,
+        elements: &[ast::Expr],
+        fs: &mut FuncState,
+        targets: &mut Vec<HUnpackTarget>,
+        bound: &mut Vec<(String, HExpr)>,
+    ) {
+        let mut starred = false;
+        for element in elements {
+            if let ast::Expr::Starred(star) = element {
+                if starred {
+                    self.error_at(
+                        star.range,
+                        "multiple starred unpacking targets are not allowed",
+                    );
+                    continue;
+                }
+                starred = true;
+                if let Some(inner) = self.class_unpack_element(&star.value, fs, bound) {
+                    targets.push(HUnpackTarget::Star(Box::new(inner)));
+                }
+                continue;
+            }
+            if let Some(target) = self.class_unpack_element(element, fs, bound) {
+                targets.push(target);
+            }
+        }
+    }
+
+    /// Lower one element of a static class-body unpacking target: a name binds
+    /// a hidden local, a nested tuple/list recurses. Attribute and subscript
+    /// elements never reach the static path (`class_body_needs_namespace` sends
+    /// them to the runtime namespace).
+    fn class_unpack_element(
+        &mut self,
+        element: &ast::Expr,
+        fs: &mut FuncState,
+        bound: &mut Vec<(String, HExpr)>,
+    ) -> Option<HUnpackTarget> {
+        match element {
+            ast::Expr::Name(name) => {
+                let (local, local_ref) = self.hidden_temp(fs, "$classattr", Type::Any);
+                bound.push((name.id.to_string(), local_ref));
+                Some(HUnpackTarget::Name(local))
+            }
+            ast::Expr::Tuple(_) | ast::Expr::List(_) => {
+                let elements = match element {
+                    ast::Expr::Tuple(tuple) => tuple.elts.as_slice(),
+                    ast::Expr::List(list) => list.elts.as_slice(),
+                    _ => unreachable!("container checked above"),
+                };
+                let mut nested = Vec::new();
+                self.class_unpack_elements(elements, fs, &mut nested, bound);
+                Some(HUnpackTarget::Nested(nested))
+            }
+            other => {
+                self.error_at(other.range(), "class attribute target must be a name");
+                None
+            }
+        }
     }
 
     /// Lower a class definition nested inside another class body.
@@ -10349,8 +10550,10 @@ impl<'a> Lowerer<'a> {
             // Module-level names are mirrored into the global table after
             // their local assignment, exactly like a single-target `Assign`
             // (see `push_lowered_stmt`); importers read them from there.
-            // Tuple/list unpacking targets bind several names at once.
-            let stores = if fs.is_module {
+            // Tuple/list unpacking targets bind several names at once. A class
+            // body at module level is a separate namespace: its `STORE_NAME`
+            // bindings never reach the module globals.
+            let stores = if fs.is_module && fs.class_ns.is_none() {
                 match &kind {
                     HStmtKind::Assign { target: local, .. } => match target {
                         ast::Expr::Name(name) => vec![(name.id.to_string(), *local)],
@@ -10491,22 +10694,46 @@ impl<'a> Lowerer<'a> {
                     name: n.id.to_string(),
                 })
             }
-            ast::Expr::Name(n) => match fs.lookup(n.id.as_str()) {
-                Some(local) => Some(if fs.is_cell(local) {
-                    HUnpackTarget::Cell(local)
-                } else {
-                    HUnpackTarget::Name(local)
-                }),
-                None => {
-                    self.error_name(
-                        n.range,
-                        n.id.as_str(),
-                        fs,
-                        format!("assignment to unknown name '{}'", n.id),
-                    );
-                    None
+            ast::Expr::Name(n) => {
+                if let Some(class_ns) = &fs.class_ns {
+                    // A dynamic class body binds through `STORE_NAME`: the
+                    // element always lands in the class namespace, even when
+                    // an enclosing scope holds a local of the same name.
+                    let (line, col) = self.span(n.range);
+                    let namespace = HExpr {
+                        kind: HExprKind::Local(class_ns.ns),
+                        ty: Ty::Concrete(Type::Dict),
+                        line,
+                        col,
+                    };
+                    let index = HExpr {
+                        kind: HExprKind::Const(Const::Str(n.id.to_string())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    };
+                    return Some(HUnpackTarget::Subscript {
+                        object: namespace,
+                        index,
+                    });
                 }
-            },
+                match fs.lookup(n.id.as_str()) {
+                    Some(local) => Some(if fs.is_cell(local) {
+                        HUnpackTarget::Cell(local)
+                    } else {
+                        HUnpackTarget::Name(local)
+                    }),
+                    None => {
+                        self.error_name(
+                            n.range,
+                            n.id.as_str(),
+                            fs,
+                            format!("assignment to unknown name '{}'", n.id),
+                        );
+                        None
+                    }
+                }
+            }
             ast::Expr::Attribute(attr) => {
                 let object = self.expr(&attr.value, fs);
                 Some(HUnpackTarget::Attr {
@@ -18862,26 +19089,60 @@ fn class_body_blocks(stmt: &ast::Stmt) -> Vec<&[ast::Stmt]> {
 /// Whether a class body needs the runtime-namespace path.
 ///
 /// The static plan can express method definitions, field declarations,
-/// docstrings, `pass` and plain assignments of names (evaluated in declaration
-/// order, ahead of the class statement so a chained right-hand side runs
-/// once). Anything else — `del`, control flow, calls, `raise`, imports, and
-/// assignments storing through an attribute, subscript or unpacking target —
-/// executes statements and therefore needs the dynamic namespace.
+/// docstrings, `pass` and assignments of names (evaluated in declaration
+/// order, ahead of the class statement so a chained or unpacking right-hand
+/// side runs once). Anything else — `del`, control flow, `raise`, imports,
+/// and assignments storing through an attribute, subscript or unpacking
+/// target that names one — executes statements and therefore needs the
+/// dynamic namespace.
 fn class_body_needs_namespace(body: &[ast::Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         ast::Stmt::Pass(_) => false,
         ast::Stmt::Expr(expr) => !is_docstring_expr(&expr.value),
-        // Only a plain name target is a frozen class attribute of the static
-        // plan; `obj.attr = ...`, `d[key] = ...` and `a, b = ...` write at
+        // A plain name target is a frozen class attribute of the static plan,
+        // and so is a tuple/list unpacking target whose elements are all
+        // names: the plan parks the right-hand side, unpacks it into hidden
+        // locals and publishes each name. `obj.attr = ...`, `d[key] = ...`
+        // and an unpacking target naming an attribute or subscript write at
         // runtime through the namespace `dict`.
-        ast::Stmt::Assign(assign) => assign
-            .targets
-            .iter()
-            .any(|target| !matches!(target, ast::Expr::Name(_))),
+        ast::Stmt::Assign(assign) => {
+            let mut names = HashSet::new();
+            for target in &assign.targets {
+                if !class_attribute_target(target) {
+                    return true;
+                }
+                collect_target_bound_names(target, &mut names);
+            }
+            // `() = value` binds no name but still evaluates its right-hand
+            // side, which only the runtime path expresses.
+            names.is_empty()
+        }
         ast::Stmt::AnnAssign(_) => false,
         ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => false,
         _ => true,
     })
+}
+
+/// Whether an assignment target binds only class-attribute names: a name, or
+/// a tuple/list unpacking target (nested and starred included) whose elements
+/// are all names.
+fn class_attribute_target(target: &ast::Expr) -> bool {
+    match target {
+        ast::Expr::Name(_) => true,
+        ast::Expr::Tuple(tuple) => tuple.elts.iter().all(class_attribute_element),
+        ast::Expr::List(list) => list.elts.iter().all(class_attribute_element),
+        _ => false,
+    }
+}
+
+/// Whether one element of an unpacking target binds a class attribute name.
+/// A starred element binds one value, and CPython only allows a name there
+/// (attribute and subscript stores stay on the runtime path).
+fn class_attribute_element(element: &ast::Expr) -> bool {
+    match element {
+        ast::Expr::Starred(starred) => matches!(&*starred.value, ast::Expr::Name(_)),
+        other => class_attribute_target(other),
+    }
 }
 
 /// Whether a class body defines a method whose decorated value must be built
@@ -20079,6 +20340,27 @@ fn import_binding(alias: &ast::Alias) -> String {
             .next()
             .unwrap_or_else(|| alias.name.as_str())
             .to_string(),
+    }
+}
+
+/// Simple names bound by an assignment target, in the left-to-right order
+/// Python binds them. Nested tuple/list targets and starred elements recurse;
+/// attribute and subscript elements bind no class attribute name.
+fn collect_ordered_target_names<'a>(target: &'a ast::Expr, out: &mut Vec<&'a ast::Identifier>) {
+    match target {
+        ast::Expr::Name(name) => out.push(&name.id),
+        ast::Expr::Tuple(tuple) => {
+            for element in &tuple.elts {
+                collect_ordered_target_names(element, out);
+            }
+        }
+        ast::Expr::List(list) => {
+            for element in &list.elts {
+                collect_ordered_target_names(element, out);
+            }
+        }
+        ast::Expr::Starred(starred) => collect_ordered_target_names(&starred.value, out),
+        _ => {}
     }
 }
 

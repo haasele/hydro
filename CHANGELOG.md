@@ -8,6 +8,20 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 class-body unpacking assignments
+
+- A tuple/list unpacking assignment in a class body (`__add__, __radd__,
+  __iadd__ = _numeric_methods(...)`, `head, (second, *rest) = value`) binds
+  every name as a class attribute, so `numpy.mixins`-style method tables
+  compile. The right-hand side is evaluated exactly once and before the class
+  object is built; the elements bind left to right, including nested and
+  starred targets, and later class attributes or methods read the unpacked
+  names through the class namespace. The static class path parks the value in a
+  hidden local, unpacks it into one local per name in declaration order and
+  publishes those values; a dynamic class body (control flow, a class
+  registered inside a function) stores each name through the runtime namespace
+  dict.
+
 ### Added — 2026-10-27 chained class attributes and augmented slice assignment
 
 - Chained assignment inside a class body (`c = coef = coefficients = coeffs`)
@@ -16,9 +30,9 @@ initial state of the first runnable core.
   parks every attribute value in source order (so a chained value runs once and
   parked reads still see earlier attributes), and a name that aliases an
   earlier method becomes a method entry for every target. Class bodies that
-  store through an attribute, subscript or unpacking target now execute
+  store through an attribute or subscript target now execute
   against the runtime class namespace instead of being rejected, so
-  `obj.attr = ...`, `d[key] = ...` and `a, b = ...` work in a class body.
+  `obj.attr = ...` and `d[key] = ...` work in a class body.
 - Augmented slice assignment (`xs[a:b] += v`, `xs[::2] -= v`, …) lowers for
   lists, `bytearray`, `memoryview` and user objects. The sliced object, every
   bound and the right-hand side are evaluated once each, in Python's order

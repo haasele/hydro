@@ -497,7 +497,8 @@ built-in kinds), so the fallback never matches a user handler.
   captured cell.
 - **Classes** (Phase 2.27): `class Name(Base):` with at most one simple
   base. Allowed are methods, `__init__`, class attributes (`x = value`,
-  `x: type = value`, including `__slots__`, which is accepted and ignored),
+  `x: type = value`, `a, b = value` with nested and starred unpacking,
+  including `__slots__`, which is accepted and ignored),
   bare field declarations (`name: type`), `pass` and a docstring; class
   attributes are evaluated when the class statement runs and the namespace
   is immutable after creation. `@property`, `@classmethod` and

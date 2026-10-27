@@ -12077,6 +12077,28 @@ fn class_def_in<'a>(stmts: &'a [HStmt], name: &str) -> Option<&'a HStmtKind> {
     None
 }
 
+/// The first `HStmtKind::Unpack` reachable from `stmts`, descending into
+/// control-flow blocks (class lowering parks attribute values in an
+/// `if True:` wrapper).
+fn first_unpack(stmts: &[HStmt]) -> Option<&[HUnpackTarget]> {
+    for stmt in stmts {
+        match &stmt.kind {
+            HStmtKind::Unpack { targets, .. } => return Some(targets),
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(found) = first_unpack(then_body).or_else(|| first_unpack(else_body)) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[test]
 fn module_level_unpack_assignments_bind_module_globals() {
     let source = "\
@@ -12431,6 +12453,258 @@ class S:
         .expect("__sub__ alias");
     assert_eq!(alias.0, difference, "the alias reuses the method function");
     assert_eq!(alias.1, MethodKind::Normal);
+}
+
+#[test]
+fn class_body_unpacking_assignment_binds_class_attributes() {
+    // NumPy's `mixins.py` builds its operators in one call and names them
+    // through a tuple target. Every name is a class attribute, the right-hand
+    // side runs once, and a later attribute reads the unpacked name.
+    let source = "\
+def numeric_methods():
+    return 1, 2, 3
+class DataOps:
+    __add__, __radd__, __iadd__ = numeric_methods()
+    primary = __add__
+";
+    let hir = lower_ok(source);
+    // The body parks the right-hand side, unpacks it into hidden locals and
+    // only then publishes the class.
+    let then_body = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::If { then_body, .. } => {
+                let wraps_class = then_body.iter().any(|inner| {
+                    matches!(&inner.kind, HStmtKind::ClassDef { name, .. } if name == "DataOps")
+                });
+                wraps_class.then_some(then_body)
+            }
+            _ => None,
+        })
+        .expect("class-attribute wrapper");
+    assert_eq!(then_body.len(), 4, "{then_body:?}");
+    assert!(
+        matches!(then_body[0].kind, HStmtKind::Assign { .. }),
+        "the right-hand side is parked once: {:?}",
+        then_body[0].kind
+    );
+    let HStmtKind::Unpack { targets, value } = &then_body[1].kind else {
+        panic!("expected the unpack, got {:?}", then_body[1].kind);
+    };
+    let bound: Vec<LocalId> = targets
+        .iter()
+        .map(|target| match target {
+            HUnpackTarget::Name(id) => *id,
+            other => panic!("expected a name target, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(bound.len(), 3);
+    assert!(
+        matches!(value.kind, HExprKind::Local(_) | HExprKind::Call { .. }),
+        "the unpack reads the parked value: {value:?}"
+    );
+    assert!(matches!(&then_body[3].kind, HStmtKind::ClassDef { .. }));
+
+    let HStmtKind::ClassDef {
+        attributes,
+        methods,
+        ..
+    } = class_def_in(&hir.functions[0].body, "DataOps").expect("class DataOps")
+    else {
+        unreachable!()
+    };
+    assert!(methods.is_empty(), "{methods:?}");
+    let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["__add__", "__radd__", "__iadd__", "primary"]);
+    for ((name, value), bound_local) in attributes[..3].iter().zip(&bound) {
+        match &value.kind {
+            HExprKind::Local(id) => assert_eq!(id, bound_local, "{name}"),
+            other => panic!("expected the unpacked local for {name}, got {other:?}"),
+        }
+    }
+    // `primary = __add__` reads the unpacked name: its parked value is the
+    // local the first element binds.
+    assert!(
+        then_body.iter().any(|stmt| matches!(
+            &stmt.kind,
+            HStmtKind::Assign { value, .. }
+                if matches!(&value.kind, HExprKind::Local(id) if *id == bound[0])
+        )),
+        "a later class attribute reads the unpacked name: {then_body:?}"
+    );
+}
+
+#[test]
+fn class_body_nested_and_starred_unpack_targets_bind_attributes() {
+    let source = "\
+class C:
+    head, (second, *rest) = 1, (2, 3, 4)
+    tail = rest
+";
+    let hir = lower_ok(source);
+    let targets = first_unpack(&hir.functions[0].body).expect("unpack in the class body");
+    assert_eq!(targets.len(), 2, "{targets:?}");
+    assert!(matches!(&targets[0], HUnpackTarget::Name(_)));
+    let HUnpackTarget::Nested(nested) = &targets[1] else {
+        panic!("expected a nested target, got {:?}", targets[1]);
+    };
+    assert!(matches!(&nested[0], HUnpackTarget::Name(_)));
+    let HUnpackTarget::Star(inner) = &nested[1] else {
+        panic!("expected a starred target, got {:?}", nested[1]);
+    };
+    let HUnpackTarget::Name(rest) = &**inner else {
+        panic!("expected a starred name target, got {inner:?}");
+    };
+
+    let HStmtKind::ClassDef { attributes, .. } =
+        class_def_in(&hir.functions[0].body, "C").expect("class C")
+    else {
+        unreachable!()
+    };
+    let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["head", "second", "rest", "tail"]);
+    // `tail = rest` reads the starred binding: the parked value of the later
+    // attribute is the local the star binds.
+    assert!(
+        hir.functions[0].body.iter().any(|stmt| {
+            matches!(
+                &stmt.kind,
+                HStmtKind::If { then_body, .. }
+                    if then_body.iter().any(|inner| matches!(
+                        &inner.kind,
+                        HStmtKind::Assign { value, .. }
+                            if matches!(&value.kind, HExprKind::Local(id) if *id == *rest)
+                    ))
+            )
+        }),
+        "the starred binding reaches later attributes"
+    );
+}
+
+#[test]
+fn class_body_chained_and_unpacking_assignment_binds_every_name() {
+    let source = "class C:\n    whole = first, second = (1, 2)\n    later = whole\n";
+    let hir = lower_ok(source);
+    let targets = first_unpack(&hir.functions[0].body).expect("unpack in the class body");
+    assert_eq!(targets.len(), 2, "{targets:?}");
+    let HStmtKind::ClassDef { attributes, .. } =
+        class_def_in(&hir.functions[0].body, "C").expect("class C")
+    else {
+        unreachable!()
+    };
+    let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["whole", "first", "second", "later"]);
+    let local = |index: usize| match &attributes[index].1.kind {
+        HExprKind::Local(id) => *id,
+        other => panic!(
+            "expected a local for {}, got {other:?}",
+            attributes[index].0
+        ),
+    };
+    assert_ne!(local(0), local(1), "the sequence and its elements differ");
+    assert_ne!(local(1), local(2));
+    // `later = whole` reads the chained target's parked value.
+    assert!(
+        hir.functions[0].body.iter().any(|stmt| {
+            matches!(
+                &stmt.kind,
+                HStmtKind::If { then_body, .. }
+                    if then_body.iter().any(|inner| matches!(
+                        &inner.kind,
+                        HStmtKind::Assign { value, .. }
+                            if matches!(&value.kind, HExprKind::Local(id) if *id == local(0))
+                    ))
+            )
+        }),
+        "`whole` keeps the sequence the chained target parked"
+    );
+}
+
+#[test]
+fn class_body_unpacking_assignment_coexists_with_slots() {
+    let source = "\
+class C:
+    __slots__ = ('x',)
+    left, right = 1, 2
+";
+    let hir = lower_ok(source);
+    let HStmtKind::ClassDef { attributes, .. } =
+        class_def_in(&hir.functions[0].body, "C").expect("class C")
+    else {
+        unreachable!()
+    };
+    let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["__slots__", "left", "right"]);
+}
+
+#[test]
+fn class_body_unpacking_assignment_in_a_dynamic_body_writes_the_namespace() {
+    // A class registered inside a function always runs against the runtime
+    // namespace dict, so the unpacked names must store through it.
+    let source = "\
+def make():
+    class C:
+        a, *rest = 1, 2, 3
+        first = a
+    return C
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let targets = first_unpack(function_body(&hir, "make")).expect("unpack");
+    assert_eq!(targets.len(), 2, "{targets:?}");
+    let HUnpackTarget::Subscript { object, index } = &targets[0] else {
+        panic!("expected a namespace store, got {:?}", targets[0]);
+    };
+    assert!(matches!(object.kind, HExprKind::Local(_)), "{object:?}");
+    assert!(
+        matches!(&index.kind, HExprKind::Const(Const::Str(name)) if name == "a"),
+        "{index:?}"
+    );
+    let HUnpackTarget::Star(inner) = &targets[1] else {
+        panic!("expected a starred target, got {:?}", targets[1]);
+    };
+    let HUnpackTarget::Subscript { index, .. } = &**inner else {
+        panic!("expected a namespace store, got {inner:?}");
+    };
+    assert!(
+        matches!(&index.kind, HExprKind::Const(Const::Str(name)) if name == "rest"),
+        "{index:?}"
+    );
+}
+
+#[test]
+fn class_body_unpacking_assignment_in_a_namespace_body_binds_names() {
+    // Control flow sends the body to the runtime namespace even at module
+    // level; an attribute element of the unpacking target stays a normal
+    // store, and a later attribute reads the unpacked name.
+    let source = "\
+holder = [0]
+class C:
+    if True:
+        left, holder[0] = 1, 2
+    both = left
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let targets = first_unpack(&hir.functions[0].body).expect("unpack");
+    let HUnpackTarget::Subscript { object, index } = &targets[0] else {
+        panic!("expected a namespace store, got {:?}", targets[0]);
+    };
+    assert!(matches!(object.kind, HExprKind::Local(_)), "{object:?}");
+    assert!(
+        matches!(&index.kind, HExprKind::Const(Const::Str(name)) if name == "left"),
+        "{index:?}"
+    );
+    let HUnpackTarget::Subscript { object, index } = &targets[1] else {
+        panic!("expected a subscript store, got {:?}", targets[1]);
+    };
+    assert!(matches!(&object.kind, HExprKind::Local(_)), "{object:?}");
+    assert!(
+        matches!(&index.kind, HExprKind::Const(Const::Int(0))),
+        "{index:?}"
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("valid program");
 }
 
 #[test]
