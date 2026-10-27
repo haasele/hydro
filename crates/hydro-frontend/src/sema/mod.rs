@@ -201,8 +201,9 @@ enum ArgKind {
     Hashable,
     /// `set.union` accepts a set, list or tuple.
     SetIterable,
-    /// Any type whose values can be iterated: `str.join`/`bytes.join` accept
-    /// every iterable, not just lists (CPython iterates the argument).
+    /// Any type whose values can be iterated: `str.join`/`bytes.join` and
+    /// `list.extend` accept every iterable, not just lists (CPython iterates
+    /// the argument).
     Iterable,
 }
 
@@ -426,7 +427,10 @@ const LIST_METHODS: &[(&str, MethodSig)] = &[
         "sort",
         MethodSig::new(0, 2, &[ArgKind::Any, ArgKind::Any], Type::None),
     ),
-    ("extend", MethodSig::new(1, 1, &[ArgKind::List], Type::None)),
+    (
+        "extend",
+        MethodSig::new(1, 1, &[ArgKind::Iterable], Type::None),
+    ),
     (
         "insert",
         MethodSig::new(2, 2, &[ArgKind::Int, ArgKind::Any], Type::None),

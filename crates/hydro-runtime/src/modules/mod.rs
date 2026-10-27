@@ -3644,6 +3644,42 @@ fn number(v: i64) -> Result<f64, i64> {
     }
 }
 
+/// Numeric view for the classification predicates (`isfinite`, `isnan`,
+/// `isinf`, `isclose`). CPython converts every argument through `float`, so
+/// integers are accepted (including `BigInt`s that fit a `float`) and a
+/// `BigInt` outside the `float` range raises `OverflowError` instead of
+/// silently becoming an infinity.
+fn classification_number(v: i64) -> Result<f64, i64> {
+    if let Some(n) = value::as_bigint(v) {
+        return match value::bigint_to_f64(n) {
+            Some(f) => Ok(f),
+            None => Err(exc::raise_with_message(
+                OVERFLOW_ERROR,
+                "int too large to convert to float",
+            )),
+        };
+    }
+    number(v)
+}
+
+/// `math.isclose` on already-converted doubles: exact equality short-circuits
+/// (so equal infinities are close), infinities are otherwise never close, and
+/// the remaining values use the weaker of the two tolerances. A negative
+/// tolerance raises `ValueError` before any comparison, as CPython does.
+fn math_isclose(a: f64, b: f64, rel_tol: f64, abs_tol: f64) -> i64 {
+    if rel_tol < 0.0 || abs_tol < 0.0 {
+        return exc::raise_with_message(VALUE_ERROR, "tolerances must be non-negative");
+    }
+    if a == b {
+        return value::bool_value(true);
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return value::bool_value(false);
+    }
+    let diff = (b - a).abs();
+    value::bool_value(diff <= (rel_tol * b).abs() || diff <= (rel_tol * a).abs() || diff <= abs_tol)
+}
+
 fn math_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "sqrt" => match number(args[0]) {
@@ -3732,6 +3768,26 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
             Ok(x) => value::float_new(x.abs()),
             Err(err) => err,
         },
+        "isfinite" | "isnan" => match classification_number(args[0]) {
+            Ok(x) if function == "isfinite" => value::bool_value(x.is_finite()),
+            Ok(x) => value::bool_value(x.is_nan()),
+            Err(err) => err,
+        },
+        "isinf" => match classification_number(args[0]) {
+            Ok(x) => value::bool_value(x.is_infinite()),
+            Err(err) => err,
+        },
+        "isclose" => {
+            let a = match classification_number(args[0]) {
+                Ok(a) => a,
+                Err(err) => return err,
+            };
+            let b = match classification_number(args[1]) {
+                Ok(b) => b,
+                Err(err) => return err,
+            };
+            math_isclose(a, b, 1e-9, 0.0)
+        }
         "floor" | "ceil" | "trunc" => {
             // Integers are already integral: return the same exact value.
             if value::is_bigint(args[0]) {
@@ -3771,7 +3827,8 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-/// Keyword-aware `math` dispatch: `prod` binds its keyword-only `start`.
+/// Keyword-aware `math` dispatch: `prod` binds its keyword-only `start`, and
+/// `isclose` its keyword-only `rel_tol` and `abs_tol` tolerances.
 fn math_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
     match function {
         "prod" => {
@@ -3794,6 +3851,51 @@ fn math_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i
                 start = value;
             }
             math_prod(args[0], start)
+        }
+        "isclose" => {
+            let a = match classification_number(args[0]) {
+                Ok(a) => a,
+                Err(err) => return err,
+            };
+            let b = match classification_number(args[1]) {
+                Ok(b) => b,
+                Err(err) => return err,
+            };
+            let mut rel_tol = 1e-9_f64;
+            let mut abs_tol = 0.0_f64;
+            let mut rel_bound = false;
+            let mut abs_bound = false;
+            for (name, value) in keywords {
+                match name.as_str() {
+                    "rel_tol" if !rel_bound => {
+                        rel_tol = match classification_number(value) {
+                            Ok(tolerance) => tolerance,
+                            Err(err) => return err,
+                        };
+                        rel_bound = true;
+                    }
+                    "abs_tol" if !abs_bound => {
+                        abs_tol = match classification_number(value) {
+                            Ok(tolerance) => tolerance,
+                            Err(err) => return err,
+                        };
+                        abs_bound = true;
+                    }
+                    "rel_tol" | "abs_tol" | "a" | "b" => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("isclose() got multiple values for keyword argument '{name}'"),
+                        );
+                    }
+                    _ => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("isclose() got an unexpected keyword argument '{name}'"),
+                        );
+                    }
+                }
+            }
+            math_isclose(a, b, rel_tol, abs_tol)
         }
         _ => exc::raise_with_message(
             TYPE_ERROR,
@@ -8664,6 +8766,215 @@ mod tests {
         exc::init();
         assert_eq!(call("math", "pow", &[int(1)]), NONE);
         assert_eq!(message(), "math.pow() takes 2 arguments (1 given)");
+    }
+
+    #[test]
+    fn math_classification_predicates_report_finite_nan_and_infinity() {
+        exc::init();
+        let inf = get("math", "inf");
+        let ninf = value::float_new(f64::NEG_INFINITY);
+        let nan = get("math", "nan");
+        assert_eq!(call("math", "isfinite", &[int(0)]), TRUE);
+        assert_eq!(call("math", "isfinite", &[TRUE]), TRUE);
+        assert_eq!(
+            call("math", "isfinite", &[value::float_new(f64::MAX)]),
+            TRUE
+        );
+        assert_eq!(call("math", "isfinite", &[inf]), FALSE);
+        assert_eq!(call("math", "isfinite", &[ninf]), FALSE);
+        assert_eq!(call("math", "isfinite", &[nan]), FALSE);
+        // A finite `BigInt` outside the tagged range converts to a float.
+        let two_100 = big("1267650600228229401496703205376");
+        assert_eq!(call("math", "isfinite", &[two_100]), TRUE);
+
+        assert_eq!(call("math", "isnan", &[nan]), TRUE);
+        assert_eq!(call("math", "isnan", &[value::float_new(f64::NAN)]), TRUE);
+        assert_eq!(call("math", "isnan", &[int(1)]), FALSE);
+        assert_eq!(call("math", "isnan", &[inf]), FALSE);
+
+        assert_eq!(call("math", "isinf", &[inf]), TRUE);
+        assert_eq!(call("math", "isinf", &[ninf]), TRUE);
+        assert_eq!(call("math", "isinf", &[nan]), FALSE);
+        assert_eq!(call("math", "isinf", &[int(0)]), FALSE);
+        assert_eq!(call("math", "isinf", &[value::float_new(1e308)]), FALSE);
+
+        // `isinf` takes exactly one positional-only argument like CPython, so
+        // a second positional argument is a TypeError.
+        exc::init();
+        assert_eq!(call("math", "isinf", &[inf, int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "math.isinf() takes 1 arguments (2 given)");
+        // Passing `x` by name is rejected: the parameter is positional-only.
+        exc::init();
+        assert_eq!(call_kw("math", "isinf", &[], &[("x", inf)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn math_classification_type_and_range_errors_match_cpython() {
+        exc::init();
+        assert_eq!(call("math", "isfinite", &[string("x")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "must be real number, not str");
+        exc::init();
+        assert_eq!(call("math", "isnan", &[string("x")]), NONE);
+        assert_eq!(message(), "must be real number, not str");
+        exc::init();
+        assert_eq!(call("math", "isinf", &[string("x")]), NONE);
+        assert_eq!(message(), "must be real number, not str");
+        // A `BigInt` beyond the `float` range raises instead of becoming inf.
+        exc::init();
+        let enormous = big(&"1".repeat(400));
+        assert_eq!(call("math", "isfinite", &[enormous]), NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::OVERFLOW_ERROR as i64);
+        assert_eq!(message(), "int too large to convert to float");
+    }
+
+    #[test]
+    fn math_isclose_follows_the_cpython_tolerances() {
+        exc::init();
+        assert_eq!(call("math", "isclose", &[int(1), int(1)]), TRUE);
+        assert_eq!(
+            call(
+                "math",
+                "isclose",
+                &[value::float_new(0.0), value::float_new(-0.0)]
+            ),
+            TRUE
+        );
+        // Within the default 1e-9 relative tolerance, but not beyond it.
+        assert_eq!(
+            call(
+                "math",
+                "isclose",
+                &[value::float_new(1.0), value::float_new(1.0000000005)]
+            ),
+            TRUE
+        );
+        assert_eq!(
+            call(
+                "math",
+                "isclose",
+                &[value::float_new(1.0), value::float_new(1.00000001)]
+            ),
+            FALSE
+        );
+        let eight_digits = [value::float_new(1e8), value::float_new(1e8 + 1.0)];
+        assert_eq!(call("math", "isclose", &eight_digits), FALSE);
+        assert_eq!(
+            call_kw(
+                "math",
+                "isclose",
+                &eight_digits,
+                &[("rel_tol", value::float_new(1e-8))]
+            ),
+            TRUE
+        );
+        let near_zero = [value::float_new(1e-9), value::float_new(0.0)];
+        assert_eq!(call("math", "isclose", &near_zero), FALSE);
+        assert_eq!(
+            call_kw(
+                "math",
+                "isclose",
+                &near_zero,
+                &[("abs_tol", value::float_new(1e-8))]
+            ),
+            TRUE
+        );
+        // PEP 485's asymmetry example holds in both argument orders.
+        let tenth = value::float_new(0.1);
+        assert_eq!(
+            call_kw("math", "isclose", &[int(9), int(10)], &[("rel_tol", tenth)]),
+            TRUE
+        );
+        assert_eq!(
+            call_kw("math", "isclose", &[int(10), int(9)], &[("rel_tol", tenth)]),
+            TRUE
+        );
+        // Zero tolerance admits only exact equality.
+        assert_eq!(
+            call_kw(
+                "math",
+                "isclose",
+                &[value::float_new(1.0), value::float_new(1.000000000000001)],
+                &[("rel_tol", value::float_new(0.0))]
+            ),
+            FALSE
+        );
+        // Infinities are close only to themselves; NaN is close to nothing.
+        let inf = get("math", "inf");
+        let ninf = value::float_new(f64::NEG_INFINITY);
+        let nan = get("math", "nan");
+        assert_eq!(call("math", "isclose", &[inf, inf]), TRUE);
+        assert_eq!(call("math", "isclose", &[ninf, ninf]), TRUE);
+        assert_eq!(
+            call_kw(
+                "math",
+                "isclose",
+                &[inf, inf],
+                &[("abs_tol", value::float_new(0.0))]
+            ),
+            TRUE
+        );
+        assert_eq!(call("math", "isclose", &[inf, ninf]), FALSE);
+        assert_eq!(call("math", "isclose", &[inf, int(1)]), FALSE);
+        assert_eq!(call("math", "isclose", &[nan, nan]), FALSE);
+        assert_eq!(call("math", "isclose", &[nan, int(1)]), FALSE);
+    }
+
+    #[test]
+    fn math_isclose_rejects_negative_tolerances_and_bad_keywords() {
+        exc::init();
+        assert_eq!(
+            call_kw(
+                "math",
+                "isclose",
+                &[int(1), int(1)],
+                &[("rel_tol", value::float_new(-1e-100))]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "tolerances must be non-negative");
+        exc::init();
+        assert_eq!(
+            call_kw(
+                "math",
+                "isclose",
+                &[int(1), int(1)],
+                &[("abs_tol", value::float_new(-1e10))]
+            ),
+            NONE
+        );
+        assert_eq!(message(), "tolerances must be non-negative");
+        // A negative tolerance is only inspected after the conversions.
+        exc::init();
+        assert_eq!(
+            call_kw(
+                "math",
+                "isclose",
+                &[string("x"), int(1)],
+                &[("rel_tol", value::float_new(-1.0))]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "must be real number, not str");
+        exc::init();
+        assert_eq!(
+            call_kw("math", "isclose", &[int(1), int(2)], &[("foo", int(1))]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "isclose() got an unexpected keyword argument 'foo'"
+        );
+        exc::init();
+        let enormous = big(&"1".repeat(400));
+        assert_eq!(call("math", "isclose", &[enormous, int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::OVERFLOW_ERROR as i64);
+        assert_eq!(message(), "int too large to convert to float");
     }
 
     /// The codegen fast path handles non-negative tagged ints inline and

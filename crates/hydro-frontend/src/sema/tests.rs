@@ -462,6 +462,37 @@ fn join_rejects_non_iterables() {
 }
 
 #[test]
+fn list_extend_accepts_any_iterable() {
+    let cases = [
+        "xs.extend([2, 3])",
+        "xs.extend((2, 3))",
+        "xs.extend({2, 3})",
+        "xs.extend({'a': 1})",
+        "xs.extend('ab')",
+        "xs.extend(b'ab')",
+        "xs.extend(range(3))",
+        "xs.extend(n for n in [1, 2])",
+    ];
+    for call in cases {
+        let source = format!("xs = [1]\na = {call}\n");
+        let program = crate::check_source(&source, "test.py").expect("valid program");
+        assert_eq!(assigned_type(&program, 1), Type::None, "{source}");
+    }
+}
+
+#[test]
+fn list_extend_rejects_non_iterables() {
+    assert_eq!(
+        check_errors("xs = [1]\nxs.extend(1)\n"),
+        vec!["list.extend() argument 1 has wrong type: expected iterable, got int"]
+    );
+    assert_eq!(
+        check_errors("xs = [1]\nxs.extend(1.5)\n"),
+        vec!["list.extend() argument 1 has wrong type: expected iterable, got float"]
+    );
+}
+
+#[test]
 fn padding_method_signatures_are_registered() {
     let source = "a = 'x'.rjust(3)\n\
                   b = 'x'.ljust(3, '-')\n\

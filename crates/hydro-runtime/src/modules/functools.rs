@@ -1499,6 +1499,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn int(n: i64) -> i64 {
@@ -2036,20 +2038,32 @@ mod tests {
         assert!(!exc::pending());
     }
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    thread_local! {
+        /// Counts how many times the `cached_property` getter ran on this
+        /// thread. The tests share the process, so a process-wide counter
+        /// would let concurrent tests overwrite each other's tally; per-thread
+        /// state keeps every test's count its own.
+        static CACHED_PROPERTY_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
 
-    /// Counts how many times the `cached_property` getter ran.
-    static CACHED_PROPERTY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// The calls observed by the current test thread.
+    fn cached_property_calls() -> usize {
+        CACHED_PROPERTY_CALLS.with(Cell::get)
+    }
 
     extern "C" fn cached_property_getter_entry(_argv: *const i64) -> i64 {
-        let calls = CACHED_PROPERTY_CALLS.fetch_add(1, Ordering::Relaxed);
+        let calls = CACHED_PROPERTY_CALLS.with(|counter| {
+            let calls = counter.get();
+            counter.set(calls + 1);
+            calls
+        });
         int(calls as i64)
     }
 
     /// A getter reporting how many times it has been called. Resets the
     /// counter, so a test observes only its own calls.
     fn counting_getter() -> i64 {
-        CACHED_PROPERTY_CALLS.store(0, Ordering::Relaxed);
+        CACHED_PROPERTY_CALLS.with(|counter| counter.set(0));
         value::function_new(
             cached_property_getter_entry as *const () as usize,
             1,
@@ -2081,17 +2095,17 @@ mod tests {
         // Class access returns the descriptor itself and never runs the
         // getter.
         assert_eq!(attribute(class, "value"), descriptor);
-        assert_eq!(CACHED_PROPERTY_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(cached_property_calls(), 0);
 
         let instance = value::instance_new(class);
         let first = attribute(instance, "value");
         assert_eq!(value::as_integer(first), Some(0));
-        assert_eq!(CACHED_PROPERTY_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(cached_property_calls(), 1);
         // The cache is an ordinary instance attribute under the attribute
         // name, so a later read never reaches `__get__`.
         assert_eq!(value::instance_attr(instance, "value"), Some(first));
         assert_eq!(attribute(instance, "value"), first);
-        assert_eq!(CACHED_PROPERTY_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(cached_property_calls(), 1);
         // The descriptor records the recovered name, like `__set_name__`.
         assert_eq!(
             value::instance_attr(descriptor, "attrname").and_then(value::as_str),
@@ -2100,7 +2114,7 @@ mod tests {
         // A second instance computes its own value.
         let other = value::instance_new(class);
         assert_eq!(value::as_integer(attribute(other, "value")), Some(1));
-        assert_eq!(CACHED_PROPERTY_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(cached_property_calls(), 2);
         assert!(!exc::pending());
     }
 
@@ -2200,7 +2214,7 @@ mod tests {
             "No '__dict__' attribute on 'Slotted' instance to cache 'value' property."
         );
         exc::clear();
-        assert_eq!(CACHED_PROPERTY_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(cached_property_calls(), 0);
         assert!(!exc::pending());
     }
 

@@ -23,6 +23,15 @@ pub static MATH: ModuleSpec = ModuleSpec {
         f("ceil", 1, 1, Type::Int),
         f("trunc", 1, 1, Type::Int),
         f("fabs", 1, 1, Type::Float),
+        // Classification predicates accept any real number and return `bool`.
+        f("isfinite", 1, 1, Type::Bool),
+        f("isnan", 1, 1, Type::Bool),
+        // `isinf(x, /)`: like CPython, exactly one positional-only argument.
+        f("isinf", 1, 1, Type::Bool),
+        // `isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)`: both tolerances are
+        // keyword-only, so they are not positional slots; the runtime binds
+        // them and rejects unknown names.
+        kw_dynamic("isclose", 2, 2, Type::Bool, &["a", "b"]),
         // `gcd(*integers)`: CPython accepts any number of integers (zero
         // arguments return 0) and rejects floats.
         f("gcd", 0, usize::MAX, Type::Int),
@@ -3998,6 +4007,26 @@ mod tests {
         assert_eq!(prod.ret, Type::Any);
         assert!(prod.dynamic_keywords);
         assert_eq!(prod.params, &["iterable"][..]);
+    }
+
+    #[test]
+    fn math_classification_predicates_are_registered_as_bool_functions() {
+        for name in ["isfinite", "isnan", "isinf", "isclose"] {
+            let spec = function("math", name).unwrap_or_else(|| panic!("math.{name}"));
+            assert_eq!(spec.ret, Type::Bool, "{name}");
+        }
+        for name in ["isfinite", "isnan", "isinf"] {
+            let spec = function("math", name).expect(name);
+            assert_eq!((spec.min_args, spec.max_args), (1, 1), "{name}");
+            assert!(spec.params.is_empty(), "{name}");
+            assert!(!spec.dynamic_keywords, "{name}");
+        }
+        let isclose = function("math", "isclose").expect("math.isclose");
+        // `rel_tol` and `abs_tol` are keyword-only, so the positional arity is
+        // the mandatory `a`/`b` pair.
+        assert_eq!((isclose.min_args, isclose.max_args), (2, 2));
+        assert_eq!(isclose.params, &["a", "b"][..]);
+        assert!(isclose.dynamic_keywords);
     }
 
     #[test]
