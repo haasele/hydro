@@ -484,8 +484,8 @@ pub static MULTIPROCESSING: ModuleSpec = ModuleSpec {
 
 /// `pickle`: the HYD1 textual format. `dumps`/`dump` accept CPython's
 /// `protocol` keyword (the format itself is version-independent, so the value
-/// is validated but never changes the output), and `dump` writes the payload
-/// to a file object.
+/// is validated but never changes the output), `dump` writes the payload to a
+/// file object, and `load` reads it back from one.
 pub static PICKLE: ModuleSpec = ModuleSpec {
     name: "pickle",
     functions: &[
@@ -501,6 +501,18 @@ pub static PICKLE: ModuleSpec = ModuleSpec {
             &["obj", "file", "protocol", "fix_imports", "buffer_callback"],
         ),
         f("loads", 1, 1, Type::Any),
+        // `load(file, *, fix_imports=True, encoding="ASCII",
+        // errors="strict", buffers=None)`: reads the HYD1 payload back from a
+        // file object. The keyword-only options are accepted for signature
+        // compatibility; HYD1 carries its own text encoding and has no
+        // out-of-band buffers.
+        kw(
+            "load",
+            1,
+            5,
+            Type::Any,
+            &["file", "fix_imports", "encoding", "errors", "buffers"],
+        ),
     ],
     constants: &[],
 };
@@ -785,6 +797,18 @@ const IO_FUNCTIONS: &[FunctionSpec] = &[
     // cached class (identity, `isinstance` and method binding need a class).
     kw("StringIO", 0, 2, Type::Any, &["initial_value", "newline"]),
     kw("BytesIO", 0, 1, Type::Any, &["initial_value"]),
+    // Binary stream classes. `FileIO(file, mode='r', closefd=True,
+    // opener=None)` opens a raw binary file; the buffered wrappers take an
+    // existing binary stream and expose it with the matching class identity.
+    kw(
+        "FileIO",
+        1,
+        4,
+        Type::Any,
+        &["file", "mode", "closefd", "opener"],
+    ),
+    kw("BufferedReader", 1, 2, Type::Any, &["raw", "buffer_size"]),
+    kw("BufferedWriter", 1, 2, Type::Any, &["raw", "buffer_size"]),
     // `TextIOWrapper(buffer, encoding=None, errors=None, newline=None,
     // line_buffering=False, write_through=False)`: declared as a function so
     // calls lower as module calls; the runtime value is the cached class.
@@ -809,6 +833,8 @@ pub static IO: ModuleSpec = ModuleSpec {
     functions: IO_FUNCTIONS,
     constants: &[
         c("IOBase", Type::Any),
+        // CPython's raw-stream base; `FileIO` derives from it.
+        c("RawIOBase", Type::Any),
         c("TextIOBase", Type::Any),
         c("BufferedIOBase", Type::Any),
     ],

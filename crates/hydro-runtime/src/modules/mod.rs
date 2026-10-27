@@ -1347,9 +1347,18 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     // function.
     if matches!(module, "io" | "_io") {
         match name {
+            // The whole `io` hierarchy is cached, so `io.IOBase is io.IOBase`
+            // holds and every subclass is a real class object.
+            "IOBase" => return io_base_class("IOBase"),
+            "RawIOBase" => return io_base_class("RawIOBase"),
+            "TextIOBase" => return io_base_class("TextIOBase"),
+            "BufferedIOBase" => return io_base_class("BufferedIOBase"),
             "StringIO" => return string_io_class(),
             "BytesIO" => return bytes_io_class(),
             "TextIOWrapper" => return text_io_wrapper_class(),
+            "FileIO" => return io_file_class(value::FileClass::FileIO),
+            "BufferedReader" => return io_file_class(value::FileClass::BufferedReader),
+            "BufferedWriter" => return io_file_class(value::FileClass::BufferedWriter),
             _ => {}
         }
     }
@@ -2644,9 +2653,6 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `os.PathLike` is the abstract base of path objects; Hydro path values
         // are plain strings (`pathlib.Path` included), so the class carries no
         // members and exists for attribute/import compatibility.
-        ("io" | "_io", name @ ("IOBase" | "TextIOBase" | "BufferedIOBase")) => {
-            value::class_new(name.to_string(), NONE, Vec::new())
-        }
         ("os", "PathLike") => value::class_new("PathLike".to_string(), NONE, Vec::new()),
         ("os", "devnull") => {
             let devnull = if cfg!(windows) { "nul" } else { "/dev/null" };
@@ -4971,6 +4977,94 @@ fn pickle_check_protocol(argument: i64) -> Result<(), i64> {
     Ok(())
 }
 
+/// Reads the remaining content of a pickle source as bytes. Native files,
+/// text wrappers around them and the in-memory streams all expose their
+/// content differently, so each kind is read through the same primitives its
+/// methods use.
+fn pickle_read_source(source: i64) -> Result<Vec<u8>, i64> {
+    let file = value::as_file(source).or_else(|| tw_file(source));
+    if let Some(file) = file {
+        return if file.binary() {
+            match file.read_bytes(None) {
+                Ok(bytes) => Ok(bytes),
+                Err(error) => Err(value::raise_file_error(error)),
+            }
+        } else {
+            match file.read(None) {
+                Ok(text) => Ok(text.into_bytes()),
+                Err(error) => Err(value::raise_file_error(error)),
+            }
+        };
+    }
+    // `io.StringIO`/`io.BytesIO` store their content in the same instance
+    // attributes their `read` methods use.
+    if value::instance_attr(source, IO_DATA).is_some() {
+        if let Some(error) = io_open_check(source) {
+            return Err(error);
+        }
+        let data = io_data(source);
+        let pos = io_pos(source);
+        if let Some(bytes) = value::as_bytes(data) {
+            let slice = bytes
+                .get(pos..)
+                .map(|slice| slice.to_vec())
+                .unwrap_or_default();
+            io_set_pos(source, bytes.len());
+            return Ok(slice);
+        }
+        if let Some(text) = value::as_str(data) {
+            let chars: Vec<char> = text.chars().collect();
+            let slice: String = chars.iter().copied().skip(pos).collect();
+            io_set_pos(source, chars.len());
+            return Ok(slice.into_bytes());
+        }
+    }
+    Err(exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "file must be a readable file object, not {}",
+            value::type_name_of(source)
+        ),
+    ))
+}
+
+/// `pickle.load(file, *, fix_imports=True, encoding="ASCII", errors="strict",
+/// buffers=None)`.
+///
+/// Reads the HYD1 text from an open file object (binary files yield its UTF-8
+/// bytes, text files the `str` itself) and decodes it. The keyword-only
+/// options are validated and then ignored: HYD1 stores its own encoding and
+/// has no import table or out-of-band buffers.
+fn pickle_load(args: &[i64]) -> i64 {
+    for (slot, name) in [(2usize, "encoding"), (3usize, "errors")] {
+        if let Some(&argument) = args.get(slot) {
+            if argument != NONE && value::as_str(argument).is_none() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "{name} must be str or None, not {}",
+                        value::type_name_of(argument)
+                    ),
+                );
+            }
+        }
+    }
+    let data = match pickle_read_source(args[0]) {
+        Ok(data) => data,
+        Err(raised) => return raised,
+    };
+    let Ok(text) = std::str::from_utf8(&data) else {
+        return exc::raise_with_message(VALUE_ERROR, "invalid pickle data");
+    };
+    let Some(bytes) = serialize::from_hex(text) else {
+        return exc::raise_with_message(VALUE_ERROR, "invalid pickle data");
+    };
+    match serialize::decode(&bytes, false) {
+        Ok(decoded) => decoded,
+        Err(error) => pickle_error(error, true),
+    }
+}
+
 /// `pickle.dumps(obj, protocol=None)` / `pickle.dump(obj, file, protocol=None,
 /// *, fix_imports=True, buffer_callback=None)`.
 ///
@@ -5037,6 +5131,7 @@ fn pickle_call(function: &str, args: &[i64]) -> i64 {
                 Err(error) => pickle_error(error, true),
             }
         }
+        "load" => pickle_load(args),
         _ => missing_attribute("pickle", function),
     }
 }
@@ -7331,13 +7426,16 @@ fn io_call(function: &str, args: &[i64]) -> i64 {
         "StringIO" => string_io_new(args),
         "BytesIO" => bytes_io_new(args),
         "TextIOWrapper" => text_io_wrapper_new(args),
+        "FileIO" => file_io_new(args),
+        "BufferedReader" => buffered_reader_new(args),
+        "BufferedWriter" => buffered_writer_new(args),
         _ => missing_attribute("io", function),
     }
 }
 
-/// The cached `io.StringIO` / `io.BytesIO` classes. Native instances compare
-/// by class identity, so every access must return the same class value.
-fn in_memory_class(name: &'static str, methods: Vec<(String, i64)>) -> i64 {
+/// Cached native `io` class. Stream instances compare by class identity, so
+/// every access must return the same class value.
+fn in_memory_class(name: &str, base: i64, methods: Vec<(String, i64)>) -> i64 {
     let key = format!("io.{name}");
     if let Some(cached) = globals::registry_get(&key) {
         return cached;
@@ -7346,7 +7444,7 @@ fn in_memory_class(name: &'static str, methods: Vec<(String, i64)>) -> i64 {
     // while the class object itself is being allocated and registered.
     let method_values: Vec<i64> = methods.iter().map(|(_, value)| *value).collect();
     let method_roots = heap::root_values(&method_values);
-    let class = value::class_new(name.to_string(), NONE, methods);
+    let class = value::class_new(name.to_string(), base, methods);
     let class_roots = heap::root_values(&[class]);
     globals::registry_set(&key, class);
     heap::release_roots(class_roots);
@@ -7354,9 +7452,43 @@ fn in_memory_class(name: &'static str, methods: Vec<(String, i64)>) -> i64 {
     class
 }
 
+/// Cached `io` base class. The hierarchy matches CPython where the runtime
+/// can express it: `RawIOBase`, `TextIOBase` and `BufferedIOBase` derive from
+/// `IOBase`, and the concrete stream classes derive from those.
+fn io_base_class(name: &str) -> i64 {
+    let base = match name {
+        "IOBase" => NONE,
+        "RawIOBase" | "TextIOBase" | "BufferedIOBase" => io_base_class("IOBase"),
+        _ => NONE,
+    };
+    in_memory_class(name, base, Vec::new())
+}
+
+/// The cached class for a file object's current state. Used by `type()`,
+/// `isinstance` and the module lookup for the class constants.
+pub(crate) fn io_file_class(class: value::FileClass) -> i64 {
+    match class {
+        value::FileClass::FileIO => {
+            in_memory_class("FileIO", io_base_class("RawIOBase"), Vec::new())
+        }
+        value::FileClass::BufferedReader => in_memory_class(
+            "BufferedReader",
+            io_base_class("BufferedIOBase"),
+            Vec::new(),
+        ),
+        value::FileClass::BufferedWriter => in_memory_class(
+            "BufferedWriter",
+            io_base_class("BufferedIOBase"),
+            Vec::new(),
+        ),
+        value::FileClass::TextIOWrapper => text_io_wrapper_class(),
+    }
+}
+
 fn string_io_class() -> i64 {
     in_memory_class(
         "StringIO",
+        io_base_class("TextIOBase"),
         vec![
             (
                 "write".to_string(),
@@ -7417,6 +7549,7 @@ fn string_io_class() -> i64 {
 fn bytes_io_class() -> i64 {
     in_memory_class(
         "BytesIO",
+        io_base_class("BufferedIOBase"),
         vec![
             (
                 "write".to_string(),
@@ -7892,6 +8025,7 @@ fn text_io_wrapper_class() -> i64 {
     let native = |name: &'static str, arity: usize| value::native_function_new("io", name, arity);
     in_memory_class(
         "TextIOWrapper",
+        io_base_class("TextIOBase"),
         vec![
             ("read".to_string(), native("TextIOWrapper.read", 2)),
             ("readline".to_string(), native("TextIOWrapper.readline", 2)),
@@ -8082,6 +8216,203 @@ fn text_io_wrapper_new(args: &[i64]) -> i64 {
     io_store(instance, "write_through", value::bool_value(write_through));
     heap::release_roots(roots);
     instance
+}
+
+/// `io.FileIO(file, mode="r", closefd=True, opener=None)`.
+///
+/// FileIO is CPython's raw binary stream, so the returned object stays binary
+/// even when the mode omits `b`. Read mode snapshots the content like
+/// `io.open`; write modes keep the OS handle. `closefd=False` only makes sense
+/// for a file descriptor and `opener` needs a callable open hook, so both are
+/// rejected instead of being silently ignored.
+fn file_io_new(args: &[i64]) -> i64 {
+    let Some(&file_arg) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "FileIO() missing required argument 'file'");
+    };
+    let Some(path) = value::as_str(file_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "FileIO() argument 'file' must be str, not {}",
+                value::type_name_of(file_arg)
+            ),
+        );
+    };
+    let path = path.to_string();
+    let mode_text = match args.get(1).copied() {
+        None | Some(NONE) => "r".to_string(),
+        Some(mode) => match value::as_str(mode) {
+            Some(text) => text.to_string(),
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "FileIO() argument 'mode' must be str, not {}",
+                        value::type_name_of(mode)
+                    ),
+                )
+            }
+        },
+    };
+    // FileIO has no text mode; `t` is only valid for `io.open`.
+    if mode_text.contains('t') {
+        return exc::raise_with_message(VALUE_ERROR, &format!("invalid mode: '{mode_text}'"));
+    }
+    let mode = match parse_mode(&mode_text) {
+        Ok(mode) => mode,
+        Err(message) => return exc::raise_with_message(VALUE_ERROR, &message),
+    };
+    if let Some(&closefd) = args.get(2) {
+        if closefd != NONE && !value::truthy(closefd) {
+            return exc::raise_with_message(VALUE_ERROR, "Cannot use closefd=False with file name");
+        }
+    }
+    if let Some(&opener) = args.get(3) {
+        if opener != NONE {
+            return exc::raise_with_message(TYPE_ERROR, "FileIO() opener is not supported");
+        }
+    }
+    let opened = match mode.base {
+        'r' => match std::fs::read(&path) {
+            Ok(content) => value::file_new_read_bytes(path, content),
+            Err(error) => return os_failure(&path, &error),
+        },
+        base => {
+            let opened = match base {
+                'w' => std::fs::File::create(&path),
+                'a' => std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&path),
+                'x' => std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path),
+                // `parse_mode` only returns one of the four letters above.
+                _ => {
+                    return exc::raise_with_message(
+                        VALUE_ERROR,
+                        &format!("invalid mode: '{mode_text}'"),
+                    )
+                }
+            };
+            match opened {
+                Ok(file) => value::file_new_write(path, base, file, true),
+                Err(error) => return os_failure(&path, &error),
+            }
+        }
+    };
+    if let Some(file) = value::as_file(opened) {
+        file.set_class(value::FileClass::FileIO);
+    }
+    opened
+}
+
+/// Validates an optional `buffer_size` argument. Both buffered constructors
+/// ignore the value (the native file object is not a separately buffered
+/// wrapper) but reject non-integers and non-positive sizes like CPython.
+fn buffered_size_arg(args: &[i64], constructor: &str) -> Result<(), i64> {
+    match args.get(1).copied() {
+        None | Some(NONE) => Ok(()),
+        Some(argument) => match value::as_integer(argument) {
+            Some(size) if size > 0 => Ok(()),
+            Some(_) => Err(exc::raise_with_message(
+                VALUE_ERROR,
+                "buffer size must be strictly positive",
+            )),
+            None => Err(exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "{constructor}() buffer size must be an integer, not {}",
+                    value::type_name_of(argument)
+                ),
+            )),
+        },
+    }
+}
+
+/// `io.BufferedReader(raw, buffer_size=DEFAULT_BUFFER_SIZE)`.
+///
+/// Hydro's file object already holds the buffered content, so the constructor
+/// returns a second view with the buffered class that shares the raw stream's
+/// body and cursor. Only binary, readable streams can be wrapped.
+fn buffered_reader_new(args: &[i64]) -> i64 {
+    let Some(&raw) = args.first() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "BufferedReader() missing required argument 'raw'",
+        );
+    };
+    let Some(file) = value::as_file(raw) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "BufferedReader() raw must be a binary file object, not {}",
+                value::type_name_of(raw)
+            ),
+        );
+    };
+    if !file.binary() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "BufferedReader() raw must be a binary file object",
+        );
+    }
+    if file.mode() != 'r' {
+        return exc::raise_with_message(VALUE_ERROR, "underlying stream is not readable");
+    }
+    if file.closed() {
+        return exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file.");
+    }
+    if let Err(raised) = buffered_size_arg(args, "BufferedReader") {
+        return raised;
+    }
+    match value::file_wrap(raw, value::FileClass::BufferedReader) {
+        Some(wrapped) => wrapped,
+        None => exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file."),
+    }
+}
+
+/// `io.BufferedWriter(raw, buffer_size=DEFAULT_BUFFER_SIZE)`.
+///
+/// Like [`buffered_reader_new`], this returns a second view of the existing
+/// binary stream with the buffered class; a read-only stream cannot be
+/// wrapped.
+fn buffered_writer_new(args: &[i64]) -> i64 {
+    let Some(&raw) = args.first() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "BufferedWriter() missing required argument 'raw'",
+        );
+    };
+    let Some(file) = value::as_file(raw) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "BufferedWriter() raw must be a binary file object, not {}",
+                value::type_name_of(raw)
+            ),
+        );
+    };
+    if !file.binary() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "BufferedWriter() raw must be a binary file object",
+        );
+    }
+    if file.mode() == 'r' {
+        return exc::raise_with_message(VALUE_ERROR, "underlying stream is not writable");
+    }
+    if file.closed() {
+        return exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file.");
+    }
+    if let Err(raised) = buffered_size_arg(args, "BufferedWriter") {
+        return raised;
+    }
+    match value::file_wrap(raw, value::FileClass::BufferedWriter) {
+        Some(wrapped) => wrapped,
+        None => exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file."),
+    }
 }
 
 /// Decodes raw buffer bytes through the existing native UTF-8 codec so the
@@ -13371,6 +13702,249 @@ mod tests {
         assert_eq!(message(), "pickle protocol must be <= 5");
         method(file, "close", &[]);
         assert!(std::fs::read(&empty_path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pickle_load_restores_payloads_from_binary_text_and_wrapped_files() {
+        exc::init();
+        let dir = temp_root("pickle-load");
+        let payload = value::list_new(vec![int(7), string("eight")]);
+        let expected = value::repr(payload);
+        let text = value::as_str(call("pickle", "dumps", &[payload]))
+            .expect("HYD1 text")
+            .to_string();
+        assert!(!exc::pending(), "{}", message());
+
+        // Binary files hold the payload's UTF-8 bytes.
+        let binary_path = dir.join("load.bin");
+        let binary_name = binary_path.to_string_lossy().into_owned();
+        let writer = call("io", "open", &[string(&binary_name), string("wb")]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(call("pickle", "dump", &[payload, writer]), NONE);
+        method(writer, "close", &[]);
+        let reader = call("io", "open", &[string(&binary_name), string("rb")]);
+        assert!(!exc::pending(), "{}", message());
+        let loaded = call(
+            "pickle",
+            "load",
+            &[reader, TRUE, string("ASCII"), string("strict"), NONE],
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(value::repr(loaded), expected);
+        method(reader, "close", &[]);
+
+        // Text files hand back the `str` directly.
+        let text_path = dir.join("load.txt");
+        let text_name = text_path.to_string_lossy().into_owned();
+        let writer = call("io", "open", &[string(&text_name), string("w")]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(call("pickle", "dump", &[payload, writer]), NONE);
+        method(writer, "close", &[]);
+        let reader = call("io", "open", &[string(&text_name), string("r")]);
+        let loaded = call("pickle", "load", &[reader]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(value::repr(loaded), expected);
+        method(reader, "close", &[]);
+        assert_eq!(std::fs::read_to_string(&text_path).unwrap(), text);
+
+        // A TextIOWrapper over a binary file is a valid source as well.
+        let wrapped_reader = call("io", "open", &[string(&binary_name), string("rb")]);
+        let wrapper = call("io", "TextIOWrapper", &[wrapped_reader]);
+        assert!(!exc::pending(), "{}", message());
+        let loaded = call("pickle", "load", &[wrapper]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(value::repr(loaded), expected);
+
+        // In-memory streams are file objects too.
+        let bytes_stream = call(
+            "io",
+            "BytesIO",
+            &[value::bytes_new(text.as_bytes().to_vec())],
+        );
+        let loaded = call("pickle", "load", &[bytes_stream]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(value::repr(loaded), expected);
+        let text_stream = call("io", "StringIO", &[string(&text)]);
+        let loaded = call("pickle", "load", &[text_stream]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(value::repr(loaded), expected);
+
+        // A non-file argument is rejected instead of being coerced.
+        exc::init();
+        assert_eq!(call("pickle", "load", &[string("not a file")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "file must be a readable file object, not str");
+
+        // The keyword-only encoding/errors options are type-checked before
+        // anything is read.
+        exc::init();
+        let reader = call("io", "open", &[string(&binary_name), string("rb")]);
+        assert_eq!(call("pickle", "load", &[reader, NONE, int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "encoding must be str or None, not int");
+        exc::init();
+        assert_eq!(call("pickle", "load", &[reader, NONE, NONE, int(1)]), NONE);
+        assert_eq!(message(), "errors must be str or None, not int");
+        method(reader, "close", &[]);
+
+        // Malformed HYD1 text is a ValueError, like `loads`.
+        let invalid_path = dir.join("invalid.pkl");
+        std::fs::write(&invalid_path, b"zz").unwrap();
+        let invalid_name = invalid_path.to_string_lossy().into_owned();
+        let reader = call("io", "open", &[string(&invalid_name), string("r")]);
+        assert_eq!(call("pickle", "load", &[reader]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "invalid pickle data");
+        method(reader, "close", &[]);
+
+        // `load` declares the CPython keyword-only slots.
+        let load = hydro_ir::stdlib::function("pickle", "load").expect("load spec");
+        assert_eq!(
+            load.params,
+            &["file", "fix_imports", "encoding", "errors", "buffers"][..]
+        );
+        assert_eq!((load.min_args, load.max_args), (1, 5));
+        assert_eq!(load.ret, hydro_ir::Type::Any);
+    }
+
+    #[test]
+    fn io_binary_classes_are_real_and_isinstance_follows_stream_state() {
+        exc::init();
+        let io_base = get("io", "IOBase");
+        let raw_base = get("io", "RawIOBase");
+        let text_base = get("io", "TextIOBase");
+        let buffered_base = get("io", "BufferedIOBase");
+        let text_class = get("io", "TextIOWrapper");
+        let fileio_class = get("io", "FileIO");
+        let buffered_reader = get("io", "BufferedReader");
+        let buffered_writer = get("io", "BufferedWriter");
+        for class in [
+            io_base,
+            raw_base,
+            text_base,
+            buffered_base,
+            text_class,
+            fileio_class,
+            buffered_reader,
+            buffered_writer,
+        ] {
+            assert!(value::as_class(class).is_some(), "io class value");
+        }
+        // Class identity is stable across lookups.
+        assert_eq!(get("io", "IOBase"), io_base);
+        assert_eq!(get("io", "BufferedReader"), buffered_reader);
+        assert_eq!(crate::builtins::issubclass(raw_base, io_base), TRUE);
+        assert_eq!(crate::builtins::issubclass(text_base, io_base), TRUE);
+        assert_eq!(crate::builtins::issubclass(buffered_base, io_base), TRUE);
+        assert_eq!(
+            crate::builtins::issubclass(buffered_reader, buffered_base),
+            TRUE
+        );
+        assert_eq!(
+            crate::builtins::issubclass(buffered_writer, buffered_base),
+            TRUE
+        );
+        assert_eq!(crate::builtins::issubclass(fileio_class, raw_base), TRUE);
+        assert_eq!(crate::builtins::issubclass(fileio_class, io_base), TRUE);
+        assert_eq!(crate::builtins::issubclass(text_class, text_base), TRUE);
+        assert_eq!(crate::builtins::issubclass(text_base, buffered_base), FALSE);
+
+        let dir = temp_root("io-classes");
+        let input_path = dir.join("input.bin");
+        std::fs::write(&input_path, b"abc").unwrap();
+        let input_name = input_path.to_string_lossy().into_owned();
+
+        // Binary read mode is a BufferedReader.
+        let reader = call("io", "open", &[string(&input_name), string("rb")]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(value::type_class(reader), buffered_reader);
+        assert_eq!(value::type_name_of(reader), "BufferedReader");
+        assert_eq!(crate::builtins::isinstance(reader, buffered_reader), TRUE);
+        assert_eq!(crate::builtins::isinstance(reader, buffered_base), TRUE);
+        assert_eq!(crate::builtins::isinstance(reader, io_base), TRUE);
+        assert_eq!(crate::builtins::isinstance(reader, text_class), FALSE);
+        assert_eq!(crate::builtins::isinstance(reader, buffered_writer), FALSE);
+        method(reader, "close", &[]);
+
+        // Text mode maps to TextIOWrapper, not to a buffered binary stream.
+        let text = call("io", "open", &[string(&input_name), string("r")]);
+        assert_eq!(value::type_class(text), text_class);
+        assert_eq!(value::type_name_of(text), "TextIOWrapper");
+        assert_eq!(crate::builtins::isinstance(text, text_base), TRUE);
+        assert_eq!(crate::builtins::isinstance(text, io_base), TRUE);
+        assert_eq!(crate::builtins::isinstance(text, buffered_reader), FALSE);
+        method(text, "close", &[]);
+
+        // Binary write mode is a BufferedWriter.
+        let output_path = dir.join("output.bin");
+        let output_name = output_path.to_string_lossy().into_owned();
+        let writer = call("io", "open", &[string(&output_name), string("wb")]);
+        assert_eq!(value::type_class(writer), buffered_writer);
+        assert_eq!(crate::builtins::isinstance(writer, buffered_base), TRUE);
+        assert_eq!(crate::builtins::isinstance(writer, buffered_reader), FALSE);
+        method(writer, "close", &[]);
+
+        // `io.FileIO` opens a raw binary stream even when the mode omits `b`.
+        let raw = call("io", "FileIO", &[string(&input_name)]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::as_file(raw).expect("file value").binary());
+        assert_eq!(value::type_class(raw), fileio_class);
+        assert_eq!(value::type_name_of(raw), "FileIO");
+        assert_eq!(crate::builtins::isinstance(raw, fileio_class), TRUE);
+        assert_eq!(crate::builtins::isinstance(raw, raw_base), TRUE);
+        assert_eq!(crate::builtins::isinstance(raw, io_base), TRUE);
+        assert_eq!(crate::builtins::isinstance(raw, buffered_reader), FALSE);
+        let data = method(raw, "read", &[]);
+        assert_eq!(value::as_bytes(data), Some(&b"abc"[..]));
+        method(raw, "close", &[]);
+
+        // Wrapping a raw stream creates a second view with the buffered class
+        // while both share the stream state.
+        let raw = call("io", "FileIO", &[string(&input_name)]);
+        let wrapped = call("io", "BufferedReader", &[raw]);
+        assert_ne!(wrapped, raw);
+        assert_eq!(value::type_class(raw), fileio_class);
+        assert_eq!(value::type_class(wrapped), buffered_reader);
+        assert_eq!(crate::builtins::isinstance(raw, fileio_class), TRUE);
+        assert_eq!(crate::builtins::isinstance(raw, buffered_reader), FALSE);
+        assert_eq!(crate::builtins::isinstance(wrapped, buffered_reader), TRUE);
+        let data = method(wrapped, "read", &[]);
+        assert_eq!(value::as_bytes(data), Some(&b"abc"[..]));
+        method(wrapped, "close", &[]);
+        // Both views observe the same body, so closing one closes the other.
+        assert_eq!(attribute(raw, "closed"), TRUE);
+
+        // A read-only raw stream cannot become a writer.
+        exc::init();
+        let raw = call("io", "FileIO", &[string(&input_name)]);
+        assert_eq!(call("io", "BufferedWriter", &[raw]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "underlying stream is not writable");
+        method(raw, "close", &[]);
+
+        // `FileIO` rejects text mode spellings and closefd=False paths.
+        exc::init();
+        assert_eq!(
+            call("io", "FileIO", &[string(&input_name), string("rt")]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "invalid mode: 'rt'");
+        exc::init();
+        assert_eq!(
+            call("io", "FileIO", &[string(&input_name), string("r"), FALSE]),
+            NONE
+        );
+        assert_eq!(message(), "Cannot use closefd=False with file name");
+
+        // The in-memory streams join the same hierarchy.
+        let string_io = call("io", "StringIO", &[]);
+        assert_eq!(crate::builtins::isinstance(string_io, text_base), TRUE);
+        assert_eq!(crate::builtins::isinstance(string_io, io_base), TRUE);
+        assert_eq!(crate::builtins::isinstance(string_io, text_class), FALSE);
+        let bytes_io = call("io", "BytesIO", &[]);
+        assert_eq!(crate::builtins::isinstance(bytes_io, buffered_base), TRUE);
+        assert_eq!(crate::builtins::isinstance(bytes_io, io_base), TRUE);
     }
 
     fn tuple_ints(list: i64) -> Vec<Vec<i64>> {

@@ -5634,6 +5634,13 @@ fn instance_of(value: i64, class: i64) -> bool {
         }
         return false;
     }
+    // File objects are native streams, not class instances. Their class
+    // identity follows the stream state (raw/buffered/text), so `isinstance`
+    // walks the real `io` hierarchy instead of guessing from the mode string.
+    if let Some(file) = value::as_file(value) {
+        let actual = crate::modules::io_file_class(file.class());
+        return value::class_mro(actual).contains(&class);
+    }
     // Non-instance values match only the cached native primitive classes
     // (`type(x)`), which `named_type_check` resolves by name.
     if value::is_cached_type_class(class) {

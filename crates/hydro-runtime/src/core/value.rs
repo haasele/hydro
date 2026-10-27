@@ -1216,6 +1216,42 @@ enum FileBody {
     Write(std::fs::File),
 }
 
+/// Native `io` class a file object currently reports.
+///
+/// `io.open` maps its mode to the stream CPython would return: binary reads
+/// are `BufferedReader`s, binary writes `BufferedWriter`s and text files
+/// `TextIOWrapper`s. `io.FileIO` marks its object raw, and the buffered
+/// constructors allocate a second view with the buffered class while both
+/// views share one stream. `isinstance` and `type()` read this state, so no
+/// second object graph has to be built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileClass {
+    FileIO,
+    BufferedReader,
+    BufferedWriter,
+    TextIOWrapper,
+}
+
+impl FileClass {
+    fn tag(self) -> u8 {
+        match self {
+            FileClass::FileIO => 0,
+            FileClass::BufferedReader => 1,
+            FileClass::BufferedWriter => 2,
+            FileClass::TextIOWrapper => 3,
+        }
+    }
+
+    fn from_tag(tag: u8) -> FileClass {
+        match tag {
+            1 => FileClass::BufferedReader,
+            2 => FileClass::BufferedWriter,
+            3 => FileClass::TextIOWrapper,
+            _ => FileClass::FileIO,
+        }
+    }
+}
+
 struct FileInner {
     body: Option<FileBody>,
     /// Cursor position: characters for a text read file, bytes for a binary
@@ -1232,47 +1268,59 @@ struct FileInner {
 /// lock is held (a blocked read/write only parks the OS thread inside the
 /// syscall, and the collector's root scanning does not depend on this object).
 pub(crate) struct FileState {
-    inner: Mutex<FileInner>,
+    inner: Arc<Mutex<FileInner>>,
     path: String,
     /// One of `r`, `w`, `a`, `x`; used by `repr`.
     mode: char,
     binary: bool,
+    /// Current native `io` class, set at construction and adjusted by the
+    /// `io.FileIO` constructor. Buffered wrappers create a separate view with
+    /// their own class rather than rewriting this one.
+    class: AtomicU8,
 }
 
 impl FileState {
     fn new_read(path: String, content: String) -> FileState {
         FileState {
-            inner: Mutex::new(FileInner {
+            inner: Arc::new(Mutex::new(FileInner {
                 body: Some(FileBody::Read(content.chars().collect())),
                 cursor: 0,
-            }),
+            })),
             path,
             mode: 'r',
             binary: false,
+            class: AtomicU8::new(FileClass::TextIOWrapper.tag()),
         }
     }
 
     fn new_read_bytes(path: String, content: Vec<u8>) -> FileState {
         FileState {
-            inner: Mutex::new(FileInner {
+            inner: Arc::new(Mutex::new(FileInner {
                 body: Some(FileBody::ReadBytes(content)),
                 cursor: 0,
-            }),
+            })),
             path,
             mode: 'r',
             binary: true,
+            class: AtomicU8::new(FileClass::BufferedReader.tag()),
         }
     }
 
     fn new_write(path: String, mode: char, file: std::fs::File, binary: bool) -> FileState {
+        let class = if binary {
+            FileClass::BufferedWriter
+        } else {
+            FileClass::TextIOWrapper
+        };
         FileState {
-            inner: Mutex::new(FileInner {
+            inner: Arc::new(Mutex::new(FileInner {
                 body: Some(FileBody::Write(file)),
                 cursor: 0,
-            }),
+            })),
             path,
             mode,
             binary,
+            class: AtomicU8::new(class.tag()),
         }
     }
 
@@ -1292,6 +1340,19 @@ impl FileState {
 
     pub(crate) fn binary(&self) -> bool {
         self.binary
+    }
+
+    /// Native `io` class this object currently reports.
+    pub(crate) fn class(&self) -> FileClass {
+        FileClass::from_tag(self.class.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Overrides the native `io` class of this view. The `io.FileIO`
+    /// constructor uses this to mark the stream raw; the buffered wrappers
+    /// allocate a separate view instead of rewriting the raw object.
+    pub(crate) fn set_class(&self, class: FileClass) {
+        self.class
+            .store(class.tag(), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn closed(&self) -> bool {
@@ -6135,6 +6196,21 @@ pub(crate) fn file_new_write(path: String, mode: char, file: std::fs::File, bina
     )
 }
 
+/// Allocates a second view of `source` that reports `class` but shares the
+/// same cursor and body. The buffered constructors use this so the raw stream
+/// keeps its own class identity while both objects observe one stream.
+pub(crate) fn file_wrap(source: i64, class: FileClass) -> Option<i64> {
+    let file = as_file(source)?;
+    let wrapped = FileState {
+        inner: Arc::clone(&file.inner),
+        path: file.path.clone(),
+        mode: file.mode,
+        binary: file.binary,
+        class: AtomicU8::new(class.tag()),
+    };
+    Some(alloc(KIND_FILE, ObjData::File(wrapped)))
+}
+
 /// Allocates a `csv.reader` from already parsed rows. `header` is `Some` for
 /// a `DictReader`.
 pub(crate) fn csv_reader_new(rows: Vec<Vec<String>>, header: Option<Vec<String>>) -> i64 {
@@ -6365,6 +6441,11 @@ pub(crate) fn type_class(v: i64) -> i64 {
         }
         return native_class("type");
     }
+    // File objects report the real `io` class the stream currently has, so
+    // `type(f) is io.BufferedReader` and `isinstance(f, ...)` agree.
+    if let Some(file) = as_file(v) {
+        return crate::modules::io_file_class(file.class());
+    }
     let name = type_name_of(v);
     // Opaque runtime kinds report `object`; use the cached root class rather
     // than creating a second class with the same name.
@@ -6392,6 +6473,11 @@ pub(crate) fn type_name_of(v: i64) -> String {
     }
     if let Some(name) = class_display_name(v) {
         return name.to_string();
+    }
+    if let Some(file) = as_file(v) {
+        if let Some(name) = class_display_name(crate::modules::io_file_class(file.class())) {
+            return name.to_string();
+        }
     }
     type_name(v).to_string()
 }

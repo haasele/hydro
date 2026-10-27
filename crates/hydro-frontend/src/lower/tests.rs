@@ -13612,7 +13612,11 @@ fn unpack_targets_declared_global_store_into_the_global_table() {
         hydro_ir::UnpackTarget::Global { ref module, ref name }
             if module == "__main__" && name == "a"
     ));
-    assert!(matches!(targets[1], hydro_ir::UnpackTarget::Name(_)));
+    assert!(matches!(
+        targets[1],
+        hydro_ir::UnpackTarget::Global { ref module, ref name }
+            if module == "__main__" && name == "b"
+    ));
 }
 
 #[test]
