@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::builtins;
-use crate::exc::{self, ASSERTION_ERROR, RUNTIME_ERROR, SKIPPED, STOP_ITERATION, XFAILED};
+use crate::exc::{
+    self, ASSERTION_ERROR, NOT_IMPLEMENTED_ERROR, RUNTIME_ERROR, SKIPPED, STOP_ITERATION, XFAILED,
+};
 use crate::fiber;
 use crate::heap;
 use crate::iter;
@@ -84,7 +86,7 @@ pub(crate) fn register_class(class: i64) {
 /// Runtime dispatch for the `pytest` module.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "main" => NONE,
+        "main" => main(args),
         "raises" => raises(args),
         "approx" => approx(args),
         "fail" => fail(args),
@@ -147,6 +149,30 @@ fn identity(args: &[i64]) -> i64 {
         }
     }
     value::native_function_new("pytest", "_identity", usize::MAX)
+}
+
+/// `pytest.main()`: refuse with a precise `NotImplementedError`.
+///
+/// The runtime has no pytest session to run: test discovery, plugin handling
+/// and report writing belong to the external Hydro test runner, which invokes
+/// [`run`] itself and owns the exit code. Pretending the call succeeded would
+/// hide the fact that no tests were collected, so the argument list is
+/// reported and the call fails at run time.
+fn main(args: &[i64]) -> i64 {
+    let supplied = if args.is_empty() {
+        String::from("no arguments")
+    } else {
+        format!("{} argument(s)", args.len())
+    };
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        &format!(
+            "pytest.main() is not implemented in Hydro (called with {supplied}): the runtime \
+             does not start a pytest session, because test collection, plugins and reporting \
+             are owned by the external Hydro test runner. Run the test file with the Hydro \
+             runner instead of calling pytest.main()."
+        ),
+    )
 }
 
 // -------------------------------------------------------------------------
@@ -725,4 +751,32 @@ fn escape(text: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exc::NOT_IMPLEMENTED_ERROR;
+
+    #[test]
+    fn main_reports_that_no_session_exists() {
+        exc::init();
+        assert_eq!(call("main", &[]), NONE);
+        assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
+        let (tag, message) = pending_text();
+        assert_eq!(tag, NOT_IMPLEMENTED_ERROR);
+        assert!(message.contains("pytest.main()"), "{message}");
+        assert!(message.contains("no arguments"), "{message}");
+        assert!(message.contains("external Hydro test runner"), "{message}");
+        exc::clear();
+    }
+
+    #[test]
+    fn main_reports_how_many_arguments_were_supplied() {
+        exc::init();
+        assert_eq!(call("main", &[NONE, NONE]), NONE);
+        let (_, message) = pending_text();
+        assert!(message.contains("2 argument(s)"), "{message}");
+        exc::clear();
+    }
 }

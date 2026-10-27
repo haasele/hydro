@@ -1135,7 +1135,10 @@ pub static UNITTEST: ModuleSpec = ModuleSpec {
 pub static PYTEST: ModuleSpec = ModuleSpec {
     name: "pytest",
     functions: &[
-        f("main", 0, 0, Type::None),
+        // `pytest.main(*args, **kwargs)` accepts any session argument list.
+        // Hydro has no in-process session, so the runtime accepts the call
+        // unchanged and rejects it at run time with `NotImplementedError`.
+        kw_dynamic("main", 0, usize::MAX, Type::None, &[]),
         kw("raises", 1, 2, Type::Any, &["expected", "match"]),
         kw("approx", 1, 3, Type::Any, &["expected", "rel", "abs"]),
         kw("fail", 0, 1, Type::None, &["msg"]),
@@ -3435,6 +3438,22 @@ mod tests {
         let dump = function("json", "dump").expect("json.dump");
         assert_eq!(dump.max_args, 6);
         assert_eq!(dump.params.last().copied(), Some("sort_keys"));
+    }
+
+    #[test]
+    fn pytest_main_accepts_a_full_session_argument_list() {
+        let main = function("pytest", "main").expect("pytest.main");
+        assert_eq!(main.min_args, 0);
+        assert_eq!(main.max_args, usize::MAX);
+        assert_eq!(main.ret, Type::None);
+        assert!(
+            main.params.is_empty(),
+            "pytest.main(*args, **kwargs) declares no fixed parameters"
+        );
+        assert!(
+            main.dynamic_keywords,
+            "pytest.main(*args, **kwargs) forwards every keyword to the runtime"
+        );
     }
 
     #[test]
