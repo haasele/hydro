@@ -197,6 +197,19 @@ fn forward_ref_class() -> i64 {
         vec![("__init__".to_string(), init)],
     );
     heap::add_thread_root(class);
+    let slots = [
+        "__forward_module__",
+        "__forward_arg__",
+        "__forward_code__",
+        "__forward_evaluated__",
+        "__forward_value__",
+        "__forward_is_argument__",
+        "__forward_is_class__",
+        "__forward_module__",
+    ]
+    .map(|name| value::str_alloc(name.to_string()));
+    let slots = value::tuple_new(slots.to_vec());
+    value::class_set_attr(class, "__slots__".to_string(), slots);
     *FORWARD_REF
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
