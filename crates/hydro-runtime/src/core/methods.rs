@@ -326,8 +326,11 @@ fn super_getattr(proxy: i64, attr: &str) -> Option<i64> {
             let args = [state.object];
             Some(builtins::call(function, 1, args.as_ptr()))
         }
-        value::ClassEntry::Method(_, _) => {
-            Some(value::bound_method_new(state.object, attr.to_string()))
+        value::ClassEntry::Method(kind, function) => {
+            // Bind the entry that resolution actually found. Returning a
+            // name-bound method would re-resolve from the receiver's class
+            // and pick up the override this `super()` call runs past.
+            Some(super_bound_value(kind, function, state.object, owner))
         }
         value::ClassEntry::Attr(value) => {
             if let Some(result) = descriptor_get(value, state.object, owner) {
@@ -338,6 +341,19 @@ fn super_getattr(proxy: i64, attr: &str) -> Option<i64> {
             }
             Some(value)
         }
+    }
+}
+
+/// Callable for a method resolved through `super(...)`.
+///
+/// Static methods stay unbound, classmethods bind the owner class, and normal
+/// methods bind the receiver, matching [`call_bound_entry`] without
+/// re-resolving the name.
+fn super_bound_value(kind: MethodKind, function: i64, receiver: i64, owner: i64) -> i64 {
+    match kind {
+        MethodKind::Staticmethod => function,
+        MethodKind::Classmethod => value::partial_new(function, vec![owner]),
+        MethodKind::Normal | MethodKind::Property => value::partial_new(function, vec![receiver]),
     }
 }
 
@@ -386,9 +402,17 @@ fn call_bound_entry(
             },
         );
     }
-    // Callables without parameter metadata cannot bind keywords; reject like
-    // the other native call paths instead of silently dropping them.
-    if let Some((name, _)) = keywords.first() {
+    // A bound method carries its own keyword handling: forward the named
+    // arguments to the receiver's method table instead of rejecting them.
+    // This is how `super().__new__(mcls, name, bases, ns, **kwds)` reaches
+    // `type.__new__`, which accepts (and does not forward) class-header
+    // keywords; `__call__` forwards them and `__prepare__` ignores them.
+    let forwards_keywords = matches!(method, "__new__" | "__call__" | "__prepare__")
+        && value::as_function(function).is_some_and(|function| {
+            matches!(&function.body, value::FunctionBody::BoundMethod { .. })
+        });
+    if !keywords.is_empty() && !forwards_keywords {
+        let name = &keywords[0].0;
         return type_error(format!(
             "{method}() got an unexpected keyword argument '{name}'"
         ));
@@ -396,7 +420,26 @@ fn call_bound_entry(
     let mut call_args = Vec::with_capacity(args.len() + 1);
     call_args.extend(bound);
     call_args.extend_from_slice(args);
-    builtins::call(function, call_args.len(), call_args.as_ptr())
+    if keywords.is_empty() {
+        builtins::call(function, call_args.len(), call_args.as_ptr())
+    } else {
+        let roots_source: Vec<i64> = keywords.iter().map(|(_, item)| *item).collect();
+        let roots = crate::heap::root_values(&roots_source);
+        let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+        for (name, item) in keywords {
+            pairs.push(value::str_alloc(name.clone()));
+            pairs.push(*item);
+        }
+        let result = builtins::call_kw(
+            function,
+            call_args.len(),
+            call_args.as_ptr(),
+            keywords.len(),
+            pairs.as_ptr(),
+        );
+        crate::heap::release_roots(roots);
+        result
+    }
 }
 
 fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
@@ -656,19 +699,30 @@ fn call_descriptor(
     builtins::call(function, call_args.len(), call_args.as_ptr())
 }
 
+/// The metaclass class-attribute lookup falls back to.
+///
+/// A class without an explicit metaclass is still an instance of the native
+/// `type` class, whose C-level operations (`mro`, `__subclasscheck__`, …) are
+/// part of every class's surface.
+fn lookup_metaclass(class: i64) -> i64 {
+    let metaclass = value::class_metaclass(class);
+    if metaclass == NONE {
+        value::native_type_class()
+    } else {
+        metaclass
+    }
+}
+
 /// Resolves `class.attr` through the class's metaclass.
 ///
 /// Used only after the class namespace misses (CPython's normal lookup order).
-/// Returns `None` when the class has no explicit metaclass or the metaclass
-/// does not define `attr`. A metaclass property runs with the class as its
-/// receiver, so `Number.__abstractmethods__` works; every other entry becomes
-/// a bound-method value that [`class_member_method`] rebinds through
+/// The default metaclass is the native `type` class, so `C.mro()` works
+/// without an explicit metaclass. A metaclass property runs with the class as
+/// its receiver, so `Number.__abstractmethods__` works; every other entry
+/// becomes a bound-method value that [`class_member_method`] rebinds through
 /// [`call_bound_entry`].
 fn metaclass_attribute(class: i64, attr: &str) -> Option<i64> {
-    let metaclass = value::class_metaclass(class);
-    if metaclass == NONE {
-        return None;
-    }
+    let metaclass = lookup_metaclass(class);
     match value::class_lookup(metaclass, attr)? {
         value::ClassEntry::Attr(item) => {
             if let Some(result) = descriptor_get(item, NONE, class) {
@@ -711,10 +765,7 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
     let (entry, via_metaclass) = match value::class_lookup(class, method) {
         Some(entry) => (entry, false),
         None => {
-            let metaclass = value::class_metaclass(class);
-            if metaclass == NONE {
-                return attribute_error(class, method);
-            }
+            let metaclass = lookup_metaclass(class);
             match value::class_lookup(metaclass, method) {
                 Some(entry) => (entry, true),
                 None => return attribute_error(class, method),
@@ -727,7 +778,7 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
         if matches!(&entry, value::ClassEntry::Method(MethodKind::Property, _)) {
             return attribute_error(class, method);
         }
-        let metaclass = value::class_metaclass(class);
+        let metaclass = lookup_metaclass(class);
         let args = if argc == 0 {
             Vec::new()
         } else {
@@ -766,10 +817,18 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
     builtins::call(function, call_args.len(), call_args.as_ptr())
 }
 
-/// Whether the class's metaclass defines `__new__`.
+/// Whether the class's metaclass defines its own `__new__`.
+///
+/// The native `type.__new__` entry is the default allocator, not a custom
+/// hook: it does not change how `Cls.__new__` behaves, so the fast
+/// instance-allocation path stays available.
 fn metaclass_defines_new(class: i64) -> bool {
     let metaclass = value::class_metaclass(class);
-    metaclass != NONE && value::class_lookup(metaclass, "__new__").is_some()
+    if metaclass == NONE {
+        return false;
+    }
+    value::class_lookup_owner(metaclass, "__new__")
+        .is_some_and(|owner| !value::is_type_class(owner))
 }
 
 /// Keyword parameter names for native class methods that bind keywords.
@@ -2185,20 +2244,43 @@ fn is_builtin_int_type(obj: i64) -> bool {
 fn type_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     match method {
         "__new__" => {
-            if let Some(err) = check_arity("type", method, args.len(), 4, usize::MAX) {
-                return err;
+            // `type.__new__` is a static method: its first argument is the
+            // metatype, followed by exactly `name`, `bases` and `namespace`.
+            // CPython counts the three class arguments, not the metatype, so
+            // the diagnostic reports the supplied count minus one.
+            if args.is_empty() {
+                return type_error("type.__new__(): not enough arguments".to_string());
             }
-            // Class-header keywords are accepted for signature parity; the
-            // runtime class construction does not forward them.
+            if args.len() != 4 {
+                return type_error(format!(
+                    "type.__new__() takes exactly 3 arguments ({} given)",
+                    args.len().saturating_sub(1)
+                ));
+            }
+            // Class-header keywords are accepted for signature parity; Hydro's
+            // class protocol has no `__init_subclass__` keyword channel, so
+            // they are not forwarded.
             let _ = keywords;
             builtins::type_new(args[0], args[1], args[2], args[3])
         }
         "__call__" => {
-            let Some((callable, rest)) = args.split_first() else {
-                return type_error("type.__call__() missing the class argument".to_string());
+            let Some(&callable) = args.first() else {
+                return type_error(
+                    "descriptor '__call__' of 'type' object needs an argument".to_string(),
+                );
             };
+            // The slot wrapper requires the receiver to be a type object; the
+            // call itself then uses the original spelling (`int`, not the
+            // native class object that `normalize_class_base` returns).
+            if value::as_class(value::normalize_class_base(callable)).is_none() {
+                return type_error(format!(
+                    "descriptor '__call__' requires a 'type' object but received a '{}'",
+                    value::type_name(callable)
+                ));
+            }
+            let rest = &args[1..];
             if keywords.is_empty() {
-                builtins::call(*callable, rest.len(), rest.as_ptr())
+                builtins::call(callable, rest.len(), rest.as_ptr())
             } else {
                 let roots_source: Vec<i64> = keywords.iter().map(|(_, item)| *item).collect();
                 let roots = crate::heap::root_values(&roots_source);
@@ -2208,7 +2290,7 @@ fn type_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, 
                     pairs.push(*item);
                 }
                 let result = builtins::call_kw(
-                    *callable,
+                    callable,
                     rest.len(),
                     rest.as_ptr(),
                     keywords.len(),
@@ -2222,6 +2304,9 @@ fn type_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, 
             if let Some(err) = check_arity("type", method, args.len(), 2, 2) {
                 return err;
             }
+            if let Some(err) = reject_method_keywords(method, keywords) {
+                return err;
+            }
             let Some(class) = type_class_operand(args[0], method) else {
                 return NONE;
             };
@@ -2230,6 +2315,9 @@ fn type_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, 
         }
         "__instancecheck__" => {
             if let Some(err) = check_arity("type", method, args.len(), 2, 2) {
+                return err;
+            }
+            if let Some(err) = reject_method_keywords(method, keywords) {
                 return err;
             }
             let Some(class) = type_class_operand(args[0], method) else {
@@ -2242,11 +2330,19 @@ fn type_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, 
             if let Some(err) = check_arity("type", method, args.len(), 1, 1) {
                 return err;
             }
-            let class = value::normalize_class_base(args[0]);
-            builtins::hash(class)
+            if let Some(err) = reject_slot_keywords(method, keywords) {
+                return err;
+            }
+            // `type.__hash__` is `object.__hash__`: the generic identity hash
+            // of any operand, bypassing a type-specific `__hash__` and never
+            // rejecting an unhashable value.
+            ops::int_result((container::identity_hash(args[0]) >> 4) as i64)
         }
         "mro" => {
             if let Some(err) = check_arity("type", method, args.len(), 1, 1) {
+                return err;
+            }
+            if let Some(err) = reject_method_keywords(method, keywords) {
                 return err;
             }
             let Some(class) = type_class_operand(args[0], method) else {
@@ -2258,12 +2354,17 @@ fn type_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, 
             if let Some(err) = check_arity("type", method, args.len(), 1, 1) {
                 return err;
             }
-            let Some(class) = type_class_operand(args[0], method) else {
+            if let Some(err) = reject_slot_keywords(method, keywords) {
+                return err;
+            }
+            let Some(class) = type_slot_operand(args[0], method) else {
                 return NONE;
             };
             value::str_alloc(value::repr(class))
         }
         "__prepare__" => {
+            // `type.__prepare__` is a classmethod that ignores its arguments;
+            // CPython returns an empty dict for any header.
             let _ = (args, keywords);
             value::dict_new(Vec::new())
         }
@@ -2271,7 +2372,10 @@ fn type_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, 
             if let Some(err) = check_arity("type", method, args.len(), 2, 2) {
                 return err;
             }
-            let Some(class) = type_class_operand(args[0], method) else {
+            if let Some(err) = reject_slot_keywords(method, keywords) {
+                return err;
+            }
+            let Some(class) = type_slot_operand(args[0], method) else {
                 return NONE;
             };
             let Some(name) = value::as_str(args[1]) else {
@@ -2299,6 +2403,35 @@ fn type_class_operand(operand: i64, method: &str) -> Option<i64> {
         ));
         None
     }
+}
+
+/// Resolves the operand of a `type` slot wrapper (`__repr__`,
+/// `__getattribute__`), which reports the missing receiver with the slot
+/// wrapper wording rather than the method-descriptor one.
+fn type_slot_operand(operand: i64, method: &str) -> Option<i64> {
+    let class = value::normalize_class_base(operand);
+    if value::as_class(class).is_some() {
+        Some(class)
+    } else {
+        type_error(format!(
+            "descriptor '{method}' requires a 'type' object but received a '{}'",
+            value::type_name(operand)
+        ));
+        None
+    }
+}
+
+/// Rejects keyword arguments for a `type` method that declares none.
+fn reject_method_keywords(method: &str, keywords: &[(String, i64)]) -> Option<i64> {
+    (!keywords.is_empty())
+        .then(|| type_error(format!("type.{method}() takes no keyword arguments")))
+}
+
+/// Rejects keyword arguments for a `type` slot wrapper, which reports the
+/// wrapper rather than the `type` method in its diagnostic.
+fn reject_slot_keywords(method: &str, keywords: &[(String, i64)]) -> Option<i64> {
+    (!keywords.is_empty())
+        .then(|| type_error(format!("wrapper {method}() takes no keyword arguments")))
 }
 
 /// Whether `obj` is the `type` builtin value.
@@ -6116,7 +6249,7 @@ fn coroutine_method(obj: i64, method: &str, args: &[i64]) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{call, delete_attr, getattr};
+    use super::{call, call_kw, delete_attr, getattr};
     use crate::container;
     use crate::value::{self, encode_int, FALSE, NONE, TRUE};
     use hydro_ir::MethodKind;
@@ -7037,6 +7170,234 @@ mod tests {
             crate::builtins::hash(derived)
         );
         assert!(!crate::exc::pending());
+
+        // `type.__hash__` is `object.__hash__`: any operand hashes by
+        // identity, including an unhashable list and a value whose type
+        // overrides `__hash__`.
+        let unhashable = list(&[]);
+        assert_eq!(
+            invoke(type_builtin, "__hash__", &[unhashable]),
+            crate::ops::int_result((container::identity_hash(unhashable) >> 4) as i64)
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // `type.__new__` is a static method with exactly three class
+        // arguments after the metatype.
+        invoke(
+            type_builtin,
+            "__new__",
+            &[type_builtin, string("Extra"), tuple(&[]), dict(&[]), int(1)],
+        );
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "type.__new__() takes exactly 3 arguments (4 given)"
+        );
+        crate::exc::clear();
+
+        // The metatype must itself derive from `type`; `str` is a type, but
+        // not a metaclass.
+        let str_builtin = value::builtin_function_new(hydro_ir::Builtin::Str);
+        invoke(
+            type_builtin,
+            "__new__",
+            &[str_builtin, string("Bad"), tuple(&[]), dict(&[])],
+        );
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "type.__new__(str): str is not a subtype of type");
+        crate::exc::clear();
+
+        invoke(
+            type_builtin,
+            "__new__",
+            &[string("NotAType"), string("Bad"), tuple(&[]), dict(&[])],
+        );
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "type.__new__(X): X is not a type object (str)");
+        crate::exc::clear();
+
+        // The `__call__` slot wrapper requires a type receiver and forwards
+        // the remaining arguments to it.
+        invoke(type_builtin, "__call__", &[string("nope")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "descriptor '__call__' requires a 'type' object but received a 'str'"
+        );
+        crate::exc::clear();
+        let int_builtin = value::builtin_function_new(hydro_ir::Builtin::Int);
+        assert_eq!(
+            invoke(type_builtin, "__call__", &[int_builtin, int(7)]),
+            int(7)
+        );
+        assert!(!crate::exc::pending());
+
+        // Slot wrappers report a missing type receiver with their own
+        // wording.
+        invoke(type_builtin, "__repr__", &[int(1)]);
+        assert_eq!(
+            message(),
+            "descriptor '__repr__' requires a 'type' object but received a 'int'"
+        );
+        crate::exc::clear();
+        invoke(
+            type_builtin,
+            "__getattribute__",
+            &[int(1), string("__name__")],
+        );
+        assert_eq!(
+            message(),
+            "descriptor '__getattribute__' requires a 'type' object but received a 'int'"
+        );
+        crate::exc::clear();
+
+        // Operations that declare no keywords reject them (the slot wrappers
+        // name the wrapper); `__prepare__` accepts and ignores any header.
+        let keyword_pairs = [string("unexpected"), int(1)];
+        assert_eq!(
+            call_kw(
+                type_builtin,
+                b"mro".as_ptr(),
+                3,
+                1,
+                [derived].as_ptr(),
+                1,
+                keyword_pairs.as_ptr(),
+            ),
+            NONE
+        );
+        assert_eq!(message(), "type.mro() takes no keyword arguments");
+        crate::exc::clear();
+        assert_eq!(
+            call_kw(
+                type_builtin,
+                b"__hash__".as_ptr(),
+                8,
+                1,
+                [derived].as_ptr(),
+                1,
+                keyword_pairs.as_ptr(),
+            ),
+            NONE
+        );
+        assert_eq!(message(), "wrapper __hash__() takes no keyword arguments");
+        crate::exc::clear();
+        assert!(value::as_dict(call_kw(
+            type_builtin,
+            b"__prepare__".as_ptr(),
+            11,
+            0,
+            std::ptr::null(),
+            1,
+            keyword_pairs.as_ptr(),
+        ))
+        .is_some_and(<[(i64, i64)]>::is_empty));
+        assert!(!crate::exc::pending(), "{}", message());
+    }
+
+    #[test]
+    fn type_class_methods_bind_through_classes_and_super() {
+        reset();
+        let base = value::class_new("Base".to_string(), NONE, Vec::new());
+        let derived = value::class_new_full("Derived".to_string(), base, Vec::new(), Vec::new());
+
+        // A class without an explicit metaclass is an instance of the native
+        // `type` class, so its operations bind the class itself: no explicit
+        // `cls` argument.
+        assert_eq!(items(invoke(derived, "mro", &[])), vec![derived, base]);
+        assert_eq!(invoke(derived, "__subclasscheck__", &[derived]), TRUE);
+        assert_eq!(invoke(derived, "__subclasscheck__", &[base]), FALSE);
+        let instance = value::instance_new(derived);
+        assert_eq!(invoke(derived, "__instancecheck__", &[instance]), TRUE);
+        assert_eq!(invoke(derived, "__instancecheck__", &[base]), FALSE);
+        let constructed = invoke(derived, "__call__", &[]);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::type_class(constructed), derived);
+        assert!(
+            value::as_dict(invoke(derived, "__prepare__", &[string("C")]))
+                .is_some_and(<[(i64, i64)]>::is_empty)
+        );
+
+        // `class Meta(type)` inherits the native entries: in the metaclass
+        // namespace they are unbound, so the metatype is passed explicitly.
+        let metaclass = value::class_new_full(
+            "Meta".to_string(),
+            value::native_type_class(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let created = invoke(
+            metaclass,
+            "__new__",
+            &[metaclass, string("FromMeta"), tuple(&[]), dict(&[])],
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::class_display_name(created), Some("FromMeta"));
+        assert_eq!(value::class_metaclass(created), metaclass);
+
+        // The type slot wrappers are inherited too: unbound in the metaclass
+        // namespace, and bound to the class by `super()`.
+        assert_eq!(
+            text(invoke(metaclass, "__repr__", &[metaclass])),
+            "<class 'Meta'>"
+        );
+        assert_eq!(
+            text(invoke(
+                metaclass,
+                "__getattribute__",
+                &[metaclass, string("__name__")]
+            )),
+            "Meta"
+        );
+        let slot_proxy = value::super_new(metaclass, metaclass);
+        assert_eq!(text(invoke(slot_proxy, "__repr__", &[])), "<class 'Meta'>");
+
+        // Class-header keywords reach `type.__new__` through `super()` and
+        // are accepted without being forwarded (Hydro's class protocol has no
+        // `__init_subclass__` keyword channel).
+        let keyword_pairs = [string("extra"), int(1)];
+        let created = call_kw(
+            slot_proxy,
+            b"__new__".as_ptr(),
+            7,
+            4,
+            [metaclass, string("Keywords"), tuple(&[]), dict(&[])].as_ptr(),
+            1,
+            keyword_pairs.as_ptr(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::class_display_name(created), Some("Keywords"));
+
+        // `super().__new__` inside a metaclass resolves past the metaclass to
+        // the same default allocator.
+        let proxy = value::super_new(metaclass, metaclass);
+        let created = invoke(
+            proxy,
+            "__new__",
+            &[metaclass, string("ViaSuper"), tuple(&[]), dict(&[])],
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::class_display_name(created), Some("ViaSuper"));
+
+        // Reading `super().__new__` keeps the resolved static method instead
+        // of re-resolving the name on the receiver's class, which would find
+        // the override the `super()` call runs past.
+        let override_new = value::native_function_new("hydro_test", "type_new_override", 4);
+        let overriding = value::class_new_full(
+            "Overriding".to_string(),
+            value::native_type_class(),
+            vec![("__new__".to_string(), override_new, MethodKind::Normal)],
+            Vec::new(),
+        );
+        let proxy = value::super_new(overriding, overriding);
+        let read = getattr(proxy, b"__new__".as_ptr(), 7);
+        let created = crate::builtins::call(
+            read,
+            4,
+            [overriding, string("Read"), tuple(&[]), dict(&[])].as_ptr(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::class_display_name(created), Some("Read"));
     }
 
     #[test]

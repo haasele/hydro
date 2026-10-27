@@ -19,6 +19,14 @@ initial state of the first runnable core.
   without re-entering the metaclass `__new__` that called it. Builtin type
   functions (`dict`, `int`, …) now normalize to their native class when used as
   a `type.__new__` base.
+- The native `type` class carries those operations with CPython's binding, so
+  `cls.mro()`, `cls.__subclasscheck__(sub)`, `cls.__instancecheck__(obj)` and
+  `cls.__call__(...)` bind the class, while `class Meta(type)` and
+  `super().__new__(...)` reach `type.__new__` as an unbound static method.
+  `type.__new__` requires its metatype to derive from `type`, `type.__call__`
+  requires a type receiver, `type.__hash__` is the generic `object.__hash__`,
+  and the `__repr__`/`__getattribute__` slot wrappers report CPython's receiver
+  errors.
 - A function body that consists only of its docstring is a declared stub when
   it has a return annotation, like `...`/`pass`; typing protocols such as
   `typing_extensions.Reader.read` document their contract without a marker.

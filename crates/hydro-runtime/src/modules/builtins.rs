@@ -89,6 +89,26 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// Keyword dispatch for `builtins` functions that accept arbitrary names.
+///
+/// `dict([source], **kwargs)` is the only builtin here whose keywords are not
+/// declared parameters: every name becomes an entry layered over the optional
+/// positional source.
+pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if function == "dict" {
+        if args.len() > 1 {
+            return type_error(&format!(
+                "dict() takes at most 1 argument ({} given)",
+                args.len()
+            ));
+        }
+        return core_builtins::dict_build(args.first().copied(), keywords);
+    }
+    type_error(&format!(
+        "builtins.{function}() does not accept keyword arguments"
+    ))
+}
+
 /// Resolves a `builtins` constant.
 pub(crate) fn constant(name: &str) -> i64 {
     match name {

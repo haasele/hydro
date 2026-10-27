@@ -575,6 +575,18 @@ pub(crate) fn key_hash(v: i64) -> u64 {
     if v == NONE {
         return HASH_NONE;
     }
+    identity_hash(v)
+}
+
+/// Unconditional identity hash, the generic `object.__hash__` result.
+///
+/// Unlike [`key_hash`] this ignores per-type hashing (`str`, `bytes`, numbers,
+/// tuples, `None`) and never reports an unhashable value, matching CPython's
+/// `object.__hash__` slot that `type.__hash__` exposes. The tagged
+/// representation is hashed directly, so a value whose type overrides
+/// `__hash__` (an `int`, a `str`, a `list`'s identity, …) gets the generic
+/// hash rather than the type-specific one.
+pub(crate) fn identity_hash(v: i64) -> u64 {
     fnv_mix(HASH_IDENTITY, v as u64)
 }
 

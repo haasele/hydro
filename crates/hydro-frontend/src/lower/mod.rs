@@ -17153,6 +17153,13 @@ impl<'a> Lowerer<'a> {
             {
                 return self.lower_extremum_keywords(call, fs, line, col, builtin);
             }
+            // `dict([source], **kwargs)`: every keyword name is an entry, so
+            // the call goes through the runtime keyword binder. Starred and
+            // double-starred forms were already routed to the dynamic branch
+            // above.
+            if builtin == Builtin::Dict && !call.keywords.is_empty() {
+                return self.lower_dict_keywords(call, fs, line, col);
+            }
             let Some(mut args) = self.builtin_call_arguments(builtin, call, fs, line, col) else {
                 return self.error_expr(call.range);
             };
@@ -18529,6 +18536,71 @@ impl<'a> Lowerer<'a> {
                 keywords,
             },
             ty: Ty::Concrete(Type::None),
+            line,
+            col,
+        }
+    }
+
+    /// Lower `dict([source], **kwargs)` to the runtime keyword binder
+    /// (`hydro_call_kw` on the `dict` builtin value).
+    ///
+    /// Any keyword name is an entry, so nothing is rejected here: the names
+    /// travel in source order and the runtime merges them over the optional
+    /// positional source. A duplicate name is a syntax error in CPython and
+    /// reported here for the same reason as `print`'s.
+    fn lower_dict_keywords(
+        &mut self,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let Some(args) = self.plain_call_args(call, fs) else {
+            return self.error_expr(call.range);
+        };
+        if args.len() > 1 {
+            self.error_at_code(
+                call.range,
+                codes::CALL,
+                format!("dict() takes at most 1 argument ({} given)", args.len()),
+            );
+            return self.error_expr(call.range);
+        }
+        let mut keywords: Vec<(String, HExpr)> = Vec::with_capacity(call.keywords.len());
+        for keyword in &call.keywords {
+            let Some(name) = keyword.arg.as_ref() else {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    "dict() does not accept **mapping arguments in this position",
+                );
+                continue;
+            };
+            if keywords
+                .iter()
+                .any(|(existing, _)| existing.as_str() == name.as_str())
+            {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!("dict() got multiple values for keyword argument '{name}'"),
+                );
+                continue;
+            }
+            keywords.push((name.to_string(), self.expr(&keyword.value, fs)));
+        }
+        HExpr {
+            kind: HExprKind::CallKw {
+                callee: Box::new(HExpr {
+                    kind: HExprKind::BuiltinRef(Builtin::Dict),
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                }),
+                args,
+                keywords,
+            },
+            ty: Ty::Concrete(Type::Dict),
             line,
             col,
         }

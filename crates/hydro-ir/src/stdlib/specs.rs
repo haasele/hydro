@@ -642,7 +642,10 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("range", 1, 3, Type::Range),
         f("list", 0, 1, Type::List),
         f("tuple", 0, 1, Type::Tuple),
-        f("dict", 0, usize::MAX, Type::Dict),
+        // `dict([source], **kwargs)`: the single positional operand is a
+        // mapping or an iterable of pairs, and every keyword name becomes an
+        // entry layered on top (`dict(a=1)`, `dict({'a': 1}, b=2)`).
+        kw_dynamic("dict", 0, 1, Type::Dict, &[]),
         f("sum", 1, 2, Type::Any),
         f("enumerate", 1, 2, Type::Any),
         f("zip", 0, usize::MAX, Type::Any),
@@ -1106,6 +1109,11 @@ pub static RE: ModuleSpec = ModuleSpec {
         c("ASCII", Type::Int),
         c("A", Type::Int),
         c("DEBUG", Type::Int),
+        // The compiled-pattern and match classes. They are the cached classes
+        // `type()` reports for those values, so `isinstance(p, re.Pattern)`
+        // and `isinstance(m, re.Match)` hold; neither can be instantiated.
+        c("Pattern", Type::Any),
+        c("Match", Type::Any),
     ],
 };
 
@@ -1743,16 +1751,59 @@ pub static DATACLASSES: ModuleSpec = ModuleSpec {
     constants: &[c("dataclass", Type::Any)],
 };
 
-/// `datetime`: the `datetime` singleton plus the `now`/`strftime` methods the
-/// runtime object exposes as native functions.
+/// `datetime`: the `date`/`time`/`datetime`/`timedelta`/`tzinfo` classes plus
+/// the constructors and methods the runtime exposes as native functions.
+///
+/// The class names are constants (`Type::Any`); the internal entries are the
+/// `FunctionBody::Native` names their method tables carry, so the runtime's
+/// arity validation knows every one of them. `_datetime_replace` takes
+/// arbitrary keyword names (`replace(year=..., tzinfo=...)`), which is why it
+/// is the one `kw_dynamic` entry.
 pub static DATETIME: ModuleSpec = ModuleSpec {
     name: "datetime",
     functions: &[
-        f("_datetime_now", 1, 1, Type::Any),
+        // Class-level constructors (`@staticmethod`s in CPython).
+        f("_datetime_now", 0, 1, Type::Any),
+        f("_datetime_utcnow", 0, 0, Type::Any),
+        f("_date_today", 0, 0, Type::Any),
+        f("_datetime_today", 0, 0, Type::Any),
+        f("_datetime_fromtimestamp", 1, 2, Type::Any),
+        f("_datetime_combine", 2, 2, Type::Any),
+        // Instance methods.
         f("_datetime_strftime", 2, 2, Type::Str),
+        f("_datetime_isoformat", 1, 2, Type::Str),
+        f("_datetime_date", 1, 1, Type::Any),
+        f("_datetime_time", 1, 1, Type::Any),
+        f("_datetime_timestamp", 1, 1, Type::Float),
+        f("_datetime_weekday", 1, 1, Type::Int),
+        f("_datetime_isoweekday", 1, 1, Type::Int),
+        f("_datetime_toordinal", 1, 1, Type::Int),
+        f("_datetime_total_seconds", 1, 1, Type::Float),
+        kw_dynamic("_datetime_replace", 1, 1, Type::Any, &[]),
+        f("_datetime_utcoffset", 1, 1, Type::Any),
+        f("_datetime_dst", 1, 1, Type::Any),
+        f("_datetime_tzname", 1, 1, Type::Any),
+        f("_datetime_tzinfo_utcoffset", 1, 2, Type::Any),
+        f("_datetime_tzinfo_dst", 1, 2, Type::Any),
+        f("_datetime_tzinfo_tzname", 1, 2, Type::Any),
+        f("_datetime_repr", 1, 1, Type::Str),
+        f("_datetime_str", 1, 1, Type::Str),
+        // Rich comparisons and arithmetic.
+        f("_datetime_eq", 2, 2, Type::Any),
+        f("_datetime_lt", 2, 2, Type::Any),
+        f("_datetime_le", 2, 2, Type::Any),
+        f("_datetime_gt", 2, 2, Type::Any),
+        f("_datetime_ge", 2, 2, Type::Any),
+        f("_datetime_add", 2, 2, Type::Any),
+        f("_datetime_radd", 2, 2, Type::Any),
+        f("_datetime_sub", 2, 2, Type::Any),
     ],
     constants: &[
+        c("date", Type::Any),
+        c("time", Type::Any),
         c("datetime", Type::Any),
+        c("timedelta", Type::Any),
+        c("tzinfo", Type::Any),
         c("MINYEAR", Type::Int),
         c("MAXYEAR", Type::Int),
     ],
@@ -3657,6 +3708,74 @@ mod tests {
             replace.dynamic_keywords,
             "replace() forwards arbitrary keyword names to the runtime"
         );
+    }
+
+    #[test]
+    fn datetime_value_classes_and_methods_are_registered() {
+        for name in ["date", "time", "datetime", "timedelta", "tzinfo"] {
+            assert_eq!(
+                constant("datetime", name).expect(name).ty,
+                Type::Any,
+                "datetime.{name} is a class value"
+            );
+        }
+        // Static constructors take no receiver.
+        for name in [
+            "_datetime_now",
+            "_datetime_utcnow",
+            "_date_today",
+            "_datetime_today",
+        ] {
+            let spec = function("datetime", name).expect(name);
+            assert_eq!(spec.min_args, 0, "{name} is static");
+        }
+        assert_eq!(
+            function("datetime", "_datetime_fromtimestamp")
+                .expect("fromtimestamp")
+                .max_args,
+            2
+        );
+        assert_eq!(
+            function("datetime", "_datetime_combine")
+                .expect("combine")
+                .min_args,
+            2
+        );
+        // `replace()` is keyword-only and forwards arbitrary names.
+        let replace = function("datetime", "_datetime_replace").expect("replace");
+        assert_eq!((replace.min_args, replace.max_args), (1, 1));
+        assert!(replace.dynamic_keywords);
+        // Comparisons/arithmetic take both operands.
+        for name in [
+            "_datetime_eq",
+            "_datetime_lt",
+            "_datetime_le",
+            "_datetime_gt",
+            "_datetime_ge",
+            "_datetime_add",
+            "_datetime_radd",
+            "_datetime_sub",
+        ] {
+            let spec = function("datetime", name).expect(name);
+            assert_eq!((spec.min_args, spec.max_args), (2, 2), "{name}");
+        }
+    }
+
+    #[test]
+    fn re_pattern_and_match_are_registered() {
+        assert_eq!(constant("re", "Pattern").expect("Pattern").ty, Type::Any);
+        assert_eq!(constant("re", "Match").expect("Match").ty, Type::Any);
+    }
+
+    #[test]
+    fn dict_accepts_dynamic_keywords() {
+        let spec = function("builtins", "dict").expect("builtins.dict");
+        assert_eq!((spec.min_args, spec.max_args), (0, 1));
+        assert!(
+            spec.dynamic_keywords,
+            "every keyword name of dict() is an entry"
+        );
+        assert!(spec.params.is_empty());
     }
 
     #[test]

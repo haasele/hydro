@@ -3426,6 +3426,23 @@ pub(crate) fn class_lookup(class: i64, name: &str) -> Option<ClassEntry> {
     None
 }
 
+/// Class value in `class`'s linearization that owns `name`, if any.
+///
+/// Unlike [`class_lookup`], the caller learns which ancestor supplied the
+/// entry; used to distinguish a metaclass's own `__new__` from the native
+/// `type` default it inherits.
+pub(crate) fn class_lookup_owner(class: i64, name: &str) -> Option<i64> {
+    let state = as_class(class)?;
+    if own_class_lookup(class, name).is_some() {
+        return Some(class);
+    }
+    state
+        .mro
+        .iter()
+        .copied()
+        .find(|&ancestor| own_class_lookup(ancestor, name).is_some())
+}
+
 /// Looks up `name` in the MRO of `class` after the position of `start`.
 ///
 /// This is `super(start, instance).name` resolution: `None` when `start` is not
@@ -4954,7 +4971,13 @@ fn class_new_multi_impl(
     let base = bases.first().copied().unwrap_or(NONE);
     // A metaclass subclass may implement `__new__`/`__init__`; both receive
     // `(name, bases, namespace)`. The namespace mirrors the frozen class body.
-    let has_new = run_hooks && resolved != NONE && class_member(resolved, "__new__").is_some();
+    // The native `type.__new__` entry every metaclass inherits is the default
+    // allocator, not a hook the generated-function trampoline can run.
+    let has_new = run_hooks
+        && resolved != NONE
+        && class_member(resolved, "__new__").is_some_and(|(_, function)| {
+            !function_signature(function).is_empty() && function_full_entry(function) != 0
+        });
     let init_hook = if run_hooks && resolved != NONE {
         class_member(resolved, "__init__")
     } else {
@@ -6425,10 +6448,101 @@ fn native_class(name: &str) -> i64 {
     if let Some(class) = TYPE_CLASS_CACHE.with(|cache| cache.borrow().get(name).copied()) {
         return class;
     }
-    let class = class_new(name.to_string(), NONE, Vec::new());
+    let class = if name == "type" {
+        // `type` is a real class in CPython, and its C-level operations are
+        // inherited by every metaclass. Build it with those entries so
+        // `class Meta(type)`, `super().__new__(...)` in a metaclass and
+        // `cls.mro()` resolve them instead of reporting `AttributeError`.
+        type_native_class()
+    } else {
+        class_new(name.to_string(), NONE, Vec::new())
+    };
     crate::heap::add_thread_root(class);
     TYPE_CLASS_CACHE.with(|cache| cache.borrow_mut().insert(name.to_string(), class));
     class
+}
+
+/// Native `type` class carrying Hydro's implementation of the class-level
+/// type operations.
+///
+/// Every entry dispatches through the `type` builtin value's method table, so
+/// the arity and operand checks live in one place. The binding kinds match
+/// CPython: `__new__` is a static method, `__prepare__` is a classmethod, and
+/// `mro`/`__call__`/`__subclasscheck__`/`__instancecheck__` are unbound in a
+/// class namespace but bind the class when reached through a metaclass.
+fn type_native_class() -> i64 {
+    let type_builtin = builtin_function_new(hydro_ir::Builtin::Type);
+    let method = |name: &str| bound_method_new(type_builtin, name.to_string());
+    let methods = vec![
+        (
+            "__new__".to_string(),
+            method("__new__"),
+            MethodKind::Staticmethod,
+        ),
+        (
+            "__call__".to_string(),
+            method("__call__"),
+            MethodKind::Normal,
+        ),
+        (
+            "__subclasscheck__".to_string(),
+            method("__subclasscheck__"),
+            MethodKind::Normal,
+        ),
+        (
+            "__instancecheck__".to_string(),
+            method("__instancecheck__"),
+            MethodKind::Normal,
+        ),
+        ("mro".to_string(), method("mro"), MethodKind::Normal),
+        (
+            "__repr__".to_string(),
+            method("__repr__"),
+            MethodKind::Normal,
+        ),
+        (
+            "__hash__".to_string(),
+            method("__hash__"),
+            MethodKind::Normal,
+        ),
+        (
+            "__getattribute__".to_string(),
+            method("__getattribute__"),
+            MethodKind::Normal,
+        ),
+        (
+            "__prepare__".to_string(),
+            method("__prepare__"),
+            MethodKind::Classmethod,
+        ),
+    ];
+    // The bound methods are heap values referenced only by this vector until
+    // the class is allocated; root them (each traces its `type` receiver) so
+    // an allocation inside class creation cannot collect them.
+    let mut roots_source: Vec<i64> = Vec::with_capacity(methods.len() + 1);
+    roots_source.push(type_builtin);
+    roots_source.extend(methods.iter().map(|(_, function, _)| *function));
+    let roots = crate::heap::root_values(&roots_source);
+    let class = class_new_full("type".to_string(), NONE, methods, Vec::new());
+    crate::heap::release_roots(roots);
+    class
+}
+
+/// Cached native `type` class, creating it on first use.
+pub(crate) fn native_type_class() -> i64 {
+    native_class("type")
+}
+
+/// The cached class a compiled `re.Pattern` reports from `type()`, i.e. the
+/// value `re.Pattern` must resolve to.
+pub(crate) fn pattern_class() -> i64 {
+    native_class("Pattern")
+}
+
+/// The cached class a `re.Match` reports from `type()`, i.e. the value
+/// `re.Match` must resolve to.
+pub(crate) fn match_class() -> i64 {
+    native_class("Match")
 }
 
 /// Cached native `object` class: the root of Hydro's value hierarchy.

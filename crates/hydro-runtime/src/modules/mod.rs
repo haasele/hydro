@@ -1756,6 +1756,8 @@ fn call_native_kw_at(
 fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
     match module {
         "math" => math_call_kw(function, args, keywords),
+        "builtins" => builtins::call_kw(function, args, &keywords),
+        "datetime" => datetime::call_kw(function, args, &keywords),
         "functools" | "_functools" => functools_call_kw(function, args, keywords),
         "collections" | "_collections" => collections::call_kw(function, args, &keywords),
         "dataclasses" => dataclasses_call_kw(function, args, keywords),
@@ -13133,13 +13135,25 @@ mod tests {
         exc::init();
         assert_eq!(as_int(get("datetime", "MINYEAR")), 1);
         assert_eq!(as_int(get("datetime", "MAXYEAR")), 9_999);
-        let singleton = get("datetime", "datetime");
+        // The value classes are cached class objects, not datetime instances.
+        let class = get("datetime", "datetime");
         assert!(!exc::pending());
-        let rendered = call(
-            "datetime",
-            "_datetime_strftime",
-            &[singleton, string("%Y%m%d")],
+        assert_eq!(
+            value::class_display_name(class),
+            Some("datetime"),
+            "datetime.datetime is a class"
         );
+        assert_eq!(get("datetime", "date"), get("datetime", "date"));
+        for name in ["date", "time", "timedelta", "tzinfo"] {
+            assert!(
+                value::as_class(get("datetime", name)).is_some(),
+                "datetime.{name} is a class"
+            );
+        }
+        // `datetime.now()` is a static method on the class.
+        let now = call("datetime", "_datetime_now", &[]);
+        assert!(!exc::pending());
+        let rendered = call("datetime", "_datetime_strftime", &[now, string("%Y%m%d")]);
         let rendered = text_at("datetime._datetime_strftime", rendered);
         assert_eq!(rendered.len(), 8);
         assert!(rendered.bytes().all(|byte| byte.is_ascii_digit()));

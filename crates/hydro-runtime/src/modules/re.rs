@@ -45,6 +45,11 @@ pub(crate) fn constant(name: &str) -> i64 {
         "VERBOSE" | "X" => VERBOSE,
         "DEBUG" => DEBUG,
         "ASCII" | "A" => ASCII,
+        // `re.Pattern`/`re.Match` are the cached classes `type()` reports for
+        // compiled patterns and match objects; `isinstance` resolves them
+        // through the native type-name table.
+        "Pattern" => return value::pattern_class(),
+        "Match" => return value::match_class(),
         // The spec table only announces the names above; anything else is
         // still reported like a missing module attribute.
         _ => {
@@ -897,5 +902,56 @@ pub(crate) fn pattern_attr(obj: i64, attr: &str) -> Option<i64> {
         "pattern" => Some(value::str_alloc(state.source.clone())),
         "flags" => Some(crate::ops::int_result(state.flags)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(raw: &str) -> i64 {
+        value::str_alloc(raw.to_string())
+    }
+
+    #[test]
+    fn pattern_and_match_classes_describe_compiled_values() {
+        exc::init();
+        let compiled = call("compile", &[text("a+")]);
+        assert!(!exc::pending());
+        assert!(value::as_pattern(compiled).is_some());
+
+        // `re.Pattern`/`re.Match` are the classes `type()` reports, so
+        // identity and `isinstance` agree.
+        let pattern_class = constant("Pattern");
+        let match_class = constant("Match");
+        assert_eq!(value::class_display_name(pattern_class), Some("Pattern"));
+        assert_eq!(value::class_display_name(match_class), Some("Match"));
+        assert_eq!(value::type_class(compiled), pattern_class);
+        assert!(value::truthy(crate::builtins::isinstance(
+            compiled,
+            pattern_class
+        )));
+        assert!(!value::truthy(crate::builtins::isinstance(
+            compiled,
+            match_class
+        )));
+
+        let found = call("search", &[compiled, text("caa")]);
+        assert!(!exc::pending());
+        assert!(value::as_match(found).is_some());
+        assert_eq!(value::type_class(found), match_class);
+        assert!(value::truthy(crate::builtins::isinstance(
+            found,
+            match_class
+        )));
+        assert!(!value::truthy(crate::builtins::isinstance(
+            found,
+            pattern_class
+        )));
+
+        // Both classes are abstract: calling them reports TypeError.
+        crate::builtins::call(pattern_class, 1, [text("a")].as_ptr());
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::init();
     }
 }

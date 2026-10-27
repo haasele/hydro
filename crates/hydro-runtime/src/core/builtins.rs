@@ -971,6 +971,39 @@ fn pair_items(v: i64) -> Option<&'static [i64]> {
     value::as_list(v).or_else(|| value::as_tuple(v))
 }
 
+/// `dict([source], **kwargs)`: builds the mapping from an optional dict or
+/// iterable of pairs and then layers the keyword arguments on top. Keyword
+/// names are inserted as `str` keys, so a name that already came from the
+/// source overwrites its value (the key keeps its original position), like
+/// CPython's `dict({'a': 1}, a=2)`.
+pub(crate) fn dict_build(source: Option<i64>, keywords: &[(String, i64)]) -> i64 {
+    let result = match source {
+        Some(source) => dict_from(source),
+        None => value::dict_new(Vec::new()),
+    };
+    if exc::pending() || keywords.is_empty() {
+        return result;
+    }
+    // The key strings are allocated before the graph lock is taken, and the
+    // source values live in Rust memory the collector cannot trace, so root
+    // the result and every value across those allocations.
+    let mut roots_source = Vec::with_capacity(keywords.len() + 1);
+    roots_source.push(result);
+    roots_source.extend(keywords.iter().map(|(_, item)| *item));
+    let roots = crate::heap::root_values(&roots_source);
+    let keys: Vec<i64> = keywords
+        .iter()
+        .map(|(name, _)| value::str_alloc(name.clone()))
+        .collect();
+    if let Some(mut pairs) = value::dict_pairs_mut(result) {
+        for (key, (_, item)) in keys.iter().zip(keywords.iter()) {
+            container::dict_insert_barrier(result, &mut pairs, *key, *item);
+        }
+    }
+    crate::heap::release_roots(roots);
+    result
+}
+
 /// `dict(iterable)`: copies a dict or consumes an iterable of two-element
 /// lists/tuples. Keys must be hashable; duplicate keys keep their first
 /// position and the last value. The result itself roots every pair inserted
@@ -1918,6 +1951,18 @@ pub(crate) fn call_kw(
         if let Some(tag) = exc::exception_tag_of_class(class) {
             return instantiate_exception_kw(tag, &args, &keywords);
         }
+        // `datetime.date(...)`, `datetime.timedelta(days=...)`, ... bind their
+        // declared parameters by name. The name check keeps the registry
+        // lookups off the hot path for ordinary user classes.
+        if matches!(
+            value::class_display_name(class),
+            Some("date" | "time" | "datetime" | "timedelta")
+        ) {
+            if let Some(result) = crate::modules::datetime::instantiate_kw(class, &args, &keywords)
+            {
+                return result;
+            }
+        }
         let instance = value::instance_new(class);
         let Some((kind, init)) = value::class_member(class, "__init__") else {
             if !args.is_empty() || !keywords.is_empty() {
@@ -2166,6 +2211,39 @@ pub(crate) fn call_kw(
     // entry points expect; every other builtin rejects keywords (matching its
     // direct call lowering).
     if let FunctionBody::Builtin(builtin) = &func.body {
+        // `dict([source], **kwargs)`: CPython builds the mapping from the
+        // optional positional source and then layers the keyword arguments on
+        // top, with later keys winning. The keyword names are not declared
+        // parameters, so the binder collects them all.
+        if matches!(builtin, Builtin::Dict) {
+            if argc > 1 {
+                return builtin_arity_error("dict", "at most 1", argc);
+            }
+            let source = if argc == 0 {
+                None
+            } else {
+                // SAFETY: nil with argc > 0 was rejected by the caller.
+                Some(unsafe { *argv })
+            };
+            let mut keywords: Vec<(String, i64)> = Vec::with_capacity(kwargc);
+            if kwargc > 0 {
+                if kw_argv.is_null() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "keyword arguments were passed without an argument buffer",
+                    );
+                }
+                // SAFETY: `kw_argv` holds `2 * kwargc` readable values.
+                let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+                for pair in pairs.as_chunks::<2>().0 {
+                    let Some(keyword) = value::as_str(pair[0]) else {
+                        return exc::raise_with_message(TYPE_ERROR, "keywords must be strings");
+                    };
+                    keywords.push((keyword.to_string(), pair[1]));
+                }
+            }
+            return dict_build(source, &keywords);
+        }
         if matches!(builtin, Builtin::Eval | Builtin::Exec) {
             let args = if argc == 0 {
                 Vec::new()
@@ -2863,6 +2941,38 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
         };
         return slice_new(args);
     }
+    // The `datetime` value classes are cached native classes whose instances
+    // carry the date/time fields as attributes. Calling the class value runs
+    // the CPython constructor (range validation included) instead of
+    // allocating a blank instance. The name check keeps the registry lookups
+    // off the hot path for ordinary user classes.
+    if matches!(
+        native_name,
+        Some("date" | "time" | "datetime" | "timedelta")
+    ) {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: argc > 0 implies a non-null, readable buffer.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        if let Some(result) = crate::modules::datetime::instantiate(class, args) {
+            return result;
+        }
+    }
+    // CPython's `re.Pattern`/`re.Match` are abstract: they exist for
+    // `isinstance` and class identity, and cannot be instantiated.
+    if (native_name == Some("Pattern") && value::pattern_class() == class)
+        || (native_name == Some("Match") && value::match_class() == class)
+    {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "cannot create 're.{}' instances",
+                native_name.unwrap_or("Pattern")
+            ),
+        );
+    }
     if let Some(tag) = exc::exception_tag_of_class(class) {
         return instantiate_exception(tag, argc, argv);
     }
@@ -2966,31 +3076,52 @@ pub(crate) fn type_new(metaclass: i64, name: i64, bases: i64, namespace: i64) ->
 }
 
 fn type_new_impl(metaclass: i64, name: i64, bases: i64, namespace: i64, run_hooks: bool) -> i64 {
+    // `type.__new__` names itself in argument diagnostics; the builtin
+    // three-argument constructor keeps `type()`.
+    let context = if run_hooks {
+        "type()"
+    } else {
+        "type.__new__()"
+    };
     let Some(name_text) = value::as_str(name) else {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
-                "type() argument 1 must be str, not {}",
+                "{context} argument 1 must be str, not {}",
                 value::type_name(name)
             ),
         );
     };
     let name_text = name_text.to_string();
     let metaclass = value::normalize_class_base(metaclass);
-    if metaclass != NONE && value::as_class(metaclass).is_none() {
-        return exc::raise_with_message(
-            TYPE_ERROR,
-            &format!(
-                "type.__new__() argument 1 must be a type, not '{}'",
-                value::type_name(metaclass)
-            ),
-        );
+    if metaclass != NONE {
+        if value::as_class(metaclass).is_none() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "type.__new__(X): X is not a type object ({})",
+                    value::type_name(metaclass)
+                ),
+            );
+        }
+        // `type.__new__` requires the metatype to derive from `type`;
+        // `str`, `dict` and other builtin classes are types, but not
+        // metaclasses.
+        if !value::is_subclass_of(metaclass, value::native_type_class()) {
+            let metaclass_name = value::class_display_name(metaclass).unwrap_or("type");
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "type.__new__({metaclass_name}): {metaclass_name} is not a subtype of type"
+                ),
+            );
+        }
     }
     let Some(base_values) = value::as_tuple(bases) else {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
-                "type() argument 2 must be tuple, not {}",
+                "{context} argument 2 must be tuple, not {}",
                 value::type_name(bases)
             ),
         );
@@ -3002,7 +3133,13 @@ fn type_new_impl(metaclass: i64, name: i64, bases: i64, namespace: i64, run_hook
         .collect();
     for &base in &base_values {
         if value::as_class(base).is_none() && base != NONE {
-            return exc::raise_with_message(TYPE_ERROR, "type() argument 2 must be tuple of types");
+            // CPython folds a non-class base into the metaclass resolution:
+            // no metaclass can be derived from it.
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "metaclass conflict: the metaclass of a derived class must be a \
+                 (non-strict) subclass of the metaclasses of all its bases",
+            );
         }
     }
     // `None` in the bases list is a no-op, as in class bodies.
@@ -3014,7 +3151,7 @@ fn type_new_impl(metaclass: i64, name: i64, bases: i64, namespace: i64, run_hook
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
-                "type() argument 3 must be dict, not {}",
+                "{context} argument 3 must be dict, not {}",
                 value::type_name(namespace)
             ),
         );
@@ -5577,6 +5714,11 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
         }
         "set" | "frozenset" => value::as_set(value).is_some(),
         "NoneType" | "None" => value == NONE,
+        // `re.Pattern`/`re.Match` are the cached classes `type()` reports for
+        // compiled patterns and match objects, so `isinstance(p, re.Pattern)`
+        // and `isinstance(m, re.Match)` hold without a class instance.
+        "Pattern" => value::as_pattern(value).is_some(),
+        "Match" => value::as_match(value).is_some(),
         // `types.FunctionType`: every function value (`def`, lambda,
         // builtin/bound/native) reports the cached `function` type name.
         "function" => value::as_function(value).is_some(),
@@ -6502,6 +6644,65 @@ mod tests {
         assert_eq!(dict_from(int(5)), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(pending_message(), "'int' object is not iterable");
+        exc::init();
+    }
+
+    #[test]
+    fn dict_build_layers_keywords_over_the_source() {
+        exc::init();
+        let built = dict_build(
+            None,
+            &[("a".to_string(), int(1)), ("b".to_string(), int(2))],
+        );
+        assert!(!exc::pending());
+        assert_eq!(rendered(built), "{'a': 1, 'b': 2}");
+
+        let source = dict_from(value::list_new(vec![value::tuple_new(vec![
+            string("a"),
+            int(1),
+        ])]));
+        assert_eq!(rendered(source), "{'a': 1}");
+
+        // A keyword with the source's key overwrites the value in place; a new
+        // name appends.
+        let merged = dict_build(
+            Some(source),
+            &[("a".to_string(), int(9)), ("c".to_string(), int(3))],
+        );
+        assert_eq!(rendered(merged), "{'a': 9, 'c': 3}");
+
+        // A plain copy keeps the source untouched.
+        let copied = dict_build(Some(source), &[]);
+        assert_eq!(rendered(copied), "{'a': 1}");
+        assert_eq!(rendered(source), "{'a': 1}");
+
+        // A malformed source still reports the iterable diagnostics.
+        let bad = dict_build(Some(int(5)), &[("a".to_string(), int(1))]);
+        assert_eq!(bad, NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
+    }
+
+    #[test]
+    fn dict_keyword_calls_merge_arguments() {
+        exc::init();
+        let dict = value::builtin_function_new(Builtin::Dict);
+        let keywords = [string("a"), int(1), string("b"), int(2)];
+        let empty = call_kw(dict, 0, std::ptr::null(), 2, keywords.as_ptr());
+        assert!(!exc::pending());
+        assert_eq!(rendered(empty), "{'a': 1, 'b': 2}");
+
+        let source = dict_from(value::list_new(vec![value::tuple_new(vec![
+            string("a"),
+            int(7),
+        ])]));
+        let merged = call_kw(dict, 1, &source, 2, keywords.as_ptr());
+        assert_eq!(rendered(merged), "{'a': 1, 'b': 2}");
+
+        // At most one positional source is accepted.
+        let two = [source, source];
+        assert_eq!(call_kw(dict, 2, two.as_ptr(), 0, std::ptr::null()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         exc::init();
     }
 
