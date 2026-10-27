@@ -703,9 +703,16 @@ third argument.
   up in one `Program`; JIT and AOT execute the same code (AOT embeds the
   modules into the binary).
 - `__name__` is a module body local and is injected only if the unit
-  reads it: `"__main__"` for the entry file, otherwise the module name.
-  The entry file additionally binds `__file__` (its source path) and
-  `__doc__` (the module docstring, or `None`); references from functions and
+  reads it: `"__main__"` for the entry file, otherwise the module name. An
+  imported unit always stores it, which is what registers the module in the
+  runtime globals store. `__file__` (the source path) and `__doc__` (the
+  module docstring, or `None`) are injected on the same read-driven rule,
+  with one exception: an imported unit always publishes `__doc__`, so
+  `from module import __doc__` resolves through its global table. A
+  module-level `from other import __doc__` re-exports that value instead —
+  the imported binding replaces the docstring, as in CPython where the import
+  statement runs after the docstring assignment — and a later explicit
+  `__doc__ = ...` still wins. References from functions and
   methods are detected too. Each binding is an `Assign` plus the matching
   `GlobalSet`, so functions read it with `GlobalGet`.
   There is no general runtime module object or `sys.modules`; stdlib module

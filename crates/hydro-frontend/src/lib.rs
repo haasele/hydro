@@ -3356,6 +3356,129 @@ mod tests {
         assert!(found, "__name__ must be initialized to '__main__'");
     }
 
+    #[test]
+    fn imported_module_docstring_is_importable() {
+        // `from module import __doc__` is the NumPy re-export idiom
+        // (`numpy/lib/array_utils.py`): the imported module publishes its
+        // docstring as a module global.
+        let dir = TestDir::new("dunder-doc");
+        dir.write("helper.py", "\"\"\"Helper documentation.\"\"\"\n");
+        let main = dir.write("main.py", "from helper import __doc__\nprint(__doc__)\n");
+        let program = program(&main);
+
+        use hydro_ir::{Const, ExprKind, StmtKind};
+        assert_eq!(program.initializers.len(), 1);
+        let helper = &program.functions[program.initializers[0] as usize];
+        assert_eq!(helper.name, "helper.<module>");
+        let mut published = None;
+        for stmt in &helper.body {
+            if let StmtKind::Assign { target, value } = &stmt.kind {
+                if helper.local(*target).name == "__doc__" {
+                    published = match &value.kind {
+                        ExprKind::Const(Const::Str(text)) => Some(text.clone()),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        assert_eq!(
+            published.as_deref(),
+            Some("Helper documentation."),
+            "the docstring must be the module's __doc__"
+        );
+
+        // The importer reads helper's global table, not an entry-local copy.
+        let entry = program.main_function();
+        let mut imported = false;
+        for stmt in &entry.body {
+            if let StmtKind::Expr(expr) = &stmt.kind {
+                if let ExprKind::Call { args, .. } = &expr.kind {
+                    imported |= args.iter().any(|arg| {
+                        matches!(
+                            &arg.kind,
+                            ExprKind::GlobalGet { module, name }
+                                if module == "helper" && name == "__doc__"
+                        )
+                    });
+                }
+            }
+        }
+        assert!(imported, "print(__doc__) must read helper.__doc__");
+    }
+
+    #[test]
+    fn undocumented_imported_module_docstring_is_none() {
+        let dir = TestDir::new("dunder-doc-none");
+        dir.write("helper.py", "VALUE = 1\n");
+        let main = dir.write("main.py", "from helper import __doc__\nprint(__doc__)\n");
+        let program = program(&main);
+
+        use hydro_ir::{Const, ExprKind, StmtKind};
+        let helper = &program.functions[program.initializers[0] as usize];
+        assert!(
+            helper.body.iter().any(|stmt| matches!(
+                &stmt.kind,
+                StmtKind::Assign { target, value }
+                    if helper.local(*target).name == "__doc__"
+                        && matches!(&value.kind, ExprKind::Const(Const::None))
+            )),
+            "an undocumented module binds __doc__ to None: {:?}",
+            helper.body
+        );
+
+        let entry = program.main_function();
+        assert!(
+            entry.body.iter().any(|stmt| matches!(
+                &stmt.kind,
+                StmtKind::Expr(expr)
+                    if matches!(
+                        &expr.kind,
+                        ExprKind::Call { args, .. }
+                            if args.iter().any(|arg| matches!(
+                                &arg.kind,
+                                ExprKind::GlobalGet { module, name }
+                                    if module == "helper" && name == "__doc__"
+                            ))
+                    )
+            )),
+            "print(__doc__) must read helper.__doc__"
+        );
+    }
+
+    #[test]
+    fn explicit_doc_assignment_replaces_the_docstring() {
+        // CPython sets the module docstring first, then executes the body, so
+        // a module-level `__doc__ = ...` replaces it.
+        let dir = TestDir::new("dunder-doc-replace");
+        dir.write(
+            "helper.py",
+            "\"\"\"Original documentation.\"\"\"\n\n__doc__ = \"Replaced documentation.\"\n",
+        );
+        let main = dir.write("main.py", "from helper import __doc__\nprint(__doc__)\n");
+        let program = program(&main);
+
+        use hydro_ir::{Const, ExprKind, StmtKind};
+        let helper = &program.functions[program.initializers[0] as usize];
+        let mut assigned = Vec::new();
+        for stmt in &helper.body {
+            if let StmtKind::Assign { target, value } = &stmt.kind {
+                if helper.local(*target).name == "__doc__" {
+                    if let ExprKind::Const(Const::Str(text)) = &value.kind {
+                        assigned.push(text.to_string());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            assigned,
+            vec![
+                "Original documentation.".to_string(),
+                "Replaced documentation.".to_string()
+            ],
+            "the docstring is bound first and the explicit assignment replaces it"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Imports nested in functions and blocks
     // ------------------------------------------------------------------

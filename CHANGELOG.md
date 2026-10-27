@@ -8,6 +8,17 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — 2026-10-27 Module `__doc__` exports
+
+- `from module import __doc__` now resolves for user modules. Every imported
+  unit publishes its docstring (or `None` without one) in the runtime global
+  table and lists `__doc__` in its export table, so NumPy's
+  `from ._array_utils_impl import __doc__` re-export idiom links instead of
+  reporting a missing export. A module-level `from other import __doc__`
+  replaces the module's own binding, exactly like CPython where the import
+  statement runs after the docstring assignment, and a later explicit
+  `__doc__ = ...` still wins.
+
 ### Added — 2026-10-27 PEP 695 generic classes
 
 - `class C[T]:` (including `[T: Bound]`, `[*Ts]` and `[**P]`) is no longer

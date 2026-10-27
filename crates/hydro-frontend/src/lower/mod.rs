@@ -3048,9 +3048,20 @@ impl<'a> Lowerer<'a> {
     /// Each binding becomes an `Assign` of a constant followed by the matching
     /// `GlobalSet`, so functions and methods of the unit can read it with a
     /// `GlobalGet`. Nothing is emitted for a dunder the unit never loads,
-    /// except `__name__` of an imported unit: storing it is what registers the
-    /// module in the runtime globals store, so the module registry can resolve
-    /// compiled modules (including empty and dotted submodules) by name.
+    /// except `__name__` and `__doc__` of an imported unit: storing `__name__`
+    /// is what registers the module in the runtime globals store (so the module
+    /// registry can resolve compiled modules, including empty and dotted
+    /// submodules, by name), and storing `__doc__` lets an importer resolve
+    /// `from module import __doc__` (CPython gives every module a `__doc__`,
+    /// `None` when it has no docstring).
+    ///
+    /// A `from other import __doc__` binding re-exports another module's
+    /// docstring (NumPy's `numpy/lib/array_utils.py` does exactly that). CPython
+    /// sets the docstring as the module global first and the import statement
+    /// then replaces it; imports are compile-time bindings here, so the imported
+    /// value is the one every read observes. The injected dunder is therefore
+    /// skipped and the import binding supplies both the reads and the mirrored
+    /// `GlobalSet` that re-exports it.
     fn lower_dunder_bindings(
         &mut self,
         module: &ast::ModModule,
@@ -3066,15 +3077,44 @@ impl<'a> Lowerer<'a> {
                     .unwrap_or(Const::None),
             ),
         ];
+        // The docstring of another module replaces this unit's own: the import
+        // binding wins for every read. Only a top-level import binds the module
+        // global (a function-local import shadows just that function). A
+        // self-import (`from . import __doc__`) names this unit, so it still
+        // needs the injected binding.
+        let docstring_binding = self.top_level_imports.contains("__doc__");
+        let docstring_source = if docstring_binding {
+            self.imported_user_globals.get("__doc__")
+        } else {
+            None
+        };
+        let imported_docstring = docstring_source
+            .is_some_and(|(module, _)| module != &self.dunder_name)
+            || (docstring_binding
+                && (self.imported_user_functions.contains_key("__doc__")
+                    || self.imported_constants.contains_key("__doc__")
+                    || self.imported_extension_members.contains_key("__doc__")));
+        let self_imported_docstring =
+            docstring_source.is_some_and(|(module, _)| module == &self.dunder_name);
 
         let mut inits = Vec::new();
         for (name, value) in bindings {
+            if name == "__doc__" && imported_docstring {
+                continue;
+            }
             // Only imported units register in the runtime module registry.
             // The entry module and REPL fragments are `__main__` and have no
             // importer, so they keep the historical conditional binding.
             let registers_module =
                 name == "__name__" && self.mirror_all_globals && self.dunder_name != "__main__";
+            // Imported units also publish `__doc__`: an importer may read it
+            // without this unit ever referencing it. REPL fragments are not
+            // imported, so they keep the conditional binding. A package that
+            // imports its own `__doc__` needs the binding too.
+            let exports_docstring = name == "__doc__"
+                && ((self.mirror_all_globals && !self.session_mode) || self_imported_docstring);
             if !registers_module
+                && !exports_docstring
                 && !module_references_name(&module.body, name)
                 && !self.template_loads_name(name)
             {
@@ -4081,6 +4121,11 @@ impl<'a> Lowerer<'a> {
     fn self_export(&self, name: &str) -> Option<UserExport> {
         if let Some(&id) = self.fn_ids.get(name) {
             return Some(UserExport::Function(id));
+        }
+        // Every module has a `__doc__` (the docstring, or `None`): the dunder
+        // binding in the module body publishes it in the global table.
+        if name == "__doc__" {
+            return Some(UserExport::Global);
         }
         self.global_names
             .contains(name)

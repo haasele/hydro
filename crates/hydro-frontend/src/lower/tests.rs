@@ -9016,12 +9016,126 @@ fn imported_units_mirror_their_import_bindings() {
                     "unexpected __name__ binding: {value:?}"
                 );
             }
+            // Imported units publish `__doc__` too: an importer resolves
+            // `from module import __doc__` through the runtime global table.
+            // This source has no docstring, so the binding is `None`.
+            "__doc__" => {
+                assert!(
+                    matches!(&value.kind, HExprKind::Local(_)),
+                    "unexpected __doc__ binding: {value:?}"
+                );
+            }
             other => panic!("unexpected mirrored binding '{other}'"),
         }
     }
     assert!(
         saw_value && saw_function,
         "import bindings were not mirrored: {:?}",
+        hir.functions[0].body
+    );
+}
+
+#[test]
+fn imported_units_publish_their_module_docstring() {
+    // `from module import __doc__` is a real module attribute in CPython: the
+    // initializer stores the docstring in the runtime global table even when
+    // the module body never reads its own `__doc__`.
+    let source = "\"\"\"Module documentation.\"\"\"\n\ndef add(a, b):\n    return a + b\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "helper.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            &assigned(&hir, "__doc__").kind,
+            HExprKind::Const(Const::Str(text)) if text == "Module documentation."
+        ),
+        "the leading string literal is the module docstring: {:?}",
+        assigned(&hir, "__doc__")
+    );
+    assert!(
+        hir.functions[0].body.iter().any(|stmt| matches!(
+            &stmt.kind,
+            HStmtKind::GlobalSet { name, .. } if name == "__doc__"
+        )),
+        "the docstring must be mirrored into the global table: {:?}",
+        hir.functions[0].body
+    );
+}
+
+#[test]
+fn imported_units_without_a_docstring_publish_none() {
+    // CPython gives every module a `__doc__`: `None` when the body has no
+    // docstring. Importers must resolve it instead of reporting a missing
+    // export.
+    let source = "VALUE = 1\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "helper.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            &assigned(&hir, "__doc__").kind,
+            HExprKind::Const(Const::None)
+        ),
+        "an undocumented module binds `__doc__` to None: {:?}",
+        assigned(&hir, "__doc__")
+    );
+}
+
+#[test]
+fn module_docstring_reexport_uses_the_imported_value() {
+    // NumPy's `numpy/lib/array_utils.py` re-exports another module's docstring
+    // with `from ._array_utils_impl import __doc__`. CPython sets the module
+    // docstring first and the import statement replaces it, so the imported
+    // value is the one every read observes; the injected dunder must not
+    // shadow it.
+    let source = "\"\"\"Wrapper documentation.\"\"\"\nfrom helper import __doc__\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lowerer_with_user_module(
+        source,
+        &mut infer,
+        "helper",
+        HashMap::from([("__doc__".to_string(), UserExport::Global)]),
+    );
+    lowerer.set_dunder_name("wrapper");
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    // No local `__doc__` slot is injected, so module-level reads resolve to the
+    // imported module instead of the shadowing local.
+    assert!(
+        !hir.functions[0]
+            .locals
+            .iter()
+            .any(|local| local.name == "__doc__"),
+        "the imported docstring must not be shadowed by an injected local"
+    );
+    // The import statement mirrors the re-exported value: `wrapper.__doc__`
+    // reads `helper.__doc__`.
+    assert!(
+        hir.functions[0].body.iter().any(|stmt| matches!(
+            &stmt.kind,
+            HStmtKind::GlobalSet {
+                name,
+                value,
+                module: _
+            } if name == "__doc__"
+                    && matches!(
+                        &value.kind,
+                        HExprKind::GlobalGet { module, name }
+                            if module == "helper" && name == "__doc__"
+                    )
+        )),
+        "the re-exported docstring must be mirrored: {:?}",
         hir.functions[0].body
     );
 }
