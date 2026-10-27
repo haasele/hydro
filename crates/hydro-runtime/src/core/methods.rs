@@ -1172,6 +1172,27 @@ pub(crate) fn call_kw(
             if let Some(value::ClassEntry::Method(kind, function)) =
                 value::class_lookup(state.class, &method)
             {
+                // Native methods such as `ExitStack.callback` forward the
+                // call-site keywords to the callable they register; their
+                // spec declares dynamic keyword support, so dispatch them
+                // with the receiver in the positional list.
+                if let Some(func) = value::as_function(function) {
+                    if let value::FunctionBody::Native { module, name } = &func.body {
+                        if crate::modules::native_accepts_keywords(module, name) {
+                            let mut call_args = Vec::with_capacity(args.len() + 1);
+                            call_args.push(obj);
+                            call_args.extend_from_slice(&args);
+                            return crate::modules::call_native_kw(
+                                module,
+                                name,
+                                call_args.len(),
+                                call_args.as_ptr(),
+                                kwargc,
+                                kw_argv,
+                            );
+                        }
+                    }
+                }
                 if kind != MethodKind::Property
                     && !value::function_signature(function).is_empty()
                     && value::function_full_entry(function) != 0

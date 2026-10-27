@@ -2772,6 +2772,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
 /// generator once; `__exit__` throws the block's exception into it (or calls
 /// `next` on the normal path) and reports whether the exception was
 /// suppressed, following CPython's `_GeneratorContextManager` rules.
+///
+/// `contextlib.closing(thing)` and `contextlib.ExitStack()` are native
+/// context managers; their helpers live below.
 fn contextlib_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "suppress" => {
@@ -2837,12 +2840,27 @@ fn contextlib_call(function: &str, args: &[i64]) -> i64 {
         },
         "_contextmanager_enter" => contextmanager_enter(args[0]),
         "_contextmanager_exit" => contextmanager_exit(args[0], args[1], args[2], args[3]),
+        "closing" => closing_new(args[0]),
+        "_closing_enter" => closing_enter(args[0]),
+        "_closing_exit" => closing_exit(args[0]),
+        "ExitStack" => exitstack_new(),
+        "_exitstack_enter" => exitstack_enter(args[0]),
+        "_exitstack_exit" => exitstack_exit(args[0], args[1], args[2], args[3]),
+        "_exitstack_close" => exitstack_close(args[0]),
+        "_exitstack_enter_context" => exitstack_enter_context(args[0], args[1]),
+        "_exitstack_push" => exitstack_push(args[0], args[1]),
+        "_exitstack_callback" => match args.split_first() {
+            Some((&stack, rest)) => exitstack_callback(stack, rest, &[]),
+            None => missing_attribute("contextlib", function),
+        },
+        "_exitstack_pop_all" => exitstack_pop_all(args[0]),
         _ => missing_attribute("contextlib", function),
     }
 }
 
 /// Keyword-aware `contextlib` dispatch: `_contextmanager_call` forwards the
-/// call-site keywords to the decorated generator function.
+/// call-site keywords to the decorated generator function, and
+/// `_exitstack_callback` keeps them for the registered callback.
 fn contextlib_call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     match function {
         "_contextmanager_call" => match args.split_first() {
@@ -2852,11 +2870,399 @@ fn contextlib_call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
                 "contextlib._contextmanager_call() missing the decorated function",
             ),
         },
+        // `ExitStack.callback(callback, *args, **kwargs)` keeps the keyword
+        // names for the registered callback.
+        "_exitstack_callback" => match args.split_first() {
+            Some((&stack, rest)) => exitstack_callback(stack, rest, keywords),
+            None => missing_attribute("contextlib", function),
+        },
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("contextlib.{function}() does not accept keyword arguments"),
         ),
     }
+}
+
+// `closing` and `ExitStack`
+
+/// The cached `closing` class. `closing(thing)` stores the wrapped object in
+/// `thing`; `__enter__` returns it and `__exit__` calls its `close()` method
+/// before reporting `False`, so an exception raised by the block still
+/// propagates.
+fn closing_class() -> i64 {
+    const KEY: &str = "contextlib.closing.class";
+    if let Some(cached) = crate::core::globals::registry_get(KEY) {
+        return cached;
+    }
+    let enter = value::native_function_new("contextlib", "_closing_enter", 1);
+    let exit = value::native_function_new("contextlib", "_closing_exit", 4);
+    let methods = vec![
+        ("__enter__".to_string(), enter),
+        ("__exit__".to_string(), exit),
+    ];
+    let method_roots = heap::root_values(&[enter, exit]);
+    let class = value::class_new("closing".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    crate::core::globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// `contextlib.closing(thing)`.
+fn closing_new(thing: i64) -> i64 {
+    let class = closing_class();
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance, thing]);
+    value::instance_setattr(instance, "thing".to_string(), thing);
+    heap::release_roots(roots);
+    instance
+}
+
+/// `closing.__enter__`: hand back the wrapped object.
+fn closing_enter(closer: i64) -> i64 {
+    value::instance_attr(closer, "thing").unwrap_or_else(|| {
+        exc::raise_with_message(ATTRIBUTE_ERROR, "'closing' object has no attribute 'thing'")
+    })
+}
+
+/// `closing.__exit__`: call `thing.close()` on both the normal and the
+/// exceptional path, then report `False` so the block exception keeps
+/// propagating. An exception raised by `close()` replaces it.
+fn closing_exit(closer: i64) -> i64 {
+    let Some(thing) = value::instance_attr(closer, "thing") else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "'closing' object has no attribute 'thing'",
+        );
+    };
+    let roots = heap::root_values(&[thing]);
+    let close = crate::core::methods::getattr(thing, b"close".as_ptr(), 5);
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let close_roots = heap::root_values(&[close]);
+    let _ = crate::core::builtins::call(close, 0, std::ptr::null());
+    heap::release_roots(close_roots);
+    heap::release_roots(roots);
+    if exc::pending() {
+        return NONE;
+    }
+    FALSE
+}
+
+/// The cached `ExitStack` class. Every registered callback is stored in the
+/// instance's `callbacks` list as
+/// `(callable, args_tuple, kwargs_dict, suppresses)` and invoked
+/// last-in-first-out, mirroring CPython's `_exit_callbacks` deque.
+fn exitstack_class() -> i64 {
+    const KEY: &str = "contextlib.ExitStack.class";
+    if let Some(cached) = crate::core::globals::registry_get(KEY) {
+        return cached;
+    }
+    let enter = value::native_function_new("contextlib", "_exitstack_enter", 1);
+    let exit = value::native_function_new("contextlib", "_exitstack_exit", 4);
+    let enter_context = value::native_function_new("contextlib", "_exitstack_enter_context", 2);
+    let push = value::native_function_new("contextlib", "_exitstack_push", 2);
+    let callback = value::native_function_new("contextlib", "_exitstack_callback", usize::MAX);
+    let pop_all = value::native_function_new("contextlib", "_exitstack_pop_all", 1);
+    let close = value::native_function_new("contextlib", "_exitstack_close", 1);
+    let methods = vec![
+        ("__enter__".to_string(), enter),
+        ("__exit__".to_string(), exit),
+        ("enter_context".to_string(), enter_context),
+        ("push".to_string(), push),
+        ("callback".to_string(), callback),
+        ("pop_all".to_string(), pop_all),
+        ("close".to_string(), close),
+    ];
+    let method_roots =
+        heap::root_values(&[enter, exit, enter_context, push, callback, pop_all, close]);
+    let class = value::class_new("ExitStack".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    crate::core::globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// `contextlib.ExitStack()`.
+fn exitstack_new() -> i64 {
+    let class = exitstack_class();
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance]);
+    let callbacks = value::list_new(Vec::new());
+    let callback_roots = heap::root_values(&[callbacks]);
+    value::instance_setattr(instance, "_exit_callbacks".to_string(), callbacks);
+    heap::release_roots(callback_roots);
+    heap::release_roots(roots);
+    instance
+}
+
+/// The stack's callback list, or `None` when `stack` is not an `ExitStack`.
+fn exitstack_callbacks(stack: i64) -> Option<i64> {
+    value::instance_attr(stack, "_exit_callbacks")
+}
+
+/// Pops the most recently registered callback entry.
+fn exitstack_pop_entry(stack: i64) -> Option<(i64, i64, i64, bool)> {
+    let callbacks = exitstack_callbacks(stack)?;
+    let entry = {
+        let mut items = value::list_items_mut(callbacks)?;
+        items.pop()?
+    };
+    match value::as_tuple(entry)? {
+        [function, args, keywords, kind] => Some((*function, *args, *keywords, *kind == TRUE)),
+        _ => None,
+    }
+}
+
+/// Registers `function` with its bound positional and keyword arguments.
+///
+/// The entry tuple keeps the callable, a tuple of bound positional arguments,
+/// a dict of bound keyword arguments and whether a truthy result suppresses
+/// the block exception (`push`/`enter_context` yes, `callback` no, matching
+/// CPython's wrapper). `close`/`__exit__` reproduce the call later.
+fn exitstack_push_callback(
+    stack: i64,
+    function: i64,
+    positional: &[i64],
+    keywords: &[(String, i64)],
+    suppresses: bool,
+) -> i64 {
+    let mut rooted: Vec<i64> = Vec::with_capacity(positional.len() + keywords.len() + 1);
+    rooted.push(function);
+    rooted.extend_from_slice(positional);
+    rooted.extend(keywords.iter().map(|(_, keyword)| *keyword));
+    let roots = heap::root_values(&rooted);
+    let args = value::tuple_new(positional.to_vec());
+    let args_roots = heap::root_values(&[args]);
+    let pairs: Vec<(i64, i64)> = keywords
+        .iter()
+        .map(|(name, keyword)| (value::str_alloc(name.clone()), *keyword))
+        .collect();
+    let kwargs = value::dict_new(pairs);
+    let keyword_roots = heap::root_values(&[kwargs]);
+    let kind = if suppresses { TRUE } else { FALSE };
+    let entry = value::tuple_new(vec![function, args, kwargs, kind]);
+    let entry_roots = heap::root_values(&[entry]);
+    if let Some(callbacks) = exitstack_callbacks(stack) {
+        let _ = container::list_append(callbacks, entry);
+    }
+    heap::release_roots(entry_roots);
+    heap::release_roots(keyword_roots);
+    heap::release_roots(args_roots);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// Invokes a stored callback, prefixing `prefix` to its bound positional
+/// arguments and appending its bound keyword arguments.
+fn exitstack_invoke(function: i64, args: i64, keywords: i64, prefix: &[i64]) -> i64 {
+    let stored = value::as_tuple(args).unwrap_or(&[]);
+    let mut positional: Vec<i64> = Vec::with_capacity(prefix.len() + stored.len());
+    positional.extend_from_slice(prefix);
+    positional.extend_from_slice(stored);
+    let binding: Vec<(String, i64)> = value::as_dict(keywords)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(name, keyword)| (value::as_str(*name).unwrap_or("").to_string(), *keyword))
+                .collect()
+        })
+        .unwrap_or_default();
+    let roots = heap::root_values(&positional);
+    let result = if binding.is_empty() {
+        crate::core::builtins::call(function, positional.len(), positional.as_ptr())
+    } else {
+        let mut pairs: Vec<i64> = Vec::with_capacity(binding.len() * 2);
+        for (name, keyword) in &binding {
+            pairs.push(value::str_alloc(name.clone()));
+            pairs.push(*keyword);
+        }
+        crate::core::builtins::call_kw(
+            function,
+            positional.len(),
+            positional.as_ptr(),
+            binding.len(),
+            pairs.as_ptr(),
+        )
+    };
+    heap::release_roots(roots);
+    result
+}
+
+/// `ExitStack.__enter__`: the stack is its own manager.
+fn exitstack_enter(stack: i64) -> i64 {
+    stack
+}
+
+/// `ExitStack.enter_context(cm)`: enter `cm`, register its `__exit__` and
+/// return the entry value. The exit method is resolved before `__enter__`
+/// runs, so an object whose `__enter__` fails is not registered.
+fn exitstack_enter_context(stack: i64, manager: i64) -> i64 {
+    let exit = crate::core::methods::getattr(manager, b"__exit__".as_ptr(), 8);
+    if exc::pending() {
+        return missing_context_protocol(manager);
+    }
+    let roots = heap::root_values(&[manager, exit]);
+    let enter = crate::core::methods::getattr(manager, b"__enter__".as_ptr(), 9);
+    if exc::pending() {
+        heap::release_roots(roots);
+        return missing_context_protocol(manager);
+    }
+    let enter_roots = heap::root_values(&[enter]);
+    let result = crate::core::builtins::call(enter, 0, std::ptr::null());
+    heap::release_roots(enter_roots);
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let result_roots = heap::root_values(&[result]);
+    exitstack_push_callback(stack, exit, &[], &[], true);
+    heap::release_roots(result_roots);
+    heap::release_roots(roots);
+    result
+}
+
+/// Reports CPython's `TypeError` when `enter_context` receives an object
+/// without the context-manager protocol. A non-`AttributeError` failure (for
+/// example a property getter raising) propagates unchanged.
+fn missing_context_protocol(manager: i64) -> i64 {
+    if exc::pending_tag() != ATTRIBUTE_ERROR as i64 {
+        return NONE;
+    }
+    let _ = exc::clear();
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "'{}' object does not support the context manager protocol",
+            value::type_name(manager)
+        ),
+    )
+}
+
+/// `ExitStack.push(cm_or_callable)`: register `cm.__exit__`, or the callable
+/// itself when it has no `__exit__` attribute, and return the registered
+/// object so `push` also works as a decorator.
+fn exitstack_push(stack: i64, exit: i64) -> i64 {
+    let bound = crate::core::methods::getattr(exit, b"__exit__".as_ptr(), 8);
+    if exc::pending() {
+        if exc::pending_tag() == ATTRIBUTE_ERROR as i64 {
+            let _ = exc::clear();
+            exitstack_push_callback(stack, exit, &[], &[], true);
+            return exit;
+        }
+        return NONE;
+    }
+    exitstack_push_callback(stack, bound, &[], &[], true);
+    exit
+}
+
+/// `ExitStack.callback(function, *args, **kwargs)`: register a plain callable
+/// and return it. The callback runs with exactly the bound arguments.
+fn exitstack_callback(stack: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let Some((&function, positional)) = args.split_first() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "ExitStack.callback() missing required argument 'callback'",
+        );
+    };
+    exitstack_push_callback(stack, function, positional, keywords, false);
+    function
+}
+
+/// `ExitStack.pop_all()`: move the pending callbacks to a fresh stack and
+/// return it, leaving this stack empty. The old stack keeps working; callbacks
+/// registered on it later run before the transferred ones.
+fn exitstack_pop_all(stack: i64) -> i64 {
+    let Some(callbacks) = exitstack_callbacks(stack) else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "'ExitStack' object has no attribute '_exit_callbacks'",
+        );
+    };
+    let roots = heap::root_values(&[stack, callbacks]);
+    let fresh = value::list_new(Vec::new());
+    let fresh_roots = heap::root_values(&[fresh]);
+    value::instance_setattr(stack, "_exit_callbacks".to_string(), fresh);
+    let new_stack = exitstack_new();
+    let new_roots = heap::root_values(&[new_stack]);
+    value::instance_setattr(new_stack, "_exit_callbacks".to_string(), callbacks);
+    heap::release_roots(new_roots);
+    heap::release_roots(fresh_roots);
+    heap::release_roots(roots);
+    new_stack
+}
+
+/// `ExitStack.close()`: immediately unwind the stack with no exception
+/// information, in LIFO order. Returns `None`; an exception raised by a
+/// callback propagates.
+fn exitstack_close(stack: i64) -> i64 {
+    let _ = exitstack_exit(stack, NONE, NONE, NONE);
+    NONE
+}
+
+/// `ExitStack.__exit__(exc_type, exc, tb)`: unwind the registered callbacks
+/// LIFO, passing the in-flight exception to each exit. A truthy exit result
+/// suppresses the block exception (subsequent callbacks then see `None`);
+/// plain `callback` entries never suppress, like CPython's wrapper. A failing
+/// exit replaces the exception being unwound, and unwinding continues so every
+/// manager still gets its cleanup. Returns `True` only when the block
+/// exception was received and suppressed.
+fn exitstack_exit(stack: i64, exc_type: i64, exception: i64, traceback: i64) -> i64 {
+    let received = exception != NONE;
+    let mut details = if received {
+        // CPython derives the first argument from the exception itself, so a
+        // caller that passes only the value still gives the exits a type.
+        let roots = heap::root_values(&[exception]);
+        let exception_type = if exc_type != NONE {
+            exc_type
+        } else {
+            value::exception_data(exception)
+                .map(|data| exc::exception_class(data.tag))
+                .unwrap_or(NONE)
+        };
+        heap::release_roots(roots);
+        [exception_type, exception, traceback]
+    } else {
+        [NONE, NONE, NONE]
+    };
+    let mut suppressed = false;
+    let mut pending_raise: Option<i64> = None;
+    // The exception being unwound stays out of the pending slot while the
+    // remaining callbacks run, so root it explicitly.
+    let pending_roots = heap::root_values(&[]);
+    while let Some((function, args, keywords, suppresses)) = exitstack_pop_entry(stack) {
+        let roots =
+            heap::root_values(&[function, args, keywords, details[0], details[1], details[2]]);
+        // Exit callbacks receive the exception details; plain callbacks keep
+        // exactly the arguments they were registered with.
+        let prefix: &[i64] = if suppresses { &details } else { &[] };
+        let result = exitstack_invoke(function, args, keywords, prefix);
+        heap::release_roots(roots);
+        if exc::pending() {
+            let tag = exc::pending_tag();
+            let error = exc::pending_value();
+            let _ = exc::clear();
+            heap::add_thread_root(error);
+            pending_raise = Some(error);
+            details = [exc::exception_class(tag as u32), error, NONE];
+            continue;
+        }
+        if suppresses && value::truthy(result) {
+            suppressed = true;
+            pending_raise = None;
+            details = [NONE, NONE, NONE];
+        }
+    }
+    let result = match pending_raise {
+        Some(error) => exc::raise_value(error),
+        None => value::bool_value(received && suppressed),
+    };
+    heap::release_roots(pending_roots);
+    result
 }
 
 /// Calls the decorated generator function and wraps the resulting generator.
@@ -9526,6 +9932,25 @@ mod tests {
         crate::core::methods::call(obj, name.as_ptr(), name.len(), args.len(), args.as_ptr())
     }
 
+    /// Calls `obj.name(...)` with keyword arguments, passing `[name, value,
+    /// ...]` pairs through the keyword-call ABI.
+    fn method_kw(obj: i64, name: &str, args: &[i64], keywords: &[(&str, i64)]) -> i64 {
+        let mut words = Vec::with_capacity(keywords.len() * 2);
+        for (keyword, item) in keywords {
+            words.push(string(keyword));
+            words.push(*item);
+        }
+        crate::core::methods::call_kw(
+            obj,
+            name.as_ptr(),
+            name.len(),
+            args.len(),
+            args.as_ptr(),
+            keywords.len(),
+            words.as_ptr(),
+        )
+    }
+
     /// Reads `obj.name` through the native attribute dispatcher.
     fn attribute(obj: i64, name: &str) -> i64 {
         crate::core::methods::getattr(obj, name.as_ptr(), name.len())
@@ -13931,6 +14356,369 @@ mod tests {
         assert_eq!(method(manager, "__enter__", &[]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(message(), "'int' object is not a generator");
+    }
+
+    // Fixtures for the `closing`/`ExitStack` tests. The native methods stand
+    // in for Python methods: the bound call prepends the receiver, so
+    // `__exit__` receives `[self, exc_type, exc, tb]`.
+
+    extern "C" fn closing_fixture_close(argv: *const i64) -> i64 {
+        let resource = unsafe { *argv };
+        let roots = crate::heap::root_values(&[resource]);
+        value::instance_setattr(resource, "closed".to_string(), TRUE);
+        crate::heap::release_roots(roots);
+        NONE
+    }
+
+    /// A resource whose `close` method records the call on the instance.
+    fn closing_fixture() -> i64 {
+        let close = value::function_new(
+            closing_fixture_close as *const () as usize,
+            1,
+            "close".to_string(),
+        );
+        let roots = crate::heap::root_values(&[close]);
+        let class = value::class_new(
+            "ClosingFixture".to_string(),
+            NONE,
+            vec![("close".to_string(), close)],
+        );
+        let class_roots = crate::heap::root_values(std::slice::from_ref(&class));
+        let instance = value::instance_new(class);
+        crate::heap::release_roots(class_roots);
+        crate::heap::release_roots(roots);
+        instance
+    }
+
+    extern "C" fn stack_manager_enter(argv: *const i64) -> i64 {
+        let manager = unsafe { *argv };
+        value::instance_attr(manager, "tag").unwrap_or(NONE)
+    }
+
+    extern "C" fn stack_manager_exit(argv: *const i64) -> i64 {
+        let manager = unsafe { *argv };
+        let roots = crate::heap::root_values(&[manager]);
+        let log = value::instance_attr(manager, "log").unwrap_or(NONE);
+        let tag = value::instance_attr(manager, "tag").unwrap_or(NONE);
+        // `argv[1]` is the exception type and `argv[2]` the exception.
+        let exception = unsafe { *argv.add(2) };
+        let seen_roots = crate::heap::root_values(&[log, tag, exception]);
+        let _ = crate::container::list_append(log, tag);
+        value::instance_setattr(manager, "seen".to_string(), exception);
+        let suppresses = value::instance_attr(manager, "suppress").is_some_and(value::truthy);
+        crate::heap::release_roots(seen_roots);
+        crate::heap::release_roots(roots);
+        if suppresses {
+            TRUE
+        } else {
+            FALSE
+        }
+    }
+
+    /// A context manager that appends `tag` to `log` on exit and reports
+    /// whether it suppresses the block exception.
+    fn stack_manager(log: i64, tag: i64, suppress: bool) -> i64 {
+        let enter = value::function_new(
+            stack_manager_enter as *const () as usize,
+            1,
+            "__enter__".to_string(),
+        );
+        let exit = value::function_new(
+            stack_manager_exit as *const () as usize,
+            4,
+            "__exit__".to_string(),
+        );
+        let roots = crate::heap::root_values(&[enter, exit]);
+        let class = value::class_new(
+            "StackManager".to_string(),
+            NONE,
+            vec![
+                ("__enter__".to_string(), enter),
+                ("__exit__".to_string(), exit),
+            ],
+        );
+        let class_roots = crate::heap::root_values(std::slice::from_ref(&class));
+        let instance = value::instance_new(class);
+        let instance_roots = crate::heap::root_values(&[instance]);
+        value::instance_setattr(instance, "log".to_string(), log);
+        value::instance_setattr(instance, "tag".to_string(), tag);
+        value::instance_setattr(
+            instance,
+            "suppress".to_string(),
+            if suppress { TRUE } else { FALSE },
+        );
+        crate::heap::release_roots(instance_roots);
+        crate::heap::release_roots(class_roots);
+        crate::heap::release_roots(roots);
+        instance
+    }
+
+    extern "C" fn stack_record(argv: *const i64) -> i64 {
+        let log = unsafe { *argv };
+        let tag = unsafe { *argv.add(1) };
+        let roots = crate::heap::root_values(&[log, tag]);
+        let _ = crate::container::list_append(log, tag);
+        crate::heap::release_roots(roots);
+        NONE
+    }
+
+    extern "C" fn stack_exit_suppressor(_argv: *const i64) -> i64 {
+        TRUE
+    }
+
+    fn recorded(log: i64) -> Vec<i64> {
+        value::as_list(log)
+            .unwrap_or_default()
+            .iter()
+            .map(|item| value::as_integer(*item).unwrap_or(i64::MIN))
+            .collect()
+    }
+
+    fn stack_callback_count(stack: i64) -> usize {
+        value::as_list(attribute(stack, "_exit_callbacks")).map_or(0, |items| items.len())
+    }
+
+    #[test]
+    fn contextlib_closing_closes_on_both_paths_and_never_suppresses() {
+        exc::init();
+        let resource = closing_fixture();
+        let closer = call("contextlib", "closing", &[resource]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            value::class_display_name(value::instance_class_value(closer).expect("instance")),
+            Some("closing")
+        );
+        assert_eq!(method(closer, "__enter__", &[]), resource);
+        assert_eq!(method(closer, "__exit__", &[NONE, NONE, NONE]), FALSE);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(attribute(resource, "closed"), TRUE);
+
+        // The exception path closes too and still reports no suppression.
+        exc::init();
+        let resource = closing_fixture();
+        let closer = call("contextlib", "closing", &[resource]);
+        let boom = exception(VALUE_ERROR, "boom");
+        assert_eq!(method(closer, "__exit__", &[NONE, boom, NONE]), FALSE);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(attribute(resource, "closed"), TRUE);
+    }
+
+    #[test]
+    fn contextlib_exitstack_unwinds_callbacks_in_lifo_order() {
+        exc::init();
+        let log = value::list_new(Vec::new());
+        let stack = call("contextlib", "ExitStack", &[]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            value::class_display_name(value::instance_class_value(stack).expect("instance")),
+            Some("ExitStack")
+        );
+        assert_eq!(method(stack, "__enter__", &[]), stack);
+        assert_eq!(stack_callback_count(stack), 0);
+
+        let first = stack_manager(log, int(1), false);
+        let second = stack_manager(log, int(2), false);
+        assert_eq!(method(stack, "enter_context", &[first]), int(1));
+        assert_eq!(method(stack, "enter_context", &[second]), int(2));
+        let record =
+            value::function_new(stack_record as *const () as usize, 2, "record".to_string());
+        assert_eq!(method(stack, "callback", &[record, log, int(3)]), record);
+        assert_eq!(stack_callback_count(stack), 3);
+
+        assert_eq!(method(stack, "close", &[]), NONE);
+        assert!(!exc::pending(), "{}", message());
+        // Last registered runs first; the callback precedes both managers.
+        assert_eq!(recorded(log), vec![3, 2, 1]);
+        assert_eq!(stack_callback_count(stack), 0);
+        // Closing an empty stack is a no-op.
+        assert_eq!(method(stack, "close", &[]), NONE);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(recorded(log), vec![3, 2, 1]);
+
+        // An object without the context-manager protocol is rejected before
+        // anything is registered.
+        exc::init();
+        assert_eq!(method(stack, "enter_context", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "'int' object does not support the context manager protocol"
+        );
+        assert_eq!(stack_callback_count(stack), 0);
+    }
+
+    #[test]
+    fn contextlib_exitstack_exit_passes_and_suppresses_exceptions() {
+        exc::init();
+        let log = value::list_new(Vec::new());
+        let stack = call("contextlib", "ExitStack", &[]);
+        // Registered first, so it is exited last and sees the suppressed
+        // exception as `None` once the later manager swallows it.
+        let outer = stack_manager(log, int(1), false);
+        let inner = stack_manager(log, int(2), true);
+        method(stack, "enter_context", &[outer]);
+        method(stack, "enter_context", &[inner]);
+        let boom = exception(VALUE_ERROR, "boom");
+        assert_eq!(method(stack, "__exit__", &[NONE, boom, NONE]), TRUE);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(attribute(inner, "seen"), boom);
+        assert_eq!(attribute(outer, "seen"), NONE);
+        assert_eq!(recorded(log), vec![2, 1]);
+        assert_eq!(stack_callback_count(stack), 0);
+
+        // Without a suppressing manager the exception propagates from the
+        // `with` lowering, which sees a falsy `__exit__` result.
+        exc::init();
+        let log = value::list_new(Vec::new());
+        let stack = call("contextlib", "ExitStack", &[]);
+        let first = stack_manager(log, int(1), false);
+        let second = stack_manager(log, int(2), false);
+        method(stack, "enter_context", &[first]);
+        method(stack, "enter_context", &[second]);
+        let boom = exception(VALUE_ERROR, "boom");
+        assert_eq!(method(stack, "__exit__", &[NONE, boom, NONE]), FALSE);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(attribute(first, "seen"), boom);
+        assert_eq!(attribute(second, "seen"), boom);
+
+        // The normal path passes `None` and never reports suppression.
+        exc::init();
+        let stack = call("contextlib", "ExitStack", &[]);
+        let manager = stack_manager(value::list_new(Vec::new()), int(7), true);
+        method(stack, "enter_context", &[manager]);
+        assert_eq!(method(stack, "__exit__", &[NONE, NONE, NONE]), FALSE);
+        assert_eq!(attribute(manager, "seen"), NONE);
+        assert!(!exc::pending(), "{}", message());
+    }
+
+    #[test]
+    fn contextlib_exitstack_push_accepts_plain_exit_callables() {
+        exc::init();
+        let log = value::list_new(Vec::new());
+        let stack = call("contextlib", "ExitStack", &[]);
+        let manager = stack_manager(log, int(1), false);
+        // `push` resolves `__exit__` on a manager...
+        assert_eq!(method(stack, "push", &[manager]), manager);
+        // ...but registers a callable without one directly, keeping its
+        // truthiness as the suppression decision.
+        let suppressor = value::function_new(
+            stack_exit_suppressor as *const () as usize,
+            3,
+            "exit_true".to_string(),
+        );
+        assert_eq!(method(stack, "push", &[suppressor]), suppressor);
+        assert_eq!(stack_callback_count(stack), 2);
+        let boom = exception(VALUE_ERROR, "boom");
+        assert_eq!(method(stack, "__exit__", &[NONE, boom, NONE]), TRUE);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(recorded(log), vec![1]);
+        assert_eq!(attribute(manager, "seen"), NONE);
+
+        // `callback` cannot suppress even when it returns a truthy value.
+        exc::init();
+        let stack = call("contextlib", "ExitStack", &[]);
+        let truthy = value::function_new(
+            stack_exit_suppressor as *const () as usize,
+            0,
+            "truthy".to_string(),
+        );
+        method(stack, "callback", &[truthy]);
+        let boom = exception(VALUE_ERROR, "boom");
+        assert_eq!(method(stack, "__exit__", &[NONE, boom, NONE]), FALSE);
+        assert!(!exc::pending(), "{}", message());
+    }
+
+    #[test]
+    fn contextlib_exitstack_callback_forwards_arguments_and_keywords() {
+        exc::init();
+        let log = value::list_new(Vec::new());
+        let record =
+            value::function_new(stack_record as *const () as usize, 2, "record".to_string());
+        let numbers = value::list_new(vec![int(2), int(3), int(4)]);
+        let prod = get("math", "prod");
+
+        // The stored entry keeps the callable, its bound positional arguments
+        // and its keyword arguments.
+        let stack = call("contextlib", "ExitStack", &[]);
+        assert_eq!(method(stack, "callback", &[record, log, int(5)]), record);
+        let callbacks = attribute(stack, "_exit_callbacks");
+        let entry = value::as_list(callbacks).expect("callbacks list")[0];
+        let parts = value::as_tuple(entry).expect("entry tuple");
+        assert_eq!((parts[0], parts[3]), (record, FALSE));
+        assert_eq!(
+            value::as_tuple(parts[1]).expect("bound args"),
+            &[log, int(5)][..]
+        );
+        assert_eq!(value::as_dict(parts[2]).expect("bound keywords").len(), 0);
+
+        // A callback runs with its arguments even though it cannot suppress.
+        assert_eq!(method(stack, "close", &[]), NONE);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(recorded(log), vec![5]);
+
+        // Keywords travel to the callee: `math.prod(..., start=10)` accepts
+        // `start`, and an unknown name is reported by `prod` itself.
+        exc::init();
+        let stack = call("contextlib", "ExitStack", &[]);
+        assert_eq!(
+            method_kw(stack, "callback", &[prod, numbers], &[("start", int(10))]),
+            prod
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(method(stack, "close", &[]), NONE);
+        assert!(!exc::pending(), "{}", message());
+
+        exc::init();
+        let stack = call("contextlib", "ExitStack", &[]);
+        method_kw(stack, "callback", &[prod, numbers], &[("bogus", int(1))]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(method(stack, "close", &[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "prod() got an unexpected keyword argument 'bogus'"
+        );
+    }
+
+    #[test]
+    fn contextlib_exitstack_pop_all_transfers_the_pending_callbacks() {
+        exc::init();
+        let log = value::list_new(Vec::new());
+        let record =
+            value::function_new(stack_record as *const () as usize, 2, "record".to_string());
+        let stack = call("contextlib", "ExitStack", &[]);
+        method(stack, "callback", &[record, log, int(1)]);
+        method(stack, "callback", &[record, log, int(2)]);
+
+        let transferred = method(stack, "pop_all", &[]);
+        assert!(!exc::pending(), "{}", message());
+        assert_ne!(transferred, stack);
+        assert_eq!(
+            value::class_display_name(
+                value::instance_class_value(transferred).expect("transferred instance")
+            ),
+            Some("ExitStack")
+        );
+        assert_eq!(stack_callback_count(stack), 0);
+        assert_eq!(stack_callback_count(transferred), 2);
+
+        // The old stack keeps working, independently of the transferred ones.
+        method(stack, "callback", &[record, log, int(3)]);
+        assert_eq!(method(stack, "close", &[]), NONE);
+        assert_eq!(recorded(log), vec![3]);
+        // The transferred callbacks keep their original LIFO order.
+        assert_eq!(method(transferred, "close", &[]), NONE);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(recorded(log), vec![3, 2, 1]);
+
+        // CPython always returns a fresh stack, even when nothing is pending.
+        exc::init();
+        let empty = call("contextlib", "ExitStack", &[]);
+        let moved = method(empty, "pop_all", &[]);
+        assert!(!exc::pending(), "{}", message());
+        assert_ne!(moved, empty);
+        assert_eq!(stack_callback_count(moved), 0);
+        assert_eq!(stack_callback_count(empty), 0);
     }
 
     #[test]

@@ -2362,6 +2362,12 @@ pub static IMPORTLIB_RESOURCES: ModuleSpec = ModuleSpec {
 /// generator it returns in a real `_GeneratorContextManager`. The wrapper
 /// forwards every keyword argument to `func`, so `_contextmanager_call` is
 /// declared with dynamic keywords.
+///
+/// `closing(thing)` wraps an object's `close()` method, and `ExitStack`
+/// registers exits dynamically (`enter_context`/`push`/`callback`), unwinds
+/// them LIFO and transfers them with `pop_all`. `callback` keeps its call-site
+/// keywords for the registered callable, so its spec also declares dynamic
+/// keywords.
 pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
     name: "contextlib",
     functions: &[
@@ -2380,6 +2386,24 @@ pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
         kw_dynamic("_contextmanager_call", 1, usize::MAX, Type::Any, &[]),
         f("_contextmanager_enter", 1, 1, Type::Any),
         f("_contextmanager_exit", 4, 4, Type::Bool),
+        // `closing(thing)`: a context manager whose `__exit__` closes the
+        // wrapped object and never suppresses the block exception.
+        f("closing", 1, 1, Type::Any),
+        f("_closing_enter", 1, 1, Type::Any),
+        f("_closing_exit", 4, 4, Type::Bool),
+        // `ExitStack()`: the native stack class. Its methods take the stack
+        // first, so the central table declares the receiver-inclusive
+        // arities. `callback(callback, *args, **kwargs)` forwards the
+        // call-site keywords to the registered callback, hence the dynamic
+        // keyword support.
+        f("ExitStack", 0, 0, Type::Any),
+        f("_exitstack_enter", 1, 1, Type::Any),
+        f("_exitstack_exit", 4, 4, Type::Bool),
+        f("_exitstack_close", 1, 1, Type::None),
+        f("_exitstack_enter_context", 2, 2, Type::Any),
+        f("_exitstack_push", 2, 2, Type::Any),
+        kw_dynamic("_exitstack_callback", 2, usize::MAX, Type::Any, &[]),
+        f("_exitstack_pop_all", 1, 1, Type::Any),
     ],
     constants: &[],
 };
@@ -3582,6 +3606,37 @@ mod tests {
             let spec = function("contextlib", name).expect(name);
             assert_eq!((spec.min_args, spec.max_args), (arity, arity));
         }
+    }
+
+    #[test]
+    fn contextlib_closing_and_exitstack_specs_are_registered() {
+        let closing = function("contextlib", "closing").expect("closing");
+        assert_eq!(
+            (closing.min_args, closing.max_args, closing.ret),
+            (1, 1, Type::Any)
+        );
+
+        let stack = function("contextlib", "ExitStack").expect("ExitStack");
+        assert_eq!((stack.min_args, stack.max_args), (0, 0));
+
+        // The native methods take the receiver first, so their arities
+        // include it; `callback` additionally forwards keyword names.
+        for (name, min, max) in [
+            ("_closing_enter", 1, 1),
+            ("_closing_exit", 4, 4),
+            ("_exitstack_enter", 1, 1),
+            ("_exitstack_exit", 4, 4),
+            ("_exitstack_close", 1, 1),
+            ("_exitstack_enter_context", 2, 2),
+            ("_exitstack_push", 2, 2),
+            ("_exitstack_pop_all", 1, 1),
+        ] {
+            let spec = function("contextlib", name).expect(name);
+            assert_eq!((spec.min_args, spec.max_args), (min, max), "{name}");
+        }
+        let callback = function("contextlib", "_exitstack_callback").expect("callback");
+        assert_eq!((callback.min_args, callback.max_args), (2, usize::MAX));
+        assert!(callback.dynamic_keywords);
     }
 
     #[test]

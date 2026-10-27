@@ -8,6 +8,19 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 `contextlib.closing` and `ExitStack`
+
+- `contextlib.closing(thing)` is a native context manager: `__enter__`
+  returns `thing`, `__exit__` calls `thing.close()` on both the normal and
+  the exceptional path and reports `False`, so block exceptions propagate.
+- `contextlib.ExitStack` registers context managers (`enter_context`),
+  exit methods or plain callables (`push`) and arbitrary callbacks
+  (`callback(callable, *args, **kwargs)`, keyword arguments included).
+  Callbacks unwind last-in-first-out, the first truthy exit suppresses the
+  block exception, and `close()` unwinds with `(None, None, None)`.
+  `pop_all()` transfers the pending callbacks to a fresh stack, matching
+  CPython 3.14.
+
 ### Added — 2026-10-27 complex literals
 
 - `0j`, `1j`, `1.5j` and the folded binary forms (`1+2j`, `1-2.5j`) are real
