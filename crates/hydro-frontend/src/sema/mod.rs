@@ -2878,28 +2878,28 @@ impl<'a> Checker<'a> {
                     let _ = self.inf.unify(out, Ty::Concrete(target));
                     return;
                 }
-                if args.is_empty() {
-                    let _ = self.inf.unify(out, Ty::Concrete(target));
-                    return;
-                }
                 let (ty, arg_line, arg_col) = args[0];
-                if let Ty::Concrete(t) = self.inf.resolve(ty) {
-                    let ok = t == Type::Any
-                        || t == Type::Int
-                        || t == Type::BigInt
-                        || t == Type::Float
-                        || t == Type::Bool
-                        || t == Type::Str;
-                    if !ok {
-                        self.error(
-                            arg_line,
-                            arg_col,
-                            format!(
-                                "{}() argument must be a string or a number, not {}",
-                                builtin.name(),
-                                t.name()
-                            ),
-                        );
+                // `int(x)` and `float(x)` accept any object: CPython dispatches
+                // to `__int__`/`__index__`/`__float__`, which user classes (and
+                // subclasses of builtins) may define, so a concrete argument
+                // type is never a static rejection. Non-convertible values fail
+                // at runtime with a TypeError.
+                //
+                // The two-argument form `int(string, base)` is the exception:
+                // CPython only accepts string-like values there, so a
+                // statically known non-string argument is an error.
+                if builtin == Builtin::Int && count == 2 {
+                    if let Ty::Concrete(t) = self.inf.resolve(ty) {
+                        // `Never` is uninhabited, so it cannot fail at runtime.
+                        let string_like =
+                            matches!(t, Type::Any | Type::Str | Type::Bytes | Type::Never);
+                        if !string_like {
+                            self.error(
+                                arg_line,
+                                arg_col,
+                                "int() can't convert non-string with explicit base".to_string(),
+                            );
+                        }
                     }
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(target));

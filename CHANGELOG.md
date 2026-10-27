@@ -8,6 +8,20 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — 2026-10-27 `int()`/`float()` argument typing
+
+- `int(x)` and `float(x)` no longer reject a statically known argument type.
+  CPython converts through `__int__`/`__index__`/`__float__`, which any object
+  (including a subclass of a builtin) may implement, so a tuple/list/dict
+  argument is only a possible runtime `TypeError`, not a compile-time error.
+  This fixes NumPy's `_linalg.py` line `axis = int(axis)` inside an
+  `isinstance`-narrowed branch, which Hydro rejected with "int() argument must
+  be a string or a number, not tuple".
+- The explicit-base form keeps its rule: `int(value, base)` requires a
+  string-like first argument, so `int("10", 2)` type-checks while `int(10, 2)`
+  is reported as `int() can't convert non-string with explicit base`, matching
+  CPython's `TypeError`. Arity checking is unchanged.
+
 ### Fixed — 2026-10-27 Module `__doc__` exports
 
 - `from module import __doc__` now resolves for user modules. Every imported

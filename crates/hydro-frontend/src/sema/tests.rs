@@ -1124,7 +1124,45 @@ fn list_dict_and_zip_reject_non_iterables() {
 }
 
 #[test]
+fn int_and_float_accept_any_object_argument() {
+    // CPython dispatches to `__int__`/`__index__`/`__float__`, so any object
+    // (including a tuple subclass) may be convertible; a concrete argument
+    // type is not a static error, only a possible runtime failure.
+    let source = "xs = (1, 2)\na = int(xs)\nb = int([1, 2])\nc = float(xs)\nd = float('1.5')\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    assert_eq!(assigned_type(&program, 1), Type::Int);
+    assert_eq!(assigned_type(&program, 2), Type::Int);
+    assert_eq!(assigned_type(&program, 3), Type::Float);
+    assert_eq!(assigned_type(&program, 4), Type::Float);
+    assert!(check_errors("def f(x):\n    return int(x)\nprint(f({'a': 1}))\n").is_empty());
+}
+
+#[test]
+fn int_with_explicit_base_requires_a_string() {
+    let program = crate::check_source("x = int('10', 2)\n", "test.py").expect("valid program");
+    assert_eq!(assigned_type(&program, 0), Type::Int);
+    assert!(check_errors("x = int(b'10', 2)\n").is_empty());
+
+    // `int(number, base)` is a TypeError in CPython: the base only applies to
+    // string-like values.
+    assert_eq!(
+        check_errors("x = int(10, 2)\n"),
+        vec!["int() can't convert non-string with explicit base"]
+    );
+    assert_eq!(
+        check_errors("x = int([1], 2)\n"),
+        vec!["int() can't convert non-string with explicit base"]
+    );
+    // An unknown argument keeps type-checking; the runtime decides.
+    assert!(check_errors("def f(x):\n    return int(x, 2)\nprint(f('10'))\n").is_empty());
+}
+
+#[test]
 fn builtin_arity_diagnostics() {
+    assert_eq!(
+        check_errors("x = int(1, 2, 3)\n"),
+        vec!["int() takes 0 to 2 argument(s) (3 given)"]
+    );
     assert_eq!(
         check_errors("x = list([1], [2])\n"),
         vec!["list() takes 0 to 1 positional argument(s) (2 given)"]
