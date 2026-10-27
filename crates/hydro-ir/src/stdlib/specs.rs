@@ -2507,7 +2507,11 @@ pub static _WEAKREF: ModuleSpec = ModuleSpec {
 /// implemented function is declared here; a name that is absent from this
 /// table raises `AttributeError` instead of returning invented data.
 const WARNING_FUNCTIONS: &[FunctionSpec] = &[
-    kw(
+    // `warn(message, category=None, stacklevel=1, *, skip_file_prefixes=())`:
+    // the three positional-or-keyword parameters keep their slots, while the
+    // keyword-only `skip_file_prefixes` is bound by the runtime (`dynamic`
+    // keywords), which validates the tuple and rejects unknown names.
+    kw_dynamic(
         "warn",
         1,
         3,
@@ -4282,6 +4286,10 @@ mod tests {
         let warn = function("warnings", "warn").unwrap();
         assert_eq!((warn.min_args, warn.max_args), (1, 3));
         assert_eq!(warn.params, &["message", "category", "stacklevel"][..]);
+        // `skip_file_prefixes` is keyword-only: it is not a positional slot but
+        // the runtime keyword binder accepts it (and rejects unknown names).
+        assert!(warn.dynamic_keywords, "skip_file_prefixes is a keyword");
+        assert!(!warn.params.contains(&"skip_file_prefixes"));
         let explicit = function("warnings", "warn_explicit").unwrap();
         assert_eq!((explicit.min_args, explicit.max_args), (4, 7));
 

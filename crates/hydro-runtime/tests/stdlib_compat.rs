@@ -241,6 +241,75 @@ fn catch_warnings_nests_and_returns_none_without_record() {
 }
 
 #[test]
+fn warn_accepts_and_validates_skip_file_prefixes() {
+    let _guard = setup();
+    let log = recording();
+
+    // A tuple of strings is accepted. Hydro has no caller frames, so the
+    // prefix cannot change attribution: the reported location stays
+    // `<unknown>` and is never derived from a prefix.
+    module_kw(
+        "warnings",
+        "warn",
+        &[text("prefixed")],
+        &[("skip_file_prefixes", tuple(&[text("/site-packages/")]))],
+    );
+    assert_no_error();
+    assert_eq!(length(log), 1);
+    assert_str(
+        getattr(hydro_subscript(log, int(0)), "filename"),
+        "<unknown>",
+    );
+
+    // The default empty tuple is accepted, and the positional-or-keyword
+    // parameters still bind by name alongside the keyword-only argument.
+    module_kw(
+        "warnings",
+        "warn",
+        &[],
+        &[
+            ("message", text("bound by name")),
+            ("category", module_get("builtins", "UserWarning")),
+            ("stacklevel", int(2)),
+            ("skip_file_prefixes", tuple(&[])),
+        ],
+    );
+    assert_no_error();
+    assert_eq!(length(log), 2);
+    assert_str(
+        hydro_to_str(getattr(hydro_subscript(log, int(1)), "message")),
+        "bound by name",
+    );
+
+    // Non-tuple containers and non-str elements are TypeErrors, as in CPython.
+    module_kw(
+        "warnings",
+        "warn",
+        &[text("bad container")],
+        &[("skip_file_prefixes", list(&[text("/tmp/")]))],
+    );
+    expect_error(TYPE_ERROR);
+    module_kw(
+        "warnings",
+        "warn",
+        &[text("bad element")],
+        &[("skip_file_prefixes", tuple(&[text("/tmp/"), int(1)]))],
+    );
+    expect_error(TYPE_ERROR);
+
+    // Unknown keyword names are rejected instead of silently dropped.
+    module_kw(
+        "warnings",
+        "warn",
+        &[text("bad keyword")],
+        &[("skip_file_prefix", tuple(&[]))],
+    );
+    expect_error(TYPE_ERROR);
+
+    assert_eq!(length(log), 2, "rejected calls emit no warning");
+}
+
+#[test]
 fn deprecated_emits_deprecation_and_pending_warnings() {
     let _guard = setup();
     let log = recording();

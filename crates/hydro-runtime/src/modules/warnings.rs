@@ -35,6 +35,12 @@
 //!   `warn(stacklevel=...)` cannot select a caller location: the location is
 //!   always reported as `<unknown>:0`. `warn_explicit` takes the location
 //!   explicitly and behaves like CPython.
+//! * `warn(..., skip_file_prefixes=(...))` is accepted and validated exactly
+//!   like CPython 3.14 (a tuple of `str`; anything else raises `TypeError`),
+//!   but the prefixes filter candidate caller frames, and Hydro has none to
+//!   filter. Only the `stacklevel`-based attribution remains, and that
+//!   attribution already reports `<unknown>:0`; no filename is fabricated
+//!   from a prefix.
 //! * `message`/`module` filters are matched as case-insensitive literal
 //!   prefixes at the start of the text, which is the behaviour of the
 //!   `re.I`-compiled `re.match` CPython uses for the common patterns; full
@@ -337,6 +343,70 @@ fn warn(args: &[i64]) -> i64 {
         NONE,
         exc::USER_WARNING,
     )
+}
+
+/// Validates the CPython 3.14 `skip_file_prefixes` keyword.
+///
+/// CPython checks with `PyTuple_Check` (so tuple subclasses pass) and then
+/// requires every element to be a `str`; both failures are `TypeError`, using
+/// the messages of the C implementation
+/// (`argument 'skip_file_prefixes' must be tuple, not list` and
+/// `Found non-str 'int' in skip_file_prefixes.`).
+///
+/// The prefixes themselves select caller frames to skip when `stacklevel` is
+/// resolved. Hydro has no frame stack in native module code (see the module
+/// docs), so there is nothing to filter: the tuple is validated and then only
+/// `stacklevel`-based attribution applies. The filename is never derived from
+/// a prefix.
+fn validate_skip_file_prefixes(value: i64) -> Result<(), i64> {
+    let Some(prefixes) = value::as_tuple(value) else {
+        return Err(type_error(&format!(
+            "argument 'skip_file_prefixes' must be tuple, not {}",
+            value::type_name(value)
+        )));
+    };
+    for prefix in prefixes {
+        if value::as_str(*prefix).is_none() {
+            return Err(type_error(&format!(
+                "Found non-str '{}' in skip_file_prefixes.",
+                value::type_name(*prefix)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `warnings.warn(message, category=None, stacklevel=1, *,
+/// skip_file_prefixes=())` called with keyword arguments.
+///
+/// `message`, `category` and `stacklevel` are declared in the spec and are
+/// already moved into their positional slots by the central keyword binder, so
+/// the only name left here is the keyword-only `skip_file_prefixes`. Unknown
+/// names are rejected instead of being dropped.
+fn warn_kw(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let mut skip_seen = false;
+    // Validate the tuple before emitting, like CPython's argument parser.
+    for (name, value) in keywords {
+        match name.as_str() {
+            "skip_file_prefixes" => {
+                if skip_seen {
+                    return type_error(
+                        "warn() got multiple values for keyword argument 'skip_file_prefixes'",
+                    );
+                }
+                skip_seen = true;
+                if let Err(error) = validate_skip_file_prefixes(*value) {
+                    return error;
+                }
+            }
+            _ => {
+                return type_error(&format!(
+                    "warn() got an unexpected keyword argument '{name}'"
+                ));
+            }
+        }
+    }
+    warn(args)
 }
 
 /// Shared body of `warn` and `warn_explicit`.
@@ -1392,9 +1462,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-/// Keyword-aware dispatch for `catch_warnings` and `_deprecated`.
+/// Keyword-aware dispatch for `warn`, `catch_warnings` and `_deprecated`.
 pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     match function {
+        "warn" => warn_kw(args, keywords),
         "catch_warnings" => catch_warnings(args, keywords),
         "_deprecated" => deprecated(args, keywords),
         _ => function_attribute_error(function),
