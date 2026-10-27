@@ -404,6 +404,85 @@ assert apply(make(5), 2) == 7
 }
 
 #[test]
+fn recursive_nested_functions() {
+    run_source(
+        "\
+def make_factorial():
+    def fact(n):
+        if n <= 1:
+            return 1
+        return n * fact(n - 1)
+    return fact
+
+fact = make_factorial()
+assert fact(5) == 120
+# The closure keeps its own binding after the outer frame returned.
+assert fact(6) == 720
+
+def parity(n):
+    def even(k):
+        if k == 0:
+            return True
+        return odd(k - 1)
+    def odd(k):
+        if k == 0:
+            return False
+        return even(k - 1)
+    return even(n)
+
+assert parity(10)
+assert not parity(7)
+
+def accumulate(step):
+    total = 0
+    def add(n):
+        nonlocal total
+        total += step
+        if n <= 0:
+            return total
+        return add(n - 1)
+    return add
+
+add = accumulate(2)
+assert add(3) == 8
+assert add(2) == 14
+
+def traced():
+    calls = []
+    def walk(n):
+        calls.append(n)
+        if n <= 0:
+            return 0
+        return walk(n - 1) + 1
+    return walk, calls
+
+walk, calls = traced()
+assert walk(3) == 3
+assert calls == [3, 2, 1, 0]
+
+def decorated():
+    seen = []
+    def twice(fn):
+        def wrapper(n):
+            seen.append(1)
+            return 2 * fn(n)
+        return wrapper
+    @twice
+    def step(n):
+        if n <= 0:
+            return 0
+        return step(n - 1) + 1
+    return step, seen
+
+step, seen = decorated()
+# Recursive calls resolve the decorated binding, exactly like CPython.
+assert step(3) == 14
+assert len(seen) == 4
+",
+    );
+}
+
+#[test]
 fn generators_and_async() {
     run_source(
         "\

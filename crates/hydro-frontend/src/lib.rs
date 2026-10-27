@@ -2045,6 +2045,9 @@ fn lower_modules(
     let entry_index = units.len() - 1;
     let mut all_functions: Vec<hydro_ir::Function> = Vec::new();
     let mut exports: Vec<HashMap<String, lower::UserExport>> = vec![HashMap::new(); units.len()];
+    // Whether each unit installs names into its own namespace at runtime;
+    // importers of such a module bind unknown members late.
+    let mut dynamic_units: Vec<bool> = vec![false; units.len()];
     let mut initializers: Vec<FunctionId> = Vec::new();
     let mut entry_main = 0;
     let mut class_registry: HashMap<(String, String), (FunctionId, lower::CallSignature)> =
@@ -2091,6 +2094,7 @@ fn lower_modules(
                     name: dep.name.clone(),
                     exports: exports[dep_index].clone(),
                     all: effective_module_all(units, &exports, dep_index, &mut HashSet::new()),
+                    dynamic_globals: dynamic_units[dep_index],
                 },
             );
         }
@@ -2103,6 +2107,7 @@ fn lower_modules(
                     name: namespace.clone(),
                     exports: HashMap::new(),
                     all: None,
+                    dynamic_globals: false,
                 });
         }
         lowerer.set_user_modules(user_modules);
@@ -2120,6 +2125,7 @@ fn lower_modules(
 
         let mut hir = lowerer.lower_module(&unit.module);
         let exported = lowerer.exported_names();
+        let dynamic_globals = lowerer.exports_dynamic_globals();
         let exported_classes = lowerer.exported_class_signatures();
         let exported_functions = lowerer.exported_function_signatures();
         let lower_diags = std::mem::take(&mut lowerer.diags);
@@ -2137,6 +2143,7 @@ fn lower_modules(
         }
 
         exports[index] = exported;
+        dynamic_units[index] = dynamic_globals;
         if index != entry_index {
             // Imported units keep one identity per unit: the module body and
             // every nested function are namespaced by the dotted module name,

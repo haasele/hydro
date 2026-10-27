@@ -95,7 +95,7 @@ pub(crate) mod zoneinfo;
 use crate::container;
 use crate::exc::{
     self, ATTRIBUTE_ERROR, INDEX_ERROR, OS_ERROR, OVERFLOW_ERROR, RECURSION_ERROR, RUNTIME_ERROR,
-    TYPE_ERROR, VALUE_ERROR,
+    STOP_ITERATION, TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::iter;
@@ -1488,6 +1488,42 @@ fn call_native_at(
     dispatch(module_name, function_name, args)
 }
 
+/// Keyword variant of [`call_native`] for a native function value.
+///
+/// `functools.partial` and the `contextlib.contextmanager` wrapper forward
+/// call-site keywords to a native target; the central dispatch rejects the
+/// names unless the spec declares dynamic keyword support.
+pub(crate) fn call_native_kw(
+    module: &str,
+    function: &str,
+    argc: usize,
+    argv: *const i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> i64 {
+    call_native_kw_at(
+        module.as_ptr() as usize,
+        module.len(),
+        module,
+        function.as_ptr() as usize,
+        function.len(),
+        function,
+        argc,
+        argv,
+        kwargc,
+        kw_argv,
+    )
+}
+
+/// Whether the native function keeps arbitrary keyword names for its callee
+/// (`dynamic_keywords` in the central spec). Callers use this to decide
+/// between the positional and keyword dispatch paths.
+pub(crate) fn native_accepts_keywords(module: &str, function: &str) -> bool {
+    resolve_native(module, function)
+        .map(|(_, _, spec)| spec.dynamic_keywords)
+        .unwrap_or(false)
+}
+
 /// Keyword variant of [`call_native_at`]: validates the spec's arity, decodes
 /// the keyword pairs, moves the fixed leading parameters supplied by name into
 /// their positional slots and hands the rest to the keyword-aware dispatcher.
@@ -1593,6 +1629,7 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "typing" => typing::call_kw(function, args, &keywords),
         "inspect" => inspect::call_kw(function, args, &keywords),
         "ast" => ast::call_kw(function, args, &keywords),
+        "contextlib" => contextlib_call_kw(function, args, &keywords),
         "types" => types::call_kw(function, args, &keywords),
         "os.path" => os_path_call_kw(function, args, &keywords),
         "itertools" => itertools_call_kw(function, args, keywords),
@@ -2443,6 +2480,14 @@ fn constant_value(module: &str, name: &str) -> i64 {
 /// `contextlib.suppress` returns a native context manager too. The subset does
 /// not suppress exceptions; its `__exit__` returns `None` and the normal block
 /// path is supported.
+///
+/// `contextlib.contextmanager(func)` returns a `functools.partial`-shaped
+/// callable that binds `func` to `_contextmanager_call`. Calling it invokes
+/// `func` with the call arguments (keywords included) and wraps the resulting
+/// generator in a `_GeneratorContextManager`. `__enter__` advances the
+/// generator once; `__exit__` throws the block's exception into it (or calls
+/// `next` on the normal path) and reports whether the exception was
+/// suppressed, following CPython's `_GeneratorContextManager` rules.
 fn contextlib_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "suppress" => {
@@ -2481,8 +2526,275 @@ fn contextlib_call(function: &str, args: &[i64]) -> i64 {
         "_nullcontext_enter" => value::instance_attr(args[0], "enter_result").unwrap_or(NONE),
         // Returning false keeps the exception raised by the block.
         "_nullcontext_exit" => value::bool_value(false),
+        // The decorator keeps `func` as the partial's bound argument; the
+        // wrapper value does not need its own class.
+        "contextmanager" => {
+            let Some(&function) = args.first() else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "contextlib.contextmanager() missing required argument 'func'",
+                );
+            };
+            let roots = heap::root_values(&[function]);
+            let wrapper =
+                value::native_function_new("contextlib", "_contextmanager_call", usize::MAX);
+            let wrapper_roots = heap::root_values(&[wrapper]);
+            let result = value::partial_new(wrapper, vec![function]);
+            heap::release_roots(wrapper_roots);
+            heap::release_roots(roots);
+            result
+        }
+        "_contextmanager_call" => match args.split_first() {
+            Some((&function, rest)) => contextmanager_wrap(function, rest, &[]),
+            None => exc::raise_with_message(
+                TYPE_ERROR,
+                "contextlib._contextmanager_call() missing the decorated function",
+            ),
+        },
+        "_contextmanager_enter" => contextmanager_enter(args[0]),
+        "_contextmanager_exit" => contextmanager_exit(args[0], args[1], args[2], args[3]),
         _ => missing_attribute("contextlib", function),
     }
+}
+
+/// Keyword-aware `contextlib` dispatch: `_contextmanager_call` forwards the
+/// call-site keywords to the decorated generator function.
+fn contextlib_call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match function {
+        "_contextmanager_call" => match args.split_first() {
+            Some((&decorated, rest)) => contextmanager_wrap(decorated, rest, keywords),
+            None => exc::raise_with_message(
+                TYPE_ERROR,
+                "contextlib._contextmanager_call() missing the decorated function",
+            ),
+        },
+        _ => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("contextlib.{function}() does not accept keyword arguments"),
+        ),
+    }
+}
+
+/// Calls the decorated generator function and wraps the resulting generator.
+///
+/// The call may raise (a normal function used as a context manager can fail
+/// before returning), in which case the exception propagates unchanged. A
+/// non-generator result is wrapped anyway; `__enter__` reports the `TypeError`
+/// at the point CPython does.
+fn contextmanager_wrap(function: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let mut rooted: Vec<i64> = Vec::with_capacity(args.len() + keywords.len() + 1);
+    rooted.push(function);
+    rooted.extend_from_slice(args);
+    rooted.extend(keywords.iter().map(|(_, value)| *value));
+    let roots = heap::root_values(&rooted);
+    let generator = if keywords.is_empty() {
+        crate::core::builtins::call(function, args.len(), args.as_ptr())
+    } else {
+        let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+        for (name, value) in keywords {
+            pairs.push(value::str_alloc(name.clone()));
+            pairs.push(*value);
+        }
+        crate::core::builtins::call_kw(
+            function,
+            args.len(),
+            args.as_ptr(),
+            keywords.len(),
+            pairs.as_ptr(),
+        )
+    };
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let generator_roots = heap::root_values(&[generator]);
+    let class = context_manager_class();
+    let manager = value::instance_new(class);
+    value::instance_setattr(manager, "gen".to_string(), generator);
+    heap::release_roots(generator_roots);
+    heap::release_roots(roots);
+    manager
+}
+
+/// The cached `_GeneratorContextManager` class returned by the
+/// `contextmanager` decorator.
+fn context_manager_class() -> i64 {
+    const KEY: &str = "contextlib._GeneratorContextManager.class";
+    if let Some(cached) = crate::core::globals::registry_get(KEY) {
+        return cached;
+    }
+    let enter = value::native_function_new("contextlib", "_contextmanager_enter", 1);
+    let exit = value::native_function_new("contextlib", "_contextmanager_exit", 4);
+    let methods = vec![
+        ("__enter__".to_string(), enter),
+        ("__exit__".to_string(), exit),
+    ];
+    let method_roots = heap::root_values(&[enter, exit]);
+    let class = value::class_new("_GeneratorContextManager".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    crate::core::globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// The generator bound to a `_GeneratorContextManager`, or a `TypeError` when
+/// the decorated function returned something else.
+fn contextmanager_generator(manager: i64) -> Result<i64, i64> {
+    let generator = value::instance_attr(manager, "gen").unwrap_or(NONE);
+    if crate::fiber::kind(generator) == Some(crate::fiber::FiberKind::Generator) {
+        Ok(generator)
+    } else {
+        Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object is not a generator",
+                value::type_name(generator)
+            ),
+        ))
+    }
+}
+
+/// `_GeneratorContextManager.__enter__`: resume the generator once.
+///
+/// A generator that stops before yielding reports CPython's
+/// `RuntimeError("generator didn't yield")`; an exception raised by the body
+/// propagates unchanged.
+fn contextmanager_enter(manager: i64) -> i64 {
+    let generator = match contextmanager_generator(manager) {
+        Ok(generator) => generator,
+        Err(err) => return err,
+    };
+    if crate::fiber::is_done(generator) {
+        if crate::fiber::has_error(generator) {
+            return crate::fiber::raise_error(generator);
+        }
+        return exc::raise_with_message(RUNTIME_ERROR, "generator didn't yield");
+    }
+    match crate::fiber::resume_value(generator) {
+        Some(true) => {
+            if crate::fiber::has_error(generator) {
+                crate::fiber::raise_error(generator)
+            } else {
+                exc::raise_with_message(RUNTIME_ERROR, "generator didn't yield")
+            }
+        }
+        Some(false) => crate::fiber::yielded_value(generator),
+        None => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object is not a generator",
+                value::type_name(generator)
+            ),
+        ),
+    }
+}
+
+/// `_GeneratorContextManager.__exit__(exc_type, exc, tb)`.
+///
+/// Without an exception, resume the generator once: finishing normally returns
+/// `False` (no suppression) and a second yield reports
+/// `RuntimeError("generator didn't stop")`. With an exception, throw it into
+/// the generator: a generator that stops after handling it returns `True`
+/// (suppress), one that lets the same exception escape returns `False`, and
+/// one that yields again reports `RuntimeError("generator didn't stop after
+/// throw()")`. A different escaping exception propagates unchanged. The
+/// error paths close the generator so its `finally` blocks run.
+fn contextmanager_exit(manager: i64, exc_type: i64, exception: i64, traceback: i64) -> i64 {
+    let _ = (exc_type, traceback);
+    let generator = match contextmanager_generator(manager) {
+        Ok(generator) => generator,
+        Err(err) => return err,
+    };
+    if exception == NONE {
+        if crate::fiber::is_done(generator) {
+            if crate::fiber::has_error(generator) {
+                return crate::fiber::raise_error(generator);
+            }
+            return FALSE;
+        }
+        return match crate::fiber::resume_value(generator) {
+            Some(true) => {
+                if crate::fiber::has_error(generator) {
+                    crate::fiber::raise_error(generator);
+                    NONE
+                } else {
+                    FALSE
+                }
+            }
+            Some(false) => {
+                contextmanager_close(generator);
+                exc::raise_with_message(RUNTIME_ERROR, "generator didn't stop")
+            }
+            None => exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "'{}' object is not a generator",
+                    value::type_name(generator)
+                ),
+            ),
+        };
+    }
+    // Throwing into a finished generator re-raises the exception in CPython,
+    // which makes `__exit__` report it as unsuppressed.
+    if crate::fiber::is_done(generator) {
+        return FALSE;
+    }
+    let _ = crate::fiber::throw_value(generator, exception);
+    if exc::pending() {
+        let pending = exc::pending_value();
+        if same_exception(pending, exception) {
+            let _ = exc::clear();
+            return FALSE;
+        }
+        if exc::pending_tag() == STOP_ITERATION as i64 {
+            // The generator handled the exception and returned.
+            let _ = exc::clear();
+            return TRUE;
+        }
+        // A different exception escapes the generator; keep it pending.
+        return NONE;
+    }
+    not_stopping_after_throw(generator)
+}
+
+/// Reports `RuntimeError("generator didn't stop after throw()")` for a
+/// generator that yielded again after the thrown exception, closing it first
+/// so its cleanup runs.
+fn not_stopping_after_throw(generator: i64) -> i64 {
+    contextmanager_close(generator);
+    exc::raise_with_message(RUNTIME_ERROR, "generator didn't stop after throw()")
+}
+
+/// Closes a generator, discarding the `close()` outcome so the caller's own
+/// error is the one reported.
+fn contextmanager_close(generator: i64) {
+    if crate::fiber::is_done(generator) {
+        return;
+    }
+    let _ = crate::fiber::close_value(generator);
+    if exc::pending() {
+        let _ = exc::clear();
+    }
+}
+
+/// Whether the exception a generator let escape is the one thrown into it.
+///
+/// Re-raising copies the payload, so pointer identity alone is not enough;
+/// the payload comparison recovers the CPython `exc is value` decision for an
+/// exception that propagated unchanged. `StopIteration` never compares equal
+/// by payload, because that tag is how a handler that stops is reported.
+fn same_exception(a: i64, b: i64) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(left), Some(right)) = (value::exception_data(a), value::exception_data(b)) else {
+        return false;
+    };
+    left.tag != STOP_ITERATION
+        && left.tag == right.tag
+        && left.msg == right.msg
+        && left.args == right.args
 }
 
 /// `dataclasses` functions. The frontend reads `field(...)` from the class-body
@@ -3433,6 +3745,54 @@ fn reduce(args: &[i64]) -> i64 {
 
 // operator
 
+/// The result of `operator.index` when `v` is already an exact integer:
+/// tagged `int` and heap `BigInt` stay as they are, while `bool` becomes the
+/// corresponding `int` (`True.__index__()` is `1`, not `True`), matching
+/// CPython's `PyNumber_Index`, which copies bools to exact ints.
+fn exact_index_value(v: i64) -> Option<i64> {
+    if value::is_int(v) || value::is_bigint(v) {
+        return Some(v);
+    }
+    match v {
+        TRUE => Some(ops::int_result(1)),
+        FALSE => Some(ops::int_result(0)),
+        _ => None,
+    }
+}
+
+/// `operator.index(a)`: CPython's `PyNumber_Index`.
+///
+/// Exact integers are returned unchanged (bools as `int`); user objects are
+/// asked for `__index__`, whose result must itself be an integer. Everything
+/// else raises the `TypeError` CPython reports.
+fn operator_index(a: i64) -> i64 {
+    if let Some(index) = exact_index_value(a) {
+        return index;
+    }
+    if let Some(result) = ops::instance_method_call(a, "__index__", &[a]) {
+        if exc::pending() {
+            return NONE;
+        }
+        if let Some(index) = exact_index_value(result) {
+            return index;
+        }
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "__index__ returned non-int (type {})",
+                value::type_name_of(result)
+            ),
+        );
+    }
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "'{}' object cannot be interpreted as an integer",
+            value::type_name_of(a)
+        ),
+    )
+}
+
 fn operator_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "attrgetter" => {
@@ -3452,6 +3812,7 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
             return value::attribute_getter_new(names);
         }
         "itemgetter" => return value::item_getter_new(args.to_vec()),
+        "index" => return operator_index(args[0]),
         _ => {}
     }
     let binary = match function {
@@ -8595,6 +8956,91 @@ mod tests {
     }
 
     #[test]
+    fn operator_index_returns_exact_integers() {
+        exc::init();
+        // Tagged ints and BigInts come back unchanged.
+        let tagged = int(42);
+        assert_eq!(call("operator", "index", &[tagged]), tagged);
+        let big = value::bigint_new(BigInt::from(1u64) << 100);
+        assert_eq!(call("operator", "index", &[big]), big);
+        // `bool.__index__()` produces an exact int, not the bool itself.
+        let one = call("operator", "index", &[TRUE]);
+        assert!(value::is_int(one));
+        assert_eq!(as_int(one), 1);
+        let zero = call("operator", "index", &[FALSE]);
+        assert!(value::is_int(zero));
+        assert_eq!(as_int(zero), 0);
+        assert!(!exc::pending());
+        // `_operator` is the same module table.
+        assert_eq!(call("_operator", "index", &[tagged]), tagged);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn operator_index_calls_the_dunder_and_validates_its_result() {
+        exc::init();
+        extern "C" fn index_probe(_argv: *const i64) -> i64 {
+            value::encode_int(7).expect("representable")
+        }
+        let method = value::function_new(
+            index_probe as *const () as usize,
+            1,
+            "__index__".to_string(),
+        );
+        let methods = vec![("__index__".to_string(), method)];
+        let class = value::class_new("Indexable".to_string(), NONE, methods);
+        let instance = value::instance_new(class);
+        assert_eq!(as_int(call("operator", "index", &[instance])), 7);
+        assert!(!exc::pending());
+
+        // A non-int `__index__` result is rejected with CPython's wording.
+        exc::init();
+        extern "C" fn bad_index_probe(_argv: *const i64) -> i64 {
+            value::str_from_bytes(b"seven")
+        }
+        let bad_method = value::function_new(
+            bad_index_probe as *const () as usize,
+            1,
+            "__index__".to_string(),
+        );
+        let bad_class = value::class_new(
+            "BadIndexable".to_string(),
+            NONE,
+            vec![("__index__".to_string(), bad_method)],
+        );
+        let bad = value::instance_new(bad_class);
+        assert_eq!(call("operator", "index", &[bad]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "__index__ returned non-int (type str)");
+
+        // Objects without `__index__` report their type, ordinary values too.
+        exc::init();
+        let plain = value::instance_new(value::class_new("Plain".to_string(), NONE, Vec::new()));
+        assert_eq!(call("operator", "index", &[plain]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "'Plain' object cannot be interpreted as an integer"
+        );
+
+        exc::init();
+        assert_eq!(call("operator", "index", &[string("x")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "'str' object cannot be interpreted as an integer"
+        );
+
+        exc::init();
+        assert_eq!(call("operator", "index", &[value::float_new(1.5)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "'float' object cannot be interpreted as an integer"
+        );
+    }
+
+    #[test]
     fn time_functions_and_sleep() {
         exc::init();
         let start = as_float(call("time", "perf_counter", &[]));
@@ -11267,6 +11713,223 @@ mod tests {
         assert_eq!(method(suppress, "__enter__", &[]), NONE);
         // `None` is falsy: the manager never suppresses the block exception.
         assert_eq!(method(suppress, "__exit__", &[NONE, NONE, NONE]), NONE);
+    }
+
+    // Generator bodies for the `contextmanager` tests. A generator function
+    // value is created with `FUNCTION_FLAG_GENERATOR`, so calling it produces
+    // a fiber whose body runs these entry points on the fiber stack.
+    extern "C" fn cm_yield_once(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(int(1));
+        NONE
+    }
+
+    extern "C" fn cm_yield_twice(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(int(1));
+        crate::fiber::yield_value(int(2));
+        NONE
+    }
+
+    extern "C" fn cm_yield_nothing(_argv: *const i64) -> i64 {
+        NONE
+    }
+
+    extern "C" fn cm_echo(argv: *const i64) -> i64 {
+        // SAFETY: the decorator test calls the generator function with exactly
+        // one positional (or bound keyword) argument.
+        let value = unsafe { *argv };
+        crate::fiber::yield_value(value);
+        NONE
+    }
+
+    extern "C" fn cm_swallow_yield(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(int(1));
+        // `except Exception: pass`: the thrown exception surfaces as the
+        // pending exception at the suspension point.
+        if exc::pending() {
+            let _ = exc::clear();
+        }
+        NONE
+    }
+
+    extern "C" fn cm_propagate_yield(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(int(1));
+        // Leave the injected exception pending: it escapes the generator.
+        NONE
+    }
+
+    extern "C" fn cm_swallow_then_yield(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(int(1));
+        if exc::pending() {
+            let _ = exc::clear();
+        }
+        crate::fiber::yield_value(int(2));
+        NONE
+    }
+
+    extern "C" fn cm_swallow_then_raise(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(int(1));
+        if exc::pending() {
+            let _ = exc::clear();
+        }
+        exc::raise_with_message(VALUE_ERROR, "from generator");
+        NONE
+    }
+
+    extern "C" fn cm_not_a_generator(_argv: *const i64) -> i64 {
+        int(7)
+    }
+
+    /// A generator function value produced by the given fiber entry point.
+    fn generator_function(
+        entry: extern "C" fn(*const i64) -> i64,
+        arity: usize,
+        name: &str,
+    ) -> i64 {
+        value::function_new_with_flags(
+            entry as usize,
+            arity,
+            name.to_string(),
+            value::FUNCTION_FLAG_GENERATOR,
+        )
+    }
+
+    /// Applies `contextlib.contextmanager` to `function` and calls the
+    /// resulting decorator value with `args`.
+    fn contextmanager_manager(function: i64, args: &[i64]) -> i64 {
+        let decorator = call("contextlib", "contextmanager", &[function]);
+        assert!(!exc::pending(), "{}", message());
+        let manager = call_value(decorator, args);
+        assert!(!exc::pending(), "{}", message());
+        manager
+    }
+
+    /// A detached exception value, leaving no pending exception behind.
+    fn exception(tag: u32, text: &str) -> i64 {
+        exc::raise_with_message(tag, text);
+        let value = exc::pending_value();
+        let _ = exc::clear();
+        value
+    }
+
+    #[test]
+    fn contextlib_contextmanager_enter_advances_and_exit_finishes() {
+        exc::init();
+        let manager = contextmanager_manager(generator_function(cm_yield_once, 0, "once"), &[]);
+        assert_eq!(
+            value::class_display_name(
+                value::instance_class_value(manager).expect("context manager instance")
+            ),
+            Some("_GeneratorContextManager")
+        );
+        assert_eq!(as_int(method(manager, "__enter__", &[])), 1);
+        assert!(!exc::pending(), "{}", message());
+        // The normal exit resumes the generator; it returns, so nothing is
+        // suppressed.
+        assert_eq!(method(manager, "__exit__", &[NONE, NONE, NONE]), FALSE);
+        assert!(!exc::pending(), "{}", message());
+
+        // Each decorated call owns a fresh generator: the same decorator can
+        // be used again.
+        let second = contextmanager_manager(generator_function(cm_yield_once, 0, "once"), &[]);
+        assert_eq!(as_int(method(second, "__enter__", &[])), 1);
+        assert_eq!(method(second, "__exit__", &[NONE, NONE, NONE]), FALSE);
+    }
+
+    #[test]
+    fn contextlib_contextmanager_reports_didnt_yield_and_didnt_stop() {
+        exc::init();
+        let empty = contextmanager_manager(generator_function(cm_yield_nothing, 0, "nothing"), &[]);
+        assert_eq!(method(empty, "__enter__", &[]), NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::RUNTIME_ERROR as i64);
+        assert_eq!(message(), "generator didn't yield");
+
+        exc::init();
+        let twice = contextmanager_manager(generator_function(cm_yield_twice, 0, "twice"), &[]);
+        assert_eq!(as_int(method(twice, "__enter__", &[])), 1);
+        assert_eq!(method(twice, "__exit__", &[NONE, NONE, NONE]), NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::RUNTIME_ERROR as i64);
+        assert_eq!(message(), "generator didn't stop");
+        // The error path closed the suspended generator.
+        assert!(crate::fiber::is_done(
+            value::instance_attr(twice, "gen").expect("generator")
+        ));
+    }
+
+    #[test]
+    fn contextlib_contextmanager_exit_throws_the_block_exception() {
+        exc::init();
+        let swallowing =
+            contextmanager_manager(generator_function(cm_swallow_yield, 0, "swallow"), &[]);
+        assert_eq!(as_int(method(swallowing, "__enter__", &[])), 1);
+        let boom = exception(VALUE_ERROR, "boom");
+        // The generator handled the exception and returned: suppress it.
+        assert_eq!(method(swallowing, "__exit__", &[NONE, boom, NONE]), TRUE);
+        assert!(!exc::pending(), "{}", message());
+
+        exc::init();
+        let propagating =
+            contextmanager_manager(generator_function(cm_propagate_yield, 0, "propagate"), &[]);
+        assert_eq!(as_int(method(propagating, "__enter__", &[])), 1);
+        let boom = exception(VALUE_ERROR, "boom");
+        // The same exception escapes the generator: do not suppress it. The
+        // `with` lowering re-raises the exception it is still holding.
+        assert_eq!(method(propagating, "__exit__", &[NONE, boom, NONE]), FALSE);
+        assert!(!exc::pending(), "{}", message());
+
+        exc::init();
+        let raising =
+            contextmanager_manager(generator_function(cm_swallow_then_raise, 0, "raising"), &[]);
+        assert_eq!(as_int(method(raising, "__enter__", &[])), 1);
+        let boom = exception(VALUE_ERROR, "boom");
+        // A different exception from the generator propagates unchanged.
+        assert_eq!(method(raising, "__exit__", &[NONE, boom, NONE]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "from generator");
+    }
+
+    #[test]
+    fn contextlib_contextmanager_reports_a_generator_that_keeps_going_after_throw() {
+        exc::init();
+        let manager = contextmanager_manager(
+            generator_function(cm_swallow_then_yield, 0, "stubborn"),
+            &[],
+        );
+        assert_eq!(as_int(method(manager, "__enter__", &[])), 1);
+        let boom = exception(VALUE_ERROR, "boom");
+        assert_eq!(method(manager, "__exit__", &[NONE, boom, NONE]), NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::RUNTIME_ERROR as i64);
+        assert_eq!(message(), "generator didn't stop after throw()");
+    }
+
+    #[test]
+    fn contextlib_contextmanager_forwards_positional_and_keyword_arguments() {
+        exc::init();
+        let manager = contextmanager_manager(generator_function(cm_echo, 1, "echo"), &[int(5)]);
+        assert_eq!(as_int(method(manager, "__enter__", &[])), 5);
+        assert_eq!(method(manager, "__exit__", &[NONE, NONE, NONE]), FALSE);
+
+        exc::init();
+        let function = generator_function(cm_echo, 1, "echo");
+        value::function_set_params(function, vec!["value".to_string()]);
+        let decorator = call("contextlib", "contextmanager", &[function]);
+        assert!(!exc::pending(), "{}", message());
+        let words = [string("value"), int(9)];
+        let manager =
+            crate::core::builtins::call_kw(decorator, 0, std::ptr::null(), 1, words.as_ptr());
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(as_int(method(manager, "__enter__", &[])), 9);
+        assert_eq!(method(manager, "__exit__", &[NONE, NONE, NONE]), FALSE);
+    }
+
+    #[test]
+    fn contextlib_contextmanager_rejects_a_non_generator_result() {
+        exc::init();
+        let entry: extern "C" fn(*const i64) -> i64 = cm_not_a_generator;
+        let plain = value::function_new(entry as usize, 0, "plain".to_string());
+        let manager = contextmanager_manager(plain, &[]);
+        assert_eq!(method(manager, "__enter__", &[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "'int' object is not a generator");
     }
 
     #[test]

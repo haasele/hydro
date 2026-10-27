@@ -380,6 +380,7 @@ fn module_level_try_import_binds_a_preloaded_submodule() {
             name: "pkg.sub".to_string(),
             exports: HashMap::from([("value".to_string(), UserExport::Function(9))]),
             all: None,
+            dynamic_globals: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -444,6 +445,7 @@ fn module_level_conditional_imports_bind_top_level_and_defer_absent_modules() {
             name: "pkg.core".to_string(),
             exports: HashMap::from([("value".to_string(), UserExport::Function(9))]),
             all: None,
+            dynamic_globals: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -546,6 +548,17 @@ fn user_module(name: &str, exports: &[(&str, UserExport)]) -> UserModule {
             .map(|(member, export)| (member.to_string(), *export))
             .collect(),
         all: None,
+        dynamic_globals: false,
+    }
+}
+
+/// Like [`user_module`], for a module that installs names into its own
+/// namespace at runtime (`globals()[key] = value`), so its export table is
+/// incomplete.
+fn dynamic_user_module(name: &str, exports: &[(&str, UserExport)]) -> UserModule {
+    UserModule {
+        dynamic_globals: true,
+        ..user_module(name, exports)
     }
 }
 
@@ -824,6 +837,7 @@ fn user_star_import_exports_public_names_only() {
                 ("_private".to_string(), UserExport::Global),
             ]),
             all: None,
+            dynamic_globals: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -850,6 +864,7 @@ fn user_star_import_exports_public_names_only() {
             name: "helper".to_string(),
             exports: HashMap::from([("_private".to_string(), UserExport::Global)]),
             all: None,
+            dynamic_globals: false,
         },
     )]));
     let _ = lowerer.lower_module(&parse(source));
@@ -877,6 +892,7 @@ fn user_star_import_honors_a_literal_all() {
                 ("drop".to_string(), UserExport::Function(2)),
             ]),
             all: Some(vec!["keep".to_string()]),
+            dynamic_globals: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -902,6 +918,7 @@ fn user_star_import_honors_a_literal_all() {
                 ("drop".to_string(), UserExport::Function(2)),
             ]),
             all: Some(vec!["keep".to_string()]),
+            dynamic_globals: false,
         },
     )]));
     let _ = lowerer.lower_module(&parse(source));
@@ -1062,6 +1079,7 @@ fn user_star_import_is_mirrored_into_module_globals() {
                 ("_private".to_string(), UserExport::Global),
             ]),
             all: None,
+            dynamic_globals: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -4196,9 +4214,18 @@ fn lambda_lowers_to_a_synthetic_function_reference() {
 }
 
 #[test]
-fn lambda_rejects_defaults_and_variadic_parameters() {
+fn lambda_defaults_lower_like_function_defaults() {
+    let source = "f = lambda x=1: x\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let lambda = function(&hir, "<lambda>");
+    assert_eq!(lambda.params.len(), 1);
+    assert_eq!(lambda.params[0].default, Some(Const::Int(1)));
+}
+
+#[test]
+fn lambda_rejects_variadic_parameters() {
     for (source, expected) in [
-        ("f = lambda x=1: x\n", "default"),
         ("f = lambda *args: args\n", "varargs"),
         ("f = lambda *, x: x\n", "keyword-only"),
         ("f = lambda **kwargs: kwargs\n", "kwargs"),
@@ -4211,6 +4238,318 @@ fn lambda_rejects_defaults_and_variadic_parameters() {
             diags[0].message
         );
     }
+}
+
+/// The binder function of the first capturing lambda, the lambda function it
+/// closes over and the capture slots the binder forwards.
+fn capturing_lambda(hir: &LHir) -> (&HFunction, &HFunction, Vec<LocalId>) {
+    let binder = hir
+        .functions
+        .iter()
+        .find(|function| function.name == "<lambda.bind>")
+        .expect("a capturing lambda creates its closure");
+    let HStmtKind::Closure {
+        function, captures, ..
+    } = &binder.body[0].kind
+    else {
+        panic!("expected the closure statement, got {:?}", binder.body[0]);
+    };
+    let lambda = &hir.functions[*function as usize];
+    (lambda, binder, captures.clone())
+}
+
+#[test]
+fn lambda_captures_enclosing_locals() {
+    // A lambda closes over the enclosing function's bindings exactly like a
+    // nested `def`: the captured names lead the synthetic function's
+    // parameters and the closure value is created where the lambda is
+    // evaluated.
+    let source = "def shape(base, extra):\n    return lambda x: base + x + extra\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let (lambda, binder, forwarded) = capturing_lambda(&hir);
+    assert_eq!(lambda.name, "<lambda>");
+    assert_eq!(lambda.capture_count, 2);
+    assert_eq!(
+        lambda
+            .params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["base", "extra", "x"]
+    );
+    assert_eq!(binder.params.len(), 2);
+    assert_eq!(forwarded, vec![0, 1]);
+
+    // The body reads the captured slots: `(base + x) + extra`. Nothing
+    // rebinds them, so they are plain values here.
+    let HStmtKind::Return(Some(body)) = &lambda.body[0].kind else {
+        panic!("expected the lambda return, got {:?}", lambda.body[0]);
+    };
+    let HExprKind::Bin { lhs, rhs, .. } = &body.kind else {
+        panic!("expected an addition, got {:?}", body.kind);
+    };
+    assert!(matches!(&rhs.kind, HExprKind::Local(1)), "{:?}", rhs.kind);
+    let HExprKind::Bin { lhs, rhs, .. } = &lhs.kind else {
+        panic!("expected an addition, got {:?}", lhs.kind);
+    };
+    assert!(matches!(&lhs.kind, HExprKind::Local(0)), "{:?}", lhs.kind);
+    assert!(matches!(&rhs.kind, HExprKind::Local(2)), "{:?}", rhs.kind);
+
+    // `shape` evaluates the lambda by calling the binder with both capture
+    // slots; the binder builds the closure from them.
+    let shape = function(&hir, "shape");
+    let HStmtKind::Return(Some(value)) = &shape.body[0].kind else {
+        panic!("expected the return, got {:?}", shape.body[0]);
+    };
+    let HExprKind::Call {
+        callee: Callee::Function(binder_id),
+        args,
+    } = &value.kind
+    else {
+        panic!("expected a binder call, got {:?}", value.kind);
+    };
+    assert_eq!(
+        *binder_id as usize,
+        hir.functions
+            .iter()
+            .position(|function| function.name == "<lambda.bind>")
+            .expect("binder")
+    );
+    assert_eq!(args.len(), 2);
+    assert!(
+        matches!(&args[0].kind, HExprKind::Local(0)),
+        "{:?}",
+        args[0].kind
+    );
+    assert!(
+        matches!(&args[1].kind, HExprKind::Local(1)),
+        "{:?}",
+        args[1].kind
+    );
+}
+
+#[test]
+fn lambda_capture_reads_a_rebound_local_through_its_cell() {
+    // CPython keeps the binding, not the value: reassigning `n` after the
+    // lambda was created is visible to the closure, so the local is a cell.
+    let source = "def counter():\n    n = 0\n    peek = lambda: n\n    n = 2\n    return peek()\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let lambda = function(&hir, "<lambda>");
+    assert_eq!(lambda.capture_count, 1);
+    let HStmtKind::Return(Some(body)) = &lambda.body[0].kind else {
+        panic!("expected the lambda return, got {:?}", lambda.body[0]);
+    };
+    assert!(
+        matches!(&body.kind, HExprKind::CellGet(0)),
+        "the captured local must be read through its cell, got {:?}",
+        body.kind
+    );
+
+    // The enclosing function owns the cell and stores through it, so the
+    // lambda observes the later assignment.
+    let counter = function(&hir, "counter");
+    assert!(
+        counter
+            .body
+            .iter()
+            .any(|stmt| matches!(&stmt.kind, HStmtKind::CellInit { .. })),
+        "{:?}",
+        counter.body
+    );
+    assert!(
+        counter
+            .body
+            .iter()
+            .any(|stmt| matches!(&stmt.kind, HStmtKind::CellAssign { .. })),
+        "{:?}",
+        counter.body
+    );
+}
+
+#[test]
+fn nested_lambdas_close_over_the_same_binding() {
+    let source = "def outer(base):\n    return lambda: (lambda: base + 1)()\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let lambdas: Vec<&HFunction> = hir
+        .functions
+        .iter()
+        .filter(|function| function.name == "<lambda>")
+        .collect();
+    assert_eq!(lambdas.len(), 2, "{:?}", hir.functions.len());
+    // The inner lambda captures the outer lambda's captured parameter, so an
+    // intermediate scope passes the binding through.
+    assert!(lambdas.iter().all(|lambda| lambda.capture_count == 1));
+    assert_eq!(
+        hir.functions
+            .iter()
+            .filter(|function| function.name == "<lambda.bind>")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn lambda_captures_a_class_instance() {
+    let source = "\
+class Point:
+    def __init__(self, x):
+        self.x = x
+
+def make(point):
+    return lambda: point.x
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let lambda = function(&hir, "<lambda>");
+    assert_eq!(lambda.capture_count, 1);
+    assert_eq!(lambda.params[0].name, "point");
+    let HStmtKind::Return(Some(body)) = &lambda.body[0].kind else {
+        panic!("expected the lambda return, got {:?}", lambda.body[0]);
+    };
+    let HExprKind::GetAttr { object, name } = &body.kind else {
+        panic!("expected an attribute read, got {:?}", body.kind);
+    };
+    assert_eq!(name, "x");
+    assert!(
+        matches!(&object.kind, HExprKind::Local(0)),
+        "the instance must come from the capture slot, got {:?}",
+        object.kind
+    );
+}
+
+#[test]
+fn module_level_lambdas_read_module_globals() {
+    // A module body is not a closure scope: the lambda reads the global table,
+    // and the module body mirrors the binding for it.
+    let source = "x = 1\nf = lambda: x\ny = f()\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let lambda = function(&hir, "<lambda>");
+    assert_eq!(lambda.capture_count, 0);
+    let HStmtKind::Return(Some(body)) = &lambda.body[0].kind else {
+        panic!("expected the lambda return, got {:?}", lambda.body[0]);
+    };
+    assert!(
+        matches!(
+            &body.kind,
+            HExprKind::GlobalGet { module, name } if module == "__main__" && name == "x"
+        ),
+        "a module-level lambda reads the module global, got {:?}",
+        body.kind
+    );
+    assert!(
+        binds_module_global(&hir.functions[0].body, "x"),
+        "the assignment must be mirrored for the lambda: {:?}",
+        hir.functions[0].body
+    );
+}
+
+#[test]
+fn lambda_can_still_call_its_parameters_and_named_functions() {
+    let source =
+        "def double(value):\n    return value * 2\nf = lambda fn: fn(1)\ng = lambda: double(2)\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn dynamic_module_member_imports_bind_at_runtime() {
+    // NumPy's `numerictypes` installs its scalar classes by writing
+    // `globals()[key] = ...`, so `arrayprint` imports names no static export
+    // table can list. Their reads must bind to the source module's runtime
+    // global table instead of failing the check.
+    let source =
+        "from numpy._core.numerictypes import complex128, flexible\nx = complex128\ny = flexible(1)\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "numpy._core.numerictypes".to_string(),
+        dynamic_user_module(
+            "numpy._core.numerictypes",
+            &[("ScalarType", UserExport::Global)],
+        ),
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    assert!(
+        matches!(
+            &assigned(&hir, "x").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "numpy._core.numerictypes" && name == "complex128"
+        ),
+        "an unknown name of a dynamic module reads its global table: {:?}",
+        assigned(&hir, "x").kind
+    );
+    let HExprKind::CallKw { callee, .. } = &assigned(&hir, "y").kind else {
+        panic!("expected a call, got {:?}", assigned(&hir, "y").kind);
+    };
+    assert!(
+        matches!(
+            &callee.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "numpy._core.numerictypes" && name == "flexible"
+        ),
+        "a dynamic callee is read from the module table too: {:?}",
+        callee.kind
+    );
+}
+
+#[test]
+fn dynamic_package_self_import_binds_at_runtime() {
+    // A package `__init__.py` that installs names through `globals()` may
+    // import its own attributes with `from . import name`; the name is not a
+    // static export, so it reads the package's global table.
+    let source = "globals()['late'] = 3\nfrom . import late\nx = late\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "pkg/__init__.py", &mut infer);
+    lowerer.set_dunder_name("pkg");
+    lowerer.set_package("pkg");
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            &assigned(&hir, "x").kind,
+            HExprKind::GlobalGet { module, name } if module == "pkg" && name == "late"
+        ),
+        "the package reads its own dynamic attribute: {:?}",
+        assigned(&hir, "x").kind
+    );
+}
+
+#[test]
+fn ordinary_module_member_typos_still_fail_at_compile_time() {
+    // A module that never writes its namespace keeps the static diagnostic.
+    let source = "from helper import missing\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_user_modules(HashMap::from([(
+        "helper".to_string(),
+        user_module("helper", &[("present", UserExport::Global)]),
+    )]));
+    let _ = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::ATTRIBUTE);
+    assert!(
+        diags[0]
+            .message
+            .contains("does not export a function named 'missing'"),
+        "{diags:?}"
+    );
 }
 
 #[test]
@@ -4469,24 +4808,6 @@ fn emitted_varargs_parameters_keep_defaults_and_kinds() {
     assert_eq!(f.params[2].kind, ParamKind::KwArg);
     assert!(f.has_dynamic_signature());
     assert_eq!(f.call_arity(), 0);
-}
-
-#[test]
-fn lambda_captures_are_rejected_as_closures() {
-    let source = "x = 1\nf = lambda: x\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert!(
-        diags[0]
-            .message
-            .contains("closures are not supported yet; lambda can only use its parameters"),
-        "{diags:?}"
-    );
-
-    // A parameter must still be callable inside the lambda.
-    let source = "f = lambda fn: fn(1)\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert!(diags.is_empty(), "{diags:?}");
 }
 
 #[test]
@@ -6553,18 +6874,415 @@ fn nested_functions_propagate_captures_through_intermediate_scopes() {
     assert_eq!(captures, &vec![x_local]);
 }
 
+/// Asserts that `expr` calls the function value held in `local`'s closure
+/// cell. A plain positional call to a name bound to a function value lowers
+/// either to the historic `IndirectCall` node or to the keyword-capable
+/// `CallKw` node with no keywords; both evaluate the callee as the `CellGet`
+/// read. A statically linked callee keeps the direct `Call` shape.
+fn assert_call_through_cell(expr: &HExpr, local: LocalId, context: &str) {
+    let callee = match &expr.kind {
+        HExprKind::IndirectCall { callee, .. } => callee,
+        HExprKind::CallKw {
+            callee, keywords, ..
+        } if keywords.is_empty() => callee,
+        HExprKind::Call { .. } => return,
+        other => panic!("{context}: expected a call, got {other:?}"),
+    };
+    assert!(
+        matches!(callee.kind, HExprKind::CellGet(slot) if slot == local),
+        "{context}: the call must read the cell, got {:?}",
+        callee.kind
+    );
+}
+
 #[test]
-fn recursive_nested_functions_are_rejected() {
-    let source = "def outer(x):\n    def inner(y):\n        return inner(y)\n    return inner\n";
+fn recursive_nested_function_shares_a_cell_with_its_own_closure() {
+    let source = "\
+def make(n):
+    def fact(k):
+        if k <= 1:
+            return 1
+        return k * fact(k - 1)
+    return fact(n)
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "make");
+    let fact_local = outer
+        .locals
+        .iter()
+        .position(|local| local.name == "fact")
+        .expect("nested function local fact") as LocalId;
+
+    // The `def` binding is a cell allocated at entry, so the closure can
+    // capture it before it holds anything and the definition fills it in.
+    assert!(
+        matches!(
+            &outer.body[0].kind,
+            HStmtKind::CellInit { target, value } if *target == fact_local && value.is_none()
+        ),
+        "expected the entry cell for fact, got {:?}",
+        outer.body[0].kind
+    );
+
+    let HStmtKind::If { then_body, .. } = &outer.body[1].kind else {
+        panic!(
+            "expected the definition block, got {:?}",
+            outer.body[1].kind
+        );
+    };
+    let HStmtKind::Closure {
+        target,
+        function: fid,
+        captures,
+    } = &then_body[0].kind
+    else {
+        panic!("expected the closure, got {:?}", then_body[0].kind);
+    };
+    assert_ne!(
+        *target, fact_local,
+        "the closure value must not overwrite the cell in its slot"
+    );
+    assert_eq!(captures, &vec![fact_local]);
+    assert!(
+        matches!(&then_body[1].kind, HStmtKind::CellAssign { target, .. } if *target == fact_local),
+        "the definition must store through the cell, got {:?}",
+        then_body[1].kind
+    );
+
+    // The enclosing scope reads the recursive name through the same cell.
+    let HStmtKind::Return(Some(value)) = &outer.body[2].kind else {
+        panic!("expected the returned call, got {:?}", outer.body[2].kind);
+    };
+    assert_call_through_cell(value, fact_local, "enclosing recursive call");
+
+    // Inside the nested function the recursive call reads the captured cell.
+    let fact = &hir.functions[*fid as usize];
+    assert_eq!(fact.capture_count, 1);
+    assert_eq!(fact.params[0].name, "fact");
+    let HStmtKind::Return(Some(value)) = &fact.body[1].kind else {
+        panic!("expected the recursive return, got {:?}", fact.body[1].kind);
+    };
+    let HExprKind::Bin { rhs, .. } = &value.kind else {
+        panic!("expected the recursive product, got {:?}", value.kind);
+    };
+    assert_call_through_cell(rhs, fact.params[0].local, "recursive call");
+}
+
+#[test]
+fn recursive_nested_function_observes_the_binding_after_the_outer_returns() {
+    let source = "\
+def build():
+    def countdown(n):
+        if n <= 0:
+            return 0
+        return countdown(n - 1) + 1
+    return countdown
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "build");
+    let countdown_local = outer
+        .locals
+        .iter()
+        .position(|local| local.name == "countdown")
+        .expect("nested function local countdown") as LocalId;
+    assert!(
+        matches!(&outer.body[0].kind, HStmtKind::CellInit { target, .. } if *target == countdown_local),
+        "expected the entry cell, got {:?}",
+        outer.body[0].kind
+    );
+
+    // The closure captures the cell itself, and returning the function reads
+    // that same cell, so the value created while the outer frame was alive
+    // stays reachable after it returns.
+    let HStmtKind::If { then_body, .. } = &outer.body[1].kind else {
+        panic!(
+            "expected the definition block, got {:?}",
+            outer.body[1].kind
+        );
+    };
+    let HStmtKind::Closure { captures, .. } = &then_body[0].kind else {
+        panic!("expected the closure, got {:?}", then_body[0].kind);
+    };
+    assert_eq!(captures, &vec![countdown_local]);
+
+    let HStmtKind::Return(Some(value)) = &outer.body[2].kind else {
+        panic!(
+            "expected the returned function, got {:?}",
+            outer.body[2].kind
+        );
+    };
+    assert!(
+        matches!(value.kind, HExprKind::CellGet(local) if local == countdown_local),
+        "returning the recursive function must read the cell, got {:?}",
+        value.kind
+    );
+
+    let countdown = function(&hir, "build.countdown");
+    assert_eq!(countdown.capture_count, 1);
+    assert_eq!(countdown.params[0].name, "countdown");
+}
+
+#[test]
+fn sibling_nested_functions_support_mutual_recursion() {
+    let source = "\
+def outer(n):
+    def even(k):
+        if k == 0:
+            return True
+        return odd(k - 1)
+    def odd(k):
+        if k == 0:
+            return False
+        return even(k - 1)
+    return even(n)
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "outer");
+    let local = |name: &str| {
+        outer
+            .locals
+            .iter()
+            .position(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("no local '{name}'")) as LocalId
+    };
+    let even_local = local("even");
+    let odd_local = local("odd");
+
+    // Both bindings are cells created at entry, so each closure captures the
+    // sibling's cell before either `def` ran.
+    assert!(
+        matches!(&outer.body[0].kind, HStmtKind::CellInit { target, value } if *target == even_local && value.is_none()),
+        "expected the entry cell for even, got {:?}",
+        outer.body[0].kind
+    );
+    assert!(
+        matches!(&outer.body[1].kind, HStmtKind::CellInit { target, value } if *target == odd_local && value.is_none()),
+        "expected the entry cell for odd, got {:?}",
+        outer.body[1].kind
+    );
+
+    let HStmtKind::If { then_body, .. } = &outer.body[2].kind else {
+        panic!("expected the even definition, got {:?}", outer.body[2].kind);
+    };
+    let HStmtKind::Closure { captures, .. } = &then_body[0].kind else {
+        panic!("expected the even closure, got {:?}", then_body[0].kind);
+    };
+    assert_eq!(captures, &vec![odd_local]);
+
+    let HStmtKind::If { then_body, .. } = &outer.body[3].kind else {
+        panic!("expected the odd definition, got {:?}", outer.body[3].kind);
+    };
+    let HStmtKind::Closure { captures, .. } = &then_body[0].kind else {
+        panic!("expected the odd closure, got {:?}", then_body[0].kind);
+    };
+    assert_eq!(captures, &vec![even_local]);
+
+    let even = function(&hir, "outer.even");
+    assert_eq!(even.capture_count, 1);
+    assert_eq!(even.params[0].name, "odd");
+    let odd = function(&hir, "outer.odd");
+    assert_eq!(odd.capture_count, 1);
+    assert_eq!(odd.params[0].name, "even");
+
+    let HStmtKind::Return(Some(value)) = &even.body[1].kind else {
+        panic!("expected the sibling call, got {:?}", even.body[1].kind);
+    };
+    assert_call_through_cell(value, even.params[0].local, "sibling call");
+}
+
+#[test]
+fn recursive_nested_function_captures_cells_and_values_together() {
+    let source = "\
+def outer(step):
+    count = 0
+    def add(n):
+        nonlocal count
+        count += 1
+        if n <= 0:
+            return count + step
+        return add(n - 1)
+    return add
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "outer");
+    let local = |name: &str| {
+        outer
+            .locals
+            .iter()
+            .position(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("no local '{name}'")) as LocalId
+    };
+    let step_local = local("step");
+    let count_local = local("count");
+    let add_local = local("add");
+
+    // `count` and the recursive name `add` are cells; `step` is read-only and
+    // keeps by-value capture, exactly like a closure without recursion.
+    assert!(
+        matches!(&outer.body[0].kind, HStmtKind::CellInit { target, value } if *target == count_local && value.is_none()),
+        "expected the entry cell for count, got {:?}",
+        outer.body[0].kind
+    );
+    assert!(
+        matches!(&outer.body[1].kind, HStmtKind::CellInit { target, value } if *target == add_local && value.is_none()),
+        "expected the entry cell for add, got {:?}",
+        outer.body[1].kind
+    );
+    let HStmtKind::If { then_body, .. } = &outer.body[3].kind else {
+        panic!(
+            "expected the definition block, got {:?}",
+            outer.body[3].kind
+        );
+    };
+    let HStmtKind::Closure { captures, .. } = &then_body[0].kind else {
+        panic!("expected the closure, got {:?}", then_body[0].kind);
+    };
+    assert_eq!(captures, &vec![count_local, step_local, add_local]);
+
+    let add = function(&hir, "outer.add");
+    assert_eq!(add.capture_count, 3);
+    let names: Vec<&str> = add.params.iter().map(|param| param.name.as_str()).collect();
+    // The capture parameters come first in first-use order. `n` is `add`'s own
+    // positional parameter and follows them; the recursive name is reached
+    // through the captured cell, never through that parameter.
+    assert_eq!(names, vec!["count", "step", "add", "n"]);
+    let capture_names: Vec<&str> = names[..add.capture_count].to_vec();
+    assert_eq!(capture_names, vec!["count", "step", "add"]);
+    assert!(matches!(&add.body[0].kind, HStmtKind::CellAssign { .. }));
+
+    let HStmtKind::If { then_body, .. } = &add.body[1].kind else {
+        panic!("expected the base-case branch, got {:?}", add.body[1].kind);
+    };
+    let HStmtKind::Return(Some(value)) = &then_body[0].kind else {
+        panic!("expected the base-case return, got {:?}", then_body[0].kind);
+    };
+    let HExprKind::Bin { lhs, rhs, .. } = &value.kind else {
+        panic!("expected the base-case sum, got {:?}", value.kind);
+    };
+    assert!(matches!(lhs.kind, HExprKind::CellGet(_)), "{:?}", lhs.kind);
+    assert!(
+        matches!(rhs.kind, HExprKind::Local(local) if local == add.params[1].local),
+        "the read-only capture keeps by-value semantics, got {:?}",
+        rhs.kind
+    );
+}
+
+#[test]
+fn recursive_nested_function_in_a_loop_gets_a_fresh_cell_per_iteration() {
+    let source = "\
+def outer(n):
+    fns = []
+    for i in range(n):
+        def step(k):
+            if k <= 0:
+                return i
+            return step(k - 1)
+        fns.append(step)
+    return fns
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "outer");
+    let local = |name: &str| {
+        outer
+            .locals
+            .iter()
+            .position(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("no local '{name}'")) as LocalId
+    };
+    let i_local = local("i");
+    let step_local = local("step");
+
+    // The loop body re-creates the recursion cell, so a closure from one
+    // iteration never shares its binding with the next iteration.
+    let HStmtKind::ForRange { body, .. } = &outer.body[2].kind else {
+        panic!("expected the range loop, got {:?}", outer.body[2].kind);
+    };
+    assert!(
+        matches!(&body[0].kind, HStmtKind::CellInit { target, value } if *target == step_local && value.is_none()),
+        "expected a fresh cell at the top of the iteration, got {:?}",
+        body[0].kind
+    );
+    let HStmtKind::If { then_body, .. } = &body[1].kind else {
+        panic!("expected the definition block, got {:?}", body[1].kind);
+    };
+    let HStmtKind::Closure { captures, .. } = &then_body[0].kind else {
+        panic!("expected the step closure, got {:?}", then_body[0].kind);
+    };
+    // `i` stays a by-value capture of the current iteration; `step` is the
+    // per-iteration cell the recursive call reads.
+    assert_eq!(captures, &vec![i_local, step_local]);
+
+    let step = function(&hir, "outer.step");
+    assert_eq!(step.capture_count, 2);
+    let names: Vec<&str> = step
+        .params
+        .iter()
+        .map(|param| param.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["i", "step", "k"]);
+}
+
+#[test]
+fn recursive_reference_to_an_unbound_name_is_a_name_error() {
+    let source =
+        "def outer():\n    def inner(n):\n        return missing(n - 1)\n    return inner\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0].message.contains("name 'missing' is not defined"),
+        "{diags:?}"
+    );
+    assert_eq!(diags[0].code, codes::NAME);
+}
+
+#[test]
+fn nested_function_rebinding_its_own_name_does_not_capture_a_cell() {
+    let source =
+        "def outer(v):\n    def inner(n):\n        inner = n\n        return inner\n    return inner\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "outer");
+    let inner_local = outer
+        .locals
+        .iter()
+        .position(|local| local.name == "inner")
+        .expect("nested function local inner") as LocalId;
+    // The body never reads the enclosing binding, so no cell is needed and the
+    // closure value goes straight into the slot.
+    assert!(
+        matches!(&outer.body[0].kind, HStmtKind::Closure { target, .. } if *target == inner_local),
+        "a non-recursive definition keeps the plain local, got {:?}",
+        outer.body[0].kind
+    );
+    let inner = function(&hir, "outer.inner");
+    assert_eq!(inner.capture_count, 0);
+}
+
+#[test]
+fn recursive_nested_function_with_a_global_binding_still_reports_the_slot_error() {
+    // `global helper` gives the enclosing function no slot for the `def`, so
+    // recursion support cannot invent one; the declaration error stands.
+    let source = "def outer():\n    global helper\n    def helper(n):\n        return helper(n - 1)\n    return helper\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert!(
         diags[0]
             .message
-            .contains("recursive nested functions are not supported"),
+            .contains("nested function 'helper' has no local slot"),
         "{diags:?}"
     );
-    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert_eq!(diags[0].code, codes::DECL);
 }
 
 #[test]
@@ -7715,6 +8433,7 @@ fn module_alias_lowers_to_a_first_class_module_value() {
             name: "helper".to_string(),
             exports: HashMap::new(),
             all: None,
+            dynamic_globals: false,
         },
     )]));
     let hir = lowerer.lower_module(&parse(source));
@@ -7741,6 +8460,7 @@ fn lowerer_with_user_module<'a>(
             name: name.to_string(),
             exports,
             all: None,
+            dynamic_globals: false,
         },
     )]));
     lowerer
@@ -9096,15 +9816,11 @@ esc = lambda s: helper(s) + str(s).replace('|', '\\\\|')
         HExprKind::FunctionRef(_)
     ));
 
-    // Enclosing locals are still a closure and stay rejected.
+    // An enclosing local is a closure capture, not an error.
     let source = "def outer():\n    x = 1\n    return lambda: x + 1\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert!(
-        diags
-            .iter()
-            .any(|diag| diag.message.contains("closures are not supported yet")),
-        "{diags:?}"
-    );
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(function(&hir, "<lambda>").capture_count, 1);
 }
 
 #[test]

@@ -260,7 +260,10 @@ pub enum HStmtKind {
         value: HExpr,
     },
     /// `def inner(...)` inside a function: evaluate `captures` (current
-    /// values) and create the closure value in `target`.
+    /// values, a cell binding as the cell object) and create the closure value
+    /// in `target`. `target` is an ordinary local: a definition bound to a
+    /// cell (recursion, mutual recursion) creates the value in a hidden local
+    /// and stores it with [`HStmtKind::CellAssign`].
     Closure {
         target: LocalId,
         function: FunctionId,
@@ -908,7 +911,9 @@ struct FuncState {
     /// slot: reads lower to `GlobalGet` and writes to `GlobalSet`.
     globals: HashSet<String>,
     loop_depth: u32,
-    /// True while lowering a lambda body: only its parameters are visible.
+    /// True while lowering a lambda body. A lambda is a closure scope like a
+    /// nested function, but `yield` inside it is rejected: the synthetic
+    /// function never runs as a generator.
     in_lambda: bool,
     /// `async def` body being lowered: `await` is allowed.
     is_async: bool,
@@ -1416,6 +1421,13 @@ pub struct UserModule {
     /// string constants. `None` means the star export set is every public
     /// (non-underscore) name, like CPython without `__all__`.
     pub all: Option<Vec<String>>,
+    /// The unit installs names into its own namespace at runtime
+    /// (`globals()[...] = ...`, `vars().update(...)`), so its export table is
+    /// incomplete: `from module import name` for a name that is not in
+    /// [`Self::exports`] must bind a runtime read of the module's global table
+    /// instead of a compile-time "does not export" error. Modules that never
+    /// touch their namespace keep the static diagnostics.
+    pub dynamic_globals: bool,
 }
 
 /// Returns the literal `__all__` of a module body, if there is one.
@@ -1945,6 +1957,17 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Whether the unit writes its own namespace at runtime through
+    /// `globals()`/`vars()`, so its static export table is incomplete.
+    ///
+    /// Importers of such a module bind a member that is not in
+    /// [`Self::exported_names`] to a runtime read of that module's global
+    /// table instead of reporting a missing export, see
+    /// [`UserModule::dynamic_globals`].
+    pub fn exports_dynamic_globals(&self) -> bool {
+        self.dynamic_module_globals
+    }
+
     /// Names this unit exports to importers: top-level functions plus every
     /// module-level value mirrored into the global table (classes included).
     pub fn exported_names(&self) -> HashMap<String, UserExport> {
@@ -2030,20 +2053,23 @@ impl<'a> Lowerer<'a> {
             self.global_names.insert(name.clone());
             self.used_globals.insert(name);
         }
-        self.collect_top_imports(&module.body);
-        self.collect_nested_imports(&module.body, true, ImportScope::Module);
-
         // A module that writes its own namespace through `globals()`/`vars()`
         // (inspect.py builds its `CO_*` constants that way) installs names the
-        // static binding scan cannot see. Record it before any body is
-        // lowered so unknown module-level reads inside functions become
-        // runtime global lookups instead of compile-time errors. A module-level
-        // binding of `globals`/`vars` shadows the builtin, so only unshadowed
-        // references count.
+        // static binding scan cannot see. Record it before imports are
+        // collected and before any body is lowered so unknown module-level
+        // reads inside functions become runtime global lookups instead of
+        // compile-time errors, and so `from . import name` in a package
+        // `__init__.py` binds the same way. A module-level binding of
+        // `globals`/`vars` shadows the builtin, so only unshadowed references
+        // count; module-level import bindings are module attributes too, so
+        // they are part of that shadow set.
         let mut module_bound = self.global_names.clone();
         module_bound.extend(self.module_def_names.iter().cloned());
-        module_bound.extend(self.top_level_imports.iter().cloned());
+        collect_import_bindings(&module.body, &mut module_bound);
         self.dynamic_module_globals = module_uses_dynamic_globals(&module.body, &module_bound);
+
+        self.collect_top_imports(&module.body);
+        self.collect_nested_imports(&module.body, true, ImportScope::Module);
 
         // 2. Signatures next: forward calls and recursion are both legal.
         //    Class methods are registered here too, but only by qualified
@@ -3194,6 +3220,13 @@ impl<'a> Lowerer<'a> {
     fn collect_function_read_globals(&mut self, stmts: &[ast::Stmt]) {
         let mut names = Vec::new();
         collect_module_function_free_names(stmts, &mut names);
+        // A lambda created at module level reads module globals through the
+        // global table exactly like a function body, so the names it needs
+        // must be mirrored even when its assignment is lowered later. Lambdas
+        // inside functions are already part of the function free-name scan.
+        let mut lambda_names = HashSet::new();
+        collect_lambda_needed(stmts, &mut lambda_names);
+        names.extend(lambda_names);
         // Templates hide their interpolation loads from the AST walk.
         names.extend(self.template_free_names());
         for name in names {
@@ -3612,6 +3645,29 @@ impl<'a> Lowerer<'a> {
                             (imported.to_string(), member.to_string()),
                         );
                     }
+                    // The package itself installs names at runtime
+                    // (`globals()[...] = ...`), so a `from . import name`
+                    // naming no static export is still a legal attribute of
+                    // this module: read it from the module's own global table
+                    // when the code runs. A missing value raises at runtime,
+                    // exactly like CPython.
+                    None if self_package && self.dynamic_module_globals => {
+                        self.imported_user_globals.insert(
+                            binding.to_string(),
+                            (imported.to_string(), member.to_string()),
+                        );
+                    }
+                    // Same rule for a linked dependency that writes its
+                    // namespace at runtime: the static export table is
+                    // incomplete, so bind a runtime read of that module's
+                    // global table. Ordinary modules keep the compile-time
+                    // "does not export" diagnostic below.
+                    None if base.as_ref().is_some_and(|module| module.dynamic_globals) => {
+                        self.imported_user_globals.insert(
+                            binding.to_string(),
+                            (imported.to_string(), member.to_string()),
+                        );
+                    }
                     None if self_package && !nested => {
                         // `from . import missing` inside a module-level
                         // conditional branch: the loader recorded the absent
@@ -3997,6 +4053,14 @@ impl<'a> Lowerer<'a> {
                     self.imported_user_functions.insert(binding, id);
                 }
                 Some(UserExport::Global) => {
+                    self.imported_user_globals
+                        .insert(binding, (self.dunder_name.clone(), member));
+                }
+                // The package installs names into its own namespace at
+                // runtime, so a name it does not define statically is still a
+                // legal attribute: read it from the package's global table
+                // when the code runs.
+                None if self.dynamic_module_globals => {
                     self.imported_user_globals
                         .insert(binding, (self.dunder_name.clone(), member));
                 }
@@ -4998,12 +5062,26 @@ impl<'a> Lowerer<'a> {
         let mut mutated = HashSet::new();
         collect_scope_mutations(decl.body, &mut mutated);
         collect_nested_nonlocals(decl.body, &mut mutated);
+        // A `def`/`class` statement binds its name when it executes, so it is
+        // not a mutation in the loop-target sense, but a nested closure that
+        // reads that name still needs the shared cell: recursion reads the
+        // function's own binding, and mutual recursion reads a sibling defined
+        // later, both possibly after this scope returned.
+        let mut definition_bound = HashSet::new();
+        collect_def_binding_names(decl.body, &mut definition_bound);
         let mut needed = HashSet::new();
         collect_nested_needed(decl.body, &mut needed);
+        // A lambda is a closure scope too: a local it captures and this
+        // function rebinds must be a shared cell, or the lambda would keep the
+        // value from creation time.
+        collect_lambda_needed(decl.body, &mut needed);
         needed.extend(self.nested_function_template_names(decl.body));
         let owned = bound
             .iter()
-            .filter(|name| needed.contains(*name) && mutated.contains(*name))
+            .filter(|name| {
+                needed.contains(*name)
+                    && (mutated.contains(*name) || definition_bound.contains(*name))
+            })
             .filter(|name| !aliases.contains(*name))
             .cloned()
             .collect();
@@ -6214,6 +6292,12 @@ impl<'a> Lowerer<'a> {
     /// whose binding is a cell passes the cell itself, so reads and `nonlocal`
     /// writes observe the enclosing function's current value; other captures
     /// keep by-value semantics.
+    ///
+    /// A `def` name that a nested closure reads (the function's own name for
+    /// recursion, or a sibling defined later for mutual recursion) is a cell:
+    /// the cell plan allocates it at function entry, the closure captures the
+    /// cell and the definition stores the closure value *through* the cell, so
+    /// the call resolves after the `def` statement ran.
     fn lower_nested_function(
         &mut self,
         decl: FnDecl<'_>,
@@ -6232,8 +6316,8 @@ impl<'a> Lowerer<'a> {
         };
 
         // Depth-first free-variable analysis. Names needed by deeper nested
-        // functions are included so they can pass through this scope; lambdas
-        // and classes are separate, non-closure scopes.
+        // functions and lambdas are included so they can pass through this
+        // scope; classes are a separate, non-closure scope for their body.
         let mut loaded = Vec::new();
         collect_free_name_loads(decl.body, &mut loaded);
         // Templates are placeholder names in the AST; add the loads hidden in
@@ -6279,13 +6363,21 @@ impl<'a> Lowerer<'a> {
             nested_locals.insert(kwarg.arg.to_string());
         }
 
-        // A self-reference would capture a slot that is not assigned until
-        // after the closure is built, so treat it as unsupported recursion.
-        if loaded.iter().any(|loaded_name| loaded_name == &name) && !nested_locals.contains(&name) {
+        // A nested function that reads its own name recurses through the
+        // enclosing binding. That binding must be a cell: the cell is
+        // allocated at function entry (unbound), the closure captures the
+        // cell itself, and the `def` statement stores the closure value
+        // through the cell, so the recursive call observes it at call time
+        // (`recursion after the enclosing function returned` included). The
+        // cell plan makes every `def` name a nested closure reads a cell, so
+        // the fallback below is unreachable for a well-formed scope.
+        let self_reference =
+            loaded.iter().any(|loaded_name| loaded_name == &name) && !nested_locals.contains(&name);
+        if self_reference && !fs.is_cell(target) {
             self.error_at_code(
                 decl.range,
                 codes::UNSUPPORTED,
-                "recursive nested functions are not supported",
+                format!("recursive nested function '{name}' has no shared cell binding"),
             );
             return None;
         }
@@ -6319,7 +6411,9 @@ impl<'a> Lowerer<'a> {
 
         let function = self.fid_base + fid;
         let decorators = self.runtime_function_decorators(decl.decorators);
-        if decorators.is_empty() {
+        // A plain `def` whose binding is an ordinary local: the closure value
+        // goes straight into the slot.
+        if decorators.is_empty() && !fs.is_cell(target) {
             return Some(HStmt {
                 kind: HStmtKind::Closure {
                     target,
@@ -6330,13 +6424,23 @@ impl<'a> Lowerer<'a> {
                 col,
             });
         }
-        // Decorated nested function: evaluate the decorators top-down, create
-        // the closure in a hidden local, apply the decorators bottom-up and
-        // bind the final value to the function's name. The block statement
+        // Otherwise the slot holds a cell (recursion/mutual recursion reads
+        // the binding through it) or decorators run at runtime. Evaluate the
+        // decorators top-down, create the closure in a hidden local, apply the
+        // decorators bottom-up and bind the final value to the function's
+        // name — through the cell when the binding is one. The block statement
         // keeps this a single lowered statement.
         let mut body = Vec::new();
         let temps = self.lower_decorator_temps(&decorators, fs, &mut body);
-        let (function_temp, _) = self.hidden_temp(fs, "$decor", Type::Any);
+        // The closure value is built in a hidden local: the definition cannot
+        // overwrite the cell (or apply decorators to the binding) before the
+        // function object exists.
+        let temp_prefix = if decorators.is_empty() {
+            "$closure"
+        } else {
+            "$decor"
+        };
+        let (function_temp, function_temp_ref) = self.hidden_temp(fs, temp_prefix, Type::Any);
         body.push(HStmt {
             kind: HStmtKind::Closure {
                 target: function_temp,
@@ -6348,32 +6452,21 @@ impl<'a> Lowerer<'a> {
         });
         self.apply_decorator_temps(&temps, function_temp, fs, &mut body, line, col);
         body.push(HStmt {
-            kind: HStmtKind::Assign {
-                target,
-                value: HExpr {
-                    kind: HExprKind::Local(function_temp),
-                    ty: Ty::Concrete(Type::Any),
-                    line,
-                    col,
-                },
+            kind: if fs.is_cell(target) {
+                HStmtKind::CellAssign {
+                    target,
+                    value: function_temp_ref,
+                }
+            } else {
+                HStmtKind::Assign {
+                    target,
+                    value: function_temp_ref,
+                }
             },
             line,
             col,
         });
-        Some(HStmt {
-            kind: HStmtKind::If {
-                cond: HExpr {
-                    kind: HExprKind::Const(Const::Bool(true)),
-                    ty: Ty::Concrete(Type::Bool),
-                    line,
-                    col,
-                },
-                then_body: body,
-                else_body: Vec::new(),
-            },
-            line,
-            col,
-        })
+        Some(if_true_block(body, line, col))
     }
 
     // ------------------------------------------------------------------
@@ -10296,7 +10389,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Fresh cells created at the top of one loop iteration for every function
-    /// cell the iteration mutates (including a cell used as the loop target).
+    /// cell the iteration mutates (including a cell used as the loop target)
+    /// or fills in with a `def`/`class` statement.
     /// Closures created inside the iteration capture that iteration's cell.
     fn loop_cell_inits(
         &mut self,
@@ -10308,6 +10402,10 @@ impl<'a> Lowerer<'a> {
     ) -> Vec<HStmt> {
         let mut mutated = HashSet::new();
         collect_scope_mutations(body, &mut mutated);
+        // A definition inside the loop rebinds its name once per iteration, so
+        // a closure that reads it must see that iteration's binding; without a
+        // fresh cell every iteration would share the entry cell.
+        collect_def_binding_names(body, &mut mutated);
         if let Some(target) = target_expr {
             let mut names = Vec::new();
             collect_target_names(target, &mut names);
@@ -13114,20 +13212,6 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
-                } else if fs.in_lambda
-                    && !self.fn_ids.contains_key(name)
-                    && !is_builtin_value_name(name)
-                    && ExcKind::from_class_name(name).is_none()
-                    && name != "NotImplemented"
-                {
-                    // A lambda may read builtins and named functions (neither
-                    // is captured) but not enclosing locals.
-                    self.error_at_code(
-                        e.range(),
-                        codes::UNSUPPORTED,
-                        "closures are not supported yet; lambda can only use its parameters, builtins and named functions",
-                    );
-                    self.error_expr(e.range())
                 } else if let Some(id) = self.fn_ids.get(name) {
                     HExpr {
                         kind: HExprKind::FunctionRef(*id),
@@ -13741,7 +13825,7 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ast::Expr::GeneratorExp(c) => self.lower_generator_exp(c, fs, line, col),
-            ast::Expr::Lambda(l) => self.lower_lambda(l, line, col),
+            ast::Expr::Lambda(l) => self.lower_lambda(l, fs, line, col),
             ast::Expr::IfExp(i) => {
                 // `i.orelse` is only evaluated when the test is falsy; the IR
                 // node keeps that laziness for codegen.
@@ -13909,26 +13993,98 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Lower a `lambda` expression into a synthetic function appended to the
-    /// unit. The body becomes a single `return`; only the parameters are in
-    /// scope, so any other name is reported as an unsupported closure.
-    fn lower_lambda(&mut self, l: &ast::ExprLambda, line: u32, col: u32) -> HExpr {
+    /// unit. The body becomes a single `return`.
+    ///
+    /// A lambda is a closure scope exactly like a nested `def`: every name its
+    /// body reads that the enclosing function binds becomes a leading capture
+    /// parameter, and a captured cell is passed by reference so the lambda
+    /// observes writes the enclosing function makes after the lambda was
+    /// created. Parameters (with default values) shadow captures. Any other
+    /// name resolves like a function body: enclosing module globals, imports,
+    /// named functions, builtins and, in a dynamic namespace, runtime globals.
+    ///
+    /// The IR creates a closure with a statement, while a lambda may appear in
+    /// any expression position. A lambda without captures therefore stays a
+    /// plain [`HExprKind::FunctionRef`]; a capturing one evaluates to a call of
+    /// a synthetic binder function that materialises the closure from the
+    /// current capture values and returns it.
+    fn lower_lambda(
+        &mut self,
+        l: &ast::ExprLambda,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        // Free names in first-use order that this scope binds: the captures.
+        // Names bound by the lambda itself were already removed.
+        //
+        // A module body is not a closure scope: its locals mirror module
+        // globals, which the lambda reads through the runtime global table, so
+        // there is nothing to capture there. A comprehension target is the
+        // exception: it is a private synthetic slot of the module frame (named
+        // `$comp…`), so a lambda inside the comprehension closes over it.
+        let mut capture_names = Vec::new();
+        let mut capture_locals = Vec::new();
+        let mut capture_cells = Vec::new();
+        for name in lambda_free_names(l) {
+            let Some(local) = fs.lookup(&name) else {
+                continue;
+            };
+            let module_binding = fs.is_module
+                && self.functions[fs.fid as usize]
+                    .locals
+                    .get(local as usize)
+                    .is_some_and(|slot| slot.name == name);
+            if module_binding {
+                continue;
+            }
+            capture_names.push(name);
+            capture_locals.push(local);
+            capture_cells.push(fs.is_cell(local));
+        }
+
         let mut params = Vec::new();
         let mut locals = Vec::new();
         let mut seen = HashSet::new();
-        let mut rejected = false;
-
-        for arg in &l.args.posonlyargs {
-            if arg.default.is_some() {
-                self.error_at(
-                    arg.def.range,
-                    "lambda default parameter values are not supported",
-                );
-                rejected = true;
+        let mut cell_alias_locals = HashSet::new();
+        // Captures become ordinary leading parameters of the synthetic
+        // function, exactly like a nested `def`. A capture of an enclosing
+        // cell becomes an alias: the slot holds the cell itself.
+        for (index, capture) in capture_names.iter().enumerate() {
+            if !seen.insert(capture.clone()) {
+                continue;
             }
+            let is_cell = capture_cells.get(index).copied().unwrap_or(false);
+            let local = locals.len() as LocalId;
+            let ty = Ty::Concrete(Type::Any);
+            params.push(HParam {
+                local,
+                name: capture.clone(),
+                ty,
+                default: None,
+                default_expr: None,
+                kind: ParamKind::Positional,
+            });
+            locals.push(HLocal {
+                name: capture.clone(),
+                ty,
+            });
+            if is_cell {
+                cell_alias_locals.insert(local);
+            }
+        }
+
+        let mut rejected = false;
+        // Defaults are evaluated where the lambda is created, like a `def`:
+        // literal defaults become parameter metadata and any other expression
+        // is lowered in a module-like scope.
+        for arg in &l.args.posonlyargs {
+            let default = self.param_default(arg.default.as_deref());
+            let default_expr = self.lowered_default(arg.default.as_deref());
             self.add_param(
                 &arg.def,
-                None,
-                None,
+                default,
+                default_expr,
                 ParamKind::PosOnly,
                 &mut params,
                 &mut locals,
@@ -13936,17 +14092,12 @@ impl<'a> Lowerer<'a> {
             );
         }
         for arg in &l.args.args {
-            if arg.default.is_some() {
-                self.error_at(
-                    arg.def.range,
-                    "lambda default parameter values are not supported",
-                );
-                rejected = true;
-            }
+            let default = self.param_default(arg.default.as_deref());
+            let default_expr = self.lowered_default(arg.default.as_deref());
             self.add_param(
                 &arg.def,
-                None,
-                None,
+                default,
+                default_expr,
                 ParamKind::Positional,
                 &mut params,
                 &mut locals,
@@ -13983,7 +14134,7 @@ impl<'a> Lowerer<'a> {
         self.functions.push(HFunction {
             name: "<lambda>".to_string(),
             params,
-            capture_count: 0,
+            capture_count: capture_names.len(),
             ret_ty: Ty::Concrete(Type::Any),
             locals,
             body: Vec::new(),
@@ -13993,13 +14144,16 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
+        // The body is a single expression, so the lambda never rebinds a
+        // local: it owns no cells, but a captured cell stays an alias (the
+        // capture slot holds the cell object itself).
 
         let mut fs = FuncState {
             fid,
             is_module: false,
             locals: local_map,
-            cells: HashSet::new(),
-            cell_aliases: HashSet::new(),
+            cells: cell_alias_locals.clone(),
+            cell_aliases: cell_alias_locals,
             comp_shadowed: HashMap::new(),
             globals: HashSet::new(),
             loop_depth: 0,
@@ -14017,8 +14171,80 @@ impl<'a> Lowerer<'a> {
             col: body_col,
         }];
 
+        let function = self.fid_base + fid;
+        if capture_names.is_empty() {
+            return HExpr {
+                kind: HExprKind::FunctionRef(function),
+                ty: self.infer.fresh(),
+                line,
+                col,
+            };
+        }
+
+        // Binder: transform the current capture values into the closure
+        // value. Its parameters are the capture slots in order, so a captured
+        // cell reaches the closure as the cell object itself.
+        let binder = self.functions.len() as FunctionId;
+        let mut binder_params = Vec::with_capacity(capture_names.len());
+        let mut binder_locals = Vec::with_capacity(capture_names.len() + 1);
+        for name in &capture_names {
+            let local = binder_locals.len() as LocalId;
+            binder_params.push(HParam {
+                local,
+                name: name.clone(),
+                ty: Ty::Concrete(Type::Any),
+                default: None,
+                default_expr: None,
+                kind: ParamKind::Positional,
+            });
+            binder_locals.push(HLocal {
+                name: name.clone(),
+                ty: Ty::Concrete(Type::Any),
+            });
+        }
+        let target = binder_locals.len() as LocalId;
+        binder_locals.push(HLocal {
+            name: "$closure".to_string(),
+            ty: Ty::Concrete(Type::Any),
+        });
+        let closure_value = self.local_read_expr(target, Type::Any, line, col);
+        self.functions.push(HFunction {
+            name: "<lambda.bind>".to_string(),
+            params: binder_params,
+            capture_count: 0,
+            ret_ty: Ty::Concrete(Type::Any),
+            locals: binder_locals,
+            body: vec![
+                HStmt {
+                    kind: HStmtKind::Closure {
+                        target,
+                        function,
+                        captures: (0..capture_names.len() as LocalId).collect(),
+                    },
+                    line,
+                    col,
+                },
+                HStmt {
+                    kind: HStmtKind::Return(Some(closure_value)),
+                    line,
+                    col,
+                },
+            ],
+            is_async: false,
+            is_generator: false,
+            is_module: false,
+            line,
+            col,
+        });
+
         HExpr {
-            kind: HExprKind::FunctionRef(self.fid_base + fid),
+            kind: HExprKind::Call {
+                callee: Callee::Function(self.fid_base + binder),
+                args: capture_locals
+                    .iter()
+                    .map(|local| self.local_read_expr(*local, Type::Any, line, col))
+                    .collect(),
+            },
             ty: self.infer.fresh(),
             line,
             col,
@@ -15740,22 +15966,6 @@ impl<'a> Lowerer<'a> {
                 line,
                 col,
             };
-        }
-
-        // A lambda may reference builtins and named functions (both resolve
-        // without a capture) but still cannot capture enclosing locals, whose
-        // slots are simply absent from its scope.
-        if fs.in_lambda
-            && !self.fn_ids.contains_key(name)
-            && !is_builtin_value_name(name)
-            && ExcKind::from_class_name(name).is_none()
-        {
-            self.error_at_code(
-                call.range,
-                codes::UNSUPPORTED,
-                "closures are not supported yet; lambda can only use its parameters, builtins and named functions",
-            );
-            return self.error_expr(call.range);
         }
 
         // Bare `open(...)` is the io.open alias unless the name is shadowed.
@@ -17862,15 +18072,6 @@ fn is_attribute_only_builtin(name: &str) -> bool {
     matches!(name, "setattr" | "delattr")
 }
 
-/// Whether `name` resolves to an unqualified builtin value: a compiler
-/// builtin (`len`, `zip`, ...) or a `builtins` module constant (`object`,
-/// `Ellipsis`, ...). Lambdas may read both without a capture.
-fn is_builtin_value_name(name: &str) -> bool {
-    builtin_by_name(name).is_some()
-        || is_attribute_only_builtin(name)
-        || stdlib::constant("builtins", name).is_some()
-}
-
 /// One `namespace[name] = value` store used while building a dynamic class
 /// namespace.
 fn class_namespace_store(ns: LocalId, name: &str, value: HExpr, line: u32, col: u32) -> HStmt {
@@ -19399,6 +19600,37 @@ fn collect_scope_mutations(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// Names bound by a `def`/`async def`/`class` statement in this scope.
+///
+/// These are the bindings [`collect_scope_mutations`] deliberately skips: the
+/// statement writes its name once, when it executes, so a loop target that is
+/// only read by a closure keeps by-value capture. A nested closure reading the
+/// name of such a definition (its own for recursion, a sibling's defined
+/// later for mutual recursion) still needs the shared cell, because the read
+/// happens after the creation site. Compound statements are searched; the
+/// bodies of nested definitions belong to their own scope and are not
+/// entered.
+fn collect_def_binding_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::FunctionDef(s) => {
+                out.insert(s.name.to_string());
+            }
+            ast::Stmt::AsyncFunctionDef(s) => {
+                out.insert(s.name.to_string());
+            }
+            ast::Stmt::ClassDef(s) => {
+                out.insert(s.name.to_string());
+            }
+            other => {
+                for block in class_body_blocks(other) {
+                    collect_def_binding_names(block, out);
+                }
+            }
+        }
+    }
+}
+
 /// Source ranges of `def`/`async def` statements nested in `stmts`.
 ///
 /// The walk follows compound statements exactly like
@@ -19497,6 +19729,279 @@ fn collect_nested_needed(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
             }
             _ => {}
         }
+    }
+}
+
+/// Names read by lambdas nested in the function body, transitively.
+///
+/// A lambda is a closure scope, so a local the function rebinds after the
+/// lambda is created must be a cell the lambda reads through; otherwise the
+/// lambda would keep the value from creation time. `collect_nested_needed`
+/// covers nested `def`s and classes, this pass covers lambdas anywhere in the
+/// body's expressions. Nested `def`/`class` bodies are skipped: their own free
+/// names already include the lambdas they contain.
+fn collect_lambda_needed(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Expr(s) => collect_lambda_needed_expr(&s.value, out),
+            ast::Stmt::Assign(s) => {
+                for target in &s.targets {
+                    collect_lambda_needed_target(target, out);
+                }
+                collect_lambda_needed_expr(&s.value, out);
+            }
+            ast::Stmt::AnnAssign(s) => {
+                collect_lambda_needed_target(&s.target, out);
+                if let Some(value) = &s.value {
+                    collect_lambda_needed_expr(value, out);
+                }
+            }
+            ast::Stmt::AugAssign(s) => {
+                collect_lambda_needed_target(&s.target, out);
+                collect_lambda_needed_expr(&s.value, out);
+            }
+            ast::Stmt::Return(s) => {
+                if let Some(value) = &s.value {
+                    collect_lambda_needed_expr(value, out);
+                }
+            }
+            ast::Stmt::Delete(s) => {
+                for target in &s.targets {
+                    collect_lambda_needed_target(target, out);
+                }
+            }
+            ast::Stmt::Raise(s) => {
+                if let Some(exc) = &s.exc {
+                    collect_lambda_needed_expr(exc, out);
+                }
+                if let Some(cause) = &s.cause {
+                    collect_lambda_needed_expr(cause, out);
+                }
+            }
+            ast::Stmt::Assert(s) => {
+                collect_lambda_needed_expr(&s.test, out);
+                if let Some(msg) = &s.msg {
+                    collect_lambda_needed_expr(msg, out);
+                }
+            }
+            ast::Stmt::If(s) => {
+                collect_lambda_needed_expr(&s.test, out);
+                collect_lambda_needed(&s.body, out);
+                collect_lambda_needed(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_lambda_needed_expr(&s.test, out);
+                collect_lambda_needed(&s.body, out);
+                collect_lambda_needed(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                collect_lambda_needed_expr(&s.iter, out);
+                collect_lambda_needed_target(&s.target, out);
+                collect_lambda_needed(&s.body, out);
+                collect_lambda_needed(&s.orelse, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_lambda_needed_expr(&s.iter, out);
+                collect_lambda_needed_target(&s.target, out);
+                collect_lambda_needed(&s.body, out);
+                collect_lambda_needed(&s.orelse, out);
+            }
+            ast::Stmt::With(s) => {
+                for item in &s.items {
+                    collect_lambda_needed_expr(&item.context_expr, out);
+                    if let Some(target) = &item.optional_vars {
+                        collect_lambda_needed_target(target, out);
+                    }
+                }
+                collect_lambda_needed(&s.body, out);
+            }
+            ast::Stmt::AsyncWith(s) => {
+                for item in &s.items {
+                    collect_lambda_needed_expr(&item.context_expr, out);
+                    if let Some(target) = &item.optional_vars {
+                        collect_lambda_needed_target(target, out);
+                    }
+                }
+                collect_lambda_needed(&s.body, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_lambda_needed(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_lambda_needed(&handler.body, out);
+                }
+                collect_lambda_needed(&s.orelse, out);
+                collect_lambda_needed(&s.finalbody, out);
+            }
+            ast::Stmt::TryStar(s) => {
+                collect_lambda_needed(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_lambda_needed(&handler.body, out);
+                }
+                collect_lambda_needed(&s.orelse, out);
+                collect_lambda_needed(&s.finalbody, out);
+            }
+            ast::Stmt::Match(s) => {
+                collect_lambda_needed_expr(&s.subject, out);
+                for case in &s.cases {
+                    if let Some(guard) = &case.guard {
+                        collect_lambda_needed_expr(guard, out);
+                    }
+                    collect_lambda_needed(&case.body, out);
+                }
+            }
+            // Nested function bodies are summarised by
+            // `collect_nested_needed`, but a class body executes in this scope
+            // chain (only its namespace is separate), so the lambdas it
+            // creates are analysed here.
+            ast::Stmt::ClassDef(c) => collect_lambda_needed(&c.body, out),
+            ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => {}
+            _ => {}
+        }
+    }
+}
+
+/// Lambdas reached through an assignment target: a plain name is a store, but
+/// an attribute object or a subscript object/index is still evaluated.
+fn collect_lambda_needed_target(target: &ast::Expr, out: &mut HashSet<String>) {
+    match target {
+        ast::Expr::Name(_) => {}
+        ast::Expr::Tuple(tuple) => {
+            for element in &tuple.elts {
+                collect_lambda_needed_target(element, out);
+            }
+        }
+        ast::Expr::List(list) => {
+            for element in &list.elts {
+                collect_lambda_needed_target(element, out);
+            }
+        }
+        ast::Expr::Starred(starred) => collect_lambda_needed_target(&starred.value, out),
+        other => collect_lambda_needed_expr(other, out),
+    }
+}
+
+/// Names read by the lambdas nested anywhere in `expr`.
+fn collect_lambda_needed_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
+    let visit: fn(&ast::Expr, &mut HashSet<String>) = collect_lambda_needed_expr;
+    match expr {
+        // `lambda_free_names` already folds the names deeper lambdas read.
+        ast::Expr::Lambda(l) => out.extend(lambda_free_names(l)),
+        ast::Expr::BoolOp(b) => {
+            for value in &b.values {
+                visit(value, out);
+            }
+        }
+        ast::Expr::NamedExpr(n) => visit(&n.value, out),
+        ast::Expr::BinOp(b) => {
+            visit(&b.left, out);
+            visit(&b.right, out);
+        }
+        ast::Expr::UnaryOp(u) => visit(&u.operand, out),
+        ast::Expr::IfExp(i) => {
+            visit(&i.test, out);
+            visit(&i.body, out);
+            visit(&i.orelse, out);
+        }
+        ast::Expr::Dict(d) => {
+            for key in d.keys.iter().flatten() {
+                visit(key, out);
+            }
+            for value in &d.values {
+                visit(value, out);
+            }
+        }
+        ast::Expr::Set(s) => {
+            for element in &s.elts {
+                visit(element, out);
+            }
+        }
+        ast::Expr::List(l) => {
+            for element in &l.elts {
+                visit(element, out);
+            }
+        }
+        ast::Expr::Tuple(t) => {
+            for element in &t.elts {
+                visit(element, out);
+            }
+        }
+        ast::Expr::ListComp(c) => collect_lambda_needed_comp(&c.generators, &[c.elt.as_ref()], out),
+        ast::Expr::SetComp(c) => collect_lambda_needed_comp(&c.generators, &[c.elt.as_ref()], out),
+        ast::Expr::DictComp(c) => {
+            collect_lambda_needed_comp(&c.generators, &[c.key.as_ref(), c.value.as_ref()], out)
+        }
+        ast::Expr::GeneratorExp(c) => {
+            collect_lambda_needed_comp(&c.generators, &[c.elt.as_ref()], out)
+        }
+        ast::Expr::Compare(c) => {
+            visit(&c.left, out);
+            for comparator in &c.comparators {
+                visit(comparator, out);
+            }
+        }
+        ast::Expr::Call(c) => {
+            visit(&c.func, out);
+            for arg in &c.args {
+                visit(arg, out);
+            }
+            for keyword in &c.keywords {
+                visit(&keyword.value, out);
+            }
+        }
+        ast::Expr::JoinedStr(s) => {
+            for value in &s.values {
+                visit(value, out);
+            }
+        }
+        ast::Expr::FormattedValue(f) => {
+            visit(&f.value, out);
+            if let Some(spec) = &f.format_spec {
+                visit(spec, out);
+            }
+        }
+        ast::Expr::Attribute(a) => visit(&a.value, out),
+        ast::Expr::Subscript(s) => {
+            visit(&s.value, out);
+            visit(&s.slice, out);
+        }
+        ast::Expr::Slice(s) => {
+            for part in [s.lower.as_deref(), s.upper.as_deref(), s.step.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                visit(part, out);
+            }
+        }
+        ast::Expr::Starred(s) => visit(&s.value, out),
+        ast::Expr::Await(a) => visit(&a.value, out),
+        ast::Expr::Yield(y) => {
+            if let Some(value) = &y.value {
+                visit(value, out);
+            }
+        }
+        ast::Expr::YieldFrom(y) => visit(&y.value, out),
+        // A template literal is an opaque placeholder in the AST; its
+        // interpolations are not visible here.
+        ast::Expr::Constant(_) | ast::Expr::Name(_) => {}
+    }
+}
+
+/// Lambdas nested in the clauses and elements of a comprehension.
+fn collect_lambda_needed_comp(
+    generators: &[ast::Comprehension],
+    elements: &[&ast::Expr],
+    out: &mut HashSet<String>,
+) {
+    for generator in generators {
+        collect_lambda_needed_expr(&generator.iter, out);
+        for condition in &generator.ifs {
+            collect_lambda_needed_expr(condition, out);
+        }
+    }
+    for element in elements {
+        collect_lambda_needed_expr(element, out);
     }
 }
 
@@ -20168,8 +20673,8 @@ fn walk_free_stmts(
                     record_name_load(&name, shadowed, out, seen);
                 }
             }
-            // Lambdas create their own scope and are not closure-converted
-            // here.
+            // Expression statements are covered by the expression walk,
+            // including the lambdas they create.
             _ => {}
         }
     }
@@ -20257,6 +20762,39 @@ fn function_free_names(body: &[ast::Stmt], args: &ast::Arguments) -> Vec<String>
     let mut loads = Vec::new();
     collect_free_name_loads(body, &mut loads);
     loads.retain(|name| !locals.contains(name));
+    loads
+}
+
+/// Free names of one lambda body: the loads its body makes (nested lambdas
+/// included) minus its own parameters.
+///
+/// A lambda is a closure scope exactly like a nested `def`, so its free names
+/// become captures of the enclosing function and must pass through any
+/// intermediate scope. Default parameter values are evaluated where the
+/// lambda is created, not in the lambda's scope, so they are not free names
+/// here.
+fn lambda_free_names(l: &ast::ExprLambda) -> Vec<String> {
+    let mut params = HashSet::new();
+    for arg in l
+        .args
+        .posonlyargs
+        .iter()
+        .chain(l.args.args.iter())
+        .chain(l.args.kwonlyargs.iter())
+    {
+        params.insert(arg.def.arg.to_string());
+    }
+    if let Some(vararg) = &l.args.vararg {
+        params.insert(vararg.arg.to_string());
+    }
+    if let Some(kwarg) = &l.args.kwarg {
+        params.insert(kwarg.arg.to_string());
+    }
+
+    let mut loads = Vec::new();
+    let mut seen = HashSet::new();
+    walk_free_expr(&l.body, &HashSet::new(), &mut loads, &mut seen);
+    loads.retain(|name| !params.contains(name));
     loads
 }
 
@@ -20420,9 +20958,14 @@ fn walk_free_expr(
             }
         }
         ast::Expr::Starred(s) => walk_free_expr(&s.value, shadowed, out, seen),
-        // A lambda is a separate scope; existing lambda lowering diagnoses
-        // any use of enclosing names.
-        ast::Expr::Lambda(_) => {}
+        // A lambda is a closure scope: its own free names are loads of this
+        // scope too, so they are captured here and can pass through an
+        // intermediate function to the lambda that needs them.
+        ast::Expr::Lambda(l) => {
+            for name in lambda_free_names(l) {
+                record_name_load(&name, shadowed, out, seen);
+            }
+        }
     }
 }
 
@@ -20451,11 +20994,14 @@ fn walk_free_comp(
 ///
 /// `shadowed` is the set of names bound at module level: a module that binds
 /// `globals`/`vars` itself uses that binding, not the builtin, so those names
-/// are ignored. Function and lambda bodies are separate scopes and are
-/// skipped; a function that mutates the namespace only matters when module
-/// code can reach it through an alias, and the alias assignment is itself a
-/// module-level use. Class bodies run while the module initializes, so they
-/// are scanned too; their methods are not.
+/// are ignored. Function bodies are separate scopes and are skipped; a
+/// function that mutates the namespace only matters when module code can reach
+/// it through an alias, and the alias assignment is itself a module-level use.
+/// Class bodies run while the module initializes, so they are scanned too;
+/// their methods are not. Lambda free names are part of the walk (they are
+/// needed for closure analysis), so a lambda that only *reads* `globals`/
+/// `vars` also marks the module dynamic: that direction only turns static name
+/// errors into runtime lookups, like the aliasing case.
 fn module_uses_dynamic_globals(stmts: &[ast::Stmt], shadowed: &HashSet<String>) -> bool {
     stmts
         .iter()

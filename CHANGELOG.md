@@ -8,6 +8,40 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 Recursive nested functions
+
+- A `def`/`async def`/`class` name that a nested closure reads is bound
+  through a closure cell instead of a by-value local slot: the enclosing
+  function allocates the cell at entry (unbound), the closure captures the
+  cell itself, and the definition stores its value through it. Direct
+  recursion, mutual recursion between sibling nested functions, recursion
+  through an intermediate scope and recursion after the enclosing function
+  returned all work; a decorated recursive function recurses through its
+  decorators, and a definition inside a loop gets a fresh cell per
+  iteration. Read-only captures keep by-value semantics. The "recursive
+  nested functions are not supported" diagnostic is gone; a `def` under
+  `global` still reports the missing local slot.
+
+### Added — 2026-10-27 Lambda closures and dynamic module exports
+
+- A lambda is a closure scope exactly like a nested `def`: names its body
+  reads from the enclosing function become leading capture parameters, a
+  binding the enclosing function rebinds arrives as a shared cell (so later
+  writes are visible), defaults lower like function defaults, and nested
+  lambdas pass bindings through intermediate scopes. A non-capturing lambda
+  stays a plain function reference; a capturing one evaluates to a call of a
+  synthetic binder that materialises the closure, because the IR creates
+  closures with a statement while a lambda may appear in any expression
+  position. The "lambda can only use its parameters" diagnostic is gone;
+  module-level lambdas keep reading module globals through the global table.
+- `from module import name` for a name the module does not define statically
+  binds a runtime read of that module's global table when the module installs
+  names at runtime (`globals()[...] = ...`, `vars().update(...)`). This is how
+  NumPy's `arrayprint` imports the scalar types `numerictypes` builds through
+  `globals()`. `from . import name` inside a dynamic package `__init__.py`
+  binds the same way, package submodules inherit the rule, and ordinary
+  modules keep the compile-time "does not export a function named" error.
+
 ### Added — 2026-10-27 NumPy-style slice subscripts
 
 - A slice is a legal element of a tuple/list subscript index

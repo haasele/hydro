@@ -131,6 +131,8 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     f("neg", 1, 1, Type::Any),
     f("not_", 1, 1, Type::Bool),
     f("truth", 1, 1, Type::Bool),
+    // `operator.index(a)`: `a.__index__()`, or `a` itself for exact integers.
+    f("index", 1, 1, Type::Int),
     f("attrgetter", 1, usize::MAX, Type::Function),
     f("itemgetter", 1, usize::MAX, Type::Function),
 ];
@@ -2243,23 +2245,35 @@ pub static IMPORTLIB_RESOURCES: ModuleSpec = ModuleSpec {
     constants: &[c("Traversable", Type::Any)],
 };
 
-/// `contextlib`: the `suppress` and `nullcontext` context managers used by
-/// rich/ansi, numpy and other libraries. `suppress`'s `__exit__` never
-/// suppresses exceptions in this subset; the common no-error path is
-/// supported. `nullcontext` is CPython's no-op manager: `__enter__` returns
-/// its `enter_result` and `__exit__` returns `False`, so exceptions propagate.
+/// `contextlib`: the `suppress`/`nullcontext` context managers and the
+/// `contextmanager` decorator used by rich/ansi, numpy and other libraries.
+/// `suppress`'s `__exit__` never suppresses exceptions in this subset; the
+/// common no-error path is supported. `nullcontext` is CPython's no-op
+/// manager: `__enter__` returns its `enter_result` and `__exit__` returns
+/// `False`, so exceptions propagate.
+///
+/// `contextmanager(func)` returns a callable that invokes `func` and wraps the
+/// generator it returns in a real `_GeneratorContextManager`. The wrapper
+/// forwards every keyword argument to `func`, so `_contextmanager_call` is
+/// declared with dynamic keywords.
 pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
     name: "contextlib",
     functions: &[
         f("suppress", 0, usize::MAX, Type::Any),
         kw("nullcontext", 0, 1, Type::Any, &["enter_result"]),
-        // The native methods of the two context-manager classes; the runtime
-        // values carry these names, so the central table must know their
-        // arities.
+        f("contextmanager", 1, 1, Type::Any),
+        // The native methods of the three context-manager classes; the
+        // runtime values carry these names, so the central table must know
+        // their arities. `_contextmanager_call` receives the decorated
+        // generator function as its first (bound) argument plus the call's
+        // positional and keyword arguments.
         f("_suppress_enter", 1, 1, Type::Any),
         f("_suppress_exit", 4, 4, Type::None),
         f("_nullcontext_enter", 1, 1, Type::Any),
         f("_nullcontext_exit", 4, 4, Type::Bool),
+        kw_dynamic("_contextmanager_call", 1, usize::MAX, Type::Any, &[]),
+        f("_contextmanager_enter", 1, 1, Type::Any),
+        f("_contextmanager_exit", 4, 4, Type::Bool),
     ],
     constants: &[],
 };
@@ -3420,6 +3434,22 @@ mod tests {
     }
 
     #[test]
+    fn contextlib_contextmanager_specs_are_registered() {
+        let decorate = function("contextlib", "contextmanager").expect("contextmanager");
+        assert_eq!((decorate.min_args, decorate.max_args), (1, 1));
+        let call = function("contextlib", "_contextmanager_call").expect("_contextmanager_call");
+        // The decorated function is the bound first argument; every further
+        // positional and keyword argument belongs to the call.
+        assert_eq!(call.min_args, 1);
+        assert_eq!(call.max_args, usize::MAX);
+        assert!(call.dynamic_keywords);
+        for (name, arity) in [("_contextmanager_enter", 1), ("_contextmanager_exit", 4)] {
+            let spec = function("contextlib", name).expect(name);
+            assert_eq!((spec.min_args, spec.max_args), (arity, arity));
+        }
+    }
+
+    #[test]
     fn os_and_platform_new_entries() {
         assert_eq!(function("os", "sysconf").unwrap().ret, Type::Int);
         assert_eq!(function("os", "getloadavg").unwrap().ret, Type::Tuple);
@@ -3839,6 +3869,13 @@ mod tests {
         let bit_or = function("operator", "or_").expect("operator.or_");
         assert_eq!((bit_or.min_args, bit_or.max_args), (2, 2));
         assert_eq!(bit_or.ret, Type::Any);
+        let index = function("operator", "index").expect("operator.index");
+        assert_eq!((index.min_args, index.max_args), (1, 1));
+        assert_eq!(index.ret, Type::Int);
+        assert_eq!(
+            function("_operator", "index").map(|spec| spec.min_args),
+            Some(1)
+        );
         assert_eq!(
             function("_operator", "or_").map(|spec| spec.min_args),
             Some(2)

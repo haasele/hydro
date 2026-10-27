@@ -133,7 +133,8 @@ See the Tea repository for the complete command reference, flavor storage
 - `def`, parameters, default return, recursion; functions and lambdas are
   values, builtins likewise (`f = int`); `map`/`filter` materialize lists.
 - **Closures:** mutable captured bindings use shared heap cells and support
-  `nonlocal`; read-only captures keep by-value semantics. Recursive nested
+  `nonlocal`; read-only captures keep by-value semantics. Lambdas close over
+  enclosing bindings exactly like nested functions. Recursive nested
   functions are a diagnostic.
 - **Classes:** `class Name(Base)` with a single base, methods, `__init__`,
   `self` attributes (`hydro_getattr`/`hydro_setattr`), inheritance/overrides,

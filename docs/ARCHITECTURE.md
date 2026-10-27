@@ -458,8 +458,14 @@ built-in kinds), so the fallback never matches a user handler.
 #### Functions, Closures, Classes
 
 - Named functions and lambdas are values (`FunctionRef`); indirect calls
-  go through `hydro_call` (wrapper with argv). Lambdas are parameter-only; an
-  access to outer names inside a lambda is a diagnostic.
+  go through `hydro_call` (wrapper with argv). A lambda is a closure scope
+  exactly like a nested `def`: names its body reads from the enclosing
+  function become leading capture parameters (a rebinding local arrives as a
+  shared cell) and its parameters shadow them. A non-capturing lambda is a
+  plain `FunctionRef`; a capturing one evaluates to a call of a synthetic
+  binder function that materialises the closure (`Closure` statement) from the
+  current capture values, because the IR creates closures with a statement
+  while a lambda may appear in any expression position.
 - Builtins are values as well: `f = int`, `map(f, xs)` etc. materialize
   a `FunctionBody::Builtin` object via `hydro_builtin_function`.
 - **Closures capture cells for mutable bindings** (Phase 2.39): a local
@@ -473,8 +479,16 @@ built-in kinds), so the fallback never matches a user handler.
   `nonlocal name` resolves to
   the nearest enclosing binding; a missing or conflicting binding is a
   compile diagnostic. Captures are passed as leading parameters to the
-  wrapper (`capture_count` in the signature). Recursive nested functions and
-  closures in lambdas are diagnosed.
+  wrapper (`capture_count` in the signature). Lambdas use the same mechanism.
+  A `def`/`class` name that a nested closure reads is a cell as well: the
+  cell is allocated when the enclosing function starts, the closure captures
+  it before the definition stored anything, and the `def`/`class` statement
+  stores its value through the cell. That makes direct recursion, mutual
+  recursion between sibling nested functions, and recursion after the
+  enclosing function returned work, and recursive calls see the final
+  binding (a decorated function recurses through its decorators). A
+  definition inside a loop gets a fresh cell per iteration, like any other
+  captured cell.
 - **Classes** (Phase 2.27): `class Name(Base):` with at most one simple
   base. Allowed are methods, `__init__`, class attributes (`x = value`,
   `x: type = value`, including `__slots__`, which is accepted and ignored),
@@ -677,7 +691,14 @@ third argument.
   is reported through the uncaught path before the next module or the entry
   body runs, so its pending error cannot be silently overwritten.
   Top-level functions, classes and mirrored module-level values are
-  exported, while `from x import *` is not supported. Module-level bindings are also mirrored into the runtime global
+  exported, while `from x import *` is not supported. A module that installs
+  names into its own namespace at runtime (`globals()[...] = ...`,
+  `vars().update(...)`) has an incomplete export table: `from module import
+  name` for a name it does not define statically binds a runtime read of that
+  module's global table (`GlobalGet`), for a linked module and for
+  `from . import name` inside a dynamic package `__init__.py` alike. Modules
+  that never touch their namespace keep the compile-time "does not export"
+  diagnostic. Module-level bindings are also mirrored into the runtime global
   table, so importers read them regardless of lowering order. All units end
   up in one `Program`; JIT and AOT execute the same code (AOT embeds the
   modules into the binary).
@@ -1299,8 +1320,9 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   need a deferred call, while class constructors can bind `**mapping`.
 - **Closures:** captured bindings are by value unless the outer function
   mutates them (or a descendant declares `nonlocal`), in which case the
-  binding lives in a traced heap cell shared with every closure; recursive
-  nested functions and closures in lambdas are diagnostics.
+  binding lives in a traced heap cell shared with every closure; lambdas close
+  over enclosing bindings the same way. Recursive nested functions are
+  diagnostics.
 - **Generators/async:** real lazy generators, async generators and coroutines
   on stackful fibers; `async for`/`async with`, async comprehensions,
   cancellation, task methods and `TaskGroup` are implemented. Open:

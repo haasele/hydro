@@ -16,7 +16,9 @@
 //!   [`Program::source_name`].
 //! - Nested functions are closures: [`StmtKind::Closure`] captures the
 //!   current values of enclosing locals, or the cell for bindings mutated
-//!   through `nonlocal`. A class carries its base expressions in source order
+//!   through `nonlocal` and for `def` names a nested closure reads
+//!   (recursion, mutual recursion). A class carries its base expressions in
+//!   source order
 //!   (the runtime resolves the MRO) and an optional `metaclass` value; its
 //!   methods are plain, property, classmethod or staticmethod entries.
 

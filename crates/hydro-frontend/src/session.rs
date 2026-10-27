@@ -153,6 +153,9 @@ pub struct SessionCompiler {
     loader: ModuleLoader,
     /// Exports of every loader unit, indexed like `loader.units`.
     exports: Vec<HashMap<String, UserExport>>,
+    /// Whether each loader unit writes its own namespace at runtime, indexed
+    /// like `loader.units` (see [`UserModule::dynamic_globals`]).
+    dynamic_units: Vec<bool>,
     /// Class constructors exported by earlier units, keyed by module and
     /// class name, so a later fragment can bind an imported class call.
     class_registry: HashMap<(String, String), (FunctionId, CallSignature)>,
@@ -199,6 +202,7 @@ impl SessionCompiler {
             options,
             loader: ModuleLoader::default(),
             exports: Vec::new(),
+            dynamic_units: Vec::new(),
             class_registry: HashMap::new(),
             function_registry: HashMap::new(),
             functions: Vec::new(),
@@ -286,6 +290,7 @@ impl SessionCompiler {
 
         let unit_count = self.loader.units.len();
         self.exports.resize(unit_count, HashMap::new());
+        self.dynamic_units.resize(unit_count, false);
         let first_new_unit = self.lowered_units;
         let mut initializers: Vec<FunctionId> = Vec::new();
         let mut entry_main: Option<FunctionId> = None;
@@ -336,6 +341,7 @@ impl SessionCompiler {
                         name: dep.name.clone(),
                         exports: self.exports[dep_index].clone(),
                         all: lower::module_all_names(&dep.module.body),
+                        dynamic_globals: self.dynamic_units[dep_index],
                     },
                 );
             }
@@ -346,6 +352,7 @@ impl SessionCompiler {
                         name: namespace.clone(),
                         exports: HashMap::new(),
                         all: None,
+                        dynamic_globals: false,
                     });
             }
             lowerer.set_user_modules(user_modules);
@@ -359,6 +366,7 @@ impl SessionCompiler {
 
             let mut hir = lowerer.lower_module(&unit.module);
             let exported = lowerer.exported_names();
+            let dynamic_globals = lowerer.exports_dynamic_globals();
             let exported_classes = lowerer.exported_class_signatures();
             let exported_functions = lowerer.exported_function_signatures();
             let lower_diags = std::mem::take(&mut lowerer.diags);
@@ -377,6 +385,7 @@ impl SessionCompiler {
                 self.function_registry.insert(id, signature);
             }
             self.exports[index] = exported;
+            self.dynamic_units[index] = dynamic_globals;
 
             if !is_entry {
                 // Same stable identity scheme as a whole-file check: imported
@@ -457,6 +466,7 @@ impl SessionCompiler {
         self.loader.stack.truncate(snapshot.stack);
         self.loader.namespaces.truncate(snapshot.namespaces);
         self.exports.truncate(snapshot.exports);
+        self.dynamic_units.truncate(snapshot.exports);
         self.lowered_units = snapshot.lowered_units;
         self.functions.truncate(snapshot.functions);
         self.class_registry = snapshot.class_registry;

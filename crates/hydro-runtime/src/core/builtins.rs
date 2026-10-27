@@ -1970,6 +1970,14 @@ pub(crate) fn call_kw(
                 kw_argv,
             );
         }
+        // Native functions whose spec declares dynamic keywords
+        // (`contextlib`'s `contextmanager` wrapper) forward the names to the
+        // callee through the module dispatcher instead of rejecting them.
+        if let FunctionBody::Native { module, name } = &func.body {
+            if crate::modules::native_accepts_keywords(module, name) {
+                return crate::modules::call_native_kw(module, name, argc, argv, kwargc, kw_argv);
+            }
+        }
         // `zip(*iterables, strict=...)`: the only keyword `zip` accepts. The
         // flag is evaluated like CPython's `PyObject_IsTrue`, so any object
         // works; a duplicate or unknown keyword reports `TypeError` without

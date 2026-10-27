@@ -17,7 +17,10 @@
 //!   [`Program::source_name`].
 //! - Nested functions are closures: [`StmtKind::Closure`] captures the
 //!   current values of enclosing locals, or the cell (`StmtKind::CellInit`)
-//!   for bindings that are mutated through `nonlocal`. Classes are limited to a single
+//!   for bindings that are mutated through `nonlocal` or that a nested
+//!   closure reads as a `def` name (recursion and mutual recursion), where
+//!   `StmtKind::CellAssign` stores the closure value into the cell. Classes
+//!   are limited to a single
 //!   optional base, methods (plain, property, classmethod or staticmethod) and
 //!   attributes frozen at class creation.
 
@@ -566,6 +569,11 @@ pub enum StmtKind {
     /// `def inner(...)` inside a function: create a closure value from
     /// `function` and the current values of `captures` (in this order) and
     /// store it in `target`.
+    ///
+    /// `target` never holds a cell: a definition whose binding is a cell
+    /// (recursion or mutual recursion, where the closure captures the cell)
+    /// creates the value in a hidden local and stores it with
+    /// [`StmtKind::CellAssign`], so the cell keeps holding the cell object.
     Closure {
         target: LocalId,
         function: FunctionId,
