@@ -384,6 +384,55 @@ assert holder[\"p\"].total() == 2
 }
 
 #[test]
+fn class_bases_resolve_mro_entries_special_forms() {
+    run_source(
+        "\
+class Base:
+    pass
+
+class SpecialForm:
+    def __mro_entries__(self, bases):
+        assert len(bases) >= 1
+        assert bases[len(bases) - 1] is self
+        return (Base,)
+
+form = SpecialForm()
+
+class Marker:
+    pass
+
+class Config(Marker, form):
+    pass
+
+assert len(Config.__bases__) == 2
+assert Config.__bases__[0] is Marker
+assert Config.__bases__[1] is Base
+assert len(Config.__orig_bases__) == 2
+assert Config.__orig_bases__[0] is Marker
+assert Config.__orig_bases__[1] is form
+
+# The single-base path resolves the hook too.
+class Single(form):
+    pass
+
+assert len(Single.__bases__) == 1
+assert Single.__bases__[0] is Base
+assert len(Single.__orig_bases__) == 1
+assert Single.__orig_bases__[0] is form
+
+# Pydantic's spelling: a special-form base plus a class keyword. The keyword
+# is evaluated but not forwarded; the base still resolves.
+class WithKeyword(form, total=False):
+    pass
+
+assert len(WithKeyword.__bases__) == 1
+assert WithKeyword.__bases__[0] is Base
+assert WithKeyword.__orig_bases__[0] is form
+",
+    );
+}
+
+#[test]
 fn closures_cells_and_global_scope() {
     run_source(
         "\

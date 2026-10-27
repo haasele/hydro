@@ -8,6 +8,22 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 PEP 560 `__mro_entries__` class bases
+
+- Class creation accepts non-class bases with a `__mro_entries__` hook and
+  calls it with the whole original bases tuple, flattening the returned
+  iterable into the base list in order and validating that every produced item
+  is a class. This is how `typing_extensions` spells `TypedDict`, `Protocol`
+  and `NamedTuple` special forms, so `class Config(TypedDict, total=False)`
+  now creates a class instead of raising `TypeError: class base of
+  'Config' must be a class object or None, got 'instance'`. When a hook
+  rewrites the bases, the class records the declared list in
+  `__orig_bases__`, matching `types.get_original_bases`. A base without the
+  hook still reports the precise `TypeError`, and a non-class hook result is
+  rejected with a dedicated message. The single-base
+  `hydro_class_new` path no longer rejects such values before the runtime can
+  resolve them.
+
 ### Added — 2026-10-27 native `_socket` accelerator alias
 
 - `import _socket` resolves to a real native module with the same surface as

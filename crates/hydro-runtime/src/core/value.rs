@@ -4823,6 +4823,91 @@ pub(crate) fn normalize_class_base(v: i64) -> i64 {
     v
 }
 
+/// Resolves non-class bases through PEP 560 `__mro_entries__`.
+///
+/// A base that is already a class (or `None`, which the caller validates
+/// afterwards) is kept. Every other value is probed for `__mro_entries__`;
+/// when present it is called with the whole original bases tuple — CPython's
+/// class creation passes the tuple, not the single element — and the returned
+/// iterable is flattened in place, preserving order. A hook may expand one
+/// base into several classes, as the `typing.TypedDict`, `Protocol` and
+/// `NamedTuple` special forms do; every produced item must be a class.
+///
+/// Returns the flattened bases plus the original list when at least one hook
+/// ran (so the caller records `__orig_bases__`), or `None` with a pending
+/// exception. A base without the hook is left untouched, so the normal
+/// validation reports the precise `TypeError`.
+fn resolve_mro_entries(class_name: &str, bases: Vec<i64>) -> Option<(Vec<i64>, Option<Vec<i64>>)> {
+    let original = bases.clone();
+    let mut resolved: Vec<i64> = Vec::with_capacity(bases.len());
+    let mut changed = false;
+    for base in bases {
+        if base == NONE || as_class(base).is_some() {
+            resolved.push(base);
+            continue;
+        }
+        let exists = crate::core::methods::hasattr(
+            base,
+            "__mro_entries__".as_ptr(),
+            "__mro_entries__".len(),
+        );
+        if crate::exc::pending() {
+            return None;
+        }
+        if exists != TRUE {
+            resolved.push(base);
+            continue;
+        }
+        let hook = crate::core::methods::getattr(
+            base,
+            "__mro_entries__".as_ptr(),
+            "__mro_entries__".len(),
+        );
+        if crate::exc::pending() {
+            return None;
+        }
+        let argument = tuple_new(original.clone());
+        let roots = crate::heap::root_values(&[hook, argument]);
+        let produced = crate::core::builtins::call(hook, 1, &argument as *const i64);
+        crate::heap::release_roots(roots);
+        if crate::exc::pending() {
+            return None;
+        }
+        let iterator = crate::core::iter::iter_new(produced);
+        if crate::exc::pending() {
+            return None;
+        }
+        let roots = crate::heap::root_values(&[produced, iterator]);
+        loop {
+            let mut item = NONE;
+            let produced_item = crate::core::iter::iter_next(iterator, &mut item);
+            if crate::exc::pending() {
+                crate::heap::release_roots(roots);
+                return None;
+            }
+            if produced_item != 1 {
+                break;
+            }
+            if as_class(item).is_none() {
+                crate::heap::release_roots(roots);
+                crate::exc::raise_with_message(
+                    crate::exc::TYPE_ERROR,
+                    &format!(
+                        "__mro_entries__ on a base of '{class_name}' returned a non-class \
+                         object '{}'",
+                        type_name(item)
+                    ),
+                );
+                return None;
+            }
+            resolved.push(item);
+        }
+        crate::heap::release_roots(roots);
+        changed = true;
+    }
+    Some((resolved, changed.then_some(original)))
+}
+
 /// Resolves the metaclass of a new class from its bases and an explicit value.
 ///
 /// `NONE` (both for the bases and for `explicit`) means the default `type`
@@ -4950,13 +5035,58 @@ fn class_new_multi_impl(
     // `type` used as a base denotes the native `type` class, not the builtin
     // function value.
     let bases: Vec<i64> = bases.into_iter().map(normalize_class_base).collect();
+    // PEP 560: special forms (`TypedDict`, `Protocol`, `NamedTuple`,
+    // `typing_extensions` fixtures) are ordinary values whose
+    // `__mro_entries__` expands them into real classes.
+    let (bases, original_bases) = match resolve_mro_entries(&name, bases) {
+        Some(resolved) => resolved,
+        None => return NONE,
+    };
+    if let Some(original) = original_bases {
+        // CPython's `__build_class__` sets `__orig_bases__` in the namespace
+        // after the class body runs, so the declared bases supersede any
+        // assignment the body made.
+        let original = tuple_new(original);
+        // Keep the recorded tuple and every resolved base (a hook may have
+        // created fresh classes only this list references) rooted while
+        // creation may allocate; `attrs`/`bases` live on the Rust heap, which
+        // the collector does not scan.
+        let mut keep = Vec::with_capacity(bases.len() + 1);
+        keep.push(original);
+        keep.extend_from_slice(&bases);
+        let root = crate::heap::root_values(&keep);
+        let mut attrs = attrs;
+        if let Some(entry) = attrs
+            .iter_mut()
+            .find(|(name, _)| name.as_str() == "__orig_bases__")
+        {
+            entry.1 = original;
+        } else {
+            attrs.push(("__orig_bases__".to_string(), original));
+        }
+        let created = create_class(name, bases, metaclass, methods, attrs, run_hooks);
+        crate::heap::release_roots(root);
+        return created;
+    }
+    create_class(name, bases, metaclass, methods, attrs, run_hooks)
+}
+
+/// Builds the class after base resolution, validation and metaclass selection.
+fn create_class(
+    name: String,
+    bases: Vec<i64>,
+    metaclass: i64,
+    methods: Vec<(String, i64, MethodKind)>,
+    attrs: Vec<(String, i64)>,
+    run_hooks: bool,
+) -> i64 {
     let metaclass = normalize_class_base(metaclass);
     for &base in &bases {
         if as_class(base).is_none() {
             return crate::exc::raise_with_message(
                 crate::exc::TYPE_ERROR,
                 &format!(
-                    "class base of '{name}' must be a class object, got '{}'",
+                    "class base of '{name}' must be a class object or None, got '{}'",
                     type_name(base)
                 ),
             );

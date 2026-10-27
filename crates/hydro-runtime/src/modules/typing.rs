@@ -3090,6 +3090,7 @@ mod tests {
 
     #[test]
     fn typing_internals_helpers_behave() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         exc::init();
         // `_tp_cache` is an identity decorator.
         let function = text("f");
@@ -3104,6 +3105,7 @@ mod tests {
             &[text("int")],
             &[("module".to_string(), text("mod"))],
         );
+        assert!(!exc::pending(), "{}", message());
         assert_eq!(
             value::instance_class_value(forward).and_then(value::class_display_name),
             Some("ForwardRef")

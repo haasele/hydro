@@ -13,6 +13,7 @@ const ATTRIBUTE_ERROR: i64 = 9;
 // `operator.eq` uses the comparison ABI's `OP_EQ`.
 const OP_EQ: u32 = 7;
 const OP_ADD: u32 = 0;
+const OP_IS: u32 = 15;
 
 fn text(value: &str) -> i64 {
     hydro_str_new(value.as_ptr(), value.len())
@@ -48,6 +49,31 @@ fn class(name: &str, base: i64, methods: &[(&str, i64)]) -> i64 {
         0,
         std::ptr::null(),
         std::ptr::null(),
+    )
+}
+
+fn class_multi(name: &str, bases: &[i64], methods: &[(&str, i64)]) -> i64 {
+    let names: Vec<i64> = methods.iter().map(|(name, _)| text(name)).collect();
+    let funcs: Vec<i64> = methods.iter().map(|(_, func)| *func).collect();
+    let kinds: Vec<i64> = vec![0; methods.len()];
+    let (names_ptr, funcs_ptr, kinds_ptr) = if methods.is_empty() {
+        (std::ptr::null(), std::ptr::null(), std::ptr::null())
+    } else {
+        (names.as_ptr(), funcs.as_ptr(), kinds.as_ptr())
+    };
+    hydro_class_new_multi(
+        name.as_ptr(),
+        name.len(),
+        bases.as_ptr(),
+        bases.len(),
+        hydro_none(),
+        names_ptr,
+        funcs_ptr,
+        kinds_ptr,
+        methods.len(),
+        std::ptr::null(),
+        std::ptr::null(),
+        0,
     )
 }
 
@@ -87,6 +113,10 @@ fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
 
 fn same(a: i64, b: i64) -> bool {
     hydro_binop(OP_EQ, a, b) == hydro_true()
+}
+
+fn same_object(a: i64, b: i64) -> bool {
+    hydro_binop(OP_IS, a, b) == hydro_true()
 }
 
 fn assert_no_error() {
@@ -598,4 +628,164 @@ fn generic_class_subscript_builds_a_typing_alias() {
     let inherited = hydro_subscript(child, int_class);
     assert_no_error();
     assert_eq!(getattr(inherited, "__origin__"), child);
+}
+
+// -------------------------------------------------------------------------
+// PEP 560 `__mro_entries__` base resolution
+// -------------------------------------------------------------------------
+
+/// `TypedDict`-style special form: `__mro_entries__(self, bases)` verifies it
+/// received the whole original bases tuple and expands to two classes.
+///
+/// The closure layout is `[tuple_base, dict_base, marker, self, bases]`.
+extern "C" fn typed_dict_mro_entries(argv: *const i64) -> i64 {
+    // SAFETY: the runtime supplies captures followed by arity-2 arguments.
+    let args = unsafe { std::slice::from_raw_parts(argv, 5) };
+    let bases = args[4];
+    let first = hydro_subscript(bases, int(0));
+    let second = hydro_subscript(bases, int(1));
+    let full_bases = same_object(first, args[2]) && same_object(second, args[3]);
+    if !full_bases {
+        // A non-iterable result makes the failure obvious in the test.
+        return hydro_none();
+    }
+    let items = [args[0], args[1]];
+    hydro_tuple_new(2, items.as_ptr())
+}
+
+/// `NamedTuple`-style hook stored as an instance attribute: expands the base
+/// to the single captured class. The result is a list, not a tuple, so the
+/// resolution path is exercising generic iterable flattening.
+///
+/// The closure layout is `[namedtuple_base, bases]`.
+extern "C" fn named_tuple_mro_entries(argv: *const i64) -> i64 {
+    // SAFETY: the runtime supplies one capture followed by the `bases` arg.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let items = [args[0]];
+    hydro_list_new(1, items.as_ptr())
+}
+
+/// A hook that violates the contract by returning a non-class element.
+extern "C" fn non_class_mro_entries(_argv: *const i64) -> i64 {
+    let items = [int(7)];
+    hydro_tuple_new(1, items.as_ptr())
+}
+
+#[test]
+fn mro_entries_special_form_expands_to_multiple_bases() {
+    hydro_runtime_init();
+    let tuple_base = class("MroTupleBase", hydro_none(), &[]);
+    let dict_base = class("MroDictBase", hydro_none(), &[]);
+    let marker = class("MroMarker", hydro_none(), &[]);
+    let captures = [tuple_base, dict_base, marker];
+    let hook = hydro_closure_new(
+        typed_dict_mro_entries as *const u8,
+        2,
+        "__mro_entries__".as_ptr(),
+        "__mro_entries__".len(),
+        captures.len(),
+        captures.as_ptr(),
+        0,
+    );
+    assert_no_error();
+    let form_class = class("TypedDictForm", hydro_none(), &[("__mro_entries__", hook)]);
+    let form = call_class(form_class, &[]);
+    assert_no_error();
+
+    // `class Config(marker, form)`: the hook is called with (marker, form) and
+    // its two classes are spliced into the base list in place.
+    let config = class_multi("Config", &[marker, form], &[]);
+    assert_no_error();
+    let bases = getattr(config, "__bases__");
+    assert_eq!(hydro_len(bases) >> 3, 3);
+    assert!(same_object(hydro_subscript(bases, int(0)), marker));
+    assert!(same_object(hydro_subscript(bases, int(1)), tuple_base));
+    assert!(same_object(hydro_subscript(bases, int(2)), dict_base));
+
+    // `__orig_bases__` reports the declared bases, not the expansion.
+    let original = getattr(config, "__orig_bases__");
+    assert_eq!(hydro_len(original) >> 3, 2);
+    assert!(same_object(hydro_subscript(original, int(0)), marker));
+    assert!(same_object(hydro_subscript(original, int(1)), form));
+    assert_no_error();
+}
+
+#[test]
+fn mro_entries_single_class_instance_attribute() {
+    hydro_runtime_init();
+    let namedtuple_base = class("NamedTupleStandIn", hydro_none(), &[]);
+    let captures = [namedtuple_base];
+    let hook = hydro_closure_new(
+        named_tuple_mro_entries as *const u8,
+        1,
+        "__mro_entries__".as_ptr(),
+        "__mro_entries__".len(),
+        captures.len(),
+        captures.as_ptr(),
+        0,
+    );
+    assert_no_error();
+    let form_class = class("NamedTupleForm", hydro_none(), &[]);
+    let form = call_class(form_class, &[]);
+    setattr(form, "__mro_entries__", hook);
+    assert_no_error();
+
+    // The single-base ABI path must hand the instance to the runtime instead
+    // of rejecting it statically.
+    let point = class("Point", form, &[]);
+    assert_no_error();
+    let bases = getattr(point, "__bases__");
+    assert_eq!(hydro_len(bases) >> 3, 1);
+    assert!(same_object(hydro_subscript(bases, int(0)), namedtuple_base));
+    let original = getattr(point, "__orig_bases__");
+    assert_eq!(hydro_len(original) >> 3, 1);
+    assert!(same_object(hydro_subscript(original, int(0)), form));
+    assert_no_error();
+}
+
+#[test]
+fn instance_base_without_mro_entries_reports_type_error() {
+    hydro_runtime_init();
+    let plain = class("PlainBase", hydro_none(), &[]);
+    let instance = call_class(plain, &[]);
+    assert_no_error();
+
+    let derived = class("Derived", instance, &[]);
+    assert_eq!(derived, hydro_none());
+    assert_eq!(hydro_exc_pending(), 1);
+    assert_eq!(hydro_exc_tag(), TYPE_ERROR);
+    let message = hydro_to_str(hydro_exc_value());
+    assert!(
+        same(
+            message,
+            text("class base of 'Derived' must be a class object or None, got 'instance'")
+        ),
+        "message mismatch, got {:?}",
+        hydro_to_str(message)
+    );
+    hydro_exc_clear();
+}
+
+#[test]
+fn mro_entries_non_class_result_reports_type_error() {
+    hydro_runtime_init();
+    let hook = function(non_class_mro_entries, 2, "__mro_entries__");
+    let form_class = class("BadForm", hydro_none(), &[("__mro_entries__", hook)]);
+    let form = call_class(form_class, &[]);
+    assert_no_error();
+
+    let derived = class("BadDerived", form, &[]);
+    assert_eq!(derived, hydro_none());
+    assert_eq!(hydro_exc_pending(), 1);
+    assert_eq!(hydro_exc_tag(), TYPE_ERROR);
+    let message = hydro_to_str(hydro_exc_value());
+    assert!(
+        same(
+            message,
+            text("__mro_entries__ on a base of 'BadDerived' returned a non-class object 'int'")
+        ),
+        "message mismatch, got {:?}",
+        hydro_to_str(message)
+    );
+    hydro_exc_clear();
 }

@@ -212,9 +212,11 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
 /// `types.get_original_bases(cls, /)`: the class's own `__orig_bases__` when
 /// it has one (class-body assignment or a class-level attribute), otherwise
 /// `__bases__`. A base-less class reports `(object,)` like CPython's implicit
-/// edge. Hydro class creation has already resolved `__mro_entries__` and keeps
-/// no synthetic `__orig_bases__`, so a generic alias base is reported as its
-/// origin unless the source class namespace recorded the alias itself.
+/// edge. Class creation records the declared bases in `__orig_bases__` when
+/// `__mro_entries__` rewrote them, so a special-form base is reported as
+/// declared rather than as the classes it expanded into. (A generic alias is
+/// still normalized to its origin before class creation, so it reports the
+/// origin unless the class namespace recorded the alias itself.)
 fn get_original_bases(class: i64) -> i64 {
     let Some(state) = value::as_class(class) else {
         return exc::raise_with_message(

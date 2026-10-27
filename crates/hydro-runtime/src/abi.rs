@@ -296,7 +296,8 @@ fn required_name(ptr: *const c_uchar, len: usize) -> Option<String> {
 /// (`0` normal, `1` property, `2` classmethod, `3` staticmethod).
 /// `attr_names_ptr`/`attr_values_ptr` point at `attr_count` class attribute
 /// name/value pairs; names are tagged strings and values any tagged value.
-/// `base` is `NONE` or a class object.
+/// `base` is `NONE`, a class object, or a PEP 560 special form whose
+/// `__mro_entries__` expands it into classes.
 ///
 /// Duplicate method or attribute names keep their first position and the last
 /// value, mirroring successive assignments in a class body. Malformed buffers,
@@ -331,15 +332,11 @@ pub extern "C" fn hydro_class_new(
         base
     };
     let base = value::normalize_class_base(base);
-    if base != value::NONE && value::as_class(base).is_none() {
-        return exc::raise_with_message(
-            exc::TYPE_ERROR,
-            &format!(
-                "class base of '{name}' must be a class object or None, got '{}'",
-                value::type_name(base)
-            ),
-        );
-    }
+    // Non-class bases are not rejected here: PEP 560 special forms
+    // (`TypedDict`, `Protocol`, `typing_extensions` fixtures) reach the
+    // runtime as ordinary values whose `__mro_entries__` expands them into
+    // real classes. `class_new_full` forwards the value and the runtime
+    // reports the precise `TypeError` when the hook is absent.
     let mut methods: Vec<(String, i64, hydro_ir::MethodKind)> = Vec::new();
     if method_count > 0 {
         if names_ptr.is_null()
@@ -441,7 +438,8 @@ pub extern "C" fn hydro_class_new(
 
 /// `class Name(Base1, Base2, metaclass=Meta): ...` with multiple bases.
 ///
-/// `bases_ptr` holds `base_count` tagged class objects (or `None`),
+/// `bases_ptr` holds `base_count` tagged bases: class objects, `None`, or
+/// PEP 560 special forms whose `__mro_entries__` expands them,
 /// `metaclass` is the tagged metaclass or `None`, and the method/attribute
 /// buffers follow [`hydro_class_new`]'s layout. Forwards to the runtime's
 /// multi-base constructor, which validates every operand, resolves the MRO and
