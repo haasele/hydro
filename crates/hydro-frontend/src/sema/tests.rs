@@ -2997,6 +2997,51 @@ class Proto:
 }
 
 #[test]
+fn raise_only_bodies_accept_return_annotations() {
+    for source in [
+        "def f() -> int:\n    raise NotImplementedError\n",
+        "def f() -> int:\n    raise NotImplementedError()\n",
+        "def f() -> int:\n    raise ValueError(\"no\")\n",
+        "def f() -> int:\n    \"\"\"Doc.\"\"\"\n    raise NotImplementedError\n",
+        "def f() -> int:\n    'Doc.'\n    raise ValueError('no')\n",
+        "def f() -> list:\n    raise NotImplementedError\n",
+        "async def f() -> int:\n    raise NotImplementedError\n",
+    ] {
+        assert!(check_errors(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn protocol_method_raise_bodies_typecheck() {
+    // NumPy protocol methods are often spelled as a bare `raise`.
+    let source = "\
+class Proto:
+    def __len__(self, /) -> int:
+        \"\"\"Implement len.\"\"\"
+        raise NotImplementedError
+
+    def entries(self) -> int:
+        raise NotImplementedError
+";
+    assert!(check_errors(source).is_empty());
+}
+
+#[test]
+fn unannotated_raise_only_functions_used_as_values_are_accepted() {
+    // The body never returns, so it cannot miss a value the call site expects.
+    let source = "\
+def take(x: int) -> int:
+    return x
+
+def f():
+    raise ValueError('no')
+
+take(f())
+";
+    assert!(check_errors(source).is_empty());
+}
+
+#[test]
 fn non_stub_bodies_still_report_a_missing_return() {
     let expected = "function 'f' is declared to return int, but has no return value";
     for source in [
@@ -3008,6 +3053,11 @@ fn non_stub_bodies_still_report_a_missing_return() {
         // `...` mixed with real code is not a stub declaration either.
         "def f() -> int:\n    ...\n    x = 1\n",
         "def f() -> int:\n    x = 1\n    ...\n",
+        // Only a lone `raise` cannot fall through: a conditional raise and a
+        // raise followed by more code still fall through.
+        "def f(x: bool) -> int:\n    if x:\n        raise ValueError\n",
+        "def f(x: bool) -> int:\n    \"\"\"Doc.\"\"\"\n    if x:\n        raise ValueError\n",
+        "def f() -> int:\n    raise ValueError\n    x = 1\n",
     ] {
         let diags = check_diags(source);
         assert_eq!(diags.len(), 1, "{source}: {diags:?}");

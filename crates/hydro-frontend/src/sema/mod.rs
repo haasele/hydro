@@ -1013,8 +1013,17 @@ impl<'a> Checker<'a> {
             // implementations honour (typing protocols, abstract
             // placeholders) rather than a missing return value. An
             // unannotated stub used as a value still reports below.
+            //
+            // A body whose only executable statement is `raise` cannot fall
+            // through at all, so it never misses a return value and no
+            // annotation can be wrong about one (NumPy protocol methods
+            // spelled as `raise NotImplementedError` do this).
             let declared_stub = matches!(f.ret_ty, Ty::Concrete(_)) && Self::is_stub_body(&f.body);
-            if self.inf.unify(f.ret_ty, Ty::Concrete(Type::None)).is_err() && !declared_stub {
+            let never_returns = Self::is_raise_only_body(&f.body);
+            if self.inf.unify(f.ret_ty, Ty::Concrete(Type::None)).is_err()
+                && !declared_stub
+                && !never_returns
+            {
                 match f.ret_ty {
                     Ty::Concrete(declared) => {
                         self.error_code(
@@ -1064,6 +1073,16 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The statements of `body` with a leading docstring removed.
+    fn body_without_docstring(body: &[HStmt]) -> &[HStmt] {
+        // A leading string literal is the docstring, not code.
+        if let Some(Const::Str(_)) = body.first().and_then(|stmt| Self::literal_stmt(stmt)) {
+            &body[1..]
+        } else {
+            body
+        }
+    }
+
     /// Whether a body only declares a stub: an optional docstring followed by
     /// `pass` or `...` (a typing stub or an abstract placeholder).
     ///
@@ -1071,15 +1090,23 @@ impl<'a> Checker<'a> {
     /// HIR. At runtime such a body returns `None`; the declared return type
     /// describes what an implementation must return.
     fn is_stub_body(body: &[HStmt]) -> bool {
-        let mut stmts = body;
-        // A leading string literal is the docstring, not code.
-        if let Some(Const::Str(_)) = stmts.first().and_then(|stmt| Self::literal_stmt(stmt)) {
-            stmts = &stmts[1..];
-        }
-        match stmts {
+        match Self::body_without_docstring(body) {
             [stmt] => Self::is_stub_marker(stmt),
             _ => false,
         }
+    }
+
+    /// Whether a body only raises: an optional docstring followed by a single
+    /// `raise ...` statement.
+    ///
+    /// Such a body cannot fall through, so it never produces a return value
+    /// and a return annotation on it states what the raising function would
+    /// have returned rather than a value it is missing.
+    fn is_raise_only_body(body: &[HStmt]) -> bool {
+        matches!(
+            Self::body_without_docstring(body),
+            [stmt] if matches!(stmt.kind, HStmtKind::Raise { .. })
+        )
     }
 
     fn check_stmts(
