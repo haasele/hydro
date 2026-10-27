@@ -740,3 +740,77 @@ assert first[1] == slice(None, None, None)
 ",
     );
 }
+
+#[test]
+fn functools_cached_property_and_math_log2_are_real() {
+    run_source(
+        r#"
+import functools
+import math
+from functools import cached_property
+
+calls = []
+
+class Holder:
+    def __init__(self, value):
+        self.value = value
+
+    @cached_property
+    def doubled(self):
+        calls.append(self.value)
+        return self.value * 2
+
+holder = Holder(21)
+assert calls == []
+assert holder.doubled == 42
+assert calls == [21]
+# The second read is the cached instance attribute, not a new computation.
+assert holder.doubled == 42
+assert calls == [21]
+assert holder.__dict__["doubled"] == 42
+
+# Class access returns the descriptor itself and never computes.
+assert isinstance(Holder.doubled, functools.cached_property)
+assert Holder.doubled is Holder.doubled
+assert calls == [21]
+
+# Every instance caches independently.
+other = Holder(1)
+assert other.doubled == 2
+assert other.doubled == 2
+assert calls == [21, 1]
+
+# Deleting the cached value makes the next read recompute it.
+del holder.doubled
+assert holder.doubled == 42
+assert calls == [21, 1, 21]
+
+# A slots-only class has no instance dictionary to cache into.
+class Slotted:
+    __slots__ = ()
+
+    @cached_property
+    def value(self):
+        return 1
+
+try:
+    Slotted().value
+except TypeError as error:
+    assert "No '__dict__' attribute" in str(error)
+else:
+    assert False
+
+# `math.log2` follows CPython, domain errors included.
+assert math.log2(8) == 3.0
+assert math.log2(1024) == 10.0
+assert math.log2(1) == 0.0
+assert abs(math.log2(10) - 3.321928094887362) < 1e-12
+try:
+    math.log2(0)
+except ValueError:
+    pass
+else:
+    assert False
+"#,
+    );
+}

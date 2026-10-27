@@ -321,6 +321,39 @@ fn method_argument_type_mismatch_is_reported() {
 }
 
 #[test]
+fn join_accepts_lists_tuples_generators_and_other_iterables() {
+    let cases = [
+        ("','.join(['x', 'y'])", Type::Str),
+        ("','.join(('x', 'y'))", Type::Str),
+        ("','.join(ch for ch in ['x', 'y'])", Type::Str),
+        ("','.join({'x', 'y'})", Type::Str),
+        ("','.join({'x': 1})", Type::Str),
+        ("','.join('xy')", Type::Str),
+        ("b','.join((b'x', b'y'))", Type::Bytes),
+    ];
+    for (expr, expected) in cases {
+        let source = format!("a = {expr}\n");
+        let program = crate::check_source(&source, "test.py").expect("valid program");
+        assert_eq!(assigned_type(&program, 0), expected, "{source}");
+    }
+}
+
+#[test]
+fn join_rejects_non_iterables() {
+    let errors = check_errors("print(','.join(1))\n");
+    assert_eq!(
+        errors,
+        vec!["str.join() argument 1 has wrong type: expected iterable, got int"]
+    );
+
+    let errors = check_errors("print(b','.join(1))\n");
+    assert_eq!(
+        errors,
+        vec!["bytes.join() argument 1 has wrong type: expected iterable, got int"]
+    );
+}
+
+#[test]
 fn padding_method_signatures_are_registered() {
     let source = "a = 'x'.rjust(3)\n\
                   b = 'x'.ljust(3, '-')\n\

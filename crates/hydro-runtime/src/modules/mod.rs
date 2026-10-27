@@ -1262,6 +1262,12 @@ fn module_get_named(module: &str, name: &str) -> i64 {
     if module == "functools" && name == "partialmethod" {
         return functools::partialmethod_class();
     }
+    // `functools.cached_property` is the same shape: declared as a function so
+    // calls lower as module calls, but the value is the real descriptor class
+    // (`isinstance`, class access and `__get__` need it).
+    if module == "functools" && name == "cached_property" {
+        return functools::cached_property_class();
+    }
     // AST node/operator names are declared as functions so `ast.Name(...)`
     // lowers as a module call, but the value itself is a real class:
     // `isinstance(node, ast.Name)` and `class T(ast.NodeTransformer)` need the
@@ -1673,6 +1679,8 @@ fn itertools_collect(iterable: i64) -> Result<i64, i64> {
 fn itertools_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "permutations" => itertools_permutations(args),
+        "combinations" => itertools_combinations(args),
+        "combinations_with_replacement" => itertools_combinations_with_replacement(args),
         "product" => itertools_product(args, 1),
         "takewhile" => itertools_takewhile(args),
         _ => itertools::call(function, args),
@@ -1784,6 +1792,107 @@ fn itertools_permutations(args: &[i64]) -> i64 {
             } else {
                 let swap = n - cycles[slot];
                 indices.swap(slot, swap);
+                advanced = true;
+                break;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    heap::release_roots(result_roots);
+    heap::release_roots(roots);
+    result
+}
+
+/// `combinations(iterable, r)`: the length-`r` subsets of the input positions,
+/// in the lexicographic order `itertools.combinations` yields.
+fn itertools_combinations(args: &[i64]) -> i64 {
+    itertools_combinations_impl(args, false)
+}
+
+/// `combinations_with_replacement(iterable, r)`: the length-`r` selections that
+/// may reuse a position, in lexicographic order.
+fn itertools_combinations_with_replacement(args: &[i64]) -> i64 {
+    itertools_combinations_impl(args, true)
+}
+
+/// Shared implementation of the two combination combinators.
+///
+/// `indices` holds the pool positions currently selected. Emitting is simply
+/// reading them; advancing finds the rightmost slot that still has room and
+/// refills the tail with the smallest legal positions, which is exactly the
+/// lexicographic successor of the current selection. Without replacement a
+/// slot `i` stops at `n - r + i` (it must leave room for the slots after it),
+/// with replacement at `n - 1` (the tail repeats the advanced position).
+fn itertools_combinations_impl(args: &[i64], replacement: bool) -> i64 {
+    let source = match itertools_collect(args[0]) {
+        Ok(source) => source,
+        Err(error) => return error,
+    };
+    let roots = heap::root_values(&[source]);
+    let items: Vec<i64> = value::as_list(source)
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    let n = items.len();
+    let r = match value::as_integer(args[1]) {
+        Some(r) if r >= 0 => usize::try_from(r).unwrap_or(usize::MAX),
+        Some(_) => {
+            heap::release_roots(roots);
+            return exc::raise_with_message(VALUE_ERROR, "r must be non-negative");
+        }
+        None => {
+            heap::release_roots(roots);
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "integer argument expected, got {}",
+                    value::type_name(args[1])
+                ),
+            );
+        }
+    };
+    let result = value::list_new(Vec::new());
+    // Without replacement `r > n` yields nothing; with replacement the empty
+    // pool is the only pool that cannot supply `r` positions.
+    if (r > n && !replacement) || (n == 0 && r > 0) {
+        heap::release_roots(roots);
+        return result;
+    }
+    let result_roots = heap::root_values(&[result]);
+    // `r == 0` starts (and ends) with the empty selection below, emitting the
+    // single empty tuple CPython yields.
+    let mut indices: Vec<usize> = if replacement {
+        vec![0; r]
+    } else {
+        (0..r).collect()
+    };
+    loop {
+        let tuple = value::tuple_new(
+            indices
+                .iter()
+                .map(|index| items[*index])
+                .collect::<Vec<i64>>(),
+        );
+        container::list_append(result, tuple);
+        let mut advanced = false;
+        for slot in (0..r).rev() {
+            if replacement {
+                if indices[slot] + 1 < n {
+                    indices[slot] += 1;
+                    let start = indices[slot];
+                    for tail in &mut indices[slot + 1..] {
+                        *tail = start;
+                    }
+                    advanced = true;
+                    break;
+                }
+            } else if indices[slot] < n - r + slot {
+                indices[slot] += 1;
+                let start = indices[slot] + 1;
+                for (offset, tail) in indices[slot + 1..].iter_mut().enumerate() {
+                    *tail = start + offset;
+                }
                 advanced = true;
                 break;
             }
@@ -3467,10 +3576,17 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
             }
             Err(err) => err,
         },
-        "log" | "log10" => match number(args[0]) {
+        // `log2(x)` shares `log`/`log10`'s domain rules: a non-positive input
+        // raises `ValueError: math domain error`, NaN propagates and infinity
+        // maps to infinity.
+        "log" | "log10" | "log2" => match number(args[0]) {
             Ok(x) if !x.is_nan() && x <= 0.0 => domain_error(),
             Ok(x) => {
-                let result = if function == "log" { x.ln() } else { x.log10() };
+                let result = match function {
+                    "log" => x.ln(),
+                    "log10" => x.log10(),
+                    _ => x.log2(),
+                };
                 value::float_new(result)
             }
             Err(err) => err,
@@ -3668,6 +3784,10 @@ pub(crate) fn floor_sqrt_int(v: i64) -> i64 {
 /// `partial(f, *args, **kwargs)` stores the keyword values by name; applying
 /// them happens when the partial is called (see
 /// `value::partial_new_with_keywords`).
+///
+/// `cached_property(func)` builds the real descriptor defined in
+/// [`functools::cached_property_class`]; the module form and the class value
+/// (`module_get` returns the class) construct the same state.
 fn functools_call(function: &str, args: &[i64]) -> i64 {
     if let Some(result) = functools::call(function, args) {
         return result;
@@ -3683,11 +3803,13 @@ fn functools_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-/// Keyword-aware `functools` dispatch: only `partial` forwards names.
+/// Keyword-aware `functools` dispatch: `partial` forwards names,
+/// `partialmethod` stores them and `cached_property` binds `func`.
 fn functools_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
     match function {
         "partial" => value::partial_new_with_keywords(args[0], args[1..].to_vec(), keywords),
         "partialmethod" => functools::new_partialmethod(args, &keywords),
+        "cached_property" => functools::new_cached_property(args, &keywords),
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("functools.{function}() does not accept keyword arguments"),
@@ -8356,6 +8478,21 @@ mod tests {
         assert_eq!(as_float(call("math", "sin", &[int(0)])), 0.0);
         assert_eq!(as_float(call("math", "cos", &[int(0)])), 1.0);
         assert_eq!(as_float(call("math", "exp", &[int(0)])), 1.0);
+        // `log2` follows CPython: exact for powers of two, NaN and infinity
+        // propagate, and float inputs keep full precision.
+        assert_eq!(as_float(call("math", "log2", &[int(8)])), 3.0);
+        assert_eq!(as_float(call("math", "log2", &[int(1)])), 0.0);
+        assert_eq!(as_float(call("math", "log2", &[int(1024)])), 10.0);
+        assert_eq!(
+            as_float(call("math", "log2", &[value::float_new(0.5)])),
+            -1.0
+        );
+        assert_eq!(
+            as_float(call("math", "log2", &[value::float_new(10.0)])),
+            10f64.log2()
+        );
+        assert!(as_float(call("math", "log2", &[get("math", "inf")])).is_infinite());
+        assert!(as_float(call("math", "log2", &[value::float_new(f64::NAN)])).is_nan());
     }
 
     #[test]
@@ -8367,6 +8504,20 @@ mod tests {
         exc::init();
         assert_eq!(call("math", "log", &[int(0)]), NONE);
         assert_eq!(message(), "math domain error");
+        exc::init();
+        assert_eq!(call("math", "log2", &[int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "math domain error");
+        exc::init();
+        assert_eq!(call("math", "log2", &[int(-8)]), NONE);
+        assert_eq!(message(), "math domain error");
+        exc::init();
+        assert_eq!(call("math", "log2", &[value::float_new(-0.0)]), NONE);
+        assert_eq!(message(), "math domain error");
+        exc::init();
+        assert_eq!(call("math", "log2", &[string("x")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "must be real number, not str");
         exc::init();
         assert_eq!(call("math", "asin", &[value::float_new(2.0)]), NONE);
         assert_eq!(message(), "math domain error");
@@ -10839,6 +10990,53 @@ mod tests {
         assert!(!exc::pending());
     }
 
+    #[test]
+    fn functools_cached_property_is_a_descriptor_class() {
+        // The registry caches one class value for the whole process, so pin
+        // the heap generation while the identity assertions run.
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let class = get("functools", "cached_property");
+        assert_eq!(
+            value::as_class(class).map(|state| state.name.as_str()),
+            Some("cached_property")
+        );
+
+        // The module-call entry and the class value build the same descriptor.
+        let getter = value::identity_function_new("computed");
+        let descriptor = call("functools", "cached_property", &[getter]);
+        assert_eq!(value::instance_class_value(descriptor), Some(class));
+        assert_eq!(value::instance_attr(descriptor, "func"), Some(getter));
+        assert_eq!(
+            value::instance_attr(descriptor, "attrname").and_then(value::as_str),
+            None,
+            "the attribute name is learned on first access"
+        );
+        let via_class = call_value(class, &[getter]);
+        assert_eq!(value::instance_class_value(via_class), Some(class));
+        let via_keyword = call_kw("functools", "cached_property", &[], &[("func", getter)]);
+        assert_eq!(value::instance_attr(via_keyword, "func"), Some(getter));
+        assert!(!exc::pending());
+
+        // The descriptor caches in the instance namespace: the getter returns
+        // the instance itself, so the cached value is recognisable.
+        let holder = value::class_new_full(
+            "Holder".to_string(),
+            NONE,
+            Vec::new(),
+            vec![("computed".to_string(), descriptor)],
+        );
+        let instance = value::instance_new(holder);
+        assert_eq!(attribute(holder, "computed"), descriptor);
+        assert_eq!(attribute(instance, "computed"), instance);
+        assert_eq!(value::instance_attr(instance, "computed"), Some(instance));
+        assert_eq!(
+            value::instance_attr(descriptor, "attrname").and_then(value::as_str),
+            Some("computed")
+        );
+        assert!(!exc::pending());
+    }
+
     /// Stand-in for a generated wrapper taking two positional parameters.
     extern "C" fn pair_probe(argv: *const i64) -> i64 {
         // SAFETY: the runtime only enters a wrapper after checking its arity.
@@ -12260,5 +12458,188 @@ mod tests {
             .map(|item| value::as_integer(*item).unwrap_or(i64::MIN))
             .collect();
         assert_eq!(prefix, vec![1, 2]);
+    }
+
+    #[test]
+    fn itertools_combinations_are_lexicographic() {
+        exc::init();
+        let input = value::list_new(vec![int(1), int(2), int(3), int(4)]);
+
+        let pairs = call("itertools", "combinations", &[input, int(2)]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            tuple_ints(pairs),
+            vec![
+                vec![1, 2],
+                vec![1, 3],
+                vec![1, 4],
+                vec![2, 3],
+                vec![2, 4],
+                vec![3, 4],
+            ]
+        );
+
+        // `r == 0` yields exactly one empty tuple; `r > n` yields nothing.
+        let zero = call("itertools", "combinations", &[input, int(0)]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(tuple_ints(zero), vec![Vec::<i64>::new()]);
+        let too_many = call("itertools", "combinations", &[input, int(5)]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(tuple_ints(too_many).is_empty());
+
+        // The empty pool only produces the empty selection.
+        let empty_pool = value::list_new(Vec::new());
+        let empty_zero = call("itertools", "combinations", &[empty_pool, int(0)]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(tuple_ints(empty_zero), vec![Vec::<i64>::new()]);
+        let empty_one = call("itertools", "combinations", &[empty_pool, int(1)]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(tuple_ints(empty_one).is_empty());
+
+        // Positions are combined, so repeated values produce repeated rows.
+        let duplicates = value::list_new(vec![int(1), int(1), int(2)]);
+        let duplicated = call("itertools", "combinations", &[duplicates, int(2)]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            tuple_ints(duplicated),
+            vec![vec![1, 1], vec![1, 2], vec![1, 2]]
+        );
+
+        // Rows are fresh tuples placed in the result list, and the pool keeps
+        // its order.
+        let rows = value::as_list(pairs).unwrap_or_default();
+        assert_eq!(rows.len(), 6);
+        for (offset, row) in rows.iter().enumerate() {
+            assert!(
+                value::as_tuple(*row).is_some(),
+                "row {offset} is not a tuple"
+            );
+            for (other, peer) in rows.iter().enumerate().skip(offset + 1) {
+                assert_ne!(*row, *peer, "rows {offset} and {other} alias");
+            }
+        }
+        let remaining: Vec<i64> = value::as_list(input)
+            .unwrap_or_default()
+            .iter()
+            .map(|item| value::as_integer(*item).unwrap_or(i64::MIN))
+            .collect();
+        assert_eq!(remaining, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn itertools_combinations_with_replacement_reuses_positions() {
+        exc::init();
+        let input = value::list_new(vec![int(1), int(2), int(3)]);
+
+        let pairs = call(
+            "itertools",
+            "combinations_with_replacement",
+            &[input, int(2)],
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            tuple_ints(pairs),
+            vec![
+                vec![1, 1],
+                vec![1, 2],
+                vec![1, 3],
+                vec![2, 2],
+                vec![2, 3],
+                vec![3, 3],
+            ]
+        );
+
+        // `r` may exceed the pool; only the empty pool cannot supply it.
+        // Replacement allows repeated positions, so every length-5 multiset
+        // of the three values appears: C(3 + 5 - 1, 5) == C(7, 5) == 21 rows,
+        // in the order CPython's `combinations_with_replacement` yields.
+        let longer = call(
+            "itertools",
+            "combinations_with_replacement",
+            &[input, int(5)],
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(
+            tuple_ints(longer),
+            vec![
+                vec![1, 1, 1, 1, 1],
+                vec![1, 1, 1, 1, 2],
+                vec![1, 1, 1, 1, 3],
+                vec![1, 1, 1, 2, 2],
+                vec![1, 1, 1, 2, 3],
+                vec![1, 1, 1, 3, 3],
+                vec![1, 1, 2, 2, 2],
+                vec![1, 1, 2, 2, 3],
+                vec![1, 1, 2, 3, 3],
+                vec![1, 1, 3, 3, 3],
+                vec![1, 2, 2, 2, 2],
+                vec![1, 2, 2, 2, 3],
+                vec![1, 2, 2, 3, 3],
+                vec![1, 2, 3, 3, 3],
+                vec![1, 3, 3, 3, 3],
+                vec![2, 2, 2, 2, 2],
+                vec![2, 2, 2, 2, 3],
+                vec![2, 2, 2, 3, 3],
+                vec![2, 2, 3, 3, 3],
+                vec![2, 3, 3, 3, 3],
+                vec![3, 3, 3, 3, 3],
+            ]
+        );
+
+        let zero = call(
+            "itertools",
+            "combinations_with_replacement",
+            &[input, int(0)],
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(tuple_ints(zero), vec![Vec::<i64>::new()]);
+
+        let empty_pool = value::list_new(Vec::new());
+        let empty_zero = call(
+            "itertools",
+            "combinations_with_replacement",
+            &[empty_pool, int(0)],
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(tuple_ints(empty_zero), vec![Vec::<i64>::new()]);
+        let empty_one = call(
+            "itertools",
+            "combinations_with_replacement",
+            &[empty_pool, int(1)],
+        );
+        assert!(!exc::pending(), "{}", message());
+        assert!(tuple_ints(empty_one).is_empty());
+    }
+
+    #[test]
+    fn itertools_combinations_validate_r() {
+        exc::init();
+        let input = value::list_new(vec![int(1), int(2)]);
+        call("itertools", "combinations", &[input, int(-1)]);
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        assert_eq!(message(), "r must be non-negative");
+        exc::clear();
+        call(
+            "itertools",
+            "combinations_with_replacement",
+            &[input, int(-1)],
+        );
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        assert_eq!(message(), "r must be non-negative");
+        exc::clear();
+
+        let not_an_integer = value::float_new(1.0);
+        call("itertools", "combinations", &[input, not_an_integer]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        assert_eq!(message(), "integer argument expected, got float");
+        exc::clear();
+        call(
+            "itertools",
+            "combinations_with_replacement",
+            &[input, not_an_integer],
+        );
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        assert_eq!(message(), "integer argument expected, got float");
+        exc::clear();
     }
 }

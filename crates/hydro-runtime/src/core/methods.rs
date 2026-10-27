@@ -6103,7 +6103,51 @@ mod tests {
         assert_eq!(text(joined), "a-b-c");
         assert_eq!(text(invoke(string(""), "join", &[list(&[])])), "");
 
+        // Tuples are iterables too.
+        assert_eq!(
+            text(invoke(
+                string("-"),
+                "join",
+                &[tuple(&[string("a"), string("b"), string("c")])]
+            )),
+            "a-b-c"
+        );
+
+        // Every other iterable is consumed through the iterator ABI.
+        let iterator = crate::core::iter::iter_new(list(&[string("a"), string("b")]));
+        assert_eq!(text(invoke(string("+"), "join", &[iterator])), "a+b");
+
+        let generator = value::fiber_generator_new(
+            yields_join_parts as *const () as usize,
+            "join_parts".to_string(),
+            Vec::new(),
+        )
+        .expect("generator");
+        assert_eq!(text(invoke(string("/"), "join", &[generator])), "a/b");
+
         invoke(string("a"), "join", &[list(&[int(1), int(2)])]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "sequence item 0: expected str instance, int found"
+        );
+
+        reset();
+        invoke(string("a"), "join", &[tuple(&[string("a"), int(1)])]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "sequence item 1: expected str instance, int found"
+        );
+
+        reset();
+        let generator = value::fiber_generator_new(
+            yields_join_int as *const () as usize,
+            "join_int".to_string(),
+            Vec::new(),
+        )
+        .expect("generator");
+        invoke(string("a"), "join", &[generator]);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
         assert_eq!(
             message(),
@@ -6113,6 +6157,19 @@ mod tests {
         reset();
         invoke(string("a"), "join", &[int(1)]);
         assert_eq!(message(), "can only join an iterable");
+    }
+
+    /// Generator body yielding the string parts `a`, `b` for the join tests.
+    extern "C" fn yields_join_parts(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(string("a"));
+        crate::fiber::yield_value(string("b"));
+        NONE
+    }
+
+    /// Generator body yielding a non-string item, rejected by `str.join`.
+    extern "C" fn yields_join_int(_argv: *const i64) -> i64 {
+        crate::fiber::yield_value(int(1));
+        NONE
     }
 
     #[test]

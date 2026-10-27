@@ -8,6 +8,42 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 `functools.cached_property` and `math.log2`
+
+- `functools.cached_property` is a real non-data descriptor: `__get__` calls
+  the wrapped getter once per instance and caches the result in the instance
+  `__dict__` under the attribute name, class access returns the descriptor,
+  `__set_name__` records the name (Hydro's frozen class namespaces have no
+  creation hook, so a first access recovers the same name from the owner
+  namespace), and the CPython `TypeError`s for a missing `__dict__`, an
+  unnamed descriptor and the same descriptor under two names are preserved.
+  `__doc__`/`__module__`/`__name__` mirror the getter's metadata. This
+  unblocks NumPy's `_core/getlimits.py`.
+- `math.log2` follows CPython: exact for powers of two, NaN and infinity
+  propagate, and non-positive inputs raise `ValueError: math domain error`
+  (`math.log`/`math.log10` share the path). `math.log1p`/`math.expm1` remain
+  unimplemented.
+
+### Fixed — 2026-10-27 `str.join` accepts every iterable
+
+- The static signatures of `str.join` and `bytes.join` accept any iterable
+  (list, tuple, set, dict, range, str, bytes, or a dynamic generator), matching
+  CPython; previously only lists were accepted, so `''.join((*a, *b))` was
+  rejected. The runtime already consumed the argument through the iterator ABI,
+  so tuples and generators now work end to end, with per-item type errors
+  unchanged.
+
+### Added — 2026-10-27 `itertools.combinations`
+
+- `itertools.combinations(iterable, r)` and
+  `itertools.combinations_with_replacement(iterable, r)` materialise every
+  length-`r` selection of the input positions as a list of tuples, in
+  lexicographic order. `r == 0` yields one empty tuple, `r > n` yields nothing
+  for `combinations`, and a negative `r` raises the CPython `ValueError`; the
+  latter reuses positions and therefore accepts `r > n`. Both carry static
+  signatures, so the `list` result propagates through type inference. This
+  unblocks NumPy's `einsumfunc`, which imports `combinations`.
+
 ### Added — 2026-10-27 String padding methods
 
 - `str.rjust`, `str.ljust` and `str.center` pad to a character (code point)

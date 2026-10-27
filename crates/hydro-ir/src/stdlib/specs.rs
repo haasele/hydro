@@ -17,6 +17,7 @@ pub static MATH: ModuleSpec = ModuleSpec {
         f("exp", 1, 1, Type::Float),
         f("log", 1, 1, Type::Float),
         f("log10", 1, 1, Type::Float),
+        f("log2", 1, 1, Type::Float),
         f("pow", 2, 2, Type::Float),
         f("floor", 1, 1, Type::Int),
         f("ceil", 1, 1, Type::Int),
@@ -81,6 +82,14 @@ const FUNCTOOLS_FUNCTIONS: &[FunctionSpec] = &[
     f("_unwrap_partial", 1, 1, Type::Any),
     f("_unwrap_partialmethod", 1, 1, Type::Any),
     f("_singledispatchmethod_get", 1, 3, Type::Any),
+    // `cached_property(func)`: a real descriptor class at runtime (see the
+    // runtime `functools` module); the module entry builds the same instance
+    // for module-call lowering. `func` may also be passed by keyword, exactly
+    // like CPython's `__init__(self, func)`, which is why the entry is
+    // keyword-dynamic: the module dispatcher rejects every keyword call whose
+    // spec is not dynamic. The runtime still validates the name and rejects an
+    // unknown one with `__init__`'s `TypeError`.
+    kw_dynamic("cached_property", 1, 1, Type::Any, &["func"]),
     // `partialmethod(func, /, *args, **keywords)`: a real descriptor at
     // runtime (`module_get` returns the cached class so `isinstance` works);
     // the module entry builds the same instance for module-call lowering.
@@ -1953,6 +1962,8 @@ pub static ITERTOOLS: ModuleSpec = ModuleSpec {
         f("accumulate", 1, 3, Type::List),
         f("tee", 1, 2, Type::Any),
         f("permutations", 1, 2, Type::List),
+        f("combinations", 2, 2, Type::List),
+        f("combinations_with_replacement", 2, 2, Type::List),
         // `product(*iterables, repeat=1)`: every positional argument is an
         // iterable and `repeat` is keyword-only, so the runtime binds the
         // keyword itself (`dynamic_keywords`).
@@ -3812,6 +3823,12 @@ mod tests {
         assert_eq!(product.min_args, 0);
         assert_eq!(product.max_args, usize::MAX);
         assert!(product.dynamic_keywords);
+        for name in ["combinations", "combinations_with_replacement"] {
+            let combinator = function("itertools", name).unwrap();
+            assert_eq!((combinator.min_args, combinator.max_args), (2, 2));
+            assert_eq!(combinator.ret, Type::List);
+            assert!(!combinator.dynamic_keywords);
+        }
         assert_eq!(
             (
                 function("itertools", "takewhile").unwrap().min_args,
@@ -3904,6 +3921,19 @@ mod tests {
         for name in ["WRAPPER_ASSIGNMENTS", "WRAPPER_UPDATES"] {
             assert_eq!(constant("functools", name).unwrap().ty, Type::Any);
         }
+        // `cached_property(func)` is a descriptor class and a module-call
+        // constructor; the getter may also be passed by keyword.
+        let cached_property = function("functools", "cached_property").expect("cached_property");
+        assert_eq!((cached_property.min_args, cached_property.max_args), (1, 1));
+        assert_eq!(cached_property.params, &["func"][..]);
+        assert_eq!(cached_property.ret, Type::Any);
+        // Keyword-dynamic so `cached_property(func=...)` reaches the module
+        // dispatcher, which rejects any other name with `__init__`'s error.
+        assert!(cached_property.dynamic_keywords);
+        assert_eq!(
+            function("_functools", "cached_property").map(|spec| spec.min_args),
+            Some(1)
+        );
     }
 
     #[test]
@@ -3944,6 +3974,15 @@ mod tests {
         let gcd = function("math", "gcd").expect("math.gcd");
         assert_eq!((gcd.min_args, gcd.max_args), (0, usize::MAX));
         assert_eq!(gcd.ret, Type::Int);
+    }
+
+    #[test]
+    fn math_log2_is_registered_as_a_float_function() {
+        for name in ["log", "log10", "log2"] {
+            let spec = function("math", name).unwrap_or_else(|| panic!("math.{name}"));
+            assert_eq!((spec.min_args, spec.max_args), (1, 1), "{name}");
+            assert_eq!(spec.ret, Type::Float, "{name}");
+        }
     }
 
     #[test]

@@ -201,6 +201,9 @@ enum ArgKind {
     Hashable,
     /// `set.union` accepts a set, list or tuple.
     SetIterable,
+    /// Any type whose values can be iterated: `str.join`/`bytes.join` accept
+    /// every iterable, not just lists (CPython iterates the argument).
+    Iterable,
 }
 
 impl ArgKind {
@@ -220,6 +223,16 @@ impl ArgKind {
             // tuples with unhashable elements are rejected recursively.
             ArgKind::Hashable => true,
             ArgKind::SetIterable => matches!(got, Type::Set | Type::List | Type::Tuple),
+            ArgKind::Iterable => matches!(
+                got,
+                Type::List
+                    | Type::Tuple
+                    | Type::Set
+                    | Type::Dict
+                    | Type::Range
+                    | Type::Str
+                    | Type::Bytes
+            ),
         }
     }
 
@@ -233,6 +246,7 @@ impl ArgKind {
             ArgKind::Dict => "dict",
             ArgKind::Hashable => "hashable",
             ArgKind::SetIterable => "set, list or tuple",
+            ArgKind::Iterable => "iterable",
         }
     }
 
@@ -246,6 +260,10 @@ impl ArgKind {
             ArgKind::List => Some(Type::List),
             ArgKind::Dict => Some(Type::Dict),
             ArgKind::SetIterable => Some(Type::Set),
+            // Lists are the common `join` operand; keep the previous
+            // narrowing so later list operations on the same unresolved
+            // variable are still checked.
+            ArgKind::Iterable => Some(Type::List),
         }
     }
 }
@@ -322,7 +340,10 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
         MethodSig::new(1, 2, &[ArgKind::Int, ArgKind::Str], Type::Str),
     ),
     ("zfill", MethodSig::new(1, 1, &[ArgKind::Int], Type::Str)),
-    ("join", MethodSig::new(1, 1, &[ArgKind::List], Type::Str)),
+    (
+        "join",
+        MethodSig::new(1, 1, &[ArgKind::Iterable], Type::Str),
+    ),
     (
         "replace",
         MethodSig::new(2, 3, &[ArgKind::Str, ArgKind::Str, ArgKind::Int], Type::Str),
@@ -379,7 +400,10 @@ const BYTES_METHODS: &[(&str, MethodSig)] = &[
         "splitlines",
         MethodSig::new(0, 1, &[ArgKind::Any], Type::List),
     ),
-    ("join", MethodSig::new(1, 1, &[ArgKind::List], Type::Bytes)),
+    (
+        "join",
+        MethodSig::new(1, 1, &[ArgKind::Iterable], Type::Bytes),
+    ),
     (
         "strip",
         MethodSig::new(0, 1, &[ArgKind::Bytes], Type::Bytes),

@@ -30,6 +30,14 @@
 //! `Placeholder` holes exactly like `functools.partialmethod` does. The
 //! `Placeholder` singleton is an instance of `_PlaceholderType`.
 //!
+//! `cached_property` is a native class too, and it caches for real: `__get__`
+//! calls the wrapped getter once per instance and stores the result in the
+//! instance's `__dict__` under the attribute name, so every later read is a
+//! plain instance-attribute hit. The class namespace has no creation hook
+//! (see [`cached_property_name`]), so the descriptor learns its attribute name
+//! from a `__set_name__` call when one happens and otherwise recovers the same
+//! name from the owner class namespace on the first access.
+//!
 //! Limits, reported instead of fabricated:
 //! - `singledispatchmethod` itself is not implemented, so the wrapper stores
 //!   the descriptor and the `(obj, cls)` pair but cannot delegate dispatch.
@@ -1080,6 +1088,315 @@ fn partialmethod_isabstractmethod(instance: i64) -> i64 {
     value::bool_value(value::truthy(flag))
 }
 
+// cached_property
+
+/// The cached `functools.cached_property` class.
+///
+/// The state lives in instance attributes, exactly like the pure-Python
+/// class: `func` is the wrapped getter, `attrname` the attribute name learned
+/// from `__set_name__` (or recovered by [`cached_property_name`]), and
+/// `__doc__`/`__module__`/`__name__` mirror the getter's metadata.
+pub(crate) fn cached_property_class() -> i64 {
+    if let Some(cached) = crate::core::globals::registry_get("functools.cached_property") {
+        return cached;
+    }
+    let init = method_entry(
+        "functools",
+        "_cached_property_init",
+        cached_property_init_entry,
+        vec![
+            self_parameter(),
+            value::ParamMeta {
+                name: "func".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+        ],
+    );
+    let get = method_entry(
+        "functools",
+        "_cached_property_get",
+        cached_property_get_entry,
+        vec![
+            self_parameter(),
+            value::ParamMeta {
+                name: "instance".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "owner".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(NONE),
+            },
+        ],
+    );
+    let set_name = method_entry(
+        "functools",
+        "_cached_property_set_name",
+        cached_property_set_name_entry,
+        vec![
+            self_parameter(),
+            value::ParamMeta {
+                name: "owner".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "name".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+        ],
+    );
+    let class = value::class_new_full(
+        "cached_property".to_string(),
+        NONE,
+        vec![
+            ("__init__".to_string(), init, MethodKind::Normal),
+            ("__get__".to_string(), get, MethodKind::Normal),
+            ("__set_name__".to_string(), set_name, MethodKind::Normal),
+        ],
+        Vec::new(),
+    );
+    crate::core::globals::registry_set("functools.cached_property", class);
+    class
+}
+
+/// `functools.cached_property(func)` through the module call path.
+///
+/// `CPython`'s `__init__(self, func)` also accepts `func` by keyword, so the
+/// module entry binds the same name.
+pub(crate) fn new_cached_property(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if args.len() > 1 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "cached_property.__init__() takes 2 positional arguments ({} given)",
+                1 + args.len()
+            ),
+        );
+    }
+    let mut func = args.first().copied();
+    for (name, item) in keywords {
+        if name != "func" {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("cached_property.__init__() got an unexpected keyword argument '{name}'"),
+            );
+        }
+        if func.is_some() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "cached_property.__init__() got multiple values for argument 'func'",
+            );
+        }
+        func = Some(*item);
+    }
+    let Some(func) = func else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "cached_property.__init__() missing 1 required positional argument: 'func'",
+        );
+    };
+    build_cached_property(func)
+}
+
+/// Allocates a `cached_property` descriptor for `func`.
+fn build_cached_property(func: i64) -> i64 {
+    let class = cached_property_class();
+    let roots = heap::root_values(&[func, class]);
+    let instance = value::instance_new(class);
+    let instance_roots = heap::root_values(&[instance]);
+    let result = initialize_cached_property(instance, func);
+    heap::release_roots(instance_roots);
+    heap::release_roots(roots);
+    result
+}
+
+/// Stores CPython's `cached_property` state on `instance`.
+fn initialize_cached_property(instance: i64, func: i64) -> i64 {
+    let roots = heap::root_values(&[instance, func]);
+    value::instance_setattr(instance, "func".to_string(), func);
+    // `None` until `__set_name__` (or the owner-namespace lookup) names it.
+    value::instance_setattr(instance, "attrname".to_string(), NONE);
+    for name in ["__doc__", "__module__", "__name__"] {
+        let metadata = cached_property_metadata(func, name);
+        value::instance_setattr(instance, name.to_string(), metadata);
+    }
+    heap::release_roots(roots);
+    instance
+}
+
+/// The getter metadata CPython copies in `cached_property.__init__`.
+///
+/// Hydro function values keep `__name__`/`__doc__`/`__module__` in their
+/// metadata slots; other callables carry none of them, so the attribute is
+/// `None` instead of raising from `__init__`.
+fn cached_property_metadata(func: i64, name: &str) -> i64 {
+    if value::as_function(func).is_none() {
+        return NONE;
+    }
+    match name {
+        "__doc__" => value::function_doc(func),
+        "__module__" => value::function_module(func).unwrap_or(NONE),
+        _ => value::str_alloc(value::function_name(func)),
+    }
+}
+
+/// `cached_property.__init__(self, func)` through the class-call path.
+extern "C" fn cached_property_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the class-call binder passes `(self, func)`.
+    let instance = unsafe { *argv };
+    let func = unsafe { *argv.add(1) };
+    let roots = heap::root_values(&[instance, func]);
+    let result = initialize_cached_property(instance, func);
+    heap::release_roots(roots);
+    result
+}
+
+/// `cached_property.__get__(self, instance, owner=None)`.
+extern "C" fn cached_property_get_entry(argv: *const i64) -> i64 {
+    // SAFETY: the descriptor binder passes `(self, instance, owner)`.
+    let this = unsafe { *argv };
+    let instance = unsafe { *argv.add(1) };
+    let owner = unsafe { *argv.add(2) };
+    cached_property_get(this, instance, owner)
+}
+
+fn cached_property_get(this: i64, instance: i64, owner: i64) -> i64 {
+    // Class access returns the descriptor itself, exactly like CPython.
+    if instance == NONE {
+        return this;
+    }
+    let name = match cached_property_name(this, owner) {
+        Ok(name) => name,
+        Err(error) => return error,
+    };
+    let Some(class) = value::instance_class_value(instance) else {
+        return cached_property_no_dict(instance, &name);
+    };
+    if !value::class_has_dict(class) {
+        return cached_property_no_dict(instance, &name);
+    }
+    // The cache is the instance namespace: a hit is an ordinary instance
+    // attribute, which is also why later reads never reach `__get__`.
+    if let Some(cached) = value::instance_attr(instance, &name) {
+        return cached;
+    }
+    let Some(func) = value::instance_attr(this, "func") else {
+        return exc::raise_with_message(TYPE_ERROR, "cached_property instance has no 'func'");
+    };
+    let roots = heap::root_values(&[this, instance, func]);
+    let computed = crate::core::builtins::call(func, 1, &instance);
+    if !exc::pending() {
+        let computed_roots = heap::root_values(&[computed]);
+        value::instance_setattr(instance, name, computed);
+        heap::release_roots(computed_roots);
+    }
+    heap::release_roots(roots);
+    computed
+}
+
+/// CPython's error when the instance cannot hold the cache.
+fn cached_property_no_dict(instance: i64, name: &str) -> i64 {
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "No '__dict__' attribute on '{}' instance to cache '{}' property.",
+            value::type_name_of(instance),
+            name
+        ),
+    )
+}
+
+/// The attribute name of the descriptor on `owner`.
+///
+/// `__set_name__` records the name when it runs. Hydro's class namespace is
+/// built and frozen by `class_new_*` without a creation hook, so the hook
+/// never runs for a class statement; the first `__get__` therefore recovers
+/// the name from the owner's frozen namespace: the entry whose value is this
+/// very descriptor. That is the name `type.__new__` would have passed to
+/// `__set_name__`, so the cache key and the double-assignment `TypeError` stay
+/// CPython's. Only the namespace frozen at class creation is scanned —
+/// assigning a descriptor to a class afterwards does not run `__set_name__` in
+/// CPython either, and stays the "without calling __set_name__" `TypeError`
+/// here. The resolved name is written back to `attrname`, so the scan happens
+/// once per descriptor.
+fn cached_property_name(this: i64, owner: i64) -> Result<String, i64> {
+    if let Some(name) = value::instance_attr(this, "attrname").and_then(value::as_str) {
+        return Ok(name.to_string());
+    }
+    let mut names: Vec<String> = Vec::new();
+    for class in value::class_mro(owner) {
+        let Some(state) = value::as_class(class) else {
+            continue;
+        };
+        for (name, item) in &state.attrs {
+            if *item == this && !names.iter().any(|existing| existing == name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    match names.len() {
+        0 => Err(exc::raise_with_message(
+            TYPE_ERROR,
+            "Cannot use cached_property instance without calling __set_name__ on it.",
+        )),
+        1 => {
+            let name = names.remove(0);
+            let roots = heap::root_values(&[this]);
+            value::instance_setattr(this, "attrname".to_string(), value::str_alloc(name.clone()));
+            heap::release_roots(roots);
+            Ok(name)
+        }
+        // CPython rejects the second `__set_name__` instead of guessing.
+        _ => Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "Cannot assign the same cached_property to two different names ('{}' and '{}').",
+                names[0], names[1]
+            ),
+        )),
+    }
+}
+
+/// `cached_property.__set_name__(self, owner, name)`.
+extern "C" fn cached_property_set_name_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, owner, name)`.
+    let this = unsafe { *argv };
+    let name = unsafe { *argv.add(2) };
+    cached_property_set_name(this, name)
+}
+
+fn cached_property_set_name(this: i64, name: i64) -> i64 {
+    let Some(name_text) = value::as_str(name) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "cached_property attribute name must be a string, not {}",
+                value::type_name(name)
+            ),
+        );
+    };
+    match value::instance_attr(this, "attrname").and_then(value::as_str) {
+        None => {
+            let roots = heap::root_values(&[this, name]);
+            value::instance_setattr(this, "attrname".to_string(), name);
+            heap::release_roots(roots);
+            NONE
+        }
+        Some(existing) if existing == name_text => NONE,
+        Some(existing) => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "Cannot assign the same cached_property to two different names ('{existing}' and \
+                 '{name_text}')."
+            ),
+        ),
+    }
+}
+
 /// Dispatches the `functools` internals, the `partialmethod` class methods and
 /// the native methods of `_singledispatchmethod_get`. Returns `None` for every
 /// other function.
@@ -1163,6 +1480,19 @@ pub(crate) fn call(function: &str, args: &[i64]) -> Option<i64> {
         },
         "_partialmethod_isabstractmethod" => partialmethod_isabstractmethod(args[0]),
         "_placeholder_repr" => value::str_alloc("Placeholder".to_string()),
+        "cached_property" => new_cached_property(args, &[]),
+        "_cached_property_init" => match args {
+            [instance, func] => initialize_cached_property(*instance, *func),
+            _ => exc::raise_with_message(TYPE_ERROR, "_cached_property_init() takes 2 arguments"),
+        },
+        "_cached_property_get" => match args {
+            [this, obj, cls] => cached_property_get(*this, *obj, *cls),
+            _ => exc::raise_with_message(TYPE_ERROR, "__get__() takes 3 arguments"),
+        },
+        "_cached_property_set_name" => match args {
+            [this, _owner, name] => cached_property_set_name(*this, *name),
+            _ => exc::raise_with_message(TYPE_ERROR, "__set_name__() takes 3 arguments"),
+        },
         _ => return None,
     })
 }
@@ -1704,6 +2034,224 @@ mod tests {
         );
         assert_eq!(attribute(merged, "__wrapped__"), wrapped);
         assert!(!exc::pending());
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts how many times the `cached_property` getter ran.
+    static CACHED_PROPERTY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn cached_property_getter_entry(_argv: *const i64) -> i64 {
+        let calls = CACHED_PROPERTY_CALLS.fetch_add(1, Ordering::Relaxed);
+        int(calls as i64)
+    }
+
+    /// A getter reporting how many times it has been called. Resets the
+    /// counter, so a test observes only its own calls.
+    fn counting_getter() -> i64 {
+        CACHED_PROPERTY_CALLS.store(0, Ordering::Relaxed);
+        value::function_new(
+            cached_property_getter_entry as *const () as usize,
+            1,
+            "value".to_string(),
+        )
+    }
+
+    /// `class Holder: value = <descriptor>`.
+    fn holder_class(descriptor: i64) -> i64 {
+        value::class_new_full(
+            "Holder".to_string(),
+            NONE,
+            Vec::new(),
+            vec![("value".to_string(), descriptor)],
+        )
+    }
+
+    #[test]
+    fn cached_property_caches_per_instance_in_the_instance_namespace() {
+        exc::init();
+        let descriptor = build_cached_property(counting_getter());
+        assert_eq!(
+            value::instance_class_name(descriptor),
+            Some("cached_property")
+        );
+        assert_eq!(value::instance_attr(descriptor, "attrname"), Some(NONE));
+
+        let class = holder_class(descriptor);
+        // Class access returns the descriptor itself and never runs the
+        // getter.
+        assert_eq!(attribute(class, "value"), descriptor);
+        assert_eq!(CACHED_PROPERTY_CALLS.load(Ordering::Relaxed), 0);
+
+        let instance = value::instance_new(class);
+        let first = attribute(instance, "value");
+        assert_eq!(value::as_integer(first), Some(0));
+        assert_eq!(CACHED_PROPERTY_CALLS.load(Ordering::Relaxed), 1);
+        // The cache is an ordinary instance attribute under the attribute
+        // name, so a later read never reaches `__get__`.
+        assert_eq!(value::instance_attr(instance, "value"), Some(first));
+        assert_eq!(attribute(instance, "value"), first);
+        assert_eq!(CACHED_PROPERTY_CALLS.load(Ordering::Relaxed), 1);
+        // The descriptor records the recovered name, like `__set_name__`.
+        assert_eq!(
+            value::instance_attr(descriptor, "attrname").and_then(value::as_str),
+            Some("value")
+        );
+        // A second instance computes its own value.
+        let other = value::instance_new(class);
+        assert_eq!(value::as_integer(attribute(other, "value")), Some(1));
+        assert_eq!(CACHED_PROPERTY_CALLS.load(Ordering::Relaxed), 2);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn cached_property_set_name_records_and_rejects_a_second_name() {
+        exc::init();
+        let descriptor = build_cached_property(counting_getter());
+        assert_eq!(
+            call(
+                "_cached_property_set_name",
+                &[descriptor, NONE, text("value")]
+            ),
+            Some(NONE)
+        );
+        assert_eq!(
+            value::instance_attr(descriptor, "attrname").and_then(value::as_str),
+            Some("value")
+        );
+        // Repeating the same name is idempotent.
+        assert_eq!(
+            call(
+                "_cached_property_set_name",
+                &[descriptor, NONE, text("value")]
+            ),
+            Some(NONE)
+        );
+        assert!(!exc::pending());
+        // A second, different name is CPython's TypeError.
+        call(
+            "_cached_property_set_name",
+            &[descriptor, NONE, text("other")],
+        );
+        assert!(exc::pending());
+        assert!(
+            value::to_string(exc::pending_value()).contains("two different names"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        exc::clear();
+        // A non-string name cannot be recorded.
+        call("_cached_property_set_name", &[descriptor, NONE, int(3)]);
+        assert!(exc::pending());
+        assert!(value::to_string(exc::pending_value()).contains("must be a string"));
+        exc::clear();
+    }
+
+    #[test]
+    fn cached_property_reports_the_cpython_errors() {
+        // A descriptor unreachable from the owner namespace has no name.
+        exc::init();
+        let descriptor = build_cached_property(counting_getter());
+        let class = value::class_new("Holder".to_string(), NONE, Vec::new());
+        let instance = value::instance_new(class);
+        cached_property_get(descriptor, instance, class);
+        assert!(exc::pending());
+        assert!(
+            value::to_string(exc::pending_value()).contains("without calling __set_name__"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        exc::clear();
+
+        // Two attribute names for the same descriptor are rejected, like
+        // CPython's second `__set_name__` call.
+        let descriptor = build_cached_property(counting_getter());
+        let class = value::class_new_full(
+            "Holder".to_string(),
+            NONE,
+            Vec::new(),
+            vec![
+                ("first".to_string(), descriptor),
+                ("second".to_string(), descriptor),
+            ],
+        );
+        let instance = value::instance_new(class);
+        cached_property_get(descriptor, instance, class);
+        assert!(exc::pending());
+        assert!(value::to_string(exc::pending_value()).contains("two different names"));
+        exc::clear();
+
+        // A slots-only class has no instance `__dict__` to cache into.
+        let descriptor = build_cached_property(counting_getter());
+        let class = value::class_new_full(
+            "Slotted".to_string(),
+            NONE,
+            Vec::new(),
+            vec![
+                ("__slots__".to_string(), text("value")),
+                ("value".to_string(), descriptor),
+            ],
+        );
+        let instance = value::instance_new(class);
+        crate::core::methods::getattr(instance, b"value".as_ptr(), 5);
+        assert!(exc::pending());
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "No '__dict__' attribute on 'Slotted' instance to cache 'value' property."
+        );
+        exc::clear();
+        assert_eq!(CACHED_PROPERTY_CALLS.load(Ordering::Relaxed), 0);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn cached_property_constructor_matches_cpython_metadata() {
+        exc::init();
+        let getter = value::identity_function_new("value");
+        set_attribute(getter, "__doc__", text("doc"));
+        set_attribute(getter, "__module__", text("pkg.mod"));
+        let descriptor = call("cached_property", &[getter]).expect("cached_property");
+        assert_eq!(
+            value::instance_class_name(descriptor),
+            Some("cached_property")
+        );
+        assert_eq!(value::instance_attr(descriptor, "func"), Some(getter));
+        assert_eq!(value::as_str(attribute(descriptor, "__doc__")), Some("doc"));
+        assert_eq!(
+            value::as_str(attribute(descriptor, "__module__")),
+            Some("pkg.mod")
+        );
+        assert_eq!(
+            value::as_str(attribute(descriptor, "__name__")),
+            Some("value")
+        );
+        assert_eq!(value::instance_attr(descriptor, "attrname"), Some(NONE));
+        assert!(!exc::pending());
+
+        // The keyword form binds the same slot.
+        let keyword = new_cached_property(&[], &[("func".to_string(), getter)]);
+        assert_eq!(value::instance_attr(keyword, "func"), Some(getter));
+        assert!(!exc::pending());
+
+        // A missing getter and unexpected/duplicate keywords are TypeErrors
+        // with CPython's `__init__` messages.
+        call("cached_property", &[]);
+        assert!(exc::pending());
+        assert!(
+            value::to_string(exc::pending_value())
+                .contains("missing 1 required positional argument: 'func'"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        exc::clear();
+        new_cached_property(&[getter], &[("func".to_string(), getter)]);
+        assert!(exc::pending());
+        assert!(value::to_string(exc::pending_value()).contains("multiple values"));
+        exc::clear();
+        new_cached_property(&[getter], &[("other".to_string(), getter)]);
+        assert!(exc::pending());
+        assert!(value::to_string(exc::pending_value()).contains("unexpected keyword argument"));
+        exc::clear();
     }
 
     #[test]
