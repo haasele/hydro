@@ -1960,9 +1960,11 @@ pub(crate) fn hasattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     NONE
 }
 
-/// `obj.name = value` for class instances and classes.
+/// `obj.name = value` for modules, class instances and classes.
 ///
-/// Instance wiring follows Python's data-descriptor rule: a data descriptor
+/// Module assignment stores an override keyed by module name (the native spec
+/// and the user globals store still supply the defaults). Instance wiring
+/// follows Python's data-descriptor rule: a data descriptor
 /// (property, or an object whose class implements `__set__`) receives the
 /// assignment; otherwise the instance dictionary stores it, subject to
 /// `__slots__` restrictions. Class assignment writes the runtime overlay, so
@@ -1971,6 +1973,12 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    // Module attributes are writable: a native module keeps its spec as the
+    // default resolution and stores the assignment as an override, while a
+    // user module also mirrors it into the globals store behind its namespace.
+    if let Some(module) = value::as_module(obj) {
+        return modules::module_set_attr(module, &attr, new_value);
+    }
     // Python-level functions and partial objects have CPython's writable
     // attribute surface: the `__name__`/`__qualname__`/`__doc__`/`__module__`/
     // `__annotations__` slots plus a `__dict__` of arbitrary attributes.
@@ -2079,15 +2087,22 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
     attribute_error(obj, &attr)
 }
 
-/// `del obj.name` for class instances and classes.
+/// `del obj.name` for modules, class instances and classes.
 ///
-/// A data descriptor with `__delete__` receives the deletion; otherwise the
-/// instance attribute is removed. Class deletion tombstones the name (or drops
-/// a runtime assignment). Every other receiver reports `AttributeError`.
+/// Module deletion drops the override (restoring the spec default) or the
+/// user module's globals binding. A data descriptor with `__delete__` receives
+/// the deletion; otherwise the instance attribute is removed. Class deletion
+/// tombstones the name (or drops a runtime assignment). Every other receiver
+/// reports `AttributeError`.
 pub(crate) fn delete_attr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    // Deleting a module attribute drops the override (restoring the spec
+    // default) or the user module's global binding.
+    if let Some(module) = value::as_module(obj) {
+        return modules::module_del_attr(module, &attr);
+    }
     if let Some(class) = value::instance_class_value(obj) {
         if let Some(value::ClassEntry::Attr(descriptor)) = value::class_lookup(class, &attr) {
             if let Some(state) = value::as_descriptor(descriptor) {

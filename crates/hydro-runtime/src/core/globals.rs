@@ -8,8 +8,13 @@
 //! Values are owned by Rust memory the collector cannot scan, so every stored
 //! value is also installed as a thread root. Conservative retention is enough
 //! for this slice: replaced values stay rooted until the runtime resets.
+//!
+//! Module attribute assignments (`module.name = value`) need a per-module
+//! shadow of the native spec, which lives in a reserved pseudo-module of the
+//! same map (see [`MODULE_ATTR_MODULE`]); [`reset`] clears it with the rest of
+//! a program run.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 
 use crate::exc::{self, NAME_ERROR};
@@ -19,6 +24,13 @@ use crate::value::NONE;
 thread_local! {
     /// Module globals of the current thread.
     static GLOBALS: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
+
+    /// Whether any module attribute override was stored on this thread.
+    ///
+    /// Attribute resolution runs on every module read and direct module call;
+    /// the flag keeps the common (no overrides) case to one thread-local
+    /// boolean instead of a store lookup.
+    static HAS_ATTRIBUTE_OVERRIDES: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Pseudo-module that owns runtime cache entries kept in the globals store.
@@ -29,6 +41,14 @@ thread_local! {
 /// ordinary module globals, which is what makes [`reset`] invalidate the
 /// module-registry caches without a separate ABI entry point.
 const REGISTRY_MODULE: &str = "\0hydro.registry";
+
+/// Pseudo-module that owns module attribute overrides.
+///
+/// A native module's attributes come from the central spec, not from a mutable
+/// namespace, so `module.name = value` needs a side table that takes
+/// precedence over the spec default. The reserved name starts with NUL for the
+/// same reason as [`REGISTRY_MODULE`]: no Python module can collide with it.
+const MODULE_ATTR_MODULE: &str = "\0hydro.module.attrs";
 
 /// Builds the store key. The NUL separator cannot occur in a Python
 /// identifier, so different `(module, name)` pairs never collide.
@@ -75,6 +95,7 @@ pub(crate) fn get(module: &str, name: &str) -> i64 {
 /// `sys.path` and every other cached module value as well.
 pub(crate) fn reset() {
     GLOBALS.with(|globals| globals.borrow_mut().clear());
+    HAS_ATTRIBUTE_OVERRIDES.with(|flag| flag.set(false));
 }
 
 /// Names of the user modules that own at least one stored global, sorted
@@ -108,16 +129,101 @@ pub(crate) fn registry_set(name: &str, value: i64) {
     set(REGISTRY_MODULE, name, value);
 }
 
+/// The stored attribute override of `module.name`, if the program assigned
+/// one.
+///
+/// Overrides shadow the native spec default for reads, calls and constants;
+/// [`attribute_overrides`] enumerates them for `vars(module)`/`dir(module)`.
+pub(crate) fn attribute_override(module: &str, name: &str) -> Option<i64> {
+    if !HAS_ATTRIBUTE_OVERRIDES.with(|flag| flag.get()) {
+        return None;
+    }
+    try_get(MODULE_ATTR_MODULE, &key(module, name))
+}
+
+/// `module.name = value`: records the override, keeping `value` rooted for as
+/// long as the entry lives.
+pub(crate) fn set_attribute_override(module: &str, name: &str, value: i64) {
+    HAS_ATTRIBUTE_OVERRIDES.with(|flag| flag.set(true));
+    set(MODULE_ATTR_MODULE, &key(module, name), value);
+}
+
+/// `del module.name` for an overridden attribute: drops the override, which
+/// makes the native spec default (or the absence of the name) visible again.
+pub(crate) fn remove_attribute_override(module: &str, name: &str) -> bool {
+    if !HAS_ATTRIBUTE_OVERRIDES.with(|flag| flag.get()) {
+        return false;
+    }
+    remove(MODULE_ATTR_MODULE, &key(module, name))
+}
+
+/// Every `(name, value)` attribute override of `module`, sorted by name.
+pub(crate) fn attribute_overrides(module: &str) -> Vec<(String, i64)> {
+    if !HAS_ATTRIBUTE_OVERRIDES.with(|flag| flag.get()) {
+        return Vec::new();
+    }
+    let module_prefix = format!("{module}\0");
+    let store_prefix = format!("{MODULE_ATTR_MODULE}\0");
+    GLOBALS.with(|globals| {
+        let globals = globals.borrow();
+        let mut entries: Vec<(String, i64)> = globals
+            .iter()
+            .filter_map(|(key, value)| {
+                let name = key
+                    .strip_prefix(store_prefix.as_str())?
+                    .strip_prefix(module_prefix.as_str())?;
+                Some((name.to_string(), *value))
+            })
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    })
+}
+
 /// Removes `module.name`, reporting whether the binding existed.
+///
+/// The cached `globals()` view is updated too: a live view must not keep
+/// reporting a name the program deleted.
 pub(crate) fn remove(module: &str, name: &str) -> bool {
-    GLOBALS.with(|globals| globals.borrow_mut().remove(&key(module, name)).is_some())
+    let removed = GLOBALS.with(|globals| globals.borrow_mut().remove(&key(module, name)).is_some());
+    if removed {
+        remove_from_view(module, name);
+    }
+    removed
+}
+
+/// Drops `name` from the cached `globals()` view of `module`, if present.
+fn remove_from_view(module: &str, name: &str) {
+    let Some(dict) = registry_get(&view_key(module)) else {
+        return;
+    };
+    let present = crate::value::as_dict(dict)
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|(key, _)| crate::value::as_str(*key) == Some(name))
+        })
+        .unwrap_or(false);
+    if !present {
+        return;
+    }
+    // Root the synthetic key before locking the dict: allocation may collect.
+    let key = crate::value::str_alloc(name.to_string());
+    let roots = heap::root_values(&[key]);
+    if let Some(mut entries) = crate::value::dict_pairs_mut(dict) {
+        let _ = entries.remove(key);
+    }
+    heap::release_roots(roots);
 }
 
 /// `del module.name`: removes the binding and returns the ABI dummy value.
 /// A missing binding raises `NameError`, like CPython's `del` of an undefined
-/// module name.
+/// module name. An attribute override stored for the same name is dropped too,
+/// so module-scope `del` cannot leave a stale shadow behind.
 pub(crate) fn delete_value(module: &str, name: &str) -> i64 {
-    if remove(module, name) {
+    let removed = remove(module, name);
+    let overridden = remove_attribute_override(module, name);
+    if removed || overridden {
         NONE
     } else {
         exc::raise_with_message(NAME_ERROR, &format!("name '{name}' is not defined"))
@@ -125,8 +231,15 @@ pub(crate) fn delete_value(module: &str, name: &str) -> i64 {
 }
 
 /// Stores `value` and returns the ABI dummy value (`None`).
+///
+/// A module attribute override already stored for the name is refreshed so
+/// `module.name` cannot keep reporting a stale value after module-scope code
+/// rebinds the same global.
 pub(crate) fn set_value(module: &str, name: &str, value: i64) -> i64 {
     set(module, name, value);
+    if attribute_override(module, name).is_some() {
+        set_attribute_override(module, name, value);
+    }
     NONE
 }
 
@@ -235,6 +348,21 @@ pub(crate) fn view_names(module: &str) -> Vec<String> {
         .iter()
         .filter_map(|(key, _)| crate::value::as_str(*key).map(str::to_string))
         .collect()
+}
+
+/// Publishes `name = value` into the cached `globals()` view of `module`, if a
+/// view was already materialised.
+///
+/// `module.name = value` stores the binding in the side store first; this keeps
+/// a live `globals()` mapping in step without waiting for the next call.
+pub(crate) fn set_in_view(module: &str, name: &str, value: i64) {
+    let Some(dict) = registry_get(&view_key(module)) else {
+        return;
+    };
+    let key = crate::value::str_alloc(name.to_string());
+    let roots = heap::root_values(&[key, value]);
+    crate::container::dict_set(dict, key, value);
+    heap::release_roots(roots);
 }
 
 #[cfg(test)]

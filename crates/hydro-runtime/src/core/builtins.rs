@@ -3289,6 +3289,13 @@ fn dir_value(object: i64) -> i64 {
                 names.extend(globals::view_names(&module_name));
             }
         }
+        // Program assignments are attributes too, even when the name is not in
+        // the native spec or the globals store (deletion removes them again).
+        names.extend(
+            globals::attribute_overrides(&module_name)
+                .into_iter()
+                .map(|(name, _)| name),
+        );
     } else if let Some(function) = value::as_function(object) {
         names.extend(["__name__", "__qualname__", "__doc__"].map(str::to_string));
         if value::function_has_attributes(object) {

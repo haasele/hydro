@@ -1318,7 +1318,11 @@ pub extern "C" fn hydro_hasattr(obj: i64, name: *const c_uchar, name_len: usize)
     methods::hasattr(obj, name, name_len)
 }
 
-/// `obj.name = value` for class instances. Class namespaces are immutable;
+/// `obj.name = value` for modules, class instances and classes.
+///
+/// Module assignment stores an override keyed by module name, so reads, calls
+/// and constants resolve it before the native spec default; user modules also
+/// write the value into their globals store. Class namespaces are immutable;
 /// assigning to a class raises `TypeError`, other receivers `AttributeError`.
 /// The stored value is published with a GC insertion barrier; returns `None`
 /// on success.
@@ -1332,10 +1336,11 @@ pub extern "C" fn hydro_setattr(
     methods::setattr(obj, name, name_len, new_value)
 }
 
-/// `del obj.name` for class instances. A missing attribute raises
-/// `AttributeError`, deleting from a class raises `TypeError` (the namespace is
-/// frozen) and every other receiver raises `AttributeError`. Returns `None` on
-/// success.
+/// `del obj.name` for modules, class instances and classes. Deleting a module
+/// attribute drops the override (restoring the native spec default) or the user
+/// module's global binding. A missing attribute raises `AttributeError`,
+/// deleting from a class raises `TypeError` (the namespace is frozen) and every
+/// other receiver raises `AttributeError`. Returns `None` on success.
 #[no_mangle]
 pub extern "C" fn hydro_delete_attr(obj: i64, name: *const c_uchar, name_len: usize) -> i64 {
     methods::delete_attr(obj, name, name_len)

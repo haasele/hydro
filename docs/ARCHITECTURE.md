@@ -534,7 +534,13 @@ built-in kinds), so the fallback never matches a user handler.
   `__cause__`, `__context__`, `__suppress_context__` and `__traceback__`
   (always `None`). For native objects, names without a call are data
   attributes; methods must be called. Unknown names → `AttributeError`.
-  `hydro_setattr` allows only instance attributes; classes are immutable.
+  `hydro_setattr` allows instance attributes and module attributes; classes
+  are immutable. A module assignment (`module.name = value`) stores an
+  override keyed by module name, which wins over the native spec default for
+  reads, direct calls and constants; user modules also write the value into
+  their globals store so `globals()`/static reads observe it. `hydro_getattr`,
+  `vars(module)`, `dir(module)` and `del module.name` honour the override,
+  and deletion restores the spec default (or the absence of the name).
 - **Method keywords** (`hydro_method_kw`): native methods with named
   parameters accept keywords. Implemented are `str.split`/
   `replace`/`startswith`/`endswith`, `pathlib.Path.mkdir`/`open`/

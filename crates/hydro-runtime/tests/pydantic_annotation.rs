@@ -468,3 +468,59 @@ fn template_node_names_are_ast_classes() {
     let _ = missing;
     expect_error(ATTRIBUTE_ERROR);
 }
+
+// -------------------------------------------------------------------------
+// Module attribute assignment (pydantic patches typing at import time)
+// -------------------------------------------------------------------------
+
+#[test]
+fn module_attribute_assignment_overrides_and_restores_native_specs() {
+    let _guard = setup();
+    // pydantic/typing_extensions execute `typing._collect_type_vars = ...`
+    // at import time; the module object must accept the assignment.
+    let typing = hydro_module_value(b"typing".as_ptr(), 6);
+    assert_no_error();
+    let replacement = module_get("builtins", "len");
+    assert_no_error();
+    assert_none(hydro_setattr(
+        typing,
+        b"_collect_type_vars".as_ptr(),
+        18,
+        replacement,
+    ));
+
+    // Reads and calls resolve the override.
+    assert_true(hydro_binop(
+        OP_EQ,
+        getattr(typing, "_collect_type_vars"),
+        replacement,
+    ));
+    let namespace = module("builtins", "vars", &[typing]);
+    assert_true(hydro_binop(
+        OP_EQ,
+        hydro_subscript(namespace, text("_collect_type_vars")),
+        replacement,
+    ));
+    assert_int(
+        module(
+            "typing",
+            "_collect_type_vars",
+            &[list(&[int(1), int(2), int(3)])],
+        ),
+        3,
+    );
+
+    // Deleting drops the override, so the spec default is visible again.
+    assert_none(hydro_delete_attr(
+        typing,
+        b"_collect_type_vars".as_ptr(),
+        18,
+    ));
+    let restored = getattr(typing, "_collect_type_vars");
+    assert_no_error();
+    assert_eq!(
+        hydro_binop(OP_EQ, restored, replacement),
+        hydro_false(),
+        "the spec default must come back after deletion"
+    );
+}

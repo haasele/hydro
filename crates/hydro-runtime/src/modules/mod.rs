@@ -1186,6 +1186,39 @@ fn encode_int(n: i64) -> i64 {
 
 // ABI entry helpers
 
+/// Dispatches a direct `module.function(...)` call to the program override,
+/// if one is stored.
+///
+/// Assigning the module attribute to its own native function value keeps the
+/// spec implementation, so the override cannot recurse forever. Returns `None`
+/// when the spec implementation must run.
+fn override_call(module: &str, function: &str, argc: usize, argv: *const i64) -> Option<i64> {
+    let overridden = globals::attribute_override(module, function)?;
+    if is_self_native(overridden, module, function) {
+        return None;
+    }
+    Some(crate::builtins::call(overridden, argc, argv))
+}
+
+/// Keyword variant of [`override_call`].
+#[allow(clippy::too_many_arguments)]
+fn override_call_kw(
+    module: &str,
+    function: &str,
+    argc: usize,
+    argv: *const i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> Option<i64> {
+    let overridden = globals::attribute_override(module, function)?;
+    if is_self_native(overridden, module, function) {
+        return None;
+    }
+    Some(crate::builtins::call_kw(
+        overridden, argc, argv, kwargc, kw_argv,
+    ))
+}
+
 /// `hydro_module_call`: direct `module.function(args...)` call.
 pub(crate) fn module_call(
     module_ptr: *const u8,
@@ -1199,6 +1232,9 @@ pub(crate) fn module_call(
         name_str(module_ptr, module_len),
         name_str(function_ptr, function_len),
     ) {
+        if let Some(result) = override_call(module, function, argc, argv) {
+            return result;
+        }
         return call_native_at(
             module_ptr as usize,
             module_len,
@@ -1214,6 +1250,9 @@ pub(crate) fn module_call(
     // error message matches the historical rendering.
     let module = decode_name(module_ptr, module_len);
     let function = decode_name(function_ptr, function_len);
+    if let Some(result) = override_call(&module, &function, argc, argv) {
+        return result;
+    }
     call_native(&module, &function, argc, argv)
 }
 
@@ -1248,6 +1287,9 @@ pub(crate) fn module_call_kw(
         name_str(module_ptr, module_len),
         name_str(function_ptr, function_len),
     ) {
+        if let Some(result) = override_call_kw(module, function, argc, argv, kwargc, kw_argv) {
+            return result;
+        }
         return call_native_kw_at(
             module_ptr as usize,
             module_len,
@@ -1263,6 +1305,9 @@ pub(crate) fn module_call_kw(
     }
     let module = decode_name(module_ptr, module_len);
     let function = decode_name(function_ptr, function_len);
+    if let Some(result) = override_call_kw(&module, &function, argc, argv, kwargc, kw_argv) {
+        return result;
+    }
     call_native_kw_at(
         module.as_ptr() as usize,
         module.len(),
@@ -1304,6 +1349,17 @@ pub(crate) fn module_get_by_name(module: &str, name: &str) -> i64 {
 }
 
 fn module_get_named(module: &str, name: &str) -> i64 {
+    // A program assignment (`module.name = value`) shadows the native spec
+    // default: reads, calls and constants all resolve the override first.
+    if let Some(overridden) = globals::attribute_override(module, name) {
+        return overridden;
+    }
+    module_get_default_named(module, name)
+}
+
+/// Resolves `module.name` from the native spec / user globals, ignoring any
+/// program assignment. [`module_get_named`] adds the override layer on top.
+fn module_get_default_named(module: &str, name: &str) -> i64 {
     // Every module value knows its import name, including user modules that
     // have no native spec.
     if name == "__name__" {
@@ -1593,6 +1649,7 @@ pub(crate) fn module_dict(module: &str) -> i64 {
     }
     let cache_key = format!("module.dict:{module}");
     if let Some(cached) = globals::registry_get(&cache_key) {
+        sync_module_overrides(module, cached);
         return cached;
     }
     let dict = value::dict_new(Vec::new());
@@ -1625,7 +1682,19 @@ pub(crate) fn module_dict(module: &str) -> i64 {
         insert_namespace_entry(dict, name, item);
     }
     crate::heap::release_roots(roots);
+    // Override-only names (assigned but absent from the spec) belong to the
+    // namespace too.
+    sync_module_overrides(module, dict);
     dict
+}
+
+/// Copies every attribute override into a native module's namespace dict, so
+/// `vars(module)`/`module.__dict__` observe program assignments rather than a
+/// snapshot of the spec taken on first access.
+fn sync_module_overrides(module: &str, dict: i64) {
+    for (name, item) in globals::attribute_overrides(module) {
+        insert_namespace_entry(dict, &name, item);
+    }
 }
 
 /// Inserts one `(name, value)` pair into a namespace dict, rooting the freshly
@@ -1634,6 +1703,16 @@ fn insert_namespace_entry(dict: i64, name: &str, item: i64) {
     let key = value::str_alloc(name.to_string());
     let roots = crate::heap::root_values(&[key, item]);
     container::dict_set(dict, key, item);
+    crate::heap::release_roots(roots);
+}
+
+/// Removes `name` from a namespace dict, if present.
+fn remove_namespace_entry(dict: i64, name: &str) {
+    let key = value::str_alloc(name.to_string());
+    let roots = crate::heap::root_values(&[key]);
+    if let Some(mut entries) = value::dict_pairs_mut(dict) {
+        let _ = entries.remove(key);
+    }
     crate::heap::release_roots(roots);
 }
 
@@ -2506,6 +2585,11 @@ fn publish_module(name: &str, module: i64) {
 /// An extension module resolves the attribute through the shared-object path
 /// stored in the value, so `getattr(ext, n)` and `ext.n` behave identically.
 pub(crate) fn module_attr(module: &value::ModuleState, name: &str) -> i64 {
+    // Program assignments shadow both the spec default and an extension
+    // module's exported attribute.
+    if let Some(overridden) = globals::attribute_override(module.name(), name) {
+        return overridden;
+    }
     if name == "__name__" {
         return value::str_alloc(module.name().to_string());
     }
@@ -2513,6 +2597,88 @@ pub(crate) fn module_attr(module: &value::ModuleState, name: &str) -> i64 {
         return extension::get(path.as_ptr(), path.len(), name.as_ptr(), name.len());
     }
     module_get_by_name(module.name(), name)
+}
+
+/// `module.name = value`: stores an attribute override for the module.
+///
+/// Native modules keep their spec as the default resolution, so the assignment
+/// only records the override; user and extension modules have no spec, so the
+/// value is also written to the module globals store that backs their
+/// namespace (`globals()`, `vars(module)`, static global reads).
+pub(crate) fn module_set_attr(module: &value::ModuleState, name: &str, new_value: i64) -> i64 {
+    let module_name = module.name().to_string();
+    globals::set_attribute_override(&module_name, name, new_value);
+    if stdlib::module(&module_name).is_none() {
+        globals::set(&module_name, name, new_value);
+        globals::set_in_view(&module_name, name, new_value);
+    }
+    // An already-materialised namespace mapping is live: reflect the
+    // assignment immediately instead of waiting for the next `vars()`.
+    if let Some(dict) = cached_module_dict(&module_name) {
+        insert_namespace_entry(dict, name, new_value);
+    }
+    NONE
+}
+
+/// `del module.name`: drops a program override (and a user module's global),
+/// which restores the native spec default or the absence of the name.
+pub(crate) fn module_del_attr(module: &value::ModuleState, name: &str) -> i64 {
+    let module_name = module.name().to_string();
+    let native = stdlib::module(&module_name).is_some();
+    let had_override = globals::remove_attribute_override(&module_name, name);
+    // A user module mirrors assignments into its globals store; drop that
+    // binding too. Native modules never have one for the same name.
+    let had_global = !native && globals::remove(&module_name, name);
+    if had_override || had_global {
+        if native {
+            refresh_module_dict_after_delete(&module_name, name);
+        }
+        return NONE;
+    }
+    exc::raise_with_message(
+        ATTRIBUTE_ERROR,
+        &format!("module '{module_name}' has no attribute '{name}'"),
+    )
+}
+
+/// The cached namespace mapping of a native module, if `vars(module)` or
+/// `module.__dict__` materialised one.
+fn cached_module_dict(module: &str) -> Option<i64> {
+    globals::registry_get(&format!("module.dict:{module}"))
+}
+
+/// Restores the default entry (or drops the name) in a materialised native
+/// module namespace after a `del module.name`.
+fn refresh_module_dict_after_delete(module: &str, name: &str) {
+    let Some(dict) = cached_module_dict(module) else {
+        return;
+    };
+    let default = module_get_default_named(module, name);
+    if exc::pending() {
+        if exc::pending_tag() == ATTRIBUTE_ERROR as i64 {
+            // The name existed only as an override.
+            exc::clear();
+            remove_namespace_entry(dict, name);
+        }
+        return;
+    }
+    insert_namespace_entry(dict, name, default);
+}
+
+/// Reports whether `value` is the native function value of `module.function`
+/// itself, so assigning a module attribute to its own value keeps resolving
+/// the spec implementation instead of recursing.
+fn is_self_native(value: i64, module: &str, function: &str) -> bool {
+    let Some(state) = value::as_function(value) else {
+        return false;
+    };
+    match &state.body {
+        value::FunctionBody::Native {
+            module: bound,
+            name,
+        } => *bound == module && *name == function,
+        _ => false,
+    }
 }
 
 /// Module value of the nested `collections.abc` module, shared by the
@@ -10421,6 +10587,36 @@ mod tests {
         crate::core::methods::getattr(obj, name.as_ptr(), name.len())
     }
 
+    /// The rooted module value for `name` (`hydro_module_value`).
+    fn module_handle(name: &str) -> i64 {
+        module_value_by_name(name)
+    }
+
+    /// `obj.name = value` through the native attribute dispatcher.
+    fn set_attr(obj: i64, name: &str, item: i64) -> i64 {
+        crate::core::methods::setattr(obj, name.as_ptr(), name.len(), item)
+    }
+
+    /// `del obj.name` through the native attribute dispatcher.
+    fn delete_attr(obj: i64, name: &str) -> i64 {
+        crate::core::methods::delete_attr(obj, name.as_ptr(), name.len())
+    }
+
+    /// `vars(obj)` through the builtin dispatcher.
+    fn vars_of(object: i64) -> i64 {
+        crate::core::builtins::call_builtin(hydro_ir::Builtin::Vars, 1, &object)
+    }
+
+    /// `dir(obj)` as plain strings, through the builtin dispatcher.
+    fn dir_names(object: i64) -> Vec<String> {
+        let result = crate::core::builtins::call_builtin(hydro_ir::Builtin::Dir, 1, &object);
+        value::as_list(result)
+            .expect("dir() returns a list")
+            .iter()
+            .filter_map(|item| value::as_str(*item).map(str::to_string))
+            .collect()
+    }
+
     /// Serialises tests that depend on the process-wide site-packages setting.
     static IMPORTLIB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -16167,6 +16363,138 @@ mod tests {
         );
         assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
         assert_eq!(message(), "integer argument expected, got float");
+        exc::clear();
+    }
+
+    #[test]
+    fn module_attribute_overrides_shadow_native_specs() {
+        globals::reset();
+        exc::init();
+        let typing = module_handle("typing");
+        let replacement = value::native_function_new("math", "fabs", 1);
+
+        // Assignment succeeds where a spec-only module used to reject it.
+        assert_eq!(set_attr(typing, "_collect_type_vars", replacement), NONE);
+        assert!(!exc::pending());
+        // Reads resolve the override through `getattr`, `module_get` and the
+        // module's own namespace mapping.
+        assert_eq!(attribute(typing, "_collect_type_vars"), replacement);
+        assert_eq!(get("typing", "_collect_type_vars"), replacement);
+        assert_eq!(
+            registry_value(vars_of(typing), "_collect_type_vars"),
+            Some(replacement)
+        );
+        assert!(dir_names(typing)
+            .iter()
+            .any(|name| name.as_str() == "_collect_type_vars"));
+        // Calls dispatch through the override, both from a function value and
+        // from a direct `typing._collect_type_vars(...)` call.
+        assert_eq!(
+            as_float(call_value(
+                attribute(typing, "_collect_type_vars"),
+                &[int(-4)]
+            )),
+            4.0
+        );
+        assert_eq!(
+            as_float(call("typing", "_collect_type_vars", &[int(-9)])),
+            9.0
+        );
+        assert!(!exc::pending());
+
+        // A name that exists only as an override is visible to introspection.
+        assert_eq!(set_attr(typing, "_hydro_override", int(5)), NONE);
+        assert_eq!(get("typing", "_hydro_override"), int(5));
+        assert_eq!(
+            registry_value(vars_of(typing), "_hydro_override"),
+            Some(int(5))
+        );
+        assert!(dir_names(typing)
+            .iter()
+            .any(|name| name.as_str() == "_hydro_override"));
+
+        // Overrides also win for constants.
+        let math = module_handle("math");
+        assert_eq!(set_attr(math, "pi", int(3)), NONE);
+        assert_eq!(get("math", "pi"), int(3));
+        assert_eq!(registry_value(vars_of(math), "pi"), Some(int(3)));
+        assert_eq!(delete_attr(math, "pi"), NONE);
+        assert!(value::as_float(get("math", "pi")).is_some());
+        assert!(!exc::pending());
+
+        // Deleting the function override restores the spec default.
+        assert_eq!(delete_attr(typing, "_collect_type_vars"), NONE);
+        let restored = get("typing", "_collect_type_vars");
+        assert_eq!(
+            value::as_function(restored).map(|function| function.name.as_str()),
+            Some("_collect_type_vars")
+        );
+        assert_eq!(
+            registry_value(vars_of(typing), "_collect_type_vars")
+                .and_then(value::as_function)
+                .map(|function| function.name.as_str()),
+            Some("_collect_type_vars")
+        );
+        assert!(!exc::pending());
+
+        // Deleting an override-only name leaves no attribute behind.
+        assert_eq!(delete_attr(typing, "_hydro_override"), NONE);
+        assert!(registry_value(vars_of(typing), "_hydro_override").is_none());
+        assert!(!dir_names(typing)
+            .iter()
+            .any(|name| name.as_str() == "_hydro_override"));
+        assert_eq!(attribute(typing, "_hydro_override"), NONE);
+        assert_eq!(exc::pending_tag(), i64::from(ATTRIBUTE_ERROR));
+        assert_eq!(
+            message(),
+            "module 'typing' has no attribute '_hydro_override'"
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn user_module_assignment_updates_globals_and_introspection() {
+        globals::reset();
+        exc::init();
+        globals::set("app", "existing", int(1));
+        let app = module_handle("app");
+
+        // The assignment reaches the attribute, the globals store and the
+        // namespace mapping.
+        assert_eq!(set_attr(app, "late", int(7)), NONE);
+        assert!(!exc::pending());
+        assert_eq!(attribute(app, "late"), int(7));
+        assert_eq!(get("app", "late"), int(7));
+        assert_eq!(globals::try_get("app", "late"), Some(int(7)));
+        assert_eq!(registry_value(vars_of(app), "late"), Some(int(7)));
+        assert!(dir_names(app).iter().any(|name| name.as_str() == "late"));
+
+        // A live `vars()` mapping tracks reassignment instead of keeping the
+        // snapshot taken on first access.
+        assert_eq!(set_attr(app, "late", int(9)), NONE);
+        assert_eq!(attribute(app, "late"), int(9));
+        assert_eq!(registry_value(vars_of(app), "late"), Some(int(9)));
+
+        // Deleting removes the binding from every view.
+        assert_eq!(delete_attr(app, "late"), NONE);
+        assert_eq!(globals::try_get("app", "late"), None);
+        assert!(registry_value(vars_of(app), "late").is_none());
+        assert!(!dir_names(app).iter().any(|name| name.as_str() == "late"));
+        assert_eq!(attribute(app, "late"), NONE);
+        assert_eq!(exc::pending_tag(), i64::from(ATTRIBUTE_ERROR));
+        exc::clear();
+
+        // Module-body globals are deletable too, and a name that never
+        // existed reports CPython's `AttributeError`.
+        assert_eq!(get("app", "existing"), int(1));
+        assert_eq!(delete_attr(app, "existing"), NONE);
+        assert_eq!(globals::try_get("app", "existing"), None);
+        assert_eq!(attribute(app, "existing"), NONE);
+        assert_eq!(exc::pending_tag(), i64::from(ATTRIBUTE_ERROR));
+        exc::clear();
+        assert_eq!(delete_attr(app, "missing"), NONE);
+        assert_eq!(exc::pending_tag(), i64::from(ATTRIBUTE_ERROR));
+        assert_eq!(message(), "module 'app' has no attribute 'missing'");
         exc::clear();
     }
 }
