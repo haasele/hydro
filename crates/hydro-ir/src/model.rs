@@ -24,6 +24,10 @@ pub enum Type {
     /// range). Numeric, but distinct from [`Type::Int`].
     BigInt,
     Float,
+    /// Complex number (`1j`, `1+2j`). Values are native instances of the
+    /// runtime `complex` class, so the runtime owns their kind; the static
+    /// type only records that both components are binary64.
+    Complex,
     Bool,
     Str,
     /// Immutable byte string.
@@ -57,6 +61,7 @@ impl Type {
             Type::Int => "int",
             Type::BigInt => "BigInt",
             Type::Float => "float",
+            Type::Complex => "complex",
             Type::Bool => "bool",
             Type::Str => "str",
             Type::Bytes => "bytes",
@@ -87,6 +92,12 @@ pub enum Const {
     /// immediate range. Canonical: no leading zeroes beyond `0`, no `+`.
     BigInt(String),
     Float(f64),
+    /// Complex literal (`0j`, `1.5j`, folded `1+2j`). Both components keep
+    /// their exact binary64 value, including the sign of a zero.
+    Complex {
+        real: f64,
+        imag: f64,
+    },
     Bool(bool),
     Str(String),
     Bytes(Vec<u8>),
@@ -118,6 +129,7 @@ impl Const {
             Const::Int(_) => Type::Int,
             Const::BigInt(_) => Type::BigInt,
             Const::Float(_) => Type::Float,
+            Const::Complex { .. } => Type::Complex,
             Const::Bool(_) => Type::Bool,
             Const::Str(_) => Type::Str,
             Const::Bytes(_) => Type::Bytes,

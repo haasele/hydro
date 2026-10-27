@@ -33,6 +33,7 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         hydro_bytes_new,
         hydro_bytes_build,
         hydro_float_new,
+        hydro_complex_new,
         hydro_binop,
         hydro_unop,
         hydro_truthy,

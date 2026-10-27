@@ -101,6 +101,13 @@ pub extern "C" fn hydro_float_new(f: f64) -> i64 {
     value::float_new(f)
 }
 
+/// Complex literal constructor: one native `complex` instance carrying `real`
+/// and `imag` (both binary64, signs preserved).
+#[no_mangle]
+pub extern "C" fn hydro_complex_new(real: f64, imag: f64) -> i64 {
+    builtins::build_complex(real, imag)
+}
+
 /// One PEP 750 template interpolation (`string.templatelib.Interpolation`).
 ///
 /// `expression` is the source text of the field's expression (a pointer/length

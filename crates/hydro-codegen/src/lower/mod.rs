@@ -135,6 +135,7 @@ struct Runtime {
     bytes_new: FuncId,
     bytes_build: FuncId,
     float_new: FuncId,
+    complex_new: FuncId,
     binop: FuncId,
     unop: FuncId,
     truthy: FuncId,
@@ -307,6 +308,14 @@ impl Runtime {
             // `argc` is `uint64_t` in the ABI: pointer-width.
             bytes_build: declare_runtime(module, "hydro_bytes_build", &[ptr, ptr], Some(i64t))?,
             float_new: declare_runtime(module, "hydro_float_new", &[types::F64], Some(i64t))?,
+            // Complex literals: one tagged `complex` instance with its real
+            // and imaginary parts (both binary64).
+            complex_new: declare_runtime(
+                module,
+                "hydro_complex_new",
+                &[types::F64, types::F64],
+                Some(i64t),
+            )?,
             binop: declare_runtime(module, "hydro_binop", &[i32t, i64t, i64t], Some(i64t))?,
             unop: declare_runtime(module, "hydro_unop", &[i32t, i64t], Some(i64t))?,
             truthy: declare_runtime(module, "hydro_truthy", &[i64t], Some(i64t))?,
@@ -1217,6 +1226,11 @@ fn wrapper_const<M: Module>(
         Const::Float(value) => {
             let float = builder.ins().f64const(*value);
             call_val_extern(module, builder, runtime.float_new, &[float])
+        }
+        Const::Complex { real, imag } => {
+            let real = builder.ins().f64const(*real);
+            let imag = builder.ins().f64const(*imag);
+            call_val_extern(module, builder, runtime.complex_new, &[real, imag])
         }
         Const::Str(text) => {
             let (slot, len) = make_bytes_slot(builder, text.as_bytes())?;
@@ -5924,6 +5938,12 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let id = self.runtime.float_new;
                 self.call_rt(id, &[float])
             }
+            Const::Complex { real, imag } => {
+                let real = self.builder.ins().f64const(*real);
+                let imag = self.builder.ins().f64const(*imag);
+                let id = self.runtime.complex_new;
+                self.call_rt(id, &[real, imag])
+            }
             Const::Str(text) => self.str_const(text),
             Const::BigInt(text) => self.bigint_const(text),
             Const::Bytes(bytes) => self.bytes_const(bytes),
@@ -7672,6 +7692,22 @@ mod tests {
             main: 0,
             initializers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn complex_literals_materialise_through_the_runtime_constructor() {
+        let value = Expr::new(
+            ExprKind::Const(Const::Complex {
+                real: 1.5,
+                imag: -2.0,
+            }),
+            Type::Complex,
+            1,
+        );
+        let mut program = program_assigning(value);
+        program.functions[0].locals[0].ty = Type::Complex;
+        let object = crate::compile_object(&program).expect("complex literal must lower");
+        assert!(runtime_call_sites(&object, "hydro_complex_new") > 0);
     }
 
     #[test]

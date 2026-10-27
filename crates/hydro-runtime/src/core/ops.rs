@@ -124,6 +124,96 @@ fn to_f64(n: Num) -> f64 {
     }
 }
 
+/// `(real, imag)` pair for a complex arithmetic operand pair, or `None` when
+/// neither operand is a complex value and the ordinary numeric path applies.
+fn complex_operands(a: i64, b: i64) -> Option<((f64, f64), (f64, f64))> {
+    if !builtins::is_complex_instance(a) && !builtins::is_complex_instance(b) {
+        return None;
+    }
+    Some((
+        builtins::complex_components(a)?,
+        builtins::complex_components(b)?,
+    ))
+}
+
+/// `a / b` for complex operands, using CPython's `_Py_c_quot` (Smith's
+/// algorithm), which avoids the intermediate overflow of `br² + bi²`.
+fn complex_divide(a: i64, b: i64) -> Option<i64> {
+    let ((ar, ai), (br, bi)) = complex_operands(a, b)?;
+    if br == 0.0 && bi == 0.0 {
+        return Some(zero_div("complex division by zero"));
+    }
+    let result = if br.abs() >= bi.abs() {
+        let ratio = bi / br;
+        let denom = br + bi * ratio;
+        builtins::build_complex((ar + ai * ratio) / denom, (ai - ar * ratio) / denom)
+    } else {
+        let ratio = br / bi;
+        let denom = bi + br * ratio;
+        builtins::build_complex((ar * ratio + ai) / denom, (ai * ratio - ar) / denom)
+    };
+    Some(result)
+}
+
+/// `a ** b` when either operand is complex. Mirrors CPython: an exponent with
+/// no imaginary part and a moderate integral value takes the exact repeated
+/// squaring path; everything else is `exp(log(a) * b)` in polar form.
+fn complex_pow(a: i64, b: i64) -> Option<i64> {
+    let ((base_real, base_imag), (exp_real, exp_imag)) = complex_operands(a, b)?;
+    if exp_imag == 0.0 && exp_real == exp_real.trunc() && exp_real.abs() <= 100.0 {
+        let negative = exp_real < 0.0;
+        let mut exponent = exp_real.abs() as u64;
+        let mut result_real = 1.0f64;
+        let mut result_imag = 0.0f64;
+        let mut factor_real = base_real;
+        let mut factor_imag = base_imag;
+        while exponent > 0 {
+            if exponent & 1 == 1 {
+                let real = result_real * factor_real - result_imag * factor_imag;
+                let imag = result_real * factor_imag + result_imag * factor_real;
+                result_real = real;
+                result_imag = imag;
+            }
+            exponent >>= 1;
+            if exponent > 0 {
+                let real = factor_real * factor_real - factor_imag * factor_imag;
+                let imag = 2.0 * factor_real * factor_imag;
+                factor_real = real;
+                factor_imag = imag;
+            }
+        }
+        if negative {
+            let denominator = result_real * result_real + result_imag * result_imag;
+            if denominator == 0.0 {
+                return Some(zero_div("0.0 to a negative or complex power"));
+            }
+            return Some(builtins::build_complex(
+                result_real / denominator,
+                -result_imag / denominator,
+            ));
+        }
+        return Some(builtins::build_complex(result_real, result_imag));
+    }
+    let modulus = base_real.hypot(base_imag);
+    if modulus == 0.0 {
+        if exp_real == 0.0 && exp_imag == 0.0 {
+            return Some(builtins::build_complex(1.0, 0.0));
+        }
+        if exp_real < 0.0 || exp_imag != 0.0 {
+            return Some(zero_div("0.0 to a negative or complex power"));
+        }
+        return Some(builtins::build_complex(0.0, 0.0));
+    }
+    let log_modulus = modulus.ln();
+    let angle = base_imag.atan2(base_real);
+    let magnitude = (log_modulus * exp_real - angle * exp_imag).exp();
+    let phase = log_modulus * exp_imag + angle * exp_real;
+    Some(builtins::build_complex(
+        magnitude * phase.cos(),
+        magnitude * phase.sin(),
+    ))
+}
+
 // -------------------------------------------------------------------------
 // Binary operators
 // -------------------------------------------------------------------------
@@ -468,6 +558,9 @@ pub(crate) fn add(a: i64, b: i64) -> i64 {
             result
         };
     }
+    if let Some(((ar, ai), (br, bi))) = complex_operands(a, b) {
+        return builtins::build_complex(ar + br, ai + bi);
+    }
     if needs_bigint(a, b) {
         return big_add(a, b);
     }
@@ -555,6 +648,9 @@ pub(crate) fn sub(a: i64, b: i64) -> i64 {
             result
         };
     }
+    if let Some(((ar, ai), (br, bi))) = complex_operands(a, b) {
+        return builtins::build_complex(ar - br, ai - bi);
+    }
     if needs_bigint(a, b) {
         return big_sub(a, b);
     }
@@ -595,6 +691,9 @@ fn is_repeatable(v: i64) -> bool {
 }
 
 fn mul(a: i64, b: i64) -> i64 {
+    if let Some(((ar, ai), (br, bi))) = complex_operands(a, b) {
+        return builtins::build_complex(ar * br - ai * bi, ar * bi + ai * br);
+    }
     if needs_bigint(a, b) {
         if let Some(result) = big_mul(a, b) {
             return result;
@@ -767,6 +866,9 @@ fn repeat_tuple(items: &[i64], n: i64) -> i64 {
 }
 
 fn div(a: i64, b: i64) -> i64 {
+    if let Some(result) = complex_divide(a, b) {
+        return result;
+    }
     if needs_bigint(a, b) {
         return big_div(a, b);
     }
@@ -855,6 +957,9 @@ fn modulo(a: i64, b: i64) -> i64 {
 }
 
 fn pow(a: i64, b: i64) -> i64 {
+    if let Some(result) = complex_pow(a, b) {
+        return result;
+    }
     if needs_bigint(a, b) {
         return big_pow(a, b);
     }
@@ -1426,6 +1531,11 @@ fn cmp_int_float(i: i64, f: f64) -> Option<Ordering> {
 pub(crate) fn unop(op: u32, a: i64) -> i64 {
     match op {
         OP_NEG => {
+            if builtins::is_complex_instance(a) {
+                if let Some((real, imag)) = builtins::complex_components(a) {
+                    return builtins::build_complex(-real, -imag);
+                }
+            }
             if let Some(n) = value::as_bigint(a) {
                 return value::bigint_new(-n);
             }
@@ -1442,6 +1552,9 @@ pub(crate) fn unop(op: u32, a: i64) -> i64 {
             unary_type_error("-", a)
         }
         OP_POS => {
+            if builtins::is_complex_instance(a) {
+                return a;
+            }
             if let Some(n) = value::as_bigint(a) {
                 return value::bigint_new(n.clone());
             }

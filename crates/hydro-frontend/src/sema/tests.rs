@@ -64,6 +64,97 @@ fn mul_with_any_stays_any() {
 }
 
 #[test]
+fn complex_arithmetic_results_are_complex() {
+    for (op, a, b) in [
+        (BinOp::Add, Type::Complex, Type::Int),
+        (BinOp::Add, Type::Int, Type::Complex),
+        (BinOp::Sub, Type::Complex, Type::Float),
+        (BinOp::Mul, Type::Float, Type::Complex),
+        (BinOp::Div, Type::Complex, Type::Int),
+        (BinOp::Div, Type::Int, Type::Complex),
+        (BinOp::Pow, Type::Complex, Type::Int),
+        (BinOp::Pow, Type::Int, Type::Complex),
+        (BinOp::Add, Type::Complex, Type::Complex),
+        (BinOp::Add, Type::Complex, Type::Bool),
+        (BinOp::Add, Type::Complex, Type::BigInt),
+    ] {
+        assert_eq!(op_result(op, a, b), Some(Type::Complex), "{op:?} {a} {b}");
+    }
+}
+
+#[test]
+fn complex_rejects_unsupported_operators() {
+    for op in [
+        BinOp::FloorDiv,
+        BinOp::Mod,
+        BinOp::Lt,
+        BinOp::Le,
+        BinOp::Gt,
+        BinOp::Ge,
+    ] {
+        assert_eq!(
+            op_result(op, Type::Complex, Type::Int),
+            None,
+            "{op:?} complex int"
+        );
+        assert_eq!(
+            op_result(op, Type::Float, Type::Complex),
+            None,
+            "{op:?} float complex"
+        );
+    }
+    assert_eq!(
+        op_result(BinOp::Mul, Type::Complex, Type::Str),
+        None,
+        "complex has no string repetition"
+    );
+    assert_eq!(
+        op_result(BinOp::Add, Type::Complex, Type::Str),
+        None,
+        "complex has no string concatenation"
+    );
+}
+
+#[test]
+fn complex_variables_accept_real_arithmetic() {
+    let program = crate::check_source(
+        "z = 1j\nw = z + 1\nv = 1 - z\nu = z * 2\nt = z / 2\np = z ** 2\n",
+        "test.py",
+    )
+    .expect("valid program");
+    let module = &program.functions[0];
+    let mut checked = 0;
+    for stmt in &module.body {
+        let hydro_ir::StmtKind::Assign { target, value } = &stmt.kind else {
+            continue;
+        };
+        let name = module.locals[*target as usize].name.as_str();
+        if matches!(name, "z" | "w" | "v" | "u" | "t" | "p") {
+            assert_eq!(value.ty, Type::Complex, "{name}");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 6, "every complex assignment is checked");
+}
+
+#[test]
+fn complex_annotations_accept_real_numbers() {
+    assert!(annotation_accepts(Type::Complex, Type::Int));
+    assert!(annotation_accepts(Type::Complex, Type::Float));
+    assert!(annotation_accepts(Type::Complex, Type::Bool));
+    assert!(annotation_accepts(Type::Complex, Type::BigInt));
+    assert!(!annotation_accepts(Type::Complex, Type::Str));
+    crate::check_source("z: complex = 1j\n", "test.py").expect("literal annotation");
+    crate::check_source(
+        "def f(z: complex):\n    return z\nf(1)\nf(1.5)\nf(True)\nf(1j)\n",
+        "test.py",
+    )
+    .expect("real numbers satisfy a complex parameter");
+    let diags = check_diags("def f(z: complex):\n    return z\nf('x')\n");
+    assert_eq!(diags[0].code, codes::TYPE, "{diags:?}");
+}
+
+#[test]
 fn mul_one_unknown_against_str_binds_int() {
     let prog = empty_prog();
     let mut inf = Infer::new();

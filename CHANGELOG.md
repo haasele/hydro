@@ -8,6 +8,20 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 complex literals
+
+- `0j`, `1j`, `1.5j` and the folded binary forms (`1+2j`, `1-2.5j`) are real
+  complex values instead of `HYD0002: complex literals are not supported in
+  Phase 1`. Both components keep their exact binary64 value, including the
+  sign of `-0j`, and parameter defaults accept them.
+- The static type is the new `complex`: arithmetic with `int`, `bool`,
+  `BigInt` and `float` operands (in either order) and unary `+`/`-` type
+  checks and returns `complex`; floor division, modulo and ordering are
+  rejected like CPython. Literal-only expressions fold at compile time, and
+  variables use the runtime `complex` arithmetic for `+`, `-`, `*`, `/` and
+  `**`. `repr`, equality, `type(x).__name__` and the `real`/`imag` attributes
+  come from the runtime `complex` class.
+
 ### Fixed — 2026-10-27 assignments to `global`-declared names
 
 - Every assignment target form now binds a name declared `global` through the

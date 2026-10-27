@@ -81,6 +81,38 @@ assert text == \"012\"
 }
 
 #[test]
+fn complex_literals_and_arithmetic() {
+    run_source(
+        "\
+assert repr(0j) == '0j'
+assert repr(1j) == '1j'
+assert repr(1.5j) == '1.5j'
+assert repr(1 + 2j) == '(1+2j)'
+assert repr(-2j) == '(-0-2j)'
+z = 1j
+assert repr(-z) == '(-0-1j)'
+assert +z == 1j
+assert z.real == 0.0
+assert z.imag == 1.0
+assert (3 + 4j).real == 3.0
+assert z == 1j
+assert z != 1
+assert z != 2j
+assert z + 1 == 1 + 1j
+assert 1 + z == 1 + 1j
+assert z * 2 == 2j
+assert 2 * z == 2j
+assert z / 2 == 0.5j
+assert z - 1 == -1 + 1j
+assert 1 - z == 1 - 1j
+assert z ** 2 == -1 + 0j
+assert (1 + 2j) * (3 + 4j) == -5 + 10j
+assert type(z).__name__ == 'complex'
+",
+    );
+}
+
+#[test]
 fn evaluation_order_matches_python() {
     run_source(
         "\

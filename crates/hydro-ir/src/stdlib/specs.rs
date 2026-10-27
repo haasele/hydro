@@ -2050,6 +2050,7 @@ pub static ITERTOOLS: ModuleSpec = ModuleSpec {
         f("filterfalse", 2, 2, Type::List),
         f("chain", 0, usize::MAX, Type::List),
         f("zip_longest", 0, usize::MAX, Type::List),
+        f("pairwise", 1, 1, Type::List),
         f("count", 0, 2, Type::Any),
         f("repeat", 1, 2, Type::List),
         f("cycle", 1, 1, Type::List),
@@ -4000,6 +4001,9 @@ mod tests {
             function("itertools", "zip_longest").unwrap().max_args,
             usize::MAX
         );
+        let pairwise = function("itertools", "pairwise").unwrap();
+        assert_eq!((pairwise.min_args, pairwise.max_args), (1, 1));
+        assert_eq!(pairwise.ret, Type::List);
         assert_eq!(function("itertools", "count").unwrap().max_args, 2);
         assert_eq!(function("itertools", "repeat").unwrap().max_args, 2);
         assert_eq!(function("itertools", "cycle").unwrap().max_args, 1);

@@ -5723,7 +5723,7 @@ pub(crate) fn slice_class() -> i64 {
     class
 }
 
-fn is_complex_instance(v: i64) -> bool {
+pub(crate) fn is_complex_instance(v: i64) -> bool {
     globals::registry_get("builtins.complex")
         .is_some_and(|class| value::instance_class_value(v) == Some(class))
 }
@@ -5746,7 +5746,7 @@ fn numeric_f64(v: i64) -> Option<f64> {
 }
 
 /// `(real, imag)` of a complex value or any numeric value.
-fn complex_components(v: i64) -> Option<(f64, f64)> {
+pub(crate) fn complex_components(v: i64) -> Option<(f64, f64)> {
     if is_complex_instance(v) {
         let real = value::instance_attr(v, "real").and_then(value::as_float);
         let imag = value::instance_attr(v, "imag").and_then(value::as_float);
@@ -5756,7 +5756,7 @@ fn complex_components(v: i64) -> Option<(f64, f64)> {
 }
 
 /// Allocates one complex value carrying `real`/`imag` attributes.
-fn build_complex(real: f64, imag: f64) -> i64 {
+pub(crate) fn build_complex(real: f64, imag: f64) -> i64 {
     let class = complex_class();
     let instance = value::instance_new(class);
     let real_value = value::float_new(real);

@@ -13,7 +13,9 @@
 //! * `zip_longest` fills shorter iterables with `None` and does not accept the
 //!   keyword-only `fillvalue`;
 //! * `count` returns an iterator over a range with an effectively unbounded
-//!   stop, so repeated `next()` calls advance normally.
+//!   stop, so repeated `next()` calls advance normally;
+//! * `pairwise` returns a list of adjacent 2-tuples (CPython returns a lazy
+//!   iterator), so an unbounded source is not streamed.
 //!
 //! `islice`, `filterfalse`, `chain` and `zip_longest` are the combinators
 //! `rich` imports; the rest exist so the module surface matches CPython's.
@@ -111,6 +113,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "filterfalse" => filterfalse(args),
         "chain" => chain(args),
         "zip_longest" => zip_longest(args),
+        "pairwise" => pairwise(args),
         "count" => count(args),
         "repeat" => repeat(args),
         "cycle" => cycle(args),
@@ -292,6 +295,45 @@ fn zip_longest(args: &[i64]) -> i64 {
         }
         let tuple = value::tuple_new(row);
         push_item(result, tuple);
+    }
+    result
+}
+
+/// `pairwise(iterable)`: adjacent overlapping pairs as 2-tuples.
+///
+/// CPython returns a lazy iterator; like the other combinators the pairs are
+/// materialised into a list. The previous element is carried in a one-slot
+/// list so the collector can trace it across allocations while the source is
+/// advanced.
+fn pairwise(args: &[i64]) -> i64 {
+    let iterator = iter::iter_of(args[0]);
+    if exc::pending() {
+        return NONE;
+    }
+    let result = value::list_new(Vec::new());
+    let carry = value::list_new(vec![NONE]);
+    let mut has_previous = false;
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        if has_previous {
+            let previous = value::as_list(carry)
+                .and_then(|items| items.first().copied())
+                .unwrap_or(NONE);
+            let pair = value::tuple_new(vec![previous, item]);
+            push_item(result, pair);
+        }
+        if let Some(mut items) = value::list_items_mut(carry) {
+            items[0] = item;
+        }
+        crate::heap::write_barrier_edge(carry, item);
+        has_previous = true;
     }
     result
 }
@@ -503,6 +545,31 @@ mod tests {
         assert_eq!(as_integer(second_row[0]), Some(2));
         assert_eq!(second_row[1], NONE);
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn pairwise_yields_adjacent_overlapping_pairs() {
+        exc::init();
+        let source = list_of(vec![int(1), int(2), int(3)]);
+        let result = call("pairwise", &[source]);
+        let rows = as_list(result).expect("list result");
+        assert_eq!(rows.len(), 2);
+        let first = value::as_tuple(rows[0]).expect("tuple pair");
+        assert_eq!(as_integer(first[0]), Some(1));
+        assert_eq!(as_integer(first[1]), Some(2));
+        let second = value::as_tuple(rows[1]).expect("tuple pair");
+        assert_eq!(as_integer(second[0]), Some(2));
+        assert_eq!(as_integer(second[1]), Some(3));
+        assert!(!exc::pending());
+
+        for items in [Vec::new(), vec![int(7)]] {
+            let pairs = call("pairwise", &[list_of(items)]);
+            assert!(
+                as_list(pairs).is_some_and(|items| items.is_empty()),
+                "fewer than two elements produce no pairs"
+            );
+            assert!(!exc::pending());
+        }
     }
 
     #[test]

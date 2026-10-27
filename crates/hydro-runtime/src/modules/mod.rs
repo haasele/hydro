@@ -14507,6 +14507,31 @@ mod tests {
     }
 
     #[test]
+    fn itertools_pairwise_dispatches_through_the_module() {
+        exc::init();
+        let input = value::list_new(vec![int(1), int(2), int(3)]);
+        let pairs = call("itertools", "pairwise", &[input]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(tuple_ints(pairs), vec![vec![1, 2], vec![2, 3]]);
+
+        // Zero or one element yields no pairs; both are valid inputs.
+        for items in [Vec::new(), vec![int(7)]] {
+            let empty = call("itertools", "pairwise", &[value::list_new(items)]);
+            assert!(!exc::pending(), "{}", message());
+            assert!(tuple_ints(empty).is_empty());
+        }
+
+        // A second positional argument is rejected by the central spec.
+        call("itertools", "pairwise", &[input, input]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        assert_eq!(
+            message(),
+            "itertools.pairwise() takes 1 arguments (2 given)"
+        );
+        exc::clear();
+    }
+
+    #[test]
     fn itertools_combinations_are_lexicographic() {
         exc::init();
         let input = value::list_new(vec![int(1), int(2), int(3), int(4)]);

@@ -153,14 +153,19 @@ fn join(a: Type, b: Type) -> Option<Type> {
     if a.is_numeric() && b.is_numeric() {
         return Some(numeric_result(a, b));
     }
+    if is_complex_mix(a, b) {
+        return Some(Type::Complex);
+    }
     None
 }
 
-/// Result type of mixing two numeric types: `float` dominates, then the
-/// arbitrary-precision integer, then the tagged integer (`bool` behaves as an
-/// `int`).
+/// Result type of mixing two numeric types: `complex` dominates, then
+/// `float`, then the arbitrary-precision integer, then the tagged integer
+/// (`bool` behaves as an `int`).
 fn numeric_result(a: Type, b: Type) -> Type {
-    if a == Type::Float || b == Type::Float {
+    if a == Type::Complex || b == Type::Complex {
+        Type::Complex
+    } else if a == Type::Float || b == Type::Float {
         Type::Float
     } else if a == Type::BigInt || b == Type::BigInt {
         Type::BigInt
@@ -169,9 +174,16 @@ fn numeric_result(a: Type, b: Type) -> Type {
     }
 }
 
+/// Whether `a`/`b` mix to a complex result: at least one operand is
+/// `complex`, and the other is real-numeric or complex as well.
+fn is_complex_mix(a: Type, b: Type) -> bool {
+    let real = |t: Type| t == Type::Complex || t.is_numeric();
+    (a == Type::Complex || b == Type::Complex) && real(a) && real(b)
+}
+
 /// Whether a value of type `got` satisfies an explicit annotation `expected`.
 /// Annotations are checked strictly, except for the documented numeric
-/// subtyping of `bool` and `int`.
+/// subtyping (`bool` -> `int`, and every real number -> `complex`).
 fn annotation_accepts(expected: Type, got: Type) -> bool {
     if expected == got || expected == Type::Any || got == Type::Any || got == Type::Never {
         return true;
@@ -185,6 +197,10 @@ fn annotation_accepts(expected: Type, got: Type) -> bool {
             | (Type::Float, Type::Int)
             | (Type::Float, Type::BigInt)
             | (Type::Float, Type::Bool)
+            | (Type::Complex, Type::Int)
+            | (Type::Complex, Type::BigInt)
+            | (Type::Complex, Type::Bool)
+            | (Type::Complex, Type::Float)
     )
 }
 
@@ -596,6 +612,8 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
         BinOp::Add => {
             if any {
                 Some(Type::Any)
+            } else if is_complex_mix(a, b) {
+                Some(Type::Complex)
             } else if a.is_numeric() && b.is_numeric() {
                 Some(numeric_result(a, b))
             } else if a == Type::Str && b == Type::Str {
@@ -613,6 +631,8 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
         BinOp::Mul => {
             if any {
                 Some(Type::Any)
+            } else if is_complex_mix(a, b) {
+                Some(Type::Complex)
             } else if a.is_numeric() && b.is_numeric() {
                 Some(numeric_result(a, b))
             } else if (a == Type::Str && matches!(b, Type::Int | Type::BigInt | Type::Bool))
@@ -684,6 +704,8 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
         BinOp::Sub => {
             if any {
                 Some(Type::Any)
+            } else if is_complex_mix(a, b) {
+                Some(Type::Complex)
             } else if a.is_numeric() && b.is_numeric() {
                 Some(numeric_result(a, b))
             } else if a == Type::Set && b == Type::Set {
@@ -706,9 +728,21 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
                 None
             }
         }
-        BinOp::FloorDiv | BinOp::Pow => {
+        // Python has no floor division for complex values; `pow` does.
+        BinOp::FloorDiv => {
             if any {
                 Some(Type::Any)
+            } else if a.is_numeric() && b.is_numeric() {
+                Some(numeric_result(a, b))
+            } else {
+                None
+            }
+        }
+        BinOp::Pow => {
+            if any {
+                Some(Type::Any)
+            } else if is_complex_mix(a, b) {
+                Some(Type::Complex)
             } else if a.is_numeric() && b.is_numeric() {
                 Some(numeric_result(a, b))
             } else {
@@ -729,6 +763,8 @@ fn op_result(op: BinOp, a: Type, b: Type) -> Option<Type> {
         BinOp::Div => {
             if any {
                 Some(Type::Any)
+            } else if is_complex_mix(a, b) {
+                Some(Type::Complex)
             } else if a.is_numeric() && b.is_numeric() {
                 Some(Type::Float)
             } else {
@@ -4058,6 +4094,9 @@ impl<'a> Checker<'a> {
             _ => match operand {
                 Ty::Var(_) => return false,
                 Ty::Concrete(Type::Any) => self.force_any(op.out),
+                Ty::Concrete(Type::Complex) => {
+                    self.bind_type(op.out, Type::Complex, op.line, op.col);
+                }
                 Ty::Concrete(t) if t.is_numeric() => {
                     let result = if t == Type::Float {
                         Type::Float
@@ -4235,6 +4274,7 @@ impl<'a> Checker<'a> {
             }
             BinOp::Add => {
                 known.is_numeric()
+                    || known == Type::Complex
                     || known == Type::Str
                     || known == Type::Bytes
                     || known == Type::List
@@ -4242,13 +4282,14 @@ impl<'a> Checker<'a> {
             }
             BinOp::Mul => {
                 known.is_numeric()
+                    || known == Type::Complex
                     || known == Type::Str
                     || known == Type::Bytes
                     || known == Type::Tuple
                     || known == Type::List
             }
             BinOp::Sub | BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
-                known.is_numeric()
+                known.is_numeric() || known == Type::Complex
             }
             // Bitwise operators accept integers; any other known operand is
             // rejected by the runtime with `TypeError`, so the unknown side

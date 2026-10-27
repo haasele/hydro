@@ -394,6 +394,10 @@ impl Interp {
             Const::Ellipsis => Ok(abi::hydro_none()),
             Const::NotImplemented => Ok(host::not_implemented()),
             Const::Float(value) => Ok(abi::hydro_float_new(*value)),
+            Const::Complex { real, imag } => {
+                let value = abi::hydro_complex_new(*real, *imag);
+                self.check(value)
+            }
             Const::Str(text) => {
                 let (ptr, len) = bytes(text);
                 let value = abi::hydro_str_new(ptr, len);

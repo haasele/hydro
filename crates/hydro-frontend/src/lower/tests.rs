@@ -1367,18 +1367,97 @@ fn undefined_name_without_a_close_match_has_no_help() {
 
 #[test]
 fn unsupported_construct_sets_the_span_and_help() {
-    // Complex literals are still rejected by `const_expr`; the diagnostic
-    // starts at the expression's own first column.
-    let source = "1j\n";
+    // A `for` target outside the supported subset is rejected with the
+    // generic unsupported diagnostic at the target's own span.
+    let source = "obj = None\nitems = []\nfor obj.attr in items:\n    pass\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, codes::UNSUPPORTED);
-    assert_eq!((diags[0].line, diags[0].col), (1, 1));
-    assert!(diags[0].end_col > 1, "span clamps to the first line");
+    assert_eq!((diags[0].line, diags[0].col), (3, 5));
+    assert!(diags[0].end_col > 5, "span clamps to the first line");
     assert_eq!(
         diags[0].help.as_deref(),
         Some("this construct is not implemented yet; see docs/TODO.md")
     );
+}
+
+#[test]
+fn complex_literals_lower_to_constants() {
+    let source = "a = 0j\nb = 1j\nc = 1.5j\nd = -2j\ne = 1+2j\nf = 1-2.5j\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let expected = [
+        ("a", 0.0, 0.0),
+        ("b", 0.0, 1.0),
+        ("c", 0.0, 1.5),
+        ("e", 1.0, 2.0),
+        ("f", 1.0, -2.5),
+    ];
+    for (name, real, imag) in expected {
+        let value = assigned(&hir, name);
+        assert_eq!(value.ty, Ty::Concrete(Type::Complex), "{name}");
+        match &value.kind {
+            HExprKind::Const(Const::Complex {
+                real: got_real,
+                imag: got_imag,
+            }) => assert_eq!((*got_real, *got_imag), (real, imag), "{name}"),
+            other => panic!("expected a complex constant for {name}, got {other:?}"),
+        }
+    }
+    // Unary minus keeps the sign of the zero real part, like CPython.
+    let value = assigned(&hir, "d");
+    assert_eq!(value.ty, Ty::Concrete(Type::Complex));
+    let HExprKind::Const(Const::Complex { real, imag }) = &value.kind else {
+        panic!("expected a complex constant, got {:?}", value.kind);
+    };
+    assert!(real.is_sign_negative(), "real part keeps its -0 sign");
+    assert_eq!(*imag, -2.0);
+}
+
+#[test]
+fn complex_literal_arithmetic_folds_to_complex_constants() {
+    let source = "a = 1j + 1\nb = 1 + 1j\nc = 2j * 3\nd = 1j / 2\ne = 1j - 1\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let expected = [
+        ("a", 1.0, 1.0),
+        ("b", 1.0, 1.0),
+        ("c", 0.0, 6.0),
+        ("d", 0.0, 0.5),
+        ("e", -1.0, 1.0),
+    ];
+    for (name, real, imag) in expected {
+        let value = assigned(&hir, name);
+        assert_eq!(value.ty, Ty::Concrete(Type::Complex), "{name}");
+        let HExprKind::Const(Const::Complex {
+            real: got_real,
+            imag: got_imag,
+        }) = &value.kind
+        else {
+            panic!(
+                "expected a folded complex constant for {name}, got {:?}",
+                value.kind
+            );
+        };
+        assert_eq!((*got_real, *got_imag), (real, imag), "{name}");
+    }
+}
+
+#[test]
+fn complex_defaults_lower_to_complex_constants() {
+    let source = "def f(z=1j, w=-2.5j):\n    pass\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let params = &function(&hir, "f").params;
+    assert_eq!(params.len(), 2);
+    assert!(matches!(
+        &params[0].default,
+        Some(Const::Complex { real, imag }) if *real == 0.0 && *imag == 1.0
+    ));
+    assert!(matches!(
+        &params[1].default,
+        Some(Const::Complex { real, imag }) if real.is_sign_negative() && *imag == -2.5
+    ));
 }
 
 #[test]

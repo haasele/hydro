@@ -137,6 +137,7 @@ i64  hydro_str_builder_finish(i64 builder);  // accumulated text as a str
 i64  hydro_bytes_new(const uint8_t* ptr, size_t len);
 i64  hydro_bytes_build(uint64_t argc, const i64* argv); // bytes(...)
 i64  hydro_float_new(double f);
+i64  hydro_complex_new(double real, double imag); // complex literal
 i64  hydro_math_floor_sqrt_int(i64 value); // floor(sqrt(int)) fast/error path
 i64  hydro_bigint_from_str(const uint8_t* ptr, size_t len); // decimal literal
 i64  hydro_binop(uint32_t op, i64 a, i64 b);          // incl. comparisons

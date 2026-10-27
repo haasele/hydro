@@ -71,6 +71,15 @@ fn const_types() {
         Type::BigInt
     );
     assert_eq!(Const::None.ty(), Type::None);
+    let complex = Const::Complex {
+        real: 1.5,
+        imag: -2.0,
+    };
+    assert_eq!(complex.ty(), Type::Complex);
+    assert_eq!(Type::Complex.name(), "complex");
+    assert_eq!(Type::Complex.to_string(), "complex");
+    // Complex is not a real number: the real-numeric paths must not accept it.
+    assert!(!Type::Complex.is_numeric());
     assert_eq!(Const::NotImplemented.ty(), Type::Any);
     // Documented limitation: `...` has no distinct sentinel and is `None`.
     assert_eq!(Const::Ellipsis.ty(), Type::None);

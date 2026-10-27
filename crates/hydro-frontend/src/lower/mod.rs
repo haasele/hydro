@@ -6206,6 +6206,10 @@ impl<'a> Lowerer<'a> {
             ast::Expr::Constant(c) => match &c.value {
                 ast::Constant::Int(value) => Some(int_const_from_decimal(value.to_str_radix(10))),
                 ast::Constant::Float(v) => Some(Const::Float(*v)),
+                ast::Constant::Complex { real, imag } => Some(Const::Complex {
+                    real: *real,
+                    imag: *imag,
+                }),
                 ast::Constant::Bool(v) => Some(Const::Bool(*v)),
                 ast::Constant::Str(v) => Some(Const::Str(v.clone())),
                 ast::Constant::None => Some(Const::None),
@@ -6225,6 +6229,10 @@ impl<'a> Lowerer<'a> {
                     Const::Int(v) => Some(negate_int_const(&v.to_string())),
                     Const::BigInt(v) => Some(negate_int_const(&v)),
                     Const::Float(v) => Some(Const::Float(-v)),
+                    Const::Complex { real, imag } => Some(Const::Complex {
+                        real: -real,
+                        imag: -imag,
+                    }),
                     _ => None,
                 }
             }
@@ -6245,6 +6253,7 @@ impl<'a> Lowerer<'a> {
                 "int" => Ty::Concrete(Type::Int),
                 "BigInt" => Ty::Concrete(Type::BigInt),
                 "float" => Ty::Concrete(Type::Float),
+                "complex" => Ty::Concrete(Type::Complex),
                 "bool" => Ty::Concrete(Type::Bool),
                 "str" => Ty::Concrete(Type::Str),
                 "list" => Ty::Concrete(Type::List),
@@ -15395,10 +15404,13 @@ impl<'a> Lowerer<'a> {
             ast::Constant::Str(v) => (Const::Str(v.clone()), Ty::Concrete(Type::Str)),
             ast::Constant::None => (Const::None, Ty::Concrete(Type::None)),
             ast::Constant::Bytes(value) => (Const::Bytes(value.clone()), Ty::Concrete(Type::Bytes)),
-            ast::Constant::Complex { .. } => {
-                self.error_at(range, "complex literals are not supported in Phase 1");
-                (Const::None, Ty::Concrete(Type::Any))
-            }
+            ast::Constant::Complex { real, imag } => (
+                Const::Complex {
+                    real: *real,
+                    imag: *imag,
+                },
+                Ty::Concrete(Type::Complex),
+            ),
             ast::Constant::Tuple(_) => {
                 self.error_at(range, "tuple literals are not supported in Phase 1");
                 (Const::None, Ty::Concrete(Type::Any))
@@ -19271,10 +19283,71 @@ fn fold_arith(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
         out.push_str(y);
         return Some(Const::Str(out));
     }
+    if matches!(a, Const::Complex { .. }) || matches!(b, Const::Complex { .. }) {
+        return fold_complex_arith(op, a, b);
+    }
     match (fold_num(a)?, fold_num(b)?) {
         (FoldNum::Int(p), FoldNum::Int(q)) => fold_int_arith(op, p, q),
         (x, y) => fold_float_arith(op, fold_num_to_f64(x), fold_num_to_f64(y)),
     }
+}
+
+/// Complex view of a literal operand used by constant folding. `BigInt`
+/// literals are declined: converting them could overflow (the runtime raises
+/// `OverflowError` instead of folding).
+fn fold_complex_parts(constant: &Const) -> Option<(f64, f64)> {
+    match constant {
+        Const::Complex { real, imag } => Some((*real, *imag)),
+        Const::Int(n) => Some((*n as f64, 0.0)),
+        Const::Bool(b) => Some((f64::from(u8::from(*b)), 0.0)),
+        Const::Float(f) => Some((*f, 0.0)),
+        _ => None,
+    }
+}
+
+/// Complex addition, subtraction, multiplication and division. Division by a
+/// zero complex stays unfused so the runtime raises `ZeroDivisionError`;
+/// `**` (and floor division/modulo, which Python rejects for complex) is left
+/// to the runtime as well.
+fn fold_complex_arith(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
+    let (ar, ai) = fold_complex_parts(a)?;
+    let (br, bi) = fold_complex_parts(b)?;
+    Some(match op {
+        BinOp::Add => Const::Complex {
+            real: ar + br,
+            imag: ai + bi,
+        },
+        BinOp::Sub => Const::Complex {
+            real: ar - br,
+            imag: ai - bi,
+        },
+        BinOp::Mul => Const::Complex {
+            real: ar * br - ai * bi,
+            imag: ar * bi + ai * br,
+        },
+        BinOp::Div => {
+            if br == 0.0 && bi == 0.0 {
+                return None;
+            }
+            // Smith's algorithm, matching `complex_divide` in the runtime.
+            if br.abs() >= bi.abs() {
+                let ratio = bi / br;
+                let denom = br + bi * ratio;
+                Const::Complex {
+                    real: (ar + ai * ratio) / denom,
+                    imag: (ai - ar * ratio) / denom,
+                }
+            } else {
+                let ratio = br / bi;
+                let denom = bi + br * ratio;
+                Const::Complex {
+                    real: (ar * ratio + ai) / denom,
+                    imag: (ai * ratio - ar) / denom,
+                }
+            }
+        }
+        _ => return None,
+    })
 }
 
 /// Integer arithmetic with the runtime's exact semantics, including Python's
@@ -19391,6 +19464,10 @@ fn fold_un(op: hydro_ir::UnOp, operand: &HExpr) -> Option<Const> {
             Const::Int(n) => Some(negate_int_const(&n.to_string())),
             Const::BigInt(n) => Some(negate_int_const(n)),
             Const::Float(f) => Some(Const::Float(-f)),
+            Const::Complex { real, imag } => Some(Const::Complex {
+                real: -real,
+                imag: -imag,
+            }),
             _ => None,
         },
         hydro_ir::UnOp::Not => match constant {
