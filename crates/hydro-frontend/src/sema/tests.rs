@@ -819,9 +819,9 @@ fn set_literal_rejects_unhashable_elements() {
 
 #[test]
 fn set_builtin_accepts_iterables() {
-    let source = "a = set()\nb = set([1, 2])\nc = set((1, 2))\nd = set({1})\ne = set('ab')\nf = set({'a': 1})\n";
+    let source = "a = set()\nb = set([1, 2])\nc = set((1, 2))\nd = set({1})\ne = set('ab')\nf = set({'a': 1})\ng = set(range(3))\nh = set(r for r in range(3))\n";
     let program = crate::check_source(source, "test.py").expect("valid program");
-    for index in 0..6 {
+    for index in 0..8 {
         assert_eq!(assigned_type(&program, index), Type::Set);
     }
     assert_eq!(
@@ -1276,14 +1276,21 @@ fn range_membership_accepts_any_left() {
 }
 
 #[test]
-fn range_is_not_subscriptable() {
+fn range_subscript_yields_int_and_slicing_yields_range() {
+    let source = "r = range(3)\na = r[0]\nb = r[-1]\nc = r[1]\nd = r[0:2]\ne = r[::2]\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    assert_eq!(assigned_type(&program, 1), Type::Int);
+    assert_eq!(assigned_type(&program, 2), Type::Int);
+    assert_eq!(assigned_type(&program, 3), Type::Int);
+    assert_eq!(assigned_type(&program, 4), Type::Range);
+    assert_eq!(assigned_type(&program, 5), Type::Range);
+}
+
+#[test]
+fn range_index_must_be_int() {
     assert_eq!(
-        check_errors("r = range(3)\nx = r[0]\n"),
-        vec!["'range' object is not subscriptable"]
-    );
-    assert_eq!(
-        check_errors("r = range(3)\nx = r[1:]\n"),
-        vec!["'range' object is not subscriptable"]
+        check_errors("r = range(3)\nx = r['a']\n"),
+        vec!["range index must be int, not str"]
     );
 }
 

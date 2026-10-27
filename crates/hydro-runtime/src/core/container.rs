@@ -74,84 +74,35 @@ pub(crate) fn set_new(argc: usize, argv: *const i64) -> i64 {
     build_set(copy_values(argc, argv))
 }
 
-/// `set(iterable)`: copies elements from a list, tuple, set or dict (keys),
-/// or the characters of a string. Anything else raises `TypeError`.
+/// `set(iterable)`: consumes any iterable — a list, tuple, set, dict (keys),
+/// the characters of a string, a range, an iterator or a generator — and
+/// keeps the first occurrence of each element.
+///
+/// The iterator protocol decides what is iterable, so the `TypeError` for a
+/// non-iterable comes from `iter()` (`'int' object is not iterable`). Every
+/// element must be hashable; the check is interleaved with the iteration, so a
+/// generator is not drained before its first unhashable element is reported.
+/// The result is allocated before the loop, so the collector traces every
+/// element that has already been inserted.
 pub(crate) fn set_from(iterable: i64) -> i64 {
-    if value::as_str(iterable).is_some() {
-        // The set is allocated first and held in a tagged local so the
-        // collector can trace the per-character strings pushed into it.
-        let result = value::set_new(Vec::new());
-        let text = value::as_str(iterable).unwrap_or("").to_string();
-        for ch in text.chars() {
-            let item = value::str_alloc(ch.to_string());
-            insert_set_item(result, item);
-        }
-        return result;
-    }
-    let supported = value::as_list(iterable).is_some()
-        || value::as_tuple(iterable).is_some()
-        || value::as_set(iterable).is_some()
-        || value::as_dict(iterable).is_some();
-    if !supported {
-        return type_error(format!(
-            "'{}' object is not iterable",
-            value::type_name(iterable)
-        ));
-    }
-    if value::as_list(iterable).is_some() {
-        return set_from_sequence(iterable);
-    }
-    if value::as_tuple(iterable).is_some() {
-        return set_from_sequence(iterable);
-    }
-    if value::as_set(iterable).is_some() {
-        return set_from_sequence(iterable);
-    }
-    // Dict: the elements are its keys.
-    if let Some(pairs) = value::as_dict(iterable) {
-        if let Some(err) = hashability_error(&pairs.iter().map(|(key, _)| *key).collect::<Vec<_>>())
-        {
-            return err;
-        }
+    let iterator = crate::iter::iter_of(iterable);
+    if exc::pending() {
+        return NONE;
     }
     let result = value::set_new(Vec::new());
-    if let Some(pairs) = value::as_dict(iterable) {
-        for (key, _) in pairs {
-            insert_set_item(result, *key);
+    loop {
+        let mut item = NONE;
+        let status = crate::iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
         }
-    }
-    result
-}
-
-/// Copies a list/tuple/set input into a fresh set. The source value stays a
-/// root across the allocation, so its elements cannot be collected while the
-/// result object is being created.
-fn set_from_sequence(iterable: i64) -> i64 {
-    let source: Vec<i64> = if let Some(items) = value::as_list(iterable) {
-        items.to_vec()
-    } else if let Some(items) = value::as_tuple(iterable) {
-        items.to_vec()
-    } else {
-        value::as_set(iterable).unwrap_or(&[]).to_vec()
-    };
-    if let Some(err) = hashability_error(&source) {
-        return err;
-    }
-    // Allocate before reading the source again; `iterable` is used below, so
-    // the collector sees it as a live root during this allocation.
-    let result = value::set_new(Vec::new());
-    if let Some(items) = value::as_list(iterable) {
-        for &item in items {
-            insert_set_item(result, item);
+        if status == 0 {
+            break;
         }
-    } else if let Some(items) = value::as_tuple(iterable) {
-        for &item in items {
-            insert_set_item(result, item);
+        if let Some(name) = unhashable_name(item) {
+            return type_error(unhashable_message(name));
         }
-    } else if let Some(items) = value::as_set(iterable) {
-        for &item in items {
-            insert_set_item(result, item);
-        }
+        insert_set_item(result, item);
     }
     result
 }
@@ -991,6 +942,38 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
             None => exc::raise_with_message(INDEX_ERROR, "tuple index out of range"),
         };
     }
+    if let Some((start, stop, step)) = value::as_range(obj) {
+        let Some(raw) = value::as_integer(index) else {
+            // An integer too large for `i64` is past the end of every range;
+            // reporting it as a non-integer index would contradict CPython.
+            if value::as_bigint(index).is_some() {
+                return exc::raise_with_message(INDEX_ERROR, "range object index out of range");
+            }
+            return type_error(format!(
+                "range indices must be integers or slices, not {}",
+                value::type_name(index)
+            ));
+        };
+        let len = value::range_len(start, stop, step);
+        let position = if raw < 0 {
+            (raw as i128).checked_add(len as i128)
+        } else {
+            Some(raw as i128)
+        };
+        let Some(position) = position.filter(|position| *position >= 0 && *position < len as i128)
+        else {
+            return exc::raise_with_message(INDEX_ERROR, "range object index out of range");
+        };
+        // A range element is `start + position * step`; both factors fit in 63
+        // bits, so the product is exact in `i128`. Values outside the tagged
+        // integer range become a heap `BigInt`, like every other integer
+        // result.
+        let element = position * step as i128 + start as i128;
+        return match i64::try_from(element) {
+            Ok(element) => crate::ops::int_result(element),
+            Err(_) => value::bigint_new(num_bigint::BigInt::from(element)),
+        };
+    }
     if let Some(dict) = value::as_dict_data(obj) {
         if let Some(name) = unhashable_name(index) {
             return type_error(unhashable_message(name));
@@ -1287,12 +1270,23 @@ enum SliceError {
     Step,
 }
 
-/// `object[start:stop:step]` for lists, strings and tuples.
+/// `object[start:stop:step]` for lists, strings, tuples, bytes-likes and
+/// ranges.
 ///
 /// `start`, `stop` and `step` are tagged values; [`NONE`] means the argument
 /// was omitted. Python's `slice.indices` rules are reproduced exactly
-/// (clamping and negative bounds); the result is always a new object.
+/// (clamping and negative bounds); the result is always a new object. A range
+/// slice is a new range (CPython returns a range, not a list).
 pub(crate) fn slice(obj: i64, start: i64, stop: i64, step: i64) -> i64 {
+    if let Some((range_start, range_stop, range_step)) = value::as_range(obj) {
+        let len = value::range_len(range_start, range_stop, range_step);
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
+        let (start, stop, step) = match slice_indices(start, stop, step, len) {
+            Ok(bounds) => bounds,
+            Err(err) => return slice_error(err),
+        };
+        return range_slice(range_start, range_step, start, stop, step);
+    }
     if let Some(items) = value::as_list(obj) {
         let len = items.len();
         let (start, stop, step) = match slice_indices(start, stop, step, len) {
@@ -1851,7 +1845,32 @@ fn slice_positions(start: i64, stop: i64, step: i64) -> Vec<usize> {
     positions
 }
 
-// Structural equality
+/// `range[start:stop:step]` as a new range.
+///
+/// `start`/`stop` are the `slice.indices` positions and `step` the slice step.
+/// Every element of the source range is `range_start + i * range_step`, so the
+/// selected positions are re-based onto that arithmetic progression: the new
+/// step is `range_step * step` and the new bounds are the source origin plus
+/// the selected offsets. This is CPython's formula, which makes
+/// `range(10)[::-1]` equal `range(9, -1, -1)` and keeps an empty selection's
+/// computed bounds (`range(0)[::-1]` → `range(-1, -1, -1)`).
+fn range_slice(range_start: i64, range_step: i64, start: i64, stop: i64, step: i64) -> i64 {
+    // Each factor fits in 63 bits, so the products are exact in `i128`; only a
+    // result outside the tagged integer domain fails to convert.
+    let new_start = range_start as i128 + start as i128 * range_step as i128;
+    let new_stop = range_start as i128 + stop as i128 * range_step as i128;
+    let new_step = range_step as i128 * step as i128;
+    let (Ok(new_start), Ok(new_stop), Ok(new_step)) = (
+        i64::try_from(new_start),
+        i64::try_from(new_stop),
+        i64::try_from(new_step),
+    ) else {
+        // A range stores its bounds as tagged integers, so an unrepresentable
+        // re-based bound cannot be returned as a range.
+        return exc::raise_with_message(exc::OVERFLOW_ERROR, "integer overflow");
+    };
+    value::range_new(new_start, new_stop, new_step)
+}
 
 /// Python `==` for the value subset (numeric cross-type equality, string
 /// contents, deep list equality and order-insensitive dict equality).
@@ -2279,6 +2298,124 @@ mod tests {
     }
 
     #[test]
+    fn range_indexing_follows_the_progression() {
+        exc::init();
+        let ascending = value::range_new(0, 10, 1);
+        assert_eq!(subscript(ascending, int(0)), int(0));
+        assert_eq!(subscript(ascending, int(-1)), int(9));
+        assert_eq!(subscript(ascending, value::TRUE), int(1));
+
+        let stepped = value::range_new(3, 10, 2);
+        assert_eq!(subscript(stepped, int(0)), int(3));
+        assert_eq!(subscript(stepped, int(3)), int(9));
+        assert_eq!(subscript(stepped, int(-4)), int(3));
+
+        let descending = value::range_new(5, 0, -2);
+        assert_eq!(subscript(descending, int(0)), int(5));
+        assert_eq!(subscript(descending, int(-1)), int(1));
+        assert!(!exc::pending());
+
+        assert_eq!(subscript(ascending, int(10)), NONE);
+        assert_eq!(exc::pending_tag(), INDEX_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "range object index out of range"
+        );
+
+        exc::init();
+        assert_eq!(subscript(ascending, int(-11)), NONE);
+        assert_eq!(exc::pending_tag(), INDEX_ERROR as i64);
+
+        // An integer beyond `i64` is past the end of every range.
+        let huge =
+            value::bigint_new(num_bigint::BigInt::from(i64::MAX) + num_bigint::BigInt::from(1));
+        exc::init();
+        assert_eq!(subscript(ascending, huge), NONE);
+        assert_eq!(exc::pending_tag(), INDEX_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "range object index out of range"
+        );
+
+        exc::init();
+        assert_eq!(subscript(value::range_new(0, 0, 1), int(0)), NONE);
+        assert_eq!(exc::pending_tag(), INDEX_ERROR as i64);
+
+        exc::init();
+        assert_eq!(subscript(stepped, string("x")), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "range indices must be integers or slices, not str"
+        );
+    }
+
+    #[test]
+    fn range_slices_return_ranges() {
+        exc::init();
+        let r = value::range_new(0, 10, 1);
+        assert_eq!(
+            value::as_range(slice(r, NONE, NONE, NONE)),
+            Some((0, 10, 1))
+        );
+        assert_eq!(
+            value::as_range(slice(r, int(2), int(8), int(2))),
+            Some((2, 8, 2))
+        );
+        assert_eq!(
+            value::as_range(slice(r, NONE, NONE, int(-1))),
+            Some((9, -1, -1))
+        );
+        assert_eq!(
+            value::as_range(slice(r, int(5), int(1), NONE)),
+            Some((5, 1, 1))
+        );
+        assert_eq!(
+            value::as_range(slice(r, int(100), int(200), NONE)),
+            Some((10, 10, 1))
+        );
+        assert!(!exc::pending());
+
+        // A slice re-bases the source progression: element `i` stays
+        // `start + i * step`, so a stepped range scales the slice step.
+        let stepped = value::range_new(1, 10, 3);
+        assert_eq!(
+            value::as_range(slice(stepped, NONE, NONE, int(-1))),
+            Some((7, -2, -3))
+        );
+        assert_eq!(
+            value::as_range(slice(stepped, int(1), NONE, NONE)),
+            Some((4, 10, 3))
+        );
+
+        // Empty sources keep CPython's computed bounds.
+        let empty = value::range_new(0, 0, 1);
+        assert_eq!(
+            value::as_range(slice(empty, NONE, NONE, int(-1))),
+            Some((-1, -1, -1))
+        );
+        assert_eq!(
+            value::as_range(slice(empty, NONE, NONE, int(2))),
+            Some((0, 0, 2))
+        );
+
+        // Slices are fresh range values.
+        assert_ne!(slice(r, NONE, NONE, NONE), r);
+
+        exc::init();
+        assert_eq!(slice(r, NONE, NONE, int(0)), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "slice step cannot be zero"
+        );
+
+        exc::init();
+        assert_eq!(slice(r, string("a"), NONE, NONE), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
     fn unpack_checks_exact_length() {
         exc::init();
         let t = tuple(&[int(1), int(2)]);
@@ -2454,6 +2591,35 @@ mod tests {
         assert_ne!(original, copied);
         assert_eq!(value::as_set(copied), value::as_set(original));
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn set_from_consumes_ranges_and_iterators() {
+        exc::init();
+        // Every element of the range, in iteration order.
+        let from_range = set_from(value::range_new(0, 6, 2));
+        assert_eq!(
+            value::as_set(from_range),
+            Some(&[int(0), int(2), int(4)][..])
+        );
+
+        // An iterator is consumed, not copied: a second `set()` is empty.
+        let iterator = crate::iter::iter_of(list(&[int(3), int(1), int(3)]));
+        let from_iterator = set_from(iterator);
+        assert_eq!(value::as_set(from_iterator), Some(&[int(3), int(1)][..]));
+        assert_eq!(
+            value::as_set(set_from(iterator)).map(|items| items.len()),
+            Some(0)
+        );
+        assert!(!exc::pending());
+
+        // Unhashable elements are reported while the iterator is consumed.
+        let mixed = crate::iter::iter_of(list(&[int(1), list(&[int(2)])]));
+        assert_eq!(set_from(mixed), NONE);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "unhashable type: 'list'"
+        );
     }
 
     #[test]

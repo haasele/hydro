@@ -1908,10 +1908,11 @@ mod tests {
         assert_eq!(binop(OP_IN, a, ascending), FALSE);
         assert!(!exc::pending());
 
-        // Ranges are not subscriptable (frontend rejects them statically).
-        assert_eq!(crate::container::subscript(ascending, int(0)), NONE);
-        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
-        assert_eq!(pending_message(), "'range' object is not subscriptable");
+        // Ranges index by position like CPython: `r[i] == r.start + i*r.step`.
+        assert_eq!(crate::container::subscript(ascending, int(0)), int(0));
+        assert_eq!(crate::container::subscript(ascending, int(-1)), int(9));
+        assert_eq!(crate::container::subscript(descending, int(-1)), int(1));
+        assert!(!exc::pending());
     }
 
     #[test]

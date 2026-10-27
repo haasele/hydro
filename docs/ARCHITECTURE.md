@@ -407,9 +407,10 @@ built-in kinds), so the fallback never matches a user handler.
   (`[1, 'a']`, `{'k': 1}`); `==`/`!=` are structural (dicts order-
   independent); `list + list` concatenates.
 - Slices (`s[a:b:c]`) follow `slice.indices` (negative indices, defaults,
-  `step == 0` → ValueError) and return new strings (Unicode scalars) or
-  lists; dicts are not sliceable (`TypeError`). List slice assignment
-  (`xs[a:b:c] = iterable`) splices for `step == 1`, replaces the visited
+  `step == 0` → ValueError) and return new strings (Unicode scalars), lists
+  or, for a range receiver, a new range (`range(10)[::-1]` is
+  `range(9, -1, -1)`); dicts are not sliceable (`TypeError`). List slice
+  assignment (`xs[a:b:c] = iterable`) splices for `step == 1`, replaces the visited
   positions for extended slices (length mismatch → ValueError) and rejects
   immutable `str`/`bytes`/`tuple` targets (`TypeError`).
 - A slice is a legal element of a tuple/list subscript index
@@ -435,9 +436,13 @@ built-in kinds), so the fallback never matches a user handler.
   other right operands → TypeError. `set` literals deduplicate but preserve
   insertion order, support `len`/iteration/truthiness/
   structural equality and `repr` (`{1, 2}`, empty `set()`); unhashable
-  elements → TypeError.
-- `range(...)` is a value (`range` object, iteration/len/membership/repr);
-  `list()`/`dict()`/`sum()`/`enumerate()`/`zip()` are builtins.
+  elements → TypeError. `set(iterable)`/`frozenset(iterable)` consume any
+  iterable through the iterator protocol (ranges, bytes, iterators,
+  generators).
+- `range(...)` is a value (`range` object, iteration/len/membership/repr,
+  integer indexing with negative wrap and `IndexError` outside the range, and
+  slicing that returns a range); `list()`/`dict()`/`sum()`/`enumerate()`/
+  `zip()` are builtins.
   `enumerate`/`zip` materialize lists of tuples.
 - Comprehensions (Phase 2.8): `[e for ...]`, `{e for ...}`, `{k: v for ...}`
   and generator expressions; multiple `for` clauses and `if` filters are

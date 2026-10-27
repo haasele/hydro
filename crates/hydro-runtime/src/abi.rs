@@ -197,8 +197,9 @@ pub extern "C" fn hydro_set_new(argc: usize, argv: *const i64) -> i64 {
     container::set_new(argc, argv)
 }
 
-/// `set(iterable)` for lists, tuples, sets, dicts and strings; other types
-/// raise `TypeError` and return `None`.
+/// `set(iterable)` for any iterable (lists, tuples, sets, dicts, strings,
+/// ranges, iterators, generators); a non-iterable raises `TypeError` and
+/// returns `None`.
 #[no_mangle]
 pub extern "C" fn hydro_set_from(iterable: i64) -> i64 {
     container::set_from(iterable)
@@ -2625,6 +2626,10 @@ mod tests {
         let from_dict = value::as_set(from_dict).expect("set");
         assert_eq!(from_dict.len(), 2);
 
+        // Any iterable is consumed through the iterator protocol.
+        let from_range = hydro_set_from(hydro_range_new(hydro_int(0), hydro_int(5), hydro_int(2)));
+        assert_eq!(value::as_set(from_range).map(|items| items.len()), Some(3));
+
         assert_eq!(hydro_set_from(hydro_int(3)), hydro_none());
         assert_eq!(hydro_exc_tag(), exc::TYPE_ERROR as i64);
         assert_eq!(
@@ -2678,6 +2683,17 @@ mod tests {
         assert_eq!(value::to_string(hydro_list_from(r)), "[0, 1, 2, 3, 4]");
         assert_eq!(hydro_sum(r, hydro_int(0)), hydro_int(10));
         assert_eq!(hydro_sum(r, hydro_int(100)), hydro_int(110));
+
+        // Range indexing and slicing follow CPython.
+        assert_eq!(hydro_subscript(r, hydro_int(-1)), hydro_int(4));
+        assert_eq!(hydro_subscript(r, hydro_int(5)), hydro_none());
+        assert_eq!(hydro_exc_tag(), exc::INDEX_ERROR as i64);
+        hydro_exc_clear();
+        assert_eq!(
+            value::to_string(hydro_slice(r, hydro_none(), hydro_none(), hydro_int(-1))),
+            "range(4, -1, -1)"
+        );
+        assert_eq!(hydro_exc_pending(), 0);
 
         let source = make_list(&[1, 2]);
         let enumerated = hydro_enumerate(source, hydro_int(10));

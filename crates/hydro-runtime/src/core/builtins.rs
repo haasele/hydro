@@ -6892,6 +6892,11 @@ mod tests {
         let duplicated = builtin_call(Builtin::Frozenset, &[built]);
         assert_eq!(set_integers(duplicated), vec![1, 3]);
 
+        // A range is consumed through the iterator protocol.
+        let from_range = builtin_call(Builtin::Frozenset, &[value::range_new(0, 5, 2)]);
+        assert_eq!(set_integers(from_range), vec![0, 2, 4]);
+        assert!(!exc::pending());
+
         assert_eq!(builtin_call(Builtin::Frozenset, &[source, source]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(

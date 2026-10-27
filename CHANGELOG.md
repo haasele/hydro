@@ -8,6 +8,24 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 `range` subscripting and `set(iterable)`
+
+- `range` objects are subscriptable: `r[i]` returns `r.start + i * r.step`
+  with negative wrap and CPython's `IndexError: range object index out of
+  range`; a non-integer index reports `range indices must be integers or
+  slices, not <type>`. Statically, `r[i]` is an `int`, so
+  `xr[-1]` on a range type-checks instead of failing with
+  `'range' object is not subscriptable`.
+- Slicing a range returns a new range, as in CPython:
+  `range(10)[::-1] == range(9, -1, -1)`, `range(1, 10, 3)[1:] ==
+  range(4, 10, 3)`, and an empty selection keeps the computed bounds
+  (`range(0)[::-1] == range(-1, -1, -1)`). The static type is `range`.
+- `set(x)`/`frozenset(x)` consume any iterable through the iterator
+  protocol instead of only list/tuple/set/dict/str: ranges, bytes, iterators
+  and generators work, so `set(range(n))` no longer raises
+  "set() argument must be iterable". Sema accepts a statically known
+  `range` argument for both constructors.
+
 ### Fixed — 2026-10-27 `int()`/`float()` argument typing
 
 - `int(x)` and `float(x)` no longer reject a statically known argument type.

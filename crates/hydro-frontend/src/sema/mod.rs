@@ -2018,6 +2018,18 @@ impl<'a> Checker<'a> {
                         }
                         let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
                     }
+                    // A range is a subscriptable sequence of its arithmetic
+                    // progression: `r[i]` is an `int`. A tuple key carrying a
+                    // slice (`r[:, 1]`) is a runtime `TypeError`, so it stays
+                    // dynamic like the other sequence receivers.
+                    Ty::Concrete(Type::Range) => {
+                        let _ = if slice_index {
+                            self.inf.unify(expr.ty, Ty::Concrete(Type::Any))
+                        } else {
+                            self.check_int_index("range", index.ty, index.line, index.col);
+                            self.inf.unify(expr.ty, Ty::Concrete(Type::Int))
+                        };
+                    }
                     Ty::Concrete(Type::Dict) | Ty::Concrete(Type::Any) => {
                         let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
                     }
@@ -2058,6 +2070,10 @@ impl<'a> Checker<'a> {
                     }
                     Ty::Concrete(Type::Tuple) => {
                         let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Tuple));
+                    }
+                    // Slicing a range yields a range (CPython semantics).
+                    Ty::Concrete(Type::Range) => {
+                        let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Range));
                     }
                     Ty::Concrete(Type::Any) => {
                         let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Any));
@@ -2438,9 +2454,9 @@ impl<'a> Checker<'a> {
             }
             Callee::Builtin(builtin) => {
                 let builtin = *builtin;
-                // `range(...)` has a concrete result type, and callers check
-                // it eagerly (e.g. subscripting rejects it before the deferred
-                // builtin checks run). Argument validation stays deferred.
+                // `range(...)` has a concrete result type, so callers can
+                // type-check against it eagerly; argument validation stays
+                // deferred.
                 if builtin == Builtin::Range {
                     let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Range));
                 }
@@ -3011,23 +3027,10 @@ impl<'a> Checker<'a> {
                 }
                 if count == 1 {
                     let (ty, arg_line, arg_col) = args[0];
-                    match self.inf.resolve(ty) {
-                        Ty::Var(_) => {
-                            // No static element information: iterate dynamically.
-                            let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
-                        }
-                        Ty::Concrete(Type::List)
-                        | Ty::Concrete(Type::Tuple)
-                        | Ty::Concrete(Type::Set)
-                        | Ty::Concrete(Type::Str)
-                        | Ty::Concrete(Type::Bytes)
-                        | Ty::Concrete(Type::Dict)
-                        | Ty::Concrete(Type::Any)
-                        | Ty::Concrete(Type::Never) => {}
-                        Ty::Concrete(_) => {
-                            self.error(arg_line, arg_col, "set() argument must be iterable")
-                        }
-                    }
+                    // Any iterable is accepted; the element type is not
+                    // tracked, so only a statically known non-iterable
+                    // (`int`) is rejected.
+                    self.check_builtin_iterable(Builtin::Set, ty, arg_line, arg_col);
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Set));
             }
@@ -3272,23 +3275,8 @@ impl<'a> Checker<'a> {
                 }
                 if count == 1 {
                     let (ty, arg_line, arg_col) = args[0];
-                    match self.inf.resolve(ty) {
-                        Ty::Var(_) => {
-                            // No static element information: iterate dynamically.
-                            let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
-                        }
-                        Ty::Concrete(Type::List)
-                        | Ty::Concrete(Type::Tuple)
-                        | Ty::Concrete(Type::Set)
-                        | Ty::Concrete(Type::Str)
-                        | Ty::Concrete(Type::Bytes)
-                        | Ty::Concrete(Type::Dict)
-                        | Ty::Concrete(Type::Any)
-                        | Ty::Concrete(Type::Never) => {}
-                        Ty::Concrete(_) => {
-                            self.error(arg_line, arg_col, "frozenset() argument must be iterable")
-                        }
-                    }
+                    // Same iterable rule as `set()`; a `range` is accepted.
+                    self.check_builtin_iterable(Builtin::Frozenset, ty, arg_line, arg_col);
                 }
                 // Hydro has one immutable set representation.
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Set));
