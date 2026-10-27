@@ -195,7 +195,6 @@ enum ArgKind {
     Str,
     Bytes,
     Int,
-    List,
     Dict,
     /// Any value Python can hash: containers are rejected recursively.
     Hashable,
@@ -218,7 +217,6 @@ impl ArgKind {
             ArgKind::Str => got == Type::Str,
             ArgKind::Bytes => got == Type::Bytes,
             ArgKind::Int => got == Type::Int || got == Type::BigInt || got == Type::Bool,
-            ArgKind::List => got == Type::List,
             ArgKind::Dict => got == Type::Dict,
             // Detailed hashability is checked on the expression itself so
             // tuples with unhashable elements are rejected recursively.
@@ -243,7 +241,6 @@ impl ArgKind {
             ArgKind::Str => "str",
             ArgKind::Bytes => "bytes",
             ArgKind::Int => "int",
-            ArgKind::List => "list",
             ArgKind::Dict => "dict",
             ArgKind::Hashable => "hashable",
             ArgKind::SetIterable => "set, list or tuple",
@@ -258,7 +255,6 @@ impl ArgKind {
             ArgKind::Str => Some(Type::Str),
             ArgKind::Bytes => Some(Type::Bytes),
             ArgKind::Int => Some(Type::Int),
-            ArgKind::List => Some(Type::List),
             ArgKind::Dict => Some(Type::Dict),
             ArgKind::SetIterable => Some(Type::Set),
             // Lists are the common `join` operand; keep the previous
