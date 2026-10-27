@@ -366,6 +366,16 @@ pub static OS: ModuleSpec = ModuleSpec {
         // `os.open(path, flags, mode=0o777)` returns the new descriptor.
         f("open", 2, 3, Type::Int),
         f("dup2", 2, 2, Type::Int),
+        // `os.putenv(name, value, /)` and `os.unsetenv(name, /)`: both are
+        // C-level functions in CPython, so their arguments are positional-only
+        // and may be str or bytes.
+        f("putenv", 2, 2, Type::None),
+        f("unsetenv", 1, 1, Type::None),
+        // `os.listdir(path=None)`: `path` may be passed by name (CPython's
+        // `os.listdir` is a Python wrapper) and `None` means the current
+        // directory. Keyword-dynamic so the runtime can bind `path=` instead
+        // of rejecting the call when it is not first.
+        kw_dynamic("listdir", 0, 1, Type::List, &["path"]),
     ],
     constants: &[
         c("name", Type::Str),
@@ -527,6 +537,11 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("platform", Type::Str),
         c("version", Type::Str),
         c("version_info", Type::Tuple),
+        // `sys.hexversion`: the packed `0xMMmmppF0` version number.
+        c("hexversion", Type::Int),
+        // `sys.implementation`: a namespace with `name`, `cache_tag`,
+        // `version` and `hexversion`; wheel discovery reads `cache_tag`.
+        c("implementation", Type::Any),
         c("hydro_version", Type::Str),
         c("hydro_version_info", Type::Tuple),
         c("maxsize", Type::Int),
@@ -3564,6 +3579,32 @@ mod tests {
         ] {
             assert_eq!(constant("sys", name).unwrap().ty, Type::Any, "{name}");
         }
+    }
+
+    #[test]
+    fn os_environment_and_listdir_specs_are_registered() {
+        for (name, arity) in [("putenv", 2), ("unsetenv", 1)] {
+            let spec = function("os", name).expect(name);
+            assert_eq!((spec.min_args, spec.max_args), (arity, arity), "{name}");
+            assert_eq!(spec.ret, Type::None, "{name}");
+            assert!(spec.params.is_empty(), "{name} is positional-only");
+        }
+        let listdir = function("os", "listdir").expect("os.listdir");
+        assert_eq!(
+            (listdir.min_args, listdir.max_args, listdir.ret),
+            (0, 1, Type::List)
+        );
+        assert_eq!(listdir.params, &["path"][..]);
+        assert!(
+            listdir.dynamic_keywords,
+            "listdir(path=...) is accepted by CPython's Python wrapper"
+        );
+    }
+
+    #[test]
+    fn sys_implementation_specs_are_registered() {
+        assert_eq!(constant("sys", "implementation").unwrap().ty, Type::Any);
+        assert_eq!(constant("sys", "hexversion").unwrap().ty, Type::Int);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hydro_ir::stdlib;
-use hydro_ir::{PYTHON_VERSION, PYTHON_VERSION_STRING};
+use hydro_ir::{PYTHON_ABI_TAG, PYTHON_VERSION, PYTHON_VERSION_STRING};
 use num_bigint::{BigInt, Sign};
 use num_traits::{Signed, ToPrimitive};
 
@@ -1752,6 +1752,7 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "ast" => ast::call_kw(function, args, &keywords),
         "contextlib" => contextlib_call_kw(function, args, &keywords),
         "types" => types::call_kw(function, args, &keywords),
+        "os" => os_call_kw(function, args, keywords),
         "os.path" => os_path_call_kw(function, args, &keywords),
         "itertools" => itertools_call_kw(function, args, keywords),
         "importlib.metadata" => importlib_metadata::call_kw(function, args, &keywords),
@@ -2357,6 +2358,54 @@ fn sys_path_importer_cache() -> i64 {
     cache
 }
 
+/// `sys.implementation`: a cached namespace describing this interpreter.
+///
+/// CPython builds it from `_imp`; Hydro reports its own name but the CPython
+/// ABI cache tag, because wheel discovery (`packaging.tags`) and
+/// `importlib._bootstrap_external` compare that tag against wheel filenames.
+/// The namespace is cached in the globals side store so repeated reads share
+/// identity, and `version` is a `version_info`-shaped namespace with the same
+/// target Python version.
+fn sys_implementation() -> i64 {
+    const SYS_IMPLEMENTATION_CACHE: &str = "sys.implementation";
+    if let Some(cached) = globals::registry_get(SYS_IMPLEMENTATION_CACHE) {
+        return cached;
+    }
+    // Every heap value allocated below is rooted as soon as it exists: the
+    // pair vectors are plain Rust memory the collector cannot trace.
+    let releaselevel = value::str_from_bytes(b"final");
+    let releaselevel_roots = crate::heap::root_values(&[releaselevel]);
+    let version = value::namespace_new(vec![
+        ("major".to_string(), encode_int(i64::from(PYTHON_VERSION.0))),
+        ("minor".to_string(), encode_int(i64::from(PYTHON_VERSION.1))),
+        ("micro".to_string(), encode_int(i64::from(PYTHON_VERSION.2))),
+        ("releaselevel".to_string(), releaselevel),
+        ("serial".to_string(), encode_int(0)),
+    ]);
+    let version_roots = crate::heap::root_values(&[version]);
+    let name = value::str_from_bytes(b"hydro");
+    let name_roots = crate::heap::root_values(&[name]);
+    let cache_tag = value::str_from_bytes(PYTHON_ABI_TAG.as_bytes());
+    let cache_tag_roots = crate::heap::root_values(&[cache_tag]);
+    let implementation = value::namespace_new(vec![
+        ("name".to_string(), name),
+        ("cache_tag".to_string(), cache_tag),
+        ("version".to_string(), version),
+        ("hexversion".to_string(), encode_int(python_hexversion())),
+    ]);
+    globals::registry_set(SYS_IMPLEMENTATION_CACHE, implementation);
+    crate::heap::release_roots(cache_tag_roots);
+    crate::heap::release_roots(name_roots);
+    crate::heap::release_roots(version_roots);
+    crate::heap::release_roots(releaselevel_roots);
+    implementation
+}
+
+/// Packed version number (`0xMMmmppF0`), the value of `sys.hexversion`.
+const fn python_hexversion() -> i64 {
+    ((PYTHON_VERSION.0 << 24) | (PYTHON_VERSION.1 << 16) | (PYTHON_VERSION.2 << 8) | 0xF0) as i64
+}
+
 /// Builds `sys.path` from the environment.
 ///
 /// Order: `HYDRO_SITE_PACKAGES`, the site-packages directories of
@@ -2555,6 +2604,8 @@ fn constant_value(module: &str, name: &str) -> i64 {
             value::str_from_bytes(b"final"),
             encode_int(0),
         ]),
+        ("sys", "hexversion") => encode_int(python_hexversion()),
+        ("sys", "implementation") => sys_implementation(),
         ("sys", "hydro_version") => value::str_from_bytes(env!("CARGO_PKG_VERSION").as_bytes()),
         ("sys", "hydro_version_info") => value::tuple_new(vec![
             encode_int(0),
@@ -6319,6 +6370,19 @@ fn os_stat_error(error: std::io::Error, path: &str) -> i64 {
     }
 }
 
+/// Keyword-aware `os` dispatch. Only `os.listdir` declares dynamic keywords;
+/// its single `path` parameter has already been moved into the positional
+/// slot by the binder, so any remaining name is unknown.
+fn os_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    if let Some((name, _)) = keywords.into_iter().next() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("os.{function}() got an unexpected keyword argument '{name}'"),
+        );
+    }
+    os_call(function, args)
+}
+
 fn os_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "getpid" => encode_int(i64::from(std::process::id())),
@@ -6426,8 +6490,190 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "open" => os_open(args),
         "dup2" => os_dup2(args),
         "get_terminal_size" => os_get_terminal_size(args),
+        "putenv" => os_putenv(args),
+        "unsetenv" => os_unsetenv(args),
+        "listdir" => os_listdir(args),
         _ => missing_attribute("os", function),
     }
+}
+
+/// Copies a pure `bytes` operand. `bytearray` is deliberately rejected:
+/// CPython's `unicode_fs_encoded`/`path_t` converters accept str and bytes,
+/// not general bytes-like objects.
+fn os_bytes_operand(argument: i64) -> Option<Vec<u8>> {
+    if value::as_bytearray(argument).is_some() {
+        return None;
+    }
+    value::as_bytes(argument).map(|bytes| bytes.to_vec())
+}
+
+/// Converts a str/bytes environment operand to its raw bytes. `os.putenv`
+/// and `os.unsetenv` accept exactly those two types.
+fn os_env_bytes(argument: i64) -> Option<Vec<u8>> {
+    if let Some(text) = value::as_str(argument) {
+        return Some(text.as_bytes().to_vec());
+    }
+    os_bytes_operand(argument)
+}
+
+/// Builds an `OsString` from raw bytes. On Unix, environment names and
+/// values are arbitrary byte strings; other targets fall back to a lossy
+/// UTF-8 mapping.
+#[cfg(unix)]
+fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(bytes.to_vec())
+}
+
+#[cfg(not(unix))]
+fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
+    std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Raw bytes of an `OsStr` name, for a bytes-mode `os.listdir`.
+#[cfg(unix)]
+fn os_str_bytes(name: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn os_str_bytes(name: &OsStr) -> Vec<u8> {
+    name.to_string_lossy().into_owned().into_bytes()
+}
+
+/// Shared validation for `os.putenv`/`os.unsetenv` names. Returns `None`
+/// after raising the exception CPython reports for an illegal name.
+fn os_env_name(argument: i64, function: &str) -> Option<Vec<u8>> {
+    let Some(name) = os_env_bytes(argument) else {
+        exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{function}() argument 1 must be str or bytes, not {}",
+                value::type_name(argument)
+            ),
+        );
+        return None;
+    };
+    if name.contains(&0) {
+        exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+        return None;
+    }
+    if name.is_empty() {
+        // `setenv("")` fails with EINVAL; report the same OSError as CPython
+        // instead of letting `std::env` panic on the empty key.
+        os_error_from_io(
+            function,
+            std::io::Error::from_raw_os_error(libc::EINVAL),
+            None,
+        );
+        return None;
+    }
+    Some(name)
+}
+
+/// `os.putenv(name, value, /)`: stores both operands in the process
+/// environment. `os.environ` reads `std::env`, so the change is visible to a
+/// later `os.environ`/`os.getenv` call.
+fn os_putenv(args: &[i64]) -> i64 {
+    let Some(name) = os_env_name(args[0], "putenv") else {
+        return NONE;
+    };
+    // `setenv(3)` would reject this with EINVAL; CPython reports the clearer
+    // ValueError before calling it.
+    if name.contains(&b'=') {
+        return exc::raise_with_message(VALUE_ERROR, "illegal environment variable name");
+    }
+    let Some(contents) = os_env_bytes(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "putenv() argument 2 must be str or bytes, not {}",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    if contents.contains(&0) {
+        return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+    }
+    std::env::set_var(os_string_from_bytes(&name), os_string_from_bytes(&contents));
+    NONE
+}
+
+/// `os.unsetenv(name, /)`: removes a variable from the process environment.
+/// Removing a missing name is not an error, matching CPython.
+fn os_unsetenv(args: &[i64]) -> i64 {
+    let Some(name) = os_env_name(args[0], "unsetenv") else {
+        return NONE;
+    };
+    if name.contains(&b'=') {
+        // `unsetenv(3)` reports EINVAL rather than ValueError.
+        return os_error_from_io(
+            "unsetenv",
+            std::io::Error::from_raw_os_error(libc::EINVAL),
+            None,
+        );
+    }
+    std::env::remove_var(os_string_from_bytes(&name));
+    NONE
+}
+
+/// `os.listdir(path=None)`: the real directory entries in arbitrary order.
+/// A str/path-like path yields str names; a bytes path yields bytes names.
+/// `None` and a missing argument mean the current directory.
+fn os_listdir(args: &[i64]) -> i64 {
+    let argument = args.first().copied().unwrap_or(NONE);
+    let (path, bytes_names) = if argument == NONE {
+        (PathBuf::from("."), false)
+    } else if let Some(text) = value::as_str(argument) {
+        (PathBuf::from(text), false)
+    } else if let Some(bytes) = os_bytes_operand(argument) {
+        (PathBuf::from(os_string_from_bytes(&bytes)), true)
+    } else if let Some(path) = value::as_path(argument) {
+        (PathBuf::from(path.path()), false)
+    } else if value::as_integer(argument).is_some() {
+        return exc::raise_with_message(
+            crate::exc::NOT_IMPLEMENTED_ERROR,
+            "os.listdir() does not support file descriptors",
+        );
+    } else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "listdir: path should be string, bytes, os.PathLike, integer or None, not {}",
+                value::type_name(argument)
+            ),
+        );
+    };
+    if os_str_bytes(path.as_os_str()).contains(&0) {
+        return exc::raise_with_message(VALUE_ERROR, "listdir: embedded null character in path");
+    }
+    let directory = path.to_string_lossy().into_owned();
+    let entries = match std::fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(error) => return os_error_from_io("listdir", error, Some(&directory)),
+    };
+    // Read the whole stream first: errors must surface before any Hydro value
+    // exists, and the names are plain Rust data the collector need not see.
+    let mut names = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => names.push(entry.file_name()),
+            Err(error) => return os_error_from_io("listdir", error, Some(&directory)),
+        }
+    }
+    let list = value::list_new(Vec::with_capacity(names.len()));
+    let roots = crate::heap::root_values(&[list]);
+    for name in names {
+        let item = if bytes_names {
+            value::bytes_new(os_str_bytes(&name))
+        } else {
+            value::str_alloc(name.to_string_lossy().into_owned())
+        };
+        container::list_append(list, item);
+    }
+    crate::heap::release_roots(roots);
+    list
 }
 
 /// Configuration names accepted by `os.sysconf`. `None` means the name is
@@ -9805,6 +10051,56 @@ mod tests {
     }
 
     #[test]
+    fn sys_implementation_namespace_is_stable() {
+        exc::init();
+        let implementation = get("sys", "implementation");
+        assert!(value::as_namespace(implementation).is_some());
+        // Repeated reads share identity, like CPython's singleton namespace.
+        assert_eq!(get("sys", "implementation"), implementation);
+
+        assert_eq!(
+            value::as_str(namespace_value(implementation, "name").expect("name")),
+            Some("hydro")
+        );
+        assert_eq!(
+            value::as_str(namespace_value(implementation, "cache_tag").expect("cache_tag")),
+            Some(PYTHON_ABI_TAG)
+        );
+
+        let version = namespace_value(implementation, "version").expect("version");
+        assert_eq!(
+            as_int(namespace_value(version, "major").expect("major")),
+            i64::from(PYTHON_VERSION.0)
+        );
+        assert_eq!(
+            as_int(namespace_value(version, "minor").expect("minor")),
+            i64::from(PYTHON_VERSION.1)
+        );
+        assert_eq!(
+            as_int(namespace_value(version, "micro").expect("micro")),
+            i64::from(PYTHON_VERSION.2)
+        );
+        assert_eq!(
+            value::as_str(namespace_value(version, "releaselevel").expect("releaselevel")),
+            Some("final")
+        );
+        assert_eq!(
+            as_int(namespace_value(version, "serial").expect("serial")),
+            0
+        );
+
+        let expected = i64::from(
+            (PYTHON_VERSION.0 << 24) | (PYTHON_VERSION.1 << 16) | (PYTHON_VERSION.2 << 8) | 0xF0,
+        );
+        assert_eq!(as_int(get("sys", "hexversion")), expected);
+        assert_eq!(
+            as_int(namespace_value(implementation, "hexversion").expect("hexversion")),
+            expected
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
     fn sys_exception_functions_follow_handled_stack() {
         exc::init();
         // Outside `except` handling the triple is all `None`.
@@ -10173,6 +10469,163 @@ mod tests {
         let stored = found.expect("os.environ must contain HYDRO_TEST_OS_ENVIRON");
         assert_eq!(value::as_str(stored), Some("value"));
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn os_putenv_and_unsetenv_update_the_process_environment() {
+        exc::init();
+        let name = format!("HYDRO_TEST_PUTENV_{}", std::process::id());
+        std::env::remove_var(&name);
+
+        assert_eq!(
+            call("os", "putenv", &[string(&name), string("value")]),
+            NONE
+        );
+        assert!(!exc::pending());
+        assert_eq!(std::env::var(&name).ok().as_deref(), Some("value"));
+
+        // `os.environ` reads the live process environment, so a new read sees
+        // the update (CPython's mapping reflects putenv through the C env).
+        let environ = get("os", "environ");
+        assert_eq!(
+            registry_value(environ, &name).map(value::as_str),
+            Some(Some("value"))
+        );
+
+        // bytes operands are stored as raw bytes on Unix.
+        let bytes_name = value::bytes_new(name.as_bytes().to_vec());
+        let bytes_value = value::bytes_new(b"bytes-value".to_vec());
+        assert_eq!(call("os", "putenv", &[bytes_name, bytes_value]), NONE);
+        assert!(!exc::pending());
+        assert_eq!(std::env::var(&name).ok().as_deref(), Some("bytes-value"));
+
+        assert_eq!(call("os", "unsetenv", &[string(&name)]), NONE);
+        assert!(!exc::pending());
+        assert!(std::env::var_os(&name).is_none());
+
+        // Removing an absent name is not an error.
+        assert_eq!(call("os", "unsetenv", &[bytes_name]), NONE);
+        assert!(!exc::pending());
+
+        exc::init();
+        assert_eq!(call("os", "putenv", &[string("A=B"), string("v")]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "illegal environment variable name");
+
+        exc::init();
+        assert_eq!(
+            call(
+                "os",
+                "putenv",
+                &[string("HYDRO_TEST_NUL"), value::bytes_new(b"v\0x".to_vec())]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "embedded null byte");
+
+        exc::init();
+        assert_eq!(call("os", "putenv", &[string(""), string("v")]), NONE);
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+
+        exc::init();
+        assert_eq!(call("os", "unsetenv", &[string("A=B")]), NONE);
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+
+        // bytearray is bytes-like but not accepted by the converters.
+        exc::init();
+        assert_eq!(
+            call(
+                "os",
+                "putenv",
+                &[
+                    value::bytearray_new(b"HYDRO_TEST_BYTEARRAY".to_vec()),
+                    string("v")
+                ]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+
+        exc::init();
+        assert_eq!(call("os", "putenv", &[int(1), string("v")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "putenv() argument 1 must be str or bytes, not int"
+        );
+    }
+
+    #[test]
+    fn os_listdir_returns_real_directory_entries() {
+        exc::init();
+        let root = temp_root("os-listdir");
+        make_dir(&root.join("sub"));
+        std::fs::write(root.join("alpha.txt"), b"x").expect("write file");
+        let path = root.to_string_lossy().into_owned();
+
+        let list = call("os", "listdir", &[string(&path)]);
+        assert!(!exc::pending());
+        let names: Vec<String> = value::as_list(list)
+            .expect("listdir result")
+            .iter()
+            .filter_map(|entry| value::as_str(*entry).map(str::to_string))
+            .collect();
+        assert!(
+            names.iter().any(|name| name.as_str() == "alpha.txt"),
+            "{names:?}"
+        );
+        assert!(names.iter().any(|name| name.as_str() == "sub"), "{names:?}");
+        // Directory streams never contain the special entries.
+        assert!(!names
+            .iter()
+            .any(|name| name.as_str() == "." || name.as_str() == ".."));
+
+        // The default path is the current directory.
+        let current = call("os", "listdir", &[]);
+        assert!(!exc::pending());
+        assert!(value::as_list(current).is_some());
+        let explicit_none = call("os", "listdir", &[NONE]);
+        assert!(!exc::pending());
+        assert!(value::as_list(explicit_none).is_some());
+
+        // `path` may be passed by name, like CPython's wrapper.
+        let keyword = call_kw("os", "listdir", &[], &[("path", string(&path))]);
+        assert!(!exc::pending());
+        let keyword_names = value::as_list(keyword).expect("keyword result");
+        assert!(keyword_names
+            .iter()
+            .any(|entry| value::as_str(*entry) == Some("alpha.txt")));
+
+        // A bytes path yields bytes names, matching CPython.
+        let byte_path = value::bytes_new(path.as_bytes().to_vec());
+        let byte_list = call("os", "listdir", &[byte_path]);
+        assert!(!exc::pending());
+        let byte_names = value::as_list(byte_list).expect("bytes result");
+        assert!(byte_names
+            .iter()
+            .all(|entry| value::as_bytes(*entry).is_some()));
+        assert!(byte_names
+            .iter()
+            .any(|entry| value::as_bytes(*entry) == Some(&b"alpha.txt"[..])));
+
+        // A missing directory reports OSError with the directory in the
+        // message.
+        let missing = root.join("does-not-exist");
+        exc::init();
+        assert_eq!(
+            call("os", "listdir", &[string(&missing.to_string_lossy())]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+        let missing_text = missing.to_string_lossy().into_owned();
+        assert!(message().contains(missing_text.as_str()), "{}", message());
+
+        exc::init();
+        assert_eq!(call("os", "listdir", &[int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::NOT_IMPLEMENTED_ERROR as i64);
+
+        std::fs::remove_dir_all(&root).expect("remove scratch directory");
     }
 
     #[test]
