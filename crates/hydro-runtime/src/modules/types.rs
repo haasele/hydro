@@ -156,6 +156,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             args.get(2).copied().unwrap_or(NONE),
             args.get(3).copied().unwrap_or(NONE),
         ),
+        "get_original_bases" => get_original_bases(args.first().copied().unwrap_or(NONE)),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'types' has no attribute '{function}'"),
@@ -206,6 +207,44 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
     let fdel = slots[2].unwrap_or(NONE);
     let doc = slots[3].unwrap_or(NONE);
     new_dynamic_class_attribute(fget, fset, fdel, doc)
+}
+
+/// `types.get_original_bases(cls, /)`: the class's own `__orig_bases__` when
+/// it has one (class-body assignment or a class-level attribute), otherwise
+/// `__bases__`. A base-less class reports `(object,)` like CPython's implicit
+/// edge. Hydro class creation has already resolved `__mro_entries__` and keeps
+/// no synthetic `__orig_bases__`, so a generic alias base is reported as its
+/// origin unless the source class namespace recorded the alias itself.
+fn get_original_bases(class: i64) -> i64 {
+    let Some(state) = value::as_class(class) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "Expected an instance of type, not '{}'",
+                value::type_name(class)
+            ),
+        );
+    };
+    if let Some(original) = state
+        .attrs
+        .iter()
+        .find(|(name, _)| name.as_str() == "__orig_bases__")
+        .map(|(_, value)| *value)
+    {
+        return original;
+    }
+    let original = state
+        .lock_overlay()
+        .iter()
+        .find(|(name, _)| name.as_str() == "__orig_bases__")
+        .map(|(_, value)| *value);
+    if let Some(original) = original {
+        return original;
+    }
+    if state.name == "object" || !state.bases.is_empty() {
+        return value::tuple_new(state.bases.clone());
+    }
+    value::tuple_new(vec![value::object_class()])
 }
 
 /// The cached `types.DynamicClassAttribute` class.
@@ -1123,5 +1162,40 @@ mod tests {
         let copy = call("_dca_deleter", &[descriptor, new_deleter]);
         assert_eq!(value::instance_attr(copy, "fdel"), Some(new_deleter));
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn get_original_bases_reports_declared_and_recorded_bases() {
+        exc::init();
+        let bare = value::class_new("Bare".to_string(), NONE, Vec::new());
+        assert_eq!(
+            value::as_tuple(call("get_original_bases", &[bare])).map(|items| items.to_vec()),
+            Some(vec![value::object_class()])
+        );
+
+        let base = value::class_new("Base".to_string(), NONE, Vec::new());
+        let derived = value::class_new("Derived".to_string(), base, Vec::new());
+        assert_eq!(
+            value::as_tuple(call("get_original_bases", &[derived])).map(|items| items.to_vec()),
+            Some(vec![base])
+        );
+
+        // `__orig_bases__` in the class namespace is authoritative.
+        let original = value::tuple_new(vec![base]);
+        let recorded = value::class_new_full(
+            "Recorded".to_string(),
+            NONE,
+            Vec::new(),
+            vec![("__orig_bases__".to_string(), original)],
+        );
+        assert_eq!(call("get_original_bases", &[recorded]), original);
+        assert!(!exc::pending());
+
+        exc::init();
+        let _ = call("get_original_bases", &[NONE]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        assert!(value::to_string(exc::pending_value())
+            .contains("Expected an instance of type, not 'NoneType'"));
+        exc::clear();
     }
 }

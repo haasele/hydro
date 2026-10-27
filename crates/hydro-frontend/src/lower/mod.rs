@@ -1339,7 +1339,7 @@ const SUPPORTED_MODULES_HELP: &str = "supported modules: math, io, functools, op
 /// Truth value of an `if` guard that the import contract fixes statically.
 ///
 /// Returns `Some(true)` when the body always runs, `Some(false)` when it
-/// never runs and `None` for a dynamic condition. Two guards are static:
+/// never runs and `None` for a dynamic condition. Three guards are static:
 ///
 /// - `TYPE_CHECKING` (bare or `typing.TYPE_CHECKING`) is `False` at runtime
 ///   and this frontend never evaluates annotations, so the guarded body is
@@ -1347,12 +1347,30 @@ const SUPPORTED_MODULES_HELP: &str = "supported modules: math, io, functools, op
 /// - `__name__ == "__main__"` (and `!=`) is only true for the entry unit, so
 ///   demo blocks of imported modules are dead code; loading their imports
 ///   would link unrelated modules.
+/// - `hasattr(<native module>, "<name>")` (and `not hasattr(...)`) is fixed by
+///   the native module surface: a name is present exactly when the spec table
+///   (or the module identity dunders and nested native submodules) provides
+///   it. This drops version-dependent fallbacks, so a branch such as
+///   `if hasattr(builtins, "sentinel"):` never types the unavailable member.
+///   Only stdlib/native modules are decided this way; a user module may gain
+///   attributes at runtime, so its guard stays dynamic.
 ///
-/// A local variable that shadows one of these names is not detected; the
-/// guard is then still treated as static.
+/// A local variable that shadows one of these names (including a local named
+/// like a native module, or a local `hasattr`) is not detected; the guard is
+/// then still treated as static.
 pub(crate) fn static_if_branch(test: &ast::Expr, dunder_name: &str) -> Option<bool> {
     if is_type_checking(test) {
         return Some(false);
+    }
+    // `not hasattr(...)` inverts only the static attribute check; every other
+    // negation stays dynamic.
+    if let ast::Expr::UnaryOp(unary) = test {
+        if matches!(unary.op, ast::UnaryOp::Not) {
+            return static_hasattr(&unary.operand).map(|present| !present);
+        }
+    }
+    if let Some(present) = static_hasattr(test) {
+        return Some(present);
     }
     if let ast::Expr::BoolOp(boolean) = test {
         let mut values = Vec::new();
@@ -1405,6 +1423,62 @@ pub(crate) fn static_if_branch(test: &ast::Expr, dunder_name: &str) -> Option<bo
     match op {
         ast::CmpOp::Eq => Some(is_entry),
         ast::CmpOp::NotEq => Some(!is_entry),
+        _ => None,
+    }
+}
+
+/// Truth value of `hasattr(<native module>, "<name>")`.
+///
+/// Both operands must be compile-time constants: the first the dotted name of
+/// a stdlib module ([`stdlib::module`]), the second a string literal. The
+/// result then reports whether the runtime module exposes the name: a declared
+/// function, constant or class, one of the identity dunders every module
+/// serves, or a nested native submodule. Any other shape (a user module, a
+/// computed name, a shadowed `hasattr`) returns `None` so the branch stays
+/// dynamic. `errno` also stays dynamic: it resolves platform-defined names on
+/// demand and its spec cannot enumerate them.
+fn static_hasattr(test: &ast::Expr) -> Option<bool> {
+    let ast::Expr::Call(call) = test else {
+        return None;
+    };
+    if !matches!(&*call.func, ast::Expr::Name(func) if func.id.as_str() == "hasattr") {
+        return None;
+    }
+    if !call.keywords.is_empty() || call.args.len() != 2 {
+        return None;
+    }
+    let module = static_module_name(&call.args[0])?;
+    let ast::Expr::Constant(constant) = &call.args[1] else {
+        return None;
+    };
+    let ast::Constant::Str(member) = &constant.value else {
+        return None;
+    };
+    let spec = stdlib::module(&module)?;
+    if spec.name == "errno" {
+        return None;
+    }
+    if module_member(spec, member.as_str()).is_some() {
+        return Some(true);
+    }
+    if matches!(
+        member.as_str(),
+        "__name__" | "__package__" | "__spec__" | "__loader__"
+    ) {
+        return Some(true);
+    }
+    Some(stdlib::module(&format!("{}.{}", spec.name, member)).is_some())
+}
+
+/// The dotted module name spelled by a `Name`/`Attribute` chain, when every
+/// segment is a plain identifier.
+fn static_module_name(expr: &ast::Expr) -> Option<String> {
+    match expr {
+        ast::Expr::Name(name) => Some(name.id.to_string()),
+        ast::Expr::Attribute(attribute) => {
+            let base = static_module_name(&attribute.value)?;
+            Some(format!("{base}.{}", attribute.attr.as_str()))
+        }
         _ => None,
     }
 }

@@ -22,6 +22,11 @@
 //! * the private `_deprecated` helper used by `annotationlib` (and the rest
 //!   of the 3.14 standard library): it validates its required arguments,
 //!   formats the removal message and emits a `DeprecationWarning`;
+//! * the public `warnings.deprecated` decorator class (PEP 702): construction
+//!   validates `message`/`category`/`stacklevel`, and decorating records
+//!   `__deprecated__` on the target. Hydro native functions have no
+//!   per-decoration call slot, so call-time warning emission is the documented
+//!   limitation instead of being simulated at the wrong time (see below);
 //! * the CPython default filters (`__main__` deprecations shown, the usual
 //!   `DeprecationWarning` / `PendingDeprecationWarning` / `ImportWarning` /
 //!   `ResourceWarning` categories ignored);
@@ -53,6 +58,12 @@
 //! * `catch_warnings(module=...)` accepts only the real `warnings` module
 //!   (or `None`); substituting another module object needs a Python-level
 //!   filter stack Hydro does not have and reports `NotImplementedError`.
+//! * `warnings.deprecated` (`_py_warnings.deprecated`) stores and validates
+//!   its `category`/`stacklevel` fields and implements the PEP 702 identity
+//!   decoration (`__deprecated__`, `category=None`). Wrapping a callable or a
+//!   class so a warning fires on each call/instantiation/subclass creation is
+//!   not possible for native function objects (they have no per-decoration
+//!   call slot); no warning is fabricated at decoration time instead.
 //!
 //! The filter stack and both once-registries live behind one mutex, so
 //! concurrent warnings from `_thread` workers are serialized and see one
@@ -67,6 +78,8 @@
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::sync::{LazyLock, Mutex, MutexGuard};
+
+use hydro_ir::ParamKind;
 
 use crate::container;
 use crate::exc::{
@@ -1479,10 +1492,153 @@ fn function_attribute_error(function: &str) -> i64 {
     )
 }
 
+/// `warnings.deprecated`: the PEP 702 decorator class introduced in CPython
+/// 3.14 (`_py_warnings.deprecated`).
+///
+/// It records the message plus the keyword-only `category`/`stacklevel`
+/// metadata and returns its argument, setting `__deprecated__`. CPython wraps
+/// callables and classes so the warning is emitted on call/instantiation;
+/// Hydro's native function/class values have no per-decoration call slot, so
+/// call-time emission is a documented limitation. The category/stacklevel
+/// values are still validated and stored, which is what pydantic and
+/// typing_extensions introspect (`warnings.deprecated | ...`, `__deprecated__`,
+/// `category=None`).
+pub(crate) fn deprecated_class() -> i64 {
+    let key = "warnings.deprecated";
+    if let Some(cached) = crate::core::globals::registry_get(key) {
+        return cached;
+    }
+    let category_default = exc::exception_class(DEPRECATION_WARNING);
+    let init = native_method(
+        "_deprecated_init",
+        deprecated_init_entry,
+        vec![
+            value::ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "message".to_string(),
+                kind: ParamKind::PosOnly,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "category".to_string(),
+                kind: ParamKind::KwOnly,
+                default: Some(category_default),
+            },
+            value::ParamMeta {
+                name: "stacklevel".to_string(),
+                kind: ParamKind::KwOnly,
+                default: Some(ops::int_result(1)),
+            },
+        ],
+    );
+    let call = native_method(
+        "_deprecated_call",
+        deprecated_call_entry,
+        vec![
+            value::ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "arg".to_string(),
+                kind: ParamKind::PosOnly,
+                default: None,
+            },
+        ],
+    );
+    let roots = heap::root_values(&[init, call, category_default]);
+    let class = value::class_new(
+        "deprecated".to_string(),
+        NONE,
+        vec![
+            ("__init__".to_string(), init),
+            ("__call__".to_string(), call),
+        ],
+    );
+    let class_roots = heap::root_values(&[class]);
+    crate::core::globals::registry_set(key, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
+/// A native method with full parameter metadata so keyword arguments bind and
+/// the trampoline receives every slot.
+fn native_method(
+    name: &'static str,
+    entry: extern "C" fn(*const i64) -> i64,
+    signature: Vec<value::ParamMeta>,
+) -> i64 {
+    let function = value::native_function_new("warnings", name, usize::MAX);
+    value::function_set_signature(function, signature);
+    value::function_set_full_entry(function, entry as *const () as usize);
+    function
+}
+
+extern "C" fn deprecated_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, message, category, stacklevel)`.
+    deprecated_init(
+        unsafe { *argv },
+        unsafe { *argv.add(1) },
+        unsafe { *argv.add(2) },
+        unsafe { *argv.add(3) },
+    )
+}
+
+extern "C" fn deprecated_call_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, arg)`.
+    deprecated_call(unsafe { *argv }, unsafe { *argv.add(1) })
+}
+
+/// `deprecated(message, /, *, category=DeprecationWarning, stacklevel=1)`.
+fn deprecated_init(instance: i64, message: i64, category: i64, stacklevel: i64) -> i64 {
+    if value::as_str(message).is_none() {
+        return type_error(&format!(
+            "Expected an object of type str for 'message', not '{}'",
+            value::type_name(message)
+        ));
+    }
+    if category != NONE && value::as_class(category).is_none() {
+        return type_error("category must be a Warning subclass or None");
+    }
+    if value::as_integer(stacklevel).is_none() {
+        return type_error("stacklevel must be an int");
+    }
+    value::instance_setattr(instance, "message".to_string(), message);
+    value::instance_setattr(instance, "category".to_string(), category);
+    value::instance_setattr(instance, "stacklevel".to_string(), stacklevel);
+    NONE
+}
+
+/// `decorator(arg, /)`: record `__deprecated__` and return the argument.
+fn deprecated_call(instance: i64, arg: i64) -> i64 {
+    let Some(message) = value::instance_attr(instance, "message") else {
+        return type_error("deprecated decorator is not initialised");
+    };
+    let _ = methods::setattr(
+        arg,
+        b"__deprecated__".as_ptr(),
+        "__deprecated__".len(),
+        message,
+    );
+    if exc::pending() {
+        // C-level callables have no writable `__dict__`; CPython skips the
+        // attribute silently in that case.
+        exc::clear();
+    }
+    arg
+}
+
 /// Materialises a `warnings` constant.
 pub(crate) fn constant(name: &str) -> i64 {
     match name {
         "filters" => filters(),
+        "deprecated" => deprecated_class(),
         _ => attribute_error(name),
     }
 }
@@ -1527,4 +1683,92 @@ pub(crate) fn filters() -> i64 {
     let result = value::list_new(entries);
     heap::release_roots(start);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::{as_class, as_integer, as_str};
+
+    #[test]
+    fn deprecated_is_the_cached_warnings_class() {
+        exc::init();
+        let class = deprecated_class();
+        assert_eq!(class, constant("deprecated"));
+        assert_eq!(
+            as_class(class).map(|state| state.name.as_str()),
+            Some("deprecated")
+        );
+        assert!(value::class_lookup(class, "__init__").is_some());
+        assert!(value::class_lookup(class, "__call__").is_some());
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn deprecated_records_metadata_and_sets_the_marker() {
+        exc::init();
+        let message = value::str_alloc("use `new` instead".to_string());
+        let category = exc::exception_class(DEPRECATION_WARNING);
+        let instance = value::instance_new(deprecated_class());
+        assert_eq!(
+            deprecated_init(instance, message, category, ops::int_result(1)),
+            NONE
+        );
+        assert_eq!(value::instance_attr(instance, "message"), Some(message));
+        assert_eq!(value::instance_attr(instance, "category"), Some(category));
+        assert_eq!(
+            value::instance_attr(instance, "stacklevel").and_then(as_integer),
+            Some(1)
+        );
+
+        let target = value::identity_function_new("target");
+        assert_eq!(deprecated_call(instance, target), target);
+        assert_eq!(
+            value::function_attribute(target, "__deprecated__").and_then(as_str),
+            Some("use `new` instead")
+        );
+        assert!(!exc::pending());
+
+        // `category=None` keeps the metadata but is otherwise the identity
+        // decorator (the same path; only the recorded category differs).
+        let quiet = value::instance_new(deprecated_class());
+        assert_eq!(
+            deprecated_init(quiet, message, NONE, ops::int_result(1)),
+            NONE
+        );
+        assert_eq!(value::instance_attr(quiet, "category"), Some(NONE));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn deprecated_validates_message_category_and_stacklevel() {
+        exc::init();
+        let instance = value::instance_new(deprecated_class());
+        let _ = deprecated_init(instance, NONE, NONE, ops::int_result(1));
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(value::to_string(exc::pending_value()).contains("Expected an object of type str"));
+        exc::clear();
+
+        exc::init();
+        let _ = deprecated_init(
+            instance,
+            value::str_alloc("message".to_string()),
+            NONE,
+            value::str_alloc("one".to_string()),
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(value::to_string(exc::pending_value()).contains("stacklevel must be an int"));
+        exc::clear();
+
+        exc::init();
+        let _ = deprecated_init(
+            instance,
+            value::str_alloc("message".to_string()),
+            ops::int_result(1),
+            ops::int_result(1),
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(value::to_string(exc::pending_value()).contains("category must be"));
+        exc::clear();
+    }
 }

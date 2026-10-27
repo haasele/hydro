@@ -1359,6 +1359,12 @@ fn module_get_named(module: &str, name: &str) -> i64 {
             "FileIO" => return io_file_class(value::FileClass::FileIO),
             "BufferedReader" => return io_file_class(value::FileClass::BufferedReader),
             "BufferedWriter" => return io_file_class(value::FileClass::BufferedWriter),
+            // `Lib/io.py`'s simple blocking-I/O ABCs; typing_extensions uses
+            // them as the origins of its generic Reader/Writer protocols.
+            // Unlike the stream classes they are pure Python, so `_io` does
+            // not expose them.
+            "Reader" if module == "io" => return io_protocol_class("Reader"),
+            "Writer" if module == "io" => return io_protocol_class("Writer"),
             _ => {}
         }
     }
@@ -8285,6 +8291,146 @@ fn io_base_class(name: &str) -> i64 {
     in_memory_class(name, base, Vec::new())
 }
 
+/// `io.Reader` / `io.Writer`: `abc.ABC` subclasses with the CPython protocol
+/// body and a structural `__subclasshook__`. The single abstract method is
+/// declared so the class shape matches `Lib/io.py`; Hydro has no abstract
+/// instantiation check, so the body returns `None` like the source's `pass`.
+fn io_protocol_class(name: &str) -> i64 {
+    let key = format!("io.{name}");
+    if let Some(cached) = globals::registry_get(&key) {
+        return cached;
+    }
+    let (method_name, method_entry, hook_entry, signature): (
+        &str,
+        extern "C" fn(*const i64) -> i64,
+        extern "C" fn(*const i64) -> i64,
+        Vec<value::ParamMeta>,
+    ) = if name == "Reader" {
+        (
+            "read",
+            io_reader_read_entry,
+            io_reader_subclasshook_entry,
+            vec![
+                value::ParamMeta {
+                    name: "self".to_string(),
+                    kind: hydro_ir::ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "size".to_string(),
+                    kind: hydro_ir::ParamKind::PosOnly,
+                    default: Some(NONE),
+                },
+            ],
+        )
+    } else {
+        (
+            "write",
+            io_writer_write_entry,
+            io_writer_subclasshook_entry,
+            vec![
+                value::ParamMeta {
+                    name: "self".to_string(),
+                    kind: hydro_ir::ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "data".to_string(),
+                    kind: hydro_ir::ParamKind::PosOnly,
+                    default: None,
+                },
+            ],
+        )
+    };
+    let method_name_static = if name == "Reader" {
+        "_io_reader_read"
+    } else {
+        "_io_writer_write"
+    };
+    let hook_name_static = if name == "Reader" {
+        "_io_reader_subclasshook"
+    } else {
+        "_io_writer_subclasshook"
+    };
+    let method = value::native_function_new("io", method_name_static, usize::MAX);
+    value::function_set_signature(method, signature);
+    value::function_set_full_entry(method, method_entry as *const () as usize);
+    let hook = value::native_function_new("io", hook_name_static, 2);
+    value::function_set_signature(
+        hook,
+        vec![
+            value::ParamMeta {
+                name: "cls".to_string(),
+                kind: hydro_ir::ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "candidate".to_string(),
+                kind: hydro_ir::ParamKind::Positional,
+                default: None,
+            },
+        ],
+    );
+    value::function_set_full_entry(hook, hook_entry as *const () as usize);
+    let base = abc::constant("ABC");
+    let slots = value::tuple_new(Vec::new());
+    let roots = heap::root_values(&[base, method, hook, slots]);
+    let class = value::class_new_multi(
+        name.to_string(),
+        vec![base],
+        NONE,
+        vec![
+            (
+                method_name.to_string(),
+                method,
+                hydro_ir::MethodKind::Normal,
+            ),
+            (
+                "__subclasshook__".to_string(),
+                hook,
+                hydro_ir::MethodKind::Classmethod,
+            ),
+        ],
+        vec![("__slots__".to_string(), slots)],
+    );
+    if !exc::pending() {
+        let class_roots = heap::root_values(&[class]);
+        globals::registry_set(&key, class);
+        heap::release_roots(class_roots);
+    }
+    heap::release_roots(roots);
+    class
+}
+
+extern "C" fn io_reader_read_entry(_argv: *const i64) -> i64 {
+    NONE
+}
+
+extern "C" fn io_writer_write_entry(_argv: *const i64) -> i64 {
+    NONE
+}
+
+extern "C" fn io_reader_subclasshook_entry(argv: *const i64) -> i64 {
+    // SAFETY: the classmethod binder passes `(cls, candidate)`.
+    io_protocol_subclasshook(unsafe { *argv.add(1) }, "read")
+}
+
+extern "C" fn io_writer_subclasshook_entry(argv: *const i64) -> i64 {
+    // SAFETY: the classmethod binder passes `(cls, candidate)`.
+    io_protocol_subclasshook(unsafe { *argv.add(1) }, "write")
+}
+
+fn io_protocol_subclasshook(candidate: i64, method: &str) -> i64 {
+    if value::as_class(candidate).is_none() {
+        return value::NOT_IMPLEMENTED;
+    }
+    if value::class_lookup(candidate, method).is_some() {
+        TRUE
+    } else {
+        value::NOT_IMPLEMENTED
+    }
+}
+
 /// The cached class for a file object's current state. Used by `type()`,
 /// `isinstance` and the module lookup for the class constants.
 pub(crate) fn io_file_class(class: value::FileClass) -> i64 {
@@ -13186,6 +13332,31 @@ mod tests {
         // Arity still comes from the central spec.
         assert_eq!(call("typing", "cast", &[NONE]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn io_reader_and_writer_are_cached_abc_classes() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        for (name, method) in [("Reader", "read"), ("Writer", "write")] {
+            let class_value = get("io", name);
+            assert_eq!(class_value, get("io", name), "{name} identity");
+            let class = value::as_class(class_value).unwrap_or_else(|| panic!("{name} class"));
+            assert_eq!(class.name, name);
+            assert_eq!(
+                value::as_class(class.base).map(|base| base.name.as_str()),
+                Some("ABC")
+            );
+            assert!(
+                value::class_lookup(class_value, method).is_some(),
+                "{name}.{method}"
+            );
+            assert!(
+                value::class_lookup(class_value, "__subclasshook__").is_some(),
+                "{name}.__subclasshook__"
+            );
+        }
+        assert!(!exc::pending());
     }
 
     #[test]

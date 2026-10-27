@@ -742,6 +742,146 @@ fn disjoint_base(cls: i64) -> i64 {
     cls
 }
 
+/// `typing.NoDefault` / `typing.NoExtraItems`: the CPython 3.13+ singleton
+/// sentinels. Each is an instance of a cached `*Type` class whose `__repr__`
+/// is the module-qualified spelling, so identity comparisons and the
+/// introspection pydantic/typing_extensions perform agree with CPython.
+fn sentinel(which: &str) -> i64 {
+    let key = format!("typing.{which}");
+    if let Some(cached) = crate::core::globals::registry_get(&key) {
+        return cached;
+    }
+    let class_key = format!("typing.{which}Type");
+    let class = match crate::core::globals::registry_get(&class_key) {
+        Some(class) => class,
+        None => {
+            let (function_name, entry): (&'static str, extern "C" fn(*const i64) -> i64) =
+                match which {
+                    "NoDefault" => ("_no_default_repr", no_default_repr_entry),
+                    _ => ("_no_extra_items_repr", no_extra_items_repr_entry),
+                };
+            let repr = value::native_function_new("typing", function_name, 1);
+            value::function_set_signature(
+                repr,
+                vec![value::ParamMeta {
+                    name: "self".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                }],
+            );
+            value::function_set_full_entry(repr, entry as *const () as usize);
+            let roots = heap::root_values(&[repr]);
+            let class = value::class_new(
+                format!("{which}Type"),
+                NONE,
+                vec![("__repr__".to_string(), repr)],
+            );
+            let class_roots = heap::root_values(&[class]);
+            crate::core::globals::registry_set(&class_key, class);
+            heap::release_roots(class_roots);
+            heap::release_roots(roots);
+            class
+        }
+    };
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance]);
+    crate::core::globals::registry_set(&key, instance);
+    heap::release_roots(roots);
+    instance
+}
+
+extern "C" fn no_default_repr_entry(_argv: *const i64) -> i64 {
+    value::str_alloc("typing.NoDefault".to_string())
+}
+
+extern "C" fn no_extra_items_repr_entry(_argv: *const i64) -> i64 {
+    value::str_alloc("typing.NoExtraItems".to_string())
+}
+
+/// Whether a class (or an ancestor) is named `name`. Hydro represents
+/// `Protocol`/`TypedDict` as native placeholder classes, so the ancestry is
+/// the available runtime marker.
+fn class_chain_contains(class: i64, name: &str) -> bool {
+    value::class_mro(class)
+        .iter()
+        .any(|&current| value::as_class(current).is_some_and(|state| state.name == name))
+}
+
+/// `typing.is_typeddict(tp)`: a class whose ancestry reaches the TypedDict
+/// placeholder. Non-classes are always false, like `isinstance(tp, _TypedDictMeta)`.
+fn is_typeddict(tp: i64) -> bool {
+    let Some(state) = value::as_class(tp) else {
+        return false;
+    };
+    state.name != "TypedDict" && class_chain_contains(tp, "TypedDict")
+}
+
+/// `typing.is_protocol(tp)`: a class marked `_is_protocol` (typing_extensions
+/// sets the marker explicitly) or one deriving from `Protocol`. `Protocol`
+/// itself is not a protocol.
+fn is_protocol(tp: i64) -> bool {
+    let Some(state) = value::as_class(tp) else {
+        return false;
+    };
+    if state.name == "Protocol" {
+        return false;
+    }
+    if let Some(value::ClassEntry::Attr(marker)) = value::class_lookup(tp, "_is_protocol") {
+        return value::truthy(marker);
+    }
+    class_chain_contains(tp, "Protocol")
+}
+
+/// `typing.get_protocol_members(tp)`: the names a protocol declares, walked
+/// over the MRO while skipping `Protocol`/`Generic`/`object` and the special
+/// attributes CPython excludes. Hydro has one set value type, so the result
+/// is a set (the observable behaviour of CPython's frozenset).
+fn get_protocol_members(tp: i64) -> i64 {
+    if !is_protocol(tp) {
+        return type_error(&format!("{} is not a Protocol", value::repr(tp)));
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for &current in &value::class_mro(tp) {
+        let Some(state) = value::as_class(current) else {
+            continue;
+        };
+        if matches!(state.name.as_str(), "Protocol" | "Generic" | "object") {
+            continue;
+        }
+        for (name, _, _) in &state.methods {
+            if !name.starts_with("_abc_") && !EXCLUDED_ATTRIBUTES.contains(&name.as_str()) {
+                names.push(name.as_str());
+            }
+        }
+        for (name, _) in &state.attrs {
+            if !name.starts_with("_abc_") && !EXCLUDED_ATTRIBUTES.contains(&name.as_str()) {
+                names.push(name.as_str());
+            }
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    let items: Vec<i64> = names
+        .into_iter()
+        .map(|name| value::str_alloc(name.to_string()))
+        .collect();
+    let roots = heap::root_values(&items);
+    let set = value::set_new(items);
+    heap::release_roots(roots);
+    set
+}
+
+/// `@override`: identity decorator that records `__override__ = True` when the
+/// target has a writable attribute surface (functions and classes do; C-level
+/// callables/instances may not, exactly like CPython's silent skip).
+fn override_marker(method: i64) -> i64 {
+    let _ = methods::setattr(method, b"__override__".as_ptr(), "__override__".len(), TRUE);
+    if exc::pending() {
+        exc::clear();
+    }
+    method
+}
+
 /// A `frozenset`-shaped constant. Hydro has one set value type, so the
 /// constant is a set built once and cached (membership/iteration are what
 /// `typing_extensions` uses it for).
@@ -1326,6 +1466,9 @@ pub(crate) fn constant(name: &str) -> i64 {
     if name == "ParamSpec" || name == "TypeVarTuple" {
         return typevar_like_class(name);
     }
+    if name == "NoDefault" || name == "NoExtraItems" {
+        return sentinel(name);
+    }
     if CLASSES.contains(&name) {
         return value::class_new(name.to_string(), NONE, Vec::new());
     }
@@ -1360,6 +1503,16 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "get_overloads" => get_overloads(args.first().copied().unwrap_or(NONE)),
         "clear_overloads" => clear_overloads(),
         "disjoint_base" => disjoint_base(args.first().copied().unwrap_or(NONE)),
+        // PEP 695/type-assertion helpers: the value argument is returned
+        // unchanged. `reveal_type` prints a diagnostic in CPython, but the
+        // runtime's contract here is the identity result (the frontend
+        // already consumes annotations and emits no reveal diagnostics).
+        "assert_type" => args.first().copied().unwrap_or(NONE),
+        "reveal_type" => args.first().copied().unwrap_or(NONE),
+        "override" => override_marker(args.first().copied().unwrap_or(NONE)),
+        "is_typeddict" => value::bool_value(is_typeddict(args.first().copied().unwrap_or(NONE))),
+        "is_protocol" => value::bool_value(is_protocol(args.first().copied().unwrap_or(NONE))),
+        "get_protocol_members" => get_protocol_members(args.first().copied().unwrap_or(NONE)),
         "_ConcatenateGenericAlias" => concatenate_generic_alias_new(args, &[]),
         // `TypeVar` carries the full type-parameter attribute set; the
         // frontend still consumes annotations itself, but the value is real
@@ -3255,6 +3408,74 @@ mod tests {
         exc::init();
         let _ = call("disjoint_base", &[NONE]);
         assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn no_default_and_no_extra_items_are_identity_stable_sentinels() {
+        exc::init();
+        let no_default = constant("NoDefault");
+        assert_eq!(no_default, constant("NoDefault"));
+        assert_eq!(value::repr(no_default), "typing.NoDefault");
+        assert_eq!(
+            value::as_class(value::type_class(no_default)).map(|class| class.name.as_str()),
+            Some("NoDefaultType")
+        );
+
+        let no_extra = constant("NoExtraItems");
+        assert_eq!(no_extra, constant("NoExtraItems"));
+        assert_ne!(no_extra, no_default);
+        assert_eq!(value::repr(no_extra), "typing.NoExtraItems");
+        assert_eq!(
+            value::as_class(value::type_class(no_extra)).map(|class| class.name.as_str()),
+            Some("NoExtraItemsType")
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn pydantic_type_helpers_use_runtime_class_shape() {
+        exc::init();
+        let plain = value::class_new("Node".to_string(), NONE, Vec::new());
+        let payload = text("payload");
+        assert_eq!(call("assert_type", &[payload, plain]), payload);
+        assert_eq!(call("reveal_type", &[payload]), payload);
+        assert_eq!(call("override", &[plain]), plain);
+        assert!(matches!(
+            value::class_lookup(plain, "__override__"),
+            Some(value::ClassEntry::Attr(TRUE))
+        ));
+        assert_eq!(call("is_typeddict", &[plain]), FALSE);
+
+        assert_eq!(call("is_typeddict", &[constant("TypedDict")]), FALSE);
+        let typed_dict = value::class_new("Film".to_string(), constant("TypedDict"), Vec::new());
+        assert_eq!(call("is_typeddict", &[typed_dict]), TRUE);
+
+        let method = value::native_function_new("test", "read", 1);
+        let marker = text("marker");
+        let protocol = value::class_new_full(
+            "Readable".to_string(),
+            constant("Protocol"),
+            vec![("read".to_string(), method, hydro_ir::MethodKind::Normal)],
+            vec![("name".to_string(), marker)],
+        );
+        assert_eq!(call("is_protocol", &[protocol]), TRUE);
+        let members = call("get_protocol_members", &[protocol]);
+        let names: Vec<&str> = value::as_set(members)
+            .expect("set")
+            .iter()
+            .filter_map(|item| value::as_str(*item))
+            .collect();
+        assert_eq!(names, vec!["name", "read"]);
+        assert_eq!(call("is_protocol", &[plain]), FALSE);
+        assert!(!exc::pending());
+
+        // `Protocol` itself and non-class arguments are not protocols.
+        assert_eq!(call("is_protocol", &[constant("Protocol")]), FALSE);
+        exc::init();
+        let _ = call("get_protocol_members", &[plain]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        assert!(pending_message().contains("is not a Protocol"));
         exc::clear();
     }
 }

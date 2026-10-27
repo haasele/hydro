@@ -846,6 +846,10 @@ pub static IO: ModuleSpec = ModuleSpec {
         c("RawIOBase", Type::Any),
         c("TextIOBase", Type::Any),
         c("BufferedIOBase", Type::Any),
+        // `io.Reader`/`io.Writer` are the ABCs from `Lib/io.py`;
+        // `typing_extensions` uses them as its generic I/O protocols.
+        c("Reader", Type::Any),
+        c("Writer", Type::Any),
     ],
 };
 
@@ -1839,6 +1843,17 @@ pub static TYPING: ModuleSpec = ModuleSpec {
         // `disjoint_base(cls)` marks a class for the 3.15 inheritance check.
         // Hydro keeps no compiler flag, so the decorator returns the class.
         f("disjoint_base", 1, 1, Type::Any),
+        // PEP 695 helpers and runtime type assertions. `assert_type` and
+        // `reveal_type` are runtime no-ops that return their argument;
+        // `override` is an identity marker. `is_typeddict`/`is_protocol`
+        // inspect the runtime class shape, and `get_protocol_members`
+        // answers from the protocol class's own method/attribute names.
+        f("assert_type", 2, 2, Type::Any),
+        f("reveal_type", 1, 1, Type::Any),
+        f("override", 1, 1, Type::Any),
+        f("is_typeddict", 1, 1, Type::Bool),
+        f("is_protocol", 1, 1, Type::Bool),
+        f("get_protocol_members", 1, 1, Type::Set),
         // CPython's private `_ConcatenateGenericAlias(origin, args, *,
         // _typevar_types, _paramspec_tvars)`. The attribute value is the real
         // alias class (see `typing::class_value`); declaring the call form
@@ -1854,6 +1869,11 @@ pub static TYPING: ModuleSpec = ModuleSpec {
     ],
     constants: &[
         c("TYPE_CHECKING", Type::Bool),
+        // CPython 3.13+ sentinels imported by `typing_extensions` and
+        // pydantic. They are identity-stable singleton instances; no
+        // `builtins.sentinel` (3.15-only) is added.
+        c("NoDefault", Type::Any),
+        c("NoExtraItems", Type::Any),
         c("Any", Type::Any),
         c("AnyStr", Type::Any),
         c("BinaryIO", Type::Any),
@@ -2038,6 +2058,10 @@ pub static TYPES: ModuleSpec = ModuleSpec {
             Type::Any,
             &["fget", "fset", "fdel", "doc"],
         ),
+        // `get_original_bases(cls, /)`: the class's `__orig_bases__` when
+        // present, else its real bases (Hydro records the declared bases, so
+        // generic aliases stay visible).
+        f("get_original_bases", 1, 1, Type::Tuple),
     ],
     constants: &[
         c("CodeType", Type::Any),
@@ -2688,7 +2712,10 @@ const WARNING_FUNCTIONS: &[FunctionSpec] = &[
 pub static WARNINGS: ModuleSpec = ModuleSpec {
     name: "warnings",
     functions: WARNING_FUNCTIONS,
-    constants: &[c("filters", Type::List)],
+    // `warnings.deprecated` is a class (usable in type aliases and as a
+    // decorator), exposed as a dynamic constant so calls take the runtime
+    // class path with keyword arguments.
+    constants: &[c("filters", Type::List), c("deprecated", Type::Any)],
 };
 
 /// `_warnings`: the accelerator alias. The same registry and filters are
@@ -3853,6 +3880,25 @@ mod tests {
         assert_eq!((defaults.min_args, defaults.max_args), (1, 1));
         assert_eq!(defaults.ret, Type::Dict);
         assert_eq!(constant("typing", "TYPE_CHECKING").unwrap().ty, Type::Bool);
+        // CPython 3.13+ sentinels used by typing_extensions/pydantic.
+        for name in ["NoDefault", "NoExtraItems"] {
+            assert_eq!(constant("typing", name).unwrap().ty, Type::Any, "{name}");
+        }
+        // Runtime type-assertion/introspection helpers added for pydantic.
+        assert_eq!(
+            (
+                function("typing", "assert_type").unwrap().min_args,
+                function("typing", "assert_type").unwrap().max_args
+            ),
+            (2, 2)
+        );
+        for name in ["reveal_type", "override", "is_typeddict", "is_protocol"] {
+            let spec = function("typing", name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!((spec.min_args, spec.max_args), (1, 1), "{name}");
+        }
+        let members = function("typing", "get_protocol_members").expect("get_protocol_members");
+        assert_eq!((members.min_args, members.max_args), (1, 1));
+        assert_eq!(members.ret, Type::Set);
         for name in [
             "Any",
             "Callable",
@@ -3957,6 +4003,17 @@ mod tests {
         assert_eq!((alias.min_args, alias.max_args), (2, 2));
         assert!(alias.dynamic_keywords);
         assert_eq!(alias.params, &["origin", "args"][..]);
+    }
+
+    #[test]
+    fn pydantic_stdlib_surface_is_registered() {
+        for name in ["Reader", "Writer"] {
+            assert_eq!(constant("io", name).unwrap().ty, Type::Any, "{name}");
+        }
+        let original_bases = function("types", "get_original_bases").expect("get_original_bases");
+        assert_eq!((original_bases.min_args, original_bases.max_args), (1, 1));
+        assert_eq!(original_bases.ret, Type::Tuple);
+        assert_eq!(constant("warnings", "deprecated").unwrap().ty, Type::Any);
     }
 
     #[test]

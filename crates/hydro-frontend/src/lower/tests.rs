@@ -13576,6 +13576,139 @@ def make():
 }
 
 #[test]
+fn hasattr_of_native_module_decides_static_if_branches() {
+    // `builtins.sentinel` only exists on 3.15, but Hydro targets 3.14: the
+    // guard is false and the dead branch must not be typed (reading the
+    // missing member would be a compile error). `typing.Concatenate` is in the
+    // native spec, so the opposite branch is dead.
+    let source = "\
+import builtins
+import os
+import typing
+if hasattr(builtins, \"sentinel\"):
+    sentinel = builtins.sentinel
+else:
+    sentinel = None
+if hasattr(typing, \"Concatenate\"):
+    concat = 1
+else:
+    concat = 2
+if not hasattr(builtins, \"sentinel\"):
+    fallback = 3
+else:
+    fallback = 4
+if hasattr(os, \"path\"):
+    nested = 1
+else:
+    nested = 2
+";
+    let hir = lower_ok(source);
+    let locals = &hir.functions[0].locals;
+    fn assigned_name<'a>(stmt: &'a HStmt, locals: &'a [HLocal]) -> &'a str {
+        match &stmt.kind {
+            HStmtKind::Assign { target, .. } => locals[*target as usize].name.as_str(),
+            other => panic!("expected an assignment, got {other:?}"),
+        }
+    }
+    let ifs: Vec<&HStmt> = hir.functions[0]
+        .body
+        .iter()
+        .filter(|stmt| matches!(stmt.kind, HStmtKind::If { .. }))
+        .collect();
+    assert_eq!(ifs.len(), 4, "{:?}", hir.functions[0].body);
+
+    let HStmtKind::If {
+        cond,
+        then_body,
+        else_body,
+    } = &ifs[0].kind
+    else {
+        unreachable!()
+    };
+    assert!(matches!(cond.kind, HExprKind::Const(Const::Bool(false))));
+    assert!(then_body.is_empty(), "{then_body:?}");
+    assert_eq!(else_body.len(), 1);
+    let HStmtKind::Assign { value, .. } = &else_body[0].kind else {
+        unreachable!()
+    };
+    assert!(matches!(value.kind, HExprKind::Const(Const::None)));
+    assert_eq!(assigned_name(&else_body[0], locals), "sentinel");
+
+    let HStmtKind::If {
+        cond,
+        then_body,
+        else_body,
+    } = &ifs[1].kind
+    else {
+        unreachable!()
+    };
+    assert!(matches!(cond.kind, HExprKind::Const(Const::Bool(true))));
+    assert_eq!(then_body.len(), 1);
+    assert!(else_body.is_empty(), "{else_body:?}");
+    assert_eq!(assigned_name(&then_body[0], locals), "concat");
+
+    let HStmtKind::If {
+        cond,
+        then_body,
+        else_body,
+    } = &ifs[2].kind
+    else {
+        unreachable!()
+    };
+    assert!(matches!(cond.kind, HExprKind::Const(Const::Bool(true))));
+    assert!(!then_body.is_empty(), "{then_body:?}");
+    assert!(else_body.is_empty(), "{else_body:?}");
+    assert_eq!(assigned_name(&then_body[0], locals), "fallback");
+
+    // A nested native submodule counts as an attribute (`os.path`).
+    let HStmtKind::If {
+        cond,
+        then_body,
+        else_body,
+    } = &ifs[3].kind
+    else {
+        unreachable!()
+    };
+    assert!(matches!(cond.kind, HExprKind::Const(Const::Bool(true))));
+    assert_eq!(then_body.len(), 1);
+    assert!(else_body.is_empty(), "{else_body:?}");
+    assert_eq!(assigned_name(&then_body[0], locals), "nested");
+}
+
+#[test]
+fn hasattr_of_user_module_and_computed_names_stays_dynamic() {
+    // A user module may gain attributes at runtime, so its guard must keep
+    // both branches. The same holds for a computed attribute name, and for
+    // `errno`, whose platform names the spec table does not enumerate.
+    let module = parse(
+        "\
+if hasattr(numpy, \"attrs\"):
+    a = 1
+else:
+    a = 2
+if not hasattr(numpy, \"attrs\"):
+    b = 1
+else:
+    b = 2
+if hasattr(builtins, name):
+    c = 1
+else:
+    c = 2
+if hasattr(errno, \"ENETUNREACH\"):
+    d = 1
+else:
+    d = 2
+",
+    );
+    for stmt in &module.body {
+        let ast::Stmt::If(s) = stmt else {
+            panic!("expected an if statement");
+        };
+        assert_eq!(static_if_branch(&s.test, "test"), None);
+    }
+}
+
+#[test]
 fn class_body_delete_binds_and_missing_names_raise_name_error() {
     let source = "\
 class C:
