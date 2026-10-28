@@ -246,6 +246,7 @@ mod tests {
 
     #[test]
     fn dotted_user_submodules_and_relative_names_resolve() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         crate::core::globals::reset();
         exc::init();
         // Compiled modules register themselves through the `__name__` global
@@ -333,6 +334,7 @@ mod tests {
 
     #[test]
     fn reloading_a_compiled_module_reports_the_missing_executor() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         crate::core::globals::reset();
         exc::init();
         crate::core::globals::set("pkg.reloadable", "__name__", text("pkg.reloadable"));

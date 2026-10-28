@@ -8,6 +8,64 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Added — 2026-10-27 blank `property()` and `type(..., **kwds)` metaclass forwarding
+
+- `property()` now accepts zero arguments and builds a real descriptor with
+  `fget`/`fset`/`fdel` unset, a writable attribute table (`p.member = ...`,
+  `p._get = ...`), `getter`/`setter`/`deleter`, the descriptor protocol
+  (`__get__`/`__set__`/`__delete__`) and a no-op `__set_name__(owner, name)`.
+  Reading a blank property raises `AttributeError` ("property has no getter")
+  and assigning to it raises "property has no setter"; the one- to
+  four-argument forms keep their behaviour. Assignments to `fget`/`fset`/`fdel`
+  after construction shadow the constructor slots. This unblocks CPython
+  3.14's `enum.py`, which builds redirect descriptors from a blank `property()`
+  and fills in `member`, `fget`, `_get` and friends.
+- `type(name, bases, namespace, **kwds)` now forwards the class-header keywords
+  to the metaclass resolved from the bases, calling its `__new__` and `__init__`
+  with them, as CPython does; `EnumType.__new__(..., boundary=..., _simple=...)`
+  therefore receives its keywords. The one-argument form still rejects
+  keywords, and a class whose metaclass is the native `type` reports CPython's
+  `"<name>.__init_subclass__() takes no keyword arguments"` error.
+
+### Changed — 2026-10-27 vendored CPython `enum` replaces the native placeholder
+
+- `enum` is now CPython 3.14.9's pure-Python `Lib/enum.py`, vendored verbatim
+  (plus a provenance header) in the repository's new `stdlib/` directory.
+  `Enum`, `IntEnum`, `IntFlag`, `Flag`, `StrEnum`, `auto()`, the metaclass
+  machinery and every decorator/hook behave as in CPython; the former native
+  placeholder that exported empty base classes and returned `None` from
+  `auto()` is gone, so NumPy 2.5's import-time `enum` usage is reached instead
+  of failing. `stdlib/LICENSE` carries the PSF License notice.
+- `stdlib/` is a default import root, searched after every explicit root
+  (`HYDRO_SITE_PACKAGES`, the `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages
+  trees, `PYTHONPATH` and `HYDRO_STDLIB`), so an explicit root always wins.
+  The root resolves relative to the executable for installed layouts and
+  relative to the repository (`CARGO_MANIFEST_DIR`) at compile time for
+  development builds. Both the compile-time resolver and `sys.path` use it.
+
+### Added — 2026-10-27 process-wide module globals and GC roots
+
+- Module globals are process-wide. The runtime global store is now a
+  `LazyLock<RwLock<HashMap>>` instead of a thread-local map, so a thread that
+  binds a module global makes it visible to every other thread, exactly like a
+  shared CPython module dictionary; module attribute overrides and cached
+  `globals()` views live in the same store, and the "any override" fast-path
+  flag is an `AtomicBool`. Concurrent first `globals()` calls of one module
+  still return one dict identity.
+- The collector gained process-wide roots: `heap::add_global_root` appends to
+  a static list that every local and shared collection marks. Stored module
+  values therefore survive the exit of the thread that wrote them and are
+  marked by a collection running on any thread. The list is cleared only by
+  `hydro_runtime_init` (through `globals::reset`, which empties the store
+  first); `reset` documents that only program start may call the runtime reset.
+- Exception state, fibers, contextvars and the asyncio loop stay per-thread.
+- Tests treat the store as shared: unit tests that reset or inspect it
+  serialise on the heap-reset lock (which also blocks a parallel
+  `hydro_runtime_init`), `abi` tests use a reentrant-per-thread session guard,
+  and new tests cover two plain OS threads exchanging module globals, the
+  modules appearing in `sys.modules`, and a heap-backed global surviving the
+  writer thread's exit under repeated collections.
+
 ### Added — 2026-10-27 CPython set methods and comparisons
 
 - Sets implement the full CPython method surface. `update(*others)` mutates in

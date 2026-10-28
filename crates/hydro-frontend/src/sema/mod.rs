@@ -3293,12 +3293,15 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(out, Ty::Concrete(Type::List));
             }
             Builtin::Type => {
-                if count != 1 {
+                // `type(x)` reports an object's type; `type(name, bases, ns)`
+                // creates a class and may forward class-header keywords to the
+                // metaclass (checked by the runtime).
+                if count != 1 && count != 3 {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
-                        format!("type() takes exactly 1 argument ({count} given)"),
+                        format!("type() takes 1 or 3 arguments ({count} given)"),
                     );
                     return;
                 }
@@ -4154,12 +4157,14 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
             }
             Builtin::Property => {
-                if count == 0 || count > 4 {
+                // `property()` with no arguments is a valid blank descriptor
+                // (`fget`/`fset`/`fdel` are None) that `enum` fills in later.
+                if count > 4 {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
-                        format!("property() takes 1 to 4 arguments ({count} given)"),
+                        format!("property() takes 0 to 4 arguments ({count} given)"),
                     );
                     return;
                 }
@@ -5184,9 +5189,14 @@ fn emit_expr(expr: &HExpr, inf: &mut Infer) -> IrExpr {
             module: module.clone(),
             name: name.clone(),
         },
-        HExprKind::DeferredImport { module, member } => ExprKind::DeferredImport {
+        HExprKind::DeferredImport {
+            module,
+            member,
+            path,
+        } => ExprKind::DeferredImport {
             module: module.clone(),
             member: member.clone(),
+            path: path.clone(),
         },
         HExprKind::ExtensionAttr { path, member } => ExprKind::ExtensionAttr {
             path: path.clone(),

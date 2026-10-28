@@ -7,23 +7,38 @@
 //! first-class function values for callables.
 //!
 //! Only the `ShimValue` types cross the boundary: scalars, bytes, strings,
-//! capsules, `NotImplemented` and lists/tuples/dicts of them. Containers are
-//! copied recursively in both directions (depth-limited to
-//! [`MAX_CONVERSION_DEPTH`]); a cyclic Hydro container raises a `TypeError`
-//! instead of recursing. Capsules cross as an opaque pointer plus name, so
-//! passing one back to the extension returns the original pointer. User
-//! objects still raise a `TypeError` rather than being silently mangled.
+//! capsules, `NotImplemented`, lists/tuples/dicts of them and opaque
+//! [`ShimValue::Object`] handles. Containers are copied recursively in both
+//! directions (depth-limited to [`MAX_CONVERSION_DEPTH`]); a cyclic Hydro
+//! container raises a `TypeError` instead of recursing. Capsules cross as an
+//! opaque pointer plus name, so passing one back to the extension returns the
+//! original pointer.
 //!
-//! Extension-created type handles have no Hydro value form: they are callable
-//! through [`call`] (`ext.Type(args...)`) but [`get`] reports them as a
-//! `TypeError` instead of inventing a value kind.
+//! Extension-owned instances and type objects cross as `KIND_EXT_OBJECT`
+//! values that own one reference to the original handle. They keep their
+//! identity (`is`), extension `repr`/`==`/truth, attributes, methods and
+//! constructors; passing one back yields the same pointer. This is what makes
+//! real extension APIs (NumPy arrays, pydantic-core sentinels and types)
+//! usable instead of rejected.
+//!
+//! The reverse direction crosses Hydro classes, instances, functions and
+//! modules as rooted handles ([`capi::hydro_shim`]). The handle owns a
+//! persistent GC root, so the collector keeps the Hydro value alive while the
+//! extension holds it; `PyObject_GetAttr*`, `PyObject_Call*`,
+//! `PyObject_Repr`/`Str`, truth, `len`, `hash` and the type checks dispatch to
+//! Hydro, and passing the handle back reproduces the identical Hydro value.
+//! Scalars and containers are still copied. A value that has no handle
+//! representation raises instead of fabricating an object.
 //!
 //! All fallible paths report a pending exception and return the `None` dummy
 //! value; no user input can panic.
 
+use std::collections::HashMap;
+use std::ffi::CString;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 
-use crate::capi::{self, ShimAttr, ShimValue, MAX_CONVERSION_DEPTH};
+use crate::capi::{self, OwnedShimObject, ShimAttr, ShimValue, MAX_CONVERSION_DEPTH};
 use crate::exc::{
     self, ARITHMETIC_ERROR, ASSERTION_ERROR, ATTRIBUTE_ERROR, BASE_EXCEPTION, BASE_EXCEPTION_GROUP,
     BLOCKING_IO_ERROR, BROKEN_PIPE_ERROR, BUFFER_ERROR, BYTES_WARNING, CHILD_PROCESS_ERROR,
@@ -96,8 +111,13 @@ pub(crate) fn init_name(path: &str) -> String {
 /// Converts one tagged Hydro value to a shim value.
 ///
 /// Supported types are `None`, `bool`, `int`, `float`, `str`, `bytes`,
-/// `list`, `tuple` and `dict`. Containers are copied recursively; nesting is
-/// bounded by [`MAX_CONVERSION_DEPTH`] and a cycle raises a `TypeError`.
+/// `list`, `tuple`, `dict`, capsules, opaque extension handles and Hydro
+/// classes, instances, functions and modules. Containers are copied
+/// recursively; nesting is bounded by [`MAX_CONVERSION_DEPTH`] and a cycle
+/// raises a `TypeError`. A handle is passed through with an additional
+/// reference, preserving its identity. A Hydro class/instance/function/module
+/// crosses as a rooted handle ([`capi::hydro_shim`]) that dispatches
+/// attribute access, calls, `repr`/`str`, truth and comparison back to Hydro.
 pub(crate) fn value_to_shim(value_arg: i64) -> Result<ShimValue, String> {
     value_to_shim_at(value_arg, 0, &mut Vec::new())
 }
@@ -137,6 +157,14 @@ fn value_to_shim_at(
     if let Some(bytes) = value::as_bytes(value_arg) {
         return Ok(ShimValue::Bytes(bytes.to_vec()));
     }
+    if let Some(state) = value::as_ext_object(value_arg) {
+        // Pass the original handle back with an additional reference: the
+        // contract value owns that reference until it is consumed.
+        return Ok(ShimValue::Object {
+            object: OwnedShimObject::new(state.object),
+            type_name: state.type_name.clone(),
+        });
+    }
     if let Some((ptr, name)) = value::as_capsule(value_arg) {
         return Ok(ShimValue::Capsule {
             ptr,
@@ -160,10 +188,30 @@ fn value_to_shim_at(
         path.pop();
         return Ok(ShimValue::Dict(converted));
     }
+    // Classes, instances, functions and modules have no copied shim
+    // representation. They cross as a rooted handle instead, so the extension
+    // can inspect, call and store them and pass them back with their identity.
+    if hydro_handle_supported(value_arg) {
+        return Ok(capi::hydro_shim(value_arg));
+    }
     Err(format!(
         "cannot pass '{}' object to a C extension function",
         value::type_name(value_arg)
     ))
+}
+
+/// Whether a Hydro value is representable as a rooted C handle.
+///
+/// Scalars and containers are copied by the arms above; the values listed
+/// here have no copy representation and need a live handle so the extension
+/// can observe their real identity, attributes and call semantics.
+fn hydro_handle_supported(value_arg: i64) -> bool {
+    value::as_class(value_arg).is_some()
+        || value::as_instance(value_arg).is_some()
+        || value::as_exc_instance(value_arg).is_some()
+        || value::as_function(value_arg).is_some()
+        || value::as_ext_function(value_arg).is_some()
+        || value::as_module(value_arg).is_some()
 }
 
 /// Converts one Hydro sequence (list or tuple) into its shim counterpart.
@@ -226,6 +274,16 @@ fn shim_to_value_at(shim: ShimValue, depth: usize) -> Result<i64, String> {
         ShimValue::Str(s) => value::str_alloc(s),
         ShimValue::Bytes(bytes) => value::bytes_new(bytes),
         ShimValue::Capsule { ptr, name } => value::capsule_new(ptr, name),
+        // Transfer the owned reference into the Hydro handle; the payload
+        // releases it when the collector drops the object.
+        ShimValue::Object { object, type_name } => {
+            value::ext_object_new(object.into_raw(), type_name)
+        }
+        // The handle names the original Hydro value, so the same class,
+        // instance, function or module comes back with its identity intact.
+        // Its persistent root is released when the handle's last owner drops
+        // (the caller roots the returned tagged value like any other result).
+        ShimValue::Hydro(handle) => handle.value(),
         ShimValue::List(items) => {
             let items = shim_items_to_values(items, "list", depth)?;
             value::list_new(items)
@@ -277,20 +335,22 @@ fn shim_items_to_values(
 }
 
 /// Python type name of a shim value, used in the not-callable error.
-fn shim_type_name(shim: &ShimValue) -> &'static str {
+fn shim_type_name(shim: &ShimValue) -> String {
     match shim {
-        ShimValue::None => "NoneType",
-        ShimValue::Bool(_) => "bool",
-        ShimValue::Int(_) => "int",
-        ShimValue::Float(_) => "float",
-        ShimValue::Str(_) => "str",
-        ShimValue::Bytes(_) => "bytes",
-        ShimValue::List(_) => "list",
-        ShimValue::Tuple(_) => "tuple",
-        ShimValue::Dict(_) => "dict",
-        ShimValue::Capsule { .. } => "PyCapsule",
-        ShimValue::NotImplemented => "NotImplementedType",
-        ShimValue::Ellipsis => "ellipsis",
+        ShimValue::None => "NoneType".to_string(),
+        ShimValue::Bool(_) => "bool".to_string(),
+        ShimValue::Int(_) => "int".to_string(),
+        ShimValue::Float(_) => "float".to_string(),
+        ShimValue::Str(_) => "str".to_string(),
+        ShimValue::Bytes(_) => "bytes".to_string(),
+        ShimValue::List(_) => "list".to_string(),
+        ShimValue::Tuple(_) => "tuple".to_string(),
+        ShimValue::Dict(_) => "dict".to_string(),
+        ShimValue::Capsule { .. } => "PyCapsule".to_string(),
+        ShimValue::Object { type_name, .. } => type_name.clone(),
+        ShimValue::Hydro(handle) => handle.type_name().to_string(),
+        ShimValue::NotImplemented => "NotImplementedType".to_string(),
+        ShimValue::Ellipsis => "ellipsis".to_string(),
     }
 }
 
@@ -310,7 +370,7 @@ fn not_callable(shim: &ShimValue) -> i64 {
 /// a known prefix is an internal load/call failure, which falls back to
 /// `RuntimeError` (with a few historical heuristics for the loader's own
 /// diagnostics).
-fn raised_error(message: &str) -> i64 {
+pub(crate) fn raised_error(message: &str) -> i64 {
     let (tag, text) = match message.split_once(": ") {
         Some((name, rest)) => match exception_tag(name) {
             Some(tag) => (tag, rest),
@@ -521,15 +581,63 @@ pub(crate) fn get(
         Ok(ShimAttr::Callable(callable)) => {
             value::ext_function_new(callable.module, callable.method, member.to_string())
         }
-        Ok(ShimAttr::Type(address)) => exc::raise_with_message(
-            TYPE_ERROR,
-            &format!(
-                "extension type '{}' has no Hydro value form; call it directly",
-                capi::type_display_name(address)
-            ),
-        ),
+        // A type object is a first-class opaque value: it exposes
+        // `__name__`/`__module__`, supports `isinstance` and is callable
+        // through [`call_type_object`](capi::call_type_object).
+        Ok(ShimAttr::Type(address)) => type_object_value(address),
         Err(message) => raised_error(&message),
     }
+}
+
+/// Python-visible attribute names exported by a compiled extension module.
+pub(crate) fn module_attribute_names(path: &str) -> Result<Vec<String>, String> {
+    capi::load_extension(path, &init_name(path)).map(capi::module_attribute_names)
+}
+
+/// Materialises a module-owned type handle as an opaque Hydro value.
+///
+/// The registry keeps its own reference; the returned value owns one more.
+fn type_object_value(address: usize) -> i64 {
+    let object = address as *mut capi::ShimObject;
+    capi::inc_ref(object);
+    value::ext_object_new(object, capi::type_display_name(address))
+}
+
+/// `from <extension> import member`: a module attribute read for an import
+/// statement.
+///
+/// Unlike [`get`], a missing member and an unloadable shared object raise
+/// `ImportError` instead of `AttributeError`/`RuntimeError`, matching CPython's
+/// from-import, so `try: from ext import name` / `except ImportError:` runs the
+/// handler. `module` is the import name used in the error message.
+pub(crate) fn import_member(module: &str, path: &str, member: &str) -> i64 {
+    let loaded = match capi::load_extension(path, &init_name(path)) {
+        Ok(loaded) => loaded,
+        Err(message) => return raised_import_error(&message),
+    };
+    match capi::get_attr(loaded, member) {
+        Ok(ShimAttr::Value(shim)) => result_value(shim),
+        Ok(ShimAttr::Callable(callable)) => {
+            value::ext_function_new(callable.module, callable.method, member.to_string())
+        }
+        Ok(ShimAttr::Type(address)) => type_object_value(address),
+        // The module exists but does not export the name: the from-import
+        // failed, which is an `ImportError`, not an `AttributeError`.
+        Err(_) => crate::builtins::cannot_import_name(member, module),
+    }
+}
+
+/// Raises `ImportError` for a shared-object load failure reported by the shim.
+///
+/// A load error means the extension module as a whole is unavailable, exactly
+/// the case CPython's importer reports as `ImportError`. A message that names a
+/// known exception class keeps its text without the `Type: ` prefix.
+fn raised_import_error(message: &str) -> i64 {
+    let text = match message.split_once(": ") {
+        Some((name, rest)) if exception_tag(name).is_some() => rest,
+        _ => message,
+    };
+    exc::raise_with_message(IMPORT_ERROR, text)
 }
 
 /// Calls a first-class extension function obtained from [`get`].
@@ -544,6 +652,440 @@ pub(crate) fn call_value(state: &ExtFunctionState, argc: usize, argv: *const i64
     };
     match capi::call_method(state.module, state.method, &args) {
         Ok(result) => result_value(result),
+        Err(message) => raised_error(&message),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Opaque extension handles
+// ---------------------------------------------------------------------------
+
+/// Converts an ABI argument buffer to contract values.
+fn abi_arguments(argc: usize, argv: *const i64) -> Result<Vec<ShimValue>, i64> {
+    let argv = match argument_slice(argc, argv) {
+        Ok(args) => args,
+        Err(message) => return Err(exc::raise_with_message(TYPE_ERROR, message)),
+    };
+    shim_arguments(argv)
+}
+
+/// Converts an ABI keyword buffer (`name`, `value` pairs) to contract values.
+fn abi_keywords(kwargc: usize, kw_argv: *const i64) -> Result<Vec<(String, ShimValue)>, i64> {
+    if kwargc == 0 {
+        return Ok(Vec::new());
+    }
+    if kw_argv.is_null() || kwargc > isize::MAX as usize / (2 * std::mem::size_of::<i64>()) {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            "keyword arguments were passed without an argument buffer",
+        ));
+    }
+    // SAFETY: ABI contract checked above: `kw_argv` holds `2 * kwargc` values.
+    let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+    let mut keywords = Vec::with_capacity(kwargc);
+    for pair in pairs.as_chunks::<2>().0 {
+        let Some(name) = value::as_str(pair[0]) else {
+            return Err(exc::raise_with_message(
+                TYPE_ERROR,
+                "keyword name must be str",
+            ));
+        };
+        match value_to_shim(pair[1]) {
+            Ok(converted) => keywords.push((name.to_string(), converted)),
+            Err(message) => return Err(exc::raise_with_message(TYPE_ERROR, &message)),
+        }
+    }
+    Ok(keywords)
+}
+
+/// Borrows the handle of an opaque extension value, or raises `TypeError`.
+fn ext_handle(value_arg: i64) -> Option<*mut capi::ShimObject> {
+    match value::as_ext_object(value_arg) {
+        Some(state) => Some(state.object),
+        None => {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "expected an extension object, not '{}'",
+                    value::type_name(value_arg)
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// `object.name` for an opaque extension value.
+pub(crate) fn ext_object_getattr(value_arg: i64, name: &str) -> i64 {
+    let Some(object) = ext_handle(value_arg) else {
+        return NONE;
+    };
+    match capi::object_get_attr(object, name) {
+        Ok(result) => result_value(result),
+        Err(message) => raised_error(&message),
+    }
+}
+
+/// Calls an opaque extension value (`Type(...)` or `instance(...)`).
+pub(crate) fn ext_object_call(value_arg: i64, argc: usize, argv: *const i64) -> i64 {
+    let Some(object) = ext_handle(value_arg) else {
+        return NONE;
+    };
+    let args = match abi_arguments(argc, argv) {
+        Ok(args) => args,
+        Err(value) => return value,
+    };
+    // Construction goes through `call_type_object` so heap types use their
+    // `Py_tp_new`/vectorcall path; any other handle is a normal callable.
+    let outcome = if capi::object_is_type(object) {
+        capi::call_type_object(object as usize, &args)
+    } else {
+        capi::object_call(object, &args, &[])
+    };
+    match outcome {
+        Ok(result) => result_value(result),
+        Err(message) => raised_error(&message),
+    }
+}
+
+/// Calls `object.name(args...)` on an opaque extension value.
+pub(crate) fn ext_object_method(value_arg: i64, name: &str, argc: usize, argv: *const i64) -> i64 {
+    let Some(object) = ext_handle(value_arg) else {
+        return NONE;
+    };
+    let args = match abi_arguments(argc, argv) {
+        Ok(args) => args,
+        Err(value) => return value,
+    };
+    match capi::object_call_method(object, name, &args, &[]) {
+        Ok(result) => result_value(result),
+        Err(message) => raised_error(&message),
+    }
+}
+
+/// Calls `object.name(args..., name=value...)` on an opaque extension value.
+pub(crate) fn ext_object_method_kw(
+    value_arg: i64,
+    name: &str,
+    argc: usize,
+    argv: *const i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> i64 {
+    let Some(object) = ext_handle(value_arg) else {
+        return NONE;
+    };
+    let args = match abi_arguments(argc, argv) {
+        Ok(args) => args,
+        Err(value) => return value,
+    };
+    let keywords = match abi_keywords(kwargc, kw_argv) {
+        Ok(keywords) => keywords,
+        Err(value) => return value,
+    };
+    match capi::object_call_method(object, name, &args, &keywords) {
+        Ok(result) => result_value(result),
+        Err(message) => raised_error(&message),
+    }
+}
+
+/// Calls an opaque extension value with keyword arguments.
+pub(crate) fn ext_object_call_kw(
+    value_arg: i64,
+    argc: usize,
+    argv: *const i64,
+    kwargc: usize,
+    kw_argv: *const i64,
+) -> i64 {
+    let Some(object) = ext_handle(value_arg) else {
+        return NONE;
+    };
+    let args = match abi_arguments(argc, argv) {
+        Ok(args) => args,
+        Err(value) => return value,
+    };
+    let keywords = match abi_keywords(kwargc, kw_argv) {
+        Ok(keywords) => keywords,
+        Err(value) => return value,
+    };
+    // Types also construct through vectorcall when keywords are present;
+    // `call_type_object` only carries the positional fast path.
+    match capi::object_call(object, &args, &keywords) {
+        Ok(result) => result_value(result),
+        Err(message) => raised_error(&message),
+    }
+}
+
+/// `callable(value)` for an opaque extension handle.
+pub(crate) fn ext_object_is_callable(value_arg: i64) -> bool {
+    match value::as_ext_object(value_arg) {
+        Some(state) => capi::object_callable(state.object),
+        None => false,
+    }
+}
+
+/// Metadata override for one opaque extension handle.
+#[derive(Default, Clone)]
+struct ExtMetadata {
+    name: Option<String>,
+    qualname: Option<String>,
+    module: Option<String>,
+    /// `Some(None)` means the attribute was explicitly set to `None`.
+    doc: Option<Option<String>>,
+}
+
+/// Writable metadata slots of extension handles, keyed by handle address.
+///
+/// Type and method handles live in the extension's heap, so their writable
+/// `__name__`/`__qualname__`/`__module__`/`__doc__` values are kept here and
+/// consulted by the Hydro attribute path before the C attribute lookup.
+static EXT_METADATA: LazyLock<Mutex<HashMap<usize, ExtMetadata>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn metadata_lock() -> std::sync::MutexGuard<'static, HashMap<usize, ExtMetadata>> {
+    EXT_METADATA
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn text_value(text: String) -> i64 {
+    value::str_alloc(text)
+}
+
+/// Reads a stored override for `name`, if the handle has one.
+pub(crate) fn ext_object_metadata_getattr(value_arg: i64, name: &str) -> Option<i64> {
+    let state = value::as_ext_object(value_arg)?;
+    let address = state.object as usize;
+    let guard = metadata_lock();
+    let metadata = guard.get(&address)?;
+    match name {
+        "__name__" => metadata.name.as_ref().map(|text| text_value(text.clone())),
+        "__qualname__" => metadata
+            .qualname
+            .as_ref()
+            .map(|text| text_value(text.clone())),
+        "__module__" => metadata
+            .module
+            .as_ref()
+            .map(|text| text_value(text.clone())),
+        "__doc__" => metadata.doc.as_ref().map(|doc| match doc {
+            Some(text) => text_value(text.clone()),
+            None => NONE,
+        }),
+        _ => None,
+    }
+}
+
+/// Stores one of the writable metadata slots of an opaque handle.
+///
+/// Returns `None` when `name` is not a metadata slot (so the caller falls back
+/// to `PyObject_SetAttr`), `Some(NONE)` on success and `Some(value)` with a
+/// pending exception on failure.
+pub(crate) fn ext_object_metadata_setattr(
+    value_arg: i64,
+    name: &str,
+    new_value: i64,
+) -> Option<i64> {
+    let state = value::as_ext_object(value_arg)?;
+    let slot = match name {
+        "__name__" | "__qualname__" | "__module__" | "__doc__" => name,
+        _ => return None,
+    };
+    let address = state.object as usize;
+    let mut guard = metadata_lock();
+    let metadata = guard.entry(address).or_default();
+    if slot == "__doc__" && new_value == NONE {
+        metadata.doc = Some(None);
+        return Some(NONE);
+    }
+    let Some(text) = value::as_str(new_value) else {
+        return Some(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{slot} must be a string, not '{}'",
+                value::type_name(new_value)
+            ),
+        ));
+    };
+    let text = text.to_string();
+    match slot {
+        "__name__" => metadata.name = Some(text),
+        "__qualname__" => metadata.qualname = Some(text),
+        "__module__" => metadata.module = Some(text),
+        "__doc__" => metadata.doc = Some(Some(text)),
+        _ => unreachable!(),
+    }
+    Some(NONE)
+}
+
+/// Attribute read for a first-class extension function.
+pub(crate) fn ext_function_getattr(value_arg: i64, name: &str) -> Option<i64> {
+    let state = value::as_ext_function(value_arg)?;
+    match name {
+        "__name__" => Some(text_value(
+            state
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .name
+                .clone()
+                .unwrap_or_else(|| state.name.clone()),
+        )),
+        "__qualname__" => {
+            let metadata = state
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Some(text_value(
+                metadata
+                    .qualname
+                    .clone()
+                    .or_else(|| metadata.name.clone())
+                    .unwrap_or_else(|| state.name.clone()),
+            ))
+        }
+        "__module__" => state
+            .metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .module
+            .clone()
+            .map(text_value),
+        "__doc__" => Some(
+            match state
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .doc
+                .clone()
+            {
+                Some(Some(text)) => text_value(text),
+                Some(None) | None => NONE,
+            },
+        ),
+        _ => None,
+    }
+}
+
+/// Attribute write for a first-class extension function.
+///
+/// Returns `None` for non-metadata names; extension functions have no writable
+/// arbitrary attributes in this shim.
+pub(crate) fn ext_function_setattr(value_arg: i64, name: &str, new_value: i64) -> Option<i64> {
+    let state = value::as_ext_function(value_arg)?;
+    let slot = match name {
+        "__name__" | "__qualname__" | "__module__" | "__doc__" => name,
+        _ => return None,
+    };
+    let mut metadata = state
+        .metadata
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot == "__doc__" && new_value == NONE {
+        metadata.doc = Some(None);
+        return Some(NONE);
+    }
+    let Some(text) = value::as_str(new_value) else {
+        return Some(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{slot} must be a string, not '{}'",
+                value::type_name(new_value)
+            ),
+        ));
+    };
+    let text = text.to_string();
+    match slot {
+        "__name__" => metadata.name = Some(text),
+        "__qualname__" => metadata.qualname = Some(text),
+        "__module__" => metadata.module = Some(text),
+        "__doc__" => metadata.doc = Some(Some(text)),
+        _ => unreachable!(),
+    }
+    Some(NONE)
+}
+
+/// Sets a non-metadata attribute on an opaque extension handle.
+pub(crate) fn ext_object_setattr(value_arg: i64, name: &str, new_value: i64) -> i64 {
+    let Some(object) = ext_handle(value_arg) else {
+        return NONE;
+    };
+    let Ok(shim) = value_to_shim(new_value) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "cannot set '{}' on an extension object with '{}'",
+                name,
+                value::type_name(new_value)
+            ),
+        );
+    };
+    let object_value = capi::value_object(shim);
+    let Ok(c_name) = CString::new(name) else {
+        capi::dec_ref(object_value);
+        return exc::raise_with_message(TYPE_ERROR, "attribute name contains a NUL");
+    };
+    let status = capi::PyObject_SetAttrString(object, c_name.as_ptr(), object_value);
+    capi::dec_ref(object_value);
+    if status == 0 {
+        NONE
+    } else {
+        raised_error(
+            &capi::take_error().unwrap_or_else(|| format!("AttributeError: cannot set '{name}'")),
+        )
+    }
+}
+
+/// Whether `value` (an opaque extension handle) is an instance of a Hydro
+/// class that derives from an extension type.
+pub(crate) fn ext_object_is_hydro_subclass(value_arg: i64, class: i64) -> bool {
+    let Some(state) = value::as_ext_object(value_arg) else {
+        return false;
+    };
+    for ancestor in value::class_mro(class) {
+        let Some(base) = value::as_ext_object(ancestor) else {
+            continue;
+        };
+        if !capi::object_is_type(base.object) {
+            continue;
+        }
+        if matches!(capi::object_isinstance(state.object, base.object), Ok(true)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `isinstance(value, extension_type)`.
+pub(crate) fn ext_object_isinstance(value_arg: i64, type_arg: i64) -> i64 {
+    let Some(state) = value::as_ext_object(type_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "isinstance() arg 2 must be a type or tuple of types",
+        );
+    };
+    if !capi::object_is_type(state.object) {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "isinstance() arg 2 must be a type or tuple of types",
+        );
+    }
+    let instance = if let Some(value) = value::as_ext_object(value_arg) {
+        value.object
+    } else {
+        let shim = match value_to_shim(value_arg) {
+            Ok(shim) => shim,
+            Err(message) => return exc::raise_with_message(TYPE_ERROR, &message),
+        };
+        capi::value_object(shim)
+    };
+    let owns_instance = value::as_ext_object(value_arg).is_none();
+    let result = capi::object_isinstance(instance, state.object);
+    if owns_instance {
+        capi::dec_ref(instance);
+    }
+    match result {
+        Ok(equal) => value::bool_value(equal),
         Err(message) => raised_error(&message),
     }
 }
@@ -698,13 +1240,18 @@ mod tests {
 
     #[test]
     fn unsupported_arguments_report_type() {
+        // Iterators have no C handle representation; they are rejected
+        // instead of crossing as a fake object. Extension functions, by
+        // contrast, are real callables and cross as Hydro handles.
+        let iterator = value::iter_new(value::list_new(Vec::new()));
+        let message = value_to_shim(iterator).expect_err("iterators are unsupported");
+        assert!(message.contains("'iterator'"), "{message}");
+
         let function = value::ext_function_new(1, 2, "tag".to_string());
         match value_to_shim(function) {
-            Err(message) => assert!(
-                message.contains("'builtin_function_or_method'"),
-                "{message}"
-            ),
-            Ok(_) => panic!("extension functions are unsupported arguments"),
+            Ok(ShimValue::Hydro(handle)) => assert_eq!(handle.value(), function),
+            Ok(other) => panic!("extension functions must cross as a Hydro handle: {other:?}"),
+            Err(message) => panic!("extension functions are callable handles: {message}"),
         }
     }
 
@@ -853,6 +1400,35 @@ mod tests {
         ));
         let back = shim_to_value(shim).expect("unnamed capsule converts back");
         assert_eq!(value::as_capsule(back), Some((0x1234, None)));
+    }
+
+    #[test]
+    fn opaque_handles_roundtrip_with_owned_references() {
+        // A handle created with one reference becomes the Hydro value's own
+        // reference; reading it back adds exactly one contract reference.
+        let object = capi::new_object(capi::ShimKind::Int(5));
+        let shim = ShimValue::Object {
+            object: OwnedShimObject::new(object),
+            type_name: "probe.Thing".to_string(),
+        };
+        assert_eq!(capi::Py_REFCNT(object), 2);
+        capi::dec_ref(object);
+
+        let tagged = shim_to_value(shim).expect("object converts to Hydro");
+        let state = value::as_ext_object(tagged).expect("Hydro ext object");
+        assert_eq!(state.type_name, "probe.Thing");
+        let pointer = state.object;
+        assert_eq!(capi::Py_REFCNT(pointer), 1);
+        assert!(value::is_ext_object(tagged));
+        assert_eq!(value::type_name_of(tagged), "probe.Thing");
+
+        let back = value_to_shim(tagged).expect("Hydro object converts back");
+        assert_eq!(capi::Py_REFCNT(pointer), 2);
+        match back {
+            ShimValue::Object { object, .. } => assert_eq!(object.as_ptr(), pointer),
+            other => panic!("unexpected shim value: {other:?}"),
+        }
+        assert_eq!(capi::Py_REFCNT(pointer), 1);
     }
 
     #[test]

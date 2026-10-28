@@ -305,6 +305,43 @@ impl Interp {
         // publish the traceback frame.
         abi::hydro_safepoint();
         abi::hydro_frame_enter(func.name.as_ptr(), func.name.len());
+        // Publish the interpreter frame's live locals so `sys._getframe` sees
+        // the same view generated code exposes: names in slot order, the
+        // module globals key and the code metadata.
+        let mut names = Vec::new();
+        for (index, local) in func.locals.iter().enumerate() {
+            if index != 0 {
+                names.push(0);
+            }
+            names.extend_from_slice(local.name.as_bytes());
+        }
+        let module = program.module_of(function_id);
+        let params = func.params[func.capture_count.min(func.params.len())..]
+            .iter()
+            .filter(|param| param.kind.is_positional())
+            .count();
+        let mut flags = 0x3u32;
+        if func.is_generator {
+            flags |= 0x20;
+        }
+        if func.is_async {
+            flags |= 0x80;
+        }
+        let first_line = func.body.first().map(|stmt| stmt.line).unwrap_or(0);
+        {
+            let frame = self.frames.last_mut().expect("frame was just pushed");
+            abi::hydro_frame_bind(
+                frame.locals.as_mut_ptr(),
+                func.locals.len(),
+                names.as_ptr(),
+                names.len(),
+                params,
+                flags,
+                module.as_ptr(),
+                module.len(),
+                first_line,
+            );
+        }
 
         let result = self.exec_stmts(&func.body);
 

@@ -2,7 +2,20 @@
 //!
 //! The tests drive the public runtime ABI the way generated code does.
 
+use std::sync::Mutex;
+
 use hydro_runtime::abi::*;
+
+/// Serialises the tests in this binary: module caches and the module-global
+/// store are process-wide, so `hydro_runtime_init` must not clear them while
+/// another test compares cached values.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const VALUE_ERROR: i64 = 0;
 const TYPE_ERROR: i64 = 1;
@@ -93,6 +106,7 @@ fn assert_same(actual: i64, expected: i64) {
 
 #[test]
 fn len_and_issubclass_work_through_the_module() {
+    let _guard = test_guard();
     hydro_runtime_init();
     let items = list(&[int(1), int(2)]);
     assert_int(module("builtins", "len", &[items]), 2);
@@ -106,6 +120,7 @@ fn len_and_issubclass_work_through_the_module() {
 
 #[test]
 fn singleton_constants_are_the_runtime_values() {
+    let _guard = test_guard();
     hydro_runtime_init();
     assert_same(module_get("builtins", "None"), hydro_none());
     assert_same(module_get("builtins", "True"), hydro_true());
@@ -148,6 +163,7 @@ fn singleton_constants_are_the_runtime_values() {
 
 #[test]
 fn object_is_the_universal_cached_base() {
+    let _guard = test_guard();
     hydro_runtime_init();
     let object = module_get("builtins", "object");
     assert_no_error();
@@ -163,6 +179,7 @@ fn object_is_the_universal_cached_base() {
 
 #[test]
 fn setattr_vars_delattr_and_dir() {
+    let _guard = test_guard();
     hydro_runtime_init();
     let object = module_get("builtins", "object");
     let instance = hydro_instance_new(object);
@@ -190,6 +207,7 @@ fn setattr_vars_delattr_and_dir() {
 
 #[test]
 fn unsupported_names_raise_tagged_errors() {
+    let _guard = test_guard();
     hydro_runtime_init();
     let _ = module("builtins", "globals", &[]);
     assert_error_tag(RUNTIME_ERROR);
@@ -255,6 +273,7 @@ fn unsupported_names_raise_tagged_errors() {
 
 #[test]
 fn id_and_attribute_name_validation() {
+    let _guard = test_guard();
     hydro_runtime_init();
     let one = module("builtins", "id", &[int(7)]);
     let two = module("builtins", "id", &[int(7)]);
@@ -283,6 +302,7 @@ fn id_and_attribute_name_validation() {
 
 #[test]
 fn import_builtin_resolves_registered_modules() {
+    let _guard = test_guard();
     hydro_runtime_init();
     let math = module("builtins", "__import__", &[text("math")]);
     assert_no_error();

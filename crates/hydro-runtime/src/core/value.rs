@@ -169,6 +169,18 @@ pub(crate) const KIND_EXC_INSTANCE: u32 = 45;
 /// value; the wrapped value and the optional property setter/deleter are
 /// traced GC edges.
 pub(crate) const KIND_DESCRIPTOR: u32 = 46;
+/// Opaque handle to an extension-owned object or type object. The payload owns
+/// one CPython reference, released when the collector drops the heap object;
+/// it has no Hydro children.
+pub(crate) const KIND_EXT_OBJECT: u32 = 47;
+/// Reified Python call frame (`sys._getframe`, `inspect.currentframe`). The
+/// payload owns the shared activation record; its locals binding reads the
+/// activation's registered GC slot array while the activation is running and
+/// a snapshot afterwards.
+pub(crate) const KIND_FRAME: u32 = 48;
+/// Code object attached to a frame (`frame.f_code`). Holds the immutable
+/// name/file/line/varname metadata of one generated function.
+pub(crate) const KIND_CODE: u32 = 49;
 
 /// Function flag: created by `async def`, a call produces a coroutine.
 pub(crate) const FUNCTION_FLAG_ASYNC: u32 = 1;
@@ -564,6 +576,81 @@ fn entropy_seed() -> u64 {
     mix64(nanos ^ pid.rotate_left(32) ^ count.wrapping_mul(SPLITMIX_GAMMA))
 }
 
+/// Fills `buffer` from the operating system's entropy source.
+///
+/// Linux/Android use `getrandom(2)`, other Unixes read `/dev/urandom`, and
+/// Windows uses `SystemFunction036` (`RtlGenRandom`). Errors are returned so
+/// callers can report them; only `SystemRandom`'s draw path, which cannot
+/// propagate an exception, treats failure as unrecoverable.
+pub(crate) fn fill_entropy(buffer: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(any(
+        all(target_os = "linux", any(target_env = "gnu", target_env = "musl")),
+        target_os = "android"
+    ))]
+    {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let slice = &mut buffer[filled..];
+            // SAFETY: `slice` is writable for `slice.len()` bytes.
+            let result = unsafe { libc::getrandom(slice.as_mut_ptr().cast(), slice.len(), 0) };
+            if result > 0 {
+                filled += result as usize;
+                continue;
+            }
+            if result == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "getrandom returned no data",
+                ));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            all(target_os = "linux", any(target_env = "gnu", target_env = "musl")),
+            target_os = "android"
+        ))
+    ))]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")?.read_exact(buffer)
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn SystemFunction036(buffer: *mut u8, length: u32) -> u8;
+        }
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let slice = &mut buffer[filled..];
+            let take = slice.len().min(u32::MAX as usize);
+            // SAFETY: `slice` is writable for `take` bytes.
+            let ok = unsafe { SystemFunction036(slice.as_mut_ptr(), take as u32) };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            filled += take;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = buffer;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no operating system entropy source",
+        ))
+    }
+}
+
 /// Native payload of a `pathlib.Path` object.
 ///
 /// The path is stored exactly as the constructor received it (no
@@ -586,6 +673,9 @@ impl PathState {
 /// deliberately *not* reproducible against CPython's Mersenne Twister.
 pub(crate) struct RandomState {
     state: Mutex<u64>,
+    /// `true` for `random.SystemRandom`: every draw comes from the operating
+    /// system and seeding is ignored.
+    os_backed: bool,
 }
 
 impl RandomState {
@@ -598,12 +688,27 @@ impl RandomState {
     pub(crate) fn seeded(seed: u64) -> RandomState {
         RandomState {
             state: Mutex::new(mix64(seed)),
+            os_backed: false,
         }
     }
 
     /// Creates a generator seeded from the process environment.
     pub(crate) fn from_entropy() -> RandomState {
         RandomState::seeded(entropy_seed())
+    }
+
+    /// Creates the unconditionally entropy-backed generator behind
+    /// `random.SystemRandom`.
+    pub(crate) fn os_backed() -> RandomState {
+        RandomState {
+            state: Mutex::new(0),
+            os_backed: true,
+        }
+    }
+
+    /// Whether draws bypass the in-process state (`SystemRandom`).
+    pub(crate) fn is_os_backed(&self) -> bool {
+        self.os_backed
     }
 
     fn state(&self) -> MutexGuard<'_, u64> {
@@ -613,17 +718,30 @@ impl RandomState {
     }
 
     /// Reseeds the generator in place (`random.seed` / `Random.seed`).
+    /// Entropy-backed generators ignore seeds, like `SystemRandom`.
     pub(crate) fn reset(&self, seed: u64) {
+        if self.os_backed {
+            return;
+        }
         *self.state() = mix64(seed);
     }
 
     /// Reseeds from the environment (`seed()` / `seed(None)`).
     pub(crate) fn reset_entropy(&self) {
+        if self.os_backed {
+            return;
+        }
         self.reset(entropy_seed());
     }
 
-    /// Next 64 bits (SplitMix64).
+    /// Next 64 bits: SplitMix64 normally, fresh OS entropy for
+    /// `SystemRandom`.
     pub(crate) fn next_u64(&self) -> u64 {
+        if self.os_backed {
+            let mut bytes = [0u8; 8];
+            fill_entropy(&mut bytes).expect("operating system entropy source unavailable");
+            return u64::from_le_bytes(bytes);
+        }
         let mut state = self.state();
         *state = state.wrapping_add(SPLITMIX_GAMMA);
         mix64(*state)
@@ -1962,7 +2080,9 @@ pub(crate) enum DescriptorKind {
     Classmethod,
     /// `staticmethod(target)`: returns the target unchanged.
     Staticmethod,
-    /// `property(getter[, setter[, deleter]])`: calls the getter on access.
+    /// `property([getter[, setter[, deleter]]])`: calls the getter on access.
+    /// The zero-argument form is a blank descriptor whose slots are `NONE` and
+    /// whose attribute table is writable afterwards.
     Property,
     /// The `type.__dict__["__annotations__"]` getset descriptor: `__get__`
     /// reports a class's own annotations and `__set__` replaces them.
@@ -1987,11 +2107,61 @@ impl DescriptorKind {
 ///
 /// The target may be any callable or class value. `setter`/`deleter` are only
 /// meaningful for `property` and are `NONE` when absent.
+///
+/// A `property` also has a writable attribute table, like CPython's blank
+/// `property()` object: `enum` builds a redirect descriptor with
+/// `p = property(); p.member = ...; p.fget = ...; p._get = ...`. Assignments
+/// to `fget`/`fset`/`fdel` shadow the constructor slots (they live in `attrs`
+/// under those names), and every other name is stored verbatim.
 pub(crate) struct DescriptorState {
     pub(crate) kind: DescriptorKind,
     pub(crate) target: i64,
     pub(crate) setter: i64,
     pub(crate) deleter: i64,
+    attrs: Attributes,
+}
+
+impl DescriptorState {
+    /// Reads a property component (`fget`/`fset`/`fdel`), preferring a value
+    /// assigned after construction over the constructor slot.
+    fn property_component(&self, name: &str, fallback: i64) -> i64 {
+        if self.kind != DescriptorKind::Property {
+            return fallback;
+        }
+        self.attrs.get(name).unwrap_or(fallback)
+    }
+
+    /// Effective `fget` of a `property` (the getter function or `NONE`).
+    pub(crate) fn fget(&self) -> i64 {
+        self.property_component("fget", self.target)
+    }
+
+    /// Effective `fset` of a `property` (the setter function or `NONE`).
+    pub(crate) fn fset(&self) -> i64 {
+        self.property_component("fset", self.setter)
+    }
+
+    /// Effective `fdel` of a `property` (the deleter function or `NONE`).
+    pub(crate) fn fdel(&self) -> i64 {
+        self.property_component("fdel", self.deleter)
+    }
+
+    /// Reads an arbitrary attribute assigned to the descriptor.
+    pub(crate) fn attr(&self, name: &str) -> Option<i64> {
+        self.attrs.get(name)
+    }
+
+    /// Assigns an arbitrary attribute to the descriptor. The insertion barrier
+    /// reaches the collector through [`Attributes::set`].
+    pub(crate) fn set_attr(&self, owner: i64, name: String, value: i64) {
+        self.attrs.set(owner, name, value);
+    }
+
+    /// Locks the attribute table for the collector, which must keep the guard
+    /// until the marker turns the descriptor black.
+    pub(crate) fn lock_attrs(&self) -> MutexGuard<'_, Vec<(String, i64)>> {
+        self.attrs.lock()
+    }
 }
 
 /// State of a module value: its import name and, for a compiled extension
@@ -2050,6 +2220,23 @@ pub(crate) struct ExtFunctionState {
     pub(crate) module: u64,
     pub(crate) method: u32,
     pub(crate) name: String,
+    /// Writable `__name__`/`__qualname__`/`__module__`/`__doc__` slots.
+    pub(crate) metadata: Mutex<ExtFunctionMetadata>,
+}
+
+/// Python-visible function metadata overrides.
+///
+/// Extension modules such as NumPy rewrite `__module__`/`__qualname__` on the
+/// functions they re-export. The function value itself owns no CPython handle
+/// (it is a `(module, method)` pair), so the overrides live in this shim slot
+/// and every subsequent read observes them.
+#[derive(Default)]
+pub(crate) struct ExtFunctionMetadata {
+    pub(crate) name: Option<String>,
+    pub(crate) qualname: Option<String>,
+    pub(crate) module: Option<String>,
+    /// `Some(None)` means the attribute was explicitly set to `None`.
+    pub(crate) doc: Option<Option<String>>,
 }
 
 /// Payload of a string accumulator ([`KIND_STR_BUILDER`]).
@@ -2169,6 +2356,8 @@ pub(crate) enum ObjData {
         ptr: usize,
         name: Option<String>,
     },
+    /// Opaque extension object/type handle. Owns one CPython reference.
+    ExtObject(ExtObjectData),
     /// Module value (`<module 'name'>`); holds no Hydro values.
     Module(ModuleState),
     /// Native text stream over fd 1/2; holds no Hydro values.
@@ -2178,6 +2367,10 @@ pub(crate) enum ObjData {
     /// Mutable closure cell. Internal to generated code; holds one traced
     /// value that reads and writes go through.
     Cell(i64),
+    /// Reified call frame ([`KIND_FRAME`]); shares the activation record.
+    Frame(FrameState),
+    /// Frame code object ([`KIND_CODE`]); immutable native metadata.
+    Code(CodeState),
 }
 
 /// Payload of a `range` object ([`KIND_RANGE`]).
@@ -2196,6 +2389,52 @@ pub(crate) struct RangeData {
 pub(crate) struct CapsuleData {
     pub(crate) ptr: usize,
     pub(crate) name: Option<String>,
+}
+
+/// Payload of an opaque extension handle ([`KIND_EXT_OBJECT`]).
+///
+/// The payload owns exactly one reference to the extension handle. Dropping it
+/// (when the Hydro collector reclaims the heap object) releases that reference,
+/// so the extension's finaliser runs at the same point CPython would run it.
+pub(crate) struct ExtObjectData {
+    /// Extension-owned handle (`PyObject *`).
+    pub(crate) object: *mut crate::capi::ShimObject,
+    /// Python-visible type name, used by diagnostics and `type()`.
+    pub(crate) type_name: String,
+}
+
+impl Drop for ExtObjectData {
+    fn drop(&mut self) {
+        crate::capi::dec_ref(self.object);
+    }
+}
+
+/// Payload of a reified frame ([`KIND_FRAME`]).
+///
+/// The activation record is shared (`Arc`) with the runtime's frame stack and
+/// with every other frame object materialised for the same activation, so
+/// `f_back` chains stay valid after a frame returns while its locals finish as
+/// a snapshot. The record owns no Hydro values directly: `f_locals` reads the
+/// activation's precise GC slots, and an ended activation stores a rooted dict
+/// snapshot. `FrameState` therefore has no GC edges.
+pub(crate) struct FrameState {
+    pub(crate) data: std::sync::Arc<crate::exc::FrameData>,
+}
+
+/// Payload of a code object ([`KIND_CODE`]).
+///
+/// Generated functions have no first-class code values; a frame materialises
+/// one on demand from this immutable metadata. It holds only native strings,
+/// so it has no Hydro children.
+pub(crate) struct CodeState {
+    pub(crate) name: String,
+    pub(crate) qualname: String,
+    pub(crate) filename: String,
+    pub(crate) first_line: u32,
+    pub(crate) argcount: usize,
+    pub(crate) flags: u32,
+    pub(crate) nlocals: usize,
+    pub(crate) varnames: Vec<String>,
 }
 
 /// Borrowed payload of a heap object, selected by [`HydroObj::kind`].
@@ -2256,10 +2495,13 @@ pub(crate) enum ObjDataRef<'a> {
         ptr: usize,
         name: Option<&'a String>,
     },
+    ExtObject(&'a ExtObjectData),
     Module(&'a ModuleState),
     StdStream(&'a StdStreamState),
     BigInt(&'a BigInt),
     Cell(i64),
+    Frame(&'a FrameState),
+    Code(&'a CodeState),
 }
 
 /// Exclusive payload view of a heap object, selected by [`HydroObj::kind`].
@@ -2311,10 +2553,13 @@ pub(crate) enum ObjDataMut<'a> {
     Fiber(&'a mut Box<crate::fiber::FiberState>),
     ExtFunction(&'a mut ExtFunctionState),
     Capsule(&'a mut CapsuleData),
+    ExtObject(&'a mut ExtObjectData),
     Module(&'a mut ModuleState),
     StdStream(&'a mut StdStreamState),
     BigInt(&'a mut BigInt),
     Cell(&'a mut i64),
+    Frame(&'a mut FrameState),
+    Code(&'a mut CodeState),
 }
 
 impl HydroObj {
@@ -2408,10 +2653,13 @@ impl HydroObj {
                         name: capsule.name.as_ref(),
                     }
                 }
+                KIND_EXT_OBJECT => ObjDataRef::ExtObject(&*(payload as *const ExtObjectData)),
                 KIND_MODULE => ObjDataRef::Module(&*(payload as *const ModuleState)),
                 KIND_STD_STREAM => ObjDataRef::StdStream(&*(payload as *const StdStreamState)),
                 KIND_BIGINT => ObjDataRef::BigInt(&*(payload as *const BigInt)),
                 KIND_CELL => ObjDataRef::Cell(*(payload as *const i64)),
+                KIND_FRAME => ObjDataRef::Frame(&*(payload as *const FrameState)),
+                KIND_CODE => ObjDataRef::Code(&*(payload as *const CodeState)),
                 other => panic!("unknown object kind {other}"),
             }
         }
@@ -2492,10 +2740,13 @@ impl HydroObj {
                     ObjDataMut::ExtFunction(&mut *(payload as *mut ExtFunctionState))
                 }
                 KIND_CAPSULE => ObjDataMut::Capsule(&mut *(payload as *mut CapsuleData)),
+                KIND_EXT_OBJECT => ObjDataMut::ExtObject(&mut *(payload as *mut ExtObjectData)),
                 KIND_MODULE => ObjDataMut::Module(&mut *(payload as *mut ModuleState)),
                 KIND_STD_STREAM => ObjDataMut::StdStream(&mut *(payload as *mut StdStreamState)),
                 KIND_BIGINT => ObjDataMut::BigInt(&mut *(payload as *mut BigInt)),
                 KIND_CELL => ObjDataMut::Cell(&mut *(payload as *mut i64)),
+                KIND_FRAME => ObjDataMut::Frame(&mut *(payload as *mut FrameState)),
+                KIND_CODE => ObjDataMut::Code(&mut *(payload as *mut CodeState)),
                 other => panic!("unknown object kind {other}"),
             }
         }
@@ -2568,10 +2819,13 @@ macro_rules! for_each_payload_type {
         $m!(KIND_FIBER, Fiber, Box<crate::fiber::FiberState>);
         $m!(KIND_EXT_FUNCTION, ExtFunction, ExtFunctionState);
         $m!(KIND_CAPSULE, Capsule, CapsuleData);
+        $m!(KIND_EXT_OBJECT, ExtObject, ExtObjectData);
         $m!(KIND_MODULE, Module, ModuleState);
         $m!(KIND_STD_STREAM, StdStream, StdStreamState);
         $m!(KIND_BIGINT, BigInt, BigInt);
         $m!(KIND_CELL, Cell, i64);
+        $m!(KIND_FRAME, Frame, FrameState);
+        $m!(KIND_CODE, Code, CodeState);
     };
 }
 
@@ -2668,10 +2922,13 @@ pub(crate) unsafe fn write_payload(kind: u32, data: ObjData, dst: *mut u8) {
         KIND_INSTANCE, Instance, InstanceState,
         KIND_FIBER, Fiber, Box<crate::fiber::FiberState>,
         KIND_EXT_FUNCTION, ExtFunction, ExtFunctionState,
+        KIND_EXT_OBJECT, ExtObject, ExtObjectData,
         KIND_MODULE, Module, ModuleState,
         KIND_STD_STREAM, StdStream, StdStreamState,
         KIND_BIGINT, BigInt, BigInt,
         KIND_CELL, Cell, i64,
+        KIND_FRAME, Frame, FrameState,
+        KIND_CODE, Code, CodeState,
     }
 }
 
@@ -3279,6 +3536,33 @@ pub(crate) fn std_stream_new(fd: i32) -> i64 {
     alloc(KIND_STD_STREAM, ObjData::StdStream(StdStreamState { fd }))
 }
 
+/// Materialises a frame object for an activation record.
+///
+/// Every call returns a fresh heap object sharing the same `Arc`: the record's
+/// locals observation stays live, and the frame object is collected normally
+/// once Python drops it.
+pub(crate) fn frame_new(data: std::sync::Arc<crate::exc::FrameData>) -> i64 {
+    alloc(KIND_FRAME, ObjData::Frame(FrameState { data }))
+}
+
+/// Allocates the code object attached to a frame.
+pub(crate) fn code_new(state: CodeState) -> i64 {
+    alloc(KIND_CODE, ObjData::Code(state))
+}
+
+/// The cached native `frame` class used by `type(frame)` and
+/// `types.FrameType`. Kept in the same cache as every primitive type class, so
+/// `type(sys._getframe(0)) is types.FrameType` holds on a thread.
+pub(crate) fn frame_class() -> i64 {
+    native_class("frame")
+}
+
+/// The cached native `code` class used by `type(frame.f_code)` and
+/// `types.CodeType`.
+pub(crate) fn code_class() -> i64 {
+    native_class("code")
+}
+
 /// Field values of a `typing.NamedTuple` instance in attribute insertion
 /// order. NamedTuple classes are empty native classes whose base is the
 /// `NamedTuple` placeholder; only that class form is recognised.
@@ -3368,6 +3652,27 @@ pub(crate) fn as_interpolation(
 /// The Python-visible name of a class object.
 pub(crate) fn class_display_name(v: i64) -> Option<&'static str> {
     as_class(v).map(|state| state.name.as_str())
+}
+
+/// True when `v` is an opaque handle naming an extension type object.
+pub(crate) fn is_extension_type(v: i64) -> bool {
+    as_ext_object(v)
+        .map(|state| crate::capi::object_is_type(state.object))
+        .unwrap_or(false)
+}
+
+/// The first extension type in a Hydro class's base chain, if any.
+///
+/// Hydro cannot allocate C-layout instances for extension types, so a class
+/// deriving from one defers instance construction to that extension type.
+pub(crate) fn extension_class_base(class: i64) -> Option<i64> {
+    let state = as_class(class)?;
+    state
+        .bases
+        .iter()
+        .chain(state.mro.iter())
+        .copied()
+        .find(|&candidate| is_extension_type(candidate))
 }
 
 /// The name of the class an instance-like value belongs to.
@@ -3874,6 +4179,91 @@ pub(crate) fn as_ext_function(v: i64) -> Option<&'static ExtFunctionState> {
     }
 }
 
+/// Allocates an opaque extension object/type handle.
+///
+/// `object` must be a reference owned by the caller: this function takes
+/// ownership of it and releases it when the collector drops the heap object.
+pub(crate) fn ext_object_new(object: *mut crate::capi::ShimObject, type_name: String) -> i64 {
+    alloc(
+        KIND_EXT_OBJECT,
+        ObjData::ExtObject(ExtObjectData { object, type_name }),
+    )
+}
+
+/// Borrows the payload of an opaque extension handle.
+pub(crate) fn as_ext_object(v: i64) -> Option<&'static ExtObjectData> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_EXT_OBJECT {
+        return None;
+    }
+    match obj.data_ref() {
+        ObjDataRef::ExtObject(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// True when `v` is an opaque extension handle.
+pub(crate) fn is_ext_object(v: i64) -> bool {
+    as_ext_object(v).is_some()
+}
+
+/// Extension pointer behind an opaque handle.
+pub(crate) fn ext_object_pointer(v: i64) -> Option<*mut crate::capi::ShimObject> {
+    as_ext_object(v).map(|state| state.object)
+}
+
+/// Compares two values where at least one is an opaque extension handle.
+///
+/// Two handles use the extension's rich comparison (pointer identity when the
+/// type declares none or returns `NotImplemented`). A handle compared with a
+/// Hydro value converts the other operand and asks the extension; a conversion
+/// failure is simply "not equal". A raised extension error is surfaced as a
+/// Hydro exception.
+pub(crate) fn ext_object_equals(a: i64, b: i64) -> bool {
+    let left = ext_object_pointer(a);
+    let right = ext_object_pointer(b);
+    match (left, right) {
+        (Some(left), Some(right)) => match crate::capi::objects_equal(left, right) {
+            Ok(equal) => equal,
+            Err(message) => {
+                crate::modules::extension::raised_error(&message);
+                false
+            }
+        },
+        (Some(object), None) => ext_object_equals_value(object, b),
+        (None, Some(object)) => ext_object_equals_value(object, a),
+        (None, None) => false,
+    }
+}
+
+/// `handle == value` for a non-handle operand.
+fn ext_object_equals_value(object: *mut crate::capi::ShimObject, other: i64) -> bool {
+    let Ok(shim) = crate::modules::extension::value_to_shim(other) else {
+        return false;
+    };
+    let value = crate::capi::value_object(shim);
+    let result = crate::capi::objects_equal(object, value);
+    crate::capi::dec_ref(value);
+    match result {
+        Ok(equal) => equal,
+        Err(message) => {
+            crate::modules::extension::raised_error(&message);
+            false
+        }
+    }
+}
+
+/// `is` for opaque extension handles: identity of the underlying pointer.
+pub(crate) fn ext_objects_identical(a: i64, b: i64) -> Option<bool> {
+    let left = ext_object_pointer(a)?;
+    let right = ext_object_pointer(b)?;
+    Some(left == right)
+}
+
 /// Allocates an opaque pointer capsule.
 ///
 /// `ptr` is owned by the extension and is never dereferenced or freed by Hydro;
@@ -4087,6 +4477,38 @@ pub(crate) fn as_fiber(v: i64) -> Option<&'static crate::fiber::FiberState> {
     }
     match obj.data_ref() {
         ObjDataRef::Fiber(state) => Some(state.as_ref()),
+        _ => None,
+    }
+}
+
+/// Borrows the frame activation record behind a frame object.
+pub(crate) fn as_frame(v: i64) -> Option<&'static FrameState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_FRAME {
+        return None;
+    }
+    match obj.data_ref() {
+        ObjDataRef::Frame(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Borrows the immutable metadata behind a code object.
+pub(crate) fn as_code(v: i64) -> Option<&'static CodeState> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_CODE {
+        return None;
+    }
+    match obj.data_ref() {
+        ObjDataRef::Code(state) => Some(state),
         _ => None,
     }
 }
@@ -4650,6 +5072,7 @@ pub(crate) fn descriptor_new(kind: DescriptorKind, target: i64, setter: i64, del
             target,
             setter,
             deleter,
+            attrs: Attributes::new(),
         }),
     )
 }
@@ -4697,6 +5120,11 @@ pub(crate) fn random_new(seed: Option<u64>) -> i64 {
         None => RandomState::from_entropy(),
     };
     alloc(KIND_RANDOM, ObjData::Random(state))
+}
+
+/// Allocates a `random.SystemRandom` object (OS entropy, seed ignored).
+pub(crate) fn random_new_os() -> i64 {
+    alloc(KIND_RANDOM, ObjData::Random(RandomState::os_backed()))
 }
 
 /// Allocates a `pathlib.Path` from an owned path string.
@@ -4773,6 +5201,12 @@ fn c3_merge(sequences: &[Vec<i64>]) -> Option<Vec<i64>> {
 fn compute_mro(bases: &[i64]) -> Option<Vec<i64>> {
     let mut sequences: Vec<Vec<i64>> = Vec::with_capacity(bases.len() + 1);
     for &base in bases {
+        if is_extension_type(base) {
+            // An extension type is a terminal ancestor for Hydro's C3 merge;
+            // its own C-level MRO stays inside the extension.
+            sequences.push(vec![base]);
+            continue;
+        }
         let state = as_class(base)?;
         let mut sequence = Vec::with_capacity(state.mro.len() + 1);
         sequence.push(base);
@@ -5004,7 +5438,34 @@ pub(crate) fn class_new_multi(
     methods: Vec<(String, i64, MethodKind)>,
     attrs: Vec<(String, i64)>,
 ) -> i64 {
-    class_new_multi_impl(name, bases, metaclass, methods, attrs, true)
+    // A class statement runs the metaclass `__prepare__` protocol before its
+    // body; `type(name, bases, ns)` uses `class_new_multi_kw` instead.
+    class_new_multi_impl(name, bases, metaclass, methods, attrs, true, true, &[])
+}
+
+/// [`class_new_multi`] with the class-header keywords CPython forwards to the
+/// metaclass `__new__`/`__init__` hooks.
+///
+/// `type(name, bases, namespace, **kwds)` uses this so
+/// `EnumType.__new__(..., boundary=..., _simple=...)` receives `boundary` and
+/// `_simple`; class-statement creation has no keyword channel and passes none.
+pub(crate) fn class_new_multi_kw(
+    name: String,
+    bases: Vec<i64>,
+    metaclass: i64,
+    methods: Vec<(String, i64, MethodKind)>,
+    attrs: Vec<(String, i64)>,
+    keywords: &[(String, i64)],
+) -> i64 {
+    // The keyword values live on the Rust stack, which the collector does not
+    // scan; root them while class creation may allocate.
+    let roots: Vec<i64> = keywords.iter().map(|(_, value)| *value).collect();
+    let root = crate::heap::root_values(&roots);
+    let created = class_new_multi_impl(
+        name, bases, metaclass, methods, attrs, true, false, keywords,
+    );
+    crate::heap::release_roots(root);
+    created
 }
 
 /// [`class_new_multi`] without invoking the metaclass `__new__`/`__init__`
@@ -5021,9 +5482,10 @@ pub(crate) fn class_new_multi_without_hooks(
     methods: Vec<(String, i64, MethodKind)>,
     attrs: Vec<(String, i64)>,
 ) -> i64 {
-    class_new_multi_impl(name, bases, metaclass, methods, attrs, false)
+    class_new_multi_impl(name, bases, metaclass, methods, attrs, false, false, &[])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn class_new_multi_impl(
     name: String,
     bases: Vec<i64>,
@@ -5031,6 +5493,8 @@ fn class_new_multi_impl(
     methods: Vec<(String, i64, MethodKind)>,
     attrs: Vec<(String, i64)>,
     run_hooks: bool,
+    run_prepare: bool,
+    keywords: &[(String, i64)],
 ) -> i64 {
     // `type` used as a base denotes the native `type` class, not the builtin
     // function value.
@@ -5064,14 +5528,33 @@ fn class_new_multi_impl(
         } else {
             attrs.push(("__orig_bases__".to_string(), original));
         }
-        let created = create_class(name, bases, metaclass, methods, attrs, run_hooks);
+        let created = create_class(
+            name,
+            bases,
+            metaclass,
+            methods,
+            attrs,
+            run_hooks,
+            run_prepare,
+            keywords,
+        );
         crate::heap::release_roots(root);
         return created;
     }
-    create_class(name, bases, metaclass, methods, attrs, run_hooks)
+    create_class(
+        name,
+        bases,
+        metaclass,
+        methods,
+        attrs,
+        run_hooks,
+        run_prepare,
+        keywords,
+    )
 }
 
 /// Builds the class after base resolution, validation and metaclass selection.
+#[allow(clippy::too_many_arguments)]
 fn create_class(
     name: String,
     bases: Vec<i64>,
@@ -5079,18 +5562,42 @@ fn create_class(
     methods: Vec<(String, i64, MethodKind)>,
     attrs: Vec<(String, i64)>,
     run_hooks: bool,
+    run_prepare: bool,
+    keywords: &[(String, i64)],
 ) -> i64 {
     let metaclass = normalize_class_base(metaclass);
     for &base in &bases {
-        if as_class(base).is_none() {
-            return crate::exc::raise_with_message(
-                crate::exc::TYPE_ERROR,
-                &format!(
-                    "class base of '{name}' must be a class object or None, got '{}'",
-                    type_name(base)
-                ),
-            );
+        if as_class(base).is_some() {
+            continue;
         }
+        if is_extension_type(base) {
+            let Some(state) = as_ext_object(base) else {
+                continue;
+            };
+            match crate::capi::extension_type_layout(state.object as usize) {
+                Ok((_basicsize, _itemsize, constructible)) if constructible => continue,
+                Ok(_) => {
+                    return crate::exc::raise_with_message(
+                        crate::exc::TYPE_ERROR,
+                        &format!(
+                            "extension type '{}' cannot be used as a Hydro base: it defines \
+                             neither tp_new nor a callable constructor",
+                            state.type_name
+                        ),
+                    )
+                }
+                Err(message) => {
+                    return crate::exc::raise_with_message(crate::exc::TYPE_ERROR, &message)
+                }
+            }
+        }
+        return crate::exc::raise_with_message(
+            crate::exc::TYPE_ERROR,
+            &format!(
+                "class base of '{name}' must be a class object or None, got '{}'",
+                type_name_of(base)
+            ),
+        );
     }
     let resolved = match resolve_metaclass(&bases, metaclass) {
         Ok(meta) => meta,
@@ -5099,10 +5606,7 @@ fn create_class(
     let mro = match compute_mro(&bases) {
         Some(mro) => mro,
         None => {
-            let names: Vec<String> = bases
-                .iter()
-                .map(|&base| class_display_name(base).unwrap_or("object").to_string())
-                .collect();
+            let names: Vec<String> = bases.iter().map(|&base| type_name_of(base)).collect();
             return crate::exc::raise_with_message(
                 crate::exc::TYPE_ERROR,
                 &format!(
@@ -5132,61 +5636,169 @@ fn create_class(
     } else {
         None
     };
+    // CPython's `type(name, bases, namespace, **kwds)` calls the metaclass
+    // with the keywords first. When the winner has no Python `__new__`, the
+    // native `type.__new__` receives them and forwards to `__init_subclass__`,
+    // which Hydro does not call; its default (`object`) refuses every keyword.
+    if !keywords.is_empty() && !has_new {
+        return crate::exc::raise_with_message(
+            crate::exc::TYPE_ERROR,
+            &format!("{name}.__init_subclass__() takes no keyword arguments"),
+        );
+    }
+    // A class statement runs the metaclass's `__prepare__` before the body
+    // and passes its returned mapping to `__new__`/`__init__`. The compiled
+    // body has already evaluated its values, so populate that mapping here
+    // (EnumDict records members through `__setitem__`). `type(name, bases,
+    // namespace, **kwds)` does not call `__prepare__`; `run_prepare` keeps
+    // the two paths distinct and prevents EnumType's internal `type(...)`
+    // call from recursing through its own prepare hook.
+    let namespace = if run_prepare && resolved != NONE {
+        prepare_class_namespace(resolved, &name, &bases, keywords)
+    } else {
+        dict_new(Vec::new())
+    };
+    let namespace_root = crate::heap::root_values(&[namespace]);
+    for (method_name, function, _) in &methods {
+        let key = str_alloc(method_name.clone());
+        crate::container::subscript_set(namespace, key, *function);
+        if crate::exc::pending() {
+            crate::heap::release_roots(namespace_root);
+            return NONE;
+        }
+    }
+    for (attr_name, value) in &attrs {
+        let key = str_alloc(attr_name.clone());
+        crate::container::subscript_set(namespace, key, *value);
+        if crate::exc::pending() {
+            crate::heap::release_roots(namespace_root);
+            return NONE;
+        }
+    }
     let hook_arguments = if has_new || init_hook.is_some() {
-        Some(metaclass_hook_arguments(&name, &bases, &methods, &attrs))
+        Some(metaclass_hook_arguments(&name, &bases, namespace))
     } else {
         None
     };
     let mut created = NONE;
     if let Some(arguments) = hook_arguments.as_ref().filter(|_| has_new) {
-        let result = invoke_metaclass_hook(resolved, "__new__", resolved, arguments);
+        let result = invoke_metaclass_hook(resolved, "__new__", resolved, arguments, keywords);
         if crate::exc::pending() {
+            crate::heap::release_roots(namespace_root);
             return NONE;
         }
         if as_class(result).is_some() {
             created = result;
         } else if result != NONE {
+            crate::heap::release_roots(namespace_root);
             return result;
         }
     }
+    let set_name_methods = methods.clone();
+    let set_name_attrs = attrs.clone();
     if created == NONE {
         created = allocate_class(
             name, base, bases, mro, resolved, methods, attrs, slots, has_dict,
         );
     }
-    // `__init__` runs after creation and may mutate the new class namespace
-    // (the overlay accepts runtime assignment).
-    if let (Some((kind, function)), Some(arguments)) = (init_hook, &hook_arguments) {
-        let _ =
-            invoke_metaclass_hook_with(resolved, "__init__", kind, function, created, arguments);
+    // CPython's `type.__new__` calls `__set_name__` on every descriptor in
+    // the class namespace before the metaclass `__init__` runs. This is the
+    // hook EnumType uses to turn `_proto_member` placeholders into members.
+    for (method_name, function, _) in &set_name_methods {
+        call_set_name(created, *function, method_name);
         if crate::exc::pending() {
+            crate::heap::release_roots(namespace_root);
             return NONE;
         }
     }
+    for (attr_name, value) in &set_name_attrs {
+        call_set_name(created, *value, attr_name);
+        if crate::exc::pending() {
+            crate::heap::release_roots(namespace_root);
+            return NONE;
+        }
+    }
+    // `__init__` runs after creation and may mutate the new class namespace
+    // (the overlay accepts runtime assignment). It receives the class-header
+    // keywords too, like CPython.
+    if let (Some((kind, function)), Some(arguments)) = (init_hook, &hook_arguments) {
+        let _ = invoke_metaclass_hook_with(
+            resolved, "__init__", kind, function, created, arguments, keywords,
+        );
+        if crate::exc::pending() {
+            crate::heap::release_roots(namespace_root);
+            return NONE;
+        }
+    }
+    crate::heap::release_roots(namespace_root);
     created
 }
 
-/// Builds the `(name, bases, namespace)` argument list for a metaclass hook.
-fn metaclass_hook_arguments(
-    name: &str,
-    bases: &[i64],
-    methods: &[(String, i64, MethodKind)],
-    attrs: &[(String, i64)],
-) -> Vec<i64> {
+/// Calls `value.__set_name__(owner, name)` when the value defines it.
+///
+/// Missing attributes are ignored; any exception raised by the hook
+/// propagates to the caller (and aborts class creation).
+fn call_set_name(owner: i64, value: i64, name: &str) {
     let name_value = str_alloc(name.to_string());
-    let bases_value = tuple_new(bases.to_vec());
-    let namespace = dict_new(Vec::new());
-    let root = crate::heap::root_values(&[name_value, bases_value, namespace]);
-    for (method_name, function, _) in methods {
-        let key = str_alloc(method_name.clone());
-        crate::container::dict_set(namespace, key, *function);
-    }
-    for (attr_name, value) in attrs {
-        let key = str_alloc(attr_name.clone());
-        crate::container::dict_set(namespace, key, *value);
+    let root = crate::heap::root_values(&[owner, name_value]);
+    let arguments = [owner, name_value];
+    let _ = crate::core::methods::call(
+        value,
+        b"__set_name__".as_ptr(),
+        12,
+        arguments.len(),
+        arguments.as_ptr(),
+    );
+    if crate::exc::pending() && crate::exc::pending_tag() == i64::from(crate::exc::ATTRIBUTE_ERROR)
+    {
+        // Ordinary class attributes do not define the hook; that is not a
+        // failure of class creation.
+        crate::exc::clear();
     }
     crate::heap::release_roots(root);
-    vec![name_value, bases_value, namespace]
+}
+
+/// Builds the `(name, bases, namespace)` argument list for a metaclass hook.
+fn metaclass_hook_arguments(name: &str, bases: &[i64], namespace: i64) -> Vec<i64> {
+    let name_value = str_alloc(name.to_string());
+    let bases_value = tuple_new(bases.to_vec());
+    let root = crate::heap::root_values(&[name_value, bases_value]);
+    let arguments = vec![name_value, bases_value, namespace];
+    crate::heap::release_roots(root);
+    arguments
+}
+
+/// Runs `metaclass.__prepare__(name, bases, **kwds)` and returns the mapping
+/// the class body must populate. A metaclass without a Python `__prepare__`
+/// (including native `type`) gets a fresh dict; an invalid return value is a
+/// `TypeError`, matching CPython's class creation protocol.
+fn prepare_class_namespace(
+    metaclass: i64,
+    name: &str,
+    bases: &[i64],
+    keywords: &[(String, i64)],
+) -> i64 {
+    if let Some((kind, function)) = class_member(metaclass, "__prepare__") {
+        if !function_signature(function).is_empty() && function_full_entry(function) != 0 {
+            let name_value = str_alloc(name.to_string());
+            let bases_value = tuple_new(bases.to_vec());
+            let root = crate::heap::root_values(&[name_value, bases_value]);
+            let namespace = invoke_metaclass_hook_with(
+                metaclass,
+                "__prepare__",
+                kind,
+                function,
+                metaclass,
+                &[name_value, bases_value],
+                keywords,
+            );
+            crate::heap::release_roots(root);
+            if !crate::exc::pending() && namespace != NONE {
+                return namespace;
+            }
+        }
+    }
+    dict_new(Vec::new())
 }
 
 /// Calls a metaclass hook method (`__new__`/`__init__`) with `receiver` bound
@@ -5194,13 +5806,20 @@ fn metaclass_hook_arguments(
 ///
 /// Only generated user methods run this way; a native/property entry is
 /// ignored so class creation never invokes runtime internals by accident.
-fn invoke_metaclass_hook(metaclass: i64, name: &str, receiver: i64, args: &[i64]) -> i64 {
+fn invoke_metaclass_hook(
+    metaclass: i64,
+    name: &str,
+    receiver: i64,
+    args: &[i64],
+    keywords: &[(String, i64)],
+) -> i64 {
     let Some((kind, function)) = class_member(metaclass, name) else {
         return NONE;
     };
-    invoke_metaclass_hook_with(metaclass, name, kind, function, receiver, args)
+    invoke_metaclass_hook_with(metaclass, name, kind, function, receiver, args, keywords)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn invoke_metaclass_hook_with(
     metaclass: i64,
     name: &str,
@@ -5208,15 +5827,21 @@ fn invoke_metaclass_hook_with(
     function: i64,
     receiver: i64,
     args: &[i64],
+    keywords: &[(String, i64)],
 ) -> i64 {
     if function_signature(function).is_empty() || function_full_entry(function) == 0 {
         return NONE;
     }
     let kind = match kind {
-        MethodKind::Staticmethod => MethodKind::Staticmethod,
+        // `type.__call__` passes the metaclass as the first argument to a
+        // Python `__new__` even though the class body treats `__new__` as a
+        // static method. Keep that binding for metaclass construction.
+        MethodKind::Staticmethod if name != "__new__" => MethodKind::Staticmethod,
         _ => MethodKind::Normal,
     };
-    crate::core::methods::call_user_method(receiver, metaclass, kind, function, name, args, &[])
+    crate::core::methods::call_user_method(
+        receiver, metaclass, kind, function, name, args, keywords,
+    )
 }
 
 /// Allocates the class object and registers framework subclasses.
@@ -6300,6 +6925,7 @@ pub(crate) fn ext_function_new(module: u64, method: u32, name: String) -> i64 {
             module,
             method,
             name,
+            metadata: Mutex::new(ExtFunctionMetadata::default()),
         }),
     )
 }
@@ -6573,9 +7199,14 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             Some(ObjDataRef::Instance(_)) => "instance",
             Some(ObjDataRef::ExtFunction(_)) => "builtin_function_or_method",
             Some(ObjDataRef::Capsule { .. }) => "PyCapsule",
+            // The specific extension type name is only available through
+            // `type_name_of`, which can return owned text.
+            Some(ObjDataRef::ExtObject(_)) => "object",
             Some(ObjDataRef::Module(_)) => "module",
             Some(ObjDataRef::StdStream(_)) => "TextIOWrapper",
             Some(ObjDataRef::Cell(_)) => "cell",
+            Some(ObjDataRef::Frame(_)) => "frame",
+            Some(ObjDataRef::Code(_)) => "code",
             Some(ObjDataRef::Template(_)) => "Template",
             Some(ObjDataRef::Interpolation(_)) => "Interpolation",
             Some(ObjDataRef::ByteArray(_)) => "bytearray",
@@ -6648,12 +7279,121 @@ fn native_class(name: &str) -> i64 {
         // `class Meta(type)`, `super().__new__(...)` in a metaclass and
         // `cls.mro()` resolve them instead of reporting `AttributeError`.
         type_native_class()
+    } else if name == "object" {
+        object_native_class()
+    } else if matches!(name, "int" | "str" | "float" | "bytes" | "complex") {
+        scalar_native_class(name)
     } else {
         class_new(name.to_string(), NONE, Vec::new())
     };
     crate::heap::add_thread_root(class);
     TYPE_CLASS_CACHE.with(|cache| cache.borrow_mut().insert(name.to_string(), class));
     class
+}
+
+/// Native scalar class carrying the introspection entries `enum.py` reads
+/// from a data-type base (`__format__`, `__new__`, `__repr__`). The methods
+/// dispatch through the existing scalar builtins, so the values they return
+/// keep normal Hydro scalar semantics.
+fn scalar_native_class(name: &str) -> i64 {
+    let methods = vec![
+        (
+            "__format__".to_string(),
+            native_function_new("builtins", "__scalar_format__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__new__".to_string(),
+            native_function_new("builtins", "__scalar_new__", usize::MAX),
+            MethodKind::Staticmethod,
+        ),
+        (
+            "__repr__".to_string(),
+            native_function_new("builtins", "__scalar_repr__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__str__".to_string(),
+            native_function_new("builtins", "__scalar_str__", usize::MAX),
+            MethodKind::Normal,
+        ),
+    ];
+    class_new_multi(
+        name.to_string(),
+        vec![object_class()],
+        NONE,
+        methods,
+        Vec::new(),
+    )
+}
+
+/// Native `object` class with the universal dunder surface CPython's
+/// `object` provides. The functions are cached on the class, so identity
+/// comparisons such as `object.__str__ is getattr(object, "__str__")` hold.
+fn object_native_class() -> i64 {
+    let methods = vec![
+        (
+            "__new__".to_string(),
+            native_function_new("builtins", "__object_new__", usize::MAX),
+            MethodKind::Staticmethod,
+        ),
+        (
+            "__init__".to_string(),
+            native_function_new("builtins", "__object_init__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__str__".to_string(),
+            native_function_new("builtins", "__object_str__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__repr__".to_string(),
+            native_function_new("builtins", "__object_repr__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__format__".to_string(),
+            native_function_new("builtins", "__object_format__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__eq__".to_string(),
+            native_function_new("builtins", "__object_eq__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__ne__".to_string(),
+            native_function_new("builtins", "__object_ne__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__hash__".to_string(),
+            native_function_new("builtins", "__object_hash__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__dir__".to_string(),
+            native_function_new("builtins", "__object_dir__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__sizeof__".to_string(),
+            native_function_new("builtins", "__object_sizeof__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__reduce_ex__".to_string(),
+            native_function_new("builtins", "__object_reduce_ex__", usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__getattribute__".to_string(),
+            native_function_new("builtins", "__object_getattribute__", usize::MAX),
+            MethodKind::Normal,
+        ),
+    ];
+    class_new_multi("object".to_string(), Vec::new(), NONE, methods, Vec::new())
 }
 
 /// Native `type` class carrying Hydro's implementation of the class-level
@@ -6910,6 +7650,9 @@ pub(crate) fn type_class(v: i64) -> i64 {
 /// Python-visible class name. Used in user-facing error messages; most callers
 /// only need the static [`type_name`].
 pub(crate) fn type_name_of(v: i64) -> String {
+    if let Some(state) = as_ext_object(v) {
+        return state.type_name.clone();
+    }
     if let Some(name) = instance_class_name(v) {
         return name.to_string();
     }
@@ -7006,10 +7749,21 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjDataRef::ExtFunction(_)) => true,
             // Capsules and module values are always truthy, like CPython.
             Some(ObjDataRef::Capsule { .. }) | Some(ObjDataRef::Module(_)) => true,
+            // Opaque extension handles defer to `__bool__`/`__len__` in the
+            // extension; an unsupported type is truthy, like CPython.
+            Some(ObjDataRef::ExtObject(state)) => match crate::capi::object_truthy(state.object) {
+                Ok(value) => value,
+                Err(message) => {
+                    crate::modules::extension::raised_error(&message);
+                    false
+                }
+            },
             // A standard stream is always truthy.
             Some(ObjDataRef::StdStream(_)) => true,
             // Cells are internal; they are always truthy.
             Some(ObjDataRef::Cell(_)) => true,
+            // Frames and code objects are always truthy.
+            Some(ObjDataRef::Frame(_)) | Some(ObjDataRef::Code(_)) => true,
             None => true,
         };
     }
@@ -7047,6 +7801,17 @@ fn instance_default_repr(state: &InstanceState) -> String {
 /// `repr(bytearray)`: the bytes literal wrapped in `bytearray(...)`.
 pub(crate) fn bytearray_repr(bytes: &[u8]) -> String {
     format!("bytearray({})", quote_bytes(bytes))
+}
+
+/// `repr(code)`: CPython prints the file path and first line; Hydro omits the
+/// address so output stays reproducible.
+fn code_repr(state: &CodeState) -> String {
+    format!(
+        "<code object {} at 0x0, file {}, line {}>",
+        state.name,
+        quote_str(&state.filename),
+        state.first_line
+    )
 }
 
 /// `repr(memoryview)`. CPython prints the exporter address; Hydro prints a
@@ -7294,9 +8059,13 @@ pub(crate) fn to_string(v: i64) -> String {
                     Some(name) => format!("<capsule object \"{name}\">"),
                     None => "<capsule object NULL>".to_string(),
                 },
+                // `str()` of an extension object is its own `tp_str`/`repr`.
+                ObjDataRef::ExtObject(state) => crate::capi::object_repr(state.object),
                 ObjDataRef::Module(state) => format!("<module '{}'>", state.name),
                 ObjDataRef::StdStream(stream) => format!("<tea.{}>", stream.name()),
                 ObjDataRef::Cell(value) => to_string(value),
+                ObjDataRef::Frame(_) => repr_depth(v, 0),
+                ObjDataRef::Code(_) => repr_depth(v, 0),
             };
         }
     }
@@ -7394,6 +8163,11 @@ fn factory_repr(factory: i64) -> String {
 }
 
 fn repr_depth(v: i64, depth: usize) -> String {
+    if let Some(state) = as_ext_object(v) {
+        // The extension owns `__repr__`; a raising implementation leaves its
+        // exception pending and yields the conventional address rendering.
+        return crate::capi::object_repr(state.object);
+    }
     if let Some(s) = as_str(v) {
         return quote_str(s);
     }
@@ -7438,6 +8212,12 @@ fn repr_depth(v: i64, depth: usize) -> String {
     }
     if let Some(state) = as_module(v) {
         return format!("<module '{}'>", state.name);
+    }
+    if let Some(state) = as_frame(v) {
+        return crate::exc::frame_repr(&state.data);
+    }
+    if let Some(state) = as_code(v) {
+        return code_repr(state);
     }
     if let Some(state) = as_instance(v) {
         let class = state.class;

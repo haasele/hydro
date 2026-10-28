@@ -48,7 +48,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Hydro gate (tests, fuzz smoke, manifest)
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Hydro gate (parallel tests, fuzz smoke, manifest)
         run: ./scripts/verify.sh
 
       - name: Harness self-tests

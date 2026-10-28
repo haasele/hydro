@@ -17,8 +17,6 @@
 //! - `globals()` / `locals()` / `vars()` without an argument: `RuntimeError`
 //!   (no frame namespace exists).
 //! - `compile()`: `NotImplementedError` (there is no bytecode compiler).
-//! - `type(name, bases, dict)`: `NotImplementedError` (dynamic class creation
-//!   is not part of the frontend's class model).
 //! - `builtins.__dict__` is a snapshot of the module namespace (the same
 //!   mapping `vars(builtins)` returns): the names and values are real, but
 //!   mutating the snapshot does not change the module.
@@ -59,6 +57,52 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         return core_builtins::call_builtin(builtin, args.len(), args.as_ptr());
     }
     match function {
+        "__object_new__" => {
+            let class = args.first().copied().unwrap_or_else(value::object_class);
+            value::instance_new(class)
+        }
+        "__object_init__" => NONE,
+        "__object_str__" => core_builtins::call_builtin(Builtin::Str, args.len(), args.as_ptr()),
+        "__object_repr__" => core_builtins::call_builtin(Builtin::Repr, args.len(), args.as_ptr()),
+        "__object_format__" => {
+            core_builtins::call_builtin(Builtin::Format, args.len(), args.as_ptr())
+        }
+        "__object_eq__" => value::bool_value(args.first() == args.get(1)),
+        "__object_ne__" => value::bool_value(args.first() != args.get(1)),
+        "__object_hash__" => core_builtins::call_builtin(Builtin::Hash, args.len(), args.as_ptr()),
+        "__object_dir__" => dir(args),
+        "__object_sizeof__" => value::encode_int(0).unwrap_or(NONE),
+        "__object_reduce_ex__" => NONE,
+        "__scalar_format__" => {
+            core_builtins::call_builtin(Builtin::Format, args.len(), args.as_ptr())
+        }
+        "__scalar_repr__" => core_builtins::call_builtin(Builtin::Repr, args.len(), args.as_ptr()),
+        "__scalar_str__" => core_builtins::call_builtin(Builtin::Str, args.len(), args.as_ptr()),
+        "__scalar_new__" => {
+            let builtin = match value::as_class(args.first().copied().unwrap_or(NONE))
+                .map(|class| class.name.as_str())
+            {
+                Some("int") => Builtin::Int,
+                Some("float") => Builtin::Float,
+                Some("str") => Builtin::Str,
+                Some("bytes") => Builtin::Bytes,
+                _ => return args.first().copied().unwrap_or(NONE),
+            };
+            core_builtins::call_builtin(
+                builtin,
+                args.len().saturating_sub(1),
+                args.as_ptr().wrapping_add(1),
+            )
+        }
+        "__object_getattribute__" => {
+            if args.len() != 2 {
+                return type_error("__getattribute__() takes exactly 2 arguments");
+            }
+            let Some(name) = value::as_str(args[1]) else {
+                return type_error("attribute name must be string");
+            };
+            crate::core::methods::getattr(args[0], name.as_ptr(), name.len())
+        }
         "object" => {
             if args.is_empty() {
                 value::instance_new(value::object_class())
@@ -91,9 +135,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 
 /// Keyword dispatch for `builtins` functions that accept arbitrary names.
 ///
-/// `dict([source], **kwargs)` is the only builtin here whose keywords are not
-/// declared parameters: every name becomes an entry layered over the optional
-/// positional source.
+/// `dict([source], **kwargs)` layers every keyword over the optional positional
+/// source, and `type(name, bases, namespace, **kwds)` forwards the class-header
+/// keywords to the metaclass resolved from the bases.
 pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     if function == "dict" {
         if args.len() > 1 {
@@ -103,6 +147,11 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
             ));
         }
         return core_builtins::dict_build(args.first().copied(), keywords);
+    }
+    // `builtins.type(name, bases, namespace, **kwds)` forwards the class
+    // header keywords to the metaclass resolved from the bases.
+    if function == "type" {
+        return core_builtins::type_build_keywords(args, keywords);
     }
     type_error(&format!(
         "builtins.{function}() does not accept keyword arguments"

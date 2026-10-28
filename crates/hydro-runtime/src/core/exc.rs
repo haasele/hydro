@@ -10,6 +10,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::ptr;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::value::{self, NONE};
 
@@ -494,12 +497,88 @@ pub(crate) fn exception_keyword_names(tag: u32) -> &'static [&'static str] {
     }
 }
 
+/// Local-slot observation of one activation.
+///
+/// While the activation runs, `base`/`slots` point at the precise GC slot
+/// array registered by generated code (or by the interpreter) and `f_locals`
+/// reads the current values. When the activation ends, `base` is cleared and
+/// `snapshot` holds the locals dict the frame object keeps exposing.
+#[derive(Default)]
+pub(crate) struct FrameLocals {
+    /// Address of the activation's slot array (`0` when unbound or ended).
+    pub(crate) base: usize,
+    pub(crate) slots: usize,
+    pub(crate) names: Vec<String>,
+    pub(crate) snapshot: Option<i64>,
+}
+
+/// One activation's introspection record, shared by the runtime frame stack
+/// and every frame object materialised for it.
+///
+/// `parent` keeps the caller chain alive after the caller has returned, so a
+/// retained frame's `f_back` can still report its snapped locals. The record
+/// contains a rooted snapshot dict after the activation ends; `f_locals` of a
+/// running activation instead reads the live GC slots.
+pub(crate) struct FrameData {
+    pub(crate) name: String,
+    /// Module key owning the code, resolved by `hydro_ir::Program::module_of`
+    /// at frame entry.
+    pub(crate) module: Mutex<String>,
+    pub(crate) file: String,
+    pub(crate) first_line: AtomicU32,
+    pub(crate) line: AtomicU32,
+    pub(crate) flags: AtomicU32,
+    pub(crate) argcount: AtomicUsize,
+    pub(crate) parent: Option<Arc<FrameData>>,
+    pub(crate) locals: Mutex<FrameLocals>,
+}
+
+impl FrameData {
+    /// Python-visible line of this activation.
+    pub(crate) fn current_line(&self) -> u32 {
+        self.line.load(Ordering::Relaxed)
+    }
+
+    /// Module key observed by `f_globals`; empty for an unbound frame.
+    pub(crate) fn module_name(&self) -> String {
+        self.module
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// CPython-style `co_qualname`: the generated function name without the
+    /// imported-module prefix the frontend adds for uniqueness. The method
+    /// chain (`C.m`) is preserved.
+    pub(crate) fn code_qualname(&self) -> String {
+        let module = self.module_name();
+        let name = self.name.as_str();
+        if module.is_empty() {
+            return name.to_string();
+        }
+        let stripped = name
+            .strip_prefix(module.as_str())
+            .and_then(|rest| rest.strip_prefix('.'))
+            .unwrap_or(name);
+        stripped.to_string()
+    }
+
+    /// CPython-style `co_name`: the final component of the qualname.
+    pub(crate) fn code_name(&self) -> String {
+        let qualname = self.code_qualname();
+        match qualname.rsplit_once('.') {
+            Some((_, name)) => name.to_string(),
+            None => qualname,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     file: String,
     line: u32,
     /// Active call frames, innermost last.
-    frames: Vec<String>,
+    frames: Vec<Arc<FrameData>>,
     /// Tagged heap pointer to the pending exception object, if any.
     pending: Option<i64>,
     /// Exceptions whose handlers are active (and in-flight exceptions while a
@@ -525,19 +604,305 @@ pub(crate) fn set_file_ptr(ptr: *const u8, len: usize) {
 }
 
 pub(crate) fn set_line(line: u32) {
-    STATE.with(|s| s.borrow_mut().line = line);
-}
-
-pub(crate) fn frame_enter_ptr(ptr: *const u8, len: usize) {
-    let frame = decode_bytes(ptr, len);
-    STATE.with(|s| s.borrow_mut().frames.push(frame));
-}
-
-/// Pops the innermost call frame; a no-op when the stack is empty.
-pub(crate) fn frame_leave() {
     STATE.with(|s| {
-        s.borrow_mut().frames.pop();
+        let mut state = s.borrow_mut();
+        state.line = line;
+        if let Some(frame) = state.frames.last() {
+            frame.line.store(line, Ordering::Relaxed);
+        }
     });
+}
+
+/// Pushes one activation. The record captures the current file and line and
+/// links to the caller, so `f_back` follows the real call chain even after
+/// frames have been materialised.
+pub(crate) fn frame_enter_ptr(ptr: *const u8, len: usize) {
+    let name = decode_bytes(ptr, len);
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let parent = state.frames.last().cloned();
+        let frame = FrameData {
+            name,
+            module: Mutex::new(String::new()),
+            file: state.file.clone(),
+            first_line: AtomicU32::new(0),
+            line: AtomicU32::new(state.line),
+            flags: AtomicU32::new(0),
+            argcount: AtomicUsize::new(0),
+            parent,
+            locals: Mutex::new(FrameLocals::default()),
+        };
+        state.frames.push(Arc::new(frame));
+    });
+}
+
+/// Binds the innermost activation to its live local slots and metadata.
+///
+/// `names` is a NUL-separated UTF-8 blob in slot order; `base` points at the
+/// `slots` tagged values the activation registered with
+/// `hydro_gc_frame_push`. An invalid pointer or blob is ignored
+/// rather than dereferenced, and never panic: the frame then exposes its
+/// metadata but no live locals.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn frame_bind(
+    base: *mut i64,
+    slots: usize,
+    names: *const u8,
+    names_len: usize,
+    params: usize,
+    flags: u32,
+    module: *const u8,
+    module_len: usize,
+    first_line: u32,
+) {
+    if slots > (1 << 20) || (base.is_null() && slots != 0) {
+        return;
+    }
+    let names = if names.is_null() || names_len == 0 || names_len > isize::MAX as usize {
+        Vec::new()
+    } else {
+        // SAFETY: the ABI contract requires `names..names+names_len` readable.
+        let bytes = unsafe { std::slice::from_raw_parts(names, names_len) };
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect()
+    };
+    let module = decode_bytes(module, module_len);
+    let data = STATE.with(|s| s.borrow().frames.last().cloned());
+    let Some(data) = data else {
+        return;
+    };
+    {
+        let mut locals = data
+            .locals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locals.base = if slots == 0 { 0 } else { base as usize };
+        locals.slots = if slots == 0 { 0 } else { slots };
+        locals.names = names;
+    }
+    if !module.is_empty() {
+        *data
+            .module
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = module;
+    }
+    if first_line != 0 {
+        data.line.store(first_line, Ordering::Relaxed);
+    }
+    data.first_line.store(first_line, Ordering::Relaxed);
+    data.flags.store(flags, Ordering::Relaxed);
+    data.argcount.store(params, Ordering::Relaxed);
+}
+
+/// Pops the innermost call frame. A frame object may outlive it, so the live
+/// slot view is replaced by a rooted snapshot when any frame object (or a
+/// retained child record) still references the activation.
+pub(crate) fn frame_leave() {
+    let data = STATE.with(|s| s.borrow_mut().frames.pop());
+    let Some(data) = data else {
+        return;
+    };
+    let mut locals = data
+        .locals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if locals.base == 0 || locals.slots == 0 {
+        return;
+    }
+    // `data` is the stack's reference: a count above one means a frame object
+    // or a retained child record still needs this activation's locals. The
+    // slots are still valid here (generated code leaves the precise frame
+    // registered until after `hydro_frame_leave`).
+    if Arc::strong_count(&data) > 1 {
+        let dict = build_locals_dict(&locals.names, locals.base as *mut i64, locals.slots);
+        // The record is native memory outside the collector's graph, so the
+        // snapshot is registered as a process-wide root. It stays valid until
+        // the runtime reset, exactly like a cached module value.
+        crate::heap::add_global_root(dict);
+        locals.snapshot = Some(dict);
+    }
+    locals.base = 0;
+    locals.slots = 0;
+}
+
+/// A live frame's locals read the activation slots; an ended frame returns
+/// the snapshot taken by [`frame_leave`].
+pub(crate) fn frame_locals(data: &Arc<FrameData>) -> i64 {
+    let locals = data
+        .locals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if locals.base != 0 && locals.slots > 0 {
+        return build_locals_dict(&locals.names, locals.base as *mut i64, locals.slots);
+    }
+    locals
+        .snapshot
+        .unwrap_or_else(|| value::dict_new(Vec::new()))
+}
+
+fn build_locals_dict(names: &[String], base: *mut i64, slots: usize) -> i64 {
+    let dict = value::dict_new(Vec::new());
+    let dict_root = crate::heap::root_values(&[dict]);
+    for (index, name) in names.iter().enumerate().take(slots) {
+        if name.is_empty() {
+            continue;
+        }
+        // SAFETY: `frame_bind` accepted this pointer only for `slots` values
+        // initialised by the registered precise frame; the binding is cleared
+        // before the activation's storage disappears.
+        let slot = unsafe { ptr::read_volatile(base.add(index)) };
+        let key = value::str_alloc(name.clone());
+        let entry_root = crate::heap::root_values(&[key, slot]);
+        crate::container::dict_set(dict, key, slot);
+        crate::heap::release_roots(entry_root);
+    }
+    crate::heap::release_roots(dict_root);
+    dict
+}
+
+/// Activation record at `depth` frames above the caller of `sys._getframe`
+/// (`depth == 0` is the innermost running Hydro activation).
+pub(crate) fn frame_at(depth: usize) -> Option<Arc<FrameData>> {
+    STATE.with(|s| {
+        let state = s.borrow();
+        state.frames.iter().rev().nth(depth).cloned()
+    })
+}
+
+/// `sys._getframe(depth)`: materialises the frame object at `depth`, or raises
+/// CPython's `ValueError` when the stack is shallower.
+pub(crate) fn getframe(depth: usize) -> i64 {
+    match frame_at(depth) {
+        Some(data) => value::frame_new(data),
+        None => raise_with_message(VALUE_ERROR, "call stack is not deep enough"),
+    }
+}
+
+/// `inspect.currentframe()`: the innermost active Hydro activation.
+pub(crate) fn current_frame() -> i64 {
+    getframe(0)
+}
+
+/// Module key of the frame at `depth`; `None` when the stack is too shallow or
+/// the activation carries no module (an ABI-only frame).
+pub(crate) fn frame_module_at(depth: usize) -> Option<String> {
+    let module = frame_at(depth)?.module_name();
+    (!module.is_empty()).then_some(module)
+}
+
+/// Attribute lookup on a frame object. `None` means the name is not a frame
+/// attribute; the caller raises `AttributeError`.
+pub(crate) fn frame_attr(frame: i64, name: &str) -> Option<i64> {
+    let state = value::as_frame(frame)?;
+    let data = &state.data;
+    match name {
+        "f_back" => Some(match &data.parent {
+            Some(parent) => value::frame_new(parent.clone()),
+            None => value::NONE,
+        }),
+        "f_code" => Some(frame_code(data)),
+        "f_globals" => Some(crate::core::globals::view(&data.module_name())),
+        "f_locals" => Some(frame_locals(data)),
+        "f_lineno" => Some(
+            value::encode_int(data.current_line() as i64)
+                .unwrap_or_else(|| value::bigint_new(i64::from(data.current_line()).into())),
+        ),
+        // CPython reports the last instruction index; the runtime keeps no
+        // bytecode, so the conventional "no instruction" value is truthful.
+        "f_lasti" => Some(value::encode_int(-1).expect("fits")),
+        "f_trace" => Some(value::NONE),
+        "__class__" => Some(value::frame_class()),
+        _ => None,
+    }
+}
+
+/// Attribute lookup on a code object.
+pub(crate) fn code_attr(code: i64, name: &str) -> Option<i64> {
+    let state = value::as_code(code)?;
+    let int = |n: usize| {
+        value::encode_int(n as i64).unwrap_or_else(|| value::bigint_new((n as u64).into()))
+    };
+    match name {
+        "co_name" => Some(value::str_alloc(state.name.clone())),
+        "co_qualname" => Some(value::str_alloc(state.qualname.clone())),
+        "co_filename" => Some(value::str_alloc(state.filename.clone())),
+        "co_firstlineno" => Some(int(state.first_line as usize)),
+        "co_argcount" => Some(int(state.argcount)),
+        "co_nlocals" => Some(int(state.nlocals)),
+        "co_flags" => Some(int(state.flags as usize)),
+        "co_varnames" => Some(string_tuple(&state.varnames)),
+        "co_freevars" | "co_cellvars" | "co_names" | "co_consts" => {
+            Some(value::tuple_new(Vec::new()))
+        }
+        "__class__" => Some(value::code_class()),
+        _ => None,
+    }
+}
+
+/// Builds a tuple of Python strings, rooting every element until the tuple
+/// allocation has completed.
+fn string_tuple(items: &[String]) -> i64 {
+    let mut values = Vec::with_capacity(items.len());
+    let mut roots = Vec::with_capacity(items.len() + 1);
+    for item in items {
+        let value = value::str_alloc(item.clone());
+        roots.push(crate::heap::root_values(&[value]));
+        values.push(value);
+    }
+    let tuple = value::tuple_new(values);
+    roots.push(crate::heap::root_values(&[tuple]));
+    for start in roots.into_iter().rev() {
+        crate::heap::release_roots(start);
+    }
+    tuple
+}
+
+fn frame_code(data: &Arc<FrameData>) -> i64 {
+    // Copy the names out before allocating: the code object's payload must not
+    // be built while the activation's locals mutex is held.
+    let (nlocals, varnames) = {
+        let locals = data
+            .locals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (locals.names.len(), locals.names.clone())
+    };
+    value::code_new(value::CodeState {
+        name: data.code_name(),
+        qualname: data.code_qualname(),
+        filename: data.file.clone(),
+        first_line: data.first_line.load(Ordering::Relaxed),
+        argcount: data.argcount.load(Ordering::Relaxed),
+        flags: data.flags.load(Ordering::Relaxed),
+        nlocals,
+        varnames,
+    })
+}
+
+/// `repr(frame)`: CPython prints the address; Hydro prints a stable zero so
+/// output stays reproducible.
+pub(crate) fn frame_repr(data: &FrameData) -> String {
+    format!(
+        "<frame at 0x0, file {}, line {}, code {}>",
+        value::quote_str(&data.file),
+        data.current_line(),
+        data.code_name()
+    )
+}
+
+/// Detaches the thread's frame stack for a fiber context switch. The returned
+/// records stay alive in the fiber object, where a retained frame object can
+/// still reach them.
+pub(crate) fn take_frames() -> Vec<Arc<FrameData>> {
+    STATE.with(|s| std::mem::take(&mut s.borrow_mut().frames))
+}
+
+/// Installs a frame stack after a fiber context switch.
+pub(crate) fn install_frames(frames: Vec<Arc<FrameData>>) {
+    STATE.with(|s| s.borrow_mut().frames = frames);
 }
 
 fn decode_bytes(ptr: *const u8, len: usize) -> String {
@@ -761,7 +1126,10 @@ fn raise_with_message_cause(
         (
             st.file.clone(),
             st.line,
-            st.frames.last().cloned().unwrap_or_default(),
+            st.frames
+                .last()
+                .map(|frame| frame.name.clone())
+                .unwrap_or_default(),
         )
     });
     let data = ExcData {
@@ -804,7 +1172,10 @@ pub(crate) fn raise_exit(code: i64) -> i64 {
         (
             st.file.clone(),
             st.line,
-            st.frames.last().cloned().unwrap_or_default(),
+            st.frames
+                .last()
+                .map(|frame| frame.name.clone())
+                .unwrap_or_default(),
         )
     });
     let data = ExcData {

@@ -3062,8 +3062,18 @@ mod tests {
                 ("day".to_string(), int(28)),
             ],
         );
-        assert!(!exc::pending());
-        assert_eq!(as_text(call(STR_METHOD, &[replaced])), "2023-02-28");
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        let rendered = call(STR_METHOD, &[replaced]);
+        assert_eq!(
+            as_text(rendered),
+            "2023-02-28",
+            "rendered type {}",
+            value::type_name(rendered)
+        );
 
         let moment = datetime_instance(2024, 2, 29, 1, 2, 3, 4);
         let replaced = replace_method(&[moment], &[("month".to_string(), int(3))]);
@@ -3075,6 +3085,7 @@ mod tests {
         exc::init();
         replace_method(&[date], &[("hours".to_string(), int(1))]);
         assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::init();
 
         let time = time_instance(1, 2, 3, 4);
         let replaced = replace_method(&[time], &[("second".to_string(), int(30))]);

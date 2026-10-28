@@ -1,0 +1,136 @@
+{
+  "schema": 1,
+  "python": "3.14.9",
+  "site_packages": "/tmp/pkgs",
+  "hash_semantics": {
+    "dist_info_record_sha256": "SHA-256 of the package's dist-info/RECORD file in the installed site-packages tree. It locks the exact installed file set without requiring the original wheel and is validated on every run.",
+    "wheel_sha256": "SHA-256 of the original wheel artifact. A null value is an explicit placeholder, reported as 'not pinned' and never as verified."
+  },
+  "packages": [
+    {
+      "name": "numpy",
+      "version": "2.5.0",
+      "role": "target",
+      "import": "numpy",
+      "case": "numpy_smoke.py",
+      "dist_info": "numpy-2.5.0.dist-info",
+      "dist_info_record_sha256": "03869fb7f21afa96835687e90b359b247b8f5ed2638f222cfbce0d74607b44a1",
+      "wheel_sha256": null
+    },
+    {
+      "name": "pandas",
+      "version": "3.1.0",
+      "role": "target",
+      "import": "pandas",
+      "case": "pandas_smoke.py",
+      "dist_info": "pandas-3.1.0.dist-info",
+      "dist_info_record_sha256": "cc43eef24c2d35b044fe9831c50c574f87572638cb4e8189e8705084da57efdc",
+      "wheel_sha256": null
+    },
+    {
+      "name": "pydantic",
+      "version": "2.14.1",
+      "role": "target",
+      "import": "pydantic",
+      "case": "pydantic_smoke.py",
+      "dist_info": "pydantic-2.14.1.dist-info",
+      "dist_info_record_sha256": "d16db24e7db99e1383a3ad68457d9b3f2a3badaa891a60f2730f06c6f8064277",
+      "wheel_sha256": null
+    },
+    {
+      "name": "pydantic-core",
+      "version": "2.50.1",
+      "role": "target",
+      "import": "pydantic_core",
+      "case": null,
+      "dist_info": "pydantic_core-2.50.1.dist-info",
+      "dist_info_record_sha256": "34bfca22c843f6195ed3a622c9349998abcbc623ddb5662ce31876761ac5bb53",
+      "wheel_sha256": null
+    },
+    {
+      "name": "python-dateutil",
+      "version": "3.0.0",
+      "role": "dependency",
+      "import": "dateutil",
+      "case": null,
+      "dist_info": "python_dateutil-3.0.0.dist-info",
+      "dist_info_record_sha256": "a17d86766c46a890c3d8b1c4ccfa5bb1c6014919f3a3a9da4b8c597f47bf5b33",
+      "wheel_sha256": null
+    },
+    {
+      "name": "six",
+      "version": "1.17.0",
+      "role": "dependency",
+      "import": "six",
+      "case": null,
+      "dist_info": "six-1.17.0.dist-info",
+      "dist_info_record_sha256": "d16e50f347969b1e1919fb0c88bac4b9c644f5305bcfcfb00f72b646dbd4065d",
+      "wheel_sha256": null
+    },
+    {
+      "name": "typing-extensions",
+      "version": "4.16.0",
+      "role": "dependency",
+      "import": "typing_extensions",
+      "case": null,
+      "dist_info": "typing_extensions-4.16.0.dist-info",
+      "dist_info_record_sha256": "9e07fea845cac76293d927afa7157a14ecba39b318bc8af236b8de530b7656c1",
+      "wheel_sha256": null
+    },
+    {
+      "name": "typing-inspection",
+      "version": "0.4.4",
+      "role": "dependency",
+      "import": "typing_inspection",
+      "case": null,
+      "dist_info": "typing_inspection-0.4.4.dist-info",
+      "dist_info_record_sha256": "83fc23669db31500d06056b13ecebe4f088f56a81c1ea86e3b68f1de3b8c7d95",
+      "wheel_sha256": null
+    },
+    {
+      "name": "annotated-types",
+      "version": "0.8.0",
+      "role": "dependency",
+      "import": "annotated_types",
+      "case": null,
+      "dist_info": "annotated_types-0.8.0.dist-info",
+      "dist_info_record_sha256": "8191d3aa1ac93480688819b4db2385606219a3f7a453b85e086646134ded4f96",
+      "wheel_sha256": null
+    },
+    {
+      "name": "tzdata",
+      "version": "2026.5",
+      "role": "dependency",
+      "import": "tzdata",
+      "case": null,
+      "dist_info": "tzdata-2026.5.dist-info",
+      "dist_info_record_sha256": "bc03ea1afd3394eb010013e6112f91d884785445c8453b7d56ddb7ba0cc4939d",
+      "wheel_sha256": null
+    }
+  ],
+  "upstream_tests": [
+    {
+      "package": "numpy",
+      "paths": [
+        "numpy/_core/tests/test_dtype.py",
+        "numpy/tests/test_public_api.py"
+      ]
+    },
+    {
+      "package": "pandas",
+      "paths": [
+        "pandas/tests/frame/test_constructors.py",
+        "pandas/tests/series/test_constructors.py",
+        "pandas/tests/reshape/merge/test_merge.py"
+      ]
+    },
+    {
+      "package": "pydantic",
+      "paths": [
+        "tests/test_main.py",
+        "tests/test_json_schema.py",
+        "tests/test_serialize.py"
+      ]
+    }
+  ]
+}

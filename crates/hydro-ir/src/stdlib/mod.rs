@@ -155,7 +155,7 @@ pub static MODULES: &[&ModuleSpec] = &[
     &CONTEXTLIB,
     &TYPING,
     &ABC,
-    &ENUM,
+    &ANNOTATIONLIB,
     &FUTURE,
     &TYPES,
     &INSPECT,

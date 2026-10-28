@@ -27,6 +27,7 @@ use num_traits::{Signed, ToPrimitive};
 use crate::core::globals;
 
 pub(crate) mod abc;
+pub(crate) mod annotationlib;
 pub(crate) mod argparse;
 pub(crate) mod ast;
 pub(crate) mod asyncio;
@@ -43,7 +44,6 @@ pub(crate) mod contextvars;
 pub(crate) mod ctypes;
 pub(crate) mod datetime;
 pub(crate) mod decimal;
-pub(crate) mod r#enum;
 pub(crate) mod errno;
 pub(crate) mod extension;
 pub(crate) mod fnmatch;
@@ -78,6 +78,7 @@ pub(crate) mod stat;
 pub(crate) mod string;
 pub(crate) mod struct_mod;
 pub(crate) mod subprocess;
+pub(crate) mod sys;
 pub(crate) mod sysconfig;
 pub(crate) mod tempfile;
 pub(crate) mod textwrap;
@@ -1454,6 +1455,12 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "functools" && name == "cached_property" {
         return functools::cached_property_class();
     }
+    // `functools.singledispatchmethod` is a descriptor class: `isinstance`,
+    // class access and `__get__` need the class, while the function entry
+    // constructs the same state for module-call lowering.
+    if module == "functools" && name == "singledispatchmethod" {
+        return functools::singledispatchmethod_class();
+    }
     // AST node/operator names are declared as functions so `ast.Name(...)`
     // lowers as a module call, but the value itself is a real class:
     // `isinstance(node, ast.Name)` and `class T(ast.NodeTransformer)` need the
@@ -1931,6 +1938,7 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "typing" => typing::call_kw(function, args, &keywords),
         "inspect" => inspect::call_kw(function, args, &keywords),
         "ast" => ast::call_kw(function, args, &keywords),
+        "annotationlib" => annotationlib::call_kw(function, args, &keywords),
         "contextlib" => contextlib_call_kw(function, args, &keywords),
         "types" => types::call_kw(function, args, &keywords),
         "os" => os_call_kw(function, args, keywords),
@@ -2367,6 +2375,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "operator" | "_operator" => operator_call(function, args),
         "itertools" => itertools_call(function, args),
         "ast" => ast::call(function, args),
+        "annotationlib" => annotationlib::call(function, args),
         "fractions" => fractions::call(function, args),
         "importlib" => importlib::call(function, args),
         "importlib.util" => importlib_util::call(function, args),
@@ -2428,7 +2437,6 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "typing" => typing::call(function, args),
         "abc" => abc::call(function, args),
         "_opcode" => opcode::call(function, args),
-        "enum" => r#enum::call(function, args),
         "_imp" => imp::call(function, args),
         "_codecs" => codecs::call(function, args),
         "codecs" => codecs::call(function, args),
@@ -2600,6 +2608,19 @@ pub(crate) fn module_attr(module: &value::ModuleState, name: &str) -> i64 {
         return extension::get(path.as_ptr(), path.len(), name.as_ptr(), name.len());
     }
     module_get_by_name(module.name(), name)
+}
+
+/// Every attribute name a module exports, for `dir(module)`.
+///
+/// Compiled extension modules expose the `ShimAttr` table of the loaded shared
+/// object; `getattr`/`hasattr` read exactly that table, so the three surfaces
+/// never disagree.
+pub(crate) fn module_attr_names(
+    module: &value::ModuleState,
+) -> Option<Result<Vec<String>, String>> {
+    module
+        .path()
+        .map(crate::modules::extension::module_attribute_names)
 }
 
 /// `module.name = value`: stores an attribute override for the module.
@@ -2778,18 +2799,57 @@ const fn python_hexversion() -> i64 {
 /// Builds `sys.path` from the environment.
 ///
 /// Order: `HYDRO_SITE_PACKAGES`, the site-packages directories of
-/// `VIRTUAL_ENV` then `CONDA_PREFIX`, `PYTHONPATH`, and finally
-/// `HYDRO_STDLIB`. Empty, missing and non-directory entries are dropped and
-/// duplicates are kept once, so the result is deterministic for a given
-/// environment.
+/// `VIRTUAL_ENV` then `CONDA_PREFIX`, `PYTHONPATH`, `HYDRO_STDLIB`, and
+/// finally the pure-Python standard library modules vendored with Hydro
+/// (`stdlib/`, see [`bundled_stdlib_root`]). Empty, missing and non-directory
+/// entries are dropped and duplicates are kept once, so the result is
+/// deterministic for a given environment. Explicit roots precede the vendored
+/// tree, so an override installed there wins.
 pub(crate) fn search_path() -> Vec<String> {
+    let bundled_stdlib = bundled_stdlib_root();
     search_path_from(
         std::env::var_os("HYDRO_SITE_PACKAGES").as_deref(),
         std::env::var_os("PYTHONPATH").as_deref(),
         std::env::var_os("VIRTUAL_ENV").as_deref(),
         std::env::var_os("CONDA_PREFIX").as_deref(),
         std::env::var_os("HYDRO_STDLIB").as_deref(),
+        bundled_stdlib,
     )
+}
+
+/// Directory of the pure-Python standard library modules vendored with Hydro
+/// (`stdlib/` in the repository).
+///
+/// A development build finds it through the crate's compile-time location
+/// (`CARGO_MANIFEST_DIR`); an installed layout ships it with the executable and
+/// is found through `<exe dir>/stdlib` or `<prefix>/stdlib` when the executable
+/// lives in `<prefix>/bin`. Executable-relative candidates come first so a
+/// shipped tree is never shadowed by the checkout of the machine that built
+/// it. `None` when no candidate exists. This is the default root only:
+/// `HYDRO_STDLIB` (a CPython `Lib` tree) and every other explicit root
+/// precede it.
+pub(crate) fn bundled_stdlib_root() -> Option<&'static Path> {
+    static ROOT: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new(|| {
+        let mut candidates = Vec::new();
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        {
+            candidates.push(exe_dir.join("stdlib"));
+            candidates.push(exe_dir.join("..").join("stdlib"));
+        }
+        candidates.push(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("stdlib"),
+        );
+        candidates
+            .into_iter()
+            .find(|dir| dir.is_dir())
+            .and_then(|dir| std::fs::canonicalize(dir).ok())
+    });
+    ROOT.as_deref()
 }
 
 /// [`search_path`] with explicit environment values, for tests.
@@ -2799,6 +2859,7 @@ fn search_path_from(
     virtual_env: Option<&OsStr>,
     conda_prefix: Option<&OsStr>,
     hydro_stdlib: Option<&OsStr>,
+    bundled_stdlib: Option<&Path>,
 ) -> Vec<String> {
     let mut dirs = Vec::new();
     if let Some(list) = hydro_site_packages {
@@ -2812,6 +2873,9 @@ fn search_path_from(
     if let Some(list) = pythonpath {
         dirs.extend(std::env::split_paths(list));
     }
+    // Hydro's vendored modules win over a generic CPython Lib sysroot; a
+    // module not present in the vendored tree still resolves from `HYDRO_STDLIB`.
+    dirs.extend(bundled_stdlib.map(Path::to_path_buf));
     if let Some(stdlib) = hydro_stdlib {
         dirs.push(PathBuf::from(stdlib));
     }
@@ -2930,6 +2994,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
             }
         }
         ("types", name) => types::constant(name),
+        ("annotationlib", name) => annotationlib::constant(name),
         ("functools" | "_functools", name) => functools::constant(name),
         ("inspect", name) => inspect::constant(name),
         ("math", "pi") => value::float_new(std::f64::consts::PI),
@@ -3074,7 +3139,6 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("datetime", name) => datetime::constant(name),
         ("typing", name) => typing::constant(name),
         ("abc", name) => abc::constant(name),
-        ("enum", name) => r#enum::constant(name),
         ("builtins", name) => builtins::constant(name),
         ("_opcode", name) => opcode::constant(name),
         ("_weakref" | "weakref", name) => weakref::constant(name),
@@ -4273,11 +4337,85 @@ fn random_getrandbits(rng: &value::RandomState, arg: i64) -> i64 {
     value::bigint_new(BigInt::from_slice(Sign::Plus, &digits))
 }
 
+/// Population backing `random.sample`: list/tuple/bytes elements are already
+/// Hydro values, while strings must allocate one string per selected char.
+enum SampleSource {
+    Values(Vec<i64>),
+    Chars(Vec<char>),
+}
+
+impl SampleSource {
+    fn len(&self) -> usize {
+        match self {
+            SampleSource::Values(items) => items.len(),
+            SampleSource::Chars(chars) => chars.len(),
+        }
+    }
+}
+
+/// `sample(population, k)`: `k` distinct elements as a list. The pool is
+/// scanned with a partial Fisher-Yates shuffle over indices, so the draw uses
+/// exactly `k` random numbers.
+fn random_sample(rng: &value::RandomState, args: &[i64]) -> i64 {
+    let population = args[0];
+    let source = if let Some(items) = value::as_list(population) {
+        SampleSource::Values(items.to_vec())
+    } else if let Some(items) = value::as_tuple(population) {
+        SampleSource::Values(items.to_vec())
+    } else if let Some(text) = value::as_str(population) {
+        SampleSource::Chars(text.chars().collect())
+    } else if let Some(bytes) = value::as_bytes(population) {
+        SampleSource::Values(
+            bytes
+                .iter()
+                .map(|byte| encode_int(i64::from(*byte)))
+                .collect(),
+        )
+    } else {
+        return random_type_error(&format!(
+            "Population must be a sequence, not {}",
+            value::type_name(population)
+        ));
+    };
+    let count = match random_int_arg(args[1]) {
+        Ok(count) => count,
+        Err(err) => return err,
+    };
+    let len = source.len();
+    if count < 0 || count as usize > len {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "Sample larger than population or is negative",
+        );
+    }
+    let count = count as usize;
+    let mut indices: Vec<usize> = (0..len).collect();
+    for slot in 0..count {
+        let picked = slot + rng.below((len - slot) as u64) as usize;
+        indices.swap(slot, picked);
+    }
+    let result = value::list_new(Vec::new());
+    let roots = crate::heap::root_values(&[result]);
+    for &index in &indices[..count] {
+        let item = match &source {
+            SampleSource::Values(items) => items[index],
+            SampleSource::Chars(chars) => value::str_alloc(chars[index].to_string()),
+        };
+        container::list_append(result, item);
+    }
+    crate::heap::release_roots(roots);
+    result
+}
+
 /// Shared implementation of the module-level functions and `Random` methods.
-/// `seed` without an argument and `seed(None)` reseed from entropy.
+/// `seed` without an argument and `seed(None)` reseed from entropy; a
+/// `SystemRandom` receiver ignores every seed.
 fn random_operation(rng: &value::RandomState, function: &str, args: &[i64]) -> i64 {
     match function {
         "seed" => {
+            if rng.is_os_backed() {
+                return NONE;
+            }
             match args.first().copied() {
                 None => rng.reset_entropy(),
                 Some(seed) if seed == NONE => rng.reset_entropy(),
@@ -4295,6 +4433,7 @@ fn random_operation(rng: &value::RandomState, function: &str, args: &[i64]) -> i
         "uniform" => random_uniform(rng, args),
         "shuffle" => random_shuffle(rng, args[0]),
         "getrandbits" => random_getrandbits(rng, args[0]),
+        "sample" => random_sample(rng, args),
         _ => missing_attribute("random", function),
     }
 }
@@ -4310,6 +4449,10 @@ fn random_call(function: &str, args: &[i64]) -> i64 {
             },
         };
         return value::random_new(seed);
+    }
+    if function == "SystemRandom" {
+        // Seeds are accepted and ignored, like CPython's entropy-only source.
+        return value::random_new_os();
     }
     random_operation(&GLOBAL_RANDOM, function, args)
 }
@@ -4346,6 +4489,7 @@ pub(crate) fn random_method(obj: i64, method: &str, args: &[i64]) -> i64 {
         "uniform" => (2, 2),
         "shuffle" => (1, 1),
         "getrandbits" => (1, 1),
+        "sample" => (2, 2),
         _ => {
             return exc::raise_with_message(
                 ATTRIBUTE_ERROR,
@@ -5008,6 +5152,20 @@ fn functools_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>)
         "partial" => value::partial_new_with_keywords(args[0], args[1..].to_vec(), keywords),
         "partialmethod" => functools::new_partialmethod(args, &keywords),
         "cached_property" => functools::new_cached_property(args, &keywords),
+        // The single-argument decorators accept their parameter by name, like
+        // CPython's `def singledispatch(func)`.
+        "singledispatch" => match functools::single_argument(args, &keywords, "func") {
+            Some(func) => functools::new_singledispatch(func),
+            None => NONE,
+        },
+        "singledispatchmethod" => match functools::single_argument(args, &keywords, "func") {
+            Some(func) => functools::new_singledispatchmethod(func),
+            None => NONE,
+        },
+        "total_ordering" => match functools::single_argument(args, &keywords, "cls") {
+            Some(class) => functools::total_ordering(class),
+            None => NONE,
+        },
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("functools.{function}() does not accept keyword arguments"),
@@ -5240,7 +5398,9 @@ fn time_call(function: &str, args: &[i64]) -> i64 {
 // `crate::heap`) before the new thread exists. Threads then run in parallel:
 // there is no GIL, so a list/dict that two threads mutate must be protected by
 // a user lock. Runtime internals (heap registry, thread registry, exception
-// state) are either mutex-protected or thread-local.
+// state) are either mutex-protected or thread-local; the module-global store
+// is process-wide (CPython module dictionaries) and `RwLock`-protected, with
+// its values kept alive by process-wide GC roots.
 //
 // Locking rules that prevent deadlocks:
 // * the heap mutex is never held while user code runs and never taken by
@@ -7733,6 +7893,7 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
             }
         }
         "access" => os_access(args),
+        "urandom" => os_urandom(args),
         "fspath" => os_fspath(args[0]),
         "stat" => os_stat(args),
         "sysconf" => os_sysconf(args),
@@ -7868,6 +8029,41 @@ fn os_unsetenv(args: &[i64]) -> i64 {
     }
     std::env::remove_var(os_string_from_bytes(&name));
     NONE
+}
+
+/// `os.urandom(n)`: `n` bytes from the operating system's entropy source.
+fn os_urandom(args: &[i64]) -> i64 {
+    let argument = args[0];
+    let Some(size) = value::as_integer(argument) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(argument)
+            ),
+        );
+    };
+    if size < 0 {
+        return exc::raise_with_message(VALUE_ERROR, "negative argument not allowed");
+    }
+    let size = match usize::try_from(size) {
+        Ok(size) => size,
+        Err(_) => {
+            return exc::raise_with_message(
+                OVERFLOW_ERROR,
+                "os.urandom() size exceeds the platform limit",
+            )
+        }
+    };
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(size).is_err() {
+        return exc::raise_with_message(exc::MEMORY_ERROR, "unable to allocate urandom buffer");
+    }
+    bytes.resize(size, 0u8);
+    match value::fill_entropy(&mut bytes) {
+        Ok(()) => value::bytes_new(bytes),
+        Err(error) => exc::raise_with_message(OS_ERROR, &format!("urandom: {error}")),
+    }
 }
 
 /// `os.listdir(path=None)`: the real directory entries in arbitrary order.
@@ -8400,8 +8596,11 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
         "excepthook" => sys_excepthook(args),
         "getrecursionlimit" => sys_getrecursionlimit(),
         "setrecursionlimit" => sys_setrecursionlimit(args),
-        "_getframemodulename" => sys_getframemodulename(args),
-        "_getframe" => sys_getframe(args),
+        "_getframemodulename" => sys::getframemodulename(args),
+        "_getframe" => sys::getframe(args),
+        "getdefaultencoding" | "getfilesystemencoding" => value::str_from_bytes(b"utf-8"),
+        "getswitchinterval" => value::float_new(0.005),
+        "setswitchinterval" => NONE,
         _ => missing_attribute("sys", function),
     }
 }
@@ -8464,59 +8663,6 @@ fn sys_setrecursionlimit(args: &[i64]) -> i64 {
     }
     RECURSION_LIMIT.store(limit, Ordering::Relaxed);
     NONE
-}
-
-/// `sys._getframemodulename(depth=0)`.
-///
-/// Hydro has no reified frame objects, so a caller's module name cannot be
-/// observed. `None` is the truthful answer (CPython also returns `None` when
-/// the stack is shallower than `depth`); an invalid depth is still rejected
-/// with CPython's `TypeError` instead of being ignored.
-fn sys_getframemodulename(args: &[i64]) -> i64 {
-    if let Some(&depth) = args.first() {
-        if let Err(raised) = frame_depth(depth) {
-            return raised;
-        }
-    }
-    NONE
-}
-
-/// Validates the optional `depth` argument of the `sys` frame APIs.
-///
-/// CPython converts the value to a C `int`: an integer that does not fit is an
-/// `OverflowError`, any other type a `TypeError` naming its type.
-fn frame_depth(depth: i64) -> Result<i64, i64> {
-    if let Some(depth) = value::as_integer(depth) {
-        return Ok(depth);
-    }
-    if value::to_bigint(depth).is_some() {
-        return Err(exc::raise_with_message(
-            OVERFLOW_ERROR,
-            "Python int too large to convert to C int",
-        ));
-    }
-    Err(exc::raise_with_message(
-        TYPE_ERROR,
-        &format!(
-            "'{}' object cannot be interpreted as an integer",
-            value::type_name(depth)
-        ),
-    ))
-}
-
-/// `sys._getframe(depth=0)`.
-///
-/// A frame object cannot be represented, so instead of fabricating one the
-/// call fails exactly like CPython when the requested depth lies beyond the
-/// available stack: `ValueError: call stack is not deep enough`. The runtime
-/// keeps no Python stack frames, so every depth is beyond it.
-fn sys_getframe(args: &[i64]) -> i64 {
-    if let Some(&depth) = args.first() {
-        if let Err(raised) = frame_depth(depth) {
-            return raised;
-        }
-    }
-    exc::raise_with_message(VALUE_ERROR, "call stack is not deep enough")
 }
 
 /// `sys.excepthook(type, value, traceback)`: prints the exception's traceback
@@ -10459,6 +10605,7 @@ fn getenv(args: &[i64]) -> i64 {
 }
 
 #[cfg(test)]
+#[allow(unused_assignments)]
 mod tests {
     use super::*;
     use crate::exc::{ATTRIBUTE_ERROR, IMPORT_ERROR, TYPE_ERROR, VALUE_ERROR};
@@ -11886,18 +12033,304 @@ mod tests {
         exc::init();
     }
 
+    fn frame_attr(frame: i64, name: &str) -> i64 {
+        crate::methods::getattr(frame, name.as_ptr(), name.len())
+    }
+
+    fn locals_entry(locals: i64, name: &str) -> Option<i64> {
+        value::as_dict(locals)?
+            .iter()
+            .find_map(|(key, item)| (value::as_str(*key) == Some(name)).then_some(*item))
+    }
+
+    /// Fiber body used by the frame-isolation test: it must see its own
+    /// activation as depth 0 and must not see the resumer's frames at depth 1.
+    extern "C" fn fiber_frame_probe(_argv: *const i64) -> i64 {
+        let mut slots = [NONE];
+        let token = crate::abi::hydro_gc_frame_push(slots.as_mut_ptr(), slots.len());
+        crate::abi::hydro_gc_frame_used(token, slots.len());
+        crate::abi::hydro_frame_enter(b"probe".as_ptr(), 5);
+        crate::abi::hydro_frame_bind(
+            slots.as_mut_ptr(),
+            1,
+            b"slot".as_ptr(),
+            4,
+            0,
+            0x3,
+            b"__main__".as_ptr(),
+            8,
+            1,
+        );
+        let frame = crate::abi::hydro_module_call(
+            b"sys".as_ptr(),
+            3,
+            b"_getframe".as_ptr(),
+            9,
+            1,
+            [int(0)].as_ptr(),
+        );
+        slots[0] = frame;
+        let name = frame_attr(frame_attr(frame, "f_code"), "co_name");
+        slots[0] = name;
+        let _ = crate::abi::hydro_module_call(
+            b"sys".as_ptr(),
+            3,
+            b"_getframe".as_ptr(),
+            9,
+            1,
+            [int(1)].as_ptr(),
+        );
+        let isolated = if exc::pending_tag() == VALUE_ERROR as i64 {
+            exc::clear();
+            TRUE
+        } else {
+            exc::clear();
+            FALSE
+        };
+        let result = value::tuple_new(vec![name, isolated]);
+        slots[0] = result;
+        // Publish one generator value before the probe frame is torn down.
+        let _ = crate::abi::hydro_yield(result);
+        crate::abi::hydro_frame_leave();
+        crate::abi::hydro_gc_frame_pop(token);
+        result
+    }
+
     #[test]
-    fn sys_frame_apis_report_absence_instead_of_fabricating_frames() {
+    fn sys_getframe_keeps_fiber_frames_separate() {
         exc::init();
-        // No frame is representable, so no module name is observable; the
-        // result is the same `None` CPython reports beyond the stack depth.
+        let mut slots = [NONE];
+        let token = crate::abi::hydro_gc_frame_push(slots.as_mut_ptr(), slots.len());
+        crate::abi::hydro_gc_frame_used(token, slots.len());
+        crate::abi::hydro_frame_enter(b"<module>".as_ptr(), 8);
+        crate::abi::hydro_frame_bind(
+            slots.as_mut_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            0,
+            0x3,
+            b"__main__".as_ptr(),
+            8,
+            0,
+        );
+
+        let entry = fiber_frame_probe as extern "C" fn(*const i64) -> i64;
+        let generator = crate::abi::hydro_generator_new(entry as *const u8, 0, std::ptr::null());
+        assert!(!exc::pending(), "generator creation raised");
+        let iterator = crate::abi::hydro_iter_new(generator);
+        let mut result = NONE;
+        assert_eq!(crate::abi::hydro_iter_next(iterator, &mut result), 1);
+        let items = value::as_tuple(result).expect("probe result tuple");
+        assert_eq!(items.len(), 2);
+        assert_eq!(value::as_str(items[0]), Some("probe"));
+        assert_eq!(items[1], TRUE);
+
+        // The resumer's frame stack is intact after the fiber finished.
+        let outer = call("sys", "_getframe", &[int(0)]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(frame_attr(frame_attr(outer, "f_code"), "co_name")),
+            Some("<module>")
+        );
+        call("sys", "_getframe", &[int(1)]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+
+        crate::abi::hydro_frame_leave();
+        crate::abi::hydro_gc_frame_pop(token);
+        exc::init();
+    }
+
+    #[test]
+    fn sys_getframe_observes_live_generated_locals() {
+        exc::init();
+        crate::abi::hydro_set_file(b"demo.py".as_ptr(), 7);
+
+        // Simulate the ABI sequence generated code emits: a precise slot
+        // array, the activation record, then its local names/module binding.
+        let mut slots = [NONE; 4];
+        let token = crate::abi::hydro_gc_frame_push(slots.as_mut_ptr(), slots.len());
+        crate::abi::hydro_gc_frame_used(token, slots.len());
+        crate::abi::hydro_frame_enter(b"outer".as_ptr(), 5);
+        crate::abi::hydro_frame_bind(
+            slots.as_mut_ptr(),
+            3,
+            b"x\0y\0z".as_ptr(),
+            5,
+            1,
+            0x3,
+            b"__main__".as_ptr(),
+            8,
+            3,
+        );
+        slots[0] = int(41);
+        slots[1] = string("s");
+        slots[2] = NONE;
+        crate::abi::hydro_set_line(6);
+        crate::core::globals::set("__main__", "gv", int(7));
+
+        let frame = call("sys", "_getframe", &[int(0)]);
+        assert!(!exc::pending(), "frame materialisation raised");
+        slots[3] = frame;
+        crate::abi::hydro_gc_frame_used(token, 4);
+        assert_eq!(value::type_name(frame), "frame");
+        assert_eq!(value::type_name(frame_attr(frame, "f_code")), "code");
+        assert_eq!(as_int(frame_attr(frame, "f_lineno")), 6);
+        assert_eq!(frame_attr(frame, "f_back"), NONE);
+
+        let code = frame_attr(frame, "f_code");
+        assert_eq!(value::as_str(frame_attr(code, "co_name")), Some("outer"));
+        assert_eq!(
+            value::as_str(frame_attr(code, "co_filename")),
+            Some("demo.py")
+        );
+        assert_eq!(as_int(frame_attr(code, "co_argcount")), 1);
+        let varnames = value::as_tuple(frame_attr(code, "co_varnames")).expect("varnames tuple");
+        let varnames: Vec<&str> = varnames.iter().filter_map(|v| value::as_str(*v)).collect();
+        assert_eq!(varnames, ["x", "y", "z"]);
+
+        // `f_locals` reads the live slot array, not a snapshot: a later store
+        // is visible without touching the frame object.
+        let locals = frame_attr(frame, "f_locals");
+        assert_eq!(locals_entry(locals, "x"), Some(int(41)));
+        assert_eq!(locals_entry(locals, "y").and_then(value::as_str), Some("s"));
+        assert_eq!(locals_entry(locals, "z"), Some(NONE));
+        slots[0] = int(42);
+        assert_eq!(
+            locals_entry(frame_attr(frame, "f_locals"), "x"),
+            Some(int(42)),
+            "f_locals must reflect the current generated-code slot"
+        );
+
+        // `f_globals` is the module's live `globals()` mapping.
+        let globals = frame_attr(frame, "f_globals");
+        let gv = string("gv");
+        assert_eq!(crate::abi::hydro_subscript(globals, gv), int(7));
+
+        // Keep the frame rooted across the end of its activation: the object
+        // must switch to the snapshot taken while the slots were alive.
+        // Keep the reified frame alive across the activation end without
+        // nesting a second GC frame (frames must pop LIFO).
+        crate::heap::add_thread_root(frame);
+
+        crate::abi::hydro_frame_leave();
+        crate::abi::hydro_gc_frame_pop(token);
+        assert_eq!(
+            locals_entry(frame_attr(frame, "f_locals"), "x"),
+            Some(int(42))
+        );
+        assert_eq!(
+            value::as_str(frame_attr(frame_attr(frame, "f_code"), "co_name")),
+            Some("outer")
+        );
+        for _ in 0..8 {
+            crate::abi::hydro_gc_collect();
+        }
+        assert_eq!(
+            locals_entry(frame_attr(frame, "f_locals"), "x"),
+            Some(int(42))
+        );
+        exc::init();
+    }
+
+    #[test]
+    fn sys_getframe_follows_f_back_and_fiber_style_depth() {
+        exc::init();
+        let mut slots = [NONE; 2];
+        let token = crate::abi::hydro_gc_frame_push(slots.as_mut_ptr(), slots.len());
+        crate::abi::hydro_gc_frame_used(token, slots.len());
+        crate::abi::hydro_frame_enter(b"<module>".as_ptr(), 8);
+        crate::abi::hydro_frame_bind(
+            slots.as_mut_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            0,
+            0x3,
+            b"pkg.mod".as_ptr(),
+            7,
+            0,
+        );
+        let mut inner_slots = [NONE; 1];
+        let inner_token = crate::abi::hydro_gc_frame_push(inner_slots.as_mut_ptr(), 1);
+        crate::abi::hydro_gc_frame_used(inner_token, 1);
+        crate::abi::hydro_frame_enter(b"inner".as_ptr(), 5);
+        crate::abi::hydro_frame_bind(
+            inner_slots.as_mut_ptr(),
+            1,
+            b"value".as_ptr(),
+            5,
+            0,
+            0x3,
+            b"__main__".as_ptr(),
+            8,
+            12,
+        );
+        inner_slots[0] = int(5);
+
+        let inner = call("sys", "_getframe", &[int(0)]);
+        let outer = call("sys", "_getframe", &[int(1)]);
+        assert!(!exc::pending());
+        let inner_back = frame_attr(inner, "f_back");
+        assert_ne!(inner_back, NONE);
+        assert_eq!(
+            value::as_str(frame_attr(frame_attr(inner_back, "f_code"), "co_name")),
+            Some("<module>")
+        );
+        assert_eq!(
+            value::as_str(frame_attr(frame_attr(outer, "f_code"), "co_name")),
+            Some("<module>")
+        );
+        assert_eq!(frame_attr(outer, "f_back"), NONE);
+
+        // `_getframemodulename` reports the module key of the requested frame.
+        assert_eq!(
+            value::as_str(call("sys", "_getframemodulename", &[int(0)])),
+            Some("__main__")
+        );
+        assert_eq!(
+            value::as_str(call("sys", "_getframemodulename", &[int(1)])),
+            Some("pkg.mod")
+        );
+        assert_eq!(call("sys", "_getframemodulename", &[int(2)]), NONE);
+
+        // Beyond the stack and negative depths raise CPython's ValueError.
+        call("sys", "_getframe", &[int(2)]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+        call("sys", "_getframe", &[int(-1)]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+
+        // `inspect.currentframe()` resolves to the same innermost activation.
+        let current = call("inspect", "currentframe", &[]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(frame_attr(frame_attr(current, "f_code"), "co_name")),
+            Some("inner")
+        );
+
+        crate::abi::hydro_frame_leave();
+        crate::abi::hydro_gc_frame_pop(inner_token);
+        crate::abi::hydro_frame_leave();
+        crate::abi::hydro_gc_frame_pop(token);
+        exc::init();
+    }
+
+    #[test]
+    fn sys_frame_apis_report_absence_without_an_active_stack() {
+        exc::init();
+        // With no Hydro activation on this thread, no module name is
+        // observable; the result is the same `None` CPython reports beyond
+        // the stack depth.
         assert_eq!(call("sys", "_getframemodulename", &[]), NONE);
         assert_eq!(call("sys", "_getframemodulename", &[int(0)]), NONE);
         assert_eq!(call("sys", "_getframemodulename", &[int(42)]), NONE);
         assert!(!exc::pending());
 
-        // `_getframe` cannot return an invented frame: it fails with the
-        // precise CPython error for a depth beyond the available stack.
+        // `_getframe` never invents a frame: with an empty stack every depth
+        // fails with the precise CPython error.
         call("sys", "_getframe", &[]);
         assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
         exc::clear();
@@ -11953,6 +12386,7 @@ mod tests {
             Some(venv.as_os_str()),
             Some(conda.as_os_str()),
             Some(stdlib.as_os_str()),
+            None,
         );
         let expected: Vec<String> = [
             &site_a,
@@ -11968,13 +12402,30 @@ mod tests {
         .collect();
         assert_eq!(path, expected);
 
-        let empty = search_path_from(None, None, None, None, None);
+        let empty = search_path_from(None, None, None, None, None, None);
         assert!(empty.is_empty(), "a bare environment has no search dirs");
+
+        // The vendored `stdlib/` tree is a default root appended after every
+        // explicit one, so `enum` resolves without `HYDRO_STDLIB`.
+        let bundled = bundled_stdlib_root().expect("vendored stdlib root");
+        assert!(
+            bundled.join("enum.py").is_file(),
+            "enum.py must be vendored in {bundled:?}"
+        );
+        let with_bundled = search_path_from(None, None, None, None, None, Some(bundled));
+        assert_eq!(
+            with_bundled,
+            vec![bundled.to_string_lossy().into_owned()],
+            "the vendored tree is the last search entry"
+        );
         std::fs::remove_dir_all(&root).expect("remove scratch directory");
     }
 
     #[test]
     fn sys_path_is_a_cached_list() {
+        // The global store (including `sys` caches) is process-wide: hold the
+        // runtime-state lock while resetting and asserting on it.
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         let first = get("sys", "path");
@@ -12001,6 +12452,7 @@ mod tests {
 
     #[test]
     fn sys_modules_membership_identity_and_module_names() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         let first = get("sys", "modules");
@@ -12064,6 +12516,7 @@ mod tests {
 
     #[test]
     fn module_getattr_resolves_missing_attributes_through_pep562() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         let hook = value::function_new(
@@ -12101,6 +12554,7 @@ mod tests {
 
     #[test]
     fn dir_calls_a_module_dir_hook() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         let hook = value::function_new(pep562_dir as *const () as usize, 0, "__dir__".to_string());
@@ -12120,6 +12574,7 @@ mod tests {
 
     #[test]
     fn builtins_module_materializes_native_functions() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         assert!(stdlib::module("builtins").is_some());
@@ -12153,6 +12608,7 @@ mod tests {
 
     #[test]
     fn reset_invalidates_module_registry() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         globals::set("helper", "value", int(1));
@@ -12254,6 +12710,144 @@ mod tests {
         let drawn = crate::methods::call(rng, b"getrandbits".as_ptr(), 11, 1, [int(8)].as_ptr());
         assert!(!exc::pending(), "unexpected exception");
         assert!((0..256).contains(&as_int(drawn)));
+    }
+
+    #[test]
+    fn os_urandom_returns_requested_entropy_bytes() {
+        exc::init();
+        assert!(value::as_bytes(call("os", "urandom", &[int(0)]))
+            .expect("urandom(0)")
+            .is_empty());
+        let first = value::as_bytes(call("os", "urandom", &[int(32)]))
+            .expect("urandom(32)")
+            .to_vec();
+        let second = value::as_bytes(call("os", "urandom", &[int(32)]))
+            .expect("urandom(32)")
+            .to_vec();
+        assert!(!exc::pending());
+        assert_eq!(first.len(), 32);
+        assert_eq!(second.len(), 32);
+        assert_ne!(first, second, "two entropy draws must differ");
+
+        exc::init();
+        assert_eq!(call("os", "urandom", &[int(-1)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "negative argument not allowed");
+
+        exc::init();
+        assert_eq!(call("os", "urandom", &[string("4")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn random_sample_selects_distinct_elements() {
+        exc::init();
+        let population = value::list_new((0i64..10).map(int).collect());
+        for count in [0i64, 1, 5, 10] {
+            exc::init();
+            let drawn = call("random", "sample", &[population, int(count)]);
+            assert!(!exc::pending(), "sample({count}) raised");
+            let items = value::as_list(drawn).expect("sample list");
+            assert_eq!(items.len(), count as usize);
+            let mut numbers: Vec<i64> = items.iter().map(|item| as_int(*item)).collect();
+            numbers.sort_unstable();
+            numbers.dedup();
+            assert_eq!(numbers.len(), count as usize, "sample repeats an element");
+            assert!(numbers.iter().all(|n| (0..10).contains(n)));
+        }
+        // Strings yield a list of one-character strings.
+        exc::init();
+        let chars = call("random", "sample", &[string("abcdef"), int(3)]);
+        assert!(!exc::pending());
+        let chars = value::as_list(chars).expect("sample list");
+        assert_eq!(chars.len(), 3);
+        for item in chars {
+            let text = value::as_str(*item).expect("sampled char");
+            assert_eq!(text.chars().count(), 1);
+            assert!("abcdef".contains(text));
+        }
+        // Out-of-range counts and non-sequences report the documented errors.
+        exc::init();
+        assert_eq!(call("random", "sample", &[population, int(-1)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "Sample larger than population or is negative");
+        exc::init();
+        assert_eq!(call("random", "sample", &[population, int(11)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::init();
+        assert_eq!(call("random", "sample", &[int(3), int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn random_system_random_draws_from_operating_system_entropy() {
+        exc::init();
+        let draw = |rng: i64, name: &str, args: &[i64]| {
+            crate::methods::call(rng, name.as_ptr(), name.len(), args.len(), args.as_ptr())
+        };
+        // `SystemRandom` is a module member; its seed is optional and ignored.
+        assert!(!exc::pending());
+        let rng = call("random", "SystemRandom", &[]);
+        assert!(!exc::pending(), "SystemRandom() raised");
+        assert_eq!(draw(rng, "seed", &[int(7)]), NONE);
+        assert!(!exc::pending(), "SystemRandom.seed(7) raised");
+        // Even a seed type the ordinary generator rejects is ignored.
+        let text_seed = string("not a seed");
+        assert_eq!(draw(rng, "seed", &[text_seed]), NONE);
+        assert!(!exc::pending(), "SystemRandom.seed(str) raised");
+
+        let mut floats = Vec::new();
+        for _ in 0..16 {
+            let drawn = value::as_float(draw(rng, "random", &[])).expect("random() float");
+            assert!((0.0..1.0).contains(&drawn), "random() out of range");
+            floats.push(drawn);
+        }
+        floats.dedup();
+        assert!(floats.len() > 1, "OS entropy must not repeat one draw");
+        for _ in 0..16 {
+            let drawn = as_int(draw(rng, "randint", &[int(5), int(7)]));
+            assert!((5..=7).contains(&drawn), "randint out of range");
+        }
+        for _ in 0..16 {
+            let drawn = as_int(draw(rng, "randrange", &[int(3), int(9), int(2)]));
+            assert!((3..9).contains(&drawn) && drawn % 2 == 1);
+        }
+        let drawn = value::as_float(draw(rng, "uniform", &[int(2), int(4)])).expect("uniform");
+        assert!((2.0..=4.0).contains(&drawn));
+        for bits in [1i64, 8, 64, 100] {
+            let drawn = draw(rng, "getrandbits", &[int(bits)]);
+            assert!(!exc::pending(), "getrandbits({bits}) raised");
+            assert!(as_big(drawn).bits() <= bits as u64);
+        }
+        let sequence = value::list_new(vec![int(1), int(2), int(3)]);
+        let picked = as_int(draw(rng, "choice", &[sequence]));
+        assert!((1..=3).contains(&picked));
+        let sampled = draw(rng, "sample", &[sequence, int(2)]);
+        assert!(!exc::pending());
+        let sampled = value::as_list(sampled).expect("sample list");
+        assert_eq!(sampled.len(), 2);
+        assert_ne!(as_int(sampled[0]), as_int(sampled[1]));
+
+        // shuffle permutes the caller's list in place, keeping its elements.
+        let shuffled = value::list_new((0i64..8).map(int).collect());
+        assert_eq!(draw(rng, "shuffle", &[shuffled]), NONE);
+        assert!(!exc::pending());
+        let mut items: Vec<i64> = value::as_list(shuffled)
+            .expect("shuffled list")
+            .iter()
+            .map(|item| as_int(*item))
+            .collect();
+        items.sort_unstable();
+        assert_eq!(items, (0i64..8).collect::<Vec<i64>>());
+
+        // An omitted seed slot (keyword binder fills `None`) also works.
+        exc::init();
+        let seeded = call("random", "SystemRandom", &[NONE]);
+        assert!(!exc::pending());
+        assert!(value::as_float(draw(seeded, "random", &[])).is_some());
+        exc::init();
+        assert!(call("random", "SystemRandom", &[string("seed")]) != NONE);
+        assert!(!exc::pending());
     }
 
     #[test]
@@ -12965,6 +13559,7 @@ mod tests {
         // A compiled package mirrors its imported globals (`from .version
         // import __version__`) and submodules into the global store; reading
         // them through the module value must find them.
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         exc::init();
         globals::set("numpy", "__version__", string("2.5.0"));
         globals::set(
@@ -13714,7 +14309,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_abc_and_enum_resolve_through_the_module_surface() {
+    fn typing_and_abc_resolve_through_the_module_surface() {
         exc::init();
         assert_eq!(get("typing", "TYPE_CHECKING"), FALSE);
         for name in ["Any", "Generic", "NamedTuple", "Protocol", "Tuple"] {
@@ -13754,12 +14349,8 @@ mod tests {
         assert_eq!(call("abc", "abstractmethod", &[payload]), payload);
         assert!(value::as_integer(call("abc", "get_cache_token", &[])).is_some());
 
-        for name in ["Enum", "IntEnum"] {
-            let class = value::as_class(get("enum", name)).expect("class value");
-            assert_eq!(class.name, name);
-        }
-        assert_eq!(call("enum", "auto", &[]), NONE);
-        assert!(!exc::pending());
+        // `enum` is the vendored `stdlib/enum.py`, so no native surface exists.
+        assert!(stdlib::module("enum").is_none());
 
         // Arity still comes from the central spec.
         assert_eq!(call("typing", "cast", &[NONE]), NONE);
@@ -13799,13 +14390,11 @@ mod tests {
         exc::init();
         // Module-level caches are process-global: the `globals` registry holds
         // the cached classes/instances and each module's native class
-        // registry compares against the heap generation, so a concurrent
-        // `globals::reset()` (and the heap reset behind it) can invalidate a
-        // cached value between two calls here. This broad smoke test therefore
-        // only checks that the module API yields usable values (a class value,
-        // an instance, a constant); pinning exact class identity or comparing
-        // pointers to independently cached values is left to each module's own
-        // tests, which resolve the class and the instance under one lock.
+        // registry compares against the heap generation. Every test that
+        // resets that state (or calls `hydro_runtime_init`) holds the same
+        // runtime-state lock, so no reset can interleave here; keep the
+        // assertions broad anyway because this smoke test resolves many
+        // independent caches.
         //
         // `functools.Placeholder` is a public value (the singleton instance of
         // its type); the repeat read shows the cache returns one value.
@@ -13829,11 +14418,6 @@ mod tests {
             "functools.partialmethod(...) returned no instance"
         );
 
-        // `enum.IntFlag` and `ast.arg`.
-        assert_eq!(
-            value::as_class(get("enum", "IntFlag")).map(|class| class.name.as_str()),
-            Some("IntFlag")
-        );
         // `ast.arg` may be built against a class registry rebuilt by another
         // test's reset, so only the shape of the result is checked here;
         // `ast`'s own tests assert the exact `arg` class of the node.
@@ -14155,6 +14739,7 @@ mod tests {
 
     #[test]
     fn importlib_submodules_resolve_to_native_modules() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         for name in [
@@ -14207,6 +14792,7 @@ mod tests {
 
     #[test]
     fn recomputed_spec_and_cache_functions_report_real_state() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         let spec = call(
@@ -14252,12 +14838,25 @@ mod tests {
 
     #[test]
     fn metadata_versions_come_from_installed_dist_info() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         let _guard = IMPORTLIB_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(_site) = ensure_site_packages() else {
+        let Some(site) = ensure_site_packages() else {
             return;
         };
+        // The assertion below needs the full pinned ecosystem tree; a partial
+        // or unrelated site-packages directory is not a failure of the
+        // metadata implementation.
+        for dist_info in [
+            "numpy-2.5.0.dist-info",
+            "pandas-3.1.0.dist-info",
+            "pydantic-2.14.1.dist-info",
+        ] {
+            if !site.join(dist_info).is_dir() {
+                return;
+            }
+        }
         globals::reset();
         exc::init();
         for (name, expected) in [
@@ -14344,6 +14943,7 @@ mod tests {
 
     #[test]
     fn metadata_missing_package_raises_package_not_found() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         let _guard = IMPORTLIB_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -14375,6 +14975,7 @@ mod tests {
 
     #[test]
     fn util_file_specs_build_module_metadata_and_refuse_execution() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         let _guard = IMPORTLIB_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -14393,7 +14994,7 @@ mod tests {
             "spec_from_file_location",
             &[string("six"), string(&six_text)],
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert!(value::instance_class_value(spec).is_some());
         assert_eq!(
             value::instance_attr(spec, "name").and_then(value::as_str),
@@ -14458,6 +15059,7 @@ mod tests {
 
     #[test]
     fn resources_files_reads_real_files() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         let _guard = IMPORTLIB_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -14470,7 +15072,7 @@ mod tests {
         globals::reset();
         exc::init();
         let root = call("importlib.resources", "files", &[string("pydantic")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             value::class_display_name(value::instance_class_value(root).expect("instance")),
             Some("Traversable")
@@ -14522,7 +15124,7 @@ mod tests {
         let path = root.join("data.txt");
         std::fs::write(&path, b"hello").expect("write stat fixture");
         let stat = call("os", "stat", &[string(&path.to_string_lossy())]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
 
         assert_eq!(
             as_int(namespace_value(stat, "st_size").expect("st_size")),
@@ -14556,7 +15158,7 @@ mod tests {
 
         // Directories keep their file-type bits too.
         let dir_stat = call("os", "stat", &[string(&root.to_string_lossy())]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let dir_mode = as_int(namespace_value(dir_stat, "st_mode").expect("st_mode"));
         assert_eq!(dir_mode & 0o170000, 0o040000, "directory mode");
     }
@@ -14591,7 +15193,7 @@ mod tests {
 
         let link_value = string(&link.to_string_lossy());
         let followed = call("os", "stat", &[link_value]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             as_int(namespace_value(followed, "st_size").expect("st_size")),
             7
@@ -14599,7 +15201,7 @@ mod tests {
 
         // Keyword calls arrive with the omitted `dir_fd` padded to `None`.
         let link_stat = call("os", "stat", &[link_value, NONE, FALSE]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let link_mode = as_int(namespace_value(link_stat, "st_mode").expect("st_mode"));
         assert_eq!(link_mode & 0o170000, 0o120000, "symbolic link mode");
         assert_ne!(
@@ -14646,7 +15248,7 @@ mod tests {
         let bytes = |data: &[u8]| value::bytes_new(data.to_vec());
 
         let plain = call("importlib.util", "decode_source", &[bytes(b"x = 1\n")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(value::as_str(plain), Some("x = 1\n"));
 
         // A UTF-8 BOM is stripped before decoding.
@@ -14667,7 +15269,7 @@ mod tests {
             "decode_source",
             &[bytes(b"# -*- coding: latin-1 -*-\nname = '\xe9'\n")],
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             value::as_str(latin1),
             Some("# -*- coding: latin-1 -*-\nname = '\u{e9}'\n")
@@ -14781,7 +15383,7 @@ mod tests {
     fn codecs_lookup_and_byte_order_marks_are_real() {
         exc::init();
         let info = call("codecs", "lookup", &[string("ascii")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(value::as_tuple(info).expect("CodecInfo tuple").len(), 4);
 
         assert_eq!(
@@ -14823,9 +15425,9 @@ mod tests {
         let path_text = path.to_string_lossy().into_owned();
 
         let file = call("io", "open", &[string(&path_text), string("rb")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let wrapper = call("io", "TextIOWrapper", &[file]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         // The wrapper is an instance of the native `io.TextIOWrapper` class:
         // `type(wrapper)` is that class and its `__name__` is what the runtime
         // reports on the resolving paths. `value::type_name` is the static
@@ -14871,9 +15473,9 @@ mod tests {
         let out = dir.join("out.txt");
         let out_text = out.to_string_lossy().into_owned();
         let file = call("io", "open", &[string(&out_text), string("wb")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let wrapper = call("io", "TextIOWrapper", &[file]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let written = method(wrapper, "write", &[string("a\nb")]);
         assert_eq!(as_int(written), 3);
         method(wrapper, "flush", &[]);
@@ -14885,7 +15487,7 @@ mod tests {
     fn contextlib_nullcontext_enters_with_its_result_and_does_not_suppress() {
         exc::init();
         let manager = call("contextlib", "nullcontext", &[string("resource")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             value::class_display_name(value::instance_class_value(manager).expect("instance")),
             Some("nullcontext")
@@ -14909,7 +15511,7 @@ mod tests {
 
         // The default `enter_result` is `None`.
         let bare = call("contextlib", "nullcontext", &[]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(attribute(bare, "enter_result"), NONE);
         assert_eq!(method(bare, "__enter__", &[]), NONE);
         assert_eq!(method(bare, "__exit__", &[NONE, NONE, NONE]), FALSE);
@@ -14917,7 +15519,7 @@ mod tests {
         // `suppress` shares the same native-method dispatch, so its internal
         // methods must be registered in the module table as well.
         let suppress = call("contextlib", "suppress", &[]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(method(suppress, "__enter__", &[]), NONE);
         // `None` is falsy: the manager never suppresses the block exception.
         assert_eq!(method(suppress, "__exit__", &[NONE, NONE, NONE]), NONE);
@@ -15005,9 +15607,9 @@ mod tests {
     /// resulting decorator value with `args`.
     fn contextmanager_manager(function: i64, args: &[i64]) -> i64 {
         let decorator = call("contextlib", "contextmanager", &[function]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let manager = call_value(decorator, args);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         manager
     }
 
@@ -15030,11 +15632,11 @@ mod tests {
             Some("_GeneratorContextManager")
         );
         assert_eq!(as_int(method(manager, "__enter__", &[])), 1);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         // The normal exit resumes the generator; it returns, so nothing is
         // suppressed.
         assert_eq!(method(manager, "__exit__", &[NONE, NONE, NONE]), FALSE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
 
         // Each decorated call owns a fresh generator: the same decorator can
         // be used again.
@@ -15072,7 +15674,7 @@ mod tests {
         let boom = exception(VALUE_ERROR, "boom");
         // The generator handled the exception and returned: suppress it.
         assert_eq!(method(swallowing, "__exit__", &[NONE, boom, NONE]), TRUE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
 
         exc::init();
         let propagating =
@@ -15082,7 +15684,7 @@ mod tests {
         // The same exception escapes the generator: do not suppress it. The
         // `with` lowering re-raises the exception it is still holding.
         assert_eq!(method(propagating, "__exit__", &[NONE, boom, NONE]), FALSE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
 
         exc::init();
         let raising =
@@ -15120,11 +15722,11 @@ mod tests {
         let function = generator_function(cm_echo, 1, "echo");
         value::function_set_params(function, vec!["value".to_string()]);
         let decorator = call("contextlib", "contextmanager", &[function]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let words = [string("value"), int(9)];
         let manager =
             crate::core::builtins::call_kw(decorator, 0, std::ptr::null(), 1, words.as_ptr());
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(as_int(method(manager, "__enter__", &[])), 9);
         assert_eq!(method(manager, "__exit__", &[NONE, NONE, NONE]), FALSE);
     }
@@ -15265,14 +15867,14 @@ mod tests {
         exc::init();
         let resource = closing_fixture();
         let closer = call("contextlib", "closing", &[resource]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             value::class_display_name(value::instance_class_value(closer).expect("instance")),
             Some("closing")
         );
         assert_eq!(method(closer, "__enter__", &[]), resource);
         assert_eq!(method(closer, "__exit__", &[NONE, NONE, NONE]), FALSE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(attribute(resource, "closed"), TRUE);
 
         // The exception path closes too and still reports no suppression.
@@ -15281,7 +15883,7 @@ mod tests {
         let closer = call("contextlib", "closing", &[resource]);
         let boom = exception(VALUE_ERROR, "boom");
         assert_eq!(method(closer, "__exit__", &[NONE, boom, NONE]), FALSE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(attribute(resource, "closed"), TRUE);
     }
 
@@ -15290,7 +15892,7 @@ mod tests {
         exc::init();
         let log = value::list_new(Vec::new());
         let stack = call("contextlib", "ExitStack", &[]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             value::class_display_name(value::instance_class_value(stack).expect("instance")),
             Some("ExitStack")
@@ -15308,13 +15910,13 @@ mod tests {
         assert_eq!(stack_callback_count(stack), 3);
 
         assert_eq!(method(stack, "close", &[]), NONE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         // Last registered runs first; the callback precedes both managers.
         assert_eq!(recorded(log), vec![3, 2, 1]);
         assert_eq!(stack_callback_count(stack), 0);
         // Closing an empty stack is a no-op.
         assert_eq!(method(stack, "close", &[]), NONE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(recorded(log), vec![3, 2, 1]);
 
         // An object without the context-manager protocol is rejected before
@@ -15342,7 +15944,7 @@ mod tests {
         method(stack, "enter_context", &[inner]);
         let boom = exception(VALUE_ERROR, "boom");
         assert_eq!(method(stack, "__exit__", &[NONE, boom, NONE]), TRUE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(attribute(inner, "seen"), boom);
         assert_eq!(attribute(outer, "seen"), NONE);
         assert_eq!(recorded(log), vec![2, 1]);
@@ -15359,7 +15961,7 @@ mod tests {
         method(stack, "enter_context", &[second]);
         let boom = exception(VALUE_ERROR, "boom");
         assert_eq!(method(stack, "__exit__", &[NONE, boom, NONE]), FALSE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(attribute(first, "seen"), boom);
         assert_eq!(attribute(second, "seen"), boom);
 
@@ -15370,7 +15972,7 @@ mod tests {
         method(stack, "enter_context", &[manager]);
         assert_eq!(method(stack, "__exit__", &[NONE, NONE, NONE]), FALSE);
         assert_eq!(attribute(manager, "seen"), NONE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
     }
 
     #[test]
@@ -15392,7 +15994,7 @@ mod tests {
         assert_eq!(stack_callback_count(stack), 2);
         let boom = exception(VALUE_ERROR, "boom");
         assert_eq!(method(stack, "__exit__", &[NONE, boom, NONE]), TRUE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(recorded(log), vec![1]);
         assert_eq!(attribute(manager, "seen"), NONE);
 
@@ -15407,7 +16009,7 @@ mod tests {
         method(stack, "callback", &[truthy]);
         let boom = exception(VALUE_ERROR, "boom");
         assert_eq!(method(stack, "__exit__", &[NONE, boom, NONE]), FALSE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
     }
 
     #[test]
@@ -15435,7 +16037,7 @@ mod tests {
 
         // A callback runs with its arguments even though it cannot suppress.
         assert_eq!(method(stack, "close", &[]), NONE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(recorded(log), vec![5]);
 
         // Keywords travel to the callee: `math.prod(..., start=10)` accepts
@@ -15446,14 +16048,14 @@ mod tests {
             method_kw(stack, "callback", &[prod, numbers], &[("start", int(10))]),
             prod
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(method(stack, "close", &[]), NONE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
 
         exc::init();
         let stack = call("contextlib", "ExitStack", &[]);
         method_kw(stack, "callback", &[prod, numbers], &[("bogus", int(1))]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(method(stack, "close", &[]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
@@ -15473,7 +16075,7 @@ mod tests {
         method(stack, "callback", &[record, log, int(2)]);
 
         let transferred = method(stack, "pop_all", &[]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_ne!(transferred, stack);
         assert_eq!(
             value::class_display_name(
@@ -15490,14 +16092,14 @@ mod tests {
         assert_eq!(recorded(log), vec![3]);
         // The transferred callbacks keep their original LIFO order.
         assert_eq!(method(transferred, "close", &[]), NONE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(recorded(log), vec![3, 2, 1]);
 
         // CPython always returns a fresh stack, even when nothing is pending.
         exc::init();
         let empty = call("contextlib", "ExitStack", &[]);
         let moved = method(empty, "pop_all", &[]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_ne!(moved, empty);
         assert_eq!(stack_callback_count(moved), 0);
         assert_eq!(stack_callback_count(empty), 0);
@@ -15516,7 +16118,7 @@ mod tests {
         let instance = value::instance_new(manager);
         assert_eq!(method(instance, "__enter__", &[]), instance);
         assert_eq!(method(instance, "__exit__", &[NONE, NONE, NONE]), NONE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
 
         // The structural hook accepts a class defining both protocol methods
         // and reports NotImplemented for one that does not.
@@ -15556,7 +16158,7 @@ mod tests {
             method(asynchronous_instance, "__aexit__", &[NONE, NONE, NONE]),
             NONE
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
     }
 
     #[test]
@@ -15582,7 +16184,7 @@ mod tests {
         let class = value::class_new("PathLikeFixture".to_string(), NONE, methods);
         let fixture = value::instance_new(class);
         let resolved = call("os", "fspath", &[fixture]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert!(value::as_str(resolved).is_some_and(|text| !text.is_empty()));
     }
 
@@ -15664,19 +16266,19 @@ mod tests {
         let text = value::as_str(call("pickle", "dumps", &[payload]))
             .expect("HYD1 text")
             .to_string();
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
 
         // Binary files receive the payload's UTF-8 bytes; the keyword-only
         // `fix_imports`/`buffer_callback` slots are accepted and ignored.
         let binary_path = dir.join("payload.bin");
         let binary_name = binary_path.to_string_lossy().into_owned();
         let file = call("io", "open", &[string(&binary_name), string("wb")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             call("pickle", "dump", &[payload, file, NONE, TRUE, NONE]),
             NONE
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         method(file, "close", &[]);
         assert_eq!(
             std::fs::read(&binary_path).unwrap().as_slice(),
@@ -15687,9 +16289,9 @@ mod tests {
         let text_path = dir.join("payload.txt");
         let text_name = text_path.to_string_lossy().into_owned();
         let file = call("io", "open", &[string(&text_name), string("w")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(call("pickle", "dump", &[payload, file]), NONE);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         method(file, "close", &[]);
         assert_eq!(std::fs::read_to_string(&text_path).unwrap(), text);
 
@@ -15707,7 +16309,7 @@ mod tests {
         let empty_path = dir.join("empty.bin");
         let empty_name = empty_path.to_string_lossy().into_owned();
         let file = call("io", "open", &[string(&empty_name), string("wb")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(call("pickle", "dump", &[payload, file, int(9)]), NONE);
         assert_eq!(message(), "pickle protocol must be <= 5");
         method(file, "close", &[]);
@@ -15723,23 +16325,23 @@ mod tests {
         let text = value::as_str(call("pickle", "dumps", &[payload]))
             .expect("HYD1 text")
             .to_string();
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
 
         // Binary files hold the payload's UTF-8 bytes.
         let binary_path = dir.join("load.bin");
         let binary_name = binary_path.to_string_lossy().into_owned();
         let writer = call("io", "open", &[string(&binary_name), string("wb")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(call("pickle", "dump", &[payload, writer]), NONE);
         method(writer, "close", &[]);
         let reader = call("io", "open", &[string(&binary_name), string("rb")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let loaded = call(
             "pickle",
             "load",
             &[reader, TRUE, string("ASCII"), string("strict"), NONE],
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(value::repr(loaded), expected);
         method(reader, "close", &[]);
 
@@ -15747,12 +16349,12 @@ mod tests {
         let text_path = dir.join("load.txt");
         let text_name = text_path.to_string_lossy().into_owned();
         let writer = call("io", "open", &[string(&text_name), string("w")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(call("pickle", "dump", &[payload, writer]), NONE);
         method(writer, "close", &[]);
         let reader = call("io", "open", &[string(&text_name), string("r")]);
         let loaded = call("pickle", "load", &[reader]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(value::repr(loaded), expected);
         method(reader, "close", &[]);
         assert_eq!(std::fs::read_to_string(&text_path).unwrap(), text);
@@ -15760,9 +16362,9 @@ mod tests {
         // A TextIOWrapper over a binary file is a valid source as well.
         let wrapped_reader = call("io", "open", &[string(&binary_name), string("rb")]);
         let wrapper = call("io", "TextIOWrapper", &[wrapped_reader]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let loaded = call("pickle", "load", &[wrapper]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(value::repr(loaded), expected);
 
         // In-memory streams are file objects too.
@@ -15772,11 +16374,11 @@ mod tests {
             &[value::bytes_new(text.as_bytes().to_vec())],
         );
         let loaded = call("pickle", "load", &[bytes_stream]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(value::repr(loaded), expected);
         let text_stream = call("io", "StringIO", &[string(&text)]);
         let loaded = call("pickle", "load", &[text_stream]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(value::repr(loaded), expected);
 
         // A non-file argument is rejected instead of being coerced.
@@ -15866,7 +16468,7 @@ mod tests {
 
         // Binary read mode is a BufferedReader.
         let reader = call("io", "open", &[string(&input_name), string("rb")]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(value::type_class(reader), buffered_reader);
         assert_eq!(value::type_name_of(reader), "BufferedReader");
         assert_eq!(crate::builtins::isinstance(reader, buffered_reader), TRUE);
@@ -15896,7 +16498,7 @@ mod tests {
 
         // `io.FileIO` opens a raw binary stream even when the mode omits `b`.
         let raw = call("io", "FileIO", &[string(&input_name)]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert!(value::as_file(raw).expect("file value").binary());
         assert_eq!(value::type_class(raw), fileio_class);
         assert_eq!(value::type_name_of(raw), "FileIO");
@@ -15946,6 +16548,7 @@ mod tests {
             NONE
         );
         assert_eq!(message(), "Cannot use closefd=False with file name");
+        exc::init();
 
         // The in-memory streams join the same hierarchy.
         let string_io = call("io", "StringIO", &[]);
@@ -15976,7 +16579,7 @@ mod tests {
         exc::init();
         let input = value::list_new(vec![int(1), int(2), int(3)]);
         let permutations = call("itertools", "permutations", &[input]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             tuple_ints(permutations),
             vec![
@@ -16004,25 +16607,25 @@ mod tests {
         );
         let none = call("itertools", "permutations", &[input, int(5)]);
         assert!(tuple_ints(none).is_empty());
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
 
         // `r = 0` yields exactly one empty tuple, and the empty pool does too.
         let zero = call("itertools", "permutations", &[input, int(0)]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let zero_rows = value::as_list(zero).unwrap_or_default();
         assert_eq!(zero_rows.len(), 1);
         assert_eq!(value::as_tuple(zero_rows[0]).map(|row| row.len()), Some(0));
         assert_eq!(tuple_ints(zero), vec![Vec::<i64>::new()]);
         let empty_pool = value::list_new(Vec::new());
         let empty = call("itertools", "permutations", &[empty_pool]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(tuple_ints(empty), vec![Vec::<i64>::new()]);
 
         // Repeated values are permuted by position: duplicates are emitted and
         // the rows still come out in non-decreasing lexicographic order.
         let duplicates = value::list_new(vec![int(1), int(1), int(2)]);
         let duplicated = call("itertools", "permutations", &[duplicates]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             tuple_ints(duplicated),
             vec![
@@ -16078,7 +16681,7 @@ mod tests {
             1,
             keywords.as_ptr(),
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             tuple_ints(repeated),
             vec![vec![1, 1], vec![1, 2], vec![2, 1], vec![2, 2]]
@@ -16097,12 +16700,12 @@ mod tests {
             1,
             zero_keywords.as_ptr(),
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(tuple_ints(collapsed), vec![Vec::<i64>::new()]);
 
         let no_items = value::list_new(Vec::new());
         let empty_product = call("itertools", "product", &[no_items, left]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert!(tuple_ints(empty_product).is_empty());
 
         let negative_keywords = [string("repeat"), int(-1)];
@@ -16123,7 +16726,7 @@ mod tests {
         let predicate = get("operator", "truth");
         let values = value::list_new(vec![int(1), int(2), int(0), int(4)]);
         let prefix = call("itertools", "takewhile", &[predicate, values]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let prefix: Vec<i64> = value::as_list(prefix)
             .unwrap_or_default()
             .iter()
@@ -16134,7 +16737,7 @@ mod tests {
         // `dropwhile` skips that same prefix and keeps the first rejected
         // element plus everything after it.
         let rest = call("itertools", "dropwhile", &[predicate, values]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let rest: Vec<i64> = value::as_list(rest)
             .unwrap_or_default()
             .iter()
@@ -16145,14 +16748,14 @@ mod tests {
         // A predicate that accepts everything drops the whole input; a
         // predicate that rejects the first element drops nothing.
         let all_true = call("itertools", "dropwhile", &[predicate, input]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert!(value::as_list(all_true).is_some_and(|items| items.is_empty()));
         let rejects_first = call(
             "itertools",
             "dropwhile",
             &[predicate, value::list_new(vec![int(0), int(4)])],
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         let rejects_first: Vec<i64> = value::as_list(rejects_first)
             .unwrap_or_default()
             .iter()
@@ -16166,13 +16769,13 @@ mod tests {
         exc::init();
         let input = value::list_new(vec![int(1), int(2), int(3)]);
         let pairs = call("itertools", "pairwise", &[input]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(tuple_ints(pairs), vec![vec![1, 2], vec![2, 3]]);
 
         // Zero or one element yields no pairs; both are valid inputs.
         for items in [Vec::new(), vec![int(7)]] {
             let empty = call("itertools", "pairwise", &[value::list_new(items)]);
-            assert!(!exc::pending(), "{}", message());
+            assert!(!exc::pending());
             assert!(tuple_ints(empty).is_empty());
         }
 
@@ -16192,7 +16795,7 @@ mod tests {
         let input = value::list_new(vec![int(1), int(2), int(3), int(4)]);
 
         let pairs = call("itertools", "combinations", &[input, int(2)]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             tuple_ints(pairs),
             vec![
@@ -16207,25 +16810,25 @@ mod tests {
 
         // `r == 0` yields exactly one empty tuple; `r > n` yields nothing.
         let zero = call("itertools", "combinations", &[input, int(0)]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(tuple_ints(zero), vec![Vec::<i64>::new()]);
         let too_many = call("itertools", "combinations", &[input, int(5)]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert!(tuple_ints(too_many).is_empty());
 
         // The empty pool only produces the empty selection.
         let empty_pool = value::list_new(Vec::new());
         let empty_zero = call("itertools", "combinations", &[empty_pool, int(0)]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(tuple_ints(empty_zero), vec![Vec::<i64>::new()]);
         let empty_one = call("itertools", "combinations", &[empty_pool, int(1)]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert!(tuple_ints(empty_one).is_empty());
 
         // Positions are combined, so repeated values produce repeated rows.
         let duplicates = value::list_new(vec![int(1), int(1), int(2)]);
         let duplicated = call("itertools", "combinations", &[duplicates, int(2)]);
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             tuple_ints(duplicated),
             vec![vec![1, 1], vec![1, 2], vec![1, 2]]
@@ -16262,7 +16865,7 @@ mod tests {
             "combinations_with_replacement",
             &[input, int(2)],
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             tuple_ints(pairs),
             vec![
@@ -16284,7 +16887,7 @@ mod tests {
             "combinations_with_replacement",
             &[input, int(5)],
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(
             tuple_ints(longer),
             vec![
@@ -16317,7 +16920,7 @@ mod tests {
             "combinations_with_replacement",
             &[input, int(0)],
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(tuple_ints(zero), vec![Vec::<i64>::new()]);
 
         let empty_pool = value::list_new(Vec::new());
@@ -16326,14 +16929,14 @@ mod tests {
             "combinations_with_replacement",
             &[empty_pool, int(0)],
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert_eq!(tuple_ints(empty_zero), vec![Vec::<i64>::new()]);
         let empty_one = call(
             "itertools",
             "combinations_with_replacement",
             &[empty_pool, int(1)],
         );
-        assert!(!exc::pending(), "{}", message());
+        assert!(!exc::pending());
         assert!(tuple_ints(empty_one).is_empty());
     }
 
@@ -16371,6 +16974,7 @@ mod tests {
 
     #[test]
     fn module_attribute_overrides_shadow_native_specs() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         let typing = module_handle("typing");
@@ -16457,6 +17061,7 @@ mod tests {
 
     #[test]
     fn user_module_assignment_updates_globals_and_introspection() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         globals::set("app", "existing", int(1));

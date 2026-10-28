@@ -567,11 +567,13 @@ pub enum HExprKind {
         module: String,
         path: String,
     },
-    /// Name bound by a nested import that was not linked at compile time.
-    /// Evaluating it raises `RuntimeError` from the runtime helper.
+    /// Name bound by an import that was not linked at compile time.
+    /// Evaluating it resolves the name at runtime through the module registry.
     DeferredImport {
         module: String,
         member: Option<String>,
+        /// Shared object of a compiled extension named by the import.
+        path: Option<String>,
     },
     /// Read of a module-level name from inside a function.
     GlobalGet {
@@ -1357,6 +1359,45 @@ pub(crate) fn resolve_import_name(
 
 const SUPPORTED_MODULES_HELP: &str = "supported modules: math, io, functools, operator, time, sys, json, os, os.path, _thread, threading, queue, multiprocessing, pickle";
 
+/// Whether a `try` statement's handlers catch an `ImportError`.
+///
+/// Imports in such a body are optional: a module that cannot be linked must
+/// fail at runtime so the handler runs, instead of becoming a compile error.
+/// A bare `except:` and the `ImportError` superclasses (`Exception`,
+/// `BaseException`) catch a failed import too, including inside an exception
+/// tuple. Attribute names are matched by their last component
+/// (`builtins.ImportError`, `importlib.ModuleNotFoundError`).
+fn try_handlers_catch_import_error(handlers: &[ast::ExceptHandler]) -> bool {
+    handlers.iter().any(|handler| {
+        let ast::ExceptHandler::ExceptHandler(handler) = handler;
+        let Some(type_expr) = &handler.type_ else {
+            // A bare `except:` catches every exception.
+            return true;
+        };
+        exception_type_catches_import_error(type_expr)
+    })
+}
+
+/// Whether one `except` type expression matches a failed import.
+fn exception_type_catches_import_error(type_expr: &ast::Expr) -> bool {
+    match type_expr {
+        ast::Expr::Name(name) => matches!(
+            name.id.as_str(),
+            "ImportError" | "ModuleNotFoundError" | "Exception" | "BaseException"
+        ),
+        ast::Expr::Tuple(tuple) => tuple.elts.iter().any(exception_type_catches_import_error),
+        ast::Expr::Attribute(_) => dotted_expr_name(type_expr)
+            .and_then(|name| name.rsplit('.').next().map(str::to_string))
+            .is_some_and(|name| {
+                matches!(
+                    name.as_str(),
+                    "ImportError" | "ModuleNotFoundError" | "Exception" | "BaseException"
+                )
+            }),
+        _ => false,
+    }
+}
+
 /// Truth value of an `if` guard that the import contract fixes statically.
 ///
 /// Returns `Some(true)` when the body always runs, `Some(false)` when it
@@ -1620,12 +1661,14 @@ pub(crate) fn module_all_names(stmts: &[ast::Stmt]) -> Option<Vec<String>> {
     all
 }
 
-/// A name bound by an import nested inside a function, class or compound body.
+/// A name bound by an import statement that could not be linked at compile
+/// time: an import nested inside a function, class or compound body, or an
+/// import inside a `try` whose handlers catch `ImportError`.
 ///
-/// The loader does not execute nested imports, so the module may not be
-/// linked. Reading the binding compiles to [`HExprKind::DeferredImport`],
-/// which raises `RuntimeError` at runtime (`dynamic import ... is not
-/// supported`); a function that never touches the binding runs normally.
+/// Reading the binding compiles to [`HExprKind::DeferredImport`], which
+/// resolves the name from the runtime module registry and raises
+/// `ModuleNotFoundError` or `ImportError` when it is unavailable; a function
+/// that never touches the binding runs normally.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DeferredImport {
     /// Dotted module named by the import.
@@ -1633,6 +1676,10 @@ struct DeferredImport {
     /// Imported member (`from x import member`), or `None` for a module alias
     /// (`import x [as y]`).
     member: Option<String>,
+    /// Shared object of a compiled extension named by the import, if any. The
+    /// runtime then materialises the extension module value (or its attribute)
+    /// instead of failing with `No module named ...`.
+    path: Option<String>,
 }
 
 /// One name bound by a module-level `from <module> import *` statement.
@@ -1661,6 +1708,26 @@ enum StarBinding {
     UserGlobal { name: String, module: String },
     /// A direct submodule of a package (`from pkg import *` binds it too).
     Module { name: String, module: String },
+}
+
+/// One name bound by an import statement inside a `try` body whose handlers
+/// catch `ImportError`.
+///
+/// The import must run at runtime, where the module may be unavailable: a
+/// failed import raises `ImportError` and the handler binds the fallback, so
+/// the name is never bound at compile time. Import statements carry no IR, so
+/// the statement itself is what materialises the binding.
+#[derive(Clone, Debug)]
+struct OptionalImport {
+    /// Name bound in the enclosing module namespace.
+    binding: String,
+    /// Dotted module named by the import.
+    module: String,
+    /// Imported member (`from x import member`), or `None` for a module alias
+    /// (`import x [as y]`).
+    member: Option<String>,
+    /// Shared object of a compiled extension named by the import, if any.
+    path: Option<String>,
 }
 
 /// Lexical scope an import statement is collected from.
@@ -1699,6 +1766,11 @@ pub struct Lowerer<'a> {
     user_modules: HashMap<String, UserModule>,
     /// `from X import f [as g]` bindings of user functions: name -> function id.
     imported_user_functions: HashMap<String, FunctionId>,
+    /// Linked function bindings whose module-level `try`/`except ImportError`
+    /// wrapper is statically infallible. The handler cannot run, so a name
+    /// read keeps the compile-time binding even though a dead fallback
+    /// assignment created a module local with the same name.
+    infallible_import_functions: HashMap<String, FunctionId>,
     /// `from X import value [as g]` bindings of user module globals (classes
     /// and constants): name -> (module full name, exported name).
     imported_user_globals: HashMap<String, (String, String)>,
@@ -1733,9 +1805,22 @@ pub struct Lowerer<'a> {
     /// statement, which is what makes them real module globals for importers.
     extension_star_bindings: Vec<(String, String)>,
     /// Names bound by imports nested inside functions, classes or compound
-    /// bodies that could not be linked statically. Reading one raises
-    /// `RuntimeError` at runtime.
+    /// bodies that could not be linked statically. Reading one resolves the
+    /// name at runtime and raises the interpreter's import error.
     deferred_imports: HashMap<String, DeferredImport>,
+    /// Names bound by an import statement inside a `try` body whose handlers
+    /// catch `ImportError`, keyed by the statement's source start. The import
+    /// statement itself resolves each binding at runtime, so a failed import
+    /// runs the handler and a successful one binds the name.
+    optional_imports: HashMap<usize, Vec<OptionalImport>>,
+    /// Dotted extension imports without an alias (`import pkg.sub_ext`):
+    /// CPython only binds the top-level package but still loads the module for
+    /// its side effects. The runtime load is appended to the module body.
+    pending_extension_loads: Vec<(String, String)>,
+    /// Whether the imports currently being collected sit in the body of a
+    /// `try` whose handlers catch `ImportError`; see
+    /// [`OptionalImport`].
+    collecting_optional_try: bool,
     /// Binding names established by module-level imports. A nested import
     /// never replaces one of these, so top-level imports keep precedence.
     top_level_imports: HashSet<String>,
@@ -1769,6 +1854,11 @@ pub struct Lowerer<'a> {
     /// importers, and mirroring every assignment would add a global store to
     /// each top-level loop iteration.
     mirror_all_globals: bool,
+    /// `from __future__ import annotations`: annotations are stored as their
+    /// source text in `__annotations__` instead of being evaluated eagerly,
+    /// matching CPython's stringified-annotation mode. This is what makes
+    /// modules whose annotations mention `TYPE_CHECKING`-only imports work.
+    future_annotations: bool,
     /// Compile a REPL/session fragment instead of a standalone module.
     ///
     /// Session fragments share one runtime global table: names bound by an
@@ -1916,6 +2006,7 @@ impl<'a> Lowerer<'a> {
             imported_extension_members: HashMap::new(),
             user_modules: HashMap::new(),
             imported_user_functions: HashMap::new(),
+            infallible_import_functions: HashMap::new(),
             imported_user_globals: HashMap::new(),
             imported_user_getattrs: HashSet::new(),
             pending_self_imports: Vec::new(),
@@ -1926,6 +2017,9 @@ impl<'a> Lowerer<'a> {
             extension_stars: Vec::new(),
             extension_star_bindings: Vec::new(),
             deferred_imports: HashMap::new(),
+            optional_imports: HashMap::new(),
+            pending_extension_loads: Vec::new(),
+            collecting_optional_try: false,
             top_level_imports: HashSet::new(),
             deferred_modules: HashSet::new(),
             late_modules: HashSet::new(),
@@ -1935,6 +2029,7 @@ impl<'a> Lowerer<'a> {
             global_names: HashSet::new(),
             used_globals: HashSet::new(),
             mirror_all_globals: false,
+            future_annotations: false,
             session_mode: false,
             session_globals: HashSet::new(),
             module_getattr: false,
@@ -2184,6 +2279,11 @@ impl<'a> Lowerer<'a> {
     }
 
     pub fn lower_module(&mut self, module: &ast::ModModule) -> LHir {
+        // `from __future__ import annotations` turns every annotation into
+        // its source text when it reaches `__annotations__`, so annotation
+        // expressions are never evaluated (and a forward reference to a
+        // `TYPE_CHECKING`-only import is harmless).
+        self.future_annotations = module_uses_future_annotations(&module.body);
         // 1. Imports bind global names. Module-level imports are collected
         //    first so their names always win over names bound by nested
         //    imports; nested imports are collected afterwards and either link
@@ -2191,7 +2291,9 @@ impl<'a> Lowerer<'a> {
         //    Everything happens before any signature or body is lowered, so
         //    imported names are visible inside functions regardless of where
         //    the import appears in the file (and so class decorators can be
-        //    recognised). Import statements themselves emit no IR.
+        //    recognised). A linked import emits no IR; an import inside a
+        //    `try` body guarded by an `ImportError` handler does, because the
+        //    statement has to perform the import when the module runs.
         //
         //    The exported global names are known first: `from . import name`
         //    inside a package may refer to a name defined by this unit.
@@ -2343,6 +2445,8 @@ impl<'a> Lowerer<'a> {
                                 &f.decorator_list,
                                 fid,
                                 f.range,
+                                &f.args,
+                                f.returns.as_deref(),
                                 &mut fs,
                                 &mut body,
                                 line,
@@ -2351,7 +2455,14 @@ impl<'a> Lowerer<'a> {
                             continue;
                         }
                     }
-                    self.mirror_module_function(start, &def_ids, &mut body);
+                    self.mirror_module_function(
+                        start,
+                        &def_ids,
+                        &f.args,
+                        f.returns.as_deref(),
+                        &mut fs,
+                        &mut body,
+                    );
                     continue;
                 }
                 ast::Stmt::AsyncFunctionDef(f) => {
@@ -2362,6 +2473,8 @@ impl<'a> Lowerer<'a> {
                                 &f.decorator_list,
                                 fid,
                                 f.range,
+                                &f.args,
+                                f.returns.as_deref(),
                                 &mut fs,
                                 &mut body,
                                 line,
@@ -2370,7 +2483,14 @@ impl<'a> Lowerer<'a> {
                             continue;
                         }
                     }
-                    self.mirror_module_function(start, &def_ids, &mut body);
+                    self.mirror_module_function(
+                        start,
+                        &def_ids,
+                        &f.args,
+                        f.returns.as_deref(),
+                        &mut fs,
+                        &mut body,
+                    );
                     continue;
                 }
                 ast::Stmt::ClassDef(c) => {
@@ -2399,7 +2519,54 @@ impl<'a> Lowerer<'a> {
                 self.push_lowered_stmt(stmt, s, &fs, &mut body);
             }
         }
+        // `__annotations__` of the module body: one entry per simple-name
+        // annotated assignment directly in the module body. The dictionary is
+        // published in the runtime global table (so importers and
+        // `annotationlib.get_annotations(module)` observe it) and declared a
+        // module global so a module-body read resolves through the table.
+        let module_annotations = self.annotations_dict_expr(
+            Self::annotation_entries(&module.body),
+            &mut fs,
+            dunder_inits.first().map(|stmt| stmt.line).unwrap_or(0),
+            dunder_inits.first().map(|stmt| stmt.col).unwrap_or(0),
+        );
+        if let Some(annotations) = module_annotations {
+            self.global_names.insert("__annotations__".to_string());
+            body.insert(
+                0,
+                HStmt {
+                    kind: HStmtKind::GlobalSet {
+                        module: self.dunder_name.clone(),
+                        name: "__annotations__".to_string(),
+                        value: annotations,
+                    },
+                    line: 0,
+                    col: 0,
+                },
+            );
+        }
         body.splice(0..0, dunder_inits);
+        for (module, path) in std::mem::take(&mut self.pending_extension_loads) {
+            let value = HExpr {
+                kind: HExprKind::DeferredImport {
+                    module,
+                    member: None,
+                    path: Some(path),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line: 0,
+                col: 0,
+            };
+            body.push(HStmt {
+                kind: HStmtKind::GlobalSet {
+                    module: self.dunder_name.clone(),
+                    name: format!("\0hydro.extload.{}", body.len()),
+                    value,
+                },
+                line: 0,
+                col: 0,
+            });
+        }
         self.functions[0].body = body;
 
         self.synthesize_pytest(&module.body, &mut fs);
@@ -2577,6 +2744,8 @@ impl<'a> Lowerer<'a> {
         &mut self,
         decorators: &[ast::Expr],
         fid: FunctionId,
+        args: &ast::Arguments,
+        returns: Option<&ast::Expr>,
         fs: &mut FuncState,
         line: u32,
         col: u32,
@@ -2599,6 +2768,22 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
+        if let Some(annotations) = self.function_annotations_expr(args, returns, fs, line, col) {
+            then_body.push(HStmt {
+                kind: HStmtKind::SetAttr {
+                    object: HExpr {
+                        kind: HExprKind::Local(target),
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    },
+                    name: "__annotations__".to_string(),
+                    value: annotations,
+                },
+                line,
+                col,
+            });
+        }
         self.apply_decorator_temps(&temps, target, fs, &mut then_body, line, col);
         then_body.push(HStmt {
             kind: HStmtKind::GlobalSet {
@@ -3174,6 +3359,9 @@ impl<'a> Lowerer<'a> {
         &mut self,
         start: usize,
         def_ids: &HashMap<usize, FunctionId>,
+        args: &ast::Arguments,
+        returns: Option<&ast::Expr>,
+        fs: &mut FuncState,
         body: &mut Vec<HStmt>,
     ) {
         if !self.mirror_all_globals {
@@ -3187,7 +3375,7 @@ impl<'a> Lowerer<'a> {
         body.push(HStmt {
             kind: HStmtKind::GlobalSet {
                 module: self.dunder_name.clone(),
-                name,
+                name: name.clone(),
                 value: HExpr {
                     kind: HExprKind::FunctionRef(self.fid_base + fid),
                     ty: Ty::Concrete(Type::Function),
@@ -3198,6 +3386,28 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
+        // The mirrored value is the object importers introspect. Attach the
+        // signature's `__annotations__` so `module.f.__annotations__` and
+        // `annotationlib.get_annotations(module.f)` agree with the source.
+        if let Some(annotations) = self.function_annotations_expr(args, returns, fs, line, col) {
+            body.push(HStmt {
+                kind: HStmtKind::SetAttr {
+                    object: HExpr {
+                        kind: HExprKind::GlobalGet {
+                            module: self.dunder_name.clone(),
+                            name,
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    },
+                    name: "__annotations__".to_string(),
+                    value: annotations,
+                },
+                line,
+                col,
+            });
+        }
     }
 
     /// Bind the module dunders this unit loads: `__name__` (the full dotted
@@ -3459,6 +3669,132 @@ impl<'a> Lowerer<'a> {
     }
 
     // ------------------------------------------------------------------
+    // Annotations
+    // ------------------------------------------------------------------
+
+    /// Builds the `__annotations__` mapping for `entries` (name, annotation
+    /// expression) in source order.
+    ///
+    /// Hydro has no lazy annotation scope (PEP 649): every annotation is
+    /// evaluated eagerly in the scope that declares it, which is CPython 3.13
+    /// behaviour and what `annotationlib.get_annotations()` reports for the
+    /// VALUE and FORWARDREF formats. An empty entry list yields `None` so no
+    /// empty dictionary is published for an unannotated class or module.
+    fn annotations_dict_expr(
+        &mut self,
+        entries: Vec<(String, &ast::Expr)>,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HExpr> {
+        if entries.is_empty() {
+            return None;
+        }
+        let mut pairs = Vec::with_capacity(entries.len());
+        for (name, annotation) in entries {
+            let value = self.annotation_value(annotation, fs);
+            pairs.push((
+                HExpr {
+                    kind: HExprKind::Const(Const::Str(name)),
+                    ty: Ty::Concrete(Type::Str),
+                    line,
+                    col,
+                },
+                value,
+            ));
+        }
+        Some(HExpr {
+            kind: HExprKind::Dict(pairs),
+            ty: Ty::Concrete(Type::Dict),
+            line,
+            col,
+        })
+    }
+
+    /// The value stored in `__annotations__` for one annotation.
+    ///
+    /// With `from __future__ import annotations` this is the expression's
+    /// source text, matching CPython's stringified mode; otherwise the
+    /// expression is evaluated in the declaring scope (Hydro's eager
+    /// annotation model).
+    fn annotation_value(&mut self, annotation: &ast::Expr, fs: &mut FuncState) -> HExpr {
+        if self.future_annotations {
+            let (line, col) = self.span(annotation.range());
+            return HExpr {
+                kind: HExprKind::Const(Const::Str(self.source_text(annotation.range()))),
+                ty: Ty::Concrete(Type::Str),
+                line,
+                col,
+            };
+        }
+        self.expr(annotation, fs)
+    }
+
+    /// The simple-name annotated assignments directly in a class or module
+    /// body, in source order. CPython only records annotations for plain
+    /// names; `obj.attr: T` and `items[0]: T` evaluate the annotation but do
+    /// not add an `__annotations__` entry.
+    fn annotation_entries(body: &[ast::Stmt]) -> Vec<(String, &ast::Expr)> {
+        let mut entries = Vec::new();
+        for stmt in body {
+            if let ast::Stmt::AnnAssign(ann) = stmt {
+                if let ast::Expr::Name(target) = &*ann.target {
+                    entries.push((target.id.to_string(), &*ann.annotation));
+                }
+            }
+        }
+        entries
+    }
+
+    /// The function-annotation entries of one signature: parameters in
+    /// declaration order followed by the `return` annotation, exactly like
+    /// CPython's function `__annotations__` dictionary.
+    #[allow(clippy::needless_lifetimes)]
+    fn function_annotation_entries<'b>(
+        args: &'b ast::Arguments,
+        returns: Option<&'b ast::Expr>,
+    ) -> Vec<(String, &'b ast::Expr)> {
+        let mut entries = Vec::new();
+        for arg in args
+            .posonlyargs
+            .iter()
+            .chain(args.args.iter())
+            .chain(args.kwonlyargs.iter())
+        {
+            if let Some(annotation) = arg.def.annotation.as_deref() {
+                entries.push((arg.def.arg.to_string(), annotation));
+            }
+        }
+        for arg in args.vararg.iter().chain(args.kwarg.iter()) {
+            if let Some(annotation) = arg.annotation.as_deref() {
+                entries.push((arg.arg.to_string(), annotation));
+            }
+        }
+        if let Some(annotation) = returns {
+            entries.push(("return".to_string(), annotation));
+        }
+        entries
+    }
+
+    /// The `__annotations__` expression of a function signature, or `None`
+    /// when the function declares no annotation at all.
+    fn function_annotations_expr(
+        &mut self,
+        args: &ast::Arguments,
+        returns: Option<&ast::Expr>,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HExpr> {
+        self.annotations_dict_expr(
+            Self::function_annotation_entries(args, returns),
+            fs,
+            line,
+            col,
+        )
+    }
+
+    // ------------------------------------------------------------------
     // Positions / diagnostics
     // ------------------------------------------------------------------
 
@@ -3598,11 +3934,12 @@ impl<'a> Lowerer<'a> {
         for stmt in stmts {
             match stmt {
                 ast::Stmt::Import(s) => {
+                    let statement = u32::from(s.range.start()) as usize;
                     for alias in &s.names {
-                        self.collect_import(alias, false);
+                        self.collect_import(alias, false, ImportScope::Module, statement);
                     }
                 }
-                ast::Stmt::ImportFrom(s) => self.collect_import_from(s, false),
+                ast::Stmt::ImportFrom(s) => self.collect_import_from(s, false, ImportScope::Module),
                 ast::Stmt::If(s) => {
                     let branch = static_if_branch(&s.test, &self.dunder_name);
                     match branch {
@@ -3661,8 +3998,9 @@ impl<'a> Lowerer<'a> {
             match stmt {
                 ast::Stmt::Import(s) => {
                     if !root {
+                        let statement = u32::from(s.range.start()) as usize;
                         for alias in &s.names {
-                            self.collect_import(alias, true);
+                            self.collect_import(alias, true, scope, statement);
                         }
                     }
                 }
@@ -3686,7 +4024,7 @@ impl<'a> Lowerer<'a> {
                             );
                             continue;
                         }
-                        self.collect_import_from(s, true);
+                        self.collect_import_from(s, true, scope);
                     }
                 }
                 ast::Stmt::FunctionDef(s) => {
@@ -3722,7 +4060,18 @@ impl<'a> Lowerer<'a> {
                     self.collect_nested_imports(&s.orelse, false, scope);
                 }
                 ast::Stmt::Try(s) => {
+                    // Imports in the body may fail: when a handler catches
+                    // `ImportError` (or a superclass), they bind at runtime so
+                    // the handler can supply the fallback. The handler,
+                    // `else` and `finally` bodies run outside that protection,
+                    // so they keep the ordinary deferred rules.
+                    let optional = try_handlers_catch_import_error(&s.handlers);
+                    let saved = self.collecting_optional_try;
+                    if optional {
+                        self.collecting_optional_try = true;
+                    }
                     self.collect_nested_imports(&s.body, false, scope);
+                    self.collecting_optional_try = saved;
                     for handler in &s.handlers {
                         let ast::ExceptHandler::ExceptHandler(handler) = handler;
                         self.collect_nested_imports(&handler.body, false, scope);
@@ -3800,23 +4149,170 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Records a name bound by a nested import that could not be linked.
+    /// Records a name bound by an import nested inside a function, class or
+    /// compound body that could not be linked, so reading it raises the runtime
+    /// import error.
     fn record_deferred(&mut self, binding: &str, module: &str, member: Option<&str>) {
         self.deferred_imports.insert(
             binding.to_string(),
             DeferredImport {
                 module: module.to_string(),
                 member: member.map(str::to_string),
+                path: None,
             },
         );
     }
 
-    fn collect_import(&mut self, alias: &ast::Alias, nested: bool) {
+    /// Records a name bound by an import statement inside a `try` whose
+    /// handlers catch `ImportError`.
+    ///
+    /// The name is a module global resolved at runtime: the import statement
+    /// binds it on success, the handler binds the fallback when it fails, and
+    /// every read goes through the module global table so both paths agree.
+    fn record_optional_import(
+        &mut self,
+        statement: usize,
+        binding: &str,
+        module: &str,
+        member: Option<&str>,
+        path: Option<&str>,
+    ) {
+        // The import executes at module initialization and is a module
+        // attribute, so it claims the name like a top-level import.
+        self.claim_import_binding(binding, false);
+        // A static binding of the same name (an earlier import) cannot stand:
+        // the handler may replace the name when this import fails.
+        self.forget_module_binding(binding);
+        self.global_names.insert(binding.to_string());
+        // The name lives in the runtime global table on both paths: the
+        // successful import publishes it, and the handler's fallback
+        // assignment must be mirrored even when no function was scanned yet.
+        self.used_globals.insert(binding.to_string());
+        self.optional_imports
+            .entry(statement)
+            .or_default()
+            .push(OptionalImport {
+                binding: binding.to_string(),
+                module: module.to_string(),
+                member: member.map(str::to_string),
+                path: path.map(str::to_string),
+            });
+    }
+
+    /// Whether an import collected right now binds at runtime because it sits
+    /// in a module-level `try` body guarded by an `ImportError` handler.
+    fn optional_import_site(&self, scope: ImportScope) -> bool {
+        self.collecting_optional_try && scope == ImportScope::Module
+    }
+
+    /// Whether the import of `module` (`import x [as y]`) cannot fail at
+    /// runtime.
+    ///
+    /// A native module and a linked user module always load, so the statement
+    /// keeps its compile-time binding and the handler can never run. A
+    /// compiled extension may fail to load, and a module that is still
+    /// initializing or absent has no guaranteed value, so those stay runtime
+    /// imports.
+    fn module_import_is_infallible(&self, module: &str) -> bool {
+        if stdlib::module(module).is_some() {
+            return true;
+        }
+        if matches!(self.find_extension(module), ExtensionLookup::Found(_)) {
+            return false;
+        }
+        self.user_modules.contains_key(module)
+            && !self.late_modules.contains(module)
+            && !self.is_initializing_ancestor(module)
+    }
+
+    /// Whether `from <module> import <names>` cannot fail at runtime.
+    ///
+    /// Every name must be provided by a surface the compiler knows completely:
+    /// a native module's spec, or the export table of a linked user module.
+    /// Anything else — a missing member, a compiled extension (which may not
+    /// load and whose namespace cannot be enumerated), a module that writes its
+    /// namespace at runtime, a module that is still initializing and a module
+    /// the compiler never saw — may fail, so the statement must run at runtime
+    /// where the handler can catch the `ImportError`.
+    fn is_from_import_infallible(&self, names: &[ast::Alias], imported: &str) -> bool {
+        if names.iter().any(|alias| alias.name.as_str() == "*") {
+            // A wildcard copies a whole namespace and is never a runtime
+            // import; the ordinary collection handles it.
+            return true;
+        }
+        if let Some(module) = stdlib::module(imported) {
+            return names
+                .iter()
+                .all(|alias| module_member(module, alias.name.as_str()).is_some());
+        }
+        if matches!(self.find_extension(imported), ExtensionLookup::Found(_)) {
+            return false;
+        }
+        // `from . import name` inside a package `__init__.py` names this very
+        // unit: a linked submodule always loads, while a name this unit
+        // defines itself may not have been bound yet when the statement runs.
+        if imported == self.dunder_name {
+            return names.iter().all(|alias| {
+                self.user_modules
+                    .contains_key(&format!("{imported}.{}", alias.name.as_str()))
+            });
+        }
+        let Some(base) = self.user_modules.get(imported) else {
+            return false;
+        };
+        if self.late_modules.contains(imported)
+            || self.is_initializing_ancestor(imported)
+            || base.dynamic_globals
+            || base.module_getattr
+        {
+            return false;
+        }
+        names.iter().all(|alias| {
+            let member = alias.name.as_str();
+            if self
+                .user_modules
+                .contains_key(&format!("{imported}.{member}"))
+            {
+                return true;
+            }
+            if matches!(
+                self.find_extension(&format!("{imported}.{member}")),
+                ExtensionLookup::Found(_)
+            ) {
+                return false;
+            }
+            base.exports.contains_key(member)
+        })
+    }
+
+    fn collect_import(
+        &mut self,
+        alias: &ast::Alias,
+        nested: bool,
+        scope: ImportScope,
+        statement: usize,
+    ) {
         let imported = alias.name.as_str();
         let binding = match &alias.asname {
             Some(name) => name.as_str(),
             None => imported.split('.').next().unwrap_or(imported),
         };
+        if self.optional_import_site(scope) && !self.module_import_is_infallible(imported) {
+            // `import x [as y]` inside `try: ... except ImportError:`: bind the
+            // module at runtime. An extension resolves through its shared
+            // object; a missing module raises `ModuleNotFoundError` so the
+            // handler runs.
+            let module = match &alias.asname {
+                Some(_) => imported,
+                None => binding,
+            };
+            let path = match self.find_extension(imported) {
+                ExtensionLookup::Found(path) => Some(path.to_string_lossy().into_owned()),
+                _ => None,
+            };
+            self.record_optional_import(statement, binding, module, None, path.as_deref());
+            return;
+        }
         if !self.claim_import_binding(binding, nested) {
             return;
         }
@@ -3845,19 +4341,27 @@ impl<'a> Lowerer<'a> {
         }
         match self.find_extension(imported) {
             ExtensionLookup::Found(path) => {
+                let path = path.to_string_lossy().into_owned();
                 if alias.asname.is_none() && imported.contains('.') {
-                    self.error_at_code(
-                        alias.range,
-                        codes::UNSUPPORTED,
-                        "dotted extension imports require an alias",
-                    );
+                    // `import pkg.sub_ext` binds `pkg` and loads the extension
+                    // for its side effects. Keep the top-level package binding
+                    // and append a runtime load statement to the module body.
+                    if self.user_modules.contains_key(binding)
+                        || self.late_modules.contains(binding)
+                        || self.is_initializing_ancestor(binding)
+                    {
+                        self.user_module_aliases
+                            .insert(binding.to_string(), binding.to_string());
+                    }
+                    self.pending_extension_loads
+                        .push((imported.to_string(), path));
                     return;
                 }
                 self.extension_aliases.insert(
                     binding.to_string(),
                     ExtensionAlias {
                         module: module.to_string(),
-                        path: path.to_string_lossy().into_owned(),
+                        path,
                     },
                 );
                 return;
@@ -3902,7 +4406,7 @@ impl<'a> Lowerer<'a> {
         self.error_unsupported_module(alias.range, imported);
     }
 
-    fn collect_import_from(&mut self, s: &ast::StmtImportFrom, nested: bool) {
+    fn collect_import_from(&mut self, s: &ast::StmtImportFrom, nested: bool, scope: ImportScope) {
         let level = s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0);
         let module_name = match resolve_import_name(
             level,
@@ -3918,11 +4422,20 @@ impl<'a> Lowerer<'a> {
         let imported = module_name.as_str();
         // Mirroring is keyed by the statement that performs the star import.
         let statement = u32::from(s.range.start()) as usize;
+        let infallible_optional =
+            self.optional_import_site(scope) && self.is_from_import_infallible(&s.names, imported);
 
         // `from __future__ import annotations` (and every other future
         // feature) changes no semantics in this frontend: annotations are
         // hints and are never evaluated.
         if imported == "__future__" {
+            return;
+        }
+
+        if self.optional_import_site(scope)
+            && !self.is_from_import_infallible(&s.names, imported)
+            && self.collect_optional_import_from(s, imported, statement)
+        {
             return;
         }
 
@@ -4061,6 +4574,10 @@ impl<'a> Lowerer<'a> {
                 match export {
                     Some(UserExport::Function(id)) => {
                         self.imported_user_functions.insert(binding.to_string(), id);
+                        if infallible_optional {
+                            self.infallible_import_functions
+                                .insert(binding.to_string(), id);
+                        }
                     }
                     Some(UserExport::Global) => {
                         self.bind_user_global(binding, imported, member);
@@ -4274,6 +4791,65 @@ impl<'a> Lowerer<'a> {
             }
             ExtensionLookup::Missing => self.error_unsupported_module(s.range, imported),
         }
+    }
+
+    /// Collects `from <module> import <member>` inside a `try` body guarded by
+    /// an `ImportError` handler.
+    ///
+    /// Nothing is linked: each name is bound at runtime by the import
+    /// statement, so a module or member that is unavailable raises the
+    /// interpreter's `ImportError` and the handler runs. A wildcard import
+    /// copies a whole namespace and cannot be expressed at runtime, so such a
+    /// statement falls back to the ordinary collection (`false` is returned).
+    ///
+    /// Returns true when every binding was recorded.
+    fn collect_optional_import_from(
+        &mut self,
+        s: &ast::StmtImportFrom,
+        imported: &str,
+        statement: usize,
+    ) -> bool {
+        if s.names.iter().any(|alias| alias.name.as_str() == "*") {
+            return false;
+        }
+        // Each name is resolved independently, so a failure on a later name
+        // still leaves the earlier bindings installed (CPython imports one
+        // name at a time).
+        for alias in &s.names {
+            let member = alias.name.as_str();
+            let binding = match &alias.asname {
+                Some(name) => name.as_str(),
+                None => member,
+            };
+            let submodule = format!("{imported}.{member}");
+            // `from pkg import ext` names a compiled extension submodule: the
+            // binding is the module itself, resolved through its shared object.
+            if let ExtensionLookup::Found(path) = self.find_extension(&submodule) {
+                let path = path.to_string_lossy().into_owned();
+                self.record_optional_import(statement, binding, &submodule, None, Some(&path));
+                continue;
+            }
+            // `from ext import member` names an attribute of a compiled
+            // extension. The runtime loads the shared object lazily and reports
+            // a missing attribute as `ImportError`.
+            let base_is_unit = self.user_modules.contains_key(imported)
+                || self.is_initializing_ancestor(imported)
+                || self.late_modules.contains(imported);
+            let module_path = match self.find_extension(imported) {
+                ExtensionLookup::Found(path) if !base_is_unit => {
+                    Some(path.to_string_lossy().into_owned())
+                }
+                _ => None,
+            };
+            self.record_optional_import(
+                statement,
+                binding,
+                imported,
+                Some(member),
+                module_path.as_deref(),
+            );
+        }
+        true
     }
 
     /// Expands `from <native module> import *` into the spec's public
@@ -4738,6 +5314,66 @@ impl<'a> Lowerer<'a> {
         self.session_import_statement(stores, line, col)
     }
 
+    /// Lowers an import statement inside a `try` body whose handlers catch
+    /// `ImportError`.
+    ///
+    /// The statement is what performs the import: each name is resolved at
+    /// runtime in source order, so a module or member that is unavailable
+    /// raises `ImportError` and the handler binds the fallback, while a
+    /// successful import binds the value. CPython binds one name at a time, so
+    /// a later failure keeps the earlier bindings; the sequential stores
+    /// reproduce that. The name is a real module attribute, so the value is
+    /// always published in the runtime global table as well as in the module
+    /// local slot when one exists (a handler assignment creates it).
+    fn lower_optional_import(
+        &mut self,
+        start: usize,
+        fs: &FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let bindings = self.optional_imports.remove(&start)?;
+        let mut stores = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let value = self.deferred_import_expr(
+                &binding.module,
+                binding.member.as_deref(),
+                binding.path.as_deref(),
+                line,
+                col,
+            );
+            let Some(local) = fs.lookup(&binding.binding) else {
+                stores.push(self.session_global_store(&binding.binding, value, line, col));
+                continue;
+            };
+            // Store through the module local and publish that local, so the
+            // import runs exactly once and both the module body and importers
+            // observe one value.
+            let ty = self
+                .functions
+                .get(fs.fid as usize)
+                .and_then(|function| function.locals.get(local as usize))
+                .map(|local| local.ty)
+                .unwrap_or(Ty::Concrete(Type::Any));
+            let local_value = HExpr {
+                kind: HExprKind::Local(local),
+                ty,
+                line,
+                col,
+            };
+            stores.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: local,
+                    value,
+                },
+                line,
+                col,
+            });
+            stores.push(self.session_global_store(&binding.binding, local_value, line, col));
+        }
+        self.session_import_statement(stores, line, col)
+    }
+
     fn module_ref_expr(&self, module: &str, line: u32, col: u32) -> HExpr {
         HExpr {
             kind: HExprKind::ModuleRef {
@@ -4974,29 +5610,35 @@ impl<'a> Lowerer<'a> {
 
     /// Resolves an expression rooted at a name bound by a deferred import.
     ///
-    /// Returns the module plus the member chain: `import pkg as p` then
-    /// `p.sub.f` yields `("pkg", Some("sub.f"))`, while the bare `p` yields
-    /// `("pkg", None)`. Locals shadow the binding, like every other import.
+    /// Returns the module, the member chain and the shared object of a
+    /// compiled extension (if any): `import pkg as p` then `p.sub.f` yields
+    /// `("pkg", Some("sub.f"), None)`, while the bare `p` yields
+    /// `("pkg", None, None)`. Locals shadow the binding, like every other
+    /// import.
     fn resolve_deferred_import(
         &self,
         expr: &ast::Expr,
         fs: &FuncState,
-    ) -> Option<(String, Option<String>)> {
+    ) -> Option<(String, Option<String>, Option<String>)> {
         match expr {
             ast::Expr::Name(name) => {
                 if fs.lookup(name.id.as_str()).is_some() {
                     return None;
                 }
                 let binding = self.deferred_imports.get(name.id.as_str())?;
-                Some((binding.module.clone(), binding.member.clone()))
+                Some((
+                    binding.module.clone(),
+                    binding.member.clone(),
+                    binding.path.clone(),
+                ))
             }
             ast::Expr::Attribute(attr) => {
-                let (module, member) = self.resolve_deferred_import(&attr.value, fs)?;
+                let (module, member, path) = self.resolve_deferred_import(&attr.value, fs)?;
                 let member = match member {
                     Some(member) => format!("{member}.{}", attr.attr),
                     None => attr.attr.to_string(),
                 };
-                Some((module, Some(member)))
+                Some((module, Some(member), path))
             }
             _ => None,
         }
@@ -5004,13 +5646,14 @@ impl<'a> Lowerer<'a> {
 
     /// Builds the placeholder expression for a deferred import binding.
     ///
-    /// The value is dynamically typed and raises `RuntimeError` when evaluated;
-    /// calls wrap it in an indirect call so arguments keep normal Python
-    /// evaluation order (the callee is evaluated first, so the error wins).
+    /// The value is dynamically typed and resolves the name at runtime; calls
+    /// wrap it in an indirect call so arguments keep normal Python evaluation
+    /// order (the callee is evaluated first, so the import error wins).
     fn deferred_import_expr(
         &self,
         module: &str,
         member: Option<&str>,
+        path: Option<&str>,
         line: u32,
         col: u32,
     ) -> HExpr {
@@ -5018,6 +5661,7 @@ impl<'a> Lowerer<'a> {
             kind: HExprKind::DeferredImport {
                 module: module.to_string(),
                 member: member.map(str::to_string),
+                path: path.map(str::to_string),
             },
             ty: Ty::Concrete(Type::Any),
             line,
@@ -6936,10 +7580,11 @@ impl<'a> Lowerer<'a> {
 
         let function = self.fid_base + fid;
         let decorators = self.runtime_function_decorators(decl.decorators);
+        let annotations = self.function_annotations_expr(decl.args, decl.returns, fs, line, col);
         // A plain `def` whose binding is an ordinary local: the closure value
         // goes straight into the slot.
         if decorators.is_empty() && !fs.is_cell(target) {
-            return Some(HStmt {
+            let closure = HStmt {
                 kind: HStmtKind::Closure {
                     target,
                     function,
@@ -6947,7 +7592,31 @@ impl<'a> Lowerer<'a> {
                 },
                 line,
                 col,
-            });
+            };
+            let Some(annotations) = annotations else {
+                return Some(closure);
+            };
+            return Some(if_true_block(
+                vec![
+                    closure,
+                    HStmt {
+                        kind: HStmtKind::SetAttr {
+                            object: HExpr {
+                                kind: HExprKind::Local(target),
+                                ty: Ty::Concrete(Type::Any),
+                                line,
+                                col,
+                            },
+                            name: "__annotations__".to_string(),
+                            value: annotations,
+                        },
+                        line,
+                        col,
+                    },
+                ],
+                line,
+                col,
+            ));
         }
         // Otherwise the slot holds a cell (recursion/mutual recursion reads
         // the binding through it) or decorators run at runtime. Evaluate the
@@ -6975,6 +7644,22 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
+        if let Some(annotations) = annotations {
+            body.push(HStmt {
+                kind: HStmtKind::SetAttr {
+                    object: HExpr {
+                        kind: HExprKind::Local(function_temp),
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    },
+                    name: "__annotations__".to_string(),
+                    value: annotations,
+                },
+                line,
+                col,
+            });
+        }
         self.apply_decorator_temps(&temps, function_temp, fs, &mut body, line, col);
         body.push(HStmt {
             kind: if fs.is_cell(target) {
@@ -7112,6 +7797,83 @@ impl<'a> Lowerer<'a> {
                 self.lower_store(&s.targets[0], value, fs)?
             }
             ast::Stmt::AnnAssign(s) => {
+                // A dynamic class body executes against a namespace dict. A
+                // simple-name annotation stores its evaluated value in
+                // `__annotations__` (created on first use) and, when a value
+                // is present, also binds the name in the namespace.
+                if let (Some(ns), ast::Expr::Name(name)) =
+                    (fs.class_ns.as_ref().map(|state| state.ns), &*s.target)
+                {
+                    let annotation = self.annotation_value(&s.annotation, fs);
+                    let (annotation_temp, annotation_ref) =
+                        self.hidden_temp(fs, "$annotation", Type::Any);
+                    let key = HExpr {
+                        kind: HExprKind::Const(Const::Str("__annotations__".to_string())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    };
+                    let ensure = HExpr {
+                        kind: HExprKind::MethodCall {
+                            object: Box::new(HExpr {
+                                kind: HExprKind::Local(ns),
+                                ty: Ty::Concrete(Type::Dict),
+                                line,
+                                col,
+                            }),
+                            method: "setdefault".to_string(),
+                            args: vec![
+                                key,
+                                HExpr {
+                                    kind: HExprKind::Dict(Vec::new()),
+                                    ty: Ty::Concrete(Type::Dict),
+                                    line,
+                                    col,
+                                },
+                            ],
+                            star: None,
+                            keywords: Vec::new(),
+                            double_star: None,
+                        },
+                        ty: Ty::Concrete(Type::Dict),
+                        line,
+                        col,
+                    };
+                    let mut statements = vec![
+                        HStmt {
+                            kind: HStmtKind::Assign {
+                                target: annotation_temp,
+                                value: annotation,
+                            },
+                            line,
+                            col,
+                        },
+                        HStmt {
+                            kind: HStmtKind::SetSubscript {
+                                object: ensure,
+                                index: HExpr {
+                                    kind: HExprKind::Const(Const::Str(name.id.to_string())),
+                                    ty: Ty::Concrete(Type::Str),
+                                    line,
+                                    col,
+                                },
+                                value: annotation_ref,
+                            },
+                            line,
+                            col,
+                        },
+                    ];
+                    if let Some(value) = s.value.as_deref() {
+                        let value = self.expr(value, fs);
+                        let store = self.lower_store(&s.target, value, fs)?;
+                        statements.push(HStmt {
+                            kind: store,
+                            line,
+                            col,
+                        });
+                    }
+                    return Some(if_true_block(statements, line, col));
+                }
                 // `x: T` without a value is a declaration only.
                 let value = s.value.as_deref()?;
                 // An explicit annotation makes the target dynamically typed;
@@ -7423,6 +8185,8 @@ impl<'a> Lowerer<'a> {
                     return self.lower_conditional_function_definition(
                         &s.decorator_list,
                         fid,
+                        &s.args,
+                        s.returns.as_deref(),
                         fs,
                         line,
                         col,
@@ -7452,6 +8216,8 @@ impl<'a> Lowerer<'a> {
                     return self.lower_conditional_function_definition(
                         &s.decorator_list,
                         fid,
+                        &s.args,
+                        s.returns.as_deref(),
                         fs,
                         line,
                         col,
@@ -7465,9 +8231,18 @@ impl<'a> Lowerer<'a> {
             // table so a later fragment sees the same names; an imported unit
             // does the same so its importers can read them through the module
             // value.
+            //
+            // An import inside a `try` body guarded by an `ImportError`
+            // handler is the exception: nothing was linked, so the statement
+            // itself performs the import at runtime and the handler can bind
+            // the fallback.
             ast::Stmt::Import(s) => {
                 if fs.class_ns.is_some() {
                     return self.lower_class_body_import(&s.names, fs, line, col);
+                }
+                let statement = u32::from(s.range.start()) as usize;
+                if fs.is_module && self.optional_imports.contains_key(&statement) {
+                    return self.lower_optional_import(statement, fs, line, col);
                 }
                 if (!self.session_mode && !self.mirror_all_globals) || !fs.is_module {
                     return None;
@@ -7477,6 +8252,10 @@ impl<'a> Lowerer<'a> {
             ast::Stmt::ImportFrom(s) => {
                 if fs.class_ns.is_some() {
                     return self.lower_class_body_import_from(s, fs, line, col);
+                }
+                let statement = u32::from(s.range.start()) as usize;
+                if fs.is_module && self.optional_imports.contains_key(&statement) {
+                    return self.lower_optional_import(statement, fs, line, col);
                 }
                 if (!self.session_mode && !self.mirror_all_globals) || !fs.is_module {
                     return None;
@@ -9105,16 +9884,15 @@ impl<'a> Lowerer<'a> {
             .current_class_method
             .as_ref()
             .map(|(_, _, first)| first.clone());
-        let receiver_name = if fs.lookup("self").is_some() {
-            "self"
-        } else if fs.lookup("cls").is_some() {
-            "cls"
-        } else {
-            method_first
-                .as_deref()
-                .filter(|first| !first.is_empty() && fs.lookup(first).is_some())
-                .unwrap_or("self")
-        };
+        // The declared first parameter is authoritative: `__new__(metacls, …)`
+        // and other non-`self` receivers must bind that local, not an
+        // unrelated `cls` name that happens to be in the parameter list.
+        let receiver_name = method_first
+            .as_deref()
+            .filter(|first| !first.is_empty() && fs.lookup(first).is_some())
+            .or_else(|| fs.lookup("self").is_some().then_some("self"))
+            .or_else(|| fs.lookup("cls").is_some().then_some("cls"))
+            .unwrap_or("self");
         let Some(receiver_local) = fs.lookup(receiver_name) else {
             self.error_at_code(
                 range,
@@ -10155,6 +10933,25 @@ impl<'a> Lowerer<'a> {
                     attributes.push((attribute.clone(), value));
                 }
                 start = end;
+            }
+            // The class-shaped `__annotations__` mapping: every simple-name
+            // annotated assignment of the class body, evaluated in declaration
+            // order and published as an ordinary class attribute. An explicit
+            // `__annotations__ = ...` in the body wins, exactly like CPython's
+            // SETUP_ANNOTATIONS only filling a missing slot.
+            let has_explicit_annotations = plan
+                .attributes
+                .iter()
+                .any(|(attribute, _)| attribute == "__annotations__");
+            if !has_explicit_annotations {
+                if let Some(annotations) =
+                    self.annotations_dict_expr(Self::annotation_entries(&s.body), fs, line, col)
+                {
+                    if let Some(scope) = self.class_attr_scopes.last_mut() {
+                        scope.insert("__annotations__".to_string(), annotations.clone());
+                    }
+                    attributes.push(("__annotations__".to_string(), annotations));
+                }
             }
             self.class_attr_scopes.pop();
             // CPython publishes the PEP 695 parameter list on the class after
@@ -11304,6 +12101,8 @@ impl<'a> Lowerer<'a> {
         decorators: &[ast::Expr],
         fid: FunctionId,
         range: TextRange,
+        args: &ast::Arguments,
+        returns: Option<&ast::Expr>,
         fs: &mut FuncState,
         out: &mut Vec<HStmt>,
         line: u32,
@@ -11338,6 +12137,24 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
+        // Annotations belong to the raw function the `def` statement creates;
+        // decorators run afterwards and may replace it, exactly like CPython.
+        if let Some(annotations) = self.function_annotations_expr(args, returns, fs, line, col) {
+            out.push(HStmt {
+                kind: HStmtKind::SetAttr {
+                    object: HExpr {
+                        kind: HExprKind::Local(function_temp),
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    },
+                    name: "__annotations__".to_string(),
+                    value: annotations,
+                },
+                line,
+                col,
+            });
+        }
         self.apply_decorator_temps(&temps, function_temp, fs, out, line, col);
         let ty = Ty::Concrete(Type::Any);
         out.push(HStmt {
@@ -14346,6 +15163,14 @@ impl<'a> Lowerer<'a> {
                     .cloned()
                 {
                     attribute
+                } else if fs.is_module && self.infallible_import_functions.contains_key(name) {
+                    let id = self.infallible_import_functions[name];
+                    HExpr {
+                        kind: HExprKind::FunctionRef(id),
+                        ty: Ty::Concrete(Type::Function),
+                        line,
+                        col,
+                    }
                 } else if let Some(local) = fs.lookup(name) {
                     let ty = self.infer.fresh();
                     self.local_read(fs, local, ty, line, col)
@@ -14456,7 +15281,14 @@ impl<'a> Lowerer<'a> {
                 } else if let Some(binding) = self.deferred_imports.get(name) {
                     let module = binding.module.clone();
                     let member = binding.member.clone();
-                    self.deferred_import_expr(&module, member.as_deref(), line, col)
+                    let path = binding.path.clone();
+                    self.deferred_import_expr(
+                        &module,
+                        member.as_deref(),
+                        path.as_deref(),
+                        line,
+                        col,
+                    )
                 } else if self.session_mode && self.global_names.contains(name) {
                     // A session name shadows builtins, functions and exception
                     // classes: in a REPL `list = ...` or `ValueError = ...`
@@ -14871,8 +15703,14 @@ impl<'a> Lowerer<'a> {
                         col,
                     };
                 }
-                if let Some((module, member)) = self.resolve_deferred_import(e, fs) {
-                    return self.deferred_import_expr(&module, member.as_deref(), line, col);
+                if let Some((module, member, path)) = self.resolve_deferred_import(e, fs) {
+                    return self.deferred_import_expr(
+                        &module,
+                        member.as_deref(),
+                        path.as_deref(),
+                        line,
+                        col,
+                    );
                 }
                 let object = self.expr(&a.value, fs);
                 HExpr {
@@ -16730,8 +17568,14 @@ impl<'a> Lowerer<'a> {
                     }
                     return self.extension_call(&path, attr.attr.as_str(), call, fs, line, col);
                 }
-                if let Some((module, member)) = self.resolve_deferred_import(&call.func, fs) {
-                    let callee = self.deferred_import_expr(&module, member.as_deref(), line, col);
+                if let Some((module, member, path)) = self.resolve_deferred_import(&call.func, fs) {
+                    let callee = self.deferred_import_expr(
+                        &module,
+                        member.as_deref(),
+                        path.as_deref(),
+                        line,
+                        col,
+                    );
                     if !call.keywords.is_empty() {
                         let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
                             return self.error_expr(call.range);
@@ -16856,7 +17700,10 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        if let Some(local) = fs.lookup(name) {
+        if let Some(local) = fs
+            .lookup(name)
+            .filter(|_| !(fs.is_module && self.infallible_import_functions.contains_key(name)))
+        {
             // A class of this unit reorders keywords into its `__init__`
             // parameter slots and fills omitted defaults at compile time.
             // Only the module body holds the class value directly; inside a
@@ -17213,6 +18060,7 @@ impl<'a> Lowerer<'a> {
             let callee = self.deferred_import_expr(
                 &binding.module,
                 binding.member.as_deref(),
+                binding.path.as_deref(),
                 callee_line,
                 callee_col,
             );
@@ -17358,6 +18206,18 @@ impl<'a> Lowerer<'a> {
             // builtin function value as the callee.
             if builtin == Builtin::Zip && !call.keywords.is_empty() {
                 return self.lower_zip_keywords(call, fs, line, col);
+            }
+            // `type(name, bases, namespace, **kwds)`: every keyword name is a
+            // class-header keyword forwarded to the metaclass resolved from
+            // the bases (`EnumType.__new__(..., boundary=..., _simple=...)`),
+            // so the call goes through the runtime keyword binder. The runtime
+            // rejects keywords on the one-argument form and duplicate names.
+            // `*`/`**` operands need runtime flattening first.
+            if builtin == Builtin::Type && !call.keywords.is_empty() {
+                if call_has_dynamic_arguments(call) {
+                    return self.lower_dynamic_call(call, fs, line, col);
+                }
+                return self.lower_type_keywords(call, fs, line, col);
             }
             // `__import__(name, globals=, locals=, fromlist=, level=)`: CPython
             // 3.14 names all five parameters, so the call goes through the
@@ -18890,6 +19750,64 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Lower `type(name, bases, namespace, **kwds)` to the runtime keyword
+    /// binder (`hydro_call_kw` on the builtin value).
+    ///
+    /// The class-header keywords are not declared parameters: CPython forwards
+    /// them to the metaclass selected from `bases`, so every name is kept in
+    /// source order. The runtime rejects a keyword on the one-argument form
+    /// and duplicate names, and reports a metaclass `__new__`/`__init__` that
+    /// does not accept them.
+    fn lower_type_keywords(
+        &mut self,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let Some(args) = self.plain_call_args(call, fs) else {
+            return self.error_expr(call.range);
+        };
+        let mut keywords: Vec<(String, HExpr)> = Vec::with_capacity(call.keywords.len());
+        for keyword in &call.keywords {
+            let Some(name) = keyword.arg.as_ref() else {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    "type() does not accept **mapping arguments in this position",
+                );
+                continue;
+            };
+            if keywords
+                .iter()
+                .any(|(existing, _)| existing.as_str() == name.as_str())
+            {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!("type() got multiple values for keyword argument '{name}'"),
+                );
+                continue;
+            }
+            keywords.push((name.to_string(), self.expr(&keyword.value, fs)));
+        }
+        HExpr {
+            kind: HExprKind::CallKw {
+                callee: Box::new(HExpr {
+                    kind: HExprKind::BuiltinRef(Builtin::Type),
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                }),
+                args,
+                keywords,
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
     /// Lower `__import__(name, globals=..., locals=..., fromlist=..., level=...)`
     /// to the runtime keyword binder (`hydro_call_kw` on the builtin value).
     ///
@@ -19112,14 +20030,8 @@ impl<'a> Lowerer<'a> {
                 slots[index] = Some(self.expr(&keyword.value, fs));
                 provided = provided.max(index + 1);
             }
-            if provided == 0 {
-                self.error_at_code(
-                    call.range,
-                    codes::CALL,
-                    "property() takes at least 1 argument",
-                );
-                return None;
-            }
+            // `property()` with no arguments builds a blank descriptor; the
+            // slots stay unset and attributes are assigned afterwards.
             return Some(
                 slots
                     .into_iter()
@@ -20766,6 +21678,21 @@ pub(crate) fn collect_source_bound_names(
             _ => {}
         }
     }
+}
+
+/// Whether the unit enables `from __future__ import annotations`.
+fn module_uses_future_annotations(body: &[ast::Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        ast::Stmt::ImportFrom(s) => {
+            s.module
+                .as_ref()
+                .is_some_and(|module| module.as_str() == "__future__")
+                && s.names
+                    .iter()
+                    .any(|alias| alias.name.as_str() == "annotations")
+        }
+        _ => false,
+    })
 }
 
 /// Name bound by one `import` alias (`import a.b` binds `a` unless renamed).

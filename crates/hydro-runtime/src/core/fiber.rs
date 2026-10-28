@@ -36,6 +36,7 @@
 use std::alloc::{self, Layout};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR};
@@ -425,6 +426,15 @@ pub(crate) struct FiberState {
     /// [`suspend_switch`]/[`finish_switch`], so the caller's frames stay
     /// scannable while its native stack is inactive.
     pub(crate) caller_roots: SavedRoots,
+    /// Frame-introspection records of this fiber while it is suspended.
+    ///
+    /// Python frames are thread state, not process state; a suspended fiber's
+    /// activations must not appear on the resumer's stack. The records are
+    /// swapped exactly like [`FiberState::saved_roots`], so `f_back` chains and
+    /// `sys._getframe` depths stay within the context that is running.
+    pub(crate) saved_frames: Vec<Arc<exc::FrameData>>,
+    /// Frame records of the resumer while this fiber runs.
+    pub(crate) caller_frames: Vec<Arc<exc::FrameData>>,
 }
 
 impl FiberState {
@@ -473,6 +483,8 @@ impl FiberState {
             finish_seq: 0,
             saved_roots: SavedRoots::default(),
             caller_roots: SavedRoots::default(),
+            saved_frames: Vec::new(),
+            caller_frames: Vec::new(),
         });
         // The three ranges stay valid until `Drop`; registering them once
         // keeps the per-resume path free of global-registry work.
@@ -644,6 +656,10 @@ unsafe fn finish_switch(ptr: *mut FiberState) {
         let _ = roots::take_current();
         let caller = std::mem::take(&mut (*ptr).caller_roots);
         let _ = roots::install(caller);
+        // The fiber's activations are dead with its stack; restore the
+        // resumer's frame stack before its native context runs again.
+        let _ = exc::take_frames();
+        exc::install_frames(std::mem::take(&mut (*ptr).caller_frames));
         // The context must never be resumed once the body returned. Save the
         // fiber's (dead) continuation into its own slot and switch to the
         // resumer (`caller_ctx`).
@@ -674,6 +690,10 @@ unsafe fn suspend_switch(ptr: *mut FiberState) {
         (*ptr).saved_roots = roots::take_current();
         let caller = std::mem::take(&mut (*ptr).caller_roots);
         let _ = roots::install(caller);
+        // Park this fiber's frame records where a retained frame object can
+        // still reach them, and make the resumer's stack current again.
+        (*ptr).saved_frames = exc::take_frames();
+        exc::install_frames(std::mem::take(&mut (*ptr).caller_frames));
         // Save the fiber's continuation into `ctx` and switch back to the
         // resumer (`caller_ctx`).
         switch_from_fiber(ptr);
@@ -736,6 +756,10 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
         // native stack is inactive.
         (*ptr).caller_roots = roots::take_current();
         let _ = roots::install(std::mem::take(&mut (*ptr).saved_roots));
+        // Frame records follow the same split: `sys._getframe` inside the
+        // fiber must not observe the resumer's activations.
+        (*ptr).caller_frames = exc::take_frames();
+        exc::install_frames(std::mem::take(&mut (*ptr).saved_frames));
         let outer = CURRENT.with(|cell| cell.replace(Some(CurrentFiber { ptr, value })));
         // Resume: save the caller's continuation into `caller_ctx` and switch
         // to the fiber's `ctx` (the trampoline entry on first resume, the

@@ -10,8 +10,8 @@ use num_bigint::BigInt;
 use crate::container;
 use crate::core::globals;
 use crate::exc::{
-    self, NAME_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, SYNTAX_ERROR,
-    TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
+    self, ATTRIBUTE_ERROR, IMPORT_ERROR, NAME_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR,
+    OVERFLOW_ERROR, RUNTIME_ERROR, SYNTAX_ERROR, TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
 };
 use crate::format;
 use crate::iter;
@@ -716,7 +716,8 @@ pub(crate) fn callable(v: i64) -> i64 {
     value::bool_value(
         value::as_function(v).is_some()
             || value::as_class(v).is_some()
-            || value::as_ext_function(v).is_some(),
+            || value::as_ext_function(v).is_some()
+            || modules::extension::ext_object_is_callable(v),
     )
 }
 
@@ -1380,7 +1381,18 @@ fn super_unbound(class: i64) -> i64 {
 /// dispatched by [`call_builtin`], native module functions by
 /// [`crate::modules`] with the same arity and argument-buffer checks.
 pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
+    // Opaque extension values are extension callables (types construct through
+    // their own `tp_new`, instances through `__call__`).
+    if value::as_ext_object(function).is_some() {
+        return modules::extension::ext_object_call(function, argc, argv);
+    }
     if value::as_class(function).is_some() {
+        // A Hydro class deriving from an extension type has no C-layout
+        // instance of its own; construction defers to the extension base's
+        // `tp_new`/vectorcall.
+        if let Some(base) = value::extension_class_base(function) {
+            return modules::extension::ext_object_call(base, argc, argv);
+        }
         return instantiate(function, argc, argv);
     }
     if let Some(state) = value::as_ext_function(function) {
@@ -1932,8 +1944,14 @@ pub(crate) fn call_kw(
             "keyword arguments were passed without an argument buffer",
         );
     }
+    if value::as_ext_object(function).is_some() {
+        return modules::extension::ext_object_call_kw(function, argc, argv, kwargc, kw_argv);
+    }
     if value::as_class(function).is_some() {
         let class = function;
+        if let Some(base) = value::extension_class_base(class) {
+            return modules::extension::ext_object_call_kw(base, argc, argv, kwargc, kw_argv);
+        }
         let args = if argc == 0 {
             Vec::new()
         } else {
@@ -2008,6 +2026,23 @@ pub(crate) fn call_kw(
         let _ =
             methods::call_user_method(instance, class, kind, init, "__init__", &args, &keywords);
         return if exc::pending() { NONE } else { instance };
+    }
+    // An instance with a `__call__` accepts keywords through the method
+    // binder, exactly like its positional call path. This is how a
+    // `functools.singledispatch` dispatcher forwards `**kwargs` to the
+    // selected implementation.
+    if let Some(instance) = value::as_instance(function) {
+        if value::class_lookup(instance.class, "__call__").is_some() {
+            return methods::call_kw(
+                function,
+                b"__call__".as_ptr(),
+                "__call__".len(),
+                argc,
+                argv,
+                kwargc,
+                kw_argv,
+            );
+        }
     }
     if let Some(func) = value::as_function(function) {
         if let FunctionBody::BoundMethod { receiver, method } = &func.body {
@@ -2217,6 +2252,43 @@ pub(crate) fn call_kw(
     // entry points expect; every other builtin rejects keywords (matching its
     // direct call lowering).
     if let FunctionBody::Builtin(builtin) = &func.body {
+        // `type(name, bases, namespace, **kwds)`: CPython forwards the
+        // class-header keywords to the metaclass resolved from the bases
+        // (`EnumType.__new__(..., boundary=..., _simple=...)`). `type(x, **kw)`
+        // has no keyword parameters and is rejected.
+        if matches!(builtin, Builtin::Type) {
+            let mut keywords: Vec<(String, i64)> = Vec::with_capacity(kwargc);
+            if kwargc > 0 {
+                if kw_argv.is_null() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "keyword arguments were passed without an argument buffer",
+                    );
+                }
+                // SAFETY: `kw_argv` holds `2 * kwargc` readable values.
+                let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+                for pair in pairs.as_chunks::<2>().0 {
+                    let Some(keyword) = value::as_str(pair[0]) else {
+                        return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                    };
+                    if keywords
+                        .iter()
+                        .any(|(existing, _)| existing.as_str() == keyword)
+                    {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("type() got multiple values for keyword argument '{keyword}'"),
+                        );
+                    }
+                    keywords.push((keyword.to_string(), pair[1]));
+                }
+            }
+            let roots_source: Vec<i64> = keywords.iter().map(|(_, item)| *item).collect();
+            let roots = crate::heap::root_values(&roots_source);
+            let result = type_build_kw(argc, argv, &keywords);
+            crate::heap::release_roots(roots);
+            return result;
+        }
         // `dict([source], **kwargs)`: CPython builds the mapping from the
         // optional positional source and then layers the keyword arguments on
         // top, with later keys winning. The keyword names are not declared
@@ -2633,13 +2705,28 @@ pub(crate) fn call_full_entry(entry: usize, args: &[i64]) -> i64 {
 ///   preloaded, otherwise an attribute of `pkg` (a function, class or
 ///   constant), and finally the module registry again for dotted attribute
 ///   chains (`from pkg import sub.value`);
-/// - a name that is not registered raises `ModuleNotFoundError` carrying the
-///   exact dotted name, so `except ImportError` handlers run with CPython's
-///   error taxonomy.
+/// - a compiled extension named by `path` materialises its module value, and
+///   `from ext import member` reads the extension attribute lazily;
+/// - a module that is not registered raises `ModuleNotFoundError` carrying the
+///   exact name, while a member an existing module does not provide raises
+///   `ImportError` (`cannot import name '<member>' from '<module>'`), so
+///   `except ImportError` handlers run with CPython's error taxonomy. A
+///   parent that never published `__name__` is still initializing, so the
+///   missing name is reported as the dotted submodule it names (NumPy probes
+///   `numpy._core` this way).
 ///
 /// The returned `None` is only the pending-exception placeholder for
 /// generated code.
-pub(crate) fn deferred_import(module: &str, member: Option<&str>) -> i64 {
+pub(crate) fn deferred_import(module: &str, member: Option<&str>, path: Option<&str>) -> i64 {
+    if let Some(path) = path {
+        // A compiled extension: the module value is materialised lazily (and
+        // cached under its import name), so an attribute read loads the shared
+        // object through the extension ABI exactly like `ext.member`.
+        return match member {
+            Some(member) => modules::extension::import_member(module, path, member),
+            None => modules::extension_module_value(module, path),
+        };
+    }
     let Some(member) = member else {
         return match modules::registry_lookup(module) {
             Some(value) => value,
@@ -2673,11 +2760,26 @@ pub(crate) fn deferred_import(module: &str, member: Option<&str>) -> i64 {
                 None => value,
             };
         }
-        // Native modules resolve their members on demand from the central
-        // spec, exactly like `getattr(module, name)`.
-        if stdlib::module(&current).is_some() {
+        // The base module exists: a name it does not provide is a failed
+        // `from ... import`, not a missing module. Native modules resolve
+        // their members on demand from the central spec, exactly like
+        // `getattr(module, name)`.
+        if modules::registry_lookup(&current).is_some() || stdlib::module(&current).is_some() {
             let value = modules::module_get_by_name(&current, head);
             if exc::pending() {
+                // `module_get_by_name` reports the missing attribute as
+                // `AttributeError`; a failed from-import is an `ImportError`.
+                if exc::pending_tag() == i64::from(ATTRIBUTE_ERROR) {
+                    exc::clear();
+                    // A module that never published `__name__` is not fully
+                    // initialized: the name was really a submodule import
+                    // (NumPy probes `numpy._core` before its package is
+                    // loaded), so report the dotted module that is missing.
+                    if !is_initialized_module(&current) {
+                        return module_not_found(&full);
+                    }
+                    return cannot_import_name(head, &current);
+                }
                 return NONE;
             }
             return match tail {
@@ -2685,8 +2787,38 @@ pub(crate) fn deferred_import(module: &str, member: Option<&str>) -> i64 {
                 None => value,
             };
         }
-        return module_not_found(&full);
+        return module_not_found(&current);
     }
+}
+
+/// Whether `module` is an initialized module.
+///
+/// A native module has a central spec. A compiled unit publishes its
+/// `__name__` into the runtime global table when it initializes, so a module
+/// that only has incidental globals is still initializing (or never loaded)
+/// and its namespace is not authoritative for import resolution.
+fn is_initialized_module(module: &str) -> bool {
+    stdlib::module(module).is_some() || globals::try_get(module, "__name__").is_some()
+}
+
+/// Raises `ImportError: cannot import name '<member>' from '<module>'`.
+///
+/// This is the error CPython reports for `from <module> import <member>` when
+/// the module exists but does not provide the name, so a `try`/`except
+/// ImportError` fallback runs. The `name` keyword stores the module name, like
+/// the interpreter's own from-import failure.
+pub(crate) fn cannot_import_name(member: &str, module: &str) -> i64 {
+    let message = format!("cannot import name '{member}' from '{module}'");
+    let missing = value::str_alloc(module.to_string());
+    let roots = crate::heap::root_values(&[missing]);
+    let exception = exc::exception_value_with_keywords(
+        IMPORT_ERROR,
+        &message,
+        vec![message.clone()],
+        vec![("name".to_string(), missing)],
+    );
+    crate::heap::release_roots(roots);
+    exc::raise_value(exception)
 }
 
 /// Follows a dotted attribute path from `value`, propagating the pending
@@ -2910,6 +3042,13 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return exc::raise_with_message(TYPE_ERROR, "class instantiation has too many arguments");
     }
+    // The universal base class has CPython's zero-argument constructor.
+    if value::is_object_class(class) {
+        if argc == 0 {
+            return value::instance_new(class);
+        }
+        return exc::raise_with_message(TYPE_ERROR, "object() takes no arguments");
+    }
     // `types.CellType` is a plain native class with one optional initial
     // value. Its cached class value is callable through the normal class
     // path, so route it to the cell constructor before generic instantiation
@@ -3078,7 +3217,38 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
 /// (see [`value::class_new_multi`]). Functions in the namespace become normal
 /// methods; every other value is a class attribute.
 fn type_three_arg(name: i64, bases: i64, namespace: i64) -> i64 {
-    type_new_impl(NONE, name, bases, namespace, true)
+    type_new_impl(NONE, name, bases, namespace, true, &[])
+}
+
+/// `type(name, bases, namespace, **kwds)`: CPython forwards the class-header
+/// keywords to the metaclass selected from `bases`, so
+/// `EnumType.__new__(..., boundary=..., _simple=...)` sees them.
+fn type_three_arg_kw(name: i64, bases: i64, namespace: i64, keywords: &[(String, i64)]) -> i64 {
+    type_new_impl(NONE, name, bases, namespace, true, keywords)
+}
+
+/// Keyword form of the three-argument `type(...)` call (`hydro_call_kw` on the
+/// builtin value). CPython's `type(x, **kwds)` has no keyword parameters.
+fn type_build_kw(argc: usize, argv: *const i64, keywords: &[(String, i64)]) -> i64 {
+    let args: &[i64] = if argc == 0 {
+        &[]
+    } else {
+        // SAFETY: ABI contract: `argv` points at `argc` readable values.
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    };
+    type_build_keywords(args, keywords)
+}
+
+/// Keyword form of `type(...)` over a decoded argument slice, shared by the
+/// builtin value path and the `builtins` module dispatcher.
+pub(crate) fn type_build_keywords(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if args.len() == 1 {
+        return exc::raise_with_message(TYPE_ERROR, "type() takes no keyword arguments");
+    }
+    if args.len() != 3 {
+        return builtin_arity_error("type", "1 or 3", args.len());
+    }
+    type_three_arg_kw(args[0], args[1], args[2], keywords)
 }
 
 /// `type.__new__(metaclass, name, bases, namespace)`: the underlying class
@@ -3090,10 +3260,17 @@ fn type_three_arg(name: i64, bases: i64, namespace: i64) -> i64 {
 /// would recurse. The metaclass must be a class (or the `type` builtin, which
 /// denotes the native `type` class).
 pub(crate) fn type_new(metaclass: i64, name: i64, bases: i64, namespace: i64) -> i64 {
-    type_new_impl(metaclass, name, bases, namespace, false)
+    type_new_impl(metaclass, name, bases, namespace, false, &[])
 }
 
-fn type_new_impl(metaclass: i64, name: i64, bases: i64, namespace: i64, run_hooks: bool) -> i64 {
+fn type_new_impl(
+    metaclass: i64,
+    name: i64,
+    bases: i64,
+    namespace: i64,
+    run_hooks: bool,
+    keywords: &[(String, i64)],
+) -> i64 {
     // `type.__new__` names itself in argument diagnostics; the builtin
     // three-argument constructor keeps `type()`.
     let context = if run_hooks {
@@ -3188,7 +3365,7 @@ fn type_new_impl(metaclass: i64, name: i64, bases: i64, namespace: i64, run_hook
         }
     }
     if run_hooks {
-        value::class_new_multi(name_text, base_values, metaclass, methods, attrs)
+        value::class_new_multi_kw(name_text, base_values, metaclass, methods, attrs, keywords)
     } else {
         value::class_new_multi_without_hooks(name_text, base_values, metaclass, methods, attrs)
     }
@@ -3286,25 +3463,34 @@ fn dir_value(object: i64) -> i64 {
         }
         names.push("__name__".to_string());
         names.push("__dict__".to_string());
-        match stdlib::module(&module_name) {
-            Some(spec) => {
-                names.extend(spec.functions.iter().map(|f| f.name.to_string()));
-                names.extend(spec.constants.iter().map(|c| c.name.to_string()));
-                if module_name == "builtins" {
-                    names.push("eval".to_string());
-                    names.push("exec".to_string());
-                }
+        if let Some(exported) = modules::module_attr_names(module) {
+            // Compiled extension module: `dir` enumerates the exact table
+            // `getattr`/`hasattr` read.
+            match exported {
+                Ok(exported) => names.extend(exported),
+                Err(message) => return modules::extension::raised_error(&message),
             }
-            None => {
-                // Compiled user module: a PEP 562 `__dir__` wins over the
-                // namespace enumeration, exactly like CPython's `dir()`.
-                if let Some(result) = modules::module_dir_value(&module_name) {
-                    return result;
+        } else {
+            match stdlib::module(&module_name) {
+                Some(spec) => {
+                    names.extend(spec.functions.iter().map(|f| f.name.to_string()));
+                    names.extend(spec.constants.iter().map(|c| c.name.to_string()));
+                    if module_name == "builtins" {
+                        names.push("eval".to_string());
+                        names.push("exec".to_string());
+                    }
                 }
-                // Otherwise the globals side store plus any names bound
-                // dynamically through its `globals()` view.
-                names.extend(globals::names(&module_name));
-                names.extend(globals::view_names(&module_name));
+                None => {
+                    // Compiled user module: a PEP 562 `__dir__` wins over the
+                    // namespace enumeration, exactly like CPython's `dir()`.
+                    if let Some(result) = modules::module_dir_value(&module_name) {
+                        return result;
+                    }
+                    // Otherwise the globals side store plus any names bound
+                    // dynamically through its `globals()` view.
+                    names.extend(globals::names(&module_name));
+                    names.extend(globals::view_names(&module_name));
+                }
             }
         }
         // Program assignments are attributes too, even when the name is not in
@@ -4423,14 +4609,18 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [target] => value::staticmethod_new(*target),
             _ => builtin_arity_error("staticmethod", "exactly one", argc),
         },
-        // `property(fget[, fset[, fdel[, doc]]])`. The doc argument is
-        // accepted and not stored (Hydro function values carry no docstring).
+        // `property([fget[, fset[, fdel[, doc]]]])`. A blank `property()` is a
+        // real descriptor whose slots are `None` and which accepts attribute
+        // assignment afterwards (`enum` builds redirect descriptors that way).
+        // The doc argument is accepted and not stored (Hydro function values
+        // carry no docstring).
         Builtin::Property => match args {
+            [] => value::property_new(NONE, NONE, NONE),
             [getter] => value::property_new(*getter, NONE, NONE),
             [getter, setter] => value::property_new(*getter, *setter, NONE),
             [getter, setter, deleter] => value::property_new(*getter, *setter, *deleter),
             [getter, setter, deleter, _doc] => value::property_new(*getter, *setter, *deleter),
-            _ => builtin_arity_error("property", "1 to 4", argc),
+            _ => builtin_arity_error("property", "0 to 4", argc),
         },
         Builtin::Zip => zip(argc, argv),
         Builtin::Set => match args {
@@ -5269,6 +5459,7 @@ pub(crate) fn sorted(argc: usize, argv: *const i64) -> i64 {
         && value::as_function(key).is_none()
         && value::as_class(key).is_none()
         && value::as_ext_function(key).is_none()
+        && !modules::extension::ext_object_is_callable(key)
     {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -5646,6 +5837,15 @@ fn type_check(value: i64, target: i64) -> Option<bool> {
     if target == NONE {
         return Some(value == NONE);
     }
+    // An extension type object participates through the extension's own
+    // type hierarchy (`PyObject_IsInstance`).
+    if value::as_ext_object(target).is_some() {
+        let result = modules::extension::ext_object_isinstance(value, target);
+        if exc::pending() {
+            return Some(false);
+        }
+        return Some(result == value::bool_value(true));
+    }
     if value::as_class(target).is_some() {
         return Some(instance_of(value, target));
     }
@@ -5752,6 +5952,11 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
         // `types.FunctionType`: every function value (`def`, lambda,
         // builtin/bound/native) reports the cached `function` type name.
         "function" => value::as_function(value).is_some(),
+        // Native descriptor/module/iterator classes are spellings of builtin
+        // function values rather than class objects; their runtime type name
+        // is still the CPython class name.
+        "staticmethod" | "classmethod" | "property" | "module" | "method" | "generator"
+        | "frame" | "code" => value::type_name(value) == name,
         "object" => true,
         "type" => value::as_class(value).is_some(),
         _ => return None,
@@ -5846,6 +6051,12 @@ fn instance_of(value: i64, class: i64) -> bool {
     if let Some(file) = value::as_file(value) {
         let actual = crate::modules::io_file_class(file.class());
         return value::class_mro(actual).contains(&class);
+    }
+    // An opaque extension handle is an instance of every Hydro class whose
+    // base chain contains the extension type it was constructed from.
+    if value::is_ext_object(value) && modules::extension::ext_object_is_hydro_subclass(value, class)
+    {
+        return true;
     }
     // Non-instance values match only the cached native primitive classes
     // (`type(x)`), which `named_type_check` resolves by name.
@@ -8728,6 +8939,9 @@ mod tests {
 
     #[test]
     fn globals_view_reads_the_store_and_publishes_dynamic_writes() {
+        // The global store is process-wide: hold the runtime-state lock while
+        // resetting it and asserting on this module's entries.
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         globals::set("mod", "counter", int(7));
@@ -8760,6 +8974,7 @@ mod tests {
 
     #[test]
     fn vars_and_dir_expose_real_namespaces() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         exc::init();
         globals::reset();
         let class = value::class_new_full(
@@ -8798,6 +9013,7 @@ mod tests {
 
     #[test]
     fn eval_supports_literals_and_names_and_fails_loudly() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         exc::init();
         globals::reset();
         assert_eq!(
@@ -8878,6 +9094,7 @@ mod tests {
 
     #[test]
     fn deferred_import_resolves_registered_modules_by_exact_name() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
         globals::reset();
         exc::init();
         // A compiled module is registered by the `__name__` global its
@@ -8887,13 +9104,13 @@ mod tests {
         globals::set("pkg.sub", "value", int(7));
 
         // Module alias (`import pkg.sub as s`).
-        let module = deferred_import("pkg.sub", None);
+        let module = deferred_import("pkg.sub", None, None);
         assert!(!exc::pending());
         assert_eq!(value::as_module(module).map(|m| m.name()), Some("pkg.sub"));
 
         // `from pkg import sub` returns the preloaded submodule, not an
         // attribute of the package.
-        let submodule = deferred_import("pkg", Some("sub"));
+        let submodule = deferred_import("pkg", Some("sub"), None);
         assert!(!exc::pending());
         assert_eq!(
             value::as_module(submodule).map(|m| m.name()),
@@ -8901,21 +9118,91 @@ mod tests {
         );
 
         // `from pkg.sub import value` returns the module attribute.
-        let attribute = deferred_import("pkg.sub", Some("value"));
+        let attribute = deferred_import("pkg.sub", Some("value"), None);
         assert!(!exc::pending());
         assert_eq!(value::as_integer(attribute), Some(7));
 
-        // A missing submodule reports the exact dotted name.
+        // A member the package does not provide is a failed from-import: the
+        // module exists, so the error is `ImportError`, exactly like CPython.
         exc::clear();
-        assert_eq!(deferred_import("pkg", Some("missing")), NONE);
-        assert_eq!(exc::pending_tag(), exc::MODULE_NOT_FOUND_ERROR as i64);
-        assert_eq!(pending_message(), "No module named 'pkg.missing'");
+        assert_eq!(deferred_import("pkg", Some("missing"), None), NONE);
+        assert_eq!(exc::pending_tag(), exc::IMPORT_ERROR as i64);
+        assert_eq!(pending_message(), "cannot import name 'missing' from 'pkg'");
 
         // A missing module alias reports its own exact name.
         exc::clear();
-        assert_eq!(deferred_import("nowhere", None), NONE);
+        assert_eq!(deferred_import("nowhere", None, None), NONE);
         assert_eq!(exc::pending_tag(), exc::MODULE_NOT_FOUND_ERROR as i64);
         assert_eq!(pending_message(), "No module named 'nowhere'");
+
+        globals::reset();
+        exc::init();
+    }
+
+    #[test]
+    fn deferred_import_reports_missing_native_members_as_import_errors() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        globals::reset();
+        exc::init();
+
+        // `from _socket import NOPE`: the native module exists, so a missing
+        // member is an `ImportError` that an `except ImportError` handler
+        // catches, not an `AttributeError`.
+        assert_eq!(deferred_import("_socket", Some("NOPE"), None), NONE);
+        assert_eq!(exc::pending_tag(), exc::IMPORT_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "cannot import name 'NOPE' from '_socket'"
+        );
+        exc::clear();
+
+        // A member the spec provides still resolves to its runtime value.
+        let function = deferred_import("_socket", Some("gethostname"), None);
+        assert!(!exc::pending());
+        assert!(value::as_function(function).is_some());
+
+        globals::reset();
+        exc::init();
+    }
+
+    #[test]
+    fn deferred_import_of_an_extension_module_value_keeps_its_path() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        globals::reset();
+        exc::init();
+
+        // Without a loadable shared object, the module value itself is still
+        // materialised lazily under its import name.
+        let module = deferred_import("ext", None, Some("/nonexistent/ext.abi3.so"));
+        assert!(!exc::pending());
+        assert_eq!(value::as_module(module).map(|m| m.name()), Some("ext"));
+        exc::clear();
+
+        // `from ext import member` must load the shared object; a failure is
+        // an `ImportError` (not the `RuntimeError` a plain attribute read
+        // reports), so an optional-import handler catches it.
+        assert_eq!(
+            deferred_import("ext", Some("NOPE"), Some("/nonexistent/ext.abi3.so")),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), exc::IMPORT_ERROR as i64);
+
+        globals::reset();
+        exc::init();
+    }
+
+    #[test]
+    fn cannot_import_name_reports_the_cpython_message() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        globals::reset();
+        exc::init();
+
+        assert_eq!(cannot_import_name("NOPE", "_socket"), NONE);
+        assert_eq!(exc::pending_tag(), exc::IMPORT_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "cannot import name 'NOPE' from '_socket'"
+        );
 
         globals::reset();
         exc::init();

@@ -196,10 +196,12 @@ See the Tea repository for the complete command reference, flavor storage
 - Native modules (see below) and **user modules**: `import foo` /
   `from foo import f` resolve a sibling file, a package (`foo/__init__.py`),
   dotted and relative submodules, `HYDRO_SITE_PACKAGES`, venv/conda
-  site-packages or `PYTHONPATH`. Each unit loads once per canonical path,
-  imported module bodies run once as initializers, and import cycles are
-  diagnosed. `from x import *` and a general `sys.modules`/`sys.path` model
-  are missing.
+  site-packages, `PYTHONPATH`, `HYDRO_STDLIB` (a CPython `Lib` tree) and
+  finally the pure-Python modules vendored in the repository's `stdlib/`
+  directory, so explicit roots always win over the vendored tree. Each unit
+  loads once per canonical path, imported module bodies run once as
+  initializers, and import cycles are diagnosed. `from x import *` and a
+  general `sys.modules`/`sys.path` model are missing.
 - Standard-library modules are first-class values (`m = errno`,
   `getattr(errno, name)`) and expose their constants through `hydro_module_get`.
   Module-level assignments are visible inside functions and methods.
@@ -217,7 +219,7 @@ See the Tea repository for the complete command reference, flavor storage
 `Pattern`/`Match`), `socket` (blocking TCP), `random`, `platform`,
 `statistics`, `pathlib`, `_thread`, `threading`, `queue`, `multiprocessing`,
 `pickle`, `asyncio` (only `run`/`sleep`/`gather`), `errno` (full Linux
-constant table, `errorcode`, module `__dict__`), `typing`, `abc`, `enum`,
+constant table, `errorcode`, module `__dict__`), `typing`, `abc`,
 `types`, `itertools`, `ast`, `fractions`, `importlib`, `__future__`,
 `dataclasses`, `datetime`, `contextlib`, `html`, a minimal `unittest`
 (`TestCase` + runner via `main`, native assertions), and Batch A of the
@@ -226,6 +228,10 @@ plus the `_bisect`/`_heapq`/`_stat`/`_operator`/`_functools`/`_io` aliases
 and `binascii`, `base64`, `quopri`, `fnmatch`, `getopt`, `mimetypes`,
 plus the benchmark-critical `subprocess`, `tempfile`, `shutil`, `textwrap`,
 `timeit`).
+
+`enum` is not native: CPython 3.14.9's `Lib/enum.py` is vendored verbatim in
+`stdlib/enum.py` (PSF license notice in `stdlib/LICENSE`), so `Enum`,
+`IntEnum`, `IntFlag`, `Flag`, `StrEnum` and `auto()` follow CPython semantics.
 
 **Concurrency and memory**
 

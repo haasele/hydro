@@ -695,18 +695,25 @@ third argument.
   `getattr(module, name)` works. User/extension module values remain
   diagnostics; unknown members are compile-time diagnostics.
   Module-level simple-name assignments that are read by a function are
-  mirrored into a keyed global store (`GlobalSet`/`GlobalGet`,
+  mirrored into a process-wide keyed global store (`GlobalSet`/`GlobalGet`,
   `hydro_global_set`/`hydro_global_get`); other module locals remain invisible
-  inside functions. Imported units mirror every export because an importer may
-  read any name; the entry module mirrors only names its own functions read
-  (precomputed before lowering), so top-level loops do not emit a global store
-  per iteration.
+  inside functions. The store is shared by every thread, like a CPython module
+  dictionary, and its values are process-wide GC roots. Imported units mirror
+  every export because an importer may read any name; the entry module mirrors
+  only names its own functions read (precomputed before lowering), so top-level
+  loops do not emit a global store per iteration.
 - **User modules and packages** (Phase 2.30; package loader extended in the
   P7 checkpoint): `import foo` / `from foo import f` resolve `foo.py` and
   packages (`foo/__init__.py`), including dotted names, submodules and
   relative imports. Search order: sibling files, the package-chain root,
   `HYDRO_SITE_PACKAGES`, the `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages trees,
-  then `PYTHONPATH`. The loader loads every unit **once per canonical path**
+  `PYTHONPATH`, `HYDRO_STDLIB` (a CPython `Lib` tree) and finally the
+  pure-Python modules vendored in Hydro's `stdlib/` directory. Explicit roots
+  therefore win over the vendored tree. The vendored root is resolved relative
+  to the executable for installed layouts (`<exe dir>/stdlib`, or
+  `<prefix>/stdlib` when the executable lives in `<prefix>/bin`) and relative to
+  the repository at compile time for development builds. The loader loads every
+  unit **once per canonical path**
   (module cache at compile time), loads dependencies first and diagnoses
   cycles made only of module-level imports. Imported module bodies are
   compiled into the `Program` and run once as initializers, so import side
@@ -766,8 +773,16 @@ Central specification in `hydro_ir::stdlib` (`MODULES` in
 `random`, `platform`, `pathlib`, `statistics`, `json`, `csv`, `os`,
 `os.path`, `_thread`, `threading`, `queue`, `multiprocessing`, `pickle`,
 `argparse`, `collections`, `re`, `socket`, `asyncio`, `errno`, `unittest`,
-`dataclasses`, `datetime`, `typing`, `abc`, `enum`, `types`, `itertools`,
+`dataclasses`, `datetime`, `typing`, `abc`, `types`, `itertools`,
 `ast`, `fractions`, `importlib` and `__future__`.
+
+Pure-Python standard library modules that need no native ABI are vendored
+verbatim from CPython 3.14.9 in the repository's `stdlib/` directory and are
+imported like any user module. `stdlib/enum.py` is the first such module: it
+replaces the former placeholder native `enum` module, so `Enum`/`IntEnum`/
+`IntFlag`, `auto()` and the metaclass machinery have CPython semantics. The
+directory is a default import root; see the import search order above.
+`stdlib/LICENSE` holds the PSF License notice for the vendored files.
 
 - `json`: `dumps`/`loads` with CPython defaults (ensure_ascii, separators,
   escapes, surrogates, error classes, depth/cycle guards) as well as `dump`/`load`
@@ -1163,12 +1178,12 @@ collector as an interim**:
   Rust frames and suspended fiber stacks are still scanned. `HYDRO_GC_PRECISE=1`
   selects *strict* mode: every conservative stack and register scan is
   disabled, so only precise frames/ranges, pending/handled/thread roots,
-  suspended fibers' `SavedRoots`, C-API shim roots and persistent roots keep
-  objects alive. Strict mode therefore requires native code to root its tagged
-  locals explicitly; the runtime's own shims, module globals and test suites
-  that hold raw Rust locals (`gc.rs`, `concurrent_gc.rs`, `stw_gc.rs`,
-  `gc_properties.rs`) are mixed-mode only, and `tests/precise_gc.rs` proves
-  strict mode end to end.
+  suspended fibers' `SavedRoots`, C-API shim roots, persistent roots and
+  process-wide module-global roots keep objects alive. Strict mode therefore
+  requires native code to root its tagged locals explicitly; the runtime's own
+  shims, module globals and test suites that hold raw Rust locals (`gc.rs`,
+  `concurrent_gc.rs`, `stw_gc.rs`, `gc_properties.rs`) are mixed-mode only, and
+  `tests/precise_gc.rs` proves strict mode end to end.
 - **Persistent roots:** `heap::add_persistent_root`/`set_persistent_root`/
   `remove_persistent_root` maintain a per-thread slot vector in `ThreadGc`
   that is marked by every collection. They are for long-lived Rust-side owners
@@ -1176,6 +1191,18 @@ collector as an interim**:
   `hydro_runtime_init` (which also resets the asyncio loop state before the heap
   is freed). The hidden `hydro_runtime::precise_roots` module re-exports them for
   the integration tests.
+- **Process-wide roots:** `heap::add_global_root` appends to a
+  mutex-protected list that every collection marks, both in local mode
+  (`collect_state`) and in the shared stop-the-world mark phase
+  (`mark_roots`). Module globals, module attribute overrides and cached
+  `globals()` views live in a process-wide global store (`RwLock<HashMap>`
+  keyed by `module\0name`) because CPython module dictionaries are shared
+  between threads; their values must stay reachable after the writing thread
+  exits and must be marked by a collection running on any other thread.
+  Retention is conservative (a replaced value stays rooted) and the list is
+  cleared only by `hydro_runtime_init`, whose `globals::reset` also empties
+  the store. Thread registrations, precise frames, exception state, fibers,
+  contextvars and the asyncio loop remain per-thread.
 - Conservative fallback (mixed mode): native stack scan (bounds via
   `pthread_getattr_np`), a register dump (x86_64/aarch64) and the pending
   exception.

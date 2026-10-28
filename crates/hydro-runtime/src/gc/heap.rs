@@ -20,8 +20,10 @@
 //!   sweep partition, never across a payload drop. `GRAPH_LOCK` serialises
 //!   container mutation against marking; `WORKLIST` is never held while
 //!   acquiring `GRAPH_LOCK`, a queue mutex or `GLOBAL`. `GC_LOCK` is only
-//!   taken with `try_lock`, so a second collector skips. No guard is held
-//!   across a safepoint or an allocation.
+//!   taken with `try_lock`, so a second collector skips. `GLOBAL_ROOTS` (the
+//!   process-wide root list) is taken by the mutator for an append and by the
+//!   marker for its walk; the walk may take `WORKLIST`, never the reverse. No
+//!   guard is held across a safepoint or an allocation.
 //!
 //! Documented limits:
 //!
@@ -79,13 +81,18 @@
 //!   (runtime helpers, tests) are still scanned conservatively.
 //! * **strict** (`HYDRO_GC_PRECISE=1`): every conservative stack and register
 //!   scan is disabled. Only precise frames/ranges, pending/handled/thread
-//!   roots, suspended fiber `SavedRoots`, C-API shim roots and persistent
-//!   roots keep objects alive. Unregistered native stacks must root their
-//!   tagged locals explicitly with [`crate::gc::roots::frame_push`] or a
-//!   scope range.
+//!   roots, suspended fiber `SavedRoots`, C-API shim roots, persistent roots
+//!   and process-wide global roots keep objects alive. Unregistered native
+//!   stacks must root their tagged locals explicitly with
+//!   [`crate::gc::roots::frame_push`] or a scope range.
 //!
 //! Persistent roots (`add_persistent_root`) belong to a thread registration
 //! and survive ordinary collections until removed or cleared by [`reset`].
+//! Process-wide roots (`add_global_root`) belong to no thread: they keep the
+//! values of thread-independent runtime state (module globals, attribute
+//! overrides, cached module views) alive after the writing thread exits, and
+//! are marked by every collection on every thread. Only the program-start
+//! reset drops them.
 //! Stack words are read with inline assembly because they may be
 //! uninitialized; those invariants are documented where they occur.
 
@@ -1694,6 +1701,86 @@ pub(crate) fn remove_persistent_root(slot: usize) {
     }
 }
 
+/// Removes the persistent root in `slot` when it still holds `value`.
+///
+/// Owners whose root was created on one thread may be released after the
+/// registration was cleared (thread exit or a program reset), so the slot may
+/// belong to a newer root. Comparing the tagged value prevents releasing
+/// somebody else's root; a mismatched or out-of-range slot is ignored instead
+/// of tripping the debug assertion.
+pub(crate) fn release_persistent_root(slot: usize, value: i64) {
+    let Some(gc) = current_gc() else {
+        return;
+    };
+    let mut persistent = gc
+        .persistent
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if persistent.get(slot).copied() != Some(value) {
+        return;
+    }
+    persistent[slot] = crate::value::NONE;
+    while persistent.last() == Some(&crate::value::NONE) {
+        persistent.pop();
+    }
+}
+
+/// Process-wide roots owned by thread-independent runtime state.
+///
+/// Module globals and module attribute overrides (`crate::core::globals`) live
+/// in Rust maps the collector cannot scan. Unlike a thread registration, they
+/// outlive the thread that created them and are visible from every thread, so
+/// the values they reference need a root that no thread exit removes. Every
+/// collection marks this list; [`clear_global_roots`] drops it at program
+/// start.
+///
+/// Retention is conservative, like [`add_thread_root`]: a replaced value stays
+/// rooted until the runtime resets.
+static GLOBAL_ROOTS: LazyLock<Mutex<Vec<i64>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Locks the process-wide root list, ignoring poisoning (the list stays a
+/// valid set of tagged values either way).
+fn lock_global_roots() -> MutexGuard<'static, Vec<i64>> {
+    GLOBAL_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Roots `value` for the rest of the run, independent of any thread
+/// registration.
+///
+/// Called by the module-global store: a global set by one thread must stay
+/// reachable after that thread exits and be marked by a collection running on
+/// any other thread. The root is removed only by [`clear_global_roots`].
+/// Takes no heap lock, so it is safe from inside allocation paths.
+pub(crate) fn add_global_root(value: i64) {
+    lock_global_roots().push(value);
+}
+
+/// Drops every process-wide root (a fresh program run). Called by
+/// `globals::reset` once the map that owned them is empty.
+pub(crate) fn clear_global_roots() {
+    lock_global_roots().clear();
+}
+
+/// Marks the process-wide roots.
+///
+/// The list is read under its own lock; `mark_word` never calls back into
+/// [`add_global_root`], so the lock is safe to hold for the walk.
+fn mark_global_roots(addresses: &AddressSet) {
+    let roots = lock_global_roots();
+    for &root in roots.iter() {
+        mark_word(root as usize, addresses);
+    }
+}
+
+/// Whether `value` is currently installed as a process-wide root; test-only
+/// support for the module-global reset assertion.
+#[cfg(test)]
+pub(crate) fn global_root_contains(value: i64) -> bool {
+    lock_global_roots().contains(&value)
+}
+
 /// Locks the shared heap, ignoring poisoning: a panic in user code must not
 /// make the process unable to allocate. The registry is always consistent
 /// because no user code runs while the lock is held.
@@ -2206,6 +2293,10 @@ fn mark_roots(
             }
         }
     }
+    // Rust-side values owned by thread-independent runtime state (module
+    // globals, attribute overrides, cached module views). No thread
+    // registration owns them, so thread exit cannot drop these roots.
+    mark_global_roots(addresses);
     // References pinned by an in-progress `getweakrefs` are keeping their
     // result objects reachable from outside the scanned stacks.
     mark_weak_pins(addresses);
@@ -2745,6 +2836,9 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
                 mark_word(root as usize, addresses);
             }
         }
+        // Module globals and their module-attribute shadows live outside any
+        // thread registration, so they are marked separately in local mode.
+        mark_global_roots(addresses);
 
         if !strict {
             scan_stack_excluding(sp, stack_high, addresses, &exclusions);
@@ -3129,7 +3223,8 @@ unsafe fn trace(addr: usize) {
                     drop(attrs);
                 }
                 // Built-in descriptors wrap their target and, for
-                // `property`, the optional setter/deleter.
+                // `property`, the optional setter/deleter plus the writable
+                // attribute table a blank `property()` object collects.
                 ObjDataRef::Descriptor(state) => {
                     mark_value(state.target);
                     if state.setter != crate::value::NONE {
@@ -3138,6 +3233,11 @@ unsafe fn trace(addr: usize) {
                     if state.deleter != crate::value::NONE {
                         mark_value(state.deleter);
                     }
+                    let attrs = state.lock_attrs();
+                    for &(_, value) in attrs.iter() {
+                        mark_value(value);
+                    }
+                    drop(attrs);
                 }
                 // A bytearray holds native bytes only.
                 ObjDataRef::ByteArray(_) => {}
@@ -3267,9 +3367,12 @@ unsafe fn trace(addr: usize) {
                 | ObjDataRef::CsvReader(_)
                 | ObjDataRef::ExtFunction(_)
                 | ObjDataRef::Capsule { .. }
+                | ObjDataRef::ExtObject(_)
                 | ObjDataRef::Module(_)
                 | ObjDataRef::StdStream(_)
-                | ObjDataRef::BigInt(_) => {}
+                | ObjDataRef::BigInt(_)
+                | ObjDataRef::Frame(_)
+                | ObjDataRef::Code(_) => {}
                 // A string accumulator is traced with its own kind above,
                 // where the graph lock protects its materialised edge.
                 ObjDataRef::StrBuilder(_) => {}

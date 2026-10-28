@@ -243,6 +243,9 @@ struct Runtime {
     set_file: FuncId,
     set_line: FuncId,
     frame_enter: FuncId,
+    /// Binds the frame created by `frame_enter` to its live locals, module
+    /// and code metadata for `sys._getframe`/`inspect.currentframe`.
+    frame_bind: FuncId,
     safepoint: FuncId,
     frame_leave: FuncId,
     /// Precise shadow frame for locals/return/temporaries.
@@ -551,12 +554,13 @@ impl Runtime {
                 &[ptr, ptr, ptr, ptr],
                 Some(i64t),
             )?,
-            // Module name and optional member, each a pointer/length pair. The
-            // helper always raises, so it never binds a real value.
+            // Module name, optional member and optional shared-object path,
+            // each a pointer/length pair. The helper resolves the name from
+            // the runtime registry or raises `ImportError`.
             deferred_import: declare_runtime(
                 module,
                 "hydro_deferred_import",
-                &[ptr, ptr, ptr, ptr],
+                &[ptr, ptr, ptr, ptr, ptr, ptr],
                 Some(i64t),
             )?,
             // Module name plus global name, each a pointer/length pair.
@@ -687,6 +691,14 @@ impl Runtime {
             set_file: declare_runtime(module, "hydro_set_file", &[ptr, ptr], None)?,
             set_line: declare_runtime(module, "hydro_set_line", &[i32t], None)?,
             frame_enter: declare_runtime(module, "hydro_frame_enter", &[ptr, ptr], None)?,
+            // `frame_bind(base, slots, names, names_len, params, flags,
+            // module, module_len, first_line)`.
+            frame_bind: declare_runtime(
+                module,
+                "hydro_frame_bind",
+                &[ptr, ptr, ptr, ptr, ptr, i32t, ptr, ptr, i32t],
+                None,
+            )?,
             // Cooperative GC safepoint: no arguments, no result. AOT resolves
             // it by name; the JIT binds it in `backend::jit::register_runtime_symbols`.
             safepoint: declare_runtime(module, "hydro_safepoint", &[], None)?,
@@ -943,6 +955,7 @@ fn lower_function<M: Module>(
             module,
             program,
             function,
+            program.module_of(index),
             symbols,
             wrappers,
             full_wrappers,
@@ -1834,6 +1847,11 @@ struct Lower<'a, 'b, M: Module> {
     params: &'a [Param],
     body: &'a [Stmt],
     name: &'a str,
+    /// Module globals key of this function (see `Program::module_of`).
+    module_name: &'a str,
+    capture_count: usize,
+    is_async: bool,
+    is_generator: bool,
     symbols: &'a HashMap<FunctionId, FuncId>,
     wrappers: &'a HashMap<FunctionId, FuncId>,
     full_wrappers: &'a HashMap<FunctionId, FuncId>,
@@ -1888,6 +1906,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         module: &'a mut M,
         program: &'a Program,
         function: &'a Function,
+        module_name: &'a str,
         symbols: &'a HashMap<FunctionId, FuncId>,
         wrappers: &'a HashMap<FunctionId, FuncId>,
         full_wrappers: &'a HashMap<FunctionId, FuncId>,
@@ -1926,6 +1945,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             params: &function.params,
             body: &function.body,
             name: &function.name,
+            module_name,
+            capture_count: function.capture_count,
+            is_async: function.is_async,
+            is_generator: function.is_generator,
             symbols,
             wrappers,
             full_wrappers,
@@ -2031,11 +2054,14 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         }
         self.builder.switch_to_block(epilogue);
         self.terminated = false;
-        // Unregister the precise frame before leaving the activation.
-        let token = self.builder.use_var(self.root_token);
-        self.call_void(self.runtime.gc_frame_pop, &[token]);
+        // Leave the activation while its precise frame is still registered:
+        // ending a frame may materialise a locals snapshot, and the values it
+        // copies must stay rooted during that allocation. The shadow frame is
+        // unregistered afterwards, before the epilogue returns.
         let id = self.runtime.frame_leave;
         self.call_void(id, &[]);
+        let token = self.builder.use_var(self.root_token);
+        self.call_void(self.runtime.gc_frame_pop, &[token]);
         let result = self.builder.use_var(self.ret_var);
         self.builder.ins().return_(&[result]);
         self.terminated = true;
@@ -2643,6 +2669,64 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
         let len_value = self.builder.ins().iconst(self.ptr_ty, len as i64);
         self.call_void(self.runtime.frame_enter, &[ptr, len_value]);
+        self.emit_frame_bind()?;
+        Ok(())
+    }
+
+    /// Publish the local names, module key and code metadata of this
+    /// activation so `sys._getframe` can observe live locals.
+    ///
+    /// The slot base is the same shadow frame registered by
+    /// `hydro_gc_frame_push`; the names blob is a NUL-separated UTF-8 list in
+    /// local-slot order. Both live in stack slots and are copied by the
+    /// runtime before this function returns.
+    fn emit_frame_bind(&mut self) -> Result<(), CodegenError> {
+        let mut names = Vec::new();
+        for (index, local) in self.locals.iter().enumerate() {
+            if index != 0 {
+                names.push(0);
+            }
+            names.extend_from_slice(local.name.as_bytes());
+        }
+        let (names_slot, names_len) = make_bytes_slot(&mut self.builder, &names)?;
+        let names_ptr = self.builder.ins().stack_addr(self.ptr_ty, names_slot, 0);
+        let names_len = self.builder.ins().iconst(self.ptr_ty, names_len as i64);
+        let module_name = self.module_name;
+        let (module_slot, module_len) = make_bytes_slot(&mut self.builder, module_name.as_bytes())?;
+        let module_ptr = self.builder.ins().stack_addr(self.ptr_ty, module_slot, 0);
+        let module_len = self.builder.ins().iconst(self.ptr_ty, module_len as i64);
+        let base = self
+            .builder
+            .ins()
+            .stack_addr(self.ptr_ty, self.root_slot, 0);
+        let slots = self
+            .builder
+            .ins()
+            .iconst(self.ptr_ty, self.locals.len() as i64);
+        let params = self.params[self.capture_count.min(self.params.len())..]
+            .iter()
+            .filter(|param| param.kind.is_positional())
+            .count();
+        let params = self.builder.ins().iconst(self.ptr_ty, params as i64);
+        // CPython's code flags: optimized + newlocals, plus the generator and
+        // coroutine bits (an async generator carries both).
+        let mut flags = 0x3u32;
+        if self.is_generator {
+            flags |= 0x20;
+        }
+        if self.is_async {
+            flags |= 0x80;
+        }
+        let flags = self.builder.ins().iconst(types::I32, flags as i64);
+        let first_line = self.body.first().map(|stmt| stmt.line).unwrap_or(0);
+        let first_line = self.builder.ins().iconst(types::I32, first_line as i64);
+        self.call_void(
+            self.runtime.frame_bind,
+            &[
+                base, slots, names_ptr, names_len, params, flags, module_ptr, module_len,
+                first_line,
+            ],
+        );
         Ok(())
     }
 
@@ -4657,9 +4741,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             ExprKind::ExtensionModuleRef { module, path } => {
                 self.lower_extension_module_ref(module, path)
             }
-            ExprKind::DeferredImport { module, member } => {
-                self.lower_deferred_import(module, member.as_deref())
-            }
+            ExprKind::DeferredImport {
+                module,
+                member,
+                path,
+            } => self.lower_deferred_import(module, member.as_deref(), path.as_deref()),
             ExprKind::GlobalGet { module, name } => self.lower_global_get(module, name),
             ExprKind::ModuleAttr { module, name } => self.lower_module_attr(module, name),
             ExprKind::ExtensionAttr { path, member } => self.lower_extension_attr(path, member),
@@ -5662,23 +5748,33 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(result)
     }
 
-    /// Lower a name bound by a nested import to `hydro_deferred_import`.
+    /// Lower a name bound by an import that was not linked at compile time to
+    /// `hydro_deferred_import`.
     ///
-    /// The helper never returns normally: it raises `RuntimeError` naming the
-    /// module and member, so no dynamic import takes place. The exception
-    /// check makes the generated code branch to the unit's handler like any
-    /// other failing runtime call.
+    /// The helper resolves the name from the runtime module registry and raises
+    /// `ModuleNotFoundError` or `ImportError` when it is unavailable, so a
+    /// module-level `try` body runs its handler and a function-local import
+    /// fails only when its binding is read. `path` is the shared object of a
+    /// compiled extension, which the runtime materialises lazily.
     fn lower_deferred_import(
         &mut self,
         module: &str,
         member: Option<&str>,
+        path: Option<&str>,
     ) -> Result<Value, CodegenError> {
         let (module_ptr, module_len) = self.module_name_args(module)?;
         // An empty member means the binding is a module alias; the ABI treats
         // a zero length as "no member".
         let (member_ptr, member_len) = self.module_name_args(member.unwrap_or(""))?;
+        // An empty path means the import does not name a compiled extension.
+        let (path_ptr, path_len) = self.module_name_args(path.unwrap_or(""))?;
         let id = self.runtime.deferred_import;
-        let result = self.call_rt(id, &[module_ptr, module_len, member_ptr, member_len])?;
+        let result = self.call_rt(
+            id,
+            &[
+                module_ptr, module_len, member_ptr, member_len, path_ptr, path_len,
+            ],
+        )?;
         self.emit_exc_check()?;
         Ok(result)
     }
@@ -7838,6 +7934,9 @@ mod tests {
         let object = crate::compile_object(&program).expect("module call must lower");
         assert!(runtime_call_sites(&object, "hydro_gc_frame_push") > 0);
         assert!(runtime_call_sites(&object, "hydro_gc_frame_pop") > 0);
+        // The activation publishes its locals and module for frame
+        // introspection.
+        assert!(runtime_call_sites(&object, "hydro_frame_bind") > 0);
         // The module-call argument buffer must be a registered GC scope.
         assert!(runtime_call_sites(&object, "hydro_gc_scope_push") > 0);
         assert!(runtime_call_sites(&object, "hydro_gc_scope_pop") > 0);

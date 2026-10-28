@@ -364,6 +364,7 @@ fn is_callable(target: i64) -> bool {
     if value::as_class(target).is_some()
         || value::as_function(target).is_some()
         || value::as_ext_function(target).is_some()
+        || crate::modules::extension::ext_object_is_callable(target)
     {
         return true;
     }

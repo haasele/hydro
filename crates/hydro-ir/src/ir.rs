@@ -244,14 +244,23 @@ pub enum ExprKind {
         module: String,
         path: String,
     },
-    /// Name bound by an import nested inside a function/class/compound body
-    /// that was not linked at compile time. Evaluating it calls the runtime
-    /// `hydro_deferred_import` helper, which raises `RuntimeError`: Hydro cannot
-    /// execute a dynamic import. `member` is the imported name (`None` for
-    /// `import x as y`, where the whole module is the binding).
+    /// Name bound by an import statement that was not linked at compile time:
+    /// an import nested inside a function/class/compound body, or an import
+    /// inside a `try` whose handlers catch `ImportError`, which must fail at
+    /// runtime so the handler runs. Evaluating it calls the runtime
+    /// `hydro_deferred_import` helper, which resolves the name from the
+    /// runtime module registry and raises `ModuleNotFoundError` (no such
+    /// module) or `ImportError` (`cannot import name ...`): Hydro cannot
+    /// execute a dynamic import.
+    ///
+    /// `member` is the imported name (`None` for `import x as y`, where the
+    /// whole module is the binding). `path` is the shared object of a compiled
+    /// extension when the import names one, so the runtime can materialise the
+    /// extension module value and report a missing attribute as `ImportError`.
     DeferredImport {
         module: String,
         member: Option<String>,
+        path: Option<String>,
     },
     /// `module.name` (constant or callable value) from a builtin module.
     ModuleAttr {
@@ -915,5 +924,39 @@ impl Program {
 
     pub fn function(&self, id: FunctionId) -> &Function {
         &self.functions[id as usize]
+    }
+
+    /// Module key owning `function`, matching the key the frontend uses for
+    /// its `GlobalGet`/`GlobalSet` operations.
+    ///
+    /// The frontend emits every imported unit's functions as one contiguous
+    /// block that starts at that unit's module body (an entry of
+    /// [`Program::initializers`]) and prefixes their names with the dotted
+    /// module name (`pkg.mod.<module>`, `pkg.mod.some_function`). The entry
+    /// unit's block starts at [`Program::main`] and uses `"__main__"`.
+    /// Frame introspection (`sys._getframe().f_globals`) uses this to resolve
+    /// the module dictionary a frame's code belongs to.
+    pub fn module_of(&self, function: FunctionId) -> &str {
+        let index = function as usize;
+        if index >= self.functions.len() {
+            return "__main__";
+        }
+        if index >= self.main as usize {
+            return "__main__";
+        }
+        let start = self
+            .initializers
+            .iter()
+            .map(|&id| id as usize)
+            .filter(|&id| id <= index && id < self.functions.len())
+            .max();
+        let Some(start) = start else {
+            return "__main__";
+        };
+        let name = self.functions[start].name.as_str();
+        match name.rsplit_once(".<module>") {
+            Some((module, _)) if !module.is_empty() => module,
+            _ => "__main__",
+        }
     }
 }

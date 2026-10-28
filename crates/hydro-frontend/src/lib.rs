@@ -4,9 +4,9 @@
 //! Public contract (used by the Tea toolchain and tests):
 //! [`check_source`] returns either a fully typed [`Program`] or a non-empty list
 //! [`Diagnostic`]s. [`check_file`] additionally resolves imports of user
-//! modules and packages (siblings, site-packages, `PYTHONPATH` and
-//! `HYDRO_STDLIB`) and links them into one program. Both must never panic on
-//! user input.
+//! modules and packages (siblings, site-packages, `PYTHONPATH`, `HYDRO_STDLIB`
+//! and the vendored `stdlib/` tree) and links them into one program. Both must
+//! never panic on user input.
 //!
 //! [`session::SessionCompiler`] builds incremental REPL/interpreter fragments
 //! on top of the same parser, lowerer and type checker, preserving modules,
@@ -93,9 +93,11 @@ fn parse_module(
 ///
 /// `import foo` / `from foo import f` are resolved as Python modules: first
 /// next to the importing file, then through `HYDRO_SITE_PACKAGES`, the
-/// `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages directories, `PYTHONPATH` and
-/// finally `HYDRO_STDLIB` (the CPython `Lib` directory backing the standard
-/// library sources). Both plain modules (`foo.py`) and packages
+/// `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages directories, `PYTHONPATH`,
+/// `HYDRO_STDLIB` (a CPython `Lib` directory backing the standard library
+/// sources) and finally the pure-Python modules vendored in Hydro's own
+/// `stdlib/` tree. Explicit roots win over the vendored tree, so an override
+/// placed there is observable. Both plain modules (`foo.py`) and packages
 /// (`foo/__init__.py`) are supported, including dotted names, submodules and
 /// relative imports. A directory without `__init__.py` is a namespace-package
 /// segment: it is importable and acts as a search root for its submodules, but
@@ -992,9 +994,10 @@ impl ModuleLoader {
     /// and compiles can become a regular dependency; its initializer then runs
     /// once, before the importer, exactly like an eager import. Anything that
     /// cannot be linked (absent module, compile diagnostics, a cycle) leaves
-    /// the binding deferred, so the runtime raises `ModuleNotFoundError` and
-    /// the enclosing `except ImportError` handles it. The load is transactional:
-    /// a failed attempt restores every loader table.
+    /// the binding to the runtime, which raises `ModuleNotFoundError` for a
+    /// missing module and `ImportError` for a missing member, and the enclosing
+    /// `except ImportError` handles it. The load is transactional: a failed
+    /// attempt restores every loader table.
     fn optional_import(
         &mut self,
         name: &str,
@@ -1799,18 +1802,20 @@ fn extension_referenced(source: &Path, package: &str, name: &str) -> bool {
 /// Directories searched for user modules, in order: the importing file's
 /// directory, the root of the current package chain (so `pkg.a` can import
 /// `pkg.b`), `HYDRO_SITE_PACKAGES`, the site-packages directories of
-/// `VIRTUAL_ENV`/`CONDA_PREFIX`, `PYTHONPATH`, then `HYDRO_STDLIB`.
+/// `VIRTUAL_ENV`/`CONDA_PREFIX`, `PYTHONPATH`, `HYDRO_STDLIB` and finally the
+/// vendored `stdlib/` tree shipped with Hydro.
 ///
-/// `HYDRO_STDLIB` is the CPython `Lib` directory that backs the standard
-/// library sources (`<cpython>/Lib`). It comes last so project modules,
-/// site-packages and user `PYTHONPATH` entries always win over the bundled
-/// stdlib source tree.
+/// `HYDRO_STDLIB` is a CPython `Lib` directory that backs the standard library
+/// sources (`<cpython>/Lib`). It and every other explicit root precede the
+/// vendored `stdlib/` tree, so project modules, site-packages, `PYTHONPATH`
+/// entries and an explicit `HYDRO_STDLIB` always win over the bundled modules.
 fn module_search_roots(importer_dir: &Path, module_root: &Path) -> Vec<PathBuf> {
     let hydro_site_packages = std::env::var_os("HYDRO_SITE_PACKAGES");
     let pythonpath = std::env::var_os("PYTHONPATH");
     let hydro_stdlib = std::env::var_os("HYDRO_STDLIB");
     let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
     let conda_prefix = std::env::var_os("CONDA_PREFIX").map(PathBuf::from);
+    let bundled_stdlib = bundled_stdlib_root();
     module_search_roots_from(
         importer_dir,
         module_root,
@@ -1819,19 +1824,58 @@ fn module_search_roots(importer_dir: &Path, module_root: &Path) -> Vec<PathBuf> 
         hydro_stdlib.as_deref(),
         virtual_env.as_deref(),
         conda_prefix.as_deref(),
+        bundled_stdlib,
     )
+}
+
+/// Directory of the pure-Python standard library modules vendored with Hydro
+/// (`stdlib/` in the repository).
+///
+/// A development build finds it through the crate's compile-time location
+/// (`CARGO_MANIFEST_DIR`); an installed layout ships it with the executable and
+/// is found through `<exe dir>/stdlib` or `<prefix>/stdlib` when the executable
+/// lives in `<prefix>/bin`. Executable-relative candidates come first so a
+/// shipped tree is never shadowed by the checkout of the machine that built
+/// it. `None` when no candidate exists. Do not confuse this root with
+/// `HYDRO_STDLIB`: that variable names a CPython `Lib` tree and takes
+/// precedence.
+fn bundled_stdlib_root() -> Option<&'static Path> {
+    static ROOT: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new(|| {
+        let mut candidates = Vec::new();
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        {
+            candidates.push(exe_dir.join("stdlib"));
+            candidates.push(exe_dir.join("..").join("stdlib"));
+        }
+        candidates.push(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("stdlib"),
+        );
+        candidates
+            .into_iter()
+            .find(|dir| dir.is_dir())
+            .and_then(|dir| fs::canonicalize(dir).ok())
+    });
+    ROOT.as_deref()
 }
 
 /// Builds the module search path from raw environment values.
 ///
 /// Order: the importing directory and the current package root, then
 /// `HYDRO_SITE_PACKAGES`, the site-packages directories of `VIRTUAL_ENV` and
-/// `CONDA_PREFIX`, `PYTHONPATH`, and finally `HYDRO_STDLIB`. Every explicit
-/// user location therefore takes precedence over the standard library source
-/// tree, matching CPython's `sys.path` layout.
+/// `CONDA_PREFIX`, `PYTHONPATH`, `HYDRO_STDLIB`, and finally the vendored
+/// `stdlib/` tree ([`bundled_stdlib_root`]). Every explicit user location
+/// therefore takes precedence over the standard library sources, and
+/// `HYDRO_STDLIB` wins over the bundled modules, matching CPython's `sys.path`
+/// layout.
 ///
 /// Missing and non-directory entries are dropped and duplicates are searched
 /// only once. The importing file's directory always comes first.
+#[allow(clippy::too_many_arguments)]
 fn module_search_roots_from(
     importer_dir: &Path,
     module_root: &Path,
@@ -1840,6 +1884,7 @@ fn module_search_roots_from(
     hydro_stdlib: Option<&std::ffi::OsStr>,
     virtual_env: Option<&Path>,
     conda_prefix: Option<&Path>,
+    bundled_stdlib: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut dirs = vec![importer_dir.to_path_buf(), module_root.to_path_buf()];
     for list in [hydro_site_packages].into_iter().flatten() {
@@ -1848,7 +1893,14 @@ fn module_search_roots_from(
     for prefix in [virtual_env, conda_prefix].into_iter().flatten() {
         dirs.extend(lower::prefix_site_packages(prefix));
     }
-    for list in [pythonpath, hydro_stdlib].into_iter().flatten() {
+    for list in [pythonpath].into_iter().flatten() {
+        dirs.extend(std::env::split_paths(list));
+    }
+    // Vendored modules are Hydro's own compatibility shims (for example the
+    // patched `enum.py`); they must win over a generic CPython `Lib` sysroot
+    // while every module Hydro does not vendor still falls through to it.
+    dirs.extend(bundled_stdlib.map(Path::to_path_buf));
+    for list in [hydro_stdlib].into_iter().flatten() {
         dirs.extend(std::env::split_paths(list));
     }
 
@@ -3320,6 +3372,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(roots, vec![project.clone(), site.clone()]);
 
@@ -3369,6 +3422,7 @@ mod tests {
             None,
             Some(pythonpath.as_os_str()),
             Some(lib.as_os_str()),
+            None,
             None,
             None,
         );
@@ -3435,6 +3489,79 @@ mod tests {
         assert_eq!(
             diags[0].help.as_deref(),
             Some("expected a module file on the import search path")
+        );
+    }
+
+    #[test]
+    fn bundled_stdlib_resolves_enum_without_hydro_stdlib() {
+        let _env = env_lock();
+        let _stdlib = EnvVar::unset("HYDRO_STDLIB");
+        let _pythonpath = EnvVar::unset("PYTHONPATH");
+        let bundled = bundled_stdlib_root().expect("the vendored stdlib root is discoverable");
+        assert!(
+            bundled.join("enum.py").is_file(),
+            "enum.py must be vendored in {bundled:?}"
+        );
+
+        let dir = TestDir::new("bundled-enum-resolver");
+        let project = dir.path.join("project");
+        fs::create_dir_all(&project).expect("create project");
+        let roots = module_search_roots_from(
+            &project,
+            &project,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(bundled),
+        );
+        assert_eq!(roots.last().map(PathBuf::as_path), Some(bundled));
+        let chain = resolve_module(&roots, "enum").expect("enum must resolve");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].path, bundled.join("enum.py"));
+        assert!(!chain[0].namespace, "enum must be a real module");
+    }
+
+    #[test]
+    fn bundled_enum_compiles_a_subclass_and_member_access() {
+        let _env = env_lock();
+        let _stdlib = EnvVar::unset("HYDRO_STDLIB");
+        let _pythonpath = EnvVar::unset("PYTHONPATH");
+        let dir = TestDir::new("bundled-enum-compile");
+        let main = dir.write(
+            "main.py",
+            "from enum import Enum, auto\n\
+             \n\
+             class DisplayModes(Enum):\n    stdout = auto()\n    stderr = auto()\n\
+             \n\
+             def mode():\n    return DisplayModes.stdout\n\
+             \n\
+             RESULT = mode()\n",
+        );
+        let program = program(&main);
+
+        // The vendored module body is linked as an initializer, so `Enum`,
+        // `auto` and the metaclass machinery exist at runtime.
+        assert_eq!(program.initializers.len(), 1, "{program:?}");
+        let initializer = program.functions[program.initializers[0] as usize]
+            .name
+            .as_str();
+        assert_eq!(initializer, "enum.<module>");
+
+        use hydro_ir::{ExprKind, StmtKind};
+        let mode = program.function(function_id(&program, "mode"));
+        let returned = mode
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                StmtKind::Return(Some(expr)) => Some(expr),
+                _ => None,
+            })
+            .expect("mode must return the member");
+        assert!(
+            matches!(&returned.kind, ExprKind::GetAttr { name, .. } if name == "stdout"),
+            "member access must stay a class attribute read: {returned:?}"
         );
     }
 
@@ -3881,7 +4008,7 @@ def __getattr__(name):
         assert!(
             matches!(
                 &callee.kind,
-                ExprKind::DeferredImport { module, member }
+                ExprKind::DeferredImport { module, member, .. }
                     if module == "helper" && member.as_deref() == Some("add")
             ),
             "the nested import must bind a deferred name: {:?}",
@@ -3917,7 +4044,7 @@ def __getattr__(name):
         assert!(
             matches!(
                 &callee.kind,
-                ExprKind::DeferredImport { module, member }
+                ExprKind::DeferredImport { module, member, .. }
                     if module == "pkg" && member.as_deref() == Some("sub.value")
             ),
             "the nested submodule import must stay deferred: {:?}",
@@ -3956,7 +4083,7 @@ def __getattr__(name):
         assert!(
             matches!(
                 &callee.kind,
-                ExprKind::DeferredImport { module, member }
+                ExprKind::DeferredImport { module, member, .. }
                     if module == "pkg.helper" && member.as_deref() == Some("add")
             ),
             "`from .helper import add` must resolve against the package: {:?}",
@@ -3991,7 +4118,7 @@ def __getattr__(name):
         };
         assert!(matches!(
             &callee.kind,
-            ExprKind::DeferredImport { module, member }
+            ExprKind::DeferredImport { module, member, .. }
                 if module == "nowhere" && member.as_deref() == Some("thing")
         ));
     }
@@ -4058,7 +4185,7 @@ def __getattr__(name):
     }
 
     #[test]
-    fn module_level_try_import_of_a_missing_submodule_stays_deferred() {
+    fn module_level_try_import_of_a_missing_submodule_is_a_runtime_import() {
         let dir = TestDir::new("try-missing");
         let pkg = dir.path.join("pkg");
         fs::create_dir_all(&pkg).expect("create package");
@@ -4069,25 +4196,39 @@ def __getattr__(name):
         .expect("write package init");
         let main = dir.write("main.py", "from pkg import get\nprint(get())\n");
         let program = program(&main);
+        use hydro_ir::ExprKind;
 
-        // Nothing was preloaded: the handler owns the missing import and the
-        // binding is resolved at runtime, where `ModuleNotFoundError` runs the
-        // `except ImportError` handler.
+        // Nothing was preloaded: the handler owns the missing import, so the
+        // statement performs it at runtime, where the failed from-import
+        // (`cannot import name 'missing' from 'pkg'`) runs the `except
+        // ImportError` handler, and reads go through the module global table so
+        // the handler's fallback is visible.
         assert_eq!(program.initializers.len(), 1, "{:?}", program.initializers);
         assert_eq!(
             program.functions[program.initializers[0] as usize].name,
             "pkg.<module>"
         );
+        let init = &program.functions[program.initializers[0] as usize].body;
+        let stored = stored_global(init, "missing").expect("the try body must perform the import");
+        assert!(
+            matches!(
+                &stored.kind,
+                ExprKind::DeferredImport { module, member, .. }
+                    if module == "pkg" && member.as_deref() == Some("missing")
+            ),
+            "the missing submodule must be imported at runtime: {:?}",
+            stored.kind
+        );
+
         let get = function_id(&program, "pkg.get");
-        use hydro_ir::ExprKind;
         let returned = returned_expression(&program, get);
         assert!(
             matches!(
                 &returned.kind,
-                ExprKind::DeferredImport { module, member }
-                    if module == "pkg" && member.as_deref() == Some("missing")
+                ExprKind::GlobalGet { module, name }
+                    if module == "pkg" && name == "missing"
             ),
-            "the missing submodule must stay deferred: {:?}",
+            "the binding must be read from the module globals: {:?}",
             returned.kind
         );
     }
@@ -4109,24 +4250,196 @@ def __getattr__(name):
             .into_owned();
         let main = dir.write("main.py", "from pkg import get\nprint(get())\n");
         let program = program(&main);
+        use hydro_ir::ExprKind;
 
-        // The extension is not a compiled unit: it binds to the shared object
-        // and the runtime loader stays inside the `try`, so a load failure
-        // runs the handler.
+        // The extension is not a compiled unit: the `try` body imports it at
+        // runtime, keeping the shared object, so a load failure runs the
+        // handler and reads go through the module global table.
         assert_eq!(program.initializers.len(), 1, "{:?}", program.initializers);
+        let init = &program.functions[program.initializers[0] as usize].body;
+        let stored = stored_global(init, "ext").expect("the try body must perform the import");
+        assert!(
+            matches!(
+                &stored.kind,
+                ExprKind::DeferredImport { module, member, path }
+                    if module == "pkg.ext"
+                        && member.is_none()
+                        && path.as_deref() == Some(expected.as_str())
+            ),
+            "the extension must be imported at runtime: {:?}",
+            stored.kind
+        );
+
         let get = function_id(&program, "pkg.get");
-        use hydro_ir::{Callee, ExprKind};
         let returned = returned_expression(&program, get);
-        match &returned.kind {
-            ExprKind::Call {
-                callee: Callee::Extension { path, member },
+        let ExprKind::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } = &returned.kind
+        else {
+            panic!("expected an extension method call, got {:?}", returned.kind);
+        };
+        assert_eq!(method, "value");
+        assert!(args.is_empty(), "{args:?}");
+        assert!(
+            matches!(
+                &object.kind,
+                ExprKind::GlobalGet { module, name }
+                    if module == "pkg" && name == "ext"
+            ),
+            "the member must be read from the module global: {:?}",
+            object.kind
+        );
+    }
+
+    /// The expression behind a value published into the global table.
+    ///
+    /// An optional import stores the deferred import in a module local
+    /// (`Assign { value: DeferredImport }`) and then publishes that local, so a
+    /// `Local` store resolves to the expression assigned to it in the same
+    /// block. Every other store publishes its value directly.
+    fn published_value<'a>(
+        stmts: &'a [hydro_ir::Stmt],
+        value: &'a hydro_ir::Expr,
+    ) -> &'a hydro_ir::Expr {
+        let hydro_ir::ExprKind::Local(local) = &value.kind else {
+            return value;
+        };
+        stmts
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                hydro_ir::StmtKind::Assign { target, value } if target == local => Some(value),
+                _ => None,
+            })
+            .unwrap_or(value)
+    }
+
+    /// Value stored into module global `name` by the entries of `stmts`.
+    ///
+    /// A store of a module local resolves through the assignment that produced
+    /// the local, so an optional import is observed as the import it performs.
+    fn stored_global<'a>(stmts: &'a [hydro_ir::Stmt], name: &str) -> Option<&'a hydro_ir::Expr> {
+        use hydro_ir::StmtKind;
+        stmts.iter().find_map(|stmt| match &stmt.kind {
+            StmtKind::GlobalSet {
+                name: bound, value, ..
+            } if bound == name => Some(published_value(stmts, value)),
+            StmtKind::Try { body, handlers, .. } => stored_global(body, name).or_else(|| {
+                handlers
+                    .iter()
+                    .find_map(|handler| stored_global(&handler.body, name))
+            }),
+            StmtKind::If {
+                then_body,
+                else_body,
                 ..
-            } => {
-                assert_eq!(path, &expected);
-                assert_eq!(member, "value");
-            }
-            other => panic!("expected an extension call, got {other:?}"),
-        }
+            } => stored_global(then_body, name).or_else(|| stored_global(else_body, name)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn optional_import_of_a_missing_native_member_runs_its_handler() {
+        // `from _socket import NOPE` names no native member. Inside a `try`
+        // whose handler catches `ImportError` the statement is a runtime
+        // import, so the handler binds the fallback instead of the compiler
+        // rejecting the program.
+        let dir = TestDir::new("optional-native-member");
+        let main = dir.write(
+            "main.py",
+            "try:\n    from _socket import NOPE\nexcept ImportError:\n    NOPE = 42\n\nprint(NOPE)\n",
+        );
+        let program = program(&main);
+        use hydro_ir::ExprKind;
+
+        let entry = program.main_function();
+        let imported = stored_global(&entry.body, "NOPE").expect("the try body must import NOPE");
+        assert!(
+            matches!(
+                &imported.kind,
+                ExprKind::DeferredImport { module, member, path }
+                    if module == "_socket"
+                        && member.as_deref() == Some("NOPE")
+                        && path.is_none()
+            ),
+            "expected a runtime import, got {:?}",
+            imported.kind
+        );
+
+        // The handler publishes its fallback in the module global table.
+        let handlers = entry
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                hydro_ir::StmtKind::Try { handlers, .. } => Some(handlers),
+                _ => None,
+            })
+            .expect("the entry module must contain the `try`");
+        let fallback = handlers[0]
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                hydro_ir::StmtKind::GlobalSet {
+                    name, value: bound, ..
+                } if name == "NOPE" => Some(published_value(&handlers[0].body, bound)),
+                _ => None,
+            })
+            .expect("the handler must bind the fallback");
+        assert!(
+            matches!(&fallback.kind, ExprKind::Const(hydro_ir::Const::Int(42))),
+            "expected the fallback value, got {:?}",
+            fallback.kind
+        );
+    }
+
+    #[test]
+    fn optional_import_of_a_missing_user_member_is_a_runtime_import() {
+        // The sibling module compiles, but it does not provide the imported
+        // name: only the handler can supply it, so the import runs at runtime.
+        let dir = TestDir::new("optional-user-member");
+        dir.write("helper.py", "def add(a, b):\n    return a + b\n");
+        let main = dir.write(
+            "main.py",
+            "try:\n    from helper import nope\nexcept ImportError:\n    nope = 0\n\nprint(nope)\n",
+        );
+        let program = program(&main);
+        use hydro_ir::ExprKind;
+
+        let entry = program.main_function();
+        let imported = stored_global(&entry.body, "nope").expect("the try body must import nope");
+        assert!(
+            matches!(
+                &imported.kind,
+                ExprKind::DeferredImport { module, member, path }
+                    if module == "helper"
+                        && member.as_deref() == Some("nope")
+                        && path.is_none()
+            ),
+            "expected a runtime import, got {:?}",
+            imported.kind
+        );
+    }
+
+    #[test]
+    fn optional_import_of_a_linked_member_keeps_the_static_binding() {
+        // The named function exists in a linked module, so the import cannot
+        // fail and stays a compile-time link.
+        let dir = TestDir::new("optional-linked-member");
+        dir.write("helper.py", "def add(a, b):\n    return a + b\n");
+        let main = dir.write(
+            "main.py",
+            "try:\n    from helper import add\nexcept ImportError:\n    add = None\n\nprint(add(1, 2))\n",
+        );
+        let program = program(&main);
+        assert_eq!(printed_call(&program), function_id(&program, "helper.add"));
+        let entry = program.main_function();
+        assert!(
+            stored_global(&entry.body, "add").is_none(),
+            "a guaranteed import must not run at runtime: {:?}",
+            entry.body
+        );
     }
 
     #[test]
@@ -4340,7 +4653,7 @@ def __getattr__(name):
         assert!(
             matches!(
                 &callee.kind,
-                ExprKind::DeferredImport { module, member }
+                ExprKind::DeferredImport { module, member, .. }
                     if module == "b" && member.as_deref() == Some("g")
             ),
             "a.f must bind b.g as a deferred call: {:?}",

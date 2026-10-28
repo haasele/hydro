@@ -1041,9 +1041,10 @@ pub extern "C" fn hydro_module_get(
 
 /// `module.name = value` for a module-level global.
 ///
-/// Module globals live in a thread-local side store keyed by module and name;
-/// the stored value is also installed as a GC root. Invalid ABI buffers raise
-/// `TypeError`. Returns `None`.
+/// Module globals live in a process-wide side store keyed by module and name,
+/// so every thread observes the binding; the stored value is also installed as
+/// a process-wide GC root. Invalid ABI buffers raise `TypeError`. Returns
+/// `None`.
 #[no_mangle]
 pub extern "C" fn hydro_global_set(
     module_ptr: *const c_uchar,
@@ -1150,19 +1151,26 @@ pub extern "C" fn hydro_extension_module_value(
     modules::extension_module_value(&name, &path)
 }
 
-/// Name bound by a function-local import that was not linked at compile time.
+/// Name bound by an import statement that was not linked at compile time.
 ///
-/// Python defers such an import until the enclosing function runs; Hydro resolves
-/// imports while compiling, so evaluating the name would require a dynamic
-/// import. This always raises `RuntimeError` naming the module (and member) and
-/// returns `None` with a pending exception. An empty/missing member means the
-/// name is a module alias (`import x as y`).
+/// Python defers imports until the statement runs; Hydro resolves imports while
+/// compiling, so evaluating the name resolves it from the runtime module
+/// registry instead of importing anything. A module alias returns the module
+/// value; `from <module> import <member>` returns the attribute. A module that
+/// is not registered raises `ModuleNotFoundError` and a member the module does
+/// not provide raises `ImportError` (`cannot import name '<member>' from
+/// '<module>'`), so `try: ... except ImportError:` handlers run with CPython's
+/// error taxonomy. An empty/missing member means the name is a module alias
+/// (`import x as y`); a non-empty `path` names the shared object of a compiled
+/// extension module, which the runtime materialises lazily.
 #[no_mangle]
 pub extern "C" fn hydro_deferred_import(
     module_ptr: *const c_uchar,
     module_len: usize,
     member_ptr: *const c_uchar,
     member_len: usize,
+    path_ptr: *const c_uchar,
+    path_len: usize,
 ) -> i64 {
     let Some(module) = required_name(module_ptr, module_len) else {
         return exc::raise_with_message(
@@ -1171,7 +1179,8 @@ pub extern "C" fn hydro_deferred_import(
         );
     };
     let member = required_name(member_ptr, member_len);
-    builtins::deferred_import(&module, member.as_deref())
+    let path = required_name(path_ptr, path_len);
+    builtins::deferred_import(&module, member.as_deref(), path.as_deref())
 }
 
 // CPython limited-API extensions
@@ -1601,6 +1610,38 @@ pub extern "C" fn hydro_frame_leave() {
     exc::frame_leave();
 }
 
+/// Binds the innermost activation to its live locals and code metadata.
+///
+/// `base` is the same precise slot array passed to [`hydro_gc_frame_push`]
+/// (`locals` entries of it are real locals, in slot order); `names` is a
+/// NUL-separated UTF-8 list of those local names. `module` is the key of the
+/// module globals the frame belongs to. The pointer pair is only stored for
+/// the lifetime of the activation, and the runtime never dereferences an
+/// invalid one: an unusable argument list leaves the frame with metadata but
+/// no live locals, and never panics.
+///
+/// # Safety
+///
+/// When `base` is non-NULL it must point at `slots` initialised tagged values
+/// (the registered precise frame) for as long as the activation runs; the
+/// pointer must be cleared by `hydro_frame_leave` before the storage dies.
+#[no_mangle]
+pub extern "C" fn hydro_frame_bind(
+    base: *mut i64,
+    slots: usize,
+    names: *const c_uchar,
+    names_len: usize,
+    params: usize,
+    flags: u32,
+    module: *const c_uchar,
+    module_len: usize,
+    first_line: u32,
+) {
+    exc::frame_bind(
+        base, slots, names, names_len, params, flags, module, module_len, first_line,
+    );
+}
+
 // Exceptions
 
 #[no_mangle]
@@ -1900,9 +1941,39 @@ pub extern "C" fn hydro_profile_dump(path_ptr: *const u8, path_len: usize) -> i3
 mod tests {
     use super::*;
 
+    /// Serialises the tests in this binary: the module-global store and the
+    /// module caches derived from it are process-wide, so one test's
+    /// `hydro_runtime_init` must not clear them while another test compares
+    /// cached values.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Initialises the runtime for a test, holding the process-wide test lock
+    /// for the rest of the test thread's life.
+    ///
+    /// A test that resets the runtime mid-body (`reset` tests call
+    /// `hydro_runtime_init` again) reuses the already-held lock instead of
+    /// deadlocking on it.
+    fn test_init() {
+        thread_local! {
+            static SESSION: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        SESSION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(
+                    TEST_LOCK
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+            }
+        });
+        super::hydro_runtime_init();
+    }
+
     #[test]
     fn constants_and_constructors() {
-        hydro_runtime_init();
+        test_init();
         assert_eq!(hydro_none(), 1);
         assert_eq!(hydro_false(), 9);
         assert_eq!(hydro_true(), 17);
@@ -1918,7 +1989,7 @@ mod tests {
 
     #[test]
     fn bigint_literals_parse_through_the_abi() {
-        hydro_runtime_init();
+        test_init();
         let text = b"987654321098765432109876543210";
         let huge = hydro_bigint_from_str(text.as_ptr(), text.len());
         assert!(value::is_bigint(huge));
@@ -1948,7 +2019,7 @@ mod tests {
             "bench_hydro.py".to_string(),
             vec!["--help".to_string(), "--n=1".to_string()],
         );
-        hydro_runtime_init();
+        test_init();
         assert_eq!(
             crate::argv(),
             vec![
@@ -1968,7 +2039,7 @@ mod tests {
 
     #[test]
     fn operator_entry_points() {
-        hydro_runtime_init();
+        test_init();
         let two = hydro_int(2);
         let ten = hydro_int(10);
         let result = hydro_binop(ops::OP_POW, two, ten);
@@ -1983,7 +2054,7 @@ mod tests {
 
     #[test]
     fn container_entry_points() {
-        hydro_runtime_init();
+        test_init();
         let items = [hydro_int(1), hydro_int(2)];
         let list = hydro_list_new(items.len(), items.as_ptr());
         assert_eq!(hydro_len(list), hydro_int(2));
@@ -2018,7 +2089,7 @@ mod tests {
 
     #[test]
     fn tuple_entry_points() {
-        hydro_runtime_init();
+        test_init();
         let items = [hydro_int(1), hydro_int(2)];
         let t = hydro_tuple_new(items.len(), items.as_ptr());
         assert_eq!(value::type_name(t), "tuple");
@@ -2056,7 +2127,7 @@ mod tests {
 
     #[test]
     fn unpack_seq_entry_point() {
-        hydro_runtime_init();
+        test_init();
 
         // Lists, tuples, strings and bytes are returned unchanged.
         let list = make_list(&[1, 2, 3]);
@@ -2106,7 +2177,7 @@ mod tests {
 
     #[test]
     fn unpack_star_entry_point() {
-        hydro_runtime_init();
+        test_init();
 
         // `a, *rest, b = [1, 2, 3, 4]`: slot 1 is the fresh middle list.
         let list = make_list(&[1, 2, 3, 4]);
@@ -2169,7 +2240,7 @@ mod tests {
 
     #[test]
     fn module_values_share_identity_and_extensions_keep_their_name() {
-        hydro_runtime_init();
+        test_init();
 
         // Every materialisation of a module value returns the same
         // `sys.modules` object, including a read through `sys.modules`.
@@ -2217,7 +2288,7 @@ mod tests {
 
     #[test]
     fn slice_entry_points() {
-        hydro_runtime_init();
+        test_init();
 
         let list = make_list(&[0, 1, 2, 3, 4]);
         assert_eq!(
@@ -2307,7 +2378,7 @@ mod tests {
 
     #[test]
     fn slice_results_are_independent() {
-        hydro_runtime_init();
+        test_init();
 
         let source = make_list(&[1, 2, 3]);
         let sliced = hydro_slice(source, hydro_none(), hydro_none(), hydro_none());
@@ -2323,7 +2394,7 @@ mod tests {
 
     #[test]
     fn slice_errors() {
-        hydro_runtime_init();
+        test_init();
         let list = make_list(&[1, 2, 3]);
 
         assert_eq!(
@@ -2377,7 +2448,7 @@ mod tests {
 
     #[test]
     fn slice_assignment_entry_point() {
-        hydro_runtime_init();
+        test_init();
 
         let list = make_list(&[0, 1, 2, 3, 4]);
         // Same-length middle replacement. The ABI returns `None`.
@@ -2538,7 +2609,7 @@ mod tests {
 
     #[test]
     fn slice_assignment_errors() {
-        hydro_runtime_init();
+        test_init();
         let list = make_list(&[0, 1, 2, 3]);
 
         // An extended slice needs exactly as many values as positions, and a
@@ -2651,7 +2722,7 @@ mod tests {
 
     #[test]
     fn gc_entry_points() {
-        hydro_runtime_init();
+        test_init();
         assert_eq!(hydro_gc_objects(), 0);
 
         let s = hydro_str_new(b"gc".as_ptr(), 2);
@@ -2669,13 +2740,13 @@ mod tests {
         assert_eq!(value::as_float(f), Some(1.0));
         assert!(hydro_gc_objects() >= 2);
 
-        hydro_runtime_init();
+        test_init();
         assert_eq!(hydro_gc_objects(), 0);
     }
 
     #[test]
     fn set_entry_points() {
-        hydro_runtime_init();
+        test_init();
         let items = [hydro_int(1), hydro_int(2), hydro_int(2), hydro_int(3)];
         let s = hydro_set_new(items.len(), items.as_ptr());
         assert_eq!(value::type_name(s), "set");
@@ -2717,7 +2788,7 @@ mod tests {
 
     #[test]
     fn gc_traces_set_elements() {
-        hydro_runtime_init();
+        test_init();
         let alpha = hydro_str_new(b"alpha".as_ptr(), 5);
         let beta = hydro_str_new(b"beta".as_ptr(), 4);
         let items = [alpha, beta];
@@ -2741,7 +2812,7 @@ mod tests {
 
     #[test]
     fn builtins_entry_points() {
-        hydro_runtime_init();
+        test_init();
         let r = hydro_range_new(hydro_int(0), hydro_int(5), hydro_int(1));
         assert_eq!(value::type_name(r), "range");
         assert_eq!(value::to_string(r), "range(0, 5)");
@@ -2813,7 +2884,7 @@ mod tests {
 
     #[test]
     fn all_and_dict_merge_entry_points() {
-        hydro_runtime_init();
+        test_init();
         assert_eq!(hydro_all(make_list(&[1, 2])), hydro_true());
         assert_eq!(hydro_all(make_list(&[1, 0])), hydro_false());
         assert_eq!(hydro_all(make_list(&[])), hydro_true());
@@ -2844,7 +2915,7 @@ mod tests {
 
     #[test]
     fn starred_method_entry_point() {
-        hydro_runtime_init();
+        test_init();
         let receiver = value::str_from_bytes(b"a-a");
         let args = [value::str_from_bytes(b"a"), value::str_from_bytes(b"b")];
         let star = hydro_tuple_new(args.len(), args.as_ptr());
@@ -2879,7 +2950,7 @@ mod tests {
 
     #[test]
     fn builtins_survive_gc() {
-        hydro_runtime_init();
+        test_init();
         let r = hydro_range_new(hydro_int(0), hydro_int(4), hydro_int(1));
         let listed = hydro_list_from(r);
         let summed = hydro_sum(r, hydro_int(0));
@@ -2936,7 +3007,7 @@ mod tests {
 
     #[test]
     fn function_values_and_indirect_calls() {
-        hydro_runtime_init();
+        test_init();
         let add = function(add_wrapper, 2, "add");
         assert_eq!(value::type_name(add), "function");
         assert!(value::truthy(add));
@@ -2972,7 +3043,7 @@ mod tests {
 
     #[test]
     fn function_call_errors() {
-        hydro_runtime_init();
+        test_init();
         let add = function(add_wrapper, 2, "add");
         let args = [hydro_int(1)];
 
@@ -3040,7 +3111,7 @@ mod tests {
 
     #[test]
     fn map_and_filter_values() {
-        hydro_runtime_init();
+        test_init();
         let double = function(double_wrapper, 1, "<lambda>");
         let even = function(is_even_wrapper, 1, "<lambda>");
         let r5 = hydro_range_new(hydro_int(0), hydro_int(5), hydro_int(1));
@@ -3080,7 +3151,7 @@ mod tests {
 
     #[test]
     fn map_and_filter_errors() {
-        hydro_runtime_init();
+        test_init();
         let source = make_list(&[1, 2, 3]);
         let double = function(double_wrapper, 1, "<lambda>");
 
@@ -3127,7 +3198,7 @@ mod tests {
 
     #[test]
     fn function_exceptions_propagate() {
-        hydro_runtime_init();
+        test_init();
         let fail = function(fail_wrapper, 1, "fail");
         let source = make_list(&[1, 2]);
 
@@ -3149,7 +3220,7 @@ mod tests {
 
     #[test]
     fn functions_survive_gc() {
-        hydro_runtime_init();
+        test_init();
         let add = function(add_wrapper, 2, "add");
         let double = function(double_wrapper, 1, "<lambda>");
 
@@ -3198,7 +3269,7 @@ mod tests {
 
     #[test]
     fn exception_entry_points() {
-        hydro_runtime_init();
+        test_init();
         assert_eq!(hydro_exc_pending(), 0);
         assert_eq!(hydro_exc_tag(), -1);
 

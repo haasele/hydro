@@ -59,6 +59,7 @@ fn callable_key(argument: i64) -> Result<(), i64> {
         || value::as_function(argument).is_some()
         || value::as_class(argument).is_some()
         || value::as_ext_function(argument).is_some()
+        || crate::modules::extension::ext_object_is_callable(argument)
     {
         return Ok(());
     }

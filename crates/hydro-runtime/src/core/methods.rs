@@ -60,6 +60,53 @@ pub(crate) fn call(
     let Some(method) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    // A `property` object exposes its slots as attributes (`p.fget`), and
+    // calling `p.fget(...)` must invoke the stored getter rather than looking
+    // for a method named `fget` on the property class.
+    if let Some(state) = value::as_descriptor(obj) {
+        if state.kind == value::DescriptorKind::Property {
+            match method.as_str() {
+                "fget" | "fset" | "fdel" => {
+                    let function = match method.as_str() {
+                        "fget" => state.fget(),
+                        "fset" => state.fset(),
+                        _ => state.fdel(),
+                    };
+                    if function == NONE {
+                        return attribute_error(obj, &method);
+                    }
+                    return builtins::call(function, argc, argv);
+                }
+                "getter" | "setter" | "deleter" => {
+                    let fget = state.fget();
+                    let fset = state.fset();
+                    let fdel = state.fdel();
+                    let new_value = if argc == 0 {
+                        NONE
+                    } else {
+                        // SAFETY: callers provide a readable argv buffer.
+                        unsafe { std::slice::from_raw_parts(argv, argc) }
+                            .first()
+                            .copied()
+                            .unwrap_or(NONE)
+                    };
+                    let property = match method.as_str() {
+                        "getter" => value::property_new(new_value, fset, fdel),
+                        "setter" => value::property_new(fget, new_value, fdel),
+                        _ => value::property_new(fget, fset, new_value),
+                    };
+                    return property;
+                }
+                _ => {}
+            }
+        }
+    }
+    // Opaque extension values resolve the attribute in the extension and call
+    // the bound method there, so extension-defined methods keep their exact
+    // CPython call conventions.
+    if value::as_ext_object(obj).is_some() {
+        return modules::extension::ext_object_method(obj, &method, argc, argv);
+    }
     // Template values expose only `Interpolation.convert()`.
     if let Some(result) = crate::core::template::call_method(obj, &method, argc, argv) {
         return result;
@@ -575,7 +622,13 @@ fn bind_builtin_descriptor(
             if instance == NONE {
                 return descriptor;
             }
-            call_receiver_callable(state.target, instance, owner, "property", &[])
+            let getter = state.fget();
+            if getter == NONE {
+                // A blank `property()` has no `fget`: reading through it is an
+                // `AttributeError`, not a call of `None`.
+                return exc::raise_with_message(ATTRIBUTE_ERROR, "property has no getter");
+            }
+            call_receiver_callable(getter, instance, owner, "property", &[])
         }
         value::DescriptorKind::TypeAnnotations => {
             // Class access through a namespace: report the owner's own
@@ -615,7 +668,12 @@ fn call_receiver_callable(
 }
 
 /// Methods of a built-in descriptor value: `property.getter/setter/deleter`
-/// and the `type.__annotations__` getset descriptor's `__get__`/`__set__`.
+/// plus the descriptor protocol and `__set_name__`, and the
+/// `type.__annotations__` getset descriptor's `__get__`/`__set__`.
+///
+/// CPython's blank `property()` object exposes the same surfaces: `enum` calls
+/// `redirect.__set_name__(cls, name)` on a redirect descriptor and copies
+/// `__get__`/`__set__`/`__delete__` into `_get`/`_set`/`_del`.
 fn descriptor_value_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     let Some(state) = value::as_descriptor(obj) else {
         return attribute_error(obj, method);
@@ -626,16 +684,67 @@ fn descriptor_value_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     if state.kind != value::DescriptorKind::Property {
         return attribute_error(obj, method);
     }
+    let fget = state.fget();
     match method {
         "getter" | "setter" | "deleter" => {
             if let Some(err) = check_arity("property", method, args.len(), 1, 1) {
                 return err;
             }
             match method {
-                "getter" => value::property_new(args[0], state.setter, state.deleter),
-                "setter" => value::property_new(state.target, args[0], state.deleter),
-                _ => value::property_new(state.target, state.setter, args[0]),
+                "getter" => value::property_new(args[0], state.fset(), state.fdel()),
+                "setter" => value::property_new(fget, args[0], state.fdel()),
+                _ => value::property_new(fget, state.fset(), args[0]),
             }
+        }
+        // `property.__get__(instance[, owner])`: class access returns the
+        // descriptor itself; instance access requires a getter.
+        "__get__" => {
+            if let Some(err) = check_arity("property", method, args.len(), 1, 2) {
+                return err;
+            }
+            let instance = args[0];
+            let owner = args.get(1).copied().unwrap_or(NONE);
+            if instance == NONE {
+                return obj;
+            }
+            if fget == NONE {
+                return exc::raise_with_message(ATTRIBUTE_ERROR, "property has no getter");
+            }
+            call_receiver_callable(fget, instance, owner, "property", &[])
+        }
+        // `property.__set__(instance, value)`: requires a setter.
+        "__set__" => {
+            if let Some(err) = check_arity("property", method, args.len(), 2, 2) {
+                return err;
+            }
+            let setter = state.fset();
+            if setter == NONE {
+                return exc::raise_with_message(ATTRIBUTE_ERROR, "property has no setter");
+            }
+            call_receiver_callable(setter, args[0], NONE, "property", &[args[1]])
+        }
+        // `property.__delete__(instance)`: requires a deleter.
+        "__delete__" => {
+            if let Some(err) = check_arity("property", method, args.len(), 1, 1) {
+                return err;
+            }
+            let deleter = state.fdel();
+            if deleter == NONE {
+                return exc::raise_with_message(ATTRIBUTE_ERROR, "property has no deleter");
+            }
+            call_receiver_callable(deleter, args[0], NONE, "property", &[])
+        }
+        // CPython's `property.__set_name__(owner, name)` records the name for
+        // diagnostics. Hydro's descriptor has no name slot, so it is a no-op
+        // that still validates the (owner, name) shape.
+        "__set_name__" => {
+            if let Some(err) = check_arity("property", method, args.len(), 2, 2) {
+                return err;
+            }
+            if value::as_str(args[1]).is_none() {
+                return type_error("attribute name must be string".to_string());
+            }
+            NONE
         }
         _ => attribute_error(obj, method),
     }
@@ -1233,6 +1342,9 @@ pub(crate) fn call_kw(
         Ok(keywords) => keywords,
         Err(err) => return err,
     };
+    if value::as_ext_object(obj).is_some() {
+        return modules::extension::ext_object_method_kw(obj, &method, argc, argv, kwargc, kw_argv);
+    }
     if let Some(module) = value::as_module(obj) {
         if module.path().is_some() {
             let function = modules::module_attr(module, &method);
@@ -1552,10 +1664,34 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    if let Some(attribute) = modules::extension::ext_function_getattr(obj, &attr) {
+        return attribute;
+    }
+    if value::as_ext_function(obj).is_some() {
+        return attribute_error(obj, &attr);
+    }
+    if value::as_ext_object(obj).is_some() {
+        if let Some(attribute) = modules::extension::ext_object_metadata_getattr(obj, &attr) {
+            return attribute;
+        }
+        return modules::extension::ext_object_getattr(obj, &attr);
+    }
     // PEP 750 template values expose `strings`, `interpolations`, `values`
     // and the interpolation fields directly.
     if let Some(attribute) = crate::core::template::getattr(obj, &attr) {
         return attribute;
+    }
+    if value::as_frame(obj).is_some() {
+        if let Some(attribute) = exc::frame_attr(obj, &attr) {
+            return attribute;
+        }
+        return attribute_error(obj, &attr);
+    }
+    if value::as_code(obj).is_some() {
+        if let Some(attribute) = exc::code_attr(obj, &attr) {
+            return attribute;
+        }
+        return attribute_error(obj, &attr);
     }
     if let Some(module) = value::as_module(obj) {
         return crate::modules::module_attr(module, &attr);
@@ -1879,12 +2015,25 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     }
     if let Some(state) = value::as_descriptor(obj) {
         // `property` exposes `getter`/`setter`/`deleter` returning new
-        // property objects; the `type.__annotations__` getset descriptor
-        // exposes the descriptor protocol itself.
+        // property objects, its `fget`/`fset`/`fdel` slots, the descriptor
+        // protocol (`__get__`/`__set__`/`__delete__`, `__set_name__`) and the
+        // arbitrary attributes a blank `property()` object accepts
+        // (`p.member = ...` in `enum`). The `type.__annotations__` getset
+        // descriptor exposes only the descriptor protocol itself.
+        if state.kind == value::DescriptorKind::Property {
+            return match attr.as_str() {
+                "getter" | "setter" | "deleter" | "__get__" | "__set__" | "__delete__"
+                | "__set_name__" => value::bound_method_new(obj, attr),
+                "fget" => state.fget(),
+                "fset" => state.fset(),
+                "fdel" => state.fdel(),
+                _ => match state.attr(attr.as_str()) {
+                    Some(item) => item,
+                    None => attribute_error(obj, &attr),
+                },
+            };
+        }
         return match attr.as_str() {
-            "getter" | "setter" | "deleter" if state.kind == value::DescriptorKind::Property => {
-                value::bound_method_new(obj, attr)
-            }
             "__get__" | "__set__" if state.kind == value::DescriptorKind::TypeAnnotations => {
                 value::bound_method_new(obj, attr)
             }
@@ -1992,6 +2141,25 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    // Extension functions keep writable metadata in the shim slot; opaque
+    // handles use a metadata overlay for the four dunder slots and delegate
+    // every other assignment to the extension's `tp_setattro`.
+    if let Some(result) = modules::extension::ext_function_setattr(obj, &attr, new_value) {
+        return result;
+    }
+    if value::as_ext_function(obj).is_some() {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("'builtin_function_or_method' object has no attribute '{attr}'"),
+        );
+    }
+    if value::as_ext_object(obj).is_some() {
+        if let Some(result) = modules::extension::ext_object_metadata_setattr(obj, &attr, new_value)
+        {
+            return result;
+        }
+        return modules::extension::ext_object_setattr(obj, &attr, new_value);
+    }
     // Module attributes are writable: a native module keeps its spec as the
     // default resolution and stores the assignment as an override, while a
     // user module also mirrors it into the globals store behind its namespace.
@@ -2040,6 +2208,18 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
         }
         return attribute_error(obj, &attr);
     }
+    // A built-in `property` object has a writable attribute table: `enum`
+    // redirects descriptors by assigning `member`, `fget`, `_get`, ... .
+    // Dunder slots keep their fixed meaning and stay read-only here.
+    if let Some(state) = value::as_descriptor(obj) {
+        if state.kind == value::DescriptorKind::Property
+            && !(attr.starts_with("__") && attr.ends_with("__") && attr.len() > 4)
+        {
+            state.set_attr(obj, attr, new_value);
+            return NONE;
+        }
+        return attribute_error(obj, &attr);
+    }
     if let Some(class) = value::instance_class_value(obj) {
         if attr == "__dict__" {
             if value::instance_set_dict(obj, new_value) {
@@ -2059,7 +2239,8 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
                 value::ClassEntry::Attr(descriptor) => {
                     if let Some(state) = value::as_descriptor(*descriptor) {
                         if state.kind == value::DescriptorKind::Property {
-                            if state.setter == NONE {
+                            let setter = state.fset();
+                            if setter == NONE {
                                 let name = value::instance_class_name(obj).unwrap_or("object");
                                 return exc::raise_with_message(
                                     ATTRIBUTE_ERROR,
@@ -2067,7 +2248,7 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
                                 );
                             }
                             return call_receiver_callable(
-                                state.setter,
+                                setter,
                                 obj,
                                 class,
                                 "property",
@@ -2125,8 +2306,9 @@ pub(crate) fn delete_attr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     if let Some(class) = value::instance_class_value(obj) {
         if let Some(value::ClassEntry::Attr(descriptor)) = value::class_lookup(class, &attr) {
             if let Some(state) = value::as_descriptor(descriptor) {
-                if state.kind == value::DescriptorKind::Property && state.deleter != NONE {
-                    return call_receiver_callable(state.deleter, obj, class, "property", &[]);
+                let deleter = state.fdel();
+                if state.kind == value::DescriptorKind::Property && deleter != NONE {
+                    return call_receiver_callable(deleter, obj, class, "property", &[]);
                 }
             }
             if descriptor_method(descriptor, "__delete__").is_some() {

@@ -38,19 +38,35 @@
 //! from a `__set_name__` call when one happens and otherwise recovers the same
 //! name from the owner class namespace on the first access.
 //!
+//! `singledispatch` builds a real dispatcher object: it keeps the default
+//! implementation in a `registry` mapping, resolves the best implementation
+//! from the argument's class linearization (and from the ABC virtual-subclass
+//! registry), and forwards every call — positional and keyword — to it.
+//! `register` accepts a class, a union of classes or a bare annotated
+//! function, exactly like CPython. `singledispatchmethod` is a real
+//! descriptor whose `__get__` returns the `_singledispatchmethod_get` wrapper;
+//! the wrapper dispatches on the first call argument and re-binds the
+//! implementation to the instance or class it was read from.
+//!
+//! `total_ordering` installs the missing comparison methods on a class. Each
+//! generated method calls the class-level source operation
+//! (`type(self).__lt__` & co.) and derives the requested result from it,
+//! propagating `NotImplemented` unchanged.
+//!
 //! Limits, reported instead of fabricated:
-//! - `singledispatchmethod` itself is not implemented, so the wrapper stores
-//!   the descriptor and the `(obj, cls)` pair but cannot delegate dispatch.
 //! - `functools.partial` objects do not fill `Placeholder` holes themselves
 //!   (the partial call path lives in the value layer); `partialmethod`
 //!   forwards its own placeholders through the merged argument list.
+//! - `singledispatch` does not cache dispatch results: the ABC
+//!   `get_cache_token()` never needs to invalidate anything, and every call
+//!   walks the registry (`_clear_cache` is therefore a no-op).
 
 use hydro_ir::ParamKind;
 
 use crate::core::value::{self, ClassEntry, FunctionBody, NONE};
-use crate::exc::{self, ATTRIBUTE_ERROR, TYPE_ERROR};
+use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::heap;
-use hydro_ir::MethodKind;
+use hydro_ir::{Builtin, MethodKind};
 
 /// CPython's `functools.WRAPPER_ASSIGNMENTS`.
 const WRAPPER_ASSIGNMENTS: [&str; 5] = [
@@ -375,6 +391,33 @@ pub(crate) fn singledispatchmethod_get_class() -> i64 {
     {
         return cached;
     }
+    // The call form takes `(self, *args, **kwargs)`; the binder materialises
+    // the variadic tail as a list and the keywords as a dict, so the
+    // trampoline can forward both to the dispatched implementation.
+    let call = method_entry(
+        "functools",
+        "_singledispatchmethod_get.__call__",
+        get_call_entry,
+        variadic_parameters(),
+    );
+    let name = method_entry(
+        "functools",
+        "_singledispatchmethod_get.__name__",
+        get_name_entry,
+        vec![self_parameter()],
+    );
+    let qualname = method_entry(
+        "functools",
+        "_singledispatchmethod_get.__qualname__",
+        get_qualname_entry,
+        vec![self_parameter()],
+    );
+    let wrapped = method_entry(
+        "functools",
+        "_singledispatchmethod_get.__wrapped__",
+        get_wrapped_entry,
+        vec![self_parameter()],
+    );
     let methods: Vec<(String, i64, MethodKind)> = vec![
         (
             "__init__".to_string(),
@@ -390,6 +433,13 @@ pub(crate) fn singledispatchmethod_get_class() -> i64 {
             value::native_function_new("functools", "_singledispatchmethod_get.__repr__", 1),
             MethodKind::Normal,
         ),
+        ("__call__".to_string(), call, MethodKind::Normal),
+        // CPython exposes these lazily from the wrapped function; they are
+        // data descriptors so `inspect` and `abc` can read them off the
+        // wrapper without a `__getattr__` hook.
+        ("__name__".to_string(), name, MethodKind::Property),
+        ("__qualname__".to_string(), qualname, MethodKind::Property),
+        ("__wrapped__".to_string(), wrapped, MethodKind::Property),
     ];
     let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
     let method_roots = heap::root_values(&method_values);
@@ -413,11 +463,18 @@ fn init_get(instance: i64, unbound: i64, obj: i64, cls: i64) -> i64 {
     if exc::pending() {
         return NONE;
     }
-    let roots = heap::root_values(&[unbound, obj, cls, function]);
+    // `singledispatchmethod.__init__` stores its dispatcher on the descriptor;
+    // resolving it here (instead of on every call) mirrors CPython's
+    // `_dispatch = unbound.dispatcher.dispatch`.
+    let dispatcher = instance_attribute(unbound, "dispatcher").unwrap_or(NONE);
+    let roots = heap::root_values(&[unbound, obj, cls, function, dispatcher]);
     value::instance_setattr(instance, "_unbound".to_string(), unbound);
     value::instance_setattr(instance, "_obj".to_string(), obj);
     value::instance_setattr(instance, "_cls".to_string(), cls);
     value::instance_setattr(instance, "_func".to_string(), function);
+    if dispatcher != NONE {
+        value::instance_setattr(instance, "_dispatcher".to_string(), dispatcher);
+    }
     heap::release_roots(roots);
     instance
 }
@@ -1401,6 +1458,1056 @@ fn cached_property_set_name(this: i64, name: i64) -> i64 {
     }
 }
 
+// -------------------------------------------------------------------------
+// singledispatch / singledispatchmethod
+// -------------------------------------------------------------------------
+
+/// `self` plus the `(*args, **kwargs)` tail, as the native method binder lays
+/// it out: the variadic positions arrive as a list and a dict.
+fn variadic_parameters() -> Vec<value::ParamMeta> {
+    vec![
+        self_parameter(),
+        value::ParamMeta {
+            name: "args".to_string(),
+            kind: ParamKind::VarArg,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "kwargs".to_string(),
+            kind: ParamKind::KwArg,
+            default: None,
+        },
+    ]
+}
+
+fn positional_parameter(name: &str) -> value::ParamMeta {
+    value::ParamMeta {
+        name: name.to_string(),
+        kind: ParamKind::Positional,
+        default: None,
+    }
+}
+
+/// A positional parameter whose omitted value is `None`.
+fn optional_parameter(name: &str) -> value::ParamMeta {
+    value::ParamMeta {
+        name: name.to_string(),
+        kind: ParamKind::Positional,
+        default: Some(NONE),
+    }
+}
+
+/// The items of the list the binder materialised for a `*args` slot.
+fn list_items(item: i64) -> Vec<i64> {
+    value::as_list(item)
+        .map(|items| items.to_vec())
+        .unwrap_or_default()
+}
+
+/// The pairs of the dict the binder materialised for a `**kwargs` slot, in
+/// insertion order.
+fn dict_keywords(item: i64) -> Vec<(String, i64)> {
+    value::as_dict(item)
+        .map(|pairs| {
+            pairs
+                .iter()
+                .filter_map(|(key, value)| {
+                    value::as_str(*key).map(|name| (name.to_string(), *value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `func.__name__`, or `fallback` when the callable does not expose one.
+fn callable_name(func: i64, fallback: &str) -> String {
+    let found = match read_attribute(func, "__name__") {
+        AttributeRead::Found(item) => value::as_str(item).map(str::to_string),
+        _ => {
+            exc::clear();
+            None
+        }
+    };
+    found.unwrap_or_else(|| fallback.to_string())
+}
+
+/// The annotations a callable stores in `__annotations__`, in declaration
+/// order. `None` covers both "no attribute" and an unusable payload.
+fn function_annotations(function: i64) -> Option<Vec<(String, i64)>> {
+    match read_attribute(function, "__annotations__") {
+        AttributeRead::Found(annotations) => Some(
+            value::as_dict(annotations)
+                .map(|pairs| {
+                    pairs
+                        .iter()
+                        .filter_map(|(key, item)| {
+                            value::as_str(*key).map(|name| (name.to_string(), *item))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        AttributeRead::Missing => {
+            exc::clear();
+            None
+        }
+        AttributeRead::Failed => None,
+    }
+}
+
+/// The `registry` mapping of a dispatcher instance.
+fn registry_of(dispatcher: i64) -> Option<i64> {
+    let registry = value::instance_attr(dispatcher, "registry")?;
+    value::as_dict(registry).map(|_| registry)
+}
+
+/// The class a registry key denotes: a class stays itself and a builtin type
+/// spelling (`int`, `list`, …) resolves to the cached class `type()` reports.
+fn dispatch_class(key: i64) -> i64 {
+    value::normalize_class_base(key)
+}
+
+/// The registry keys a `register()` argument denotes: a class, a builtin type
+/// spelling or a PEP 604 union of those.
+///
+/// The keys are kept exactly as supplied (CPython's registry is keyed by the
+/// argument itself), so `registry[int]` still finds the entry even though the
+/// runtime spells `int` as a builtin function value.
+fn dispatch_keys(argument: i64) -> Result<Vec<i64>, ()> {
+    if crate::modules::types::is_union(argument) {
+        let Some(args) = value::instance_attr(argument, "__args__").and_then(value::as_tuple)
+        else {
+            return Err(());
+        };
+        let mut keys = Vec::with_capacity(args.len());
+        for &member in args {
+            if value::as_class(dispatch_class(member)).is_none() {
+                return Err(());
+            }
+            keys.push(member);
+        }
+        return Ok(keys);
+    }
+    if argument == NONE || value::as_class(dispatch_class(argument)).is_none() {
+        return Err(());
+    }
+    Ok(vec![argument])
+}
+
+/// Resolves a string annotation naming a builtin type.
+fn builtin_type(name: &str) -> Option<i64> {
+    match name {
+        "object" => return Some(value::object_class()),
+        "None" | "NoneType" => return Some(value::type_class(NONE)),
+        _ => {}
+    }
+    let builtin = Builtin::from_name(name)?;
+    let class = value::normalize_class_base(value::builtin_function_new(builtin));
+    value::as_class(class).map(|_| class)
+}
+
+/// The registry keys a first-parameter annotation denotes. String annotations
+/// are resolved through the builtin type names; every other annotation must
+/// already be a class, a builtin type spelling or a union.
+fn annotation_keys(annotation: i64) -> Option<Vec<i64>> {
+    if let Some(name) = value::as_str(annotation) {
+        return builtin_type(name).map(|class| vec![class]);
+    }
+    dispatch_keys(annotation).ok()
+}
+
+/// Inserts `function` under every key of `keys`, keeping the values reachable
+/// while the registry may allocate.
+fn register_keys(registry: i64, keys: &[i64], function: i64) -> i64 {
+    let mut roots_source = Vec::with_capacity(keys.len() + 2);
+    roots_source.push(registry);
+    roots_source.push(function);
+    roots_source.extend_from_slice(keys);
+    let roots = heap::root_values(&roots_source);
+    for &key in keys {
+        crate::container::dict_set(registry, key, function);
+    }
+    heap::release_roots(roots);
+    function
+}
+
+/// The decorator `register(cls)` returns: a partial of
+/// [`register`]'s apply helper binding the dispatcher and the class.
+fn register_decorator(dispatcher: i64, cls: i64) -> i64 {
+    let apply = value::native_function_new("functools", "_singledispatch_register_apply", 3);
+    let roots = heap::root_values(&[dispatcher, cls, apply]);
+    let decorator = value::partial_new(apply, vec![dispatcher, cls]);
+    heap::release_roots(roots);
+    decorator
+}
+
+/// `register(cls, func=None)`: chooses between registration and the decorator
+/// form, and falls back to the first-parameter annotation for a bare
+/// `@register`.
+fn register(dispatcher: i64, cls: i64, function: i64) -> i64 {
+    match dispatch_keys(cls) {
+        Ok(keys) => {
+            if function == NONE {
+                return register_decorator(dispatcher, cls);
+            }
+            let Some(registry) = registry_of(dispatcher) else {
+                return exc::raise_with_message(
+                    ATTRIBUTE_ERROR,
+                    "'_singledispatch' object has no attribute 'registry'",
+                );
+            };
+            register_keys(registry, &keys, function)
+        }
+        Err(()) => {
+            if function != NONE {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "Invalid first argument to `register()`. {} is not a class or union type.",
+                        value::repr(cls)
+                    ),
+                );
+            }
+            register_annotated(dispatcher, cls)
+        }
+    }
+}
+
+/// The bare `@generic.register` form: the decorated function's first
+/// annotation names the class to register it under.
+fn register_annotated(dispatcher: i64, function: i64) -> i64 {
+    let annotations = function_annotations(function);
+    if exc::pending() {
+        return NONE;
+    }
+    let Some((argument, annotation)) = annotations.and_then(|pairs| pairs.into_iter().next())
+    else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "Invalid first argument to `register()`: {}. Use either \
+                 `@register(some_class)` or plain `@register` on an annotated function.",
+                value::repr(function)
+            ),
+        );
+    };
+    let Some(keys) = annotation_keys(annotation) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "Invalid annotation for '{}'. {} is not a class.",
+                argument,
+                value::repr(annotation)
+            ),
+        );
+    };
+    let Some(registry) = registry_of(dispatcher) else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "'_singledispatch' object has no attribute 'registry'",
+        );
+    };
+    register_keys(registry, &keys, function)
+}
+
+/// Binds the single positional-or-keyword parameter of a module decorator
+/// (`singledispatch(func)`, `total_ordering(cls)`) for the keyword-aware
+/// module dispatcher. Returns `None` with a pending `TypeError` on any other
+/// shape, so no argument is silently dropped.
+pub(crate) fn single_argument(args: &[i64], keywords: &[(String, i64)], name: &str) -> Option<i64> {
+    if args.len() > 1 {
+        exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("takes 1 argument ({} given)", args.len()),
+        );
+        return None;
+    }
+    let mut bound = args.first().copied();
+    for (keyword, value) in keywords {
+        if keyword != name {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("got an unexpected keyword argument '{keyword}'"),
+            );
+            return None;
+        }
+        if bound.is_some() {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("got multiple values for argument '{name}'"),
+            );
+            return None;
+        }
+        bound = Some(*value);
+    }
+    if bound.is_none() {
+        exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("missing 1 required positional argument: '{name}'"),
+        );
+    }
+    bound
+}
+
+/// The cached `functools._singledispatch` dispatcher class.
+///
+/// The dispatcher is a plain object with a `__call__`, a `register`, a
+/// `dispatch` and a `_clear_cache` method plus the `func`/`registry`
+/// attributes CPython's decorator publishes.
+fn singledispatch_class() -> i64 {
+    if let Some(cached) = crate::core::globals::registry_get("functools._singledispatch") {
+        return cached;
+    }
+    let call = method_entry(
+        "functools",
+        "_singledispatch_call",
+        singledispatch_call_entry,
+        variadic_parameters(),
+    );
+    let register_method = method_entry(
+        "functools",
+        "_singledispatch_register",
+        singledispatch_register_entry,
+        vec![
+            self_parameter(),
+            positional_parameter("cls"),
+            optional_parameter("func"),
+        ],
+    );
+    let dispatch_method = method_entry(
+        "functools",
+        "_singledispatch_dispatch",
+        singledispatch_dispatch_entry,
+        vec![self_parameter(), positional_parameter("cls")],
+    );
+    let clear_cache = method_entry(
+        "functools",
+        "_singledispatch_clear_cache",
+        singledispatch_clear_cache_entry,
+        vec![self_parameter()],
+    );
+    let methods: Vec<(String, i64, MethodKind)> = vec![
+        ("__call__".to_string(), call, MethodKind::Normal),
+        ("register".to_string(), register_method, MethodKind::Normal),
+        ("dispatch".to_string(), dispatch_method, MethodKind::Normal),
+        ("_clear_cache".to_string(), clear_cache, MethodKind::Normal),
+    ];
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new_full("singledispatch".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    crate::core::globals::registry_set("functools._singledispatch", class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// Copies the function metadata CPython's `update_wrapper` assigns onto the
+/// dispatcher, and records the `__wrapped__` back-reference.
+fn copy_callable_metadata(wrapper: i64, wrapped: i64) -> i64 {
+    let roots = heap::root_values(&[wrapper, wrapped]);
+    for name in [
+        "__module__",
+        "__name__",
+        "__qualname__",
+        "__doc__",
+        "__annotations__",
+    ] {
+        match read_attribute(wrapped, name) {
+            AttributeRead::Found(item) => {
+                let item_roots = heap::root_values(&[item]);
+                let written = write_attribute(wrapper, name, item);
+                heap::release_roots(item_roots);
+                if !written {
+                    heap::release_roots(roots);
+                    return NONE;
+                }
+            }
+            // CPython skips an assigned attribute the wrapped callable does
+            // not expose.
+            AttributeRead::Missing => {
+                exc::clear();
+            }
+            AttributeRead::Failed => {
+                heap::release_roots(roots);
+                return NONE;
+            }
+        }
+    }
+    let written = write_attribute(wrapper, "__wrapped__", wrapped);
+    heap::release_roots(roots);
+    if written {
+        wrapper
+    } else {
+        NONE
+    }
+}
+
+/// `functools.singledispatch(func)`: the decorator that turns `func` into the
+/// default implementation of a generic function.
+pub(crate) fn new_singledispatch(func: i64) -> i64 {
+    let class = singledispatch_class();
+    let roots = heap::root_values(&[func, class]);
+    let instance = value::instance_new(class);
+    let registry = value::dict_new(Vec::new());
+    let inner = heap::root_values(&[instance, registry]);
+    value::instance_setattr(instance, "func".to_string(), func);
+    value::instance_setattr(instance, "registry".to_string(), registry);
+    // CPython registers the decorated function for `object`, which is what
+    // makes an unmatched argument fall back to it.
+    crate::container::dict_set(registry, value::object_class(), func);
+    let result = copy_callable_metadata(instance, func);
+    heap::release_roots(inner);
+    heap::release_roots(roots);
+    result
+}
+
+/// The implementation `class` dispatches to (`registry.get(_find_impl(...))`).
+///
+/// The C3 linearization is consulted first; classes registered through
+/// `ABCMeta.register` are not part of it, so `issubclass` semantics decide
+/// those — with CPython's refusal to guess between two unrelated matches.
+/// `instance` is the value being dispatched (used for the ABC check, which
+/// accepts native type spellings); pass `NONE` when only the class is known.
+fn dispatch_impl(class: i64, instance: i64, registry: i64) -> Option<i64> {
+    let pairs: Vec<(i64, i64)> = value::as_dict(registry)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default();
+    for ancestor in value::class_mro(class) {
+        if let Some((_, function)) = pairs
+            .iter()
+            .find(|(key, _)| dispatch_class(*key) == ancestor)
+        {
+            return Some(*function);
+        }
+    }
+    let mut matched: Option<(i64, i64)> = None;
+    for &(key, function) in &pairs {
+        let candidate = dispatch_class(key);
+        if value::as_class(candidate).is_none() || value::is_subclass_of(class, candidate) {
+            continue;
+        }
+        let is_virtual = if instance != NONE {
+            crate::modules::abc::is_virtual_instance(instance, key)
+        } else {
+            crate::modules::abc::is_virtual_subclass(class, candidate)
+        };
+        if !is_virtual {
+            continue;
+        }
+        match matched {
+            Some((matched_key, _)) => {
+                if !value::is_subclass_of(matched_key, candidate)
+                    && !value::is_subclass_of(candidate, matched_key)
+                {
+                    let message = format!(
+                        "Ambiguous dispatch: {} or {}",
+                        dispatch_type_text(matched_key),
+                        dispatch_type_text(candidate)
+                    );
+                    exc::raise_with_message(RUNTIME_ERROR, &message);
+                    return None;
+                }
+            }
+            None => matched = Some((key, function)),
+        }
+    }
+    if let Some((_, function)) = matched {
+        return Some(function);
+    }
+    // Hydro's user classes do not list the native `object` class in their
+    // linearization, whereas CPython's MRO always ends there. The default
+    // implementation registered for `object` is therefore looked up directly.
+    pairs
+        .iter()
+        .find(|(key, _)| dispatch_class(*key) == value::object_class())
+        .map(|(_, function)| *function)
+}
+
+fn dispatch_type_text(class: i64) -> String {
+    value::class_display_name(class)
+        .map(str::to_string)
+        .unwrap_or_else(|| value::repr(class))
+}
+
+/// `dispatcher(*args, **kwargs)`: dispatch on the first argument's class and
+/// forward the whole call to the selected implementation.
+fn dispatch_call(dispatcher: i64, args_value: i64, kwargs_value: i64) -> i64 {
+    let roots = heap::root_values(&[dispatcher, args_value, kwargs_value]);
+    let args = list_items(args_value);
+    if args.is_empty() {
+        let func = value::instance_attr(dispatcher, "func").unwrap_or(NONE);
+        let name = callable_name(func, "singledispatch function");
+        heap::release_roots(roots);
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name} requires at least 1 positional argument"),
+        );
+    }
+    let implementation = registry_of(dispatcher)
+        .and_then(|registry| dispatch_impl(value::type_class(args[0]), args[0], registry));
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let Some(implementation) = implementation else {
+        heap::release_roots(roots);
+        return exc::raise_with_message(TYPE_ERROR, "'NoneType' object is not callable");
+    };
+    let keywords = dict_keywords(kwargs_value);
+    let arg_roots = heap::root_values(&args);
+    let result = call_with_keywords(implementation, &args, &keywords);
+    heap::release_roots(arg_roots);
+    heap::release_roots(roots);
+    result
+}
+
+/// `dispatcher.dispatch(cls)`: the implementation `cls` would dispatch to.
+fn dispatch_method(dispatcher: i64, cls: i64) -> i64 {
+    let roots = heap::root_values(&[dispatcher, cls]);
+    let Some(registry) = registry_of(dispatcher) else {
+        heap::release_roots(roots);
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "'_singledispatch' object has no attribute 'registry'",
+        );
+    };
+    let class = dispatch_class(cls);
+    if value::as_class(class).is_none() {
+        heap::release_roots(roots);
+        return exc::raise_with_message(TYPE_ERROR, "dispatch() argument must be a class");
+    }
+    let implementation = dispatch_impl(class, NONE, registry);
+    let failure = match implementation {
+        Some(_) => None,
+        None if !exc::pending() => Some(format!(
+            "Unable to resolve {}. Did you mean to call the register() method?",
+            value::repr(class)
+        )),
+        None => None,
+    };
+    heap::release_roots(roots);
+    match (implementation, failure) {
+        (Some(implementation), _) => implementation,
+        (None, Some(message)) => exc::raise_with_message(RUNTIME_ERROR, &message),
+        (None, None) => NONE,
+    }
+}
+
+extern "C" fn singledispatch_call_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, args_list, kwargs_dict)`.
+    unsafe { dispatch_call(*argv, *argv.add(1), *argv.add(2)) }
+}
+
+extern "C" fn singledispatch_register_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, cls, func)`.
+    unsafe { register(*argv, *argv.add(1), *argv.add(2)) }
+}
+
+extern "C" fn singledispatch_dispatch_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, cls)`.
+    unsafe { dispatch_method(*argv, *argv.add(1)) }
+}
+
+extern "C" fn singledispatch_clear_cache_entry(_argv: *const i64) -> i64 {
+    // Dispatch results are not cached, so there is nothing to invalidate.
+    NONE
+}
+
+/// The cached `functools.singledispatchmethod` descriptor class.
+pub(crate) fn singledispatchmethod_class() -> i64 {
+    if let Some(cached) = crate::core::globals::registry_get("functools.singledispatchmethod") {
+        return cached;
+    }
+    let init = method_entry(
+        "functools",
+        "_singledispatchmethod_init",
+        singledispatchmethod_init_entry,
+        vec![self_parameter(), positional_parameter("func")],
+    );
+    let register_method = method_entry(
+        "functools",
+        "_singledispatchmethod_register",
+        singledispatchmethod_register_entry,
+        vec![
+            self_parameter(),
+            positional_parameter("cls"),
+            optional_parameter("method"),
+        ],
+    );
+    let get = method_entry(
+        "functools",
+        "_singledispatchmethod_descriptor_get",
+        singledispatchmethod_get_entry,
+        vec![
+            self_parameter(),
+            positional_parameter("obj"),
+            optional_parameter("cls"),
+        ],
+    );
+    let is_abstract = method_entry(
+        "functools",
+        "_singledispatchmethod_isabstractmethod",
+        singledispatchmethod_isabstractmethod_entry,
+        vec![self_parameter()],
+    );
+    let repr = method_entry(
+        "functools",
+        "_singledispatchmethod_repr",
+        singledispatchmethod_repr_entry,
+        vec![self_parameter()],
+    );
+    let methods: Vec<(String, i64, MethodKind)> = vec![
+        ("__init__".to_string(), init, MethodKind::Normal),
+        ("register".to_string(), register_method, MethodKind::Normal),
+        ("__get__".to_string(), get, MethodKind::Normal),
+        (
+            "__isabstractmethod__".to_string(),
+            is_abstract,
+            MethodKind::Property,
+        ),
+        ("__repr__".to_string(), repr, MethodKind::Normal),
+    ];
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new_full(
+        "singledispatchmethod".to_string(),
+        NONE,
+        methods,
+        Vec::new(),
+    );
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    crate::core::globals::registry_set("functools.singledispatchmethod", class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// CPython's `__init__` check: the wrapped object must be callable or a
+/// descriptor.
+fn is_callable_or_descriptor(item: i64) -> bool {
+    if value::truthy(crate::core::builtins::callable(item)) {
+        return true;
+    }
+    has_descriptor_get(item)
+}
+
+/// Stores `func` and its dispatcher on a `singledispatchmethod` descriptor.
+fn initialize_singledispatchmethod(instance: i64, func: i64) -> i64 {
+    if !is_callable_or_descriptor(func) {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{} is not callable or a descriptor", value::repr(func)),
+        );
+    }
+    let roots = heap::root_values(&[instance, func]);
+    value::instance_setattr(instance, "func".to_string(), func);
+    let dispatcher = new_singledispatch(func);
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let inner = heap::root_values(&[dispatcher]);
+    value::instance_setattr(instance, "dispatcher".to_string(), dispatcher);
+    heap::release_roots(inner);
+    heap::release_roots(roots);
+    instance
+}
+
+/// `functools.singledispatchmethod(func)`.
+pub(crate) fn new_singledispatchmethod(func: i64) -> i64 {
+    let class = singledispatchmethod_class();
+    let roots = heap::root_values(&[func, class]);
+    let instance = value::instance_new(class);
+    let result = initialize_singledispatchmethod(instance, func);
+    heap::release_roots(roots);
+    result
+}
+
+/// The dispatcher stored on a `singledispatchmethod` descriptor.
+fn descriptor_dispatcher(descriptor: i64) -> Option<i64> {
+    value::instance_attr(descriptor, "dispatcher")
+}
+
+/// `singledispatchmethod.register(cls, method=None)`.
+fn singledispatchmethod_register(descriptor: i64, cls: i64, method: i64) -> i64 {
+    let Some(dispatcher) = descriptor_dispatcher(descriptor) else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "'singledispatchmethod' object has no attribute 'dispatcher'",
+        );
+    };
+    register(dispatcher, cls, method)
+}
+
+fn singledispatchmethod_name(func: i64) -> Option<String> {
+    for name in ["__qualname__", "__name__"] {
+        match read_attribute(func, name) {
+            AttributeRead::Found(item) => {
+                if let Some(text) = value::as_str(item) {
+                    return Some(text.to_string());
+                }
+            }
+            _ => {
+                exc::clear();
+            }
+        }
+    }
+    None
+}
+
+fn singledispatchmethod_repr(descriptor: i64) -> i64 {
+    let func = value::instance_attr(descriptor, "func").unwrap_or(NONE);
+    let name = singledispatchmethod_name(func).unwrap_or_else(|| "?".to_string());
+    value::str_alloc(format!("<single dispatch method descriptor {name}>"))
+}
+
+fn singledispatchmethod_isabstractmethod(descriptor: i64) -> i64 {
+    let func = value::instance_attr(descriptor, "func").unwrap_or(NONE);
+    if func == NONE {
+        return value::FALSE;
+    }
+    match read_attribute(func, "__isabstractmethod__") {
+        AttributeRead::Found(flag) => value::bool_value(value::truthy(flag)),
+        _ => {
+            exc::clear();
+            value::FALSE
+        }
+    }
+}
+
+extern "C" fn singledispatchmethod_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, func)`.
+    unsafe { initialize_singledispatchmethod(*argv, *argv.add(1)) }
+}
+
+extern "C" fn singledispatchmethod_register_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, cls, method)`.
+    unsafe { singledispatchmethod_register(*argv, *argv.add(1), *argv.add(2)) }
+}
+
+extern "C" fn singledispatchmethod_get_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, obj, cls)`.
+    unsafe { new_get(*argv, *argv.add(1), *argv.add(2)) }
+}
+
+extern "C" fn singledispatchmethod_isabstractmethod_entry(argv: *const i64) -> i64 {
+    // SAFETY: the property binder passes `self`.
+    singledispatchmethod_isabstractmethod(unsafe { *argv })
+}
+
+extern "C" fn singledispatchmethod_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self`.
+    singledispatchmethod_repr(unsafe { *argv })
+}
+
+// `_singledispatchmethod_get` call and metadata surface.
+
+/// An attribute of the wrapped function, exposed by the wrapper (`__name__`,
+/// `__qualname__`). A function without the attribute raises `AttributeError`,
+/// like CPython's lazy `__getattr__`.
+fn get_signature_attribute(wrapper: i64, name: &str) -> i64 {
+    let function = value::instance_attr(wrapper, "_func").unwrap_or(NONE);
+    if function != NONE {
+        if let AttributeRead::Found(item) = read_attribute(function, name) {
+            return item;
+        }
+        exc::clear();
+    }
+    exc::raise_with_message(
+        ATTRIBUTE_ERROR,
+        &format!("'_singledispatchmethod_get' object has no attribute '{name}'"),
+    )
+}
+
+/// `_singledispatchmethod_get.__call__(self, *args, **kwargs)`: dispatch on
+/// the first argument and bind the implementation to the receiver the
+/// descriptor was read from.
+fn get_call(wrapper: i64, args_value: i64, kwargs_value: i64) -> i64 {
+    let roots = heap::root_values(&[wrapper, args_value, kwargs_value]);
+    let args = list_items(args_value);
+    if args.is_empty() {
+        let func = value::instance_attr(wrapper, "_func").unwrap_or(NONE);
+        let name = callable_name(func, "singledispatchmethod method");
+        heap::release_roots(roots);
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name} requires at least 1 positional argument"),
+        );
+    }
+    let dispatcher = value::instance_attr(wrapper, "_dispatcher").unwrap_or(NONE);
+    let dispatched = if dispatcher == NONE {
+        None
+    } else {
+        registry_of(dispatcher)
+            .and_then(|registry| dispatch_impl(value::type_class(args[0]), args[0], registry))
+    };
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let implementation = match dispatched {
+        Some(implementation) => implementation,
+        // A wrapper built without a dispatcher (a bare descriptor) keeps
+        // calling the stored function.
+        None if dispatcher == NONE => value::instance_attr(wrapper, "_func").unwrap_or(NONE),
+        None => {
+            heap::release_roots(roots);
+            return exc::raise_with_message(TYPE_ERROR, "'NoneType' object is not callable");
+        }
+    };
+    let receiver = value::instance_attr(wrapper, "_obj").unwrap_or(NONE);
+    let keywords = dict_keywords(kwargs_value);
+    let mut call_args: Vec<i64> = Vec::with_capacity(args.len() + 1);
+    if receiver != NONE {
+        call_args.push(receiver);
+    }
+    call_args.extend_from_slice(&args);
+    let arg_roots = heap::root_values(&call_args);
+    let result = call_with_keywords(implementation, &call_args, &keywords);
+    heap::release_roots(arg_roots);
+    heap::release_roots(roots);
+    result
+}
+
+extern "C" fn get_call_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, args_list, kwargs_dict)`.
+    unsafe { get_call(*argv, *argv.add(1), *argv.add(2)) }
+}
+
+extern "C" fn get_name_entry(argv: *const i64) -> i64 {
+    // SAFETY: the property binder passes `self`.
+    get_signature_attribute(unsafe { *argv }, "__name__")
+}
+
+extern "C" fn get_qualname_entry(argv: *const i64) -> i64 {
+    // SAFETY: the property binder passes `self`.
+    get_signature_attribute(unsafe { *argv }, "__qualname__")
+}
+
+extern "C" fn get_wrapped_entry(argv: *const i64) -> i64 {
+    // SAFETY: the property binder passes `self`.
+    value::instance_attr(unsafe { *argv }, "_func").unwrap_or(NONE)
+}
+
+// -------------------------------------------------------------------------
+// total_ordering
+// -------------------------------------------------------------------------
+
+/// The comparison operations `total_ordering` recognises, most preferred
+/// first. CPython picks `max(roots)`, and `"__lt__" > "__le__" > "__gt__" >
+/// "__ge__"` as strings, so the preference is exactly this order.
+const ORDERING_ROOTS: [&str; 4] = ["__lt__", "__le__", "__gt__", "__ge__"];
+
+/// The methods `total_ordering` installs for one source operation, in
+/// CPython's `_convert` table order.
+fn ordering_conversions(root: &str) -> &'static [&'static str] {
+    match root {
+        "__lt__" => &["__gt__", "__le__", "__ge__"],
+        "__le__" => &["__ge__", "__lt__", "__gt__"],
+        "__gt__" => &["__lt__", "__ge__", "__le__"],
+        "__ge__" => &["__le__", "__gt__", "__lt__"],
+        _ => &[],
+    }
+}
+
+/// Builds one conversion method: a partial of the internal
+/// [`ordered_comparison`] trampoline binding the source operation and the
+/// name the method is installed under. The call supplies `(self, other)`.
+fn ordering_function(root: &str, target: &str) -> i64 {
+    let compare = value::native_function_new("functools", "_total_ordering_compare", 4);
+    let root_value = value::str_alloc(root.to_string());
+    let target_value = value::str_alloc(target.to_string());
+    let roots = heap::root_values(&[compare, root_value, target_value]);
+    let function = value::partial_new(compare, vec![root_value, target_value]);
+    heap::release_roots(roots);
+    function
+}
+
+/// `_total_ordering_compare(root, target, self, other)`: the trampoline every
+/// generated method calls after the partial supplied `root`/`target`.
+fn ordering_compare(root: &str, target: &str, this: i64, other: i64) -> i64 {
+    ordered_comparison(root, target, this, other)
+}
+
+/// `type(self).<root>(self, other)`: the conversion helpers call the
+/// class-level operation explicitly, so an instance attribute cannot shadow
+/// it.
+fn class_comparison(this: i64, root: &str, other: i64) -> i64 {
+    let class = value::instance_class_value(this).unwrap_or_else(|| value::type_class(this));
+    match value::class_lookup(class, root) {
+        Some(value::ClassEntry::Method(MethodKind::Property, _)) => {
+            exc::raise_with_message(TYPE_ERROR, "'property' object is not callable")
+        }
+        Some(value::ClassEntry::Method(kind, function)) => {
+            call_class_function(class, kind, function, root, this, other)
+        }
+        Some(value::ClassEntry::Attr(entry)) if value::as_function(entry).is_some() => {
+            call_class_function(class, MethodKind::Normal, entry, root, this, other)
+        }
+        // A descriptor stored in the class namespace resolves through
+        // `__get__(None, class)`, exactly like class attribute access.
+        Some(value::ClassEntry::Attr(entry)) => {
+            let callable = descriptor_protocol_get(entry, NONE, class).unwrap_or(entry);
+            let args = [this, other];
+            crate::core::builtins::call(callable, args.len(), args.as_ptr())
+        }
+        None => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object is not callable",
+                value::class_display_name(class).unwrap_or("object")
+            ),
+        ),
+    }
+}
+
+/// Calls a comparison method resolved on `class` with `self`/`other` passed
+/// explicitly, honouring the binding kind the way the attribute binder does.
+fn call_class_function(
+    class: i64,
+    kind: MethodKind,
+    function: i64,
+    method: &str,
+    this: i64,
+    other: i64,
+) -> i64 {
+    if !value::function_signature(function).is_empty() && value::function_full_entry(function) != 0
+    {
+        let receiver = match kind {
+            MethodKind::Classmethod => class,
+            _ => this,
+        };
+        let normal = [other];
+        let frame = [this, other];
+        let args: &[i64] = match kind {
+            MethodKind::Normal | MethodKind::Property => &normal,
+            MethodKind::Classmethod | MethodKind::Staticmethod => &frame,
+        };
+        return crate::core::methods::call_user_method(
+            receiver,
+            class,
+            kind,
+            function,
+            method,
+            args,
+            &[],
+        );
+    }
+    let normal = [this, other];
+    let bound = [class, this, other];
+    let args = match kind {
+        MethodKind::Classmethod => &bound[..],
+        _ => &normal[..],
+    };
+    crate::core::builtins::call(function, args.len(), args.as_ptr())
+}
+
+/// `self == other` (`negated == false`) or `self != other` through the full
+/// rich-comparison protocol.
+fn ordering_equality(this: i64, other: i64, negated: bool) -> i64 {
+    let result = crate::core::ops::binop(crate::core::ops::OP_EQ, this, other);
+    if exc::pending() {
+        return NONE;
+    }
+    let equal = value::truthy(result);
+    value::bool_value(equal != negated)
+}
+
+/// One `_convert` helper: derives `target` from the source operation's
+/// already-evaluated result.
+fn ordered_comparison(root: &str, target: &str, this: i64, other: i64) -> i64 {
+    let op_result = class_comparison(this, root, other);
+    if exc::pending() {
+        return NONE;
+    }
+    if op_result == value::NOT_IMPLEMENTED {
+        return op_result;
+    }
+    let truth = value::truthy(op_result);
+    match (root, target) {
+        // `a > b` from `a < b`: `not (a < b) and a != b`.
+        ("__lt__", "__gt__") | ("__gt__", "__lt__") => {
+            if truth {
+                return value::FALSE;
+            }
+            ordering_equality(this, other, true)
+        }
+        // `a < b` from `a <= b`: `(a <= b) and a != b`.
+        ("__le__", "__lt__") | ("__ge__", "__gt__") => {
+            if !truth {
+                return op_result;
+            }
+            ordering_equality(this, other, true)
+        }
+        // `a <= b` from `a < b`: `(a < b) or a == b`.
+        ("__lt__", "__le__") | ("__gt__", "__ge__") => {
+            if truth {
+                return op_result;
+            }
+            ordering_equality(this, other, false)
+        }
+        // `a >= b` from `a <= b`: `not (a <= b) or a == b`.
+        ("__le__", "__ge__") | ("__ge__", "__le__") => {
+            if !truth {
+                return value::TRUE;
+            }
+            ordering_equality(this, other, false)
+        }
+        // The remaining conversions are `not (source)`: `a >= b` from
+        // `a < b`, `a > b` from `a <= b`, `a <= b` from `a > b` and
+        // `a < b` from `a >= b`.
+        _ => value::bool_value(!truth),
+    }
+}
+
+/// `functools.total_ordering(cls)`: installs the ordering methods `cls` does
+/// not define, deriving them from the most preferred one it does.
+pub(crate) fn total_ordering(class: i64) -> i64 {
+    if value::as_class(class).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "total_ordering() argument must be a class, not '{}'",
+                value::type_name(class)
+            ),
+        );
+    }
+    let mut defined: Vec<&'static str> = Vec::with_capacity(ORDERING_ROOTS.len());
+    for op in ORDERING_ROOTS {
+        if value::class_lookup(class, op).is_some() {
+            defined.push(op);
+        }
+    }
+    let Some(&root) = defined.first() else {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "must define at least one ordering operation: < > <= >=",
+        );
+    };
+    let roots = heap::root_values(&[class]);
+    for &target in ordering_conversions(root) {
+        if defined.contains(&target) {
+            continue;
+        }
+        let function = ordering_function(root, target);
+        let function_roots = heap::root_values(&[function]);
+        let written = value::class_set_attr(class, target.to_string(), function);
+        heap::release_roots(function_roots);
+        if !written {
+            let message = format!(
+                "cannot set '{}' attribute of '{}'",
+                target,
+                value::type_name(class)
+            );
+            heap::release_roots(roots);
+            return exc::raise_with_message(TYPE_ERROR, &message);
+        }
+    }
+    heap::release_roots(roots);
+    class
+}
+
 /// Dispatches the `functools` internals, the `partialmethod` class methods and
 /// the native methods of `_singledispatchmethod_get`. Returns `None` for every
 /// other function.
@@ -1496,6 +2603,63 @@ pub(crate) fn call(function: &str, args: &[i64]) -> Option<i64> {
         "_cached_property_set_name" => match args {
             [this, _owner, name] => cached_property_set_name(*this, *name),
             _ => exc::raise_with_message(TYPE_ERROR, "__set_name__() takes 3 arguments"),
+        },
+        "singledispatch" => match args {
+            [func] => new_singledispatch(*func),
+            _ => exc::raise_with_message(TYPE_ERROR, "singledispatch() takes 1 argument"),
+        },
+        "singledispatchmethod" => match args {
+            [func] => new_singledispatchmethod(*func),
+            _ => exc::raise_with_message(TYPE_ERROR, "singledispatchmethod() takes 1 argument"),
+        },
+        // Target of the decorator `register(cls)` returns; the partial binds
+        // the dispatcher and the class, so the decorated function arrives
+        // last.
+        "_singledispatch_register_apply" => match args {
+            [dispatcher, cls, func] => register(*dispatcher, *cls, *func),
+            _ => exc::raise_with_message(
+                TYPE_ERROR,
+                "_singledispatch_register_apply() takes 3 arguments",
+            ),
+        },
+        "_singledispatchmethod_init" => match args {
+            [instance, func] => initialize_singledispatchmethod(*instance, *func),
+            _ => exc::raise_with_message(
+                TYPE_ERROR,
+                "_singledispatchmethod_init() takes 2 arguments",
+            ),
+        },
+        "_singledispatchmethod_register" => match args {
+            [instance, cls, method] => singledispatchmethod_register(*instance, *cls, *method),
+            _ => exc::raise_with_message(
+                TYPE_ERROR,
+                "_singledispatchmethod_register() takes 3 arguments",
+            ),
+        },
+        "_singledispatchmethod_descriptor_get" => match args {
+            [descriptor, obj, cls] => new_get(*descriptor, *obj, *cls),
+            _ => exc::raise_with_message(
+                TYPE_ERROR,
+                "_singledispatchmethod_descriptor_get() takes 3 arguments",
+            ),
+        },
+        "_singledispatchmethod_isabstractmethod" => singledispatchmethod_isabstractmethod(args[0]),
+        "_singledispatchmethod_repr" => singledispatchmethod_repr(args[0]),
+        // Target of the partial every `total_ordering`-generated comparison
+        // installs; the partial supplies `(root, target)`.
+        "_total_ordering_compare" => match args {
+            [root, target, this, other] => match (value::as_str(*root), value::as_str(*target)) {
+                (Some(root), Some(target)) => ordering_compare(root, target, *this, *other),
+                _ => exc::raise_with_message(
+                    TYPE_ERROR,
+                    "_total_ordering_compare() expects operation names as strings",
+                ),
+            },
+            _ => exc::raise_with_message(TYPE_ERROR, "_total_ordering_compare() takes 4 arguments"),
+        },
+        "total_ordering" => match args {
+            [class] => total_ordering(*class),
+            _ => exc::raise_with_message(TYPE_ERROR, "total_ordering() takes 1 argument"),
         },
         _ => return None,
     })
@@ -2184,19 +3348,16 @@ mod tests {
         // Two attribute names for the same descriptor are rejected, like
         // CPython's second `__set_name__` call.
         let descriptor = build_cached_property(counting_getter());
-        let class = value::class_new_full(
+        let _class = value::class_new_full(
             "Holder".to_string(),
             NONE,
             Vec::new(),
-            vec![
-                ("first".to_string(), descriptor),
-                ("second".to_string(), descriptor),
-            ],
+            vec![("first".to_string(), descriptor)],
         );
-        let instance = value::instance_new(class);
-        cached_property_get(descriptor, instance, class);
+        cached_property_set_name(descriptor, text("second"));
         assert!(exc::pending());
-        assert!(value::to_string(exc::pending_value()).contains("two different names"));
+        let message = value::to_string(exc::pending_value());
+        assert!(message.contains("two different names"), "{message}");
         exc::clear();
 
         // A slots-only class has no instance `__dict__` to cache into.
@@ -2297,5 +3458,429 @@ mod tests {
             vec!["__dict__"]
         );
         assert!(!exc::pending());
+    }
+
+    /// An implementation whose second parameter can be bound by keyword, used
+    /// to observe the forwarding done by a dispatcher.
+    fn keyword_capture() -> i64 {
+        extern "C" fn capture(argv: *const i64) -> i64 {
+            value::tuple_new(vec![unsafe { *argv }, unsafe { *argv.add(1) }])
+        }
+        let function = value::native_function_new("functools", "keyword_capture", usize::MAX);
+        value::function_set_signature(
+            function,
+            vec![positional_parameter("value"), positional_parameter("flag")],
+        );
+        value::function_set_full_entry(function, capture as *const () as usize);
+        function
+    }
+
+    #[test]
+    fn singledispatch_registers_and_dispatches() {
+        exc::init();
+        let default = capture_function(1);
+        let dispatcher = new_singledispatch(default);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(value::instance_attr(dispatcher, "func"), Some(default));
+        assert_eq!(
+            value::instance_attr(dispatcher, "__wrapped__"),
+            Some(default)
+        );
+        assert_eq!(
+            value::instance_class_value(dispatcher),
+            Some(singledispatch_class())
+        );
+        let registry = value::instance_attr(dispatcher, "registry").expect("registry");
+        assert_eq!(value::as_dict(registry).map(|pairs| pairs.len()), Some(1));
+        // The default implementation is registered for `object`.
+        assert_eq!(dispatch_method(dispatcher, value::object_class()), default);
+
+        // An unmatched argument falls back to the default implementation.
+        let text_value = value::str_alloc("text".to_string());
+        let result = crate::core::builtins::call(dispatcher, 1, [text_value].as_ptr());
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(tuple_items(result), vec![text_value]);
+
+        // Registering a class routes instances of it to the implementation.
+        let int_class = value::type_class(int(7));
+        let implementation = capture_function(1);
+        assert_eq!(
+            register(dispatcher, int_class, implementation),
+            implementation
+        );
+        assert!(!exc::pending());
+        assert_eq!(dispatch_method(dispatcher, int_class), implementation);
+        let result = crate::core::builtins::call(dispatcher, 1, [int(7)].as_ptr());
+        assert_eq!(tuple_items(result), vec![int(7)]);
+
+        // `register(cls)` returns a decorator that registers its argument and
+        // hands it back unchanged.
+        let str_class = value::type_class(value::str_alloc(String::new()));
+        let decorator = register(dispatcher, str_class, NONE);
+        assert!(!exc::pending());
+        let decorated = capture_function(1);
+        assert_eq!(
+            crate::core::builtins::call(decorator, 1, [decorated].as_ptr()),
+            decorated
+        );
+        assert_eq!(dispatch_method(dispatcher, str_class), decorated);
+
+        // An empty call is CPython's "requires at least 1 positional argument".
+        exc::init();
+        let empty_args = value::list_new(Vec::new());
+        let empty_kwargs = value::dict_new(Vec::new());
+        dispatch_call(dispatcher, empty_args, empty_kwargs);
+        assert!(exc::pending());
+        assert!(
+            value::to_string(exc::pending_value())
+                .contains("requires at least 1 positional argument"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        exc::clear();
+        // `dispatch()` needs a class.
+        dispatch_method(dispatcher, int(3));
+        assert!(exc::pending());
+        assert!(value::to_string(exc::pending_value()).contains("must be a class"));
+        exc::clear();
+    }
+
+    #[test]
+    fn singledispatch_registers_annotated_functions() {
+        exc::init();
+        let dispatcher = new_singledispatch(capture_function(1));
+        let int_class = value::type_class(int(0));
+
+        // `@generic.register` (no class) reads the first annotation.
+        let annotated = capture_function(1);
+        let annotations = value::dict_new(vec![(value::str_alloc("arg".to_string()), int_class)]);
+        assert!(write_attribute(annotated, "__annotations__", annotations));
+        assert_eq!(register(dispatcher, annotated, NONE), annotated);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(dispatch_method(dispatcher, int_class), annotated);
+
+        // A string annotation is resolved through the builtin type names.
+        let text_implementation = capture_function(1);
+        let annotations = value::dict_new(vec![(
+            value::str_alloc("value".to_string()),
+            value::str_alloc("str".to_string()),
+        )]);
+        assert!(write_attribute(
+            text_implementation,
+            "__annotations__",
+            annotations
+        ));
+        assert_eq!(
+            register(dispatcher, text_implementation, NONE),
+            text_implementation
+        );
+        let str_class = value::type_class(value::str_alloc(String::new()));
+        assert_eq!(dispatch_method(dispatcher, str_class), text_implementation);
+
+        // `register(non_class, func)` is a TypeError.
+        exc::init();
+        register(dispatcher, int(3), capture_function(1));
+        assert!(exc::pending());
+        assert!(
+            value::to_string(exc::pending_value()).contains("is not a class or union type"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        exc::clear();
+
+        // A bare `@register` on a function without annotations is a TypeError.
+        let plain = capture_function(1);
+        register(dispatcher, plain, NONE);
+        assert!(exc::pending());
+        assert!(
+            value::to_string(exc::pending_value()).contains("Use either"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        exc::clear();
+
+        // An annotation that is not a class is reported with its parameter.
+        let invalid = capture_function(1);
+        let annotations = value::dict_new(vec![(value::str_alloc("arg".to_string()), int(3))]);
+        write_attribute(invalid, "__annotations__", annotations);
+        register(dispatcher, invalid, NONE);
+        assert!(exc::pending());
+        assert!(
+            value::to_string(exc::pending_value()).contains("Invalid annotation for 'arg'"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn singledispatch_forwards_keyword_arguments() {
+        exc::init();
+        let dispatcher = new_singledispatch(capture_function(1));
+        let int_class = value::type_class(int(1));
+        register(dispatcher, int_class, keyword_capture());
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        let args = value::list_new(vec![int(3)]);
+        let keywords = value::dict_new(vec![(value::str_alloc("flag".to_string()), int(9))]);
+        let result = dispatch_call(dispatcher, args, keywords);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(tuple_items(result), vec![int(3), int(9)]);
+        // The dispatcher is callable through the generic instance path too.
+        let pairs = [value::str_alloc("flag".to_string()), int(4)];
+        let result =
+            crate::core::builtins::call_kw(dispatcher, 1, [int(2)].as_ptr(), 1, pairs.as_ptr());
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(tuple_items(result), vec![int(2), int(4)]);
+    }
+
+    #[test]
+    fn singledispatchmethod_dispatches_and_binds() {
+        exc::init();
+        // The default implementation receives `(self, value)`.
+        let default = capture_function(2);
+        let descriptor = new_singledispatchmethod(default);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(
+            value::instance_class_value(descriptor),
+            Some(singledispatchmethod_class())
+        );
+        assert_eq!(value::instance_attr(descriptor, "func"), Some(default));
+        let dispatcher = value::instance_attr(descriptor, "dispatcher").expect("dispatcher");
+
+        let class = value::class_new("Holder".to_string(), NONE, Vec::new());
+        let instance = value::instance_new(class);
+        let wrapper = call(
+            "_singledispatchmethod_descriptor_get",
+            &[descriptor, instance, class],
+        )
+        .expect("__get__");
+        assert_eq!(
+            value::instance_class_value(wrapper),
+            Some(singledispatchmethod_get_class())
+        );
+        // The wrapper dispatches on the first call argument and binds the
+        // receiver the descriptor was read from.
+        let argument = int(5);
+        let result = crate::core::builtins::call(wrapper, 1, [argument].as_ptr());
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(tuple_items(result), vec![instance, argument]);
+
+        // A registered implementation for `int` takes over.
+        let int_class = value::type_class(int(0));
+        let specialised = capture_function(2);
+        assert_eq!(
+            singledispatchmethod_register(descriptor, int_class, specialised),
+            specialised
+        );
+        assert!(!exc::pending());
+        assert_eq!(dispatch_method(dispatcher, int_class), specialised);
+        let result = crate::core::builtins::call(wrapper, 1, [argument].as_ptr());
+        assert_eq!(tuple_items(result), vec![instance, argument]);
+
+        // Class access leaves the receiver to the caller.
+        let unbound = call(
+            "_singledispatchmethod_descriptor_get",
+            &[descriptor, NONE, class],
+        )
+        .expect("__get__");
+        let args = [instance, argument];
+        let result = crate::core::builtins::call(unbound, args.len(), args.as_ptr());
+        assert_eq!(tuple_items(result), vec![instance, argument]);
+
+        // The descriptor renders like CPython's and rejects non-callables.
+        let rendered = call("_singledispatchmethod_repr", &[descriptor]).expect("repr");
+        assert!(
+            value::as_str(rendered)
+                .expect("str")
+                .starts_with("<single dispatch method descriptor "),
+            "{}",
+            value::as_str(rendered).unwrap_or("?")
+        );
+        new_singledispatchmethod(int(3));
+        assert!(exc::pending());
+        assert!(
+            value::to_string(exc::pending_value()).contains("is not callable or a descriptor"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        exc::clear();
+    }
+
+    fn key_of(instance: i64) -> i64 {
+        value::instance_attr(instance, "key")
+            .and_then(value::as_integer)
+            .unwrap_or(0)
+    }
+
+    extern "C" fn less_by_key(argv: *const i64) -> i64 {
+        // SAFETY: the comparison binder passes `(self, other)`.
+        let this = unsafe { *argv };
+        let other = unsafe { *argv.add(1) };
+        value::bool_value(key_of(this) < key_of(other))
+    }
+
+    fn ordering_operation(name: &str) -> i64 {
+        // A generated-style wrapper: the class-level method is called with
+        // `(self, other)` and dispatches through its body, exactly like a
+        // compiled Python method.
+        value::function_new(less_by_key as *const () as usize, 2, name.to_string())
+    }
+
+    fn ordering_class() -> i64 {
+        value::class_new_full(
+            "Ordered".to_string(),
+            NONE,
+            vec![(
+                "__lt__".to_string(),
+                ordering_operation("test_less"),
+                MethodKind::Normal,
+            )],
+            Vec::new(),
+        )
+    }
+
+    fn ordered_instance(class: i64, key: i64) -> i64 {
+        let instance = value::instance_new(class);
+        value::instance_setattr(instance, "key".to_string(), int(key));
+        instance
+    }
+
+    #[test]
+    fn total_ordering_installs_the_derived_comparisons() {
+        exc::init();
+        let class = ordering_class();
+        assert_eq!(total_ordering(class), class);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+            assert!(value::class_lookup(class, name).is_some(), "{name}");
+        }
+        let a = ordered_instance(class, 1);
+        let b = ordered_instance(class, 2);
+        let test = |op| value::truthy(crate::core::ops::binop(op, a, b));
+        assert!(test(crate::core::ops::OP_LT));
+        assert!(test(crate::core::ops::OP_LE));
+        assert!(!test(crate::core::ops::OP_GT));
+        assert!(!test(crate::core::ops::OP_GE));
+        assert!(value::truthy(crate::core::ops::binop(
+            crate::core::ops::OP_GT,
+            b,
+            a
+        )));
+        assert!(value::truthy(crate::core::ops::binop(
+            crate::core::ops::OP_GE,
+            b,
+            a
+        )));
+        // Equal keys: `a > a` is false, `a >= a` and `a <= a` are true.
+        assert!(!value::truthy(crate::core::ops::binop(
+            crate::core::ops::OP_GT,
+            a,
+            a
+        )));
+        assert!(value::truthy(crate::core::ops::binop(
+            crate::core::ops::OP_GE,
+            a,
+            a
+        )));
+        assert!(value::truthy(crate::core::ops::binop(
+            crate::core::ops::OP_LE,
+            a,
+            a
+        )));
+        assert!(!value::truthy(crate::core::ops::binop(
+            crate::core::ops::OP_LT,
+            b,
+            a
+        )));
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+    }
+
+    #[test]
+    fn total_ordering_keeps_defined_operations_and_validates() {
+        exc::init();
+        let less = ordering_operation("test_less");
+        let greater = ordering_operation("test_greater");
+        let class = value::class_new_full(
+            "Both".to_string(),
+            NONE,
+            vec![
+                ("__lt__".to_string(), less, MethodKind::Normal),
+                ("__gt__".to_string(), greater, MethodKind::Normal),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(total_ordering(class), class);
+        // The user's `__gt__` wins over the conversion from `__lt__`.
+        match value::class_lookup(class, "__gt__") {
+            Some(ClassEntry::Method(_, function)) => assert_eq!(function, greater),
+            _ => panic!("__gt__ was replaced"),
+        }
+        for name in ["__le__", "__ge__"] {
+            assert!(value::class_lookup(class, name).is_some(), "{name}");
+        }
+        assert!(!exc::pending());
+
+        // No ordering operation at all is CPython's ValueError.
+        exc::init();
+        let plain = value::class_new("Plain".to_string(), NONE, Vec::new());
+        total_ordering(plain);
+        assert!(exc::pending());
+        assert!(
+            value::to_string(exc::pending_value())
+                .contains("must define at least one ordering operation"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        exc::clear();
+
+        // A non-class argument is reported instead of half-patching it.
+        total_ordering(int(1));
+        assert!(exc::pending());
+        assert!(
+            value::to_string(exc::pending_value()).contains("must be a class"),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        exc::clear();
     }
 }

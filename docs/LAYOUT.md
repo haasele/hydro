@@ -32,6 +32,9 @@ repository root.
 ├── fuzz/                      libFuzzer targets + stable fallback harness
 ├── tests/compat/              pinned CPython test manifests (3.14.9)
 ├── examples/                  JIT/AOT examples + expected/*.txt
+├── stdlib/                    vendored pure-Python stdlib modules (CPython 3.14.9)
+│   ├── enum.py                verbatim CPython `enum` + provenance header
+│   └── LICENSE                PSF License notice for the vendored sources
 ├── docs/
 │   ├── ARCHITECTURE.md        binding contract (IR/ABI, GC, modules)
 │   ├── C_API.md               P4-04 decision, probes, milestones
@@ -77,7 +80,7 @@ repository root.
     │   │   ├── gc/            heap, color/barriers, safepoints, sweep, roots
 │   │   │                  (precise shadow frames)
     │   │   ├── modules/       math/io/json/os/... + argparse, collections,
-    │   │   │                  re, socket, asyncio, typing, abc, enum, types,
+    │   │   │                  re, socket, asyncio, typing, abc, types,
     │   │   │                  itertools, ast, fractions, importlib,
     │   │   │                  __future__; extension.rs (abi3 loader)
     │   │   ├── concurrency/   threads/locks/queue/processes/pool/spawn

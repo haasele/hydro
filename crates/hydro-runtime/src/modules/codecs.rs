@@ -1094,9 +1094,14 @@ fn replace_errors(args: &[i64]) -> i64 {
 mod tests {
     use super::*;
 
-    fn init() {
+    /// Resets the process-wide runtime state and returns the lock that
+    /// serialises this module's tests (the global store is shared by all
+    /// threads, so resets must not interleave).
+    fn init() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::heap::heap_reset_test_guard();
         crate::core::globals::reset();
         exc::init();
+        guard
     }
 
     fn text(s: &str) -> i64 {
@@ -1125,7 +1130,7 @@ mod tests {
 
     #[test]
     fn ascii_round_trips_through_names_and_aliases() {
-        init();
+        let _guard = init();
         let encoded = call("encode", &[text("abc"), text("ascii")]);
         assert_eq!(bytes_of(encoded), b"abc");
         let decoded = call("decode", &[bytes(b"abc"), text("ascii")]);
@@ -1141,7 +1146,7 @@ mod tests {
 
     #[test]
     fn latin_1_decodes_every_byte_and_answers_aliases() {
-        init();
+        let _guard = init();
         for alias in [
             "latin-1",
             "latin1",
@@ -1166,7 +1171,7 @@ mod tests {
 
     #[test]
     fn ascii_decode_strict_ignore_and_replace() {
-        init();
+        let _guard = init();
         call("decode", &[bytes(b"a\xffb"), text("ascii")]);
         assert_eq!(exc::pending_tag(), i64::from(UNICODE_DECODE_ERROR));
         assert_eq!(
@@ -1185,7 +1190,7 @@ mod tests {
 
     #[test]
     fn unrepresentable_characters_raise_and_honour_error_modes() {
-        init();
+        let _guard = init();
         call("encode", &[text("aé"), text("ascii")]);
         assert_eq!(exc::pending_tag(), i64::from(UNICODE_ENCODE_ERROR));
         assert_eq!(
@@ -1235,7 +1240,7 @@ mod tests {
 
     #[test]
     fn stateless_entries_report_input_lengths() {
-        init();
+        let _guard = init();
         let encoded = call("ascii_encode", &[text("aé"), text("replace")]);
         let items = value::as_tuple(encoded).expect("tuple");
         assert_eq!(bytes_of(items[0]), b"a?");
@@ -1255,7 +1260,7 @@ mod tests {
 
     #[test]
     fn lookup_names_built_in_codecs_and_rejects_unknown_names() {
-        init();
+        let _guard = init();
         for (alias, encode_name, decode_name) in [
             ("utf-8", "utf_8_encode", "utf_8_decode"),
             ("ascii", "ascii_encode", "ascii_decode"),
@@ -1287,7 +1292,7 @@ mod tests {
 
     #[test]
     fn registered_handlers_apply_to_encode_and_decode() {
-        init();
+        let _guard = init();
         let handler = call("lookup_error", &[text("ignore")]);
         assert!(!exc::pending());
         assert_eq!(call("register_error", &[text("mine"), handler]), NONE);

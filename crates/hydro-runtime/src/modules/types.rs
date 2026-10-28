@@ -4,8 +4,9 @@
 //! and friends almost exclusively for annotations, `isinstance` checks and
 //! dictionary keys. Each name therefore materialises as an empty native class
 //! whose identity is fresh on every access, like the `typing` placeholders.
-//! `CodeType` and `NoneType` follow the same pattern; no introspection API is
-//! attached to them.
+//! `FrameType` and `CodeType` instead report the cached native classes of the
+//! real frame and code objects, so `type(sys._getframe(0)) is
+//! types.FrameType` holds on a thread.
 //!
 //! `CellType`, `FunctionType`, `UnionType` and `DynamicClassAttribute` are
 //! cached:
@@ -58,10 +59,8 @@ const CLASSES: &[&str] = &[
     "BuiltinFunctionType",
     "BuiltinMethodType",
     "ClassMethodDescriptorType",
-    "CodeType",
     "CoroutineType",
     "EllipsisType",
-    "FrameType",
     "GeneratorType",
     "GenericAlias",
     "GetSetDescriptorType",
@@ -81,6 +80,10 @@ const CLASSES: &[&str] = &[
 pub(crate) fn constant(name: &str) -> i64 {
     match name {
         "CellType" => cell_type_class(),
+        // Reified frames and code objects report these real native classes, so
+        // `type(sys._getframe(0)) is types.FrameType` holds on a thread.
+        "FrameType" => value::frame_class(),
+        "CodeType" => value::code_class(),
         // Exposed as a module function too, so that `types.FunctionType(...)`
         // lowers as a call; the class form still answers direct lookups and
         // the `isinstance` route through `type_check_target`.

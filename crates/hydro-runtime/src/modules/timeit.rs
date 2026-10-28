@@ -125,6 +125,7 @@ fn is_callable(candidate: i64) -> bool {
     value::as_function(candidate).is_some()
         || value::as_ext_function(candidate).is_some()
         || value::as_class(candidate).is_some()
+        || crate::modules::extension::ext_object_is_callable(candidate)
 }
 
 /// Builds a `Timer` instance from an explicit constructor argument list.

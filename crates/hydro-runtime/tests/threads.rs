@@ -1,9 +1,11 @@
 //! Integration tests for the shared heap and `_thread` (Phase 2.12).
 //!
-//! The heap switch and the thread registry are process-global, so every test
-//! takes `TEST_LOCK` and starts from `hydro_runtime_init` (which resets both the
-//! thread-local and the shared heap). Threads are always joined before the
-//! guard is released, so no test observes another test's state.
+//! The heap switch, the thread registry and the module-global store are
+//! process-global, so every test takes `TEST_LOCK` and starts from
+//! `hydro_runtime_init` (which resets both the thread-local and the shared
+//! heap, and clears the module globals with their process-wide roots). Threads
+//! are always joined before the guard is released, so no test observes
+//! another test's state.
 //!
 //! Values are tagged `i64`s; helpers below decode them via `hydro_to_int`, which
 //! is the identity for integer inputs.
@@ -49,6 +51,22 @@ fn module(module: &str, function: &str, args: &[i64]) -> i64 {
         args.len(),
         args.as_ptr(),
     )
+}
+
+/// `module.name = value` for a module-level global.
+fn set_global(module: &str, name: &str, value: i64) -> i64 {
+    hydro_global_set(
+        module.as_ptr(),
+        module.len(),
+        name.as_ptr(),
+        name.len(),
+        value,
+    )
+}
+
+/// `module.name` for a module-level global.
+fn get_global(module: &str, name: &str) -> i64 {
+    hydro_global_get(module.as_ptr(), module.len(), name.as_ptr(), name.len())
 }
 
 fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
@@ -179,6 +197,23 @@ fn spawn_with_fresh_argument(lock: i64, ready: i64, out: i64) -> i64 {
     let payload = text("argument-payload");
     let worker = function(argument_worker, 4, "argument");
     start(worker, list(&[lock, ready, out, payload]))
+}
+
+/// `worker(ready)`: stores a freshly allocated string as a module global,
+/// signals readiness and exits.
+///
+/// The payload is created inside the child, so after the thread exits the only
+/// thing keeping it reachable is the process-wide root installed by the global
+/// store (spawn arguments and the child stack are gone).
+extern "C" fn module_global_writer(argv: *const i64) -> i64 {
+    // SAFETY: the caller passes exactly one argument.
+    let args = unsafe { std::slice::from_raw_parts(argv, 1) };
+    let payload = text("global-payload-survives-thread-exit");
+    // Store the payload through the module-global API; generated code ignores
+    // the `None` result the same way.
+    let _ = set_global("threadglobals", "payload", payload);
+    hydro_subscript_set(args[0], int(0), int(1));
+    hydro_none()
 }
 
 // -------------------------------------------------------------------------
@@ -400,5 +435,116 @@ fn spawn_arguments_survive_collection_while_child_is_parked() {
     let expected = "argument-payload";
     assert_eq!(hydro_len(child_value), int(expected.len() as i64));
     assert_eq!(hydro_binop(7, child_value, text(expected)), hydro_true());
+    assert_eq!(hydro_exc_pending(), 0);
+}
+
+#[test]
+fn module_globals_are_process_wide_across_os_threads() {
+    let _guard = guard();
+    hydro_runtime_init();
+
+    // Two plain OS threads (no runtime registration): the module store is
+    // process-wide, so each thread sees the module the other one created.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let alpha = {
+        let barrier = std::sync::Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            assert_eq!(
+                set_global("threadmod.alpha", "value", int(11)),
+                hydro_none()
+            );
+            barrier.wait();
+            assert_eq!(decode(get_global("threadmod.beta", "value")), 22);
+        })
+    };
+    let beta = {
+        let barrier = std::sync::Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            assert_eq!(set_global("threadmod.beta", "value", int(22)), hydro_none());
+            barrier.wait();
+            assert_eq!(decode(get_global("threadmod.alpha", "value")), 11);
+        })
+    };
+    alpha.join().expect("alpha writer thread");
+    beta.join().expect("beta writer thread");
+    assert_eq!(hydro_exc_pending(), 0);
+
+    // Both writers are gone; their bindings and modules remain observable.
+    assert_eq!(decode(get_global("threadmod.alpha", "value")), 11);
+    assert_eq!(decode(get_global("threadmod.beta", "value")), 22);
+
+    // The registry discovers user modules from the global store, so
+    // `sys.modules` reports both even though no thread ever imported them.
+    let modules = hydro_module_get(b"sys".as_ptr(), 3, b"modules".as_ptr(), 7);
+    let alpha_module = hydro_module_value(b"threadmod.alpha".as_ptr(), 15);
+    let beta_module = hydro_module_value(b"threadmod.beta".as_ptr(), 14);
+    assert_ne!(alpha_module, hydro_none());
+    assert_ne!(beta_module, hydro_none());
+    assert_ne!(alpha_module, beta_module);
+    assert_eq!(
+        hydro_subscript(modules, text("threadmod.alpha")),
+        alpha_module
+    );
+    assert_eq!(
+        hydro_subscript(modules, text("threadmod.beta")),
+        beta_module
+    );
+    assert_eq!(hydro_exc_pending(), 0);
+}
+
+#[test]
+fn module_global_values_survive_writer_thread_exit() {
+    let _guard = guard();
+    hydro_runtime_init();
+
+    let ready = list(&[int(0)]);
+    let handle = start(
+        function(module_global_writer, 1, "global-writer"),
+        list(&[ready]),
+    );
+    assert_eq!(hydro_exc_pending(), 0);
+
+    let poll_delay = hydro_float_new(0.0005);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while decode(hydro_subscript(ready, int(0))) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer did not become ready"
+        );
+        module("time", "sleep", &[poll_delay]);
+    }
+    assert_eq!(join(handle), hydro_none());
+    assert_eq!(hydro_exc_pending(), 0);
+
+    // The writer's stack and spawn roots are gone: the payload is reachable
+    // only through the process-wide root that the global store installed.
+    // Collect repeatedly while allocating into any freed blocks.
+    scrub_stack();
+    let mut freed = 0;
+    for _ in 0..8 {
+        for _ in 0..2048 {
+            let _ = hydro_str_new(b"post-writer-garbage!".as_ptr(), 20);
+        }
+        freed += hydro_gc_collect();
+    }
+    assert!(
+        freed > 0,
+        "the collector freed no garbage after the writer exited"
+    );
+    assert_eq!(hydro_exc_pending(), 0);
+
+    let payload = get_global("threadglobals", "payload");
+    assert_ne!(payload, hydro_none());
+    let expected = "global-payload-survives-thread-exit";
+    assert_eq!(decode(hydro_len(payload)), expected.len() as i64);
+    assert_eq!(hydro_binop(7, payload, text(expected)), hydro_true());
+    assert_eq!(hydro_exc_pending(), 0);
+
+    let modules = hydro_module_get(b"sys".as_ptr(), 3, b"modules".as_ptr(), 7);
+    let module_value = hydro_module_value(b"threadglobals".as_ptr(), 13);
+    assert_eq!(
+        hydro_subscript(modules, text("threadglobals")),
+        module_value
+    );
     assert_eq!(hydro_exc_pending(), 0);
 }

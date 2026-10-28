@@ -127,6 +127,7 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         hydro_set_file,
         hydro_set_line,
         hydro_frame_enter,
+        hydro_frame_bind,
         hydro_safepoint,
         hydro_frame_leave,
         hydro_gc_frame_push,

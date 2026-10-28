@@ -1978,6 +1978,11 @@ pub(crate) fn equals(a: i64, b: i64) -> bool {
 const MAX_EQ_DEPTH: usize = 64;
 
 fn equals_depth(a: i64, b: i64, depth: usize) -> bool {
+    // Opaque extension handles own their equality: `tp_richcompare` when the
+    // type implements one, identity otherwise.
+    if value::is_ext_object(a) || value::is_ext_object(b) {
+        return value::ext_object_equals(a, b);
+    }
     match (value::num_of(a), value::num_of(b)) {
         (Some(x), Some(y)) => return num_eq(x, y),
         (Some(_), None) | (None, Some(_)) => {

@@ -22,6 +22,49 @@ pub(crate) fn iter_new(obj: i64) -> i64 {
     if value::as_iter(obj).is_some() {
         return obj;
     }
+    // A class object is iterable when its metaclass defines `__iter__`
+    // (CPython's class iteration protocol). `enum.EnumType.__iter__` is the
+    // main user of this path, and it must receive the class as `cls`.
+    if value::as_class(obj).is_some() {
+        let metaclass = value::class_metaclass(obj);
+        if metaclass != value::NONE {
+            if let Some(entry) = value::class_lookup(metaclass, "__iter__") {
+                let result = match entry {
+                    value::ClassEntry::Method(kind, function) => {
+                        crate::core::methods::call_user_method(
+                            obj,
+                            metaclass,
+                            kind,
+                            function,
+                            "__iter__",
+                            &[],
+                            &[],
+                        )
+                    }
+                    value::ClassEntry::Attr(function) => {
+                        let arguments = [obj];
+                        crate::core::builtins::call(function, 1, arguments.as_ptr())
+                    }
+                };
+                if exc::pending() {
+                    return value::NONE;
+                }
+                if value::as_iter(result).is_some() || value::as_fiber(result).is_some() {
+                    return result;
+                }
+                if value::as_instance(result).is_some() {
+                    return value::iter_new(result);
+                }
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "iter() returned non-iterator of type '{}'",
+                        value::type_name(result)
+                    ),
+                );
+            }
+        }
+    }
     if let Some(instance) = value::as_instance(obj) {
         if let Some(value::ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
             value::class_lookup(instance.class, "__iter__")
@@ -128,6 +171,7 @@ fn is_callable(v: i64) -> bool {
     value::as_function(v).is_some()
         || value::as_class(v).is_some()
         || value::as_ext_function(v).is_some()
+        || crate::modules::extension::ext_object_is_callable(v)
         || value::as_instance(v)
             .map(|instance| value::class_lookup(instance.class, "__call__").is_some())
             .unwrap_or(false)

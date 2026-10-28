@@ -103,6 +103,21 @@ const FUNCTOOLS_FUNCTIONS: &[FunctionSpec] = &[
     // runtime (`module_get` returns the cached class so `isinstance` works);
     // the module entry builds the same instance for module-call lowering.
     kw_dynamic("partialmethod", 1, usize::MAX, Type::Any, &["func"]),
+    // Single-dispatch generic functions: `singledispatch(func)` returns the
+    // dispatcher object (a native class instance with `register`/`dispatch`),
+    // `singledispatchmethod(func)` the descriptor, and `total_ordering(cls)`
+    // installs the missing comparison methods on the class. CPython accepts
+    // each single argument by name, so the entries are keyword-dynamic.
+    kw_dynamic("singledispatch", 1, 1, Type::Any, &["func"]),
+    kw_dynamic("singledispatchmethod", 1, 1, Type::Any, &["func"]),
+    kw_dynamic("total_ordering", 1, 1, Type::Any, &["cls"]),
+    // Target of the decorator `register(cls)` returns: a partial binds the
+    // dispatcher and the class, so the decorated function arrives last.
+    f("_singledispatch_register_apply", 3, 3, Type::Any),
+    // Target of the partial each generated `total_ordering` method installs:
+    // the partial binds the source operation's name and the installed method
+    // name, so the call supplies `(self, other)`.
+    f("_total_ordering_compare", 4, 4, Type::Any),
 ];
 
 pub static FUNCTOOLS: ModuleSpec = ModuleSpec {
@@ -209,10 +224,15 @@ pub static RANDOM: ModuleSpec = ModuleSpec {
         f("choice", 1, 1, Type::Any),
         f("uniform", 2, 2, Type::Float),
         f("shuffle", 1, 1, Type::None),
+        // `random.sample(population, k)`: `k` distinct elements as a list.
+        f("sample", 2, 2, Type::List),
         // `getrandbits(k)`: a non-negative random int with `k` bits drawn from
         // the global SplitMix64 generator.
         f("getrandbits", 1, 1, Type::Int),
         kw("Random", 0, 1, Type::Any, &["seed"]),
+        // `random.SystemRandom(seed=None)`: every draw comes from the OS
+        // entropy source; the optional seed is ignored.
+        kw("SystemRandom", 0, 1, Type::Any, &["seed"]),
     ],
     constants: &[],
 };
@@ -355,6 +375,8 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("remove", 1, 1, Type::None),
         f("rename", 2, 2, Type::None),
         f("access", 2, 2, Type::Bool),
+        // `os.urandom(n)`: `n` bytes from the OS entropy source.
+        f("urandom", 1, 1, Type::Bytes),
         // `os.stat(path, *, dir_fd=None, follow_symlinks=True)`: an
         // `os.stat_result`-shaped namespace with the documented attributes.
         kw(
@@ -549,6 +571,10 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // `sys._getframe()` rejects keywords in CPython (it is C-level), so
         // this stays positional-only.
         f("_getframe", 0, 1, Type::Any),
+        f("getdefaultencoding", 0, 0, Type::Str),
+        f("getfilesystemencoding", 0, 0, Type::Str),
+        f("getswitchinterval", 0, 0, Type::Float),
+        f("setswitchinterval", 1, 1, Type::None),
     ],
     constants: &[
         c("argv", Type::List),
@@ -626,7 +652,10 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("float", 0, 1, Type::Float),
         f("abs", 1, 1, Type::Any),
         f("bool", 0, 1, Type::Bool),
-        f("type", 1, 3, Type::Any),
+        // `type(x)` reports an object's type; `type(name, bases, ns, **kwds)`
+        // creates a class and forwards the extra names to the metaclass
+        // resolved from the bases, so they are not declared parameters.
+        kw_dynamic("type", 1, 3, Type::Any, &[]),
         f("super", 0, 2, Type::Any),
         f("reversed", 1, 1, Type::Any),
         // CPython 3.14 names every parameter of `__import__`, so callers may
@@ -677,12 +706,13 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("callable", 1, 1, Type::Bool),
         // Descriptor factories (unqualified compiler builtins). `property`
         // keeps CPython's parameter names; the runtime accepts and does not
-        // store the `doc` argument.
+        // store the `doc` argument. Every slot defaults to `None`, so the
+        // zero-argument form is valid.
         f("classmethod", 1, 1, Type::Any),
         f("staticmethod", 1, 1, Type::Any),
         kw(
             "property",
-            1,
+            0,
             4,
             Type::Any,
             &["fget", "fset", "fdel", "doc"],
@@ -703,6 +733,25 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("compile", 3, 6, Type::Any),
         f("issubclass", 2, 2, Type::Bool),
         f("open", 1, 5, Type::Any),
+        // Internal native method bodies attached to the cached object/scalar
+        // classes. They are not part of CPython's builtins namespace, but the
+        // module dispatcher must be able to resolve a bound method value.
+        f("__object_new__", 0, 1, Type::Any),
+        f("__object_init__", 0, 1, Type::None),
+        f("__object_str__", 1, 1, Type::Str),
+        f("__object_repr__", 1, 1, Type::Str),
+        f("__object_format__", 1, 2, Type::Str),
+        f("__object_eq__", 2, 2, Type::Bool),
+        f("__object_ne__", 2, 2, Type::Bool),
+        f("__object_hash__", 1, 1, Type::Int),
+        f("__object_dir__", 1, 1, Type::List),
+        f("__object_sizeof__", 1, 1, Type::Int),
+        f("__object_reduce_ex__", 1, 2, Type::Any),
+        f("__object_getattribute__", 2, 2, Type::Any),
+        f("__scalar_new__", 1, 2, Type::Any),
+        f("__scalar_format__", 1, 2, Type::Str),
+        f("__scalar_repr__", 1, 1, Type::Str),
+        f("__scalar_str__", 1, 1, Type::Str),
     ],
     constants: &[
         // Every exception class the runtime taxonomy knows (plus the IOError
@@ -2071,14 +2120,37 @@ pub static ABC: ModuleSpec = ModuleSpec {
     constants: &[c("ABC", Type::Any), c("ABCMeta", Type::Any)],
 };
 
-/// `enum`: placeholder enum bases and `auto()`.
-pub static ENUM: ModuleSpec = ModuleSpec {
-    name: "enum",
-    functions: &[f("auto", 0, 0, Type::Any)],
+/// `annotationlib`: CPython 3.14 annotation introspection.
+pub static ANNOTATIONLIB: ModuleSpec = ModuleSpec {
+    name: "annotationlib",
+    functions: &[
+        kw_dynamic("get_annotations", 1, 1, Type::Dict, &["obj"]),
+        kw_dynamic(
+            "call_annotate_function",
+            2,
+            2,
+            Type::Dict,
+            &["annotate", "format"],
+        ),
+        kw_dynamic(
+            "call_evaluate_function",
+            2,
+            2,
+            Type::Dict,
+            &["evaluate", "format"],
+        ),
+        f("get_annotate_from_class_namespace", 1, 1, Type::Any),
+        f("type_repr", 1, 1, Type::Str),
+        f("annotations_to_string", 1, 1, Type::Dict),
+    ],
     constants: &[
-        c("Enum", Type::Any),
-        c("IntEnum", Type::Any),
-        c("IntFlag", Type::Any),
+        c("Format", Type::Any),
+        c("VALUE", Type::Int),
+        c("VALUE_WITH_FAKE_GLOBALS", Type::Int),
+        c("FORWARDREF", Type::Int),
+        c("STRING", Type::Int),
+        c("ForwardRef", Type::Any),
+        c("__all__", Type::List),
     ],
 };
 
@@ -3131,6 +3203,16 @@ const CTYPES_FUNCTIONS: &[FunctionSpec] = &[
     f("PYFUNCTYPE", 1, usize::MAX, Type::Any),
     f("get_last_error", 0, 0, Type::Int),
     f("set_last_error", 1, 1, Type::None),
+    f("get_errno", 0, 0, Type::Int),
+    f("set_errno", 1, 1, Type::None),
+    f("dlopen", 1, 2, Type::Int),
+    f("FreeLibrary", 1, 1, Type::None),
+    f("GetLastError", 0, 0, Type::Int),
+    f("WinError", 0, 2, Type::Any),
+    f("_cfield_init", 1, usize::MAX, Type::None),
+    f("_cfield_get", 2, 3, Type::Any),
+    f("_cfield_set", 3, 3, Type::None),
+    f("_cfield_repr", 1, 1, Type::Str),
     f("_cdata_init", 1, usize::MAX, Type::Any),
     f("_cdata_get_value", 1, 1, Type::Any),
     f("_cdata_set_value", 2, 2, Type::None),
@@ -3165,6 +3247,8 @@ const CTYPES_CONSTANTS: &[ConstantSpec] = &[
     c("PyDLL", Type::Any),
     c("LibraryLoader", Type::Any),
     c("ArgumentError", Type::Any),
+    c("CField", Type::Any),
+    c("wintypes", Type::Any),
     c("c_bool", Type::Any),
     c("c_byte", Type::Any),
     c("c_int8", Type::Any),
@@ -3680,7 +3764,7 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::{constant, function};
+    use crate::stdlib::{constant, function, module};
 
     #[test]
     fn json_keyword_defaults_are_declared() {
@@ -4165,7 +4249,7 @@ mod tests {
     }
 
     #[test]
-    fn abc_and_enum_surfaces_are_registered() {
+    fn abc_surface_is_registered_and_enum_is_not_native() {
         assert_eq!(constant("abc", "ABC").unwrap().ty, Type::Any);
         assert_eq!(constant("abc", "ABCMeta").unwrap().ty, Type::Any);
         assert_eq!(function("abc", "abstractmethod").unwrap().max_args, 1);
@@ -4177,11 +4261,9 @@ mod tests {
         ] {
             assert_eq!(function("abc", name).unwrap().max_args, 1, "{name}");
         }
-        assert_eq!(constant("enum", "Enum").unwrap().ty, Type::Any);
-        assert_eq!(constant("enum", "IntEnum").unwrap().ty, Type::Any);
-        assert_eq!(constant("enum", "IntFlag").unwrap().ty, Type::Any);
-        let auto = function("enum", "auto").unwrap();
-        assert_eq!((auto.min_args, auto.max_args), (0, 0));
+        // `enum` is the vendored CPython `enum.py`, not a native module: the
+        // central table must not claim it, so the loader resolves `stdlib/enum.py`.
+        assert!(module("enum").is_none(), "enum must not be a native module");
     }
 
     #[test]
@@ -4489,6 +4571,28 @@ mod tests {
             function("_functools", "cached_property").map(|spec| spec.min_args),
             Some(1)
         );
+        // Single-dispatch decorators and `total_ordering` take exactly one
+        // positional-or-keyword argument; the decorator helper the register
+        // path uses takes `(dispatcher, cls, function)`.
+        for (name, parameter) in [
+            ("singledispatch", "func"),
+            ("singledispatchmethod", "func"),
+            ("total_ordering", "cls"),
+        ] {
+            let spec = function("functools", name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!((spec.min_args, spec.max_args), (1, 1), "{name}");
+            assert_eq!(spec.params.len(), 1, "{name}");
+            assert_eq!(spec.params[0], parameter, "{name}");
+            assert!(spec.dynamic_keywords, "{name}");
+            assert_eq!(spec.ret, Type::Any, "{name}");
+        }
+        let apply =
+            function("functools", "_singledispatch_register_apply").expect("register helper");
+        assert_eq!((apply.min_args, apply.max_args), (3, 3));
+        assert!(!apply.dynamic_keywords);
+        let compare = function("functools", "_total_ordering_compare").expect("ordering helper");
+        assert_eq!((compare.min_args, compare.max_args), (4, 4));
+        assert!(!compare.dynamic_keywords);
     }
 
     #[test]
@@ -4698,8 +4802,13 @@ mod tests {
         let staticmethod = function("builtins", "staticmethod").unwrap();
         assert_eq!((staticmethod.min_args, staticmethod.max_args), (1, 1));
         let property = function("builtins", "property").unwrap();
-        assert_eq!((property.min_args, property.max_args), (1, 4));
+        assert_eq!((property.min_args, property.max_args), (0, 4));
         assert_eq!(property.params, &["fget", "fset", "fdel", "doc"][..]);
+        // `type(name, bases, ns, **kwds)` forwards the class-header keywords
+        // to the metaclass, so they are not declared parameters.
+        let type_spec = function("builtins", "type").unwrap();
+        assert_eq!((type_spec.min_args, type_spec.max_args), (1, 3));
+        assert!(type_spec.dynamic_keywords);
         for name in [
             "ValueError",
             "ImportError",

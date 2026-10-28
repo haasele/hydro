@@ -612,11 +612,11 @@ mod tests {
 
     #[test]
     fn every_kind_has_exactly_one_payload_layout() {
-        // Kinds are dense: 0 ..= KIND_INTERPOLATION. `payload_layout` panics
+        // Kinds are dense: 0 ..= KIND_CODE. `payload_layout` panics
         // on an unknown kind, so this walks the whole table and checks the
         // class either covers the payload or deliberately uses the large
         // fallback.
-        for kind in 0..=crate::value::KIND_INTERPOLATION {
+        for kind in 0..=crate::value::KIND_CODE {
             let layout = payload_layout(kind);
             assert!(layout.size() > 0, "kind {kind} has an empty payload");
             assert!(layout.align() >= 1);

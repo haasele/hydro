@@ -28,12 +28,11 @@
 //!   `abstractmethod` are real: they record and report the declared abstract
 //!   names instead of pretending enforcement happened.
 //!
-//! The registry lives in the globals side store under `\0hydro.registry`
-//! (thread-local, like every other runtime registry), which roots every
-//! registered class for the rest of the heap generation and is cleared by
-//! `hydro_runtime_init`. A registration is therefore visible to the checking
-//! thread, matching the thread-local scope of the runtime's module globals;
-//! class objects themselves are shared by the heap.
+//! The registry lives in the process-wide globals side store under
+//! `\0hydro.registry`, which roots every registered class for the rest of the
+//! heap generation and is cleared by `hydro_runtime_init`. A registration is
+//! therefore visible to every thread, matching the process-wide scope of the
+//! runtime's module globals; class objects themselves are shared by the heap.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -375,9 +374,9 @@ fn value_is_abstract(item: i64) -> bool {
     };
     match descriptor.kind {
         DescriptorKind::Property => {
-            is_abstract(descriptor.target)
-                || (descriptor.setter != NONE && is_abstract(descriptor.setter))
-                || (descriptor.deleter != NONE && is_abstract(descriptor.deleter))
+            is_abstract(descriptor.fget())
+                || (descriptor.fset() != NONE && is_abstract(descriptor.fset()))
+                || (descriptor.fdel() != NONE && is_abstract(descriptor.fdel()))
         }
         DescriptorKind::Classmethod | DescriptorKind::Staticmethod => {
             is_abstract(descriptor.target)
@@ -488,10 +487,10 @@ mod tests {
     use super::*;
     use crate::value::{as_class, class_new, class_new_multi, str_alloc};
 
-    /// The edge counter is process-global; serialise the tests that mutate it.
+    /// The edge counter and the module-global store are process-wide;
+    /// serialise the tests that reset or read them.
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::heap::heap_reset_test_guard()
     }
 
     fn reset() {

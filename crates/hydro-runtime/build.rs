@@ -19,5 +19,9 @@ fn main() {
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         println!("cargo:rustc-link-lib=dl");
+        // Integration tests load the C fixture with `dlopen`; the extension's
+        // undefined `Py*` symbols must resolve against the test binary, so its
+        // symbols have to be in the dynamic symbol table.
+        println!("cargo:rustc-link-arg-tests=-Wl,--export-dynamic");
     }
 }

@@ -1239,3 +1239,149 @@ assert other[3] == {}
 "#,
     );
 }
+
+#[test]
+fn blank_property_supports_the_enum_redirect_flow() {
+    // CPython's blank `property()` has `fget`/`fset`/`fdel` set to None and a
+    // writable attribute table; `enum` builds redirect descriptors with it.
+    run_source(
+        r#"
+class Owner:
+    pass
+
+blank = property()
+assert blank.fget is None
+assert blank.fset is None
+assert blank.fdel is None
+
+# Arbitrary attributes (enum stores `member` and `_get`/`_set`/`_del`).
+blank.member = 3
+blank._get = None
+blank._attr_type = 'attr'
+assert blank.member == 3
+assert blank._attr_type == 'attr'
+
+# `__set_name__(owner, name)` is accepted and records nothing observable.
+assert blank.__set_name__(Owner, 'value') is None
+
+# A blank descriptor raises AttributeError on instance access and assignment.
+class Holder:
+    value = blank
+
+try:
+    Holder().value
+except AttributeError:
+    pass
+else:
+    assert False
+
+probe = Holder()
+try:
+    probe.value = 1
+except AttributeError:
+    pass
+else:
+    assert False
+
+# Accessing a blank property through the class returns the descriptor itself.
+assert Holder.value is blank
+
+# Filling the slots afterwards (the enum redirect copies a found descriptor).
+def read(self):
+    return 42
+
+def write(self, new_value):
+    self.stored = new_value
+
+def drop(self):
+    self.dropped = True
+
+blank.fget = read
+assert Holder().value == 42
+blank.fset = write
+holder = Holder()
+holder.value = 9
+assert holder.stored == 9
+blank.fdel = drop
+del holder.value
+assert holder.dropped
+
+# The one- to four-argument forms keep their behaviour.
+def getter(self):
+    return 'g'
+
+def setter(self, new_value):
+    self.seen = new_value
+
+def deleter(self):
+    self.deleted = True
+
+full = property(getter, setter, deleter, 'doc')
+class Full:
+    attr = full
+
+f = Full()
+assert f.attr == 'g'
+f.attr = 'v'
+assert f.seen == 'v'
+del f.attr
+assert f.deleted
+
+derived = property(getter).setter(setter)
+assert derived.fget(None) == 'g'
+assert derived.fset is not None
+assert derived.fdel is None
+"#,
+    );
+}
+
+#[test]
+fn type_forwards_class_keywords_to_the_resolved_metaclass() {
+    run_source(
+        r#"
+class Meta(type):
+    def __new__(metacls, name, bases, namespace, boundary=None, _simple=False):
+        cls = type.__new__(metacls, name, bases, namespace)
+        cls.new_boundary = boundary
+        cls.new_simple = _simple
+        return cls
+
+    def __init__(cls, name, bases, namespace, boundary=None, _simple=False):
+        cls.init_boundary = boundary
+        cls.init_simple = _simple
+
+class Base(metaclass=Meta):
+    pass
+
+# The three-argument form keeps working without keywords.
+Plain = type('Plain', (Base,), {'value': 1})
+assert Plain.value == 1
+assert type(Plain) is Meta
+
+# The keywords reach the metaclass `__new__` and `__init__`, as in CPython.
+Made = type('Made', (Base,), {'value': 2}, boundary=7, _simple=True)
+assert Made.value == 2
+assert Made.new_boundary == 7
+assert Made.new_simple is True
+assert Made.init_boundary == 7
+assert Made.init_simple is True
+
+# A class-header keyword on the one-argument form is rejected.
+try:
+    type(Plain, boundary=7)
+except TypeError:
+    pass
+else:
+    assert False
+
+# The native `type` metaclass has no keyword channel: CPython forwards class
+# keywords to `__init_subclass__`, whose default rejects them.
+try:
+    type('NoMeta', (), {}, boundary=7)
+except TypeError:
+    pass
+else:
+    assert False
+"#,
+    );
+}

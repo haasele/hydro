@@ -5,8 +5,9 @@
 //! a name in `hydro_ir::stdlib` is a built-in module, an installed package is
 //! found exactly where CPython would find it on `sys.path` (`HYDRO_SITE_PACKAGES`,
 //! the `VIRTUAL_ENV`/`CONDA_PREFIX` site directories, `PYTHONPATH`,
-//! `HYDRO_STDLIB`), and a module compiled into the program resolves through
-//! the runtime registry.
+//! `HYDRO_STDLIB` and the pure-Python modules vendored in Hydro's `stdlib/`),
+//! and a module compiled into the program resolves through the runtime
+//! registry.
 //!
 //! Hydro compiles Python ahead of time, so `module_from_spec` returns the
 //! already-initialized module when one exists and otherwise creates a real

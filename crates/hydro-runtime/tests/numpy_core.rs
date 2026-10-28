@@ -53,7 +53,7 @@ fn deferred(module: &str, member: Option<&str>) -> i64 {
         Some(member) => (member.as_ptr(), member.len()),
         None => (std::ptr::null(), 0),
     };
-    hydro_deferred_import(module.as_ptr(), module.len(), ptr, len)
+    hydro_deferred_import(module.as_ptr(), module.len(), ptr, len, std::ptr::null(), 0)
 }
 
 fn getattr(obj: i64, name: &str) -> i64 {

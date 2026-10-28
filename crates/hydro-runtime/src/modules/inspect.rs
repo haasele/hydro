@@ -3311,7 +3311,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                 }
             }
         }
-        "currentframe" => NONE,
+        "currentframe" => crate::modules::sys::current_frame(),
         "stack" => value::list_new(Vec::new()),
         "getclosurevars" => exc::raise_with_message(
             NOT_IMPLEMENTED_ERROR,
@@ -3953,7 +3953,11 @@ mod tests {
         assert_eq!(call("isclass", &[function]), FALSE);
         assert_eq!(call("isframe", &[function]), FALSE);
         assert_eq!(call("iscode", &[function]), FALSE);
-        assert_eq!(call("currentframe", &[]), NONE);
+        // Without a running Hydro activation there is no frame to report;
+        // `currentframe` raises the same `ValueError` as `sys._getframe(0)`.
+        let _ = call("currentframe", &[]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        let _ = exc::clear();
         assert_eq!(
             value::as_list(call("stack", &[])).map(|frames| frames.len()),
             Some(0)

@@ -60,6 +60,8 @@ use super::{
 
 /// `Py_TPFLAGS_*` bits from CPython 3.14's `object.h`.
 pub(crate) const PY_TPFLAGS_HAVE_FINALIZE: c_ulong = 1 << 0;
+/// Set on exception classes; `PyExceptionClass_Check`/PyO3 require it.
+pub(crate) const PY_TPFLAGS_BASE_EXC_SUBCLASS: c_ulong = 1 << 30;
 const PY_TPFLAGS_INLINE_VALUES: c_ulong = 1 << 2;
 const PY_TPFLAGS_MANAGED_WEAKREF: c_ulong = 1 << 3;
 const PY_TPFLAGS_MANAGED_DICT: c_ulong = 1 << 4;
@@ -761,8 +763,16 @@ pub(crate) static mut CONTEXT_TOKEN_TYPE: TypeObject = TypeObject::builtin(
     PY_TPFLAGS_IMMUTABLETYPE,
 );
 
+/// The `ob_type` of a handle that wraps a Hydro value.
+///
+/// Not an exported CPython symbol: extensions see it only as an opaque
+/// pointer from `Py_TYPE`. Its `tp_basicsize` names this host's wrapper, so a
+/// C extension can never reach Hydro heap storage through the handle.
+pub(crate) static mut HYDRO_TYPE: TypeObject =
+    TypeObject::builtin(c"object".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
+
 /// Every static builtin type, used to patch the metatype link.
-fn builtin_type_pointers() -> [*mut TypeObject; 41] {
+fn builtin_type_pointers() -> [*mut TypeObject; 42] {
     [
         ptr::addr_of_mut!(TYPE_TYPE),
         ptr::addr_of_mut!(OBJECT_TYPE),
@@ -805,6 +815,7 @@ fn builtin_type_pointers() -> [*mut TypeObject; 41] {
         ptr::addr_of_mut!(SEQITER_TYPE),
         ptr::addr_of_mut!(CONTEXT_VAR_TYPE),
         ptr::addr_of_mut!(CONTEXT_TOKEN_TYPE),
+        ptr::addr_of_mut!(HYDRO_TYPE),
     ]
 }
 
@@ -1483,7 +1494,12 @@ pub(crate) fn type_from_spec(
         // SAFETY: `base` was validated as a type pointer above.
         let base_role = unsafe { (*base).role };
         let base_flags = unsafe { (*base).tp_flags };
-        if base_role != TypeRole::Instance {
+        // Exception classes live in the Shim role (their instances carry the
+        // CPython exception payload), but PyO3 creates `#[pyclass(extends =
+        // PyException)]` types from them; accept a marked exception base.
+        if base_role != TypeRole::Instance
+            && !(base_role == TypeRole::Shim && base_flags & PY_TPFLAGS_BASE_EXC_SUBCLASS != 0)
+        {
             return Err(format!(
                 "TypeError: PyType_FromSpec: type '{name}' cannot use '{}' as a base (only \
                  instance types can be bases)",
@@ -1621,6 +1637,12 @@ pub(crate) fn type_from_spec(
     // C3 linearisation of the bases. The new type is prepended later when the
     // `__mro__` tuple is built; inheritance below walks this list directly.
     let base_mro = linearize_bases(&bases)?;
+    // Exception subclasses inherit CPython's `Py_TPFLAGS_BASE_EXC_SUBCLASS`
+    // marker; `PyExceptionClass_Check` (used by PyO3) requires it.
+    let inherits_exception = bases.iter().any(|&base| {
+        // SAFETY: every base was validated as a live type pointer above.
+        unsafe { (*base).tp_flags & PY_TPFLAGS_BASE_EXC_SUBCLASS != 0 }
+    });
 
     let name_c = CString::new(name.as_str())
         .map_err(|_| "TypeError: PyType_FromSpec: type name contains a NUL".to_string())?;
@@ -1645,6 +1667,9 @@ pub(crate) fn type_from_spec(
     type_object.tp_itemsize = itemsize;
     type_object.tp_doc = doc_c.map_or(ptr::null(), |doc| doc.into_raw() as *const c_char);
     type_object.owns_name = true;
+    if inherits_exception {
+        type_object.tp_flags |= PY_TPFLAGS_BASE_EXC_SUBCLASS;
+    }
     type_object.tp_methods = slots.methods as *mut PyMethodDefMirror;
     type_object.tp_members = slots.members as *mut c_void;
     type_object.tp_getset = slots.getset as *mut c_void;
@@ -2277,6 +2302,11 @@ pub extern "C" fn PyType_Ready(type_object: *mut ShimObject) -> c_int {
 /// identifier is a `SystemError`, exactly as CPython's `PyType_GetSlot` does.
 #[no_mangle]
 pub extern "C" fn PyType_GetSlot(object: *mut ShimObject, slot: c_int) -> *mut c_void {
+    // A Hydro class has no C slot suites; like CPython for a type that does
+    // not provide the slot, the result is NULL (no exception).
+    if super::hydro_tagged(object).is_some() {
+        return ptr::null_mut();
+    }
     let type_object = match as_type(object) {
         Ok(type_object) => type_object,
         Err(error) => {
@@ -2367,6 +2397,13 @@ pub extern "C" fn PyType_GetSlot(object: *mut ShimObject, slot: c_int) -> *mut c
 /// `PyType_GetName`: returns a new reference to the type's short name.
 #[no_mangle]
 pub extern "C" fn PyType_GetName(object: *mut ShimObject) -> *mut ShimObject {
+    if let Some(name) = super::hydro_type_name_text(object) {
+        return value_object(ShimValue::Str(name));
+    }
+    if super::hydro_tagged(object).is_some() {
+        set_error("TypeError: PyType_GetName: expected a class object");
+        return ptr::null_mut();
+    }
     match as_type(object) {
         Ok(type_object) => value_object(ShimValue::Str(type_short_name(type_object))),
         Err(error) => {
@@ -2379,6 +2416,13 @@ pub extern "C" fn PyType_GetName(object: *mut ShimObject) -> *mut ShimObject {
 /// `PyType_GetQualName`: returns a new reference to the qualified type name.
 #[no_mangle]
 pub extern "C" fn PyType_GetQualName(object: *mut ShimObject) -> *mut ShimObject {
+    if let Some(name) = super::hydro_type_qualname_text(object) {
+        return value_object(ShimValue::Str(name));
+    }
+    if super::hydro_tagged(object).is_some() {
+        set_error("TypeError: PyType_GetQualName: expected a class object");
+        return ptr::null_mut();
+    }
     match as_type(object) {
         Ok(type_object) => value_object(ShimValue::Str(type_name(type_object))),
         Err(error) => {
@@ -2391,6 +2435,13 @@ pub extern "C" fn PyType_GetQualName(object: *mut ShimObject) -> *mut ShimObject
 /// `PyType_GetFlags`: returns `tp_flags`.
 #[no_mangle]
 pub extern "C" fn PyType_GetFlags(object: *mut ShimObject) -> c_ulong {
+    if let Some(flags) = super::hydro_type_flags(object) {
+        return flags;
+    }
+    if super::hydro_tagged(object).is_some() {
+        set_error("TypeError: PyType_GetFlags: expected a class object");
+        return 0;
+    }
     match as_type(object) {
         // SAFETY: validated type pointer.
         Ok(type_object) => unsafe { (*type_object).tp_flags },
@@ -3659,6 +3710,8 @@ pub(crate) fn object_length(object: *mut ShimObject) -> isize {
             }
             super::ShimKind::Str { text, .. } => return super::py_ssize_of(text.chars().count()),
             super::ShimKind::Bytes { data, .. } => return super::py_ssize_of(data.len()),
+            // Hydro containers and user objects resolve `len()` in Hydro.
+            super::ShimKind::Hydro(_) => return super::hydro_length(object),
             _ => {}
         }
     }
@@ -3888,6 +3941,11 @@ pub(crate) fn object_is_true(object: *mut ShimObject) -> c_int {
     if object.is_null() {
         super::set_error("SystemError: PyObject_IsTrue called with NULL");
         return -1;
+    }
+    // Hydro values use Hydro's truth rules (containers by length, objects by
+    // their class's `__bool__`/`__len__` support).
+    if let Some(value) = super::hydro_tagged(object) {
+        return crate::value::truthy(value) as c_int;
     }
     let function = number_function(type_of(object), 9);
     if function != 0 {
@@ -4444,6 +4502,9 @@ pub extern "C" fn PyCallable_Check(object: *mut ShimObject) -> c_int {
     if let Some(super::ShimKind::RuntimeFunction { .. }) = super::kind_ref(object) {
         return 1;
     }
+    if let Some(value) = super::hydro_tagged(object) {
+        return super::hydro_value_callable(value) as c_int;
+    }
     // SAFETY: live type object.
     unsafe {
         ((*type_object).tp_call != 0
@@ -4515,6 +4576,9 @@ pub extern "C" fn PyIter_Next(object: *mut ShimObject) -> *mut ShimObject {
     let result = unsafe { next(object) };
     if result.is_null() && !super::error_pending() {
         // CPython's exhaustion protocol: NULL with StopIteration set.
+        // Ensure the exported exception singleton is initialized before
+        // naming it; the static is null until the hierarchy is built.
+        super::initialize_exception_types();
         // SAFETY: the exception class is a live exported singleton.
         unsafe { super::PyErr_SetNone(super::PyExc_StopIteration) };
     }
@@ -4582,6 +4646,17 @@ pub extern "C" fn PyObject_RichCompare(
     if left.is_null() || right.is_null() {
         super::set_error("SystemError: PyObject_RichCompare called with NULL");
         return ptr::null_mut();
+    }
+    // At least one operand is Hydro-backed: compare both through Hydro so a
+    // user-defined `__eq__`/`__lt__` runs and identity is preserved.
+    if super::hydro_tagged(left).is_some() || super::hydro_tagged(right).is_some() {
+        return match super::hydro_richcompare(left, right, op) {
+            Ok(result) => bool_object(result),
+            Err(error) => {
+                super::set_error(error);
+                ptr::null_mut()
+            }
+        };
     }
     let function = unsafe { (*type_of(left)).tp_richcompare };
     let function = if function != 0 {
@@ -4683,6 +4758,16 @@ pub extern "C" fn PyType_Freeze(object: *mut ShimObject) -> c_int {
 /// `PyType_IsSubtype`.
 #[no_mangle]
 pub extern "C" fn PyType_IsSubtype(type_object: *mut ShimObject, base: *mut ShimObject) -> c_int {
+    // Hydro classes answer from their own linearization.
+    if let (Some(derived), Some(base_class)) = (
+        super::hydro_class_value(type_object),
+        super::hydro_class_value(base),
+    ) {
+        return match super::hydro_issubclass(derived, base_class) {
+            Ok(subtype) => subtype as c_int,
+            Err(_) => 0,
+        };
+    }
     if !is_type_pointer(type_object) || !is_type_pointer(base) {
         return 0;
     }

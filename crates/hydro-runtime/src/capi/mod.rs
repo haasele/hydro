@@ -62,6 +62,25 @@
 //! objects created by `PyCFunction_NewEx` are callable and dispatch every
 //! `METH_*` convention, including `METH_FASTCALL` with and without keywords.
 //!
+//! Extension instances and type objects cross to Hydro as opaque handles
+//! ([`ShimValue::Object`]) that own one reference to the original `PyObject *`.
+//! Attribute lookup, method calls, construction, truth, `repr` and
+//! `tp_richcompare` all run in the extension; passing a handle back yields the
+//! same pointer with an additional reference, so identity is preserved.
+//!
+//! Hydro values travel the other way as [`ShimKind::Hydro`] handles that own a
+//! persistent GC root. Classes, instances, functions, modules and the
+//! containers/scalars nested in them keep their identity across the boundary:
+//! `PyObject_GetAttr*` and `PyObject_SetAttr*` run Hydro's descriptor-aware
+//! lookup, `PyObject_Call*` invokes Hydro code (classes construct, functions
+//! and bound methods call), and `PyObject_Repr`/`Str`, truth, `len`, `hash`,
+//! `PyObject_IsInstance`/`IsSubclass`, `PyType_GetName`/`GetFlags`/`IsSubtype`
+//! and rich comparison dispatch to the runtime. The wrapper type's
+//! `tp_basicsize` describes this host's handle, never Hydro heap memory, and
+//! releasing the last C reference releases the root without freeing the value.
+//! A Hydro value with no handle representation raises instead of producing a
+//! fake object.
+//!
 //! # Buffers
 //!
 //! [`buffer`] implements the full request/validation surface: read-only and
@@ -150,8 +169,13 @@
 #![allow(private_interfaces)]
 
 pub(crate) mod buffer;
+pub(crate) mod container_api;
+pub(crate) mod descriptor_api;
+pub(crate) mod numeric_api;
+pub(crate) mod object_api;
 #[path = "type.rs"]
 pub(crate) mod types;
+pub(crate) mod unicode_api;
 
 #[allow(unused_imports)]
 pub(crate) use buffer::{
@@ -162,8 +186,8 @@ pub(crate) use buffer::{
 #[allow(unused_imports)]
 pub(crate) use types::{
     PyTypeSlotMirror, PyTypeSpecMirror, TypeObject, TypeRole, PY_TPFLAGS_BASETYPE,
-    PY_TPFLAGS_DISALLOW_INSTANTIATION, PY_TPFLAGS_HAVE_GC, PY_TPFLAGS_HAVE_VECTORCALL,
-    PY_TPFLAGS_HEAPTYPE, PY_TPFLAGS_IMMUTABLETYPE,
+    PY_TPFLAGS_BASE_EXC_SUBCLASS, PY_TPFLAGS_DISALLOW_INSTANTIATION, PY_TPFLAGS_HAVE_GC,
+    PY_TPFLAGS_HAVE_VECTORCALL, PY_TPFLAGS_HEAPTYPE, PY_TPFLAGS_IMMUTABLETYPE,
 };
 
 // The type/object allocation API lives in `type.rs`; re-export it so the link
@@ -323,11 +347,155 @@ pub(crate) struct PyMethodDefMirror {
     pub(crate) ml_doc: *const c_char,
 }
 
+/// One owned reference to an extension handle.
+///
+/// Used by [`ShimValue::Object`] so cloning a contract value keeps every handle
+/// alive and dropping it releases exactly one reference. `into_raw` transfers
+/// the owned reference to the caller (the pointer then behaves like a new
+/// reference, matching every other [`value_object`] result).
+#[derive(Debug)]
+pub(crate) struct OwnedShimObject(*mut ShimObject);
+
+// The shim heap is process-wide and handles are reference counted with
+// atomics; registry access is additionally serialised by its mutex.
+unsafe impl Send for OwnedShimObject {}
+
+impl OwnedShimObject {
+    #[cfg(test)]
+    pub(crate) fn as_ptr(&self) -> *mut ShimObject {
+        self.0
+    }
+}
+
+impl OwnedShimObject {
+    /// Wraps `object`, owning one new reference to it.
+    pub(crate) fn new(object: *mut ShimObject) -> Self {
+        inc_ref(object);
+        OwnedShimObject(object)
+    }
+
+    /// Relinquishes the owned reference and returns the raw handle.
+    pub(crate) fn into_raw(self) -> *mut ShimObject {
+        let object = self.0;
+        std::mem::forget(self);
+        object
+    }
+}
+
+impl Clone for OwnedShimObject {
+    fn clone(&self) -> Self {
+        inc_ref(self.0);
+        OwnedShimObject(self.0)
+    }
+}
+
+impl Drop for OwnedShimObject {
+    fn drop(&mut self) {
+        dec_ref(self.0);
+    }
+}
+
+std::thread_local! {
+    /// Identity of the GC registration that owns this thread's persistent
+    /// root slots. Used to keep a root release on the registering thread; a
+    /// slot index is only meaningful inside its own registration.
+    static ROOT_OWNER_TOKEN: u8 = const { 0 };
+}
+
+/// Address that identifies the calling thread's root registration.
+fn root_owner_token() -> usize {
+    ROOT_OWNER_TOKEN.with(|token| token as *const u8 as usize)
+}
+
+/// One persistent GC root keeping a Hydro value alive for C references.
+///
+/// The root is registered when the first handle is created and removed when
+/// the last clone (the [`ShimValue`] variant and the owning
+/// [`ShimKind::Hydro`]) is dropped. Sharing is reference-counted with an
+/// `Arc`, so a value that travels through several contract copies stays
+/// rooted exactly once.
+struct HydroRoot {
+    value: i64,
+    /// Persistent-root slot, or `usize::MAX` outside the runtime.
+    slot: usize,
+    /// Thread whose registration owns `slot`.
+    owner: usize,
+}
+
+impl HydroRoot {
+    fn new(value: i64) -> Arc<HydroRoot> {
+        let owner = root_owner_token();
+        let slot = crate::heap::add_persistent_root(value);
+        Arc::new(HydroRoot { value, slot, owner })
+    }
+}
+
+impl Drop for HydroRoot {
+    fn drop(&mut self) {
+        // A persistent root belongs to the registration that created it. A
+        // handle released on another thread (an extension may decref
+        // anywhere) leaves the root to that registration; it is cleared when
+        // the thread exits or the run resets. Never touch another
+        // registration's slot.
+        if self.slot == usize::MAX || root_owner_token() != self.owner {
+            return;
+        }
+        crate::heap::release_persistent_root(self.slot, self.value);
+    }
+}
+
+impl std::fmt::Debug for HydroRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HydroRoot")
+            .field("value", &self.value)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A Hydro value crossing to an extension as a real `PyObject *`.
+///
+/// The handle owns a persistent GC root, so the collector treats the value as
+/// reachable for as long as any C reference to the wrapper exists. Cloning
+/// shares that root; the last drop releases it without touching the Hydro
+/// object itself (the collector reclaims it when it really is unreachable).
+#[derive(Clone, Debug)]
+pub(crate) struct HydroValue {
+    root: Arc<HydroRoot>,
+    /// Python-visible type name, used by diagnostics and the wrapper's type.
+    type_name: String,
+}
+
+impl HydroValue {
+    /// Roots `value` and snapshots its Python-visible type name.
+    pub(crate) fn new(value: i64) -> HydroValue {
+        HydroValue {
+            root: HydroRoot::new(value),
+            type_name: crate::value::type_name_of(value),
+        }
+    }
+
+    /// The tagged Hydro value this handle names.
+    pub(crate) fn value(&self) -> i64 {
+        self.root.value
+    }
+
+    /// Python-visible type name of the wrapped value.
+    pub(crate) fn type_name(&self) -> &str {
+        &self.type_name
+    }
+}
+
 /// The crate-internal value contract shared with the extension loader.
 ///
 /// Containers are owned copies: passing a Hydro list to an extension copies it,
 /// and a container returned by an extension is converted into a fresh Hydro
-/// container. Nothing is shared across the boundary.
+/// container. [`ShimValue::Object`] is the exception: it carries an owned
+/// reference to the extension's own handle, so the same pointer can be passed
+/// back and the extension's identity, attributes and call semantics are
+/// preserved. [`ShimValue::Hydro`] is the mirror image: a Hydro class,
+/// instance, function, module or other value crosses as a rooted handle, and
+/// passing it back yields the identical Hydro value.
 #[derive(Clone, Debug)]
 pub(crate) enum ShimValue {
     None,
@@ -345,6 +513,18 @@ pub(crate) enum ShimValue {
         ptr: usize,
         name: Option<String>,
     },
+    /// An extension-owned object or type object, kept as an owned handle.
+    ///
+    /// `type_name` is the Python-visible type name used by diagnostics and
+    /// `type()`. The handle is passed back to the extension unchanged (with an
+    /// additional reference), so instances retain their identity.
+    Object {
+        object: OwnedShimObject,
+        type_name: String,
+    },
+    /// A Hydro value (class, instance, function, module, container, scalar)
+    /// kept alive by a persistent GC root while C references it.
+    Hydro(HydroValue),
     NotImplemented,
     Ellipsis,
 }
@@ -484,7 +664,7 @@ impl Drop for MemoryViewBuffer {
 
 /// Internal representation of one shim object.
 #[derive(Clone)]
-enum ShimKind {
+pub(crate) enum ShimKind {
     None,
     Bool(bool),
     Int(i64),
@@ -601,6 +781,12 @@ enum ShimKind {
     ModuleDef {
         def: usize,
     },
+    /// A Hydro value handed to the extension as a real object.
+    ///
+    /// The payload owns the persistent GC root, so attribute access, calls,
+    /// `repr`/`str`, truth and comparison dispatch to Hydro while any C
+    /// reference keeps the wrapper alive.
+    Hydro(HydroValue),
     /// Non-NULL sentinel returned by `PyErr_Occurred`.
     Error,
 }
@@ -815,6 +1001,10 @@ fn kind_type(kind: &ShimKind) -> *mut TypeObject {
         ShimKind::Module(_) | ShimKind::ModuleDef { .. } => {
             ptr::addr_of_mut!(types::MODULE_TYPE)
         }
+        // A Hydro value uses the opaque wrapper type: `tp_basicsize` names
+        // this host's wrapper, never Hydro heap storage. The Python-visible
+        // type name comes from `object_type_name`.
+        ShimKind::Hydro(_) => ptr::addr_of_mut!(types::HYDRO_TYPE),
         ShimKind::Error => ptr::addr_of_mut!(types::ERROR_TYPE),
     }
 }
@@ -1129,6 +1319,7 @@ fn release_kind(kind: ShimKind, address: *mut ShimObject) {
         | ShimKind::Ellipsis
         | ShimKind::Module(_)
         | ShimKind::ModuleDef { .. }
+        | ShimKind::Hydro(_)
         | ShimKind::Error => {}
     }
 }
@@ -1426,7 +1617,9 @@ macro_rules! exception_type_symbols {
                     $(
                         $symbol = types::allocate_exception_type(
                             $name,
-                            PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE,
+                            PY_TPFLAGS_IMMUTABLETYPE
+                                | PY_TPFLAGS_BASETYPE
+                                | PY_TPFLAGS_BASE_EXC_SUBCLASS,
                         ) as *mut ShimObject;
                     )+
                 }
@@ -1627,6 +1820,7 @@ exception_bases! {
 /// Maps an exported exception class to the loader's message prefix.
 fn exception_prefix(exception: *mut ShimObject) -> String {
     ensure_builtin_types();
+    initialize_exception_types();
     if !exception.is_null() {
         if types::is_type_pointer(exception) {
             let name = types::type_name(exception as *mut TypeObject);
@@ -1733,7 +1927,10 @@ fn exception_from_message(message: &str) -> *mut ShimObject {
 // ---------------------------------------------------------------------------
 
 /// Turns a contract value into a handle.
-fn value_object(value: ShimValue) -> *mut ShimObject {
+///
+/// Every return value is a new reference, including [`ShimValue::Object`],
+/// which transfers its owned reference.
+pub(crate) fn value_object(value: ShimValue) -> *mut ShimObject {
     match value {
         ShimValue::None => ptr::addr_of_mut!(_Py_NoneStruct),
         ShimValue::Bool(true) => ptr::addr_of_mut!(_Py_TrueStruct),
@@ -1774,6 +1971,12 @@ fn value_object(value: ShimValue) -> *mut ShimObject {
             context: 0,
             destructor: 0,
         }),
+        // The wrapped value's root moves into the handle; releasing the last
+        // C reference drops it again.
+        ShimValue::Hydro(handle) => new_object(ShimKind::Hydro(handle)),
+        // Transfer the owned reference: the returned pointer is a new
+        // reference, exactly like the freshly allocated arms above.
+        ShimValue::Object { object, .. } => object.into_raw(),
     }
 }
 
@@ -1827,6 +2030,9 @@ fn object_type_name(object: *mut ShimObject) -> String {
     if object.is_null() {
         return "NULL".to_string();
     }
+    if let Some(handle) = hydro_handle(object) {
+        return handle.type_name().to_string();
+    }
     if types::is_type_pointer(object) {
         return "type".to_string();
     }
@@ -1837,8 +2043,16 @@ fn object_type_name(object: *mut ShimObject) -> String {
     types::type_name(type_object)
 }
 
+/// Wraps `object` as an opaque contract value owning one new reference.
+fn opaque_object(object: *mut ShimObject, type_name: String) -> ShimValue {
+    ShimValue::Object {
+        object: OwnedShimObject::new(object),
+        type_name,
+    }
+}
+
 /// Converts an extension's return object to the contract value.
-fn object_to_value(object: *mut ShimObject) -> Result<ShimValue, String> {
+pub(crate) fn object_to_value(object: *mut ShimObject) -> Result<ShimValue, String> {
     object_to_value_at(object, 0, &mut Vec::new())
 }
 
@@ -1851,16 +2065,18 @@ fn object_to_value_at(
         return Err("cannot convert a NULL object".to_string());
     }
     if types::is_type_pointer(object) {
-        return Err(format!(
-            "extension returned the type object '{}', which cannot be converted to a Hydro value",
-            types::type_name(object as *mut TypeObject)
+        // Type objects cross the boundary as opaque handles: they are
+        // callable, expose `__name__`/`__module__` and participate in
+        // `isinstance`.
+        return Ok(opaque_object(
+            object,
+            types::type_name(object as *mut TypeObject),
         ));
     }
     let Some(kind) = kind_ref(object) else {
-        return Err(format!(
-            "TypeError: extension object of type '{}' cannot be converted to a Hydro value",
-            object_type_name(object)
-        ));
+        // An extension-owned instance (including instances of types created by
+        // the extension) has no shim payload; keep the handle itself.
+        return Ok(opaque_object(object, object_type_name(object)));
     };
     match kind {
         ShimKind::None => Ok(ShimValue::None),
@@ -1929,48 +2145,19 @@ fn object_to_value_at(
                     .map(|name| name.to_string_lossy().into_owned()),
             })
         }
-        ShimKind::CFunction { .. } | ShimKind::RuntimeFunction { .. } => Err(
-            "extension returned a C function object, which cannot be converted to a Hydro value"
-                .to_string(),
-        ),
-        ShimKind::ByteArray { .. } => Err(
-            "extension returned a bytearray object, which cannot be converted to a Hydro value"
-                .to_string(),
-        ),
-        ShimKind::Set(_) | ShimKind::FrozenSet(_) => Err(
-            "extension returned a set object, which cannot be converted to a Hydro value"
-                .to_string(),
-        ),
-        ShimKind::Complex { .. } => Err(
-            "extension returned a complex object, which cannot be converted to a Hydro value"
-                .to_string(),
-        ),
-        ShimKind::Exception { .. } => Err(
-            "extension returned an exception object, which cannot be converted to a Hydro value"
-                .to_string(),
-        ),
-        ShimKind::Method { .. } => Err(
-            "extension returned a bound method object, which cannot be converted to a Hydro value"
-                .to_string(),
-        ),
-        ShimKind::Slice { .. } | ShimKind::MemoryView { .. } | ShimKind::SeqIter { .. } => Err(
-            "extension returned an object that cannot be converted to a Hydro value".to_string(),
-        ),
-        ShimKind::DictProxy { .. }
-        | ShimKind::GenericAlias { .. }
-        | ShimKind::ContextVar { .. }
-        | ShimKind::ContextVarToken { .. } => Err(
-            "extension returned an object that cannot be converted to a Hydro value".to_string(),
-        ),
+        // A Hydro-backed handle keeps the identity of the value it wraps:
+        // the contract value shares the same persistent root, so passing it
+        // back to Hydro yields the identical tagged value.
+        ShimKind::Hydro(handle) => Ok(ShimValue::Hydro(handle.clone())),
+        // Every other handle is opaque: callables (C functions, bound
+        // methods), containers Hydro has no native counterpart for, exception
+        // instances, modules and extension-owned protocol objects all keep
+        // their identity and extension semantics through the same handle.
+        // Only the internal error sentinel is not a real object.
         ShimKind::NotImplemented => Ok(ShimValue::NotImplemented),
         ShimKind::Ellipsis => Ok(ShimValue::Ellipsis),
-        ShimKind::Module(_) => {
-            Err("extension returned a module object, which is not supported".to_string())
-        }
-        ShimKind::ModuleDef { .. } => {
-            Err("extension returned a module definition object, which is not supported".to_string())
-        }
         ShimKind::Error => Err("extension returned an error object".to_string()),
+        _ => Ok(opaque_object(object, object_type_name(object))),
     }
 }
 
@@ -2211,6 +2398,14 @@ fn shim_repr_at(object: *mut ShimObject, depth: usize) -> String {
         ShimKind::Ellipsis => "Ellipsis".to_string(),
         ShimKind::Module(_) => "<module>".to_string(),
         ShimKind::ModuleDef { .. } => "<module definition>".to_string(),
+        // Hydro renders its own objects; a failing `__repr__` leaves a pending
+        // Hydro exception, which this diagnostic path swallows in favour of
+        // the conventional address rendering (the caller that can propagate
+        // the error handles it in `PyObject_Repr`).
+        ShimKind::Hydro(handle) => match hydro_repr_text(handle.value()) {
+            Ok(text) => text,
+            Err(_) => format!("<{} object at 0x{:x}>", handle.type_name(), object as usize),
+        },
         ShimKind::Error => "<error>".to_string(),
     }
 }
@@ -3084,6 +3279,38 @@ pub(crate) fn get_attr(module: u64, name: &str) -> Result<ShimAttr, String> {
     })
 }
 
+/// Every Python-visible attribute name of a loaded module.
+///
+/// `dir(extension_module)` must agree with `getattr`/`hasattr`; the registry's
+/// attribute table is the authoritative export list (`PyModule_AddObject`,
+/// `PyModule_AddStringConstant` and module-dict writes all land there).
+pub(crate) fn module_attribute_names(module: u64) -> Vec<String> {
+    let registry = registry_lock();
+    let Some(entry) = registry.modules.get(&module) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entry.attrs.keys().cloned().collect();
+    names.extend(["__name__", "__doc__", "__dict__"].map(str::to_string));
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Layout and construction facts of an extension type used as a Hydro base.
+pub(crate) fn extension_type_layout(address: usize) -> Result<(isize, isize, bool), String> {
+    let type_object = types::as_type(address as *mut ShimObject)?;
+    // SAFETY: `as_type` validated the pointer as a live type object.
+    unsafe {
+        let constructible = ((*type_object).tp_new != 0 || (*type_object).tp_call != 0)
+            && (*type_object).tp_flags & PY_TPFLAGS_DISALLOW_INSTANTIATION == 0;
+        Ok((
+            (*type_object).tp_basicsize,
+            (*type_object).tp_itemsize,
+            constructible,
+        ))
+    }
+}
+
 /// Calls a method of a loaded module with contract values.
 pub(crate) fn call_method(
     module: u64,
@@ -3181,9 +3408,584 @@ pub(crate) fn type_display_name(address: usize) -> String {
     }
 }
 
+/// True when `object` names an extension type object.
+pub(crate) fn object_is_type(object: *mut ShimObject) -> bool {
+    types::is_type_pointer(object)
+}
+
+/// True when `object` can be called through vectorcall / `tp_call`.
+pub(crate) fn object_callable(object: *mut ShimObject) -> bool {
+    types::PyCallable_Check(object) != 0
+}
+
+/// Looks up `name` on an arbitrary extension handle.
+///
+/// The returned contract value owns its own reference; the lookup reference is
+/// released here. A missing attribute is reported with CPython's
+/// `AttributeError` spelling so the Hydro bridge raises `AttributeError`.
+pub(crate) fn object_get_attr(object: *mut ShimObject, name: &str) -> Result<ShimValue, String> {
+    if object.is_null() {
+        return Err(format!(
+            "AttributeError: NULL object has no attribute '{name}'"
+        ));
+    }
+    let attribute = attribute_lookup(object, name)?;
+    let converted = object_to_value(attribute);
+    dec_ref(attribute);
+    converted
+}
+
+/// Builds the keyword dictionary for a vectorcall from contract values.
+fn keyword_dict(keywords: &[(String, ShimValue)]) -> Result<*mut ShimObject, String> {
+    if keywords.is_empty() {
+        return Ok(ptr::null_mut());
+    }
+    let dict = PyDict_New();
+    if dict.is_null() {
+        return Err(take_error()
+            .unwrap_or_else(|| "MemoryError: cannot allocate a keyword dictionary".to_string()));
+    }
+    for (name, value) in keywords {
+        let key = new_str(name.clone());
+        let item = value_object(value.clone());
+        let status = PyDict_SetItem(dict, key, item);
+        dec_ref(key);
+        dec_ref(item);
+        if status != 0 {
+            let error =
+                take_error().unwrap_or_else(|| format!("TypeError: cannot bind keyword '{name}'"));
+            dec_ref(dict);
+            return Err(error);
+        }
+    }
+    Ok(dict)
+}
+
+/// Calls an arbitrary extension handle with contract arguments.
+///
+/// Positional and keyword arguments are materialised as fresh handles and
+/// released once the call returns; the result converts recursively.
+pub(crate) fn object_call(
+    object: *mut ShimObject,
+    args: &[ShimValue],
+    keywords: &[(String, ShimValue)],
+) -> Result<ShimValue, String> {
+    if object.is_null() {
+        return Err("TypeError: cannot call a NULL object".to_string());
+    }
+    let objects: Vec<usize> = args
+        .iter()
+        .cloned()
+        .map(|value| value_object(value) as usize)
+        .collect();
+    let pointers: Vec<*mut ShimObject> = objects
+        .iter()
+        .map(|&object| object as *mut ShimObject)
+        .collect();
+    let kwargs = keyword_dict(keywords)?;
+    let result = if kwargs.is_null() {
+        PyObject_Vectorcall(object, pointers.as_ptr(), pointers.len(), ptr::null_mut())
+    } else {
+        PyObject_VectorcallDict(object, pointers.as_ptr(), pointers.len(), kwargs)
+    };
+    if !kwargs.is_null() {
+        dec_ref(kwargs);
+    }
+    let outcome = take_result_value(result);
+    for object in objects {
+        dec_ref(object as *mut ShimObject);
+    }
+    outcome
+}
+
+/// Resolves `name` on `object` and calls the result with contract arguments.
+pub(crate) fn object_call_method(
+    object: *mut ShimObject,
+    name: &str,
+    args: &[ShimValue],
+    keywords: &[(String, ShimValue)],
+) -> Result<ShimValue, String> {
+    let method = attribute_lookup(object, name)?;
+    let outcome = object_call(method, args, keywords);
+    dec_ref(method);
+    outcome
+}
+
+/// `repr()` of an arbitrary extension handle.
+///
+/// A failing `tp_repr` keeps its exception pending but still yields the
+/// conventional `<Type object at 0x...>` fallback, because this renderer
+/// returns plain text.
+pub(crate) fn object_repr(object: *mut ShimObject) -> String {
+    if object.is_null() {
+        return "<NULL>".to_string();
+    }
+    let result = PyObject_Repr(object);
+    if result.is_null() {
+        return format!(
+            "<{} object at 0x{:x}>",
+            object_type_name(object),
+            object as usize
+        );
+    }
+    let text = match kind_ref(result) {
+        Some(ShimKind::Str { text, .. }) => text.clone(),
+        _ => object_type_name(result),
+    };
+    dec_ref(result);
+    text
+}
+
+/// Truthiness of an arbitrary extension handle.
+pub(crate) fn object_truthy(object: *mut ShimObject) -> Result<bool, String> {
+    let result = types::object_is_true(object);
+    if result < 0 {
+        let message = take_error();
+        // An extension instance whose type defines neither `__bool__`,
+        // `__len__` nor a number slot is truthy, like CPython's default
+        // `object.__bool__`; `as_predicate` only knows shim payloads.
+        if kind_ref(object).is_none()
+            && message
+                .as_deref()
+                .is_none_or(|text| text.contains("predicate"))
+        {
+            return Ok(true);
+        }
+        return Err(message.unwrap_or_else(|| {
+            "SystemError: __bool__ failed without setting an exception".into()
+        }));
+    }
+    Ok(result != 0)
+}
+
+/// `==` between two extension handles.
+///
+/// Uses the extension's `tp_richcompare` when either type declares one,
+/// falling back to identity when the comparison is unsupported. Without a
+/// rich comparison the result is pointer identity, matching Python's default
+/// `object.__eq__`.
+pub(crate) fn objects_equal(left: *mut ShimObject, right: *mut ShimObject) -> Result<bool, String> {
+    if left == right {
+        return Ok(true);
+    }
+    if left.is_null() || right.is_null() {
+        return Ok(false);
+    }
+    ensure_builtin_types();
+    let left_rich = unsafe { (*type_of(left)).tp_richcompare };
+    let right_rich = unsafe { (*type_of(right)).tp_richcompare };
+    if left_rich == 0 && right_rich == 0 {
+        return Ok(false);
+    }
+    // `PY_EQ` from `Include/object.h`.
+    const PY_EQ: c_int = 2;
+    let result = types::PyObject_RichCompare(left, right, PY_EQ);
+    if result.is_null() {
+        return Err(
+            take_error().unwrap_or_else(|| "RuntimeError: extension comparison failed".to_string())
+        );
+    }
+    if matches!(kind_ref(result), Some(ShimKind::NotImplemented)) {
+        dec_ref(result);
+        return Ok(false);
+    }
+    let truth = types::object_is_true(result);
+    dec_ref(result);
+    if truth < 0 {
+        return Err(take_error()
+            .unwrap_or_else(|| "RuntimeError: comparison result is not truth-testable".into()));
+    }
+    Ok(truth != 0)
+}
+
+/// `isinstance(object, class)` against an extension type object.
+pub(crate) fn object_isinstance(
+    object: *mut ShimObject,
+    class: *mut ShimObject,
+) -> Result<bool, String> {
+    let result = PyObject_IsInstance(object, class);
+    if result < 0 {
+        return Err(take_error()
+            .unwrap_or_else(|| "TypeError: isinstance() argument check failed".to_string()));
+    }
+    Ok(result != 0)
+}
+
+// ---------------------------------------------------------------------------
+// Hydro-backed handles
+// ---------------------------------------------------------------------------
+
+/// The Hydro value behind a handle, if it wraps one.
+pub(crate) fn hydro_tagged(object: *mut ShimObject) -> Option<i64> {
+    hydro_handle(object).map(HydroValue::value)
+}
+
+/// The rooted handle behind a Hydro-backed object.
+fn hydro_handle(object: *mut ShimObject) -> Option<&'static HydroValue> {
+    match kind_ref(object) {
+        Some(ShimKind::Hydro(handle)) => Some(handle),
+        _ => None,
+    }
+}
+
+/// Wraps a Hydro value as a contract value that owns one GC root.
+pub(crate) fn hydro_shim(value: i64) -> ShimValue {
+    ShimValue::Hydro(HydroValue::new(value))
+}
+
+/// `repr()` of a Hydro value, propagating a raising `__repr__`.
+fn hydro_repr_text(value: i64) -> Result<String, String> {
+    let _gripper = GilGuard::new();
+    let text = crate::value::repr(value);
+    if crate::exc::pending() {
+        return Err(take_hydro_error("repr() failed"));
+    }
+    Ok(text)
+}
+
+/// `str()` of a Hydro value, propagating a raising `__str__`.
+fn hydro_str_text(value: i64) -> Result<String, String> {
+    let _gripper = GilGuard::new();
+    let text = crate::value::to_string(value);
+    if crate::exc::pending() {
+        return Err(take_hydro_error("str() failed"));
+    }
+    Ok(text)
+}
+
+/// `object.name` dispatched to Hydro (methods, descriptors and data
+/// attributes run in Hydro).
+fn hydro_attribute(object: *mut ShimObject, name: &str) -> Result<*mut ShimObject, String> {
+    let Some(value) = hydro_tagged(object) else {
+        return Err(format!("AttributeError: object has no attribute '{name}'"));
+    };
+    let _gripper = GilGuard::new();
+    let attribute = crate::methods::getattr(value, name.as_ptr(), name.len());
+    if crate::exc::pending() {
+        return Err(take_hydro_error(&format!(
+            "attribute '{name}' lookup failed"
+        )));
+    }
+    match crate::modules::extension::value_to_shim(attribute) {
+        Ok(shim) => Ok(value_object(shim)),
+        Err(error) => Err(format!("TypeError: {error}")),
+    }
+}
+
+/// `object.name = value` (or deletion with a NULL value) dispatched to
+/// Hydro's `setattr`/`delattr` implementation.
+fn hydro_attribute_set(
+    object: *mut ShimObject,
+    name: &str,
+    value: *mut ShimObject,
+) -> Result<(), String> {
+    let Some(target) = hydro_tagged(object) else {
+        return Err(format!("AttributeError: object has no attribute '{name}'"));
+    };
+    let new_value = if value.is_null() {
+        crate::value::NONE
+    } else {
+        let shim = object_to_value(value)?;
+        crate::modules::extension::shim_to_value(shim)
+            .map_err(|error| format!("TypeError: {error}"))?
+    };
+    let _gripper = GilGuard::new();
+    if value.is_null() {
+        crate::methods::delete_attr(target, name.as_ptr(), name.len());
+    } else {
+        crate::methods::setattr(target, name.as_ptr(), name.len(), new_value);
+    }
+    if crate::exc::pending() {
+        return Err(take_hydro_error(&format!(
+            "cannot assign attribute '{name}'"
+        )));
+    }
+    Ok(())
+}
+
+/// `len()` of a Hydro-backed value.
+pub(crate) fn hydro_length(object: *mut ShimObject) -> isize {
+    let Some(value) = hydro_tagged(object) else {
+        set_error("SystemError: PyObject_Length requires a live object");
+        return -1;
+    };
+    let _gripper = GilGuard::new();
+    let result = crate::builtins::len(value);
+    if crate::exc::pending() {
+        set_error(take_hydro_error("len() failed"));
+        return -1;
+    }
+    match crate::value::as_integer(result) {
+        Some(length) => match isize::try_from(length) {
+            Ok(length) => length,
+            Err(_) => {
+                set_error("OverflowError: integer out of range for Py_ssize_t");
+                -1
+            }
+        },
+        None => {
+            set_error("TypeError: __len__ returned a non-integer");
+            -1
+        }
+    }
+}
+
+/// Whether a Hydro value is callable (function, class, bound method or an
+/// instance whose class defines `__call__`).
+pub(crate) fn hydro_value_callable(value: i64) -> bool {
+    if crate::value::as_function(value).is_some()
+        || crate::value::as_class(value).is_some()
+        || crate::value::as_ext_function(value).is_some()
+    {
+        return true;
+    }
+    match crate::value::as_instance(value) {
+        Some(instance) => crate::value::class_lookup(instance.class, "__call__").is_some(),
+        None => false,
+    }
+}
+
+/// `isinstance(instance, class)` with `class` a Hydro class value.
+fn hydro_isinstance_value(instance: *mut ShimObject, class_value: i64) -> Result<bool, String> {
+    let instance_value = object_to_value(instance)
+        .and_then(crate::modules::extension::shim_to_value)
+        .map_err(|error| format!("TypeError: {error}"))?;
+    let _gripper = GilGuard::new();
+    let result = crate::builtins::isinstance(instance_value, class_value);
+    if crate::exc::pending() {
+        return Err(take_hydro_error("isinstance() failed"));
+    }
+    Ok(result == crate::value::TRUE)
+}
+
+/// `issubclass(derived, class)` for Hydro class values.
+pub(crate) fn hydro_issubclass(derived: i64, class: i64) -> Result<bool, String> {
+    let _gripper = GilGuard::new();
+    let result = crate::builtins::issubclass(derived, class);
+    if crate::exc::pending() {
+        return Err(take_hydro_error("issubclass() failed"));
+    }
+    Ok(result == crate::value::TRUE)
+}
+
+/// `Py_TYPE`-independent type check for a Hydro class value.
+pub(crate) fn hydro_class_value(object: *mut ShimObject) -> Option<i64> {
+    let value = hydro_tagged(object)?;
+    crate::value::as_class(value).map(|_| value)
+}
+
+/// Python-visible short name of a Hydro class handle.
+pub(crate) fn hydro_type_name_text(object: *mut ShimObject) -> Option<String> {
+    let value = hydro_class_value(object)?;
+    crate::value::class_display_name(value).map(str::to_string)
+}
+
+/// Qualified name of a Hydro class handle (`__qualname__` when assigned).
+pub(crate) fn hydro_type_qualname_text(object: *mut ShimObject) -> Option<String> {
+    let value = hydro_class_value(object)?;
+    let _gripper = GilGuard::new();
+    let qualname = crate::methods::getattr(value, b"__qualname__".as_ptr(), 12);
+    if crate::exc::pending() {
+        crate::exc::clear();
+    } else if let Some(text) = crate::value::as_str(qualname) {
+        return Some(text.to_string());
+    }
+    crate::value::class_display_name(value).map(str::to_string)
+}
+
+/// Flags reported for a Hydro class handle.
+///
+/// Hydro classes are mutable heap types that support subclassing; no C slot
+/// suite exists, so the wrapper reports only the conceptual type flags.
+pub(crate) fn hydro_type_flags(object: *mut ShimObject) -> Option<c_ulong> {
+    hydro_class_value(object)?;
+    Some(
+        (types::PY_TPFLAGS_HEAPTYPE | types::PY_TPFLAGS_BASETYPE | types::PY_TPFLAGS_READY)
+            as c_ulong,
+    )
+}
+
+/// `left <op> right` where at least one side is Hydro-backed.
+///
+/// `op` uses CPython's `Py_LT..Py_GE` numbering. Both operands are converted
+/// to Hydro values and compared by the runtime, so a user-defined `__eq__`
+/// keeps working through the C boundary.
+pub(crate) fn hydro_richcompare(
+    left: *mut ShimObject,
+    right: *mut ShimObject,
+    op: c_int,
+) -> Result<bool, String> {
+    let convert = |object: *mut ShimObject| -> Result<i64, String> {
+        object_to_value(object)
+            .and_then(crate::modules::extension::shim_to_value)
+            .map_err(|error| format!("TypeError: {error}"))
+    };
+    let left_value = convert(left)?;
+    let right_value = convert(right)?;
+    let operation = match op {
+        0 => crate::ops::OP_LT,
+        1 => crate::ops::OP_LE,
+        2 => crate::ops::OP_EQ,
+        3 => crate::ops::OP_NE,
+        4 => crate::ops::OP_GT,
+        5 => crate::ops::OP_GE,
+        _ => {
+            return Err(format!("SystemError: invalid rich comparison op {op}"));
+        }
+    };
+    let _gripper = GilGuard::new();
+    let result = crate::ops::binop(operation, left_value, right_value);
+    if crate::exc::pending() {
+        return Err(take_hydro_error("comparison failed"));
+    }
+    Ok(result == crate::value::TRUE)
+}
+
+/// Tagged values whose heap members stay rooted while a Rust-side buffer is
+/// built and passed to Hydro.
+///
+/// The collector never scans Rust heap payloads, so every appended value is
+/// registered as a persistent root immediately. Hydro code called later may
+/// create roots of its own, so each root is released individually (by slot and
+/// value) instead of truncating the shared registry.
+struct RootedValues {
+    values: Vec<i64>,
+    roots: Vec<(usize, i64)>,
+}
+
+impl RootedValues {
+    fn with_capacity(capacity: usize) -> RootedValues {
+        RootedValues {
+            values: Vec::with_capacity(capacity),
+            roots: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, value: i64) {
+        self.values.push(value);
+        let last = self.values.len() - 1;
+        let slot = crate::heap::root_values(&self.values[last..]);
+        self.roots.push((slot, value));
+    }
+
+    fn as_slice(&self) -> &[i64] {
+        &self.values
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
+impl Drop for RootedValues {
+    fn drop(&mut self) {
+        for &(slot, value) in self.roots.iter().rev() {
+            crate::heap::release_persistent_root(slot, value);
+        }
+    }
+}
+
+/// Calls a Hydro-backed callable with vectorcall arguments.
+///
+/// Every argument and keyword value is converted to a Hydro value (Hydro
+/// handles keep their identity), rooted for the duration of the call and
+/// released afterwards. A Hydro exception becomes a pending C error and a
+/// NULL result; a result that has no contract representation does the same.
+fn call_hydro(
+    handle: &HydroValue,
+    values: &[*mut ShimObject],
+    names: &[usize],
+    positional_count: usize,
+) -> *mut ShimObject {
+    let keyword_count = names.len();
+    let mut arguments = RootedValues::with_capacity(positional_count);
+    for &value in &values[..positional_count] {
+        match object_to_value(value).and_then(crate::modules::extension::shim_to_value) {
+            Ok(argument) => arguments.push(argument),
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                return ptr::null_mut();
+            }
+        }
+    }
+    let mut keyword_names = RootedValues::with_capacity(keyword_count);
+    let mut keyword_values = RootedValues::with_capacity(keyword_count);
+    for (index, &name) in names.iter().enumerate() {
+        let text = match kind_ref(name as *mut ShimObject) {
+            Some(ShimKind::Str { text, .. }) => text.clone(),
+            _ => {
+                set_error("TypeError: keywords must be strings");
+                return ptr::null_mut();
+            }
+        };
+        let key = crate::value::str_alloc(text);
+        keyword_names.push(key);
+        let argument = values[positional_count + index];
+        match object_to_value(argument).and_then(crate::modules::extension::shim_to_value) {
+            Ok(converted) => keyword_values.push(converted),
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                return ptr::null_mut();
+            }
+        }
+    }
+    // Flatten `name, value` pairs into the ABI's keyword buffer.
+    let mut pairs = RootedValues::with_capacity(keyword_count.saturating_mul(2));
+    for (index, &name) in keyword_names.as_slice().iter().enumerate() {
+        pairs.push(name);
+        let value = keyword_values
+            .as_slice()
+            .get(index)
+            .copied()
+            .unwrap_or(crate::value::NONE);
+        pairs.push(value);
+    }
+    let result = {
+        let _gripper = GilGuard::new();
+        if keyword_count == 0 {
+            crate::builtins::call(
+                handle.value(),
+                arguments.len(),
+                arguments.as_slice().as_ptr(),
+            )
+        } else {
+            crate::builtins::call_kw(
+                handle.value(),
+                arguments.len(),
+                arguments.as_slice().as_ptr(),
+                keyword_count,
+                pairs.as_slice().as_ptr(),
+            )
+        }
+    };
+    let failure = if crate::exc::pending() {
+        Some(take_hydro_error(&format!(
+            "{}() raised an exception",
+            handle.type_name()
+        )))
+    } else {
+        None
+    };
+    if let Some(error) = failure {
+        set_error(error);
+        return ptr::null_mut();
+    }
+    // The buffers stay alive (and rooted) until the result is converted: the
+    // call may return one of its arguments.
+    match crate::modules::extension::value_to_shim(result) {
+        Ok(shim) => value_object(shim),
+        Err(error) => {
+            set_error(format!(
+                "TypeError: cannot represent the result of a Hydro call: {error}"
+            ));
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Converts a pending Hydro exception into the shim's `"<Type>: <message>"`
 /// spelling and clears it.
-fn take_hydro_error(fallback: &str) -> String {
+pub(crate) fn take_hydro_error(fallback: &str) -> String {
     let pending = crate::exc::pending_value();
     let message = crate::value::exception_data(pending)
         .map(|data| format!("{}: {}", data.name, data.msg))
@@ -5884,6 +6686,12 @@ pub extern "C" fn PyObject_Vectorcall(
     let keyword_count = names.len();
     let positional_count = values.len() - keyword_count;
 
+    // A Hydro-backed callable (class, function, bound method or instance with
+    // `__call__`) invokes Hydro code and converts the result back.
+    if let Some(ShimKind::Hydro(handle)) = kind_ref(callable) {
+        return call_hydro(handle, values, names, positional_count);
+    }
+
     if types::is_type_pointer(callable) {
         let type_object = callable as *mut TypeObject;
         // SAFETY: validated type object.
@@ -6578,6 +7386,12 @@ fn attribute_lookup(object: *mut ShimObject, name: &str) -> Result<*mut ShimObje
             "AttributeError: NULL object has no attribute '{name}'"
         ));
     }
+    // A Hydro-backed handle resolves its attributes in Hydro: classes expose
+    // their methods/descriptors, instances run `__getattribute__` and modules
+    // resolve their attributes.
+    if hydro_handle(object).is_some() {
+        return hydro_attribute(object, name);
+    }
     if types::is_type_pointer(object) {
         return generic_attribute(object, name);
     }
@@ -6651,6 +7465,15 @@ pub extern "C" fn PyObject_GenericGetAttr(
         set_error("TypeError: attribute name must be a string");
         return ptr::null_mut();
     };
+    if hydro_handle(object).is_some() {
+        return match hydro_attribute(object, &name) {
+            Ok(attribute) => attribute,
+            Err(error) => {
+                set_error(error);
+                ptr::null_mut()
+            }
+        };
+    }
     match generic_attribute(object, &name) {
         Ok(attribute) => attribute,
         Err(error) => {
@@ -6666,6 +7489,11 @@ fn generic_setattr(
     name: &str,
     value: *mut ShimObject,
 ) -> Result<(), String> {
+    // Hydro handles own their attribute semantics: class overlays, instance
+    // descriptors and module overrides all run in Hydro.
+    if hydro_handle(object).is_some() {
+        return hydro_attribute_set(object, name, value);
+    }
     if types::is_type_pointer(object) {
         return Err(format!(
             "AttributeError: cannot set '{name}' on immutable type '{}'",
@@ -6866,6 +7694,15 @@ pub extern "C" fn PyObject_Repr(object: *mut ShimObject) -> *mut ShimObject {
         set_error("SystemError: PyObject_Repr: object is NULL");
         return ptr::null_mut();
     }
+    if let Some(value) = hydro_tagged(object) {
+        return match hydro_repr_text(value) {
+            Ok(text) => new_str(text),
+            Err(error) => {
+                set_error(error);
+                ptr::null_mut()
+            }
+        };
+    }
     let type_object = type_of(object);
     if type_object.is_null() {
         return new_str(shim_repr(object));
@@ -6892,6 +7729,15 @@ pub extern "C" fn PyObject_Str(object: *mut ShimObject) -> *mut ShimObject {
     if object.is_null() {
         set_error("SystemError: PyObject_Str: object is NULL");
         return ptr::null_mut();
+    }
+    if let Some(value) = hydro_tagged(object) {
+        return match hydro_str_text(value) {
+            Ok(text) => new_str(text),
+            Err(error) => {
+                set_error(error);
+                ptr::null_mut()
+            }
+        };
     }
     let type_object = type_of(object);
     if type_object.is_null() {
@@ -6990,6 +7836,19 @@ fn hash_object(object: *mut ShimObject, depth: usize) -> Result<isize, String> {
         }
         None if types::is_type_pointer(object) => {
             return Ok(object as isize);
+        }
+        // Hydro values hash through Python's rules: classes and instances by
+        // identity (or a user `__hash__`), containers by content.
+        Some(ShimKind::Hydro(handle)) => {
+            let _gripper = GilGuard::new();
+            let hash = crate::builtins::hash(handle.value());
+            if crate::exc::pending() {
+                return Err(take_hydro_error("hash() failed"));
+            }
+            match crate::value::as_integer(hash) {
+                Some(hash) => hash as isize,
+                None => -2,
+            }
         }
         _ => {
             return Err(format!(
@@ -7279,8 +8138,12 @@ pub extern "C" fn PyErr_NewExceptionWithDoc(
         set_error("TypeError: PyErr_NewException: dict must be a dict");
         return ptr::null_mut();
     }
-    let type_object =
-        types::allocate_exception_type(&full_name, PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE);
+    // `Py_TPFLAGS_BASE_EXC_SUBCLASS` is what PyO3's `PyExceptionClass_Check`
+    // macro tests when it validates an exception class returned here.
+    let type_object = types::allocate_exception_type(
+        &full_name,
+        PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE | (1 << 30),
+    );
     if type_object.is_null() {
         set_error("MemoryError: cannot allocate the exception class");
         return ptr::null_mut();
@@ -9280,6 +10143,17 @@ pub extern "C" fn PyObject_GenericGetDict(
         bad_internal_call();
         return ptr::null_mut();
     }
+    // A Hydro instance/class exposes `__dict__` through Hydro; a value with
+    // no attribute dict reports AttributeError like CPython's default.
+    if hydro_handle(object).is_some() {
+        return match attribute_lookup(object, "__dict__") {
+            Ok(dict) => dict,
+            Err(error) => {
+                set_error(error);
+                ptr::null_mut()
+            }
+        };
+    }
     if matches!(kind_ref(object), Some(ShimKind::Module(_))) {
         let dict = PyModule_GetDict(object);
         if !dict.is_null() {
@@ -9301,6 +10175,15 @@ pub extern "C" fn PyObject_GenericSetDict(
     if value.is_null() {
         set_error("TypeError: cannot delete __dict__");
         return -1;
+    }
+    if hydro_handle(object).is_some() {
+        return match hydro_attribute_set(object, "__dict__", value) {
+            Ok(()) => 0,
+            Err(error) => {
+                set_error(error);
+                -1
+            }
+        };
     }
     if !matches!(kind_ref(value), Some(ShimKind::Dict(_))) {
         set_error(format!(
@@ -9365,6 +10248,18 @@ pub extern "C" fn PyObject_IsInstance(instance: *mut ShimObject, class: *mut Shi
         return 0;
     }
     if !types::is_type_pointer(class) {
+        // A Hydro class (or a native type value such as `int`) answers
+        // through Hydro's `isinstance`, including virtual subclasses and
+        // `__instancecheck__`.
+        if let Some(class_value) = hydro_tagged(class) {
+            return match hydro_isinstance_value(instance, class_value) {
+                Ok(equal) => equal as c_int,
+                Err(error) => {
+                    set_error(error);
+                    -1
+                }
+            };
+        }
         set_error("TypeError: isinstance() arg 2 must be a type, a tuple of types, or a union");
         return -1;
     }
@@ -9393,10 +10288,39 @@ pub extern "C" fn PyObject_IsSubclass(derived: *mut ShimObject, class: *mut Shim
         return 0;
     }
     if !types::is_type_pointer(derived) {
+        // Hydro classes are not C type objects; answer from Hydro when the
+        // other operand is a Hydro class, and from the wrapper otherwise.
+        if let Some(derived_class) = hydro_tagged(derived) {
+            if let Some(class_value) = hydro_tagged(class) {
+                return match hydro_issubclass(derived_class, class_value) {
+                    Ok(equal) => equal as c_int,
+                    Err(error) => {
+                        set_error(error);
+                        -1
+                    }
+                };
+            }
+            if types::is_type_pointer(class)
+                && types::type_name(class as *mut TypeObject) == "object"
+            {
+                return 1;
+            }
+            if !types::is_type_pointer(class) {
+                set_error(
+                    "TypeError: issubclass() arg 2 must be a class, a tuple of classes, or a union",
+                );
+                return -1;
+            }
+            return 0;
+        }
         set_error("TypeError: issubclass() arg 1 must be a class");
         return -1;
     }
     if !types::is_type_pointer(class) {
+        // A C type cannot derive from a Hydro class.
+        if hydro_class_value(class).is_some() {
+            return 0;
+        }
         set_error("TypeError: issubclass() arg 2 must be a class, a tuple of classes, or a union");
         return -1;
     }
@@ -12857,6 +13781,68 @@ pub(crate) fn anchor() {
         hydro_capi_tuple_pack as *const (),
     ];
     let _ = std::hint::black_box(symbols);
+    // Symbols implemented in the focused API modules. Keep them referenced so
+    // the staticlib linker preserves every definition.
+    let api_symbols: &[*const ()] = &[
+        container_api::PyDict_Pop as *const (),
+        container_api::PyDict_SetDefault as *const (),
+        container_api::_PyDict_GetItem_KnownHash as *const (),
+        container_api::_PyDict_NewPresized as *const (),
+        container_api::PyList_Insert as *const (),
+        container_api::PyList_SetSlice as *const (),
+        container_api::PyList_Sort as *const (),
+        container_api::PySequence_List as *const (),
+        container_api::PySet_Discard as *const (),
+        container_api::PySet_Pop as *const (),
+        descriptor_api::PyArg_ValidateKeywordArguments as *const (),
+        descriptor_api::PyClassMethod_New as *const (),
+        descriptor_api::PyDescr_NewClassMethod as *const (),
+        descriptor_api::PyStaticMethod_New as *const (),
+        descriptor_api::PyErr_NewException as *const (),
+        numeric_api::PyLong_AsDouble as *const (),
+        numeric_api::PyLong_AsInt as *const (),
+        numeric_api::PyLong_AsUnsignedLongLongMask as *const (),
+        numeric_api::PyLong_FromSize_t as *const (),
+        numeric_api::PyLong_FromString as *const (),
+        numeric_api::_PyLong_Copy as *const (),
+        numeric_api::PyOS_double_to_string as *const (),
+        numeric_api::PyMemoryView_FromMemory as *const (),
+        object_api::PyObject_CallFinalizerFromDealloc as *const (),
+        object_api::PyObject_CallMethodObjArgs as *const (),
+        object_api::PyObject_ClearManagedDict as *const (),
+        object_api::PyObject_GC_IsFinalized as *const (),
+        object_api::PyObject_HasAttr as *const (),
+        object_api::PyObject_VisitManagedDict as *const (),
+        object_api::_PyObject_GetDictPtr as *const (),
+        object_api::_PyType_Lookup as *const (),
+        object_api::PyGC_Disable as *const (),
+        object_api::PyGC_Enable as *const (),
+        object_api::PyWeakref_GetRef as *const (),
+        object_api::PyWeakref_NewRef as *const (),
+        object_api::PyThread_allocate_lock as *const (),
+        object_api::PyThread_free_lock as *const (),
+        object_api::PyThreadState_GetFrame as *const (),
+        object_api::PyTraceBack_Here as *const (),
+        object_api::PyFrame_New as *const (),
+        object_api::PyCode_NewEmpty as *const (),
+        object_api::PyUnstable_Code_NewWithPosOnlyArgs as *const (),
+        object_api::PyUnstable_Object_EnableDeferredRefcount as *const (),
+        object_api::_Py_FatalErrorFunc as *const (),
+        unicode_api::PyUnicode_CopyCharacters as *const (),
+        unicode_api::PyUnicode_DecodeLocale as *const (),
+        unicode_api::PyUnicode_DecodeUTF8 as *const (),
+        unicode_api::PyUnicode_EncodeLocale as *const (),
+        unicode_api::PyUnicode_Equal as *const (),
+        unicode_api::PyUnicode_Find as *const (),
+        unicode_api::PyUnicode_FindChar as *const (),
+        unicode_api::PyUnicode_FromOrdinal as *const (),
+        unicode_api::PyUnicode_FromWideChar as *const (),
+        unicode_api::PyUnicode_Join as *const (),
+        unicode_api::PyUnicode_Resize as *const (),
+        unicode_api::PyUnicode_Split as *const (),
+        unicode_api::PyBytes_Join as *const (),
+    ];
+    let _ = std::hint::black_box(api_symbols);
 }
 
 #[cfg(test)]
@@ -12932,6 +13918,7 @@ mod tests {
             Some(ShimKind::Ellipsis) => "Ellipsis",
             Some(ShimKind::Module(_)) => "Module",
             Some(ShimKind::ModuleDef { .. }) => "ModuleDef",
+            Some(ShimKind::Hydro(_)) => "Hydro",
             Some(ShimKind::Error) => "Error",
         }
     }
@@ -14974,7 +15961,8 @@ mod tests {
         assert_eq!(types::PyIter_Check(instance), 1);
         clear_error();
         assert!(types::PyIter_Next(iterator).is_null());
-        assert!(take_error().unwrap().contains("StopIteration"));
+        let error = take_error().unwrap_or_default();
+        assert!(error.contains("StopIteration"), "{error:?}");
         assert_eq!(unsafe { next_calls() }, 1);
         Py_DecRef(iterator);
 
@@ -16288,5 +17276,63 @@ long hydro_fixture_last_op(void) { return last_op; }
         // SAFETY: `end` receives a pointer into the input literal.
         let parsed = unsafe { super::PyOS_strtol(c"ff".as_ptr(), &mut text, 16) };
         assert_eq!(parsed, 255);
+    }
+    #[test]
+    fn hydro_handles_wrap_hydro_values() {
+        ensure_builtin_types();
+        // An immediate value still becomes a real handle whose behaviour
+        // dispatches to Hydro; `tp_basicsize` of the wrapper type names this
+        // host's storage (it never exposes Hydro heap memory).
+        let tagged = 5i64 << 3;
+        let handle = value_object(hydro_shim(tagged));
+        assert!(matches!(kind_ref(handle), Some(ShimKind::Hydro(_))));
+        assert_eq!(object_type_name(handle), "int");
+        assert_eq!(
+            Py_TYPE(handle) as usize,
+            ptr::addr_of_mut!(types::HYDRO_TYPE) as usize
+        );
+        assert_eq!(types::type_name(Py_TYPE(handle)), "object");
+
+        let repr = PyObject_Repr(handle);
+        let rendered = match kind_ref(repr) {
+            Some(ShimKind::Str { text, .. }) => text.clone(),
+            _ => panic!("repr did not produce a string: {:?}", take_error()),
+        };
+        assert_eq!(rendered, "5");
+        dec_ref(repr);
+        assert_eq!(types::object_is_true(handle), 1);
+        assert_eq!(hydro_tagged(handle), Some(tagged));
+        assert!(hash_object(handle, 0).is_ok());
+
+        match object_to_value(handle).expect("Hydro handle converts") {
+            ShimValue::Hydro(value) => assert_eq!(value.value(), tagged),
+            other => panic!("expected a Hydro contract value, got {other:?}"),
+        }
+
+        // Passing the tagged value back through Hydro creates a handle that
+        // names the same value.
+        let again = value_object(hydro_shim(tagged));
+        assert_eq!(hydro_tagged(again), Some(tagged));
+        dec_ref(again);
+        dec_ref(handle);
+
+        // A Hydro class handle reports type metadata through the C API.
+        let class = crate::value::class_new("Widget".to_string(), crate::value::NONE, Vec::new());
+        let class_handle = value_object(hydro_shim(class));
+        assert_eq!(
+            hydro_type_name_text(class_handle).as_deref(),
+            Some("Widget")
+        );
+        assert!(hydro_type_flags(class_handle).is_some());
+        assert_eq!(types::PyType_IsSubtype(class_handle, class_handle), 1);
+
+        // Unsupported objects (an iterator here) are rejected, not faked.
+        let iterator = crate::value::iter_new(crate::value::list_new(vec![tagged]));
+        let outcome = crate::modules::extension::value_to_shim(iterator);
+        assert!(
+            outcome.is_err(),
+            "an iterator must not cross as a fake object"
+        );
+        dec_ref(class_handle);
     }
 }

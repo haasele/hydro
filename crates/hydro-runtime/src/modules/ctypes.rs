@@ -11,6 +11,10 @@
 //! - `create_string_buffer`, `create_unicode_buffer`, `string_at`,
 //!   `wstring_at`, `memmove`, `memset`, `resize`;
 //! - `CDLL`/`LibraryLoader` with real `dlopen`/`dlsym`;
+//! - `get_errno`/`set_errno` over the calling thread's `errno`, and the
+//!   `CField` field descriptor;
+//! - `ctypes.wintypes`: the portable alias subset of the Windows type module
+//!   (the Windows-only calls themselves raise `OSError` off Windows);
 //! - `CFUNCTYPE`-style callbacks for up to eight integer/pointer arguments.
 //!
 //! # Memory model
@@ -2808,16 +2812,166 @@ thread_local! {
     static LAST_ERROR: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// ctypes' private per-thread `errno` copy.
+    ///
+    /// CPython keeps this separate from the C library's `errno`:
+    /// `get_errno`/`set_errno` read and write the copy, and a foreign call
+    /// through a `use_errno=True` function refreshes it from the system value
+    /// after the call. Calls without the flag leave it untouched.
+    static CTYPES_ERRNO: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// The calling thread's `errno` slot, when the C library exposes one.
 #[cfg(target_os = "linux")]
-fn current_errno() -> i64 {
+fn errno_slot() -> Option<*mut libc::c_int> {
     // SAFETY: `__errno_location` returns a valid pointer to the thread's
     // errno slot on glibc and musl.
-    i64::from(unsafe { *libc::__errno_location() })
+    Some(unsafe { libc::__errno_location() })
 }
 
 #[cfg(not(target_os = "linux"))]
+fn errno_slot() -> Option<*mut libc::c_int> {
+    None
+}
+
+/// The current value of the system `errno` (not the ctypes copy).
 fn current_errno() -> i64 {
-    0
+    match errno_slot() {
+        // SAFETY: `slot` points at this thread's errno cell.
+        Some(slot) => i64::from(unsafe { *slot }),
+        None => 0,
+    }
+}
+
+/// Records the system `errno` in ctypes' private copy.
+fn save_errno() {
+    CTYPES_ERRNO.with(|cell| cell.set(current_errno()));
+}
+
+/// `_ctypes.get_errno()`: the thread-local copy of `errno`.
+fn get_errno(_args: &[i64]) -> i64 {
+    encode(CTYPES_ERRNO.with(std::cell::Cell::get))
+}
+
+/// `_ctypes.set_errno(value)`: assigns the thread-local copy of `errno`.
+fn set_errno(args: &[i64]) -> i64 {
+    let value = match int_arg(args[0], "errno value") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if i32::try_from(value).is_err() {
+        return raise(OVERFLOW_ERROR, "errno value is out of range");
+    }
+    CTYPES_ERRNO.with(|cell| cell.set(value));
+    NONE
+}
+
+/// `_ctypes.dlopen(name, mode=DEFAULT_MODE)`: opens a shared object and
+/// returns its handle as an integer.
+///
+/// The handle stays open for the process lifetime, exactly like a `CDLL`
+/// handle: `FuncPtr` objects built from it keep working.
+fn dlopen(args: &[i64]) -> i64 {
+    let mode = args
+        .get(1)
+        .copied()
+        .and_then(value::as_integer)
+        .unwrap_or(DEFAULT_MODE);
+    match load_library_object(args[0], mode, false) {
+        Ok(library) => encode_len(library.handle),
+        Err(error) => error,
+    }
+}
+
+/// Raises the explicit `OSError` reported by Windows-only `ctypes` entries on
+/// every other platform.
+fn windows_only_error(name: &str) -> i64 {
+    raise(
+        OS_ERROR,
+        &format!("ctypes.{name} is only available on Windows"),
+    )
+}
+
+/// `ctypes.FreeLibrary(handle)`: releases a handle returned by `LoadLibrary`.
+///
+/// The Hydro runtime does not fake Windows handles: on non-Windows platforms
+/// the call raises `OSError` instead of pretending to free one.
+fn free_library(args: &[i64]) -> i64 {
+    #[cfg(windows)]
+    {
+        let handle = match int_arg(args[0], "library handle") {
+            Ok(handle) => handle,
+            Err(error) => return error,
+        };
+        // SAFETY: the caller passes a handle obtained from `LoadLibrary`;
+        // `FreeLibrary` ignores an invalid one.
+        unsafe { win::FreeLibrary(handle as *mut c_void) };
+        NONE
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        windows_only_error("FreeLibrary")
+    }
+}
+
+/// `ctypes.GetLastError()`: the Win32 last-error value.
+fn get_last_error_win32(_args: &[i64]) -> i64 {
+    #[cfg(windows)]
+    {
+        // SAFETY: `GetLastError` has no preconditions.
+        encode(i64::from(unsafe { win::GetLastError() }))
+    }
+    #[cfg(not(windows))]
+    {
+        windows_only_error("GetLastError")
+    }
+}
+
+/// `ctypes.WinError(code=None, descr=None)`: builds an `OSError` from a Win32
+/// error code.
+///
+/// On non-Windows platforms there is no Win32 error space, so the call raises
+/// `OSError` instead of producing a fabricated message.
+fn win_error(args: &[i64]) -> i64 {
+    #[cfg(windows)]
+    {
+        let code = match args.first().copied().filter(|raw| *raw != NONE) {
+            Some(raw) => match int_arg(raw, "error code") {
+                Ok(code) => code,
+                Err(error) => return error,
+            },
+            // SAFETY: `GetLastError` has no preconditions.
+            None => i64::from(unsafe { win::GetLastError() }),
+        };
+        let description = match args.get(1).copied().filter(|raw| *raw != NONE) {
+            Some(raw) => match str_arg(raw, "error description") {
+                Ok(description) => description,
+                Err(error) => return error,
+            },
+            None => std::io::Error::from_raw_os_error(code as i32).to_string(),
+        };
+        let message = format!("[WinError {code}] {description}");
+        exc::exception_value(OS_ERROR, &message, vec![message.clone()])
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        windows_only_error("WinError")
+    }
+}
+
+/// Win32 entry points used by the Windows-only `ctypes` surface.
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub(super) fn FreeLibrary(module: *mut c_void) -> i32;
+        pub(super) fn GetLastError() -> u32;
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -2887,10 +3041,10 @@ fn invoke_pointer(instance: i64, restype: TypeId, argtypes: &[TypeId], args: &[i
     if addr == 0 {
         return raise(VALUE_ERROR, "NULL function pointer");
     }
-    let errno_before = instance_use_errno(instance);
+    let use_errno = instance_use_errno(instance);
     let raw = unsafe { call_raw(addr as usize, &words) };
-    if errno_before {
-        LAST_ERROR.with(|cell| cell.set(current_errno()));
+    if use_errno {
+        save_errno();
     }
     match restype_word(restype, raw) {
         Ok(value_arg) => value_arg,
@@ -3748,6 +3902,16 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "CFUNCTYPE" | "WINFUNCTYPE" | "PYFUNCTYPE" => make_cfunctype(args),
         "get_last_error" => get_last_error(args),
         "set_last_error" => set_last_error(args),
+        "get_errno" => get_errno(args),
+        "set_errno" => set_errno(args),
+        "dlopen" => dlopen(args),
+        "FreeLibrary" => free_library(args),
+        "GetLastError" => get_last_error_win32(args),
+        "WinError" => win_error(args),
+        CFIELD_INIT => cfield_init(args),
+        CFIELD_GET => cfield_get(args),
+        CFIELD_SET => cfield_set(args),
+        CFIELD_REPR => cfield_repr(args),
         INIT => cdata_init(args),
         GET_VALUE => cdata_get_value(args),
         SET_VALUE => cdata_set_value(args),
@@ -3787,6 +3951,8 @@ pub(crate) fn constant(name: &str) -> i64 {
         "CDLL" | "PyDLL" => cdll_class(),
         "LibraryLoader" => library_loader_class(),
         "ArgumentError" => argument_error_class(),
+        "CField" => cfield_class(),
+        "wintypes" => wintypes_module(),
 
         "c_bool" => simple_class(Simple::Bool),
         "c_byte" | "c_int8" => simple_class(Simple::I8),
@@ -3834,4 +4000,831 @@ fn argument_error_class() -> i64 {
     let class = value::class_new("ArgumentError".to_string(), base, Vec::new());
     globals::registry_set("ctypes.class.ArgumentError", class);
     class
+}
+
+// -------------------------------------------------------------------------
+// CField
+// -------------------------------------------------------------------------
+
+const CFIELD_INIT: &str = "_cfield_init";
+const CFIELD_GET: &str = "_cfield_get";
+const CFIELD_SET: &str = "_cfield_set";
+const CFIELD_REPR: &str = "_cfield_repr";
+
+/// `_ctypes.CField`: the descriptor type that describes one structure field.
+///
+/// CPython 3.14 constructs it internally as
+/// `CField(*, name, type, byte_size, byte_offset, bit_size=None,
+/// bit_offset=None, index=0)`; the older `CField(type, name)` form is
+/// accepted as well. The object exposes the field metadata (`name`, `type`,
+/// `byte_size`, `byte_offset`, `bit_size`, `bit_offset`, `index` and their
+/// `size`/`offset` aliases) and implements the descriptor protocol over a
+/// ctypes instance.
+fn cfield_class() -> i64 {
+    if let Some(class) = cached("ctypes.class.CField") {
+        return class;
+    }
+    let methods = vec![
+        (
+            "__init__".to_string(),
+            native(CFIELD_INIT, usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__get__".to_string(),
+            native(CFIELD_GET, usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__set__".to_string(),
+            native(CFIELD_SET, usize::MAX),
+            MethodKind::Normal,
+        ),
+        (
+            "__repr__".to_string(),
+            native(CFIELD_REPR, 1),
+            MethodKind::Normal,
+        ),
+    ];
+    let class = value::class_new_full("CField".to_string(), NONE, methods, Vec::new());
+    globals::registry_set("ctypes.class.CField", class);
+    class
+}
+
+fn cfield_init(args: &[i64]) -> i64 {
+    let instance = args[0];
+    let rest = &args[1..];
+    if rest.len() < 2 {
+        return type_error("CField() requires a field name and a type");
+    }
+    // `CField(type, name)` (the pre-3.14 form) puts the type first; the
+    // documented internal form starts with the name.
+    let (name_raw, type_raw, extras) = if value::as_class(rest[0]).is_some() {
+        (rest[1], rest[0], &rest[2..])
+    } else {
+        (rest[0], rest[1], &rest[2..])
+    };
+    match fill_cfield(instance, name_raw, type_raw, extras) {
+        Ok(()) => NONE,
+        Err(error) => error,
+    }
+}
+
+/// Validates and stores the metadata of one `CField`.
+fn fill_cfield(instance: i64, name_raw: i64, type_raw: i64, extras: &[i64]) -> Result<(), i64> {
+    let name = str_arg(name_raw, "field name")?;
+    let tid = type_id_of(type_raw)?;
+    let type_size = {
+        let state = state();
+        state.size_of(tid)
+    };
+    let byte_size = match extras.first().copied().filter(|raw| *raw != NONE) {
+        Some(raw) => {
+            let declared = int_arg(raw, "byte_size")?;
+            if declared != type_size as i64 {
+                return Err(raise(
+                    VALUE_ERROR,
+                    &format!(
+                        "CField byte_size ({declared}) does not match type size ({type_size})"
+                    ),
+                ));
+            }
+            declared
+        }
+        None => type_size as i64,
+    };
+    let byte_offset = match extras.get(1).copied().filter(|raw| *raw != NONE) {
+        Some(raw) => int_arg(raw, "byte_offset")?,
+        None => 0,
+    };
+    let bit_size = match extras.get(2).copied().filter(|raw| *raw != NONE) {
+        Some(raw) => Some(int_arg(raw, "bit_size")?),
+        None => None,
+    };
+    let bit_offset = match extras.get(3).copied().filter(|raw| *raw != NONE) {
+        Some(raw) => int_arg(raw, "bit_offset")?,
+        None => 0,
+    };
+    let index = match extras.get(4).copied().filter(|raw| *raw != NONE) {
+        Some(raw) => int_arg(raw, "index")?,
+        None => 0,
+    };
+    let total_bits = byte_size.saturating_mul(8);
+    if let Some(width) = bit_size {
+        if width <= 0 || bit_offset < 0 || bit_offset.saturating_add(width) > total_bits {
+            return Err(raise(
+                VALUE_ERROR,
+                &format!(
+                    "bit field '{name}' overflows its type ({bit_offset} + {width} > {total_bits})"
+                ),
+            ));
+        }
+    }
+    set_attr(instance, "name", value::str_alloc(name));
+    set_attr(instance, "type", type_raw);
+    set_attr(instance, "_hydro_field_tid", encode(tid as i64));
+    set_attr(instance, "byte_size", encode(byte_size));
+    set_attr(instance, "byte_offset", encode(byte_offset));
+    set_attr(instance, "size", encode(byte_size));
+    set_attr(instance, "offset", encode(byte_offset));
+    set_attr(instance, "bit_size", encode(bit_size.unwrap_or(total_bits)));
+    set_attr(instance, "bit_offset", encode(bit_offset));
+    set_attr(instance, "index", encode(index));
+    set_attr(
+        instance,
+        "is_bitfield",
+        value::bool_value(bit_size.is_some()),
+    );
+    Ok(())
+}
+
+fn cfield_name(field: i64) -> Result<String, i64> {
+    value::instance_attr(field, "name")
+        .and_then(value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| type_error("CField has no field name"))
+}
+
+/// Checks that `instance` is a ctypes value (a structure instance in the
+/// normal case) and returns its class.
+fn cfield_instance(instance: i64) -> Result<i64, i64> {
+    let Some(class) = value::instance_class_value(instance) else {
+        return Err(type_error("descriptor 'CField' requires a ctypes instance"));
+    };
+    if class_kind(class).is_none() {
+        return Err(type_error("descriptor 'CField' requires a ctypes instance"));
+    }
+    Ok(class)
+}
+
+fn cfield_get(args: &[i64]) -> i64 {
+    let field = args[0];
+    let instance = args.get(1).copied().unwrap_or(NONE);
+    // Class access (`MyStruct.field`) returns the descriptor itself.
+    if instance == NONE {
+        return field;
+    }
+    if let Err(error) = cfield_instance(instance) {
+        return error;
+    }
+    let name = match cfield_name(field) {
+        Ok(name) => name,
+        Err(error) => return error,
+    };
+    match value::instance_attr(instance, &name) {
+        Some(view) => view,
+        None => raise(
+            ATTRIBUTE_ERROR,
+            &format!(
+                "'{name}' is not a field of '{}'",
+                value::type_name(instance)
+            ),
+        ),
+    }
+}
+
+fn cfield_set(args: &[i64]) -> i64 {
+    let field = args[0];
+    let instance = args[1];
+    let new_value = args.get(2).copied().unwrap_or(NONE);
+    if let Err(error) = cfield_instance(instance) {
+        return error;
+    }
+    let name = match cfield_name(field) {
+        Ok(name) => name,
+        Err(error) => return error,
+    };
+    if value::instance_attr(field, "is_bitfield").is_some_and(value::truthy) {
+        return raise(
+            NOT_IMPLEMENTED_ERROR,
+            "ctypes bitfield values are not supported",
+        );
+    }
+    // A materialised field view owns the conversion rules (arrays and
+    // character buffers included); write through it when present.
+    if let Some(view) = value::instance_attr(instance, &name) {
+        if value::as_instance(view).is_some() {
+            return cdata_set_value(&[view, new_value]);
+        }
+    }
+    let tid = match attr_int(field, "_hydro_field_tid") {
+        Some(tid) if tid > 0 => tid as TypeId,
+        _ => return type_error("CField has no type information"),
+    };
+    let Some((slot, base_offset)) = instance_slot(instance) else {
+        return type_error("ctypes object has no storage");
+    };
+    let byte_offset = attr_int(field, "byte_offset").unwrap_or(0).max(0) as usize;
+    match write_value(
+        slot,
+        base_offset.saturating_add(byte_offset),
+        tid,
+        new_value,
+    ) {
+        Ok(()) => NONE,
+        Err(error) => error,
+    }
+}
+
+fn cfield_repr(args: &[i64]) -> i64 {
+    let field = args[0];
+    let name = cfield_name(field).unwrap_or_else(|_| "?".to_string());
+    let type_name = value::instance_attr(field, "type")
+        .and_then(value::class_display_name)
+        .unwrap_or("ctypes type");
+    let byte_offset = attr_int(field, "byte_offset").unwrap_or(0);
+    let byte_size = attr_int(field, "byte_size").unwrap_or(0);
+    let rendered = if value::instance_attr(field, "is_bitfield").is_some_and(value::truthy) {
+        format!(
+            "CField(name={name:?}, type={type_name}, byte_offset={byte_offset}, byte_size={byte_size}, bit_size={}, bit_offset={})",
+            attr_int(field, "bit_size").unwrap_or(0),
+            attr_int(field, "bit_offset").unwrap_or(0),
+        )
+    } else {
+        format!(
+            "CField(name={name:?}, type={type_name}, byte_offset={byte_offset}, byte_size={byte_size})"
+        )
+    };
+    value::str_alloc(rendered)
+}
+
+// -------------------------------------------------------------------------
+// ctypes.wintypes
+// -------------------------------------------------------------------------
+
+/// `ctypes.wintypes`: the portable subset of CPython's Windows type aliases.
+///
+/// The module mirrors `ctypes/wintypes.py`: the scalar, handle, pointer and
+/// structure aliases are the same `ctypes` classes CPython builds on every
+/// platform. No handle value is created or faked; only type aliases are
+/// exposed. `RGB` is the only member that needs a callable and is provided by
+/// the pure-Python module when it is imported from the standard library.
+fn wintypes_module() -> i64 {
+    if let Some(module) = cached("ctypes.module.wintypes") {
+        return module;
+    }
+    let module = value::module_value("ctypes.wintypes".to_string());
+    globals::registry_set("ctypes.module.wintypes", module);
+    for (name, item) in wintypes_entries() {
+        globals::set_attribute_override("ctypes.wintypes", name, item);
+    }
+    module
+}
+
+fn wintypes_struct(name: &str, fields: &[(&str, i64)]) -> i64 {
+    let declared: Vec<i64> = fields
+        .iter()
+        .map(|(field, ty)| value::tuple_new(vec![value::str_alloc((*field).to_string()), *ty]))
+        .collect();
+    value::class_new_full(
+        name.to_string(),
+        structure_class(),
+        Vec::new(),
+        vec![
+            (
+                "_hydro_kind".to_string(),
+                value::str_alloc("struct".to_string()),
+            ),
+            ("_fields_".to_string(), value::list_new(declared)),
+        ],
+    )
+}
+
+fn wintypes_array(name: &str, elem: i64, len: usize) -> i64 {
+    value::class_new_full(
+        name.to_string(),
+        array_class(),
+        Vec::new(),
+        vec![
+            (
+                "_hydro_kind".to_string(),
+                value::str_alloc("array".to_string()),
+            ),
+            ("_type_".to_string(), elem),
+            ("_length_".to_string(), encode_len(len)),
+        ],
+    )
+}
+
+/// `ctypes.POINTER(ty)` for a class with a known layout; `None` (with the
+/// pending exception dropped) when the pointee cannot be laid out.
+fn wintypes_pointer(ty: i64) -> Option<i64> {
+    let tid = match type_id_of(ty) {
+        Ok(tid) => tid,
+        Err(_) => {
+            let _ = exc::clear();
+            return None;
+        }
+    };
+    let pointer = {
+        let mut state = state();
+        state.pointer_to(tid)
+    };
+    Some(class_for_type(pointer))
+}
+
+fn wintypes_entries() -> Vec<(&'static str, i64)> {
+    let byte = simple_class(Simple::U8);
+    let word = simple_class(Simple::U16);
+    let dword = simple_class(Simple::U64);
+    let char_type = simple_class(Simple::CChar);
+    let wchar_type = simple_class(Simple::WChar);
+    let uint = simple_class(Simple::U32);
+    let int = simple_class(Simple::I32);
+    let double = simple_class(Simple::F64);
+    let float = simple_class(Simple::F32);
+    let long = simple_class(Simple::I64);
+    let ulong = simple_class(Simple::U64);
+    let ushort = simple_class(Simple::U16);
+    let short = simple_class(Simple::I16);
+    let longlong = simple_class(Simple::I64);
+    let ulonglong = simple_class(Simple::U64);
+    let char_p = simple_class(Simple::CharP);
+    let wchar_p = simple_class(Simple::WCharP);
+    let void_p = simple_class(Simple::VoidP);
+
+    let (wparam, lparam) = {
+        let state = state();
+        let long_size = state.size_of(state.simple_id(Simple::I64));
+        let pointer_size = state.size_of(state.simple_id(Simple::VoidP));
+        if long_size == pointer_size {
+            (ulong, long)
+        } else {
+            (ulonglong, longlong)
+        }
+    };
+
+    let mut entries: Vec<(&'static str, i64)> = vec![
+        ("BYTE", byte),
+        ("WORD", word),
+        ("DWORD", dword),
+        ("CHAR", char_type),
+        ("WCHAR", wchar_type),
+        ("UINT", uint),
+        ("INT", int),
+        ("DOUBLE", double),
+        ("FLOAT", float),
+        ("BOOLEAN", byte),
+        ("BOOL", long),
+        ("ULONG", ulong),
+        ("LONG", long),
+        ("USHORT", ushort),
+        ("SHORT", short),
+        ("LARGE_INTEGER", longlong),
+        ("ULARGE_INTEGER", ulonglong),
+        ("LPCOLESTR", wchar_p),
+        ("LPOLESTR", wchar_p),
+        ("OLESTR", wchar_p),
+        ("LPCWSTR", wchar_p),
+        ("LPWSTR", wchar_p),
+        ("LPCSTR", char_p),
+        ("LPSTR", char_p),
+        ("LPCVOID", void_p),
+        ("LPVOID", void_p),
+        ("WPARAM", wparam),
+        ("LPARAM", lparam),
+        ("ATOM", word),
+        ("LANGID", word),
+        ("COLORREF", dword),
+        ("LGRPID", dword),
+        ("LCTYPE", dword),
+        ("LCID", dword),
+        ("HANDLE", void_p),
+        ("HFILE", int),
+        ("HRESULT", long),
+    ];
+    // Handle aliases: every one is `void *`.
+    for name in [
+        "HACCEL",
+        "HBITMAP",
+        "HBRUSH",
+        "HCOLORSPACE",
+        "HCONV",
+        "HCONVLIST",
+        "HCURSOR",
+        "HDC",
+        "HDDEDATA",
+        "HDESK",
+        "HDROP",
+        "HDWP",
+        "HENHMETAFILE",
+        "HFONT",
+        "HGDIOBJ",
+        "HGLOBAL",
+        "HHOOK",
+        "HICON",
+        "HINSTANCE",
+        "HKEY",
+        "HKL",
+        "HLOCAL",
+        "HMENU",
+        "HMETAFILE",
+        "HMODULE",
+        "HMONITOR",
+        "HPALETTE",
+        "HPEN",
+        "HRGN",
+        "HRSRC",
+        "HSTR",
+        "HSZ",
+        "HTASK",
+        "HWINSTA",
+        "HWND",
+        "SC_HANDLE",
+        "SERVICE_STATUS_HANDLE",
+    ] {
+        entries.push((name, void_p));
+    }
+
+    let rect = wintypes_struct(
+        "RECT",
+        &[
+            ("left", long),
+            ("top", long),
+            ("right", long),
+            ("bottom", long),
+        ],
+    );
+    let small_rect = wintypes_struct(
+        "_SMALL_RECT",
+        &[
+            ("Left", short),
+            ("Top", short),
+            ("Right", short),
+            ("Bottom", short),
+        ],
+    );
+    let coord = wintypes_struct("_COORD", &[("X", short), ("Y", short)]);
+    let point = wintypes_struct("POINT", &[("x", long), ("y", long)]);
+    let size = wintypes_struct("SIZE", &[("cx", long), ("cy", long)]);
+    let filetime = wintypes_struct(
+        "FILETIME",
+        &[("dwLowDateTime", dword), ("dwHighDateTime", dword)],
+    );
+    let msg = wintypes_struct(
+        "MSG",
+        &[
+            ("hWnd", void_p),
+            ("message", uint),
+            ("wParam", wparam),
+            ("lParam", lparam),
+            ("time", dword),
+            ("pt", point),
+        ],
+    );
+    let find_data_a = wintypes_struct(
+        "WIN32_FIND_DATAA",
+        &[
+            ("dwFileAttributes", dword),
+            ("ftCreationTime", filetime),
+            ("ftLastAccessTime", filetime),
+            ("ftLastWriteTime", filetime),
+            ("nFileSizeHigh", dword),
+            ("nFileSizeLow", dword),
+            ("dwReserved0", dword),
+            ("dwReserved1", dword),
+            (
+                "cFileName",
+                wintypes_array("c_char_Array_260", char_type, 260),
+            ),
+            (
+                "cAlternateFileName",
+                wintypes_array("c_char_Array_14", char_type, 14),
+            ),
+        ],
+    );
+    let find_data_w = wintypes_struct(
+        "WIN32_FIND_DATAW",
+        &[
+            ("dwFileAttributes", dword),
+            ("ftCreationTime", filetime),
+            ("ftLastAccessTime", filetime),
+            ("ftLastWriteTime", filetime),
+            ("nFileSizeHigh", dword),
+            ("nFileSizeLow", dword),
+            ("dwReserved0", dword),
+            ("dwReserved1", dword),
+            (
+                "cFileName",
+                wintypes_array("c_wchar_Array_260", wchar_type, 260),
+            ),
+            (
+                "cAlternateFileName",
+                wintypes_array("c_wchar_Array_14", wchar_type, 14),
+            ),
+        ],
+    );
+    entries.extend([
+        ("RECT", rect),
+        ("tagRECT", rect),
+        ("_RECTL", rect),
+        ("RECTL", rect),
+        ("_SMALL_RECT", small_rect),
+        ("SMALL_RECT", small_rect),
+        ("_COORD", coord),
+        ("POINT", point),
+        ("tagPOINT", point),
+        ("_POINTL", point),
+        ("POINTL", point),
+        ("SIZE", size),
+        ("tagSIZE", size),
+        ("SIZEL", size),
+        ("FILETIME", filetime),
+        ("_FILETIME", filetime),
+        ("MSG", msg),
+        ("tagMSG", msg),
+        ("MAX_PATH", encode(260)),
+        ("WIN32_FIND_DATAA", find_data_a),
+        ("WIN32_FIND_DATAW", find_data_w),
+    ]);
+
+    let pointer_groups: &[(&[&str], i64)] = &[
+        (&["LPBOOL", "PBOOL"], long),
+        (&["PBOOLEAN"], byte),
+        (&["LPBYTE", "PBYTE"], byte),
+        (&["PCHAR"], char_type),
+        (&["LPCOLORREF"], dword),
+        (&["LPDWORD", "PDWORD"], dword),
+        (&["PFLOAT"], float),
+        (&["LPHANDLE", "PHANDLE"], void_p),
+        (&["PHKEY"], void_p),
+        (&["LPHKL"], void_p),
+        (&["LPINT", "PINT"], int),
+        (&["PLARGE_INTEGER"], longlong),
+        (&["PLCID"], dword),
+        (&["LPLONG", "PLONG"], long),
+        (&["PSHORT"], short),
+        (&["LPUINT", "PUINT"], uint),
+        (&["PULARGE_INTEGER"], ulonglong),
+        (&["PULONG"], ulong),
+        (&["PUSHORT"], ushort),
+        (&["PWCHAR"], wchar_type),
+        (&["LPWORD", "PWORD"], word),
+        (&["LPFILETIME", "PFILETIME"], filetime),
+        (&["LPMSG", "PMSG"], msg),
+        (&["LPPOINT", "PPOINT"], point),
+        (&["PPOINTL"], point),
+        (&["LPRECT", "PRECT"], rect),
+        (&["LPRECTL", "PRECTL"], rect),
+        (&["LPSIZE", "PSIZE"], size),
+        (&["LPSIZEL", "PSIZEL"], size),
+        (&["PSMALL_RECT"], small_rect),
+        (&["LPWIN32_FIND_DATAA", "PWIN32_FIND_DATAA"], find_data_a),
+        (&["LPWIN32_FIND_DATAW", "PWIN32_FIND_DATAW"], find_data_w),
+        (&["LPSC_HANDLE"], void_p),
+    ];
+    for (names, ty) in pointer_groups {
+        if let Some(pointer) = wintypes_pointer(*ty) {
+            for &name in *names {
+                entries.push((name, pointer));
+            }
+        }
+    }
+    entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn int(n: i64) -> i64 {
+        value::encode_int(n).expect("representable")
+    }
+
+    fn string(text: &str) -> i64 {
+        value::str_alloc(text.to_string())
+    }
+
+    fn new_cfield(type_class: i64, name: &str) -> i64 {
+        let field = value::instance_new(cfield_class());
+        let result = call(CFIELD_INIT, &[field, type_class, string(name)]);
+        assert_eq!(result, NONE, "CField construction failed");
+        assert!(!exc::pending(), "CField construction raised");
+        field
+    }
+
+    #[test]
+    fn errno_round_trips_through_the_thread_slot() {
+        exc::init();
+        let previous = call("get_errno", &[]);
+        assert_eq!(call("set_errno", &[int(32)]), NONE);
+        assert_eq!(call("get_errno", &[]), int(32));
+        // The copy is ctypes-private: it does not alias the system `errno`.
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: writing this thread's errno slot.
+            unsafe { *libc::__errno_location() = 7 };
+            assert_eq!(call("get_errno", &[]), int(32));
+            // A `use_errno=True` call refreshes the copy from the system
+            // value (`save_errno` is the post-call hook).
+            // SAFETY: writing this thread's errno slot.
+            unsafe { *libc::__errno_location() = 42 };
+            save_errno();
+            assert_eq!(call("get_errno", &[]), int(42));
+        }
+        assert_eq!(call("set_errno", &[previous]), NONE);
+        assert_eq!(call("get_errno", &[]), previous);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn set_errno_rejects_out_of_range_values() {
+        exc::init();
+        let huge = value::bigint_new(num_bigint::BigInt::from(i64::MAX));
+        assert_eq!(call("set_errno", &[huge]), NONE);
+        assert!(exc::pending());
+        assert_eq!(exc::pending_tag(), i64::from(OVERFLOW_ERROR));
+        exc::clear();
+    }
+
+    #[test]
+    fn cfield_records_the_declared_layout() {
+        exc::init();
+        let c_int = constant("c_int");
+        let field = new_cfield(c_int, "value");
+        assert_eq!(
+            value::instance_attr(field, "name").and_then(value::as_str),
+            Some("value")
+        );
+        assert_eq!(value::instance_attr(field, "type"), Some(c_int));
+        assert_eq!(attr_int(field, "byte_size"), Some(4));
+        assert_eq!(attr_int(field, "byte_offset"), Some(0));
+        assert_eq!(attr_int(field, "size"), Some(4));
+        assert_eq!(attr_int(field, "offset"), Some(0));
+        assert_eq!(attr_int(field, "bit_size"), Some(32));
+        assert_eq!(attr_int(field, "bit_offset"), Some(0));
+        assert_eq!(attr_int(field, "index"), Some(0));
+        assert!(!value::instance_attr(field, "is_bitfield").is_some_and(value::truthy));
+        // The class is cached, so `ctypes.CField` is a stable identity.
+        assert_eq!(constant("CField"), cfield_class());
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn cfield_accepts_the_legacy_type_first_form() {
+        exc::init();
+        let c_byte = constant("c_byte");
+        let field = value::instance_new(cfield_class());
+        assert_eq!(call(CFIELD_INIT, &[field, c_byte, string("x")]), NONE);
+        assert_eq!(attr_int(field, "byte_size"), Some(1));
+        assert_eq!(cfield_name(field).as_deref(), Ok("x"));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn cfield_rejects_a_mismatched_byte_size() {
+        exc::init();
+        let field = value::instance_new(cfield_class());
+        let c_byte = constant("c_byte");
+        assert_eq!(
+            call(
+                CFIELD_INIT,
+                &[
+                    field,
+                    string("a"),
+                    c_byte,
+                    int(2),
+                    int(2),
+                    NONE,
+                    NONE,
+                    int(1)
+                ]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        let message = exc::render_exception(exc::pending_value()).expect("message");
+        assert!(message.contains("does not match type size"), "{message}");
+        exc::clear();
+    }
+
+    #[test]
+    fn cfield_rejects_an_overflowing_bitfield() {
+        exc::init();
+        let field = value::instance_new(cfield_class());
+        let c_byte = constant("c_byte");
+        assert_eq!(
+            call(
+                CFIELD_INIT,
+                &[field, string("x"), c_byte, int(1), int(0), int(7), int(2)]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        let message = exc::render_exception(exc::pending_value()).expect("message");
+        assert!(message.contains("overflows its type"), "{message}");
+        exc::clear();
+    }
+
+    #[test]
+    fn cfield_descriptor_reads_and_writes_field_views() {
+        exc::init();
+        let c_int = constant("c_int");
+        let field = new_cfield(c_int, "value");
+        let structure = value::instance_new(structure_class());
+        let view = call("_cdata_init", &[value::instance_new(c_int)]);
+        assert_eq!(call("_cdata_set_value", &[view, int(1)]), NONE);
+        value::instance_setattr(structure, "value".to_string(), view);
+
+        // Class access returns the descriptor itself.
+        assert_eq!(call(CFIELD_GET, &[field, NONE]), field);
+        assert_eq!(call(CFIELD_GET, &[field, NONE, NONE]), field);
+        // Instance access returns the materialised field view.
+        assert_eq!(call(CFIELD_GET, &[field, structure]), view);
+        // Assignment goes through the view's conversion rules.
+        assert_eq!(call(CFIELD_SET, &[field, structure, int(7)]), NONE);
+        assert_eq!(call("_cdata_get_value", &[view]), int(7));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn cfield_descriptor_rejects_non_ctypes_instances() {
+        exc::init();
+        let field = new_cfield(constant("c_int"), "value");
+        assert_eq!(call(CFIELD_GET, &[field, string("wrong type self")]), NONE);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::clear();
+        assert_eq!(
+            call(CFIELD_SET, &[field, string("wrong type self"), int(1)]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::clear();
+    }
+
+    #[test]
+    fn cfield_repr_names_the_field_and_its_type() {
+        exc::init();
+        let field = new_cfield(constant("c_int"), "value");
+        let rendered = value::as_str(call(CFIELD_REPR, &[field])).expect("repr");
+        assert!(rendered.contains("name=\"value\""), "{rendered}");
+        assert!(rendered.contains("c_int"), "{rendered}");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn dlopen_returns_a_real_handle() {
+        exc::init();
+        // `None` opens the main program, so the handle is a real `dlopen`
+        // result rather than a fabricated one.
+        let handle = call("dlopen", &[NONE]);
+        assert!(handle > 0, "dlopen(None) returned {handle}");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn dlopen_reports_missing_libraries() {
+        exc::init();
+        assert_eq!(
+            call("dlopen", &[string("/nonexistent/hydro-missing.so")]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), i64::from(OS_ERROR));
+        exc::clear();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_only_entries_raise_platform_errors() {
+        exc::init();
+        for (name, args) in [
+            ("FreeLibrary", vec![int(1)]),
+            ("GetLastError", Vec::new()),
+            ("WinError", Vec::new()),
+        ] {
+            assert_eq!(call(name, &args), NONE, "{name} must raise on non-Windows");
+            assert_eq!(exc::pending_tag(), i64::from(OS_ERROR), "{name}");
+            let message = exc::render_exception(exc::pending_value()).expect("message");
+            assert!(message.contains("only available on Windows"), "{message}");
+            exc::clear();
+        }
+    }
+
+    #[test]
+    fn wintypes_exposes_the_portable_aliases() {
+        exc::init();
+        let module = constant("wintypes");
+        let state = value::as_module(module).expect("module value");
+        assert_eq!(state.name(), "ctypes.wintypes");
+        let dword = crate::modules::module_attr(state, "DWORD");
+        assert_eq!(dword, simple_class(Simple::U64));
+        let handle = crate::modules::module_attr(state, "HANDLE");
+        assert_eq!(handle, simple_class(Simple::VoidP));
+        assert_eq!(crate::modules::module_attr(state, "MAX_PATH"), int(260));
+        // Pointer aliases are real `POINTER` classes.
+        let lpdword = crate::modules::module_attr(state, "LPDWORD");
+        assert_eq!(class_kind(lpdword), Some("pointer"));
+        // The structure aliases carry their declared fields.
+        let rect = crate::modules::module_attr(state, "RECT");
+        assert_eq!(class_kind(rect), Some("struct"));
+        let long_size =
+            value::as_integer(call("sizeof", &[simple_class(Simple::I64)])).expect("c_long size");
+        assert_eq!(
+            value::as_integer(call("sizeof", &[rect])),
+            Some(long_size * 4)
+        );
+        // Repeated access returns the same module value.
+        assert_eq!(constant("wintypes"), module);
+        assert!(!exc::pending());
+    }
 }

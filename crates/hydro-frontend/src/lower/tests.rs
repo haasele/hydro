@@ -67,6 +67,85 @@ fn has_global_set(stmts: &[HStmt]) -> bool {
     })
 }
 
+/// The expression behind a value published into the global table.
+///
+/// An optional import stores the deferred import in a module local
+/// (`Assign { value: DeferredImport }`) and then publishes that local, so a
+/// `Local` store resolves to the expression assigned to it in the same block.
+/// Every other store publishes its value directly.
+fn published_value<'a>(stmts: &'a [HStmt], value: &'a HExpr) -> &'a HExpr {
+    let HExprKind::Local(local) = &value.kind else {
+        return value;
+    };
+    stmts
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Assign { target, value } if target == local => Some(value),
+            _ => None,
+        })
+        .unwrap_or(value)
+}
+
+/// Value stored into module global `name` by `stmts` or any nested block.
+///
+/// Import statements are what publish their bindings, so the value of a
+/// runtime import is the `GlobalSet` it emits; a store of a module local
+/// resolves through the assignment that produced the local.
+fn global_set_value<'a>(stmts: &'a [HStmt], name: &str) -> Option<&'a HExpr> {
+    for stmt in stmts {
+        match &stmt.kind {
+            HStmtKind::GlobalSet {
+                name: bound, value, ..
+            } if bound == name => return Some(published_value(stmts, value)),
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(value) =
+                    global_set_value(then_body, name).or_else(|| global_set_value(else_body, name))
+                {
+                    return Some(value);
+                }
+            }
+            HStmtKind::While {
+                body, else_body, ..
+            }
+            | HStmtKind::ForRange {
+                body, else_body, ..
+            }
+            | HStmtKind::ForEach {
+                body, else_body, ..
+            } => {
+                if let Some(value) =
+                    global_set_value(body, name).or_else(|| global_set_value(else_body, name))
+                {
+                    return Some(value);
+                }
+            }
+            HStmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                let handler_value = handlers
+                    .iter()
+                    .find_map(|handler| global_set_value(&handler.body, name));
+                if let Some(value) = global_set_value(body, name)
+                    .or(handler_value)
+                    .or_else(|| global_set_value(else_body, name))
+                    .or_else(|| global_set_value(finally_body, name))
+                {
+                    return Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[test]
 fn import_forms_resolve_to_module_nodes() {
     let source = "import math, sys as system\n\
@@ -327,7 +406,7 @@ fn imports_inside_functions_bind_deferred_names() {
     };
     assert!(matches!(
         &callee.kind,
-        HExprKind::DeferredImport { module, member }
+        HExprKind::DeferredImport { module, member, .. }
             if module == "helper" && member.as_deref() == Some("add")
     ));
 }
@@ -346,7 +425,7 @@ fn imports_inside_functions_bind_deferred_module_attributes() {
     };
     assert!(matches!(
         &callee.kind,
-        HExprKind::DeferredImport { module, member }
+        HExprKind::DeferredImport { module, member, .. }
             if module == "helper" && member.as_deref() == Some("add")
     ));
 }
@@ -425,6 +504,237 @@ fn module_level_try_import_binds_a_preloaded_submodule() {
     assert!(
         bound,
         "the try body must bind the submodule: {:?}",
+        hir.functions[0].body
+    );
+}
+
+#[test]
+fn optional_native_import_binds_a_missing_member_at_runtime() {
+    // `from _socket import NOPE` names no native member: outside a handler the
+    // compiler rejects it, but an `except ImportError` fallback makes the
+    // import a runtime one, so the handler binds the fallback and every later
+    // read sees it through the module local/global table.
+    let source =
+        "try:\n    from _socket import NOPE\nexcept ImportError:\n    NOPE = 42\n\nvalue = NOPE\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let imported = global_set_value(&hir.functions[0].body, "NOPE")
+        .unwrap_or_else(|| panic!("the try must import NOPE: {:?}", hir.functions[0].body));
+    assert!(
+        matches!(
+            &imported.kind,
+            HExprKind::DeferredImport { module, member, path }
+                if module == "_socket" && member.as_deref() == Some("NOPE") && path.is_none()
+        ),
+        "expected a runtime import, got {:?}",
+        imported.kind
+    );
+
+    // The handler stores the fallback after the failed import.
+    let fallback = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Try { handlers, .. } => handlers.first().and_then(|handler| {
+                handler.body.iter().find_map(|inner| match &inner.kind {
+                    HStmtKind::Assign { target, value } => Some((*target, value)),
+                    _ => None,
+                })
+            }),
+            _ => None,
+        })
+        .expect("the handler must bind the fallback");
+    assert!(matches!(&fallback.1.kind, HExprKind::Const(_)));
+
+    // The read after the `try` is the same binding the handler assigned, not a
+    // compile-time import.
+    assert_eq!(
+        match &assigned(&hir, "value").kind {
+            HExprKind::Local(local) => *local,
+            other => panic!("expected a local read, got {other:?}"),
+        },
+        fallback.0
+    );
+}
+
+#[test]
+fn optional_import_accepts_every_import_error_handler_spelling() {
+    for handler in [
+        "except ImportError:",
+        "except ModuleNotFoundError:",
+        "except Exception:",
+        "except BaseException:",
+        "except:",
+        "except (ValueError, ImportError):",
+        "except builtins.ImportError:",
+    ] {
+        let source =
+            format!("try:\n    import absent_platform_module\n{handler}\n    absent_platform_module = None\n");
+        let (hir, _, diags) = lower_source(&source, &parse(&source));
+        assert!(diags.is_empty(), "{handler}: {diags:?}");
+        let imported = global_set_value(&hir.functions[0].body, "absent_platform_module")
+            .unwrap_or_else(|| panic!("{handler}: the try must import the module"));
+        assert!(
+            matches!(
+                &imported.kind,
+                HExprKind::DeferredImport { module, member, .. }
+                    if module == "absent_platform_module" && member.is_none()
+            ),
+            "{handler}: expected a runtime import, got {:?}",
+            imported.kind
+        );
+    }
+}
+
+#[test]
+fn unrelated_handler_keeps_the_missing_member_error() {
+    // A handler that cannot catch `ImportError` does not make the import
+    // optional: the missing native member stays a compile-time diagnostic
+    // instead of silently failing at runtime.
+    for handler in ["except ValueError:", "except (TypeError, KeyError):"] {
+        let source = format!("try:\n    from _socket import NOPE\n{handler}\n    pass\n");
+        let (_, _, diags) = lower_source(&source, &parse(&source));
+        assert_eq!(diags.len(), 1, "{handler}: {diags:?}");
+        assert_eq!(diags[0].code, codes::ATTRIBUTE, "{handler}: {diags:?}");
+    }
+}
+
+#[test]
+fn optional_user_module_missing_member_is_a_runtime_import() {
+    // The source module is linked, but its export table does not provide the
+    // name: the import must fail at runtime so the handler runs.
+    let source = "try:\n    from .helper import nope\nexcept ImportError:\n    nope = 0\n\ndef get():\n    return nope\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "pkg/__init__.py", &mut infer);
+    lowerer.set_dunder_name("pkg");
+    lowerer.set_package("pkg");
+    lowerer.set_user_modules(HashMap::from([(
+        "pkg.helper".to_string(),
+        UserModule {
+            name: "pkg.helper".to_string(),
+            exports: HashMap::new(),
+            all: None,
+            dynamic_globals: false,
+            extension_stars: Vec::new(),
+            module_getattr: false,
+        },
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let imported = global_set_value(&hir.functions[0].body, "nope")
+        .unwrap_or_else(|| panic!("the try must import nope: {:?}", hir.functions[0].body));
+    assert!(
+        matches!(
+            &imported.kind,
+            HExprKind::DeferredImport { module, member, path }
+                if module == "pkg.helper" && member.as_deref() == Some("nope") && path.is_none()
+        ),
+        "expected a runtime import, got {:?}",
+        imported.kind
+    );
+
+    // The function reads the module global, so the handler's fallback wins when
+    // the import fails.
+    let body = function_body(&hir, "get");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(matches!(
+        &value.kind,
+        HExprKind::GlobalGet { module, name } if module == "pkg" && name == "nope"
+    ));
+}
+
+#[test]
+fn optional_user_module_member_stays_linked_when_it_exists() {
+    // A linked module that exports the name cannot fail to provide it, so the
+    // statement keeps its compile-time binding and no runtime import is
+    // emitted.
+    let source =
+        "try:\n    from .helper import add\nexcept ImportError:\n    add = None\n\nvalue = add\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "pkg/__init__.py", &mut infer);
+    lowerer.set_dunder_name("pkg");
+    lowerer.set_package("pkg");
+    lowerer.set_user_modules(HashMap::from([(
+        "pkg.helper".to_string(),
+        UserModule {
+            name: "pkg.helper".to_string(),
+            exports: HashMap::from([("add".to_string(), UserExport::Function(3))]),
+            all: None,
+            dynamic_globals: false,
+            extension_stars: Vec::new(),
+            module_getattr: false,
+        },
+    )]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    assert!(
+        global_set_value(&hir.functions[0].body, "add").is_none(),
+        "a guaranteed import must not run at runtime: {:?}",
+        hir.functions[0].body
+    );
+    assert!(
+        matches!(&assigned(&hir, "value").kind, HExprKind::FunctionRef(3)),
+        "unexpected assignment: {:?}; locals={:?}; body={:?}",
+        assigned(&hir, "value").kind,
+        hir.functions[0]
+            .locals
+            .iter()
+            .map(|l| (l.name.clone(), l.ty))
+            .collect::<Vec<_>>(),
+        hir.functions[0].body
+    );
+}
+
+#[test]
+fn optional_extension_member_import_keeps_the_shared_object() {
+    // An extension may fail to load and its namespace cannot be enumerated, so
+    // the `try` body imports the member at runtime with the shared object the
+    // compiler resolved.
+    let dir = ExtensionDir::new("optional-ext-member");
+    let so = dir.add_extension("mod_ext.abi3.so");
+    let expected = fs::canonicalize(&so)
+        .expect("canonical extension path")
+        .to_string_lossy()
+        .into_owned();
+    let source =
+        "try:\n    from mod_ext import NOPE\nexcept ImportError:\n    NOPE = 42\n\nvalue = NOPE\n";
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let imported = global_set_value(&hir.functions[0].body, "NOPE")
+        .unwrap_or_else(|| panic!("the try must import NOPE: {:?}", hir.functions[0].body));
+    assert!(
+        matches!(
+            &imported.kind,
+            HExprKind::DeferredImport { module, member, path }
+                if module == "mod_ext"
+                    && member.as_deref() == Some("NOPE")
+                    && path.as_deref() == Some(expected.as_str())
+        ),
+        "expected a runtime extension import, got {:?}",
+        imported.kind
+    );
+}
+
+#[test]
+fn optional_import_inside_a_function_stays_deferred() {
+    // Only module-level imports sit in the module initialization try. A
+    // function-local import keeps its local deferred binding.
+    let source = "def f():\n    try:\n        from mapping import thing\n    except ImportError:\n        thing = None\n    return thing\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        global_set_value(hir.functions[0].body.as_slice(), "thing").is_none(),
+        "a function-local import must not publish a module global: {:?}",
         hir.functions[0].body
     );
 }
@@ -517,7 +827,7 @@ fn module_level_conditional_imports_bind_top_level_and_defer_absent_modules() {
     assert!(
         matches!(
             &value.kind,
-            HExprKind::DeferredImport { module, member }
+            HExprKind::DeferredImport { module, member, .. }
                 if module == "pkg" && member.as_deref() == Some("absent")
         ),
         "expected a deferred import, got {:?}",
@@ -5533,15 +5843,228 @@ fn annotated_assignments_lower_like_plain_assignments() {
     let source = "x: int = 3\ny: int\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
-    assert_eq!(
-        hir.functions[0].body.len(),
-        1,
-        "bare annotations emit nothing"
-    );
+    // The module publishes `__annotations__` first; `x` still lowers as its
+    // plain assignment and the bare `y` declaration emits no assignment.
+    assert_eq!(hir.functions[0].body.len(), 2);
+    let HStmtKind::GlobalSet { name, value, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected the module annotations store");
+    };
+    assert_eq!(name, "__annotations__");
+    let HExprKind::Dict(pairs) = &value.kind else {
+        panic!("expected an annotations dict, got {:?}", value.kind);
+    };
+    let names: Vec<&str> = pairs
+        .iter()
+        .map(|(key, _)| match &key.kind {
+            HExprKind::Const(Const::Str(name)) => name.as_str(),
+            other => panic!("expected a string key, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["x", "y"]);
     assert!(matches!(
-        &hir.functions[0].body[0].kind,
+        &hir.functions[0].body[1].kind,
         HStmtKind::Assign { .. }
     ));
+}
+
+/// Depth-first search through every nested statement block.
+fn find_stmt<'a>(stmts: &'a [HStmt], pred: &dyn Fn(&HStmt) -> bool) -> Option<&'a HStmt> {
+    for stmt in stmts {
+        if pred(stmt) {
+            return Some(stmt);
+        }
+        let nested = match &stmt.kind {
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => find_stmt(then_body, pred).or_else(|| find_stmt(else_body, pred)),
+            HStmtKind::While {
+                body, else_body, ..
+            }
+            | HStmtKind::ForRange {
+                body, else_body, ..
+            }
+            | HStmtKind::ForEach {
+                body, else_body, ..
+            } => find_stmt(body, pred).or_else(|| find_stmt(else_body, pred)),
+            HStmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => find_stmt(body, pred)
+                .or_else(|| {
+                    handlers
+                        .iter()
+                        .find_map(|handler| find_stmt(&handler.body, pred))
+                })
+                .or_else(|| find_stmt(else_body, pred))
+                .or_else(|| find_stmt(finally_body, pred)),
+            _ => None,
+        };
+        if nested.is_some() {
+            return nested;
+        }
+    }
+    None
+}
+
+/// Dictionary keys of an `HExprKind::Dict` literal.
+fn dict_keys(expr: &HExpr) -> Vec<&str> {
+    let HExprKind::Dict(pairs) = &expr.kind else {
+        panic!("expected a dict literal, got {:?}", expr.kind);
+    };
+    pairs
+        .iter()
+        .map(|(key, _)| match &key.kind {
+            HExprKind::Const(Const::Str(name)) => name.as_str(),
+            other => panic!("expected a string key, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn class_bodies_capture_annotations() {
+    let source = "\
+class Model:
+    name: str
+    age: int = 0
+    species = 'human'
+";
+    let hir = lower_ok(source);
+    let annotations = find_stmt(
+        &hir.functions[0].body,
+        &|stmt| matches!(&stmt.kind, HStmtKind::ClassDef { name, .. } if name == "Model"),
+    )
+    .and_then(|stmt| match &stmt.kind {
+        HStmtKind::ClassDef { attributes, .. } => attributes
+            .iter()
+            .find_map(|(name, value)| (name == "__annotations__").then_some(value)),
+        _ => unreachable!(),
+    })
+    .expect("Model must publish __annotations__");
+    assert_eq!(dict_keys(annotations), ["name", "age"]);
+    let HStmtKind::ClassDef { attributes, .. } = &find_stmt(
+        &hir.functions[0].body,
+        &|stmt| matches!(&stmt.kind, HStmtKind::ClassDef { name, .. } if name == "Model"),
+    )
+    .expect("Model class")
+    .kind
+    else {
+        unreachable!()
+    };
+    assert!(attributes.iter().any(|(name, _)| name == "age"));
+    assert!(attributes.iter().any(|(name, _)| name == "species"));
+}
+
+#[test]
+fn future_annotations_store_source_text() {
+    let source = "\
+from __future__ import annotations
+x: Missing = 1
+class Model:
+    value: AlsoMissing
+";
+    let hir = lower_ok(source);
+    let annotations = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::GlobalSet { name, value, .. } if name == "__annotations__" => Some(value),
+            _ => None,
+        })
+        .expect("module annotations");
+    let HExprKind::Dict(pairs) = &annotations.kind else {
+        panic!("expected an annotations dict");
+    };
+    assert!(matches!(
+        &pairs[0].1.kind,
+        HExprKind::Const(Const::Str(text)) if text == "Missing"
+    ));
+    let class_annotations = find_stmt(
+        &hir.functions[0].body,
+        &|stmt| matches!(&stmt.kind, HStmtKind::ClassDef { name, .. } if name == "Model"),
+    )
+    .and_then(|stmt| match &stmt.kind {
+        HStmtKind::ClassDef { attributes, .. } => attributes
+            .iter()
+            .find_map(|(name, value)| (name == "__annotations__").then_some(value)),
+        _ => None,
+    })
+    .expect("class annotations");
+    let HExprKind::Dict(pairs) = &class_annotations.kind else {
+        panic!("expected an annotations dict");
+    };
+    assert!(matches!(
+        &pairs[0].1.kind,
+        HExprKind::Const(Const::Str(text)) if text == "AlsoMissing"
+    ));
+}
+
+#[test]
+fn dynamic_class_bodies_capture_annotations_in_the_namespace() {
+    let source = "\
+class Model:
+    name: str
+    del missing
+";
+    let hir = lower_ok(source);
+    // The annotation is written into the runtime namespace's
+    // `__annotations__` dictionary (created with `setdefault` on first use).
+    let record = find_stmt(&hir.functions[0].body, &|stmt| {
+        matches!(
+            &stmt.kind,
+            HStmtKind::SetSubscript { index, .. }
+                if matches!(&index.kind, HExprKind::Const(Const::Str(key)) if key == "name")
+        )
+    });
+    assert!(record.is_some(), "dynamic class must record `name`");
+}
+
+#[test]
+fn function_signatures_capture_annotations() {
+    let source = "\
+def f(x: int, *args: str, **kwargs: float) -> bool:
+    return True
+";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    let attach = find_stmt(
+        &hir.functions[0].body,
+        &|stmt| matches!(&stmt.kind, HStmtKind::SetAttr { name, .. } if name == "__annotations__"),
+    )
+    .expect("mirrored function must publish __annotations__");
+    let HStmtKind::SetAttr { value, .. } = &attach.kind else {
+        unreachable!()
+    };
+    assert_eq!(dict_keys(value), ["x", "args", "kwargs", "return"]);
+}
+
+#[test]
+fn nested_functions_capture_annotations() {
+    let source = "\
+def outer():
+    def inner(value: int) -> str:
+        return 'a'
+    return inner
+";
+    let hir = lower_ok(source);
+    let outer = function(&hir, "outer");
+    let attach = find_stmt(
+        &outer.body,
+        &|stmt| matches!(&stmt.kind, HStmtKind::SetAttr { name, .. } if name == "__annotations__"),
+    )
+    .expect("nested function must publish __annotations__");
+    let HStmtKind::SetAttr { value, .. } = &attach.kind else {
+        unreachable!()
+    };
+    assert_eq!(dict_keys(value), ["value", "return"]);
 }
 
 #[test]
@@ -6048,7 +6571,7 @@ fn class_attributes_are_frozen_in_the_class_statement() {
     };
     assert!(methods.is_empty(), "{methods:?}");
     let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, vec!["mark", "ratio"]);
+    assert_eq!(names, vec!["mark", "ratio", "__annotations__"]);
     assert!(matches!(
         &attributes[0].1.kind,
         HExprKind::Const(Const::Int(7))
@@ -6067,8 +6590,9 @@ fn class_attributes_are_frozen_in_the_class_statement() {
     else {
         panic!("expected a class statement");
     };
-    assert_eq!(emitted.len(), 2);
+    assert_eq!(emitted.len(), 3);
     assert_eq!(emitted[0].name, "mark");
+    assert_eq!(emitted[2].name, "__annotations__");
 }
 
 #[test]
@@ -8778,8 +9302,8 @@ c = add
 fn relative_extension_submodule_inside_try_binds_the_loader() {
     // `from . import ext` inside a module-level `try` resolves the extension
     // from the package root (the source file lives inside the package) and
-    // binds the lazy loader; the extension is never loaded at compile time, so
-    // a load failure stays catchable by the handler.
+    // binds the lazy loader; the extension is never loaded at compile time, and
+    // a load failure runs the handler, so the binding is a runtime import.
     let dir = ExtensionDir::new("relative-try-ext");
     let so = dir.add_extension("pkg/ext.abi3.so");
     let expected = fs::canonicalize(&so)
@@ -8802,11 +9326,47 @@ fn relative_extension_submodule_inside_try_binds_the_loader() {
     drop(lowerer);
     assert!(diags.is_empty(), "{diags:?}");
 
+    // The try body performs the import at runtime, keeping the shared object
+    // of the extension so the runtime can materialise it lazily.
+    let value = global_set_value(&hir.functions[0].body, "ext")
+        .unwrap_or_else(|| panic!("the try body must bind `ext`: {:?}", hir.functions[0].body));
+    assert!(
+        matches!(
+            &value.kind,
+            HExprKind::DeferredImport { module, member, path }
+                if module == "pkg.ext"
+                    && member.is_none()
+                    && path.as_deref() == Some(expected.as_str())
+        ),
+        "expected a deferred extension import, got {:?}",
+        value.kind
+    );
+
+    // `ext.value()` reads the module global, so a failed import leaves the
+    // handler's fallback visible.
     let body = function_body(&hir, "get");
     let HStmtKind::Return(Some(value)) = &body[0].kind else {
         panic!("expected a return statement");
     };
-    assert_eq!(extension_callee(value), (expected.as_str(), "value"));
+    let HExprKind::MethodCall {
+        object,
+        method,
+        args,
+        ..
+    } = &value.kind
+    else {
+        panic!("expected an extension method call, got {:?}", value.kind);
+    };
+    assert_eq!(method, "value");
+    assert!(args.is_empty(), "{args:?}");
+    assert!(
+        matches!(
+            &object.kind,
+            HExprKind::GlobalGet { module, name } if module == "pkg" && name == "ext"
+        ),
+        "expected a module global read, got {:?}",
+        object.kind
+    );
 }
 
 #[test]
@@ -9069,17 +9629,23 @@ d = e.add
 }
 
 #[test]
-fn dotted_extension_import_without_alias_is_rejected() {
+fn dotted_extension_import_without_alias_loads_side_effect() {
     let dir = ExtensionDir::new("dotted-no-alias");
     dir.add_extension("pkg/sub_ext.abi3.so");
     let source = "import pkg.sub_ext\n";
-    let (_, _, diags) = lower_source_in(&dir.path, source);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::UNSUPPORTED);
-    assert_eq!(
-        diags[0].message,
-        "dotted extension imports require an alias"
-    );
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(hir.functions[0].body.iter().any(|stmt| {
+        matches!(
+            &stmt.kind,
+            HStmtKind::GlobalSet { value, .. }
+                if matches!(
+                    &value.kind,
+                    HExprKind::DeferredImport { module, member: None, path: Some(_) }
+                        if module == "pkg.sub_ext"
+                )
+        )
+    }));
 }
 
 #[test]
@@ -13791,13 +14357,30 @@ fn descriptor_builtin_arity_is_checked() {
     for source in [
         "x = classmethod()\n",
         "x = staticmethod(1, 2)\n",
-        "x = property()\n",
         "x = property(1, 2, 3, 4, 5)\n",
     ] {
         let diags = crate::check_source(source, "test.py")
             .expect_err("invalid descriptor call must be rejected");
         assert!(!diags.is_empty(), "{source}");
     }
+}
+
+#[test]
+fn blank_property_lowers_to_an_empty_builtin_call() {
+    // CPython's `property()` is a valid blank descriptor; `enum` builds its
+    // redirect descriptors that way and fills `fget`/`fset`/`fdel` later.
+    let hir = lower_ok("x = property()\n");
+    let HStmtKind::Assign { value, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected the module assignment");
+    };
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::Property),
+        args,
+    } = &value.kind
+    else {
+        panic!("expected a property() call: {value:?}");
+    };
+    assert!(args.is_empty(), "no components: {args:?}");
 }
 
 #[test]

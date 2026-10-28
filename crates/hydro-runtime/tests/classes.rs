@@ -758,7 +758,7 @@ fn instance_base_without_mro_entries_reports_type_error() {
     assert!(
         same(
             message,
-            text("class base of 'Derived' must be a class object or None, got 'instance'")
+            text("class base of 'Derived' must be a class object or None, got 'PlainBase'")
         ),
         "message mismatch, got {:?}",
         hydro_to_str(message)

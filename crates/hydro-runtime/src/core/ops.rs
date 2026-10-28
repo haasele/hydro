@@ -55,6 +55,15 @@ fn overflow() -> i64 {
     exc::raise_with_message(OVERFLOW_ERROR, "integer overflow")
 }
 
+/// Python `is`: tagged identity, except that two opaque extension handles use
+/// the identity of the underlying extension pointer.
+fn identical(a: i64, b: i64) -> bool {
+    match value::ext_objects_identical(a, b) {
+        Some(identical) => identical,
+        None => a == b,
+    }
+}
+
 fn zero_div(message: &str) -> i64 {
     exc::raise_with_message(ZERO_DIVISION_ERROR, message)
 }
@@ -271,9 +280,11 @@ pub(crate) fn binop(op: u32, a: i64, b: i64) -> i64 {
         OP_NOT_IN => contains(a, b, true),
         // Identity compares the tagged representation: `None` and the
         // booleans are singletons, small integers are unboxed immediates, and
-        // heap values compare by pointer.
-        OP_IS => value::bool_value(a == b),
-        OP_IS_NOT => value::bool_value(a != b),
+        // heap values compare by pointer. Two opaque extension handles are
+        // identical when they name the same extension pointer, even when they
+        // arrived through separate conversions.
+        OP_IS => value::bool_value(identical(a, b)),
+        OP_IS_NOT => value::bool_value(!identical(a, b)),
         OP_BIT_AND => bitwise(op, a, b),
         OP_BIT_OR => bitwise(op, a, b),
         OP_BIT_XOR => bitwise(op, a, b),
@@ -537,12 +548,34 @@ fn instance_dunder_binop(a: i64, b: i64, op: &str, reflected: &str) -> Option<i6
 /// Calls a normal user instance method with already-evaluated arguments.
 pub(crate) fn instance_method_call(instance: i64, name: &str, args: &[i64]) -> Option<i64> {
     let state = value::as_instance(instance)?;
-    let value::ClassEntry::Method(MethodKind::Normal, function) =
-        value::class_lookup(state.class, name)?
-    else {
-        return None;
-    };
-    Some(builtins::call(function, args.len(), args.as_ptr()))
+    match value::class_lookup(state.class, name)? {
+        value::ClassEntry::Method(MethodKind::Normal, function) => {
+            Some(builtins::call(function, args.len(), args.as_ptr()))
+        }
+        // A runtime class assignment (`C.__lt__ = fn`, which is how
+        // `functools.total_ordering` installs the derived comparisons) lands in
+        // the namespace overlay. CPython binds it exactly like a class-body
+        // function, so operators must resolve it too.
+        value::ClassEntry::Attr(entry) if value::as_function(entry).is_some() => {
+            if !value::function_signature(entry).is_empty()
+                && value::function_full_entry(entry) != 0
+            {
+                let rest = args.get(1..).unwrap_or_default();
+                Some(crate::core::methods::call_user_method(
+                    instance,
+                    state.class,
+                    MethodKind::Normal,
+                    entry,
+                    name,
+                    rest,
+                    &[],
+                ))
+            } else {
+                Some(builtins::call(entry, args.len(), args.as_ptr()))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// `a + b` with full Python semantics (`__add__`/`__radd__`, big integers,
@@ -1426,6 +1459,19 @@ fn compare(op: u32, a: i64, b: i64) -> i64 {
     {
         let equal = container::equals(a, b);
         return value::bool_value(if op == OP_EQ { equal } else { !equal });
+    }
+    // Two opaque extension wrappers for the same extension pointer compare
+    // equal even though the Hydro heap objects differ.
+    if matches!(op, OP_EQ | OP_NE) {
+        if let (Some(left), Some(right)) =
+            (value::ext_object_pointer(a), value::ext_object_pointer(b))
+        {
+            let equal = match crate::capi::objects_equal(left, right) {
+                Ok(equal) => equal,
+                Err(message) => return exc::raise_with_message(TYPE_ERROR, &message),
+            };
+            return value::bool_value(if op == OP_EQ { equal } else { !equal });
+        }
     }
     // Python's `==`/`!=` across different types is well-defined.
     match op {
