@@ -401,11 +401,11 @@ def main():
     TIMEOUT = args.timeout
 
     repeat = max(1, args.repeat)
-    if args.hydro:
-        explicit = Path(args.hydro).expanduser()
+    if args.tea:
+        explicit = Path(args.tea).expanduser()
         if not (explicit.is_file() and os.access(explicit, os.X_OK)):
-            sys.exit(f"--tea: '{args.hydro}' ist keine ausführbare Datei")
-    tea = find_hydro(args.hydro)
+            sys.exit(f"--tea: '{args.tea}' ist keine ausführbare Datei")
+    tea = find_hydro(args.tea)
     if tea is None:
         sys.exit("hydro-Binary nicht gefunden: --tea/HYDRO_BIN prüfen oder bauen mit "
                  "`cargo build --release -p hydro-runtime` "

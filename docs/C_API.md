@@ -131,13 +131,16 @@ The first vertical slice of option B is in `hydro-runtime` and verified by
 
 ### 3.2 Full-ABI foundation (2026-10-26)
 
-The next layer is implemented but **not yet NumPy/pandas/pydantic
-compatible**. Real-wheel inventory (2026-10-28) reports **0 missing required
-CPython symbols** across 68 extension modules (479 referenced, 593 exported);
-the generated report is `benchmarks/abi/latest.{json,md}`. The remaining gap
-is semantic, not link-time: the `datetime.datetime_CAPI` capsule, PyO3
-exception-class validation, NumPy dtype/array handles, and full
-traverse/clear/GIL integration.
+The next layer is implemented; **pydantic 2.14.1 and pydantic-core 2.50.1
+import** through the native extension. Real-wheel inventory (2026-10-28)
+reports **0 missing required CPython symbols** across 68 extension modules
+(479 referenced, 593 exported); the generated report is
+`benchmarks/abi/latest.{json,md}`. The remaining gap is semantic, not
+link-time: NumPy/pandas dtype/array/datetime behavior, pydantic model smoke
+(lazy submodule imports, walrus-in-generator, dataclasses APIs), and full
+traverse/clear/GIL integration. The `datetime.datetime_CAPI` capsule exists
+with CPython's layout; its constructor slots are not yet backed by the native
+datetime layout.
 
 `PyObject_HEAD`/`PyVarObject` headers with real refcounts and immortal
 singletons, a 3.14 `PyTypeObject` layout with `PyType_FromSpec`/`GetSlot`,
@@ -147,7 +150,8 @@ multi-D), GIL emulation around extension entry points, GC tracking, and the
 common `PyExc_*`/constant data symbols. Handles are self-contained; full
 `tp_traverse`/`tp_clear` integration and the unsupported type slots remain
 explicitly unimplemented. The gate is still a real NumPy 2.5 array smoke and
-pydantic-core model validation; neither is claimed here.
+pydantic-core model validation; pydantic import is green, model evaluation is
+not yet claimed.
 
 ### Scope of "full stdlib"
 

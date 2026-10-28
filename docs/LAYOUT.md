@@ -33,7 +33,7 @@ repository root.
 ├── tests/compat/              pinned CPython test manifests (3.14.9)
 ├── examples/                  JIT/AOT examples + expected/*.txt
 ├── stdlib/                    vendored pure-Python stdlib modules (CPython 3.14.9)
-│   ├── enum.py                verbatim CPython `enum` + provenance header
+│   ├── enum.py                CPython `enum` + provenance header and Hydro adaptations
 │   └── LICENSE                PSF License notice for the vendored sources
 ├── docs/
 │   ├── ARCHITECTURE.md        binding contract (IR/ABI, GC, modules)

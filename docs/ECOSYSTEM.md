@@ -6,8 +6,9 @@ the pinned CPython 3.14.9 oracle, under Hydro JIT (`tea infuse`) and under a
 Hydro AOT binary (`tea build`), and all three processes must exit 0.
 
 The gate runs the pinned NumPy 2.5.0, pandas 3.1.0, pydantic 2.14.1 and
-pydantic-core 2.50.1 wheels from a site-packages tree (default `/tmp/pkgs`,
-override with `--site` or `$HYDRO_ECOSYSTEM_SITE_PACKAGES`). Exact versions and
+pydantic-core 2.50.1 wheels from a site-packages tree (default
+`.hydro/ecosystem/site` from `pins.json`; override with `--site` or
+`$HYDRO_ECOSYSTEM_SITE_PACKAGES`). Exact versions and
 dist-info RECORD digests are pinned in `benchmarks/ecosystem/pins.json`; a
 version or RECORD mismatch fails the gate. Wheel digests are `null` until the
 original artifacts are pinned and are never reported as verified.
@@ -64,17 +65,63 @@ uv pip install --target .hydro/ecosystem/site \
   typing-inspection==0.4.4 annotated-types==0.8.0 tzdata==2026.5
 ```
 
-`HYDRO_STDLIB` should point at the CPython 3.14.9 `Lib` tree for unvendored
-stdlib modules. As of 2026-10-28 the link-time ABI inventory is complete
-(0 missing symbols), but imports still stop on semantic blockers: NumPy
-`datetime_CAPI`, pandas' mixed-type conditional type check, and PyO3's
-exception-class validation in pydantic-core. No case is reported as passing
-until the differential runner actually observes it.
+`HYDRO_STDLIB` defaults to the oracle's CPython 3.14.9 `Lib` tree (or
+`--stdlib`/the environment). The 2026-10-29 import run passes
+pydantic/pydantic-core and six dependencies; NumPy stops on
+`numpy.exceptions`, pandas on `dataclasses.is_dataclass`, six on
+`importlib.util.spec_from_loader`, and annotated-types on a native-method
+attribute. The link-time ABI inventory is complete (0 missing symbols); these
+are semantic/dynamic-import blockers. Smoke/AOT/upstream runs are not claimed
+until the runner observes them.
 
 <!-- BEGIN GENERATED ECOSYSTEM RESULTS -->
 
-_No ecosystem run recorded yet._ Run `python3 scripts/ecosystem_compat.py` to
-generate this block. No import, smoke or upstream result is claimed before that
-run; in particular, upstream suites have not been executed.
+Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` · binary `/mnt/Vault/GitHub/tea/target/release/tea` · site `/mnt/Vault/GitHub/hydro/.hydro/ecosystem/site`
+
+## Package pins
+
+Versions and dist-info RECORD digests are verified before any case runs. The
+NumPy RECORD digest was refreshed on 2026-10-29 for the current
+`.hydro/ecosystem/site` tree; wheel digests remain unpinned, so this verifies
+tree integrity, not provenance.
+
+| Package | Expected | Actual | RECORD SHA-256 | Wheel SHA-256 | Status |
+| --- | --- | --- | --- | --- | --- |
+| `numpy` | 2.5.0 | 2.5.0 | `d47a1166cd35d7d8b4ffcbcae0aa3a8890667fcdc76cfa383410db1de3b2e854` | not pinned | ok |
+| `pandas` | 3.1.0 | 3.1.0 | `cc43eef24c2d35b044fe9831c50c574f87572638cb4e8189e8705084da57efdc` | not pinned | ok |
+| `pydantic` | 2.14.1 | 2.14.1 | `d16db24e7db99e1383a3ad68457d9b3f2a3badaa891a60f2730f06c6f8064277` | not pinned | ok |
+| `pydantic-core` | 2.50.1 | 2.50.1 | `34bfca22c843f6195ed3a622c9349998abcbc623ddb5662ce31876761ac5bb53` | not pinned | ok |
+| `python-dateutil` | 3.0.0 | 3.0.0 | `a17d86766c46a890c3d8b1c4ccfa5bb1c6014919f3a3a9da4b8c597f47bf5b33` | not pinned | ok |
+| `six` | 1.17.0 | 1.17.0 | `d16e50f347969b1e1919fb0c88bac4b9c644f5305bcfcfb00f72b646dbd4065d` | not pinned | ok |
+| `typing-extensions` | 4.16.0 | 4.16.0 | `9e07fea845cac76293d927afa7157a14ecba39b318bc8af236b8de530b7656c1` | not pinned | ok |
+| `typing-inspection` | 0.4.4 | 0.4.4 | `83fc23669db31500d06056b13ecebe4f088f56a81c1ea86e3b68f1de3b8c7d95` | not pinned | ok |
+| `annotated-types` | 0.8.0 | 0.8.0 | `8191d3aa1ac93480688819b4db2385606219a3f7a453b85e086646134ded4f96` | not pinned | ok |
+| `tzdata` | 2026.5 | 2026.5 | `bc03ea1afd3394eb010013e6112f91d884785445c8453b7d56ddb7ba0cc4939d` | not pinned | ok |
+
+## Summary
+
+| Status | Cases |
+| --- | ---: |
+| compile_error | 2 |
+| pass | 6 |
+| runtime_error | 2 |
+| **Total** | 10 |
+
+A case passes only when the oracle, Hydro JIT and (unless `--no-aot`) the AOT binary all exit 0 with byte-identical stdout.
+
+## Cases
+
+| Case | CPython | Hydro JIT | Hydro AOT | Status | Detail |
+| --- | --- | --- | --- | --- | --- |
+| `numpy:import` | ok | exit 1 | - | runtime_error | jit: ImportError: No module named 'numpy.exceptions' |
+| `pandas:import` | ok | exit 1 | - | compile_error | jit: error[HYD0201]: module 'dataclasses' has no attribute 'is_dataclass' |
+| `pydantic:import` | ok | ok | - | pass | - |
+| `pydantic-core:import` | ok | ok | - | pass | - |
+| `python-dateutil:import` | ok | ok | - | pass | - |
+| `six:import` | ok | exit 1 | - | compile_error | jit: error[HYD0201]: module 'importlib.util' has no attribute 'spec_from_loader' |
+| `typing-extensions:import` | ok | ok | - | pass | - |
+| `typing-inspection:import` | ok | ok | - | pass | - |
+| `annotated-types:import` | ok | exit 1 | - | runtime_error | jit: AttributeError: 'function' object has no attribute 'islower' |
+| `tzdata:import` | ok | ok | - | pass | - |
 
 <!-- END GENERATED ECOSYSTEM RESULTS -->

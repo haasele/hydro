@@ -72,10 +72,12 @@ preserved.
 ```json
 {
   "python": "3.14.9",
-  "minimum_passing": 1,
+  "minimum_passing": 3,
   "required": [],
   "known_passing": [
-    "test_errno.py"
+    "test_errno.py",
+    "test_int_literal.py",
+    "test_longexp.py"
   ],
   "notes": "Release gate; grow as stdlib/language support lands. Import-only baseline is separate in docs/COMPATIBILITY.md."
 }
@@ -96,16 +98,16 @@ The gate fails when the manifest's `python` differs from 3.14.9, when any
 pass count is below `minimum_passing`. As tests are added and the manifest
 grows, this blocks release and catches regressions.
 
-## The first passing test and `required`
+## Passing tests and `required`
 
-The manifest started empty and now records the first genuine pass,
-`test_errno.py`: Hydro has a native `errno` module plus enough `unittest`
-(`TestCase`, native assertions, runner), module values/`getattr`, module
-globals and `frozenset` for the unmodified official file to exit 0 under both
-interpreters. `required` remains empty until the project pins a
-never-regress set; `minimum_passing` is 1. The separate import-only baseline
-in [`COMPATIBILITY.md`](COMPATIBILITY.md) tracks module imports and makes no
-test-suite claim.
+The manifest records three genuine passes from the full 2026-10-29 run:
+`test_errno.py` (native `errno`, `unittest`, module values/globals),
+`test_int_literal.py` (arbitrary-precision int literals, lexer edge cases) and
+`test_longexp.py` (long regular expressions). `required` remains empty until
+the project pins a never-regress subset; `minimum_passing` is 3 so the gate
+cannot silently drop below the recorded full-run count. The separate
+import-only baseline in [`COMPATIBILITY.md`](COMPATIBILITY.md) tracks module
+imports and makes no test-suite claim.
 
 Once another test genuinely passes under both interpreters, record it:
 
@@ -121,9 +123,9 @@ blocker.
 
 <!-- BEGIN GENERATED RESULTS -->
 
-Environment: CPython `3.14.9` (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` (`/mnt/Vault/GitHub/tea/target/debug/tea`)
+Environment: CPython `3.14.9` (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` (`/mnt/Vault/GitHub/tea/target/release/tea`)
 
-Source: `/mnt/Vault/GitHub/hydro/.hydro/cpython/Python-3.14.9` · generated 2026-10-26T07:52:22Z
+Source: `/mnt/Vault/GitHub/hydro/.hydro/cpython/Python-3.14.9` · generated 2026-10-28T23:41:12Z
 
 ## Summary
 
@@ -142,7 +144,7 @@ Passing: **3 / 398** (a pass requires Hydro and CPython 3.14.9 to both exit 0).
 
 - `test_errno.py`
 - `test_int_literal.py`
-- `test_perfmaps.py`
+- `test_longexp.py`
 
 ## Failure classes
 
@@ -155,403 +157,403 @@ Passing: **3 / 398** (a pass requires Hydro and CPython 3.14.9 to both exit 0).
 
 | Test | CPython 3.14.9 | Hydro | Status | First error |
 | --- | --- | --- | --- | --- |
-| `test___all__.py` | ok / 1672.8 ms | exit 1 / 726.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test__colorize.py` | ok / 116.3 ms | exit 1 / 596 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test__interpchannels.py` | ok / 795.3 ms | exit 1 / 545.1 ms | hydro_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
-| `test__interpreters.py` | ok / 666.1 ms | exit 1 / 504 ms | hydro_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
-| `test__locale.py` | ok / 56 ms | exit 1 / 511.7 ms | hydro_fail | error[HYD0002]: module '_locale' not found: not supported on the import search path |
-| `test__opcode.py` | ok / 51.8 ms | exit 1 / 471.2 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
-| `test__osx_support.py` | ok / 55.6 ms | exit 1 / 749.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_abc.py` | ok / 52.7 ms | exit 1 / 598.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_abstract_numbers.py` | ok / 46.4 ms | exit 1 / 29.9 ms | hydro_fail | error[HYD0201]: module 'abc' has no attribute 'ABCMeta' |
-| `test_android.py` | exit 1 / 110.9 ms | exit 1 / 578.5 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_annotationlib.py` | ok / 76.4 ms | exit 1 / 808.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_apple.py` | exit 1 / 109.5 ms | exit 1 / 570.6 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_argparse.py` | ok / 1387.3 ms | exit 1 / 719.2 ms | hydro_fail | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
-| `test_array.py` | ok / 286.4 ms | exit 1 / 535.8 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_asdl_parser.py` | exit 1 / 33.8 ms | exit 1 / 641.5 ms | expected_fail | error[HYD0002]: decorators are not supported in Phase 1 |
-| `test_asyncgen.py` | ok / 849 ms | exit 1 / 771.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_atexit.py` | exit 1 / 142.3 ms | exit 1 / 788.1 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_audit.py` | ok / 1717 ms | exit 1 / 743.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_augassign.py` | ok / 43.5 ms | exit 1 / 19.1 ms | hydro_fail | error[HYD0101]: name 'compile' is not defined |
-| `test_base64.py` | ok / 143.9 ms | exit 1 / 496.2 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_baseexception.py` | ok / 49.8 ms | exit 1 / 19.1 ms | hydro_fail | error[HYD0101]: name 'object' is not defined |
-| `test_bdb.py` | exit 1 / 76.3 ms | exit 1 / 616.5 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_bigaddrspace.py` | ok / 45.9 ms | exit 1 / 713.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_bigmem.py` | ok / 63.3 ms | exit 1 / 816.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_binascii.py` | ok / 64.4 ms | exit 1 / 466.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_binop.py` | ok / 44 ms | exit 1 / 85.1 ms | hydro_fail | error[HYD0201]: module 'abc' has no attribute 'ABCMeta' |
-| `test_bisect.py` | ok / 61.2 ms | exit 1 / 785.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_bool.py` | ok / 49.8 ms | exit 1 / 769.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_buffer.py` | ok / 95 ms | exit 1 / 601.1 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_bufio.py` | ok / 147 ms | exit 1 / 796.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_build_details.py` | exit 1 / 131.3 ms | exit 1 / 555.3 ms | expected_fail | error[HYD0201]: module 'os.path' has no attribute 'realpath' |
-| `test_builtin.py` | ok / 377.3 ms | exit 1 / 780.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_bytes.py` | exit 1 / 92.7 ms | exit 1 / 707 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_bz2.py` | ok / 382.7 ms | exit 1 / 506.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_c_locale_coercion.py` | ok / 832.4 ms | exit 1 / 696.8 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_calendar.py` | ok / 1427.4 ms | exit 1 / 712.7 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_call.py` | exit 1 / 62.3 ms | exit 1 / 479.6 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_charmapcodec.py` | ok / 45.5 ms | exit 1 / 177.8 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_class.py` | ok / 65.3 ms | exit 1 / 491.1 ms | hydro_fail | error[HYD0002]: module '_testinternalcapi' not found: not supported on the import search path |
-| `test_clinic.py` | ok / 242.9 ms | exit 1 / 892.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_cmath.py` | ok / 92.2 ms | exit 1 / 597.2 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_cmd.py` | ok / 201.6 ms | exit 1 / 675.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_cmd_line.py` | exit 1 / 1783.6 ms | exit 1 / 610.3 ms | expected_fail | error[HYD0201]: module 'os.path' has no attribute 'realpath' |
-| `test_cmd_line_script.py` | exit 1 / 1456.8 ms | exit 1 / 498.7 ms | expected_fail | error[HYD0002]: module '_frozen_importlib_external' not found: not supported on the import search path |
-| `test_code.py` | ok / 213.5 ms | exit 1 / 745.3 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_code_module.py` | ok / 135.8 ms | exit 1 / 481.4 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
-| `test_codeccallbacks.py` | ok / 62.5 ms | exit 1 / 118 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
-| `test_codecencodings_cn.py` | ok / 128.2 ms | exit 1 / 787 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecencodings_hk.py` | ok / 96 ms | exit 1 / 779.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecencodings_iso2022.py` | ok / 144.3 ms | exit 1 / 823.7 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecencodings_jp.py` | ok / 183.9 ms | exit 1 / 854.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecencodings_kr.py` | ok / 110.9 ms | exit 1 / 784.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecencodings_tw.py` | ok / 104 ms | exit 1 / 768.9 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecmaps_cn.py` | ok / 182.9 ms | exit 1 / 800.2 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecmaps_hk.py` | ok / 116.9 ms | exit 1 / 796.4 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecmaps_jp.py` | ok / 174.5 ms | exit 1 / 795.1 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecmaps_kr.py` | ok / 169 ms | exit 1 / 813.7 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecmaps_tw.py` | ok / 143.1 ms | exit 1 / 786.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codecs.py` | ok / 340.9 ms | exit 1 / 747.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_codeop.py` | ok / 54.3 ms | exit 1 / 758.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_collections.py` | ok / 1143.3 ms | exit 1 / 749.6 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_colorsys.py` | ok / 46.1 ms | exit 1 / 315.7 ms | hydro_fail | AssertionError: 8 test(s) failed |
-| `test_compare.py` | ok / 61.2 ms | exit 1 / 746.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_compile.py` | ok / 2289 ms | exit 1 / 536.9 ms | hydro_fail | error[HYD0002]: module '_ast' not found: not supported on the import search path |
-| `test_compileall.py` | exit 1 / 66.1 ms | exit 1 / 548.9 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_compiler_assemble.py` | ok / 40.8 ms | exit 1 / 457.3 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
-| `test_compiler_codegen.py` | ok / 37.5 ms | exit 1 / 740.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_complex.py` | ok / 68.1 ms | exit 1 / 499.8 ms | hydro_fail | error[HYD0002]: module 'cmath' not found: not supported on the import search path |
-| `test_configparser.py` | ok / 415.2 ms | exit 1 / 1043.8 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
-| `test_contains.py` | ok / 57.6 ms | exit 1 / 768.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_context.py` | ok / 534.9 ms | exit 1 / 472.7 ms | hydro_fail | error[HYD0002]: module '_contextvars' not found: not supported on the import search path |
-| `test_contextlib.py` | ok / 71.2 ms | exit 1 / 507.2 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
-| `test_contextlib_async.py` | ok / 75.8 ms | exit 1 / 805.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_copy.py` | ok / 79.9 ms | exit 1 / 534.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_copyreg.py` | ok / 81.5 ms | exit 1 / 921.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_coroutines.py` | ok / 268.5 ms | exit 1 / 603.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_cprofile.py` | ok / 529.2 ms | exit 1 / 551.6 ms | hydro_fail | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
-| `test_crossinterp.py` | exit 1 / 55.1 ms | exit 1 / 480.5 ms | expected_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
-| `test_csv.py` | ok / 240.2 ms | exit 1 / 590.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_curses.py` | ok / 291 ms | exit 1 / 665.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_datetime.py` | ok / 18911.1 ms | exit 1 / 765.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_dbm.py` | ok / 386.7 ms | exit 1 / 463.2 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_dbm_dumb.py` | ok / 76.1 ms | exit 1 / 458.6 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_dbm_gnu.py` | exit 1 / 49.9 ms | exit 1 / 770.8 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_dbm_ndbm.py` | ok / 107.4 ms | exit 1 / 461.3 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_dbm_sqlite3.py` | ok / 589.4 ms | exit 1 / 477 ms | hydro_fail | error[HYD0002]: module '_sqlite3' not found: not supported on the import search path |
-| `test_decimal.py` | ok / 1939.5 ms | exit 1 / 721.9 ms | hydro_fail | error[HYD0002]: module '_contextvars' not found: not supported on the import search path |
-| `test_decorators.py` | ok / 45.2 ms | exit 1 / 39.2 ms | hydro_fail | error[HYD0101]: name 'compile' is not defined |
-| `test_defaultdict.py` | ok / 44.3 ms | exit 1 / 107.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_deque.py` | ok / 374.2 ms | exit 1 / 739.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_descr.py` | exit 1 / 336.3 ms | exit 1 / 633.7 ms | expected_fail | error[HYD0101]: name 'complex' is not defined |
-| `test_descrtut.py` | ok / 141.8 ms | exit 1 / 653.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_devpoll.py` | exit 1 / 39 ms | exit 1 / 743.1 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_dict.py` | ok / 304.5 ms | exit 1 / 567.3 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
-| `test_dictcomps.py` | ok / 48.6 ms | exit 1 / 469.2 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
-| `test_dictviews.py` | ok / 143 ms | exit 1 / 545 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_difflib.py` | ok / 238.7 ms | exit 1 / 702.3 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_dis.py` | ok / 225.5 ms | exit 1 / 568.4 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
-| `test_docxmlrpc.py` | ok / 4668.1 ms | exit 1 / 852.7 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
-| `test_dtrace.py` | exit 1 / 55 ms | exit 1 / 477.9 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_dynamic.py` | ok / 50.3 ms | exit 1 / 754.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_dynamicclassattribute.py` | ok / 44.3 ms | exit 1 / 26.4 ms | hydro_fail | error[HYD0201]: module 'types' has no attribute 'DynamicClassAttribute' |
-| `test_eintr.py` | exit 1 / 99.5 ms | exit 1 / 468.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_embed.py` | ok / 63.9 ms | exit 1 / 833 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_ensurepip.py` | ok / 157.6 ms | exit 1 / 615.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_enum.py` | exit 1 / 579.6 ms | exit 1 / 1007.4 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_enumerate.py` | ok / 80.5 ms | exit 1 / 750.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_eof.py` | ok / 311.2 ms | exit 1 / 637.7 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_epoll.py` | ok / 153.6 ms | exit 1 / 726.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_errno.py` | ok / 42.8 ms | ok / 111.9 ms | hydro_pass | - |
-| `test_except_star.py` | ok / 56.3 ms | exit 1 / 754.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_exception_group.py` | ok / 262.1 ms | exit 1 / 756.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_exception_hierarchy.py` | ok / 47.1 ms | exit 1 / 24.5 ms | hydro_fail | error[HYD0201]: module 'errno' has no attribute 'EEXIST' |
-| `test_exception_variations.py` | ok / 44.8 ms | exit 1 / 553 ms | hydro_fail | AssertionError: 8 test(s) failed |
-| `test_exceptions.py` | exit 1 / 949.4 ms | exit 1 / 617.2 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_extcall.py` | exit 1 / 143.6 ms | exit 1 / 545.9 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_external_inspection.py` | ok / 1427.8 ms | exit 1 / 659.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_faulthandler.py` | ok / 18705.6 ms | exit 1 / 482.8 ms | hydro_fail | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
-| `test_fcntl.py` | ok / 200.8 ms | exit 1 / 490.4 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_file.py` | ok / 84.5 ms | exit 1 / 497.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_file_eintr.py` | ok / 1436.6 ms | exit 1 / 497 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_filecmp.py` | ok / 76.2 ms | exit 1 / 484.6 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
-| `test_fileinput.py` | ok / 129.7 ms | exit 1 / 537.5 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'fspath' |
-| `test_fileio.py` | ok / 530.9 ms | exit 1 / 558.6 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_fileutils.py` | ok / 125.8 ms | exit 1 / 756.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_finalization.py` | ok / 99.3 ms | exit 1 / 515.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_float.py` | ok / 95.7 ms | exit 1 / 514.9 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_flufl.py` | ok / 45.9 ms | exit 1 / 9.2 ms | hydro_fail | error[HYD0101]: name 'compile' is not defined |
-| `test_fnmatch.py` | ok / 52.9 ms | exit 1 / 49.6 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
-| `test_fork1.py` | ok / 5130.1 ms | exit 1 / 454.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_format.py` | ok / 54.7 ms | exit 1 / 829.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_fractions.py` | ok / 77 ms | exit 1 / 510.4 ms | hydro_fail | error[HYD0002]: 'from _decimal import *' is not supported for a module that is not loaded |
-| `test_frame.py` | exit 1 / 937.4 ms | exit 1 / 591.1 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_frozen.py` | ok / 53.2 ms | exit 1 / 994.8 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
-| `test_fstring.py` | exit 1 / 393.9 ms | exit 1 / 36.8 ms | expected_fail | error[HYD0001]: invalid syntax: f-string: expressions nested too deeply |
-| `test_ftplib.py` | ok / 7063.1 ms | exit 1 / 701.7 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute '_GLOBAL_DEFAULT_TIMEOUT' |
-| `test_funcattrs.py` | ok / 55.8 ms | exit 1 / 750.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_functools.py` | ok / 373.8 ms | exit 1 / 758.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_gc.py` | exit 1 / 1539.3 ms | exit 1 / 646.5 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_generated_cases.py` | ok / 120.7 ms | exit 1 / 757 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_generator_stop.py` | ok / 42.5 ms | exit 1 / 93.8 ms | hydro_fail | AssertionError: 2 test(s) failed |
-| `test_generators.py` | ok / 185.1 ms | exit 1 / 676.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_genericalias.py` | ok / 171.6 ms | exit 1 / 890.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_genericclass.py` | ok / 53.7 ms | exit 1 / 782.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_genericpath.py` | ok / 57 ms | exit 1 / 507.5 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
-| `test_genexps.py` | ok / 135.5 ms | exit 1 / 553.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_getopt.py` | ok / 165.4 ms | exit 1 / 722.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_getpass.py` | ok / 124.3 ms | exit 1 / 464 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'O_NOCTTY' |
-| `test_getpath.py` | ok / 47.6 ms | exit 1 / 590.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_gettext.py` | exit 1 / 163.7 ms | exit 1 / 625.5 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_glob.py` | ok / 106.8 ms | exit 1 / 569 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'audit' |
-| `test_global.py` | ok / 50.3 ms | exit 1 / 706.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_grammar.py` | ok / 69.2 ms | exit 1 / 39.2 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token ',' |
-| `test_graphlib.py` | ok / 92.8 ms | exit 1 / 504.1 ms | hydro_fail | error[HYD0103]: raise with a message requires exactly one argument |
-| `test_grp.py` | ok / 329.8 ms | exit 1 / 488.1 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
-| `test_gzip.py` | ok / 877 ms | exit 1 / 501.8 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_hash.py` | ok / 304.3 ms | exit 1 / 785.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_hashlib.py` | ok / 14294.1 ms | exit 1 / 704.4 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_heapq.py` | ok / 246.6 ms | exit 1 / 731.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_hmac.py` | ok / 169.9 ms | exit 1 / 651.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_html.py` | ok / 50.2 ms | exit 1 / 176.9 ms | hydro_fail | AssertionError: 1 test(s) failed |
-| `test_htmlparser.py` | ok / 459.9 ms | exit 1 / 683.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_http_cookiejar.py` | ok / 279.5 ms | exit 1 / 1146.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_http_cookies.py` | ok / 623.6 ms | exit 1 / 788.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_httplib.py` | ok / 3581.3 ms | exit 1 / 727.5 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_httpservers.py` | ok / 3937.1 ms | exit 1 / 803.8 ms | hydro_fail | error[HYD0201]: module 'enum' has no attribute 'StrEnum' |
-| `test_idle.py` | ok / 9791.9 ms | exit 1 / 713.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_imaplib.py` | timeout / 30004.1 ms | exit 1 / 949.6 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_index.py` | ok / 49.5 ms | exit 1 / 699.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_int.py` | ok / 20882.3 ms | exit 1 / 712.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_int_literal.py` | ok / 40.2 ms | ok / 200.5 ms | hydro_pass | - |
-| `test_io.py` | exit 1 / 28633.3 ms | exit 1 / 704.1 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_ioctl.py` | ok / 555.2 ms | exit 1 / 442.8 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_ipaddress.py` | ok / 92.4 ms | exit 1 / 606.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_isinstance.py` | ok / 810.5 ms | exit 1 / 702.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_iter.py` | ok / 65.4 ms | exit 1 / 724.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_iterlen.py` | ok / 43.4 ms | exit 1 / 24.4 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'deque' |
-| `test_itertools.py` | ok / 767.9 ms | exit 1 / 785.4 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_keyword.py` | ok / 42.1 ms | exit 1 / 6.4 ms | hydro_fail | error[HYD0101]: name 'setattr' is not defined |
-| `test_keywordonlyarg.py` | ok / 42.1 ms | exit 1 / 29.3 ms | hydro_fail | error[HYD0101]: name 'compile' is not defined |
-| `test_kqueue.py` | exit 1 / 38.9 ms | exit 1 / 698 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_largefile.py` | ok / 1319.6 ms | exit 1 / 783.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_launcher.py` | exit 1 / 66.2 ms | exit 1 / 451.2 ms | expected_fail | error[HYD0002]: module 'winreg' not found: not supported on the import search path |
-| `test_linecache.py` | ok / 122.6 ms | exit 1 / 556.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_list.py` | ok / 367.7 ms | exit 1 / 477.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_listcomps.py` | ok / 163.9 ms | exit 1 / 667.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_lltrace.py` | ok / 49 ms | exit 1 / 472.5 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
-| `test_locale.py` | ok / 148.1 ms | exit 1 / 499.5 ms | hydro_fail | error[HYD0002]: 'from _decimal import *' is not supported for a module that is not loaded |
-| `test_logging.py` | ok / 20489.5 ms | exit 1 / 1275.8 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_long.py` | ok / 486.1 ms | exit 1 / 465.7 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_longexp.py` | ok / 104.8 ms | exit 1 / 3.6 ms | hydro_fail | error[HYD0101]: name 'eval' is not defined |
-| `test_lzma.py` | ok / 174.1 ms | exit 1 / 484.2 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_mailbox.py` | ok / 1276.9 ms | exit 1 / 1665.9 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
-| `test_marshal.py` | ok / 223.2 ms | exit 1 / 454.5 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_math.py` | ok / 9054 ms | exit 1 / 523.3 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_math_property.py` | ok / 35.2 ms | exit 1 / 702.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_memoryio.py` | ok / 98.9 ms | exit 1 / 754.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_memoryview.py` | ok / 289.8 ms | exit 1 / 474 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_metaclass.py` | ok / 123 ms | exit 1 / 539.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_mimetypes.py` | ok / 426.2 ms | exit 1 / 626.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_minidom.py` | ok / 84.2 ms | exit 1 / 533.4 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
-| `test_mmap.py` | ok / 109.3 ms | exit 1 / 752.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_modulefinder.py` | ok / 274.4 ms | exit 1 / 949.7 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
-| `test_monitoring.py` | ok / 61.6 ms | exit 1 / 534.3 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
-| `test_msvcrt.py` | exit 1 / 35.3 ms | exit 1 / 415 ms | expected_fail | error[HYD0002]: module '_winapi' not found: not supported on the import search path |
-| `test_multibytecodec.py` | ok / 217.5 ms | exit 1 / 427.2 ms | hydro_fail | error[HYD0002]: module '_multibytecodec' not found: not supported on the import search path |
-| `test_multiprocessing_main_handling.py` | exit 1 / 1271.2 ms | exit 1 / 740.3 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_named_expressions.py` | ok / 49.4 ms | exit 1 / 230.2 ms | hydro_fail | error[HYD0101]: name 'exec' is not defined |
-| `test_netrc.py` | ok / 51.7 ms | exit 1 / 443.2 ms | hydro_fail | error[HYD0201]: module 'os.path' has no attribute 'expanduser' |
-| `test_ntpath.py` | ok / 275.4 ms | exit 1 / 838.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_nturl2path.py` | ok / 55.5 ms | exit 1 / 1312.6 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
-| `test_numeric_tower.py` | ok / 65.7 ms | exit 1 / 10.9 ms | hydro_fail | error[HYD0002]: 'from _decimal import *' is not supported for a module that is not loaded |
-| `test_opcache.py` | ok / 282.3 ms | exit 1 / 552.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_opcodes.py` | ok / 47.1 ms | exit 1 / 697.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_openpty.py` | ok / 48.2 ms | exit 1 / 3.9 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'openpty' |
-| `test_operator.py` | ok / 81.3 ms | exit 1 / 759.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_optimizer.py` | ok / 45.7 ms | exit 1 / 716.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_optparse.py` | ok / 122.7 ms | exit 1 / 585 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_ordered_dict.py` | ok / 174.6 ms | exit 1 / 485.6 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_os.py` | exit 1 / 12665.7 ms | exit 1 / 674.2 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_osx_env.py` | ok / 44.6 ms | exit 1 / 693.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_patma.py` | exit 1 / 48.8 ms | exit 1 / 485.9 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_pdb.py` | exit 1 / 17418 ms | exit 1 / 978.3 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_peepholer.py` | ok / 355.5 ms | exit 1 / 519.9 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
-| `test_pep646_syntax.py` | ok / 219 ms | exit 1 / 548.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_perf_profiler.py` | ok / 394.5 ms | exit 1 / 465.7 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
-| `test_perfmaps.py` | ok / 104.6 ms | ok / 59.9 ms | hydro_pass | - |
-| `test_pickle.py` | ok / 2070.3 ms | exit 1 / 1083.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_picklebuffer.py` | ok / 128 ms | exit 1 / 535.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_pickletools.py` | ok / 528.9 ms | exit 1 / 1024.9 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_pkg.py` | ok / 118 ms | exit 1 / 29.6 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
-| `test_pkgutil.py` | exit 1 / 137.7 ms | exit 1 / 561.9 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_platform.py` | ok / 466.9 ms | exit 1 / 519.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_plistlib.py` | ok / 225.3 ms | exit 1 / 490.3 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_poll.py` | ok / 11275.2 ms | exit 1 / 706.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_popen.py` | ok / 165.4 ms | exit 1 / 705.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_poplib.py` | ok / 6006 ms | exit 1 / 515.5 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'audit' |
-| `test_positional_only_arg.py` | ok / 132.9 ms | exit 1 / 450.3 ms | hydro_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
-| `test_posix.py` | exit 1 / 815 ms | exit 1 / 532.5 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_posixpath.py` | ok / 322.2 ms | exit 1 / 852.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_pow.py` | ok / 239 ms | exit 1 / 26.9 ms | hydro_fail | error[HYD0101]: name 'pow' is not defined |
-| `test_pprint.py` | ok / 170.4 ms | exit 1 / 621 ms | hydro_fail | error[HYD0201]: module 'io' has no attribute 'StringIO' |
-| `test_print.py` | ok / 119.6 ms | exit 1 / 687.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_profile.py` | ok / 370 ms | exit 1 / 626.9 ms | hydro_fail | error[HYD0201]: module 'enum' has no attribute 'StrEnum' |
-| `test_property.py` | ok / 88.2 ms | exit 1 / 727.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_pstats.py` | ok / 157.2 ms | exit 1 / 463.7 ms | hydro_fail | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
-| `test_pty.py` | ok / 103.4 ms | exit 1 / 447.8 ms | hydro_fail | error[HYD0002]: module 'termios' not found: not supported on the import search path |
-| `test_pulldom.py` | ok / 153 ms | exit 1 / 457.2 ms | hydro_fail | error[HYD0101]: unknown exception type 'exception' |
-| `test_pwd.py` | ok / 111 ms | exit 1 / 479.9 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
-| `test_py_compile.py` | ok / 340.8 ms | exit 1 / 927.9 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
-| `test_pyclbr.py` | exit 1 / 90.8 ms | exit 1 / 959.4 ms | expected_fail | error[HYD0002]: decorators are not supported in Phase 1 |
-| `test_pyexpat.py` | ok / 222.4 ms | exit 1 / 503.5 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
-| `test_queue.py` | ok / 7829.5 ms | exit 1 / 509.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_quopri.py` | ok / 131.6 ms | exit 1 / 724.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_raise.py` | ok / 90.6 ms | exit 1 / 694.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_random.py` | ok / 719.5 ms | exit 1 / 589.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_range.py` | ok / 198.7 ms | exit 1 / 743.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_re.py` | ok / 426.8 ms | exit 1 / 868.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_readline.py` | ok / 240.9 ms | exit 1 / 645.8 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_regrtest.py` | exit 1 / 1495.5 ms | exit 1 / 876.2 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_remote_pdb.py` | ok / 2402.3 ms | exit 1 / 733.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_repl.py` | ok / 920.1 ms | exit 1 / 768.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_reprlib.py` | ok / 68 ms | exit 1 / 726.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_resource.py` | ok / 84.4 ms | exit 1 / 732.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_richcmp.py` | ok / 39.5 ms | exit 1 / 706.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_rlcompleter.py` | ok / 112.2 ms | exit 1 / 577 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_robotparser.py` | ok / 1359.3 ms | exit 1 / 737.7 ms | hydro_fail | error[HYD0101]: name 'super' is not defined |
-| `test_runpy.py` | timeout / 30010.9 ms | exit 1 / 482.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_sax.py` | ok / 177.1 ms | exit 1 / 721.7 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
-| `test_sched.py` | ok / 587.9 ms | exit 1 / 437.9 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'namedtuple' |
-| `test_scope.py` | ok / 45.8 ms | exit 1 / 494.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_script_helper.py` | ok / 188.9 ms | exit 1 / 738.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_secrets.py` | ok / 39.5 ms | exit 1 / 35.5 ms | hydro_fail | error[HYD0201]: module '_operator' has no attribute '_compare_digest' |
-| `test_select.py` | ok / 1556.2 ms | exit 1 / 696.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_selectors.py` | ok / 14695.4 ms | exit 1 / 591 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_set.py` | ok / 713.1 ms | exit 1 / 547.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_setcomps.py` | ok / 120.3 ms | exit 1 / 614.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_shelve.py` | ok / 2580.9 ms | exit 1 / 539.3 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_shlex.py` | ok / 155.5 ms | exit 1 / 659.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_shutil.py` | exit 1 / 422.8 ms | exit 1 / 812.5 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_signal.py` | exit 1 / 15518.7 ms | exit 1 / 661.8 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_site.py` | ok / 2085.4 ms | exit 1 / 1164.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_slice.py` | ok / 62.1 ms | exit 1 / 540.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_smtplib.py` | ok / 1448 ms | exit 1 / 1024.4 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_smtpnet.py` | ok / 9206.5 ms | exit 1 / 1027.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_socket.py` | ok / 27916.4 ms | exit 1 / 698.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_socketserver.py` | ok / 483.4 ms | exit 1 / 471 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_sort.py` | ok / 77 ms | exit 1 / 738.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_source_encoding.py` | ok / 13358.7 ms | exit 1 / 782.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_ssl.py` | ok / 21594.4 ms | exit 1 / 1056.4 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_stable_abi_ctypes.py` | exit 1 / 130 ms | exit 1 / 785.3 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_startfile.py` | exit 1 / 116.2 ms | exit 1 / 758.6 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_stat.py` | ok / 146.2 ms | exit 1 / 761.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_statistics.py` | ok / 9563.6 ms | exit 1 / 842.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_str.py` | ok / 1132.3 ms | exit 1 / 642.8 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_strftime.py` | ok / 167 ms | exit 1 / 676.6 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_string_literals.py` | ok / 142.8 ms | exit 1 / 92.7 ms | hydro_fail | error[HYD0101]: name 'eval' is not defined |
-| `test_stringprep.py` | ok / 116.2 ms | exit 1 / 40.3 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
-| `test_strptime.py` | ok / 148.2 ms | exit 1 / 718.4 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_strtod.py` | ok / 244.4 ms | exit 1 / 749.2 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_struct.py` | ok / 393.9 ms | exit 1 / 534.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_structseq.py` | ok / 163.6 ms | exit 1 / 556.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_subclassinit.py` | ok / 125 ms | exit 1 / 21.2 ms | hydro_fail | error[HYD0002]: nested class definitions are not supported yet |
-| `test_subprocess.py` | exit 1 / 15700.5 ms | exit 1 / 574.4 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_sundry.py` | ok / 104.5 ms | exit 1 / 772.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_super.py` | ok / 214.2 ms | exit 1 / 643.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_support.py` | exit 1 / 4947.2 ms | exit 1 / 516.3 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_symtable.py` | ok / 63.8 ms | exit 1 / 480.5 ms | hydro_fail | error[HYD0002]: module '_symtable' not found: not supported on the import search path |
-| `test_syntax.py` | ok / 190.2 ms | exit 1 / 699 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_sys.py` | exit 1 / 1217.9 ms | exit 1 / 584.5 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_sys_setprofile.py` | ok / 47 ms | exit 1 / 196.7 ms | hydro_fail | error[HYD0201]: module 'io' has no attribute 'StringIO' |
-| `test_sys_settrace.py` | ok / 850.5 ms | exit 1 / 839.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_sysconfig.py` | exit 1 / 222 ms | exit 1 / 565.1 ms | expected_fail | error[HYD0002]: circular import: test.support.venv -> venv |
-| `test_syslog.py` | ok / 197.1 ms | exit 1 / 794.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_tabnanny.py` | ok / 120.4 ms | exit 1 / 631 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_tarfile.py` | exit 1 / 5640.1 ms | exit 1 / 834.9 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_tcl.py` | ok / 120.7 ms | exit 1 / 592.2 ms | hydro_fail | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
-| `test_tempfile.py` | ok / 389.9 ms | exit 1 / 581.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_termios.py` | ok / 562.3 ms | exit 1 / 762.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_textwrap.py` | ok / 49.2 ms | exit 1 / 317.8 ms | hydro_fail | error[HYD0201]: module 'textwrap' has no attribute 'TextWrapper' |
-| `test_thread.py` | ok / 1285.4 ms | exit 1 / 787.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_thread_local_bytecode.py` | ok / 51.6 ms | exit 1 / 767 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_threadedtempfile.py` | ok / 55.5 ms | exit 1 / 740.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_threading.py` | exit 1 / 14139.9 ms | exit 1 / 580.9 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_threading_local.py` | ok / 345.4 ms | exit 1 / 686.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_threadsignals.py` | ok / 4961.8 ms | exit 1 / 437.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_time.py` | ok / 3084.4 ms | exit 1 / 748.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_timeit.py` | ok / 60.8 ms | exit 1 / 738.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_timeout.py` | ok / 10131.2 ms | exit 1 / 735.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_tokenize.py` | ok / 6422.8 ms | exit 1 / 550.7 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute 'ChainMap' |
-| `test_trace.py` | ok / 1010.5 ms | exit 1 / 797.9 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_traceback.py` | exit 1 / 2336.2 ms | exit 1 / 736.6 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_tracemalloc.py` | ok / 685.1 ms | exit 1 / 671.6 ms | hydro_fail | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
-| `test_tstring.py` | exit 1 / 293.2 ms | exit 1 / 784.6 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_ttk_textonly.py` | ok / 75.2 ms | exit 1 / 583.7 ms | hydro_fail | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
-| `test_tty.py` | ok / 49 ms | exit 1 / 751.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_tuple.py` | ok / 223 ms | exit 1 / 765.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_turtle.py` | ok / 192.5 ms | exit 1 / 626.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_type_aliases.py` | ok / 55.9 ms | exit 1 / 715.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_type_annotations.py` | ok / 50.6 ms | exit 1 / 773.6 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_type_cache.py` | exit 1 / 47.7 ms | exit 1 / 483.8 ms | expected_fail | error[HYD0201]: module '_opcode' has no attribute 'stack_effect' |
-| `test_type_comments.py` | ok / 53.9 ms | exit 1 / 760.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_type_params.py` | ok / 59.1 ms | exit 1 / 36.6 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token '=' |
-| `test_typechecks.py` | ok / 44.7 ms | exit 1 / 230.2 ms | hydro_fail | AssertionError: 4 test(s) failed |
-| `test_types.py` | ok / 232.7 ms | exit 1 / 752.6 ms | hydro_fail | error[HYD0002]: module '_datetime' not found: not supported on the import search path |
-| `test_typing.py` | ok / 398.4 ms | exit 1 / 977 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_ucn.py` | ok / 148.7 ms | exit 1 / 639.7 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
-| `test_unary.py` | ok / 42.6 ms | exit 1 / 7.4 ms | hydro_fail | error[HYD0002]: complex literals are not supported in Phase 1 |
-| `test_unicode_file.py` | ok / 48.1 ms | exit 1 / 461.9 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
-| `test_unicode_file_functions.py` | ok / 75 ms | exit 1 / 446.7 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
-| `test_unicode_identifiers.py` | ok / 42.9 ms | exit 1 / 4.7 ms | hydro_fail | error[HYD0002]: nested class definitions are not supported yet |
-| `test_unicodedata.py` | ok / 4434.5 ms | exit 1 / 710.9 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
-| `test_univnewlines.py` | ok / 59.9 ms | exit 1 / 662.8 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_unpack.py` | exit 1 / 144.8 ms | exit 1 / 552.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_unpack_ex.py` | exit 1 / 150.7 ms | exit 1 / 532.4 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_unparse.py` | ok / 6225.2 ms | exit 1 / 766.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_urllib.py` | ok / 406.3 ms | exit 1 / 1601.8 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
-| `test_urllib2.py` | ok / 1500.5 ms | exit 1 / 839 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_urllib2_localnet.py` | ok / 2164.8 ms | exit 1 / 1671.7 ms | hydro_fail | error[HYD0002]: decorators are not supported in Phase 1 |
-| `test_urllib2net.py` | timeout / 30003.5 ms | exit 1 / 839.8 ms | expected_fail | error[HYD0201]: module 'os.path' has no attribute 'realpath' |
-| `test_urllib_response.py` | ok / 53.7 ms | exit 1 / 448.3 ms | hydro_fail | error[HYD0101]: name 'super' is not defined |
-| `test_urllibnet.py` | ok / 7746.8 ms | exit 1 / 976.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_urlparse.py` | ok / 132.5 ms | exit 1 / 563.3 ms | hydro_fail | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
-| `test_userdict.py` | ok / 146.7 ms | exit 1 / 778.4 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_userlist.py` | ok / 136.8 ms | exit 1 / 780.5 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_userstring.py` | ok / 598.2 ms | exit 1 / 531.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_utf8_mode.py` | ok / 429.1 ms | exit 1 / 696.7 ms | hydro_fail | error[HYD0101]: name 'id' is not defined |
-| `test_utf8source.py` | ok / 43.4 ms | exit 1 / 5.1 ms | hydro_fail | error[HYD0101]: name 'compile' is not defined |
-| `test_uuid.py` | ok / 274.3 ms | exit 1 / 591.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_venv.py` | exit 1 / 6904.5 ms | exit 1 / 653.6 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_wait3.py` | ok / 5065.9 ms | exit 1 / 745.3 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_wait4.py` | ok / 5057.7 ms | exit 1 / 748 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_wave.py` | ok / 70.8 ms | exit 1 / 493.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_weakref.py` | exit 1 / 2509.3 ms | exit 1 / 797.7 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_weakset.py` | ok / 73.1 ms | exit 1 / 556 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_webbrowser.py` | ok / 2277.3 ms | exit 1 / 661.8 ms | hydro_fail | error[HYD0201]: module 'io' has no attribute 'StringIO' |
-| `test_winapi.py` | exit 1 / 63.8 ms | exit 1 / 924.1 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_winconsoleio.py` | exit 1 / 64.9 ms | exit 1 / 523.6 ms | expected_fail | error[HYD0002]: module '_testconsole' not found: not supported on the import search path |
-| `test_winreg.py` | exit 1 / 75.4 ms | exit 1 / 570.9 ms | expected_fail | error[HYD0002]: module 'winreg' not found: not supported on the import search path |
-| `test_winsound.py` | exit 1 / 57.5 ms | exit 1 / 902.2 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_with.py` | ok / 53.1 ms | exit 1 / 132.6 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'stat' |
-| `test_wmi.py` | exit 1 / 50.9 ms | exit 1 / 757.8 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_wsgiref.py` | ok / 222.5 ms | exit 1 / 873.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `test_xml_dom_minicompat.py` | ok / 55.4 ms | exit 1 / 107.1 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_xml_dom_xmlbuilder.py` | ok / 172.7 ms | exit 1 / 807.2 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
-| `test_xml_etree.py` | ok / 803.4 ms | exit 1 / 783.6 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
-| `test_xml_etree_c.py` | ok / 516.8 ms | exit 1 / 473.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_xmlrpc.py` | ok / 27422.6 ms | exit 1 / 972.7 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
-| `test_xpickle.py` | ok / 2241.4 ms | exit 1 / 903.5 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_xxlimited.py` | exit 1 / 51.5 ms | exit 1 / 817.7 ms | expected_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_xxtestfuzz.py` | ok / 55 ms | exit 1 / 455.8 ms | hydro_fail | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
-| `test_yield_from.py` | ok / 54 ms | exit 1 / 757.7 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_zipapp.py` | ok / 149.5 ms | exit 1 / 713 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_zipfile64.py` | timeout / 30029.6 ms | exit 1 / 547.4 ms | expected_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_zipimport.py` | ok / 18909.9 ms | exit 1 / 949.1 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_zipimport_support.py` | ok / 511.4 ms | exit 1 / 825.3 ms | hydro_fail | error[HYD0002]: module '_struct' not found: not supported on the import search path |
-| `test_zlib.py` | ok / 419.9 ms | exit 1 / 801.8 ms | hydro_fail | error[HYD0002]: class body may only contain method definitions, field declarations and attributes (plus pass… |
-| `test_zstd.py` | ok / 375.7 ms | exit 1 / 550.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test___all__.py` | ok / 2064.3 ms | exit 1 / 26.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test__colorize.py` | ok / 111.5 ms | exit 1 / 42.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test__interpchannels.py` | ok / 870.6 ms | exit 1 / 49.8 ms | hydro_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
+| `test__interpreters.py` | ok / 634.4 ms | exit 1 / 38.2 ms | hydro_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
+| `test__locale.py` | ok / 50.7 ms | exit 1 / 29.4 ms | hydro_fail | error[HYD0002]: module '_locale' not found: not supported on the import search path |
+| `test__opcode.py` | ok / 46.8 ms | exit 1 / 66.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test__osx_support.py` | ok / 49.3 ms | exit 1 / 28.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_abc.py` | ok / 44.7 ms | exit 1 / 8.9 ms | hydro_fail | error[HYD0002]: pytest fixture 'abc_ABCMeta' is not defined |
+| `test_abstract_numbers.py` | ok / 43.1 ms | exit 1 / 52.4 ms | hydro_fail | AssertionError: 7 test(s) failed |
+| `test_android.py` | exit 1 / 105.8 ms | exit 1 / 40.6 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_annotationlib.py` | ok / 67.5 ms | exit 1 / 35.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_apple.py` | exit 1 / 101 ms | exit 1 / 39.9 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_argparse.py` | ok / 1325.6 ms | exit 1 / 57.9 ms | hydro_fail | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
+| `test_array.py` | ok / 287.3 ms | exit 1 / 41.2 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_asdl_parser.py` | exit 1 / 31.6 ms | exit 1 / 3.5 ms | expected_fail | error[HYD0201]: module 'importlib.util' has no attribute 'spec_from_loader' |
+| `test_asyncgen.py` | ok / 834.2 ms | exit 1 / 31.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_atexit.py` | exit 1 / 117.3 ms | exit 1 / 38.7 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_audit.py` | ok / 1474.3 ms | exit 1 / 28.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_augassign.py` | ok / 42.9 ms | exit 1 / 39.7 ms | hydro_fail | AssertionError: 3 test(s) failed |
+| `test_base64.py` | ok / 143.8 ms | exit 1 / 39.6 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_baseexception.py` | ok / 52.6 ms | exit 1 / 27.1 ms | hydro_fail | AssertionError: 11 test(s) failed |
+| `test_bdb.py` | exit 1 / 67.1 ms | exit 1 / 62.4 ms | expected_fail | error[HYD0201]: module 'sys' has no attribute 'monitoring' |
+| `test_bigaddrspace.py` | ok / 43.6 ms | exit 1 / 25.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_bigmem.py` | ok / 61.3 ms | exit 1 / 31.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_binascii.py` | ok / 53.5 ms | exit 1 / 31.4 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_binop.py` | ok / 42.3 ms | exit -6 / 246.6 ms | hydro_fail | fatal runtime error: stack overflow, aborting |
+| `test_bisect.py` | ok / 67.3 ms | exit 1 / 30.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_bool.py` | ok / 48.7 ms | exit 1 / 28.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_buffer.py` | ok / 78.4 ms | exit 1 / 37.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_bufio.py` | ok / 141.6 ms | exit 1 / 31.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_build_details.py` | exit 1 / 120.5 ms | exit 1 / 29.1 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_builtin.py` | ok / 365 ms | exit 1 / 58.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_bytes.py` | exit 1 / 88.2 ms | exit 1 / 54 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_bz2.py` | ok / 361 ms | exit 1 / 30.1 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_c_locale_coercion.py` | ok / 807 ms | exit 1 / 45 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_calendar.py` | ok / 1369.5 ms | exit 1 / 154.2 ms | hydro_fail | error[HYD0101]: name 'FEBRUARY' is not defined |
+| `test_call.py` | exit 1 / 57.2 ms | exit 1 / 32 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_charmapcodec.py` | ok / 41.2 ms | exit 1 / 2.5 ms | hydro_fail | error[HYD0201]: module 'codecs' has no attribute 'register' |
+| `test_class.py` | ok / 59 ms | exit 1 / 27.3 ms | hydro_fail | error[HYD0002]: module '_testinternalcapi' not found: not supported on the import search path |
+| `test_clinic.py` | ok / 213.4 ms | exit 1 / 42.7 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_cmath.py` | ok / 85.3 ms | exit 1 / 35 ms | hydro_fail | error[HYD0002]: module 'cmath' not found: not supported on the import search path |
+| `test_cmd.py` | ok / 198.4 ms | exit 1 / 52.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_cmd_line.py` | exit 1 / 1752.9 ms | exit 1 / 43 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_cmd_line_script.py` | exit 1 / 1293.9 ms | exit 1 / 40.9 ms | expected_fail | error[HYD0002]: module '_frozen_importlib_external' not found: not supported on the import search path |
+| `test_code.py` | ok / 207.7 ms | exit 1 / 68.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_code_module.py` | ok / 131.1 ms | exit 1 / 28.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_codeccallbacks.py` | ok / 56.1 ms | exit 1 / 141.2 ms | hydro_fail | error[HYD0201]: module '_codecs' has no attribute '_unregister_error' |
+| `test_codecencodings_cn.py` | ok / 119.6 ms | exit 1 / 144.3 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecencodings_hk.py` | ok / 98.1 ms | exit 1 / 148.1 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecencodings_iso2022.py` | ok / 137.3 ms | exit 1 / 155 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecencodings_jp.py` | ok / 159.4 ms | exit 1 / 145.9 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecencodings_kr.py` | ok / 110.7 ms | exit 1 / 147.5 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecencodings_tw.py` | ok / 137.9 ms | exit 1 / 145 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecmaps_cn.py` | ok / 170.3 ms | exit 1 / 145.2 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecmaps_hk.py` | ok / 109.5 ms | exit 1 / 143.1 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecmaps_jp.py` | ok / 175 ms | exit 1 / 149.9 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecmaps_kr.py` | ok / 169.6 ms | exit 1 / 142.9 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecmaps_tw.py` | ok / 140.3 ms | exit 1 / 144.4 ms | hydro_fail | error[HYD0103]: sub() does not accept keyword arguments |
+| `test_codecs.py` | ok / 308.9 ms | exit 1 / 51.8 ms | hydro_fail | error[HYD0201]: module 'codecs' has no attribute 'code_page_encode' |
+| `test_codeop.py` | ok / 51.3 ms | exit 1 / 28 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_collections.py` | ok / 1102.4 ms | exit 1 / 57 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_colorsys.py` | ok / 42.6 ms | exit 1 / 23.9 ms | hydro_fail | AssertionError: 8 test(s) failed |
+| `test_compare.py` | ok / 52.9 ms | exit 1 / 26.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_compile.py` | ok / 2353.9 ms | exit 1 / 47 ms | hydro_fail | error[HYD0002]: module '_ast' not found: not supported on the import search path |
+| `test_compileall.py` | exit 1 / 65.1 ms | exit 1 / 181 ms | expected_fail | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
+| `test_compiler_assemble.py` | ok / 35.4 ms | exit 1 / 62.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_compiler_codegen.py` | ok / 37.6 ms | exit 1 / 30.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_complex.py` | ok / 64.9 ms | exit 1 / 28 ms | hydro_fail | error[HYD0002]: module 'cmath' not found: not supported on the import search path |
+| `test_configparser.py` | ok / 395.9 ms | exit 1 / 71.2 ms | hydro_fail | error[HYD0201]: module 'io' has no attribute 'text_encoding' |
+| `test_contains.py` | ok / 44.7 ms | exit 1 / 25.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_context.py` | ok / 538.3 ms | exit 1 / 30.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_contextlib.py` | ok / 69.3 ms | exit 1 / 31.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_contextlib_async.py` | ok / 70.2 ms | exit 1 / 32.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_copy.py` | ok / 74 ms | exit 1 / 38.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_copyreg.py` | ok / 79.2 ms | exit 1 / 65.8 ms | hydro_fail | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
+| `test_coroutines.py` | ok / 272.7 ms | exit 1 / 54.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_cprofile.py` | ok / 503.9 ms | exit 1 / 46.3 ms | hydro_fail | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
+| `test_crossinterp.py` | exit 1 / 52 ms | exit 1 / 28.6 ms | expected_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
+| `test_csv.py` | ok / 240 ms | exit 1 / 42.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_curses.py` | ok / 285.4 ms | exit 1 / 46.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_datetime.py` | ok / 18371.2 ms | exit 1 / 28 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_dbm.py` | ok / 408.5 ms | exit 1 / 28.3 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'fsencode' |
+| `test_dbm_dumb.py` | ok / 65.7 ms | exit 1 / 26.9 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'fsencode' |
+| `test_dbm_gnu.py` | exit 1 / 47.3 ms | exit 1 / 28.2 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_dbm_ndbm.py` | ok / 104.3 ms | exit 1 / 25.3 ms | hydro_fail | error[HYD0002]: module '_dbm' not found: not supported on the import search path |
+| `test_dbm_sqlite3.py` | ok / 537.3 ms | exit 1 / 26.5 ms | hydro_fail | error[HYD0002]: module '_sqlite3' not found: not supported on the import search path |
+| `test_decimal.py` | ok / 1850.4 ms | exit 1 / 53.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_decorators.py` | ok / 48.5 ms | exit 1 / 55 ms | hydro_fail | AssertionError: 11 test(s) failed |
+| `test_defaultdict.py` | ok / 46.3 ms | exit 1 / 19.6 ms | hydro_fail | error[HYD0103]: defaultdict() got an unexpected keyword argument 'foo' |
+| `test_deque.py` | ok / 353.9 ms | exit 1 / 54.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_descr.py` | exit 1 / 293 ms | exit 1 / 63 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_descrtut.py` | ok / 140.9 ms | exit 1 / 52.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_devpoll.py` | exit 1 / 36.5 ms | exit 1 / 26.4 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_dict.py` | ok / 288.6 ms | exit 1 / 43.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_dictcomps.py` | ok / 46.1 ms | exit 1 / 26.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_dictviews.py` | ok / 133.4 ms | exit 1 / 39.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_difflib.py` | ok / 267.2 ms | exit 1 / 55.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_dis.py` | ok / 207.3 ms | exit 1 / 70.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_docxmlrpc.py` | ok / 4656.3 ms | exit 1 / 78.4 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_dtrace.py` | exit 1 / 53 ms | exit 1 / 33.5 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_dynamic.py` | ok / 46.2 ms | exit 1 / 25.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_dynamicclassattribute.py` | ok / 42.8 ms | exit 1 / 5.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'skipIf' |
+| `test_eintr.py` | exit 1 / 83.3 ms | exit 1 / 35.8 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_embed.py` | ok / 61.1 ms | exit 1 / 33.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_ensurepip.py` | ok / 149.2 ms | exit 1 / 42.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_enum.py` | exit 1 / 539.1 ms | exit 1 / 85.8 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_enumerate.py` | ok / 72.2 ms | exit 1 / 26.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_eof.py` | ok / 288.8 ms | exit 1 / 43.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_epoll.py` | ok / 153.2 ms | exit 1 / 25.7 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_errno.py` | ok / 45.7 ms | ok / 8.3 ms | hydro_pass | - |
+| `test_except_star.py` | ok / 57.7 ms | exit 1 / 30.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_exception_group.py` | ok / 258.1 ms | exit 1 / 29 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_exception_hierarchy.py` | ok / 43.2 ms | exit 1 / 5 ms | hydro_fail | error[HYD0201]: module 'errno' has no attribute 'EEXIST' |
+| `test_exception_variations.py` | ok / 43.6 ms | exit 1 / 35.7 ms | hydro_fail | AssertionError: 8 test(s) failed |
+| `test_exceptions.py` | exit 1 / 895.9 ms | exit 1 / 54.8 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_extcall.py` | exit 1 / 133.8 ms | exit 1 / 40.7 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_external_inspection.py` | ok / 1343.4 ms | exit 1 / 54.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_faulthandler.py` | ok / 18621.7 ms | exit 1 / 40 ms | hydro_fail | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
+| `test_fcntl.py` | ok / 193.2 ms | exit 1 / 28.7 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_file.py` | ok / 81.3 ms | exit 1 / 30 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_file_eintr.py` | ok / 1397.6 ms | exit 1 / 31 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_filecmp.py` | ok / 61.6 ms | exit 1 / 28.6 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'curdir' |
+| `test_fileinput.py` | ok / 126.4 ms | exit 1 / 35.7 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'flags' |
+| `test_fileio.py` | ok / 666.3 ms | exit 1 / 42.2 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_fileutils.py` | ok / 124.5 ms | exit 1 / 29 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_finalization.py` | ok / 105.7 ms | exit 1 / 35.3 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_float.py` | ok / 83.1 ms | exit 1 / 30.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_flufl.py` | ok / 40.9 ms | exit 1 / 2.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'CO_FUTURE_BARRY_AS_BDFL' |
+| `test_fnmatch.py` | ok / 43.3 ms | exit 1 / 13.7 ms | hydro_fail | error[HYD0201]: module 'fnmatch' has no attribute '_translate' |
+| `test_fork1.py` | ok / 5130.8 ms | exit 1 / 29.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_format.py` | ok / 56.7 ms | exit 1 / 30.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_fractions.py` | ok / 70 ms | exit 1 / 32.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_frame.py` | exit 1 / 967.5 ms | exit 1 / 52.8 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_frozen.py` | ok / 47.4 ms | exit 1 / 27.5 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_fstring.py` | exit 1 / 380.1 ms | exit 1 / 4.3 ms | expected_fail | error[HYD0001]: invalid syntax: f-string: expressions nested too deeply |
+| `test_ftplib.py` | ok / 6867.9 ms | exit 1 / 49.6 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute '_GLOBAL_DEFAULT_TIMEOUT' |
+| `test_funcattrs.py` | ok / 50 ms | exit 1 / 26.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_functools.py` | ok / 357.8 ms | exit 1 / 56.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_gc.py` | exit 1 / 1493.1 ms | exit 1 / 50.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_generated_cases.py` | ok / 123.4 ms | exit 1 / 29.5 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_generator_stop.py` | ok / 40.3 ms | exit 1 / 8.3 ms | hydro_fail | AssertionError: 2 test(s) failed |
+| `test_generators.py` | ok / 179.2 ms | exit 1 / 55.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_genericalias.py` | ok / 160.2 ms | exit 1 / 92.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_genericclass.py` | ok / 47.5 ms | exit 1 / 29.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_genericpath.py` | ok / 53.9 ms | exit 1 / 39.5 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'lstat' |
+| `test_genexps.py` | ok / 130.3 ms | exit 1 / 39.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_getopt.py` | ok / 159.2 ms | exit 1 / 54.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_getpass.py` | ok / 123.3 ms | exit 1 / 26.9 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'O_NOCTTY' |
+| `test_getpath.py` | ok / 47.5 ms | exit 1 / 41.9 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'lstat' |
+| `test_gettext.py` | exit 1 / 149.7 ms | exit 1 / 49.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_glob.py` | ok / 105.4 ms | exit 1 / 35.2 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `test_global.py` | ok / 46.8 ms | exit 1 / 25.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_grammar.py` | ok / 70.5 ms | exit 1 / 5.2 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token ',' |
+| `test_graphlib.py` | ok / 82.6 ms | exit 1 / 39.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_grp.py` | ok / 243 ms | exit 1 / 33.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_gzip.py` | ok / 821.4 ms | exit 1 / 40.5 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_hash.py` | ok / 279.1 ms | exit 1 / 40.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_hashlib.py` | ok / 13295.6 ms | exit 1 / 58.8 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_heapq.py` | ok / 236.1 ms | exit 1 / 54.3 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_hmac.py` | ok / 162.6 ms | exit 1 / 45.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_html.py` | ok / 45.3 ms | exit 1 / 13.7 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_htmlparser.py` | ok / 428.5 ms | exit 1 / 48.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_http_cookiejar.py` | ok / 307.8 ms | exit 1 / 66 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_http_cookies.py` | ok / 576.8 ms | exit 1 / 58.3 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_httplib.py` | ok / 3490.9 ms | exit 1 / 55.6 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_httpservers.py` | ok / 4144 ms | exit 1 / 266 ms | hydro_fail | error[HYD0201]: module 'math' has no attribute 'isqrt' |
+| `test_idle.py` | ok / 9570.5 ms | exit 1 / 29.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_imaplib.py` | timeout / 30003.2 ms | exit 1 / 47.7 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_index.py` | ok / 46.2 ms | exit 1 / 26.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_int.py` | ok / 21089.6 ms | exit 1 / 28.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_int_literal.py` | ok / 40.4 ms | ok / 14.9 ms | hydro_pass | - |
+| `test_io.py` | exit 1 / 27815.9 ms | exit 1 / 52.5 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_ioctl.py` | ok / 550.8 ms | exit 1 / 25.6 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_ipaddress.py` | ok / 90.1 ms | exit 1 / 115.3 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_isinstance.py` | ok / 775.3 ms | exit 1 / 25.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_iter.py` | ok / 57.3 ms | exit 1 / 29.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_iterlen.py` | ok / 40.4 ms | exit 1 / 4.7 ms | hydro_fail | error[HYD0201]: module 'operator' has no attribute 'length_hint' |
+| `test_itertools.py` | ok / 777.4 ms | exit 1 / 69.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_keyword.py` | ok / 42.5 ms | exit 1 / 15.4 ms | hydro_fail | AssertionError: 6 test(s) failed |
+| `test_keywordonlyarg.py` | ok / 46.7 ms | exit 1 / 5.6 ms | hydro_fail | error[HYD0103]: keywordonly_sum() got an unexpected keyword argument 'non_existing_arg' |
+| `test_kqueue.py` | exit 1 / 40.9 ms | exit 1 / 26.5 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_largefile.py` | ok / 1245 ms | exit 1 / 35.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_launcher.py` | exit 1 / 60 ms | exit 1 / 23.6 ms | expected_fail | error[HYD0002]: module 'winreg' not found: not supported on the import search path |
+| `test_linecache.py` | ok / 107.1 ms | exit 1 / 53.7 ms | hydro_fail | error[HYD0002]: module '_frozen_importlib_external' not found: not supported on the import search path |
+| `test_list.py` | ok / 364.3 ms | exit 1 / 40.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_listcomps.py` | ok / 149.3 ms | exit 1 / 57.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_lltrace.py` | ok / 52.3 ms | exit 1 / 79 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_locale.py` | ok / 137.7 ms | exit 1 / 30.3 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_logging.py` | ok / 21931.4 ms | exit 1 / 106.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_long.py` | ok / 474.9 ms | exit 1 / 27.6 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_longexp.py` | ok / 102.5 ms | ok / 6.3 ms | hydro_pass | - |
+| `test_lzma.py` | ok / 178.5 ms | exit 1 / 31.7 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_mailbox.py` | ok / 1262.2 ms | exit 1 / 154.2 ms | hydro_fail | error[HYD0201]: module 'math' has no attribute 'isqrt' |
+| `test_marshal.py` | ok / 211.6 ms | exit 1 / 42.1 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_math.py` | ok / 9072.1 ms | exit 1 / 35.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_math_property.py` | ok / 38.1 ms | exit 1 / 32.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_memoryio.py` | ok / 69.6 ms | exit 1 / 34.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_memoryview.py` | ok / 307.8 ms | exit 1 / 29.8 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_metaclass.py` | ok / 131.7 ms | exit 1 / 41.1 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_mimetypes.py` | ok / 418 ms | exit 1 / 49.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_minidom.py` | ok / 93.7 ms | exit 1 / 34.4 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_mmap.py` | ok / 109.3 ms | exit 1 / 43.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_modulefinder.py` | ok / 278.3 ms | exit 1 / 175.5 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
+| `test_monitoring.py` | ok / 61.3 ms | exit 1 / 80 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_msvcrt.py` | exit 1 / 32.1 ms | exit 1 / 23.3 ms | expected_fail | error[HYD0002]: module '_winapi' not found: not supported on the import search path |
+| `test_multibytecodec.py` | ok / 223.4 ms | exit 1 / 25.7 ms | hydro_fail | error[HYD0002]: module '_multibytecodec' not found: not supported on the import search path |
+| `test_multiprocessing_main_handling.py` | exit 1 / 1273.2 ms | exit 1 / 41 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_named_expressions.py` | ok / 51.3 ms | exit 1 / 28.4 ms | hydro_fail | error[HYD0002]: assignment expressions inside a generator expression are not supported |
+| `test_netrc.py` | ok / 51.2 ms | exit 1 / 27.1 ms | hydro_fail | error[HYD0201]: module 'os.path' has no attribute 'expanduser' |
+| `test_ntpath.py` | ok / 274.7 ms | exit 1 / 47.3 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'lstat' |
+| `test_nturl2path.py` | ok / 60.5 ms | exit 1 / 126.5 ms | hydro_fail | error[HYD0201]: module 'math' has no attribute 'isqrt' |
+| `test_numeric_tower.py` | ok / 67.2 ms | exit 1 / 4.9 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'hash_info' |
+| `test_opcache.py` | ok / 277 ms | exit 1 / 82.3 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_opcodes.py` | ok / 46.3 ms | exit 1 / 24.5 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_openpty.py` | ok / 36.3 ms | exit 1 / 2 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'openpty' |
+| `test_operator.py` | ok / 61.2 ms | exit 1 / 37.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_optimizer.py` | ok / 41.8 ms | exit 1 / 28.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_optparse.py` | ok / 127.4 ms | exit 1 / 50 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_ordered_dict.py` | ok / 155.6 ms | exit 1 / 41.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_os.py` | exit 1 / 12655.8 ms | exit 1 / 55.8 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_osx_env.py` | ok / 44.8 ms | exit 1 / 27.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_patma.py` | exit 1 / 49.1 ms | exit 1 / 40.4 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_pdb.py` | exit 1 / 17455 ms | exit 1 / 105.6 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_peepholer.py` | ok / 343 ms | exit 1 / 68.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_pep646_syntax.py` | ok / 222.7 ms | exit 1 / 41.4 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_perf_profiler.py` | ok / 401 ms | exit 1 / 42.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_perfmaps.py` | ok / 95.5 ms | exit 1 / 6.5 ms | hydro_fail | ModuleNotFoundError: No module named '_testinternalcapi' |
+| `test_pickle.py` | ok / 2082.2 ms | exit 1 / 96.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_picklebuffer.py` | ok / 123.6 ms | exit 1 / 36.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_pickletools.py` | ok / 545 ms | exit 1 / 86.5 ms | hydro_fail | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
+| `test_pkg.py` | ok / 121.1 ms | exit 1 / 6.3 ms | hydro_fail | error[HYD0201]: module 'os.path' has no attribute 'islink' |
+| `test_pkgutil.py` | exit 1 / 138.3 ms | exit 1 / 47.2 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_platform.py` | ok / 427.7 ms | exit 1 / 41.5 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_plistlib.py` | ok / 231.3 ms | exit 1 / 33.7 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_poll.py` | ok / 11257.1 ms | exit 1 / 28.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_popen.py` | ok / 158.1 ms | exit 1 / 24.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_poplib.py` | ok / 5917.2 ms | exit 1 / 38.8 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `test_positional_only_arg.py` | ok / 132.8 ms | exit 1 / 65.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_posix.py` | exit 1 / 839.7 ms | exit 1 / 46.2 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_posixpath.py` | ok / 332.8 ms | exit 1 / 50 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'lstat' |
+| `test_pow.py` | ok / 244.7 ms | exit 1 / 5 ms | hydro_fail | error[HYD0101]: name 'pow' is not defined |
+| `test_pprint.py` | ok / 162.9 ms | exit 1 / 42.2 ms | hydro_fail | error[HYD0201]: module 'dataclasses' has no attribute 'is_dataclass' |
+| `test_print.py` | ok / 125 ms | exit 1 / 26.7 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_profile.py` | ok / 288 ms | exit 1 / 147.5 ms | hydro_fail | error[HYD0201]: module 'functools' has no attribute 'cmp_to_key' |
+| `test_property.py` | ok / 89.2 ms | exit 1 / 26.3 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_pstats.py` | ok / 158.5 ms | exit 1 / 32.7 ms | hydro_fail | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
+| `test_pty.py` | ok / 107.5 ms | exit 1 / 30.4 ms | hydro_fail | error[HYD0002]: module 'termios' not found: not supported on the import search path |
+| `test_pulldom.py` | ok / 161.1 ms | exit 1 / 153 ms | hydro_fail | error[HYD0201]: module 'math' has no attribute 'isqrt' |
+| `test_pwd.py` | ok / 98.7 ms | exit 1 / 31.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_py_compile.py` | ok / 330.1 ms | exit 1 / 180.9 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
+| `test_pyclbr.py` | exit 1 / 97.2 ms | exit 1 / 31.2 ms | expected_fail | error[HYD0201]: module 'importlib.util' has no attribute '_find_spec_from_path' |
+| `test_pyexpat.py` | ok / 278.1 ms | exit 1 / 29.2 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_queue.py` | ok / 7904.4 ms | exit 1 / 38.5 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_quopri.py` | ok / 131.4 ms | exit 1 / 25 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_raise.py` | ok / 85.1 ms | exit 1 / 26.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_random.py` | ok / 748.5 ms | exit 1 / 51.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_range.py` | ok / 202.4 ms | exit 1 / 36.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_re.py` | ok / 432.4 ms | exit 1 / 38 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_readline.py` | ok / 241.7 ms | exit 1 / 39.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_regrtest.py` | exit 1 / 1411.1 ms | exit 1 / 80 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_remote_pdb.py` | ok / 2377.2 ms | exit 1 / 60.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_repl.py` | ok / 927.2 ms | exit 1 / 40.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_reprlib.py` | ok / 77.9 ms | exit 1 / 32.3 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_resource.py` | ok / 97.6 ms | exit 1 / 31.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_richcmp.py` | ok / 42.4 ms | exit 1 / 25.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_rlcompleter.py` | ok / 108.7 ms | exit 1 / 40.4 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_robotparser.py` | ok / 1413.4 ms | exit 1 / 58.5 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
+| `test_runpy.py` | timeout / 30010.9 ms | exit 1 / 70.3 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_sax.py` | ok / 189.3 ms | exit 1 / 60.2 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_sched.py` | ok / 584.8 ms | exit 1 / 27.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_scope.py` | ok / 48.2 ms | exit 1 / 35.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_script_helper.py` | ok / 196.6 ms | exit 1 / 43.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_secrets.py` | ok / 38 ms | exit 1 / 5.6 ms | hydro_fail | error[HYD0201]: module '_operator' has no attribute '_compare_digest' |
+| `test_select.py` | ok / 1554.5 ms | exit 1 / 26 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_selectors.py` | ok / 14649.3 ms | exit 1 / 42.6 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_set.py` | ok / 734.8 ms | exit 1 / 44 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_setcomps.py` | ok / 115.1 ms | exit 1 / 52 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_shelve.py` | ok / 2487.4 ms | exit 1 / 31.4 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'fsencode' |
+| `test_shlex.py` | ok / 148.8 ms | exit 1 / 45.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_shutil.py` | exit 1 / 454.7 ms | exit 1 / 66.8 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_signal.py` | exit 1 / 29584.1 ms | exit 1 / 38.8 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_site.py` | ok / 2580.6 ms | exit 1 / 67.7 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_slice.py` | ok / 90.9 ms | exit 1 / 39.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_smtplib.py` | ok / 1478.4 ms | exit 1 / 78.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_smtpnet.py` | ok / 9856.6 ms | exit 1 / 46.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_socket.py` | timeout / 30020.9 ms | exit 1 / 47.8 ms | expected_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_socketserver.py` | ok / 480.3 ms | exit 1 / 33.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_sort.py` | ok / 70.7 ms | exit 1 / 25.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_source_encoding.py` | ok / 12426 ms | exit 1 / 40.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_ssl.py` | ok / 19404 ms | exit 1 / 86.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_stable_abi_ctypes.py` | exit 1 / 117.6 ms | exit 1 / 27.9 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_startfile.py` | exit 1 / 110.8 ms | exit 1 / 26.4 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_stat.py` | ok / 142.1 ms | exit 1 / 28.3 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_statistics.py` | ok / 9524.7 ms | exit 1 / 62.4 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_str.py` | ok / 1114.9 ms | exit 1 / 52.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_strftime.py` | ok / 153.7 ms | exit 1 / 140.9 ms | hydro_fail | error[HYD0101]: name 'FEBRUARY' is not defined |
+| `test_string_literals.py` | ok / 123.6 ms | exit 1 / 58 ms | hydro_fail | AssertionError: 19 test(s) failed |
+| `test_stringprep.py` | ok / 109.1 ms | exit 1 / 28.6 ms | hydro_fail | error[HYD0201]: module 'unicodedata' has no attribute 'ucd_3_2_0' |
+| `test_strptime.py` | ok / 150 ms | exit 1 / 35.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_strtod.py` | ok / 226.2 ms | exit 1 / 27 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_struct.py` | ok / 374.6 ms | exit 1 / 38.1 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_structseq.py` | ok / 155.2 ms | exit 1 / 52.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_subclassinit.py` | ok / 115.7 ms | exit 1 / 5.5 ms | hydro_fail | error[HYD0002]: class keyword 'otherarg' cannot be forwarded together with metaclass=; Hydro's metaclass hook… |
+| `test_subprocess.py` | exit 1 / 15970.8 ms | exit 1 / 53.6 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_sundry.py` | ok / 104.2 ms | exit 1 / 28.7 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_super.py` | ok / 211.4 ms | exit 1 / 45.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_support.py` | exit 1 / 4743.8 ms | exit 1 / 39.6 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_symtable.py` | ok / 58.9 ms | exit 1 / 30.6 ms | hydro_fail | error[HYD0002]: module '_symtable' not found: not supported on the import search path |
+| `test_syntax.py` | ok / 176.3 ms | exit 1 / 52.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_sys.py` | exit 1 / 1189.1 ms | exit 1 / 53.1 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_sys_setprofile.py` | ok / 43 ms | exit 1 / 22 ms | hydro_fail | error[HYD0201]: module 'dataclasses' has no attribute 'is_dataclass' |
+| `test_sys_settrace.py` | ok / 776.6 ms | exit 1 / 36.5 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_sysconfig.py` | exit 1 / 191.2 ms | exit 1 / 32.9 ms | expected_fail | error[HYD0002]: module '_sysconfig' not found: not supported on the import search path |
+| `test_syslog.py` | ok / 177.3 ms | exit 1 / 32 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_tabnanny.py` | ok / 116.5 ms | exit 1 / 49 ms | hydro_fail | error[HYD0201]: module 'os.path' has no attribute 'islink' |
+| `test_tarfile.py` | exit 1 / 5316.1 ms | exit 1 / 76.2 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_tcl.py` | ok / 109.3 ms | exit 1 / 40.9 ms | hydro_fail | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `test_tempfile.py` | ok / 379.6 ms | exit 1 / 50.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_termios.py` | ok / 552.5 ms | exit 1 / 29.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_textwrap.py` | ok / 55.4 ms | exit 1 / 36.9 ms | hydro_fail | error[HYD0201]: module 'textwrap' has no attribute 'TextWrapper' |
+| `test_thread.py` | ok / 1273.7 ms | exit 1 / 32.5 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_thread_local_bytecode.py` | ok / 52.9 ms | exit 1 / 39.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_threadedtempfile.py` | ok / 51.1 ms | exit 1 / 26.3 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_threading.py` | exit 1 / 13972.4 ms | exit 1 / 46.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_threading_local.py` | ok / 304.4 ms | exit 1 / 55.8 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_threadsignals.py` | ok / 4892.2 ms | exit 1 / 28.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_time.py` | ok / 3077.9 ms | exit 1 / 33.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_timeit.py` | ok / 96.3 ms | exit 1 / 28.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_timeout.py` | ok / 9971.5 ms | exit 1 / 26.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_tokenize.py` | ok / 6217.1 ms | exit 1 / 52.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_trace.py` | ok / 920.9 ms | exit 1 / 46.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_traceback.py` | exit 1 / 2105.5 ms | exit 1 / 60.4 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_tracemalloc.py` | ok / 640.5 ms | exit 1 / 51.3 ms | hydro_fail | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
+| `test_tstring.py` | exit 1 / 275.7 ms | exit 1 / 39.7 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_ttk_textonly.py` | ok / 72.8 ms | exit 1 / 38.6 ms | hydro_fail | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `test_tty.py` | ok / 47.4 ms | exit 1 / 29.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_tuple.py` | ok / 223.2 ms | exit 1 / 28.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_turtle.py` | ok / 199.9 ms | exit 1 / 45.9 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_type_aliases.py` | ok / 53.4 ms | exit 1 / 27.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_type_annotations.py` | ok / 48.4 ms | exit 1 / 30.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_type_cache.py` | exit 1 / 46.8 ms | exit 1 / 64.4 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_type_comments.py` | ok / 50.7 ms | exit 1 / 29.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_type_params.py` | ok / 54.3 ms | exit 1 / 6.2 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token '=' |
+| `test_typechecks.py` | ok / 40.2 ms | exit 1 / 17.2 ms | hydro_fail | AssertionError: 4 test(s) failed |
+| `test_types.py` | ok / 236.5 ms | exit 1 / 54.4 ms | hydro_fail | error[HYD0002]: module '_datetime' not found: not supported on the import search path |
+| `test_typing.py` | ok / 379.8 ms | exit 1 / 69.2 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_ucn.py` | ok / 133.7 ms | exit 1 / 46.5 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
+| `test_unary.py` | ok / 40.9 ms | exit 1 / 10.7 ms | hydro_fail | AssertionError: 2 test(s) failed |
+| `test_unicode_file.py` | ok / 46.2 ms | exit 1 / 34.6 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `test_unicode_file_functions.py` | ok / 67.8 ms | exit 1 / 26 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_unicode_identifiers.py` | ok / 43.5 ms | exit 1 / 6.5 ms | hydro_fail | AssertionError: 3 test(s) failed |
+| `test_unicodedata.py` | ok / 4260.3 ms | exit 1 / 64.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_univnewlines.py` | ok / 58.1 ms | exit 1 / 144.5 ms | hydro_fail | error[HYD0201]: module 'io' has no attribute '__all__' |
+| `test_unpack.py` | exit 1 / 141.5 ms | exit 1 / 42 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_unpack_ex.py` | exit 1 / 144.4 ms | exit 1 / 41.2 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_unparse.py` | ok / 5920.7 ms | exit 1 / 27.1 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_urllib.py` | ok / 333.4 ms | exit 1 / 150 ms | hydro_fail | error[HYD0201]: module 'math' has no attribute 'isqrt' |
+| `test_urllib2.py` | ok / 2011 ms | exit 1 / 67.4 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_urllib2_localnet.py` | ok / 2267.1 ms | exit 1 / 165.2 ms | hydro_fail | error[HYD0201]: module 'math' has no attribute 'isqrt' |
+| `test_urllib2net.py` | ok / 29698.9 ms | exit 1 / 56.7 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_urllib_response.py` | ok / 50.7 ms | exit 1 / 23.6 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
+| `test_urllibnet.py` | ok / 6828.2 ms | exit 1 / 54.7 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_urlparse.py` | ok / 122 ms | exit 1 / 127.3 ms | hydro_fail | error[HYD0201]: module 'math' has no attribute 'isqrt' |
+| `test_userdict.py` | ok / 125 ms | exit 1 / 28.5 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_userlist.py` | ok / 136.8 ms | exit 1 / 29.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_userstring.py` | ok / 543.1 ms | exit 1 / 36.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_utf8_mode.py` | ok / 397.2 ms | exit 1 / 40.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_utf8source.py` | ok / 43 ms | exit 1 / 7.2 ms | hydro_fail | AssertionError: 2 test(s) failed |
+| `test_uuid.py` | ok / 255 ms | exit 1 / 150.5 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_venv.py` | exit 1 / 6879 ms | exit 1 / 51.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_wait3.py` | ok / 5062.5 ms | exit 1 / 26.9 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_wait4.py` | ok / 5055.5 ms | exit 1 / 26.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_wave.py` | ok / 67.3 ms | exit 1 / 25.9 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_weakref.py` | exit 1 / 2402.9 ms | exit 1 / 68.1 ms | expected_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_weakset.py` | ok / 62 ms | exit 1 / 40.2 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_webbrowser.py` | ok / 2067.2 ms | exit 1 / 45.4 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `test_winapi.py` | exit 1 / 45.2 ms | exit 1 / 36.7 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_winconsoleio.py` | exit 1 / 47.8 ms | exit 1 / 24.6 ms | expected_fail | error[HYD0002]: module '_testconsole' not found: not supported on the import search path |
+| `test_winreg.py` | exit 1 / 45.3 ms | exit 1 / 25.7 ms | expected_fail | error[HYD0002]: module 'winreg' not found: not supported on the import search path |
+| `test_winsound.py` | exit 1 / 46.8 ms | exit 1 / 28 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_with.py` | ok / 42.5 ms | exit 1 / 13.7 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_wmi.py` | exit 1 / 46.3 ms | exit 1 / 28.3 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_wsgiref.py` | ok / 237.9 ms | exit 1 / 79.5 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_xml_dom_minicompat.py` | ok / 40.8 ms | exit 1 / 17.9 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'flags' |
+| `test_xml_dom_xmlbuilder.py` | ok / 167.6 ms | exit 1 / 59.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
+| `test_xml_etree.py` | ok / 813.5 ms | exit 1 / 53.5 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_xml_etree_c.py` | ok / 543.7 ms | exit 1 / 28.6 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_xmlrpc.py` | ok / 27447.6 ms | exit 1 / 90.1 ms | hydro_fail | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `test_xpickle.py` | ok / 2020.9 ms | exit 1 / 79.8 ms | hydro_fail | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
+| `test_xxlimited.py` | exit 1 / 40.6 ms | exit 1 / 28.2 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_xxtestfuzz.py` | ok / 53.8 ms | exit 1 / 24.8 ms | hydro_fail | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
+| `test_yield_from.py` | ok / 54.6 ms | exit 1 / 28.8 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_zipapp.py` | ok / 138.5 ms | exit 1 / 53.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_zipfile64.py` | timeout / 30030.1 ms | exit 1 / 39.9 ms | expected_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_zipimport.py` | ok / 18218.4 ms | exit 1 / 81.7 ms | hydro_fail | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `test_zipimport_support.py` | ok / 480.9 ms | exit 1 / 74.8 ms | hydro_fail | error[HYD0002]: module '_frozen_importlib_external' not found: not supported on the import search path |
+| `test_zlib.py` | ok / 391.8 ms | exit 1 / 32.4 ms | hydro_fail | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `test_zstd.py` | ok / 359.1 ms | exit 1 / 40.3 ms | hydro_fail | error[HYD0002]: module 'array' not found: not supported on the import search path |
 
 <!-- END GENERATED RESULTS -->

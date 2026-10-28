@@ -15,18 +15,18 @@ Hydro is a standalone Python runtime with an AOT compiler and toolchain
 One goal is broad Python compatibility, initially via a clearly
 defined subset (see `docs/TODO.md`).
 
-**Supported:** tagged values, containers, functions/closures, classes
-(single base), comprehensions, f-strings/formatting, exceptions,
-file I/O, user modules and packages, native stdlib modules, lazy generators,
-async generators and coroutines
-with a cooperative event loop and task groups, threads/processes/pool, and a
-precise-shadow-frame concurrent mark-&-sweep GC with a size-classed payload
-allocator.
+**Supported:** tagged values, containers, functions/closures, classes with C3
+multiple bases, metaclasses, `__prepare__`, `__set_name__`, class-header
+keywords, comprehensions, f-strings/formatting, exceptions, descriptor and
+`bytearray`/`memoryview` protocols, file I/O, user modules and packages,
+native stdlib modules, lazy/async generators and coroutines with a cooperative
+event loop and task groups, threads/processes/pool, and a precise-shadow-frame
+concurrent mark-&-sweep GC with a size-classed payload allocator.
 
-**Deliberately not (as of now):** the complete CPython stdlib,
-C extensions/C API, decorators, pattern matching, metaclasses,
-`bytearray`/`memoryview` and the complete CPython stdlib/ABI. Details in §10
-and `docs/TODO.md`.
+**Deliberately not (as of now):** the complete CPython stdlib/C-API semantics,
+user decorators and pattern matching in all forms, `except*` grouping and some
+dynamic descriptor/positional-only edge cases. Details in §10 and
+`docs/TODO.md`.
 
 ## 2. Components & Data Flow
 
@@ -525,9 +525,10 @@ built-in kinds), so the fallback never matches a user handler.
   `hydro_method` by receiver type and class chain; attributes via
   `hydro_getattr`/`hydro_setattr`. Instances expose `__class__`; classes expose
   their frozen attributes and `__name__`. Zero-argument
-  `super().__init__(...)` calls the direct base initializer; not supported:
-  other class decorators, metaclasses, `class` keywords, multiple inheritance,
-  other `super()` forms and the general descriptor protocol. Common user
+  `super().__init__(...)` calls the next initializer in the C3 MRO.
+  Metaclasses, `__prepare__`, `__set_name__`, class-header keywords, multiple
+  bases and the general descriptor protocol are implemented; some user
+  decorator/`super()` edge forms remain incomplete. Common user
   dunders (`__repr__`/`__str__`/`__len__`/`__contains__`/operators/`__call__`)
   are dispatched; otherwise instances render
   deterministically as `<ClassName object>` (no heap address), classes as
@@ -776,11 +777,12 @@ Central specification in `hydro_ir::stdlib` (`MODULES` in
 `dataclasses`, `datetime`, `typing`, `abc`, `types`, `itertools`,
 `ast`, `fractions`, `importlib` and `__future__`.
 
-Pure-Python standard library modules that need no native ABI are vendored
-verbatim from CPython 3.14.9 in the repository's `stdlib/` directory and are
-imported like any user module. `stdlib/enum.py` is the first such module: it
-replaces the former placeholder native `enum` module, so `Enum`/`IntEnum`/
-`IntFlag`, `auto()` and the metaclass machinery have CPython semantics. The
+Pure-Python standard library modules that need no native ABI are vendored from
+CPython 3.14.9 in the repository's `stdlib/` directory and imported like any
+user module. `stdlib/enum.py` is the first such module: it replaces the former
+placeholder native `enum` module, so `Enum`/`IntEnum`/`IntFlag`, `auto()` and
+the metaclass machinery follow CPython, with documented Hydro adaptations in
+the vendored file. The
 directory is a default import root; see the import search order above.
 `stdlib/LICENSE` holds the PSF License notice for the vendored files.
 
@@ -1380,17 +1382,20 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 ## 10. Verification and Documented Limits
 
 - `scripts/verify.sh`: fmt-check, clippy (`-D warnings`), build,
-  `cargo test --workspace`, E2E examples (JIT **and** AOT), negative tests
-  (diagnostics/tracebacks), GC threshold/stress.
+  **all-core `cargo nextest run --workspace`**, E2E examples (JIT **and**
+  AOT), negative tests (diagnostics/tracebacks), GC threshold/stress, fuzz
+  smoke and the offline CPython manifest check.
 - Test counts and the per-crate breakdown are canonical in
   [`AGENTS.md`](../AGENTS.md#current-state). E2E coverage
   includes, among others, formatting, classes, closures, lazy generators/coroutines
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
   socket echo, pathlib, build cache, `tea gc` and uv passthrough.
-- Generated stdlib import matrix (2026-10-26): **78/297 importable** (27
-  builtin/frozen, 46 pure, 5 extension; report in
-  [`COMPATIBILITY.md`](COMPATIBILITY.md)). `benchmarks/bench_all.py --only hydro`
+- Generated stdlib import matrix (2026-10-29): **128/297 importable** (30
+  builtin/frozen, 86 pure, 12 extension; report in
+  [`COMPATIBILITY.md`](COMPATIBILITY.md)). The official CPython `Lib/test`
+  differential baseline is **3/398** (`test_errno.py`, `test_int_literal.py`,
+  `test_longexp.py`); see [`CPYTHON_TESTS.md`](CPYTHON_TESTS.md). `benchmarks/bench_all.py --only hydro`
   runs at the default GC threshold; rich console/table/panel/rule rendering
   works and a native `rich.status.Status` shim covers `Console.status`.
   Precise roots removed the former live-value loss.
@@ -1404,20 +1409,15 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
 
 **Limits (deliberate, documented):**
 
-- **Language:** arbitrary-precision `int` is implemented via a tagged fast
-  path plus `BigInt`; `range` bounds and a few native i64 interfaces remain.
-  No general decorators (only
-  `property`/`classmethod`/`staticmethod` on methods and the ignored
-  `lru_cache`/`cache`/`wraps`/`abstractmethod`/`overload`/
-  `runtime_checkable`), pattern matching,
-  metaclasses, the general descriptor protocol, `except*`,
-  `bytearray`/`memoryview`; other `super()` forms; class namespace immutable. Multiple inheritance is approximated
-  by the first base (additional bases are ignored). General dynamic calls
-  combine at most one `*` operand, and `*args`/`**kwargs` (with named
-  keywords) forward through the runtime binder; compiled extension members
-  called with keywords and coroutine/generator calls with a dynamic
-  signature remain unsupported at runtime. Class constructors can bind
-  `**mapping`.
+- **Language:** arbitrary-precision `int` uses a tagged fast path plus
+  `BigInt`. Metaclasses, `__prepare__`, `__set_name__`, multiple bases (C3),
+  the general descriptor protocol and `bytearray`/`memoryview` are
+  implemented. Pattern matching, `except*`, some decorator/positional-only/
+  dict-view edge cases and some `super()` forms remain open. Dynamic calls
+  combine at most one `*` operand; `*args`/`**kwargs` with named keywords
+  forward through the runtime binder. Compiled-extension keyword calls and
+  dynamic-signature coroutine/generator calls remain limited; class
+  constructors can bind `**mapping`.
 - **Closures:** captured bindings are by value unless the outer function
   mutates them (or a descendant declares `nonlocal`), in which case the
   binding lives in a traced heap cell shared with every closure; lambdas close
@@ -1433,9 +1433,10 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   default mixed mode keeps the conservative fallback for Rust-side frames.
 - **Performance:** native module dispatch is fixed (thread-local spec cache).
   The precise root-frame bookkeeping currently makes generator resume the
-  weak spot; the default-GC benchmark records generator_sum at JIT 16.07 ms /
-  AOT 14.61 ms versus CPython 11.23 ms. String concatenation and float boxing
-  are otherwise improved. The x86_64 fiber switch remains register-only.
+  weak spot; the 2026-10-29 default-GC benchmark records generator_sum at JIT
+  17.63 ms / AOT 15.72 ms versus CPython 12.03 ms. String concatenation and
+  float boxing are otherwise improved. The x86_64 fiber switch remains
+  register-only.
 - **Nested imports:** declaration-only site-packages modules referenced
   only from nested blocks are preloaded after the import graph is complete
   and inserted before their importer; modules with executable top-level

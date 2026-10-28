@@ -7,6 +7,7 @@
 
 # Hydro build cache / project state (also test-created caches under crates/)
 .hydro/
+.tea/
 
 # Native artifacts from `tea build` (ad-hoc, in-tree output)
 *.o

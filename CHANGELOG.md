@@ -8,6 +8,21 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Changed — 2026-10-29 full compatibility and benchmark refresh
+
+- Full CPython 3.14.9 `Lib/test` differential run (398 tests, 742.6 s):
+  **3 passing** (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`),
+  332 `hydro_fail`, 63 `expected_fail`, 0 timeouts. The import matrix is
+  **128/297** modules.
+- Hydro micro suite rerun: 22 workloads pass; startup JIT/AOT 2.0/1.0 ms.
+  `bench_all.py --only hydro` medians: JIT 2.71×, AOT 5.27×, faster on 10/11
+  workloads. `sum_genexp` remains above the tracked regression threshold
+  (JIT 26.1 ms, AOT 19.4 ms vs CPython 12.4 ms), tracked under P5.
+- README/ARCHITECTURE/TODO/AGENTS no longer describe async generators,
+  metaclasses, multiple inheritance, descriptors or vendored `enum.py` as
+  absent/verbatim; corrected stale import/test counts, benchmark medians and
+  all-core `nextest` commands.
+
 ### Fixed — 2026-10-29 pydantic import through the real extension
 
 - CPython 3.14 `PyType_Check`/`PyType_FastSubclass` now see

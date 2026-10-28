@@ -14,7 +14,7 @@
       "import": "numpy",
       "case": "numpy_smoke.py",
       "dist_info": "numpy-2.5.0.dist-info",
-      "dist_info_record_sha256": "03869fb7f21afa96835687e90b359b247b8f5ed2638f222cfbce0d74607b44a1",
+      "dist_info_record_sha256": "d47a1166cd35d7d8b4ffcbcae0aa3a8890667fcdc76cfa383410db1de3b2e854",
       "wheel_sha256": null
     },
     {

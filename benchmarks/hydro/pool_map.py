@@ -10,7 +10,8 @@ def work(n):
     return total
 
 
-pool = multiprocessing.Pool(4)
-print(sum(pool.map(work, [50000, 50000, 50000, 50000])))
-pool.close()
-pool.join()
+if __name__ == "__main__":
+    pool = multiprocessing.Pool(4)
+    print(sum(pool.map(work, [50000, 50000, 50000, 50000])))
+    pool.close()
+    pool.join()

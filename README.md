@@ -21,14 +21,16 @@ profiling flavors) and `tea brew`/`tea build` (AOT).
 | Phase 1 — Compiler, runtime ABI, JIT/AOT | done, verified by `scripts/verify.sh` |
 | Phase 2 — Runtime, GC, modules, classes, concurrency | **done & verified**; precise shadow-stack GC, size-classed allocator, async generators/TaskGroup, TLS/UDP networking, pytest, interpreter/REPL |
 | Phase 3 — Toolchain (`new`/`init`/`test`/`fmt`/`lint`/`clean`, build cache, uv passthrough) | moved to the separate **Tea** repository |
-| Phase 4 — Python compatibility, C API/ABI | **decision B; first abi3 slice works** (limited-API `.so` imports/calls under JIT+AOT, no `libpython`); full ABI/stdlib/ecosystem open (P4-04a…P4-11), see [`docs/C_API.md`](docs/C_API.md) |
+| Phase 4 — Python compatibility, C API/ABI | **decision B; native C-API layer imports real wheels** (0 missing link-time symbols for pinned NumPy/pandas/pydantic extensions, no `libpython`; pydantic import green); full ABI semantics/stdlib/ecosystem remain open (P4-04c…P4-11), see [`docs/C_API.md`](docs/C_API.md) |
 | Phase 5 — Performance | baseline + local regression gate + CPython/Hydro/PyPy/Go engine comparison |
 | Phase 6 — Diagnostics/Developer Experience | largely done; CLI/diagnostic references, `--verbose`/`--quiet`, ICE and span tests; troubleshooting/migration open |
 
 Current state of work (Cargo version 0.1.0, no public release yet): the runtime
 monorepo carries the unit/integration suites; CLI/E2E/AOT tests live in Tea.
 Compatibility target: **CPython 3.14.9**; the official `Lib/test` baseline is
-1/398 (`test_errno.py`), tracked in [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md).
+**3/398** (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`), tracked in
+[`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md). The generated stdlib import
+matrix is **128/297** ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
 Hydro JIT (`tea infuse`) and AOT (`tea build`) share this runtime and IR.
 Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
 [`docs/TODO.md`](docs/TODO.md), source tree in
@@ -45,19 +47,23 @@ HYDRO_SITE_PACKAGES=/usr/lib/python3.14/site-packages \
 
 | Workload | CPython | Hydro JIT | Hydro AOT | CPython/JIT | CPython/AOT |
 |---|---:|---:|---:|---:|---:|
-| hello | 8.40 ms | 1.88 ms | 1.19 ms | 4.48× | 7.04× |
-| while_sum | 24.79 ms | 3.94 ms | 2.96 ms | 6.30× | 8.37× |
-| for_range_sum | 15.48 ms | 2.84 ms | 1.98 ms | 5.45× | 7.83× |
-| list_append | 15.79 ms | 6.33 ms | 5.97 ms | 2.49× | 2.65× |
-| list_comp | 13.74 ms | 4.70 ms | 3.91 ms | 2.92× | 3.51× |
-| dict_insert | 10.08 ms | 3.29 ms | 1.82 ms | 3.06× | 5.54× |
-| string_concat | 9.64 ms | 3.21 ms | 1.95 ms | 3.00× | 4.93× |
-| json_roundtrip | 16.00 ms | 3.53 ms | 2.47 ms | 4.53× | 6.47× |
-| math_loop | 25.52 ms | 4.52 ms | 2.62 ms | 5.64× | 9.73× |
-| generator_sum | 11.23 ms | 16.07 ms | 14.61 ms | 0.70× | 0.77× |
-| async_gather | 71.94 ms | 24.04 ms | 22.11 ms | 2.99× | 3.25× |
+| hello | 6.76 ms | 1.62 ms | 0.89 ms | 4.17× | 7.61× |
+| while_sum | 17.91 ms | 3.42 ms | 2.03 ms | 5.24× | 8.82× |
+| for_range_sum | 13.83 ms | 3.03 ms | 1.78 ms | 4.57× | 7.79× |
+| list_append | 13.26 ms | 8.32 ms | 5.33 ms | 1.59× | 2.49× |
+| list_comp | 9.66 ms | 7.76 ms | 5.75 ms | 1.24× | 1.68× |
+| dict_insert | 7.53 ms | 2.78 ms | 1.43 ms | 2.71× | 5.27× |
+| string_concat | 7.66 ms | 3.07 ms | 1.47 ms | 2.50× | 5.22× |
+| json_roundtrip | 12.70 ms | 3.47 ms | 2.11 ms | 3.66× | 6.02× |
+| math_loop | 21.73 ms | 4.81 ms | 3.36 ms | 4.52× | 6.48× |
+| generator_sum | 12.03 ms | 17.63 ms | 15.72 ms | 0.68× | 0.77× |
+| async_gather | 61.41 ms | 24.10 ms | 21.55 ms | 2.55× | 2.85× |
 
-Hydro is faster on 10 of 11 workloads (JIT median **3.06×**, AOT **5.54×**); the exception is generator resume, where per-frame precise-root bookkeeping is currently the dominant cost. Startup remains substantially lower (`tea JIT hello` 1.88 ms, `tea AOT hello` 1.19 ms, CPython 9.00 ms). Closing the generator gap is tracked under P5.
+Measured 2026-10-29 with `repeat=5`, fresh processes, AOT excluding build time.
+Hydro is faster on 10 of 11 workloads (JIT median **2.71×**, AOT **5.27×**);
+the exception is generator resume, where per-frame precise-root bookkeeping is
+currently dominant. Startup is lower (`tea JIT hello` 1.62 ms, `tea AOT hello`
+0.89 ms, CPython 7.20 ms). Closing the generator gap is tracked under P5.
 
 ## Requirements
 
@@ -83,7 +89,7 @@ cargo build --release --manifest-path ../tea/Cargo.toml
 # 3. Compatibility mode (CPython via uv)
 ../tea/target/release/tea run main.py
 
-# 4. Hydro engine (JIT)
+# 4. Hydro engine (Hydro JIT)
 ../tea/target/release/tea infuse main.py
 
 # 5. AOT
@@ -104,7 +110,7 @@ The command-line tool is **Tea** and lives in its own repository. Hydro only
 exposes the compiler/runtime APIs and the `libhydro_runtime.a` ABI archive.
 
 ```
-tea infuse <...>      compatibility mode: `uv run` (CPython)
+tea run <file>     compatibility mode: CPython via uv
 tea infuse <file>  run with the Hydro JIT (or `--interpret`)
 tea steep <file>   profile a run into a named PGO flavor
 tea brew|build     AOT compile/link, optionally `--flavor NAME`
@@ -141,7 +147,8 @@ See the Tea repository for the complete command reference, flavor storage
   class attributes (`x = value`), `@property`/`@classmethod`/
   `@staticmethod` and ignored `lru_cache`/`cache`/`wraps`/`abstractmethod`/
   `overload`/`runtime_checkable` decorators.
-  No general decorators, metaclasses or multiple inheritance.
+  Metaclasses, `__prepare__`, `__set_name__` and multiple bases are supported;
+  see `docs/ARCHITECTURE.md` for current descriptor/metaclass limits.
 - **Integers:** arbitrary-precision `int` with a tagged i64 fast path and
   automatic `BigInt` promotion; exact arithmetic, comparisons, formatting
   and JSON beyond 64 bits.
@@ -186,8 +193,9 @@ See the Tea repository for the complete command reference, flavor storage
   results in input order and propagates the first error.
   Generators support `send`/`throw`/`close`, `yield` expressions and
   `yield from` (`throw` accepts exception instances only).
-  Not supported: async generators, async comprehensions; `async for`/
-  `async with` use the synchronous protocol. Generator expressions are lazy
+  Async generators, async comprehensions, `async for`/`async with`, task
+  cancellation and `TaskGroup` are implemented; `ExceptionGroup`/`wait_for`
+  and the wider `asyncio` API remain open. Generator expressions are lazy
   (synthetic generator function; the outermost iterable is evaluated at
   creation, the remaining clauses run per resume).
 
@@ -229,8 +237,8 @@ and `binascii`, `base64`, `quopri`, `fnmatch`, `getopt`, `mimetypes`,
 plus the benchmark-critical `subprocess`, `tempfile`, `shutil`, `textwrap`,
 `timeit`).
 
-`enum` is not native: CPython 3.14.9's `Lib/enum.py` is vendored verbatim in
-`stdlib/enum.py` (PSF license notice in `stdlib/LICENSE`), so `Enum`,
+`enum` is not native: CPython 3.14.9's `Lib/enum.py` is vendored with documented
+Hydro adaptations in `stdlib/enum.py` (PSF license notice in `stdlib/LICENSE`), so `Enum`,
 `IntEnum`, `IntFlag`, `Flag`, `StrEnum` and `auto()` follow CPython semantics.
 
 **Concurrency and memory**
@@ -246,18 +254,16 @@ plus the benchmark-critical `subprocess`, `tempfile`, `shutil`, `textwrap`,
 
 **Not supported (selection)**
 
-Async generators and async comprehensions (`asyncio` only
-`run`/`sleep`/`gather`), user decorators, pattern matching, metaclasses,
-multiple inheritance, the general descriptor protocol, `bytearray`/
-`memoryview`, `except*`; arbitrary C extensions or the C API/ABI and the
-complete CPython stdlib (63/297 modules importable; see
-[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). Precise GC roots/stack maps
-and variable payload size classes are missing. A general `sys.path`/
-`sys.modules` model, namespace/zip/frozen imports and `from x import *` are
-open; packages, dotted/relative imports and `site-packages` resolution work
-through the module loader, and imports inside functions are deferred until
-the enclosing code runs. Package management is only a uv passthrough (no
-interpreter injection/packaging).
+User decorators and pattern matching remain incomplete; `except*` grouping and
+`await`/cancellation edge cases are still open. The general descriptor and
+metaclass protocols, `bytearray`/`memoryview`, async generators and async
+comprehensions are implemented. Arbitrary C extensions/full CPython ABI
+semantics and the complete stdlib remain open (128/297 modules import; see
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). A general `sys.path`/
+`sys.modules` model, dynamic imports from unlinked packages, namespace/zip/
+frozen imports and `from x import *` are incomplete; packages, dotted/relative
+imports, `site-packages` and vendored `stdlib/` resolution work. Package
+management is a uv passthrough (no interpreter injection/packaging).
 
 ## Architecture
 
@@ -288,10 +294,11 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests and Benchmarks
 
 - `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), runtime
-  build, `cargo test --workspace`, fuzz smoke and the offline CPython manifest
-  check. CLI/E2E/AOT gates live in the Tea repository.
+  build, **`cargo nextest run --workspace` on all cores**, fuzz smoke and the
+  offline CPython manifest check. The 2026-10-29 run covers 2307 tests
+  (2306 pass, 1 skipped). CLI/E2E/AOT gates live in the Tea repository.
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Ubuntu, stable
-  Rust, fmt/clippy/test/verify, no secrets).
+  Rust, fmt/clippy/nextest/verify, no secrets).
 - Benchmarks: [`benchmarks/HYDRO.md`](benchmarks/HYDRO.md) describes readiness and
   integration of the CPython harnesses; `benchmarks/hydro/run_micro.py` measures
   CPython vs. Hydro JIT vs. Hydro AOT (incl. thread/process/pool scaling) and
@@ -313,7 +320,10 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   The gate compares only workloads that are present in both the result and
   threshold file. Enforcement stays local/release-only: timing on shared
   runners is too noisy for a blocking CI gate. CI runs the check as a
-  non-blocking report and runs `scripts/test_check_benchmarks.py`.
+  non-blocking report and runs `scripts/test_check_benchmarks.py`. The
+  2026-10-29 run reports `sum_genexp` above its old threshold (JIT 26.1 ms,
+  AOT 19.4 ms); this is the known P5 generator-root overhead, not a threshold
+  rewrite.
 - Harnesses: `scripts/bench_hyperfine.sh` wraps the `bench_*.py` scripts in
   hyperfine with output validation (skips cleanly when hyperfine/uv is
   missing); `benchmarks/compare_engines.py` compares loop/startup under

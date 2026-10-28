@@ -74,54 +74,55 @@ skipped test:
 Tea (separate repository) carries **339** CLI/E2E/AOT/pytest/REPL/PGO/wheel tests.
 Other docs must link here instead of repeating the total.
 
-### Compatibility checkpoint (2026-10-25)
+### Compatibility checkpoint (2026-10-29)
 
-- **Import matrix:** **78/297 modules importable** (27 builtin/frozen, 46 pure,
-  5 extension; 25/128/58 + 8 platform missing; 9 modules fail under CPython
-  3.14.9 itself). Report: `docs/COMPATIBILITY.md`, JSON
-  `benchmarks/compat/latest.json`.
-- **Official suite:** **3/398 passing** (`test_errno.py`, `test_int_literal.py`, `test_perfmaps.py`), 332 `hydro_fail`,
-  63 `expected_fail` (CPython also fails), 0 timeouts. Manifest
-  `tests/compat/cpython-3.14.9.json` grows only from real `hydro_pass` runs.
-- **C-API:** the limited-API fixture `hydro_capi_probe` (scalars, strings, bytes,
-  floats, lists, tuples, dicts, capsules, read-only buffers) builds against
-  CPython 3.14 headers, loads from a sibling `.so` and runs under JIT and AOT;
-  neither Tea nor the AOT binary links `libpython`. Multi-phase init and
-  wheel-tag validation work; wheels/venvs and the full ABI are open.
-- **`bench_all.py` under Hydro:** the Hydro group completes at the **default GC
-  threshold** (official pure-Python `rich` renders; AOT report written). The
-  full suite was previously green with `HYDRO_GC_THRESHOLD` raised; the default
-  gate is now the normal path. Precise roots are active by default, with
-  `HYDRO_GC_PRECISE=1` strict and `HYDRO_GC_PRECISE=0` conservative fallback.
-- **Benchmarks:** micro harness + tracked baselines; default-GC n=200000
-  Hydro group: hello JIT/AOT 1.88/1.19 ms, while_sum 3.94/2.96 ms,
-  math_loop 4.52/2.62 ms, async_gather 24.04/22.11 ms. Root-frame emission
-  made generator resume the current weak spot (JIT/AOT 16.07/14.61 ms vs
-  CPython 11.23 ms); P5 performance work owns that regression.
-  `compare_engines.py` covers CPython/Hydro/PyPy/Go and skips missing engines.
+- **Import matrix:** **128/297 modules importable** (30 builtin/frozen, 86 pure,
+  12 extension; 169 failed; 9 modules fail under CPython 3.14.9 itself).
+  Report: `docs/COMPATIBILITY.md`, JSON `benchmarks/compat/latest.json`.
+- **Official suite:** **3/398 passing** (`test_errno.py`,
+  `test_int_literal.py`, `test_longexp.py`), 332 `hydro_fail`, 63
+  `expected_fail` (CPython also fails), 0 timeouts; full differential run took
+  742.6 s. Manifest `tests/compat/cpython-3.14.9.json` grows only from real
+  `hydro_pass` runs.
+- **Ecosystem:** the ABI inventory reports **0 missing required symbols** across
+  68 pinned extension modules. `pydantic 2.14.1` now imports through the real
+  `_pydantic_core` extension; NumPy/pandas still stop on semantic gaps, and
+  pydantic model smoke is not yet green (lazy submodule imports,
+  walrus-in-generator, dataclasses APIs).
+- **C-API:** limited-API fixture runs under JIT/AOT without `libpython`;
+  multi-phase init, wheel tags, heap types, vectorcall, buffers and the
+  pinned-wheel link-time symbol set work. Full ABI behavior/GIL/ecosystem
+  suites remain open.
+- **Benchmarks:** default-GC micro suite (2026-10-29) passes all 22 workloads
+  plus startup: hello JIT/AOT 1.62/0.89 ms, while_sum 3.42/2.03 ms,
+  math_loop 4.81/3.36 ms, async_gather 24.10/21.55 ms; generator_sum remains
+  slower than CPython (JIT/AOT 17.63/15.72 ms vs 12.03 ms). `bench_all.py
+  --only hydro` medians: JIT 2.71×, AOT 5.27×, faster on 10/11 workloads.
 
 ### Known limits (details in `docs/TODO.md` / `ARCHITECTURE.md` §10)
 
 - GC is precise for generated frames/arrays, with a conservative fallback for
   Rust-side frames/tests; strict mode (`HYDRO_GC_PRECISE=1`) removes it.
   Native Rust owners must still root tagged locals explicitly.
-- Async generators/comprehensions, `async for`/`async with`, cancellation and
-  `TaskGroup` are implemented; `ExceptionGroup`, `wait_for` and the wider
-  `asyncio` API remain open. Generator expressions are lazy; loops root-heavy
+- Async generators/comprehensions, `async for`/`async with`, cancellation,
+  `TaskGroup`, `ExceptionGroup` and `wait_for` are implemented; the wider
+  `asyncio` API remains open. Generator expressions are lazy; root-heavy
   generator resumes are the current performance weak spot.
-- Full CPython stdlib/P7 parity, C extensions/full ABI, and the ecosystem
-  suites remain open; P2-13 covers the core named modules only.
-- Imports: packages, dotted/relative imports and site-packages work; no general
-  `sys.path`/`sys.modules`, namespace/zip/frozen imports or `from x import *`.
-- Language: no user decorators, metaclasses, multiple inheritance, pattern
-  matching, `except*`, positional-only params, dict views or
-  `bytearray`/`memoryview`; `*args` + `**kwargs` in one call is still deferred.
+- Full CPython stdlib/P7 parity, C extensions/full ABI behavior, and the
+  ecosystem suites remain open; 128/297 stdlib modules import.
+- Imports: packages, dotted/relative imports, site-packages and vendored
+  `stdlib/` work; dynamic imports of unlinked package submodules, namespace/
+  zip/frozen imports and `from x import *` remain incomplete.
+- Language: pattern matching, `except*` and some decorator/descriptor/
+  positional-only/dict-view edge cases remain incomplete; metaclasses,
+  multiple inheritance, `bytearray`/`memoryview` and `__set_name__` exist.
 - Stdlib is a curated subset; `re` is Rust syntax, `socket` supports TCP/UDP/
   IPv6, TLS client, non-blocking I/O and selectors; argparse covers the
   documented CPython surface, pytest is the native runner, and pickle uses
   HYD1. Full P7 parity is open.
-- C-API is a defined limited subset; no real wheels, NumPy/pydantic-core, GIL
-  emulation or `ctypes`/`cffi` yet.
+- C-API: full link-time symbol coverage for the pinned wheels, but NumPy/
+  pandas semantic ABI, full GIL/thread integration, wheel ecosystem suites and
+  some `ctypes` paths remain open; pydantic imports, model smoke does not yet.
 - Tea owns uv interoperability/injection and packaging; Hydro does not embed
   `uv` or a package manager.
 - Linux x86_64 is the verified target; aarch64 is untested; macOS/Windows and
@@ -148,7 +149,7 @@ Other docs must link here instead of repeating the total.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo live here
 cargo build                            # Hydro workspace
-cargo test --workspace                 # Hydro unit/integration tests
+cargo nextest run --workspace          # all-core unit/integration tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ./scripts/verify.sh                    # Hydro gate (tests, fuzz smoke, manifest)

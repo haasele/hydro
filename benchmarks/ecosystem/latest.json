@@ -1,0 +1,483 @@
+{
+  "meta": {
+    "date": "2026-10-28T23:45:30Z",
+    "python": "CPython 3.14.9",
+    "python_version": "3.14.9",
+    "python_executable": "/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14",
+    "python_target": "3.14.9",
+    "python_pinned": true,
+    "tea": {
+      "path": "/mnt/Vault/GitHub/tea/target/release/tea",
+      "version": "tea 0.1.0"
+    },
+    "site_packages": [
+      "/mnt/Vault/GitHub/hydro/.hydro/ecosystem/site"
+    ],
+    "pins": "/mnt/Vault/GitHub/hydro/benchmarks/ecosystem/pins.json",
+    "options": {
+      "suite": "import",
+      "only": null,
+      "timeout": 120.0,
+      "aot": false,
+      "tests": null
+    },
+    "cwd": "/mnt/Vault/GitHub/hydro",
+    "elapsed_seconds": 11.8,
+    "pins_ok": true,
+    "upstream_note": null
+  },
+  "pins": [
+    {
+      "name": "numpy",
+      "role": "target",
+      "expected": "2.5.0",
+      "actual": "2.5.0",
+      "dist_info": "numpy-2.5.0.dist-info",
+      "record_sha256_expected": "d47a1166cd35d7d8b4ffcbcae0aa3a8890667fcdc76cfa383410db1de3b2e854",
+      "record_sha256_actual": "d47a1166cd35d7d8b4ffcbcae0aa3a8890667fcdc76cfa383410db1de3b2e854",
+      "record_ok": true,
+      "wheel_sha256": null,
+      "wheel_pinned": false,
+      "ok": true,
+      "error": null
+    },
+    {
+      "name": "pandas",
+      "role": "target",
+      "expected": "3.1.0",
+      "actual": "3.1.0",
+      "dist_info": "pandas-3.1.0.dist-info",
+      "record_sha256_expected": "cc43eef24c2d35b044fe9831c50c574f87572638cb4e8189e8705084da57efdc",
+      "record_sha256_actual": "cc43eef24c2d35b044fe9831c50c574f87572638cb4e8189e8705084da57efdc",
+      "record_ok": true,
+      "wheel_sha256": null,
+      "wheel_pinned": false,
+      "ok": true,
+      "error": null
+    },
+    {
+      "name": "pydantic",
+      "role": "target",
+      "expected": "2.14.1",
+      "actual": "2.14.1",
+      "dist_info": "pydantic-2.14.1.dist-info",
+      "record_sha256_expected": "d16db24e7db99e1383a3ad68457d9b3f2a3badaa891a60f2730f06c6f8064277",
+      "record_sha256_actual": "d16db24e7db99e1383a3ad68457d9b3f2a3badaa891a60f2730f06c6f8064277",
+      "record_ok": true,
+      "wheel_sha256": null,
+      "wheel_pinned": false,
+      "ok": true,
+      "error": null
+    },
+    {
+      "name": "pydantic-core",
+      "role": "target",
+      "expected": "2.50.1",
+      "actual": "2.50.1",
+      "dist_info": "pydantic_core-2.50.1.dist-info",
+      "record_sha256_expected": "34bfca22c843f6195ed3a622c9349998abcbc623ddb5662ce31876761ac5bb53",
+      "record_sha256_actual": "34bfca22c843f6195ed3a622c9349998abcbc623ddb5662ce31876761ac5bb53",
+      "record_ok": true,
+      "wheel_sha256": null,
+      "wheel_pinned": false,
+      "ok": true,
+      "error": null
+    },
+    {
+      "name": "python-dateutil",
+      "role": "dependency",
+      "expected": "3.0.0",
+      "actual": "3.0.0",
+      "dist_info": "python_dateutil-3.0.0.dist-info",
+      "record_sha256_expected": "a17d86766c46a890c3d8b1c4ccfa5bb1c6014919f3a3a9da4b8c597f47bf5b33",
+      "record_sha256_actual": "a17d86766c46a890c3d8b1c4ccfa5bb1c6014919f3a3a9da4b8c597f47bf5b33",
+      "record_ok": true,
+      "wheel_sha256": null,
+      "wheel_pinned": false,
+      "ok": true,
+      "error": null
+    },
+    {
+      "name": "six",
+      "role": "dependency",
+      "expected": "1.17.0",
+      "actual": "1.17.0",
+      "dist_info": "six-1.17.0.dist-info",
+      "record_sha256_expected": "d16e50f347969b1e1919fb0c88bac4b9c644f5305bcfcfb00f72b646dbd4065d",
+      "record_sha256_actual": "d16e50f347969b1e1919fb0c88bac4b9c644f5305bcfcfb00f72b646dbd4065d",
+      "record_ok": true,
+      "wheel_sha256": null,
+      "wheel_pinned": false,
+      "ok": true,
+      "error": null
+    },
+    {
+      "name": "typing-extensions",
+      "role": "dependency",
+      "expected": "4.16.0",
+      "actual": "4.16.0",
+      "dist_info": "typing_extensions-4.16.0.dist-info",
+      "record_sha256_expected": "9e07fea845cac76293d927afa7157a14ecba39b318bc8af236b8de530b7656c1",
+      "record_sha256_actual": "9e07fea845cac76293d927afa7157a14ecba39b318bc8af236b8de530b7656c1",
+      "record_ok": true,
+      "wheel_sha256": null,
+      "wheel_pinned": false,
+      "ok": true,
+      "error": null
+    },
+    {
+      "name": "typing-inspection",
+      "role": "dependency",
+      "expected": "0.4.4",
+      "actual": "0.4.4",
+      "dist_info": "typing_inspection-0.4.4.dist-info",
+      "record_sha256_expected": "83fc23669db31500d06056b13ecebe4f088f56a81c1ea86e3b68f1de3b8c7d95",
+      "record_sha256_actual": "83fc23669db31500d06056b13ecebe4f088f56a81c1ea86e3b68f1de3b8c7d95",
+      "record_ok": true,
+      "wheel_sha256": null,
+      "wheel_pinned": false,
+      "ok": true,
+      "error": null
+    },
+    {
+      "name": "annotated-types",
+      "role": "dependency",
+      "expected": "0.8.0",
+      "actual": "0.8.0",
+      "dist_info": "annotated_types-0.8.0.dist-info",
+      "record_sha256_expected": "8191d3aa1ac93480688819b4db2385606219a3f7a453b85e086646134ded4f96",
+      "record_sha256_actual": "8191d3aa1ac93480688819b4db2385606219a3f7a453b85e086646134ded4f96",
+      "record_ok": true,
+      "wheel_sha256": null,
+      "wheel_pinned": false,
+      "ok": true,
+      "error": null
+    },
+    {
+      "name": "tzdata",
+      "role": "dependency",
+      "expected": "2026.5",
+      "actual": "2026.5",
+      "dist_info": "tzdata-2026.5.dist-info",
+      "record_sha256_expected": "bc03ea1afd3394eb010013e6112f91d884785445c8453b7d56ddb7ba0cc4939d",
+      "record_sha256_actual": "bc03ea1afd3394eb010013e6112f91d884785445c8453b7d56ddb7ba0cc4939d",
+      "record_ok": true,
+      "wheel_sha256": null,
+      "wheel_pinned": false,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "counts": {
+    "total": 10,
+    "pass": 6,
+    "failed": 4,
+    "by_status": {
+      "compile_error": 2,
+      "pass": 6,
+      "runtime_error": 2
+    }
+  },
+  "cases": [
+    {
+      "id": "numpy:import",
+      "package": "numpy",
+      "kind": "import",
+      "status": "runtime_error",
+      "detail": "jit: ImportError: No module named 'numpy.exceptions'",
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 207.9,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 1,
+          "timed_out": false,
+          "duration_ms": 4557.5,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-smspjlg2/import_numpy.py\", line 12, in numpy._core.umath.<module>\nImportError: No module named 'numpy.exceptions'\n"
+        },
+        "aot": null
+      },
+      "aot_build": null
+    },
+    {
+      "id": "pandas:import",
+      "package": "pandas",
+      "kind": "import",
+      "status": "compile_error",
+      "detail": "jit: error[HYD0201]: module 'dataclasses' has no attribute 'is_dataclass'",
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 1009.3,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 1,
+          "timed_out": false,
+          "duration_ms": 1802.3,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": "error[HYD0201]: module 'dataclasses' has no attribute 'is_dataclass'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/core/dtypes/inference.py:518:16\n     |\n 518 |         return dataclasses.is_dataclass(item) and not isinstance(item, type)\n     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nerror: could not compile '/tmp/hydro-ecosystem-f78tphcj/import_pandas.py' due to 1 previous error(s)\n"
+        },
+        "aot": null
+      },
+      "aot_build": null
+    },
+    {
+      "id": "pydantic:import",
+      "package": "pydantic",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 52.2,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 1641.6,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": null
+      },
+      "aot_build": null
+    },
+    {
+      "id": "pydantic-core:import",
+      "package": "pydantic-core",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 33.6,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 1574.4,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": null
+      },
+      "aot_build": null
+    },
+    {
+      "id": "python-dateutil:import",
+      "package": "python-dateutil",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 10.3,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 8.8,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": null
+      },
+      "aot_build": null
+    },
+    {
+      "id": "six:import",
+      "package": "six",
+      "kind": "import",
+      "status": "compile_error",
+      "detail": "jit: error[HYD0201]: module 'importlib.util' has no attribute 'spec_from_loader'",
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 15.8,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 1,
+          "timed_out": false,
+          "duration_ms": 26.3,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": "error[HYD0201]: module 'importlib.util' has no attribute 'spec_from_loader'\n   --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:75:32\n    |\n 75 |     from importlib.util import spec_from_loader\n    |                                ^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'types' has no attribute 'ClassType'\n   --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:51:26\n    |\n 51 |     class_types = (type, types.ClassType)\n    |                          ^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:615:16\n     |\n 615 |     viewkeys = operator.methodcaller(\"keys\")\n     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:617:18\n     |\n 617 |     viewvalues = operator.methodcaller(\"values\")\n     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:619:17\n     |\n 619 |     viewitems = operator.methodcaller(\"items\")\n     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:633:16\n     |\n 633 |     viewkeys = operator.methodcaller(\"viewkeys\")\n     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:635:18\n     |\n 635 |     viewvalues = operator.methodcaller(\"viewvalues\")\n     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:637:17\n     |\n 637 |     viewitems = operator.methodcaller(\"viewitems\")\n     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'itertools' has no attribute 'imap'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:688:35\n     |\n 688 |     iterbytes = functools.partial(itertools.imap, ord)\n     |                                   ^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'sys' has no attribute 'meta_path'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:991:4\n     |\n 991 | if sys.meta_path:\n     |    ^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'sys' has no attribute 'meta_path'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:992:34\n     |\n 992 |     for i, importer in enumerate(sys.meta_path):\n     |                                  ^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'sys' has no attribute 'meta_path'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:999:17\n     |\n 999 |             del sys.meta_path[i]\n     |                 ^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'sys' has no attribute 'meta_path'\n     --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:1003:1\n      |\n 1003 | sys.meta_path.append(_importer)\n      | ^^^^^^^^^^^^^\nerror: could not compile '/tmp/hydro-ecosystem-gn_37o2f/import_six.py' due to 13 previous error(s)\n"
+        },
+        "aot": null
+      },
+      "aot_build": null
+    },
+    {
+      "id": "typing-extensions:import",
+      "package": "typing-extensions",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 22.9,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 772.2,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": null
+      },
+      "aot_build": null
+    },
+    {
+      "id": "typing-inspection:import",
+      "package": "typing-inspection",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 8.3,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 3.9,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": null
+      },
+      "aot_build": null
+    },
+    {
+      "id": "annotated-types:import",
+      "package": "annotated-types",
+      "kind": "import",
+      "status": "runtime_error",
+      "detail": "jit: AttributeError: 'function' object has no attribute 'islower'",
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 28.0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 1,
+          "timed_out": false,
+          "duration_ms": 50.4,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-aw956qcf/import_annotated_types.py\", line 359, in annotated_types.<module>\nAttributeError: 'function' object has no attribute 'islower'\n"
+        },
+        "aot": null
+      },
+      "aot_build": null
+    },
+    {
+      "id": "tzdata:import",
+      "package": "tzdata",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 10.0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 3.8,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": null
+      },
+      "aot_build": null
+    }
+  ]
+}

@@ -215,8 +215,9 @@ no CPython is needed at runtime.
       Single-base classes with methods, `__init__`, inheritance/overrides,
       `hydro_getattr`/`hydro_setattr`, dynamic dispatch, frozen class attributes,
       `@property`/`@classmethod`/`@staticmethod`, and deterministic
-      representation. Limits: user decorators, metaclasses, multiple
-      inheritance and the general descriptor protocol are absent (P4-02).
+      representation. Metaclasses, multiple inheritance and the general
+      descriptor protocol are delivered; remaining language gaps are
+      tracked under P4-02.
 - [x] P2-10 Generators, `yield`, closures/cell variables.
       Delivered: closures with mutable cell captures and `nonlocal`, real **lazy**
       generators (stackful fibers, `yield [value]`, bare `yield`, `return`
@@ -415,10 +416,13 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `Lib/test/test_*.py` differential runs against the pinned CPython
       **3.14.9** oracle, JSON + `docs/CPYTHON_TESTS.md`, release gate
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
-      Manifest `tests/compat/cpython-3.14.9.json` records **1** pass
-      (`test_errno.py`); it grows only from real `hydro_pass` results.
-      Stdlib import baseline 2026-10-26: **78/297 importable** (27
-      builtin/frozen, 46 pure, 5 extension; 9 `cpython_failed`). Batch A of
+      Manifest `tests/compat/cpython-3.14.9.json` records `minimum_passing=3`
+      for the 2026-10-29 full run's **3/398** genuine passes
+      (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`); `required`
+      stays empty until a never-regress subset is pinned. It grows only from
+      real `hydro_pass` results.
+      Stdlib import baseline 2026-10-29: **128/297 importable** (30
+      builtin/frozen, 86 pure, 12 extension; 9 `cpython_failed`). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
       `_operator`, `_functools`, `_io`), the Batch B native core
@@ -428,9 +432,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       package/site-packages loader and the native
       `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
       `__future__` modules are importable and API-tested.
-      Official-suite
-      baseline 2026-10-26: **3/398 passing** (332 `hydro_fail`, 63
-      `expected_fail` where CPython also fails; 0 timeouts). No test is marked
+      Official-suite baseline 2026-10-29: **3/398 passing** (332
+      `hydro_fail`, 63 `expected_fail` where CPython also fails; 0 timeouts). No test is marked
       passing unless CPython 3.14.9 and Hydro both exit 0.
       The harness runs a defined subset of CPython 3.14 `Lib/test` against
       `tea` and emits a machine-readable report (per test: pass/skip/fail,
@@ -451,12 +454,12 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `__call__`/`__str__`/`__repr__`/`__len__`/`__contains__`/`__dict__`/
       `__new__`, and native `Thread` subclassing (including zero-argument
       `super().__init__`).
-      Program: user decorators (function/class, parametrised),
-      `except*`, `match`, positional-only parameters, `__slots__`,
-      metaclasses, multiple inheritance, the general descriptor protocol,
-      dict views, `bytearray`/`memoryview`, the full format mini-language,
-      a single call combining dynamic `*args` **and** `**kwargs`, and the
-      remaining `super()` forms.
+      Program: user decorators (function/class, parametrised), `except*`,
+      `match`, positional-only parameters, `__slots__`, the full format
+      mini-language, a single call combining dynamic `*args` **and**
+      `**kwargs`, and the remaining `super()` forms. Metaclasses, multiple
+      inheritance, the general descriptor protocol and
+      `bytearray`/`memoryview` are delivered rather than open.
       Acceptance: the CPython language-feature tests in scope pass; every
       remaining deviation is listed in `docs/COMPATIBILITY.md`.
 - [ ] P4-03 Import system and module model for real packages.
@@ -787,8 +790,8 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the Hydro runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-26: **78/297 modules importable**, **219 failed**
-(39 builtin/frozen, 129 pure Python, 58 extension, 8 unknown/platform),
+from it). Status 2026-10-29: **128/297 modules importable**, **169 failed**
+(22 builtin/frozen, 88 pure Python, 51 extension, 8 unknown/platform),
 including 9 modules where CPython 3.14.9 itself fails on this host.
 
 The package/site-packages loader (P7-01) is in place: packages with
@@ -1047,8 +1050,8 @@ marks a module CPython ships only for a
 platform Hydro does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
-Current matrix: 78/297 importable, 219 failed (25 builtin/frozen, 128 pure,
-58 extension, 8 platform). The ledger is the work list for the failed entries;
+Current matrix: 128/297 importable, 169 failed (22 builtin/frozen, 88 pure,
+51 extension, 8 platform). The ledger is the work list for the failed entries;
 checked entries count as delivered slices, not as complete parity.
 
 #### Builtin / frozen (46: 7 importable, 39 open)

@@ -30,24 +30,28 @@ Machine-readable results are written to `benchmarks/compat/latest.json`.
 
 <!-- BEGIN GENERATED TABLE -->
 
-Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` · binary `/mnt/Vault/GitHub/tea/target/debug/tea`
+Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` · binary `/mnt/Vault/GitHub/tea/target/release/tea`
 
 ## Summary
 
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
-| builtin/frozen | 52 | 27 | 25 |
-| pure | 174 | 46 | 128 |
-| extension | 63 | 5 | 58 |
+| builtin/frozen | 52 | 30 | 22 |
+| pure | 174 | 86 | 88 |
+| extension | 63 | 12 | 51 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 78 | 219 |
+| **Total** | 297 | 128 | 169 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:HYD0002 | 210 |
+| compile_error:HYD0002 | 85 |
+| compile_error:HYD0201 | 63 |
 | cpython_failed | 9 |
+| runtime_error | 6 |
+| compile_error:HYD0101 | 5 |
+| compile_error:HYD0102 | 1 |
 
 ## Modules by layer
 
@@ -60,7 +64,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_codecs` | ok | ok | ok | - |
 | `_collections` | ok | ok | ok | - |
 | `_collections_abc` | ok | ok | ok | - |
-| `_contextvars` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_contextvars' not found: not supported on the import search path |
+| `_contextvars` | ok | ok | ok | - |
 | `_datetime` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_datetime' not found: not supported on the import search path |
 | `_frozen_importlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_frozen_importlib' not found: not supported on the import search… |
 | `_frozen_importlib_external` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_frozen_importlib_external' not found: not supported on the impor… |
@@ -71,7 +75,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_opcode` | ok | ok | ok | - |
 | `_operator` | ok | ok | ok | - |
 | `_signal` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `_sitebuiltins` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sitebuiltins' not found: not supported on the import search path |
+| `_sitebuiltins` | ok | ok | ok | - |
 | `_sre` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sre' not found: not supported on the import search path |
 | `_stat` | ok | ok | ok | - |
 | `_string` | ok | ok | ok | - |
@@ -88,204 +92,204 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `abc` | ok | ok | ok | - |
 | `atexit` | ok | ok | ok | - |
 | `builtins` | ok | ok | ok | - |
-| `codecs` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'codecs' not found: not supported on the import search path |
+| `codecs` | ok | ok | ok | - |
 | `errno` | ok | ok | ok | - |
 | `faulthandler` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
 | `gc` | ok | ok | ok | - |
-| `genericpath` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'genericpath' not found: not supported on the import search path |
+| `genericpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'lstat' |
 | `io` | ok | ok | ok | - |
 | `itertools` | ok | ok | ok | - |
 | `marshal` | ok | ok | ok | - |
-| `ntpath` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'ntpath' not found: not supported on the import search path |
+| `ntpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'lstat' |
 | `os` | ok | ok | ok | - |
 | `posix` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'posix' not found: not supported on the import search path |
-| `posixpath` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'posixpath' not found: not supported on the import search path |
+| `posixpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'lstat' |
 | `pwd` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pwd' not found: not supported on the import search path |
-| `runpy` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'runpy' not found: not supported on the import search path |
+| `runpy` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute 'open_code' |
 | `site` | ok | ok | ok | - |
 | `stat` | ok | ok | ok | - |
 | `sys` | ok | ok | ok | - |
 | `time` | ok | ok | ok | - |
-| `zipimport` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'zipimport' not found: not supported on the import search path |
+| `zipimport` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_frozen_importlib_external' not found: not supported on the impor… |
 
 ### pure (174)
 
 | Module | CPython | Hydro | Status | Error |
 | --- | --- | --- | --- | --- |
 | `__future__` | ok | ok | ok | - |
-| `_aix_support` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_aix_support' not found: not supported on the import search path |
-| `_android_support` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_android_support' not found: not supported on the import search p… |
-| `_apple_support` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_apple_support' not found: not supported on the import search path |
-| `_ast_unparse` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_ast_unparse' not found: not supported on the import search path |
-| `_colorize` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_colorize' not found: not supported on the import search path |
-| `_compat_pickle` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_compat_pickle' not found: not supported on the import search path |
-| `_ios_support` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_ios_support' not found: not supported on the import search path |
-| `_markupbase` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_markupbase' not found: not supported on the import search path |
-| `_opcode_metadata` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_opcode_metadata' not found: not supported on the import search p… |
-| `_osx_support` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_osx_support' not found: not supported on the import search path |
-| `_py_abc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_py_abc' not found: not supported on the import search path |
-| `_py_warnings` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_py_warnings' not found: not supported on the import search path |
-| `_pydatetime` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_pydatetime' not found: not supported on the import search path |
-| `_pydecimal` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_pydecimal' not found: not supported on the import search path |
-| `_pyio` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_pyio' not found: not supported on the import search path |
-| `_pylong` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_pylong' not found: not supported on the import search path |
-| `_pyrepl` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_pyrepl' not found: not supported on the import search path |
-| `_strptime` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_strptime' not found: not supported on the import search path |
-| `_threading_local` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_threading_local' not found: not supported on the import search p… |
-| `_weakrefset` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_weakrefset' not found: not supported on the import search path |
-| `annotationlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'annotationlib' not found: not supported on the import search path |
-| `antigravity` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'antigravity' not found: not supported on the import search path |
+| `_aix_support` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'system' |
+| `_android_support` | ok | ok | ok | - |
+| `_apple_support` | ok | ok | ok | - |
+| `_ast_unparse` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_ast' not found: not supported on the import search path |
+| `_colorize` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
+| `_compat_pickle` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'WindowsError' is not defined |
+| `_ios_support` | ok | ok | ok | - |
+| `_markupbase` | ok | ok | ok | - |
+| `_opcode_metadata` | ok | ok | ok | - |
+| `_osx_support` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'pathsep' |
+| `_py_abc` | ok | ok | ok | - |
+| `_py_warnings` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_thread' has no attribute 'RLock' |
+| `_pydatetime` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'time' has no attribute 'struct_time' |
+| `_pydecimal` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'math' has no attribute 'copysign' |
+| `_pyio` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute '__all__' |
+| `_pylong` | ok | exit 1 | compile_error:HYD0102 | error[HYD0102]: unsupported operand type(s) for <=: 'set' and 'list' |
+| `_pyrepl` | ok | ok | ok | - |
+| `_strptime` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'FEBRUARY' is not defined |
+| `_threading_local` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'threading' has no attribute 'current_thread' |
+| `_weakrefset` | ok | ok | ok | - |
+| `annotationlib` | ok | ok | ok | - |
+| `antigravity` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'audit' |
 | `argparse` | ok | ok | ok | - |
 | `ast` | ok | ok | ok | - |
 | `asyncio` | ok | ok | ok | - |
 | `base64` | ok | ok | ok | - |
-| `bdb` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'bdb' not found: not supported on the import search path |
+| `bdb` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'monitoring' |
 | `bisect` | ok | ok | ok | - |
-| `bz2` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'bz2' not found: not supported on the import search path |
-| `cProfile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'cProfile' not found: not supported on the import search path |
-| `calendar` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'calendar' not found: not supported on the import search path |
-| `cmd` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'cmd' not found: not supported on the import search path |
-| `code` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'code' not found: not supported on the import search path |
-| `codeop` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'codeop' not found: not supported on the import search path |
+| `bz2` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_bz2' not found: not supported on the import search path |
+| `cProfile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
+| `calendar` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'FEBRUARY' is not defined |
+| `cmd` | ok | ok | ok | - |
+| `code` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `codeop` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
 | `collections` | ok | ok | ok | - |
 | `colorsys` | ok | ok | ok | - |
-| `compileall` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'compileall' not found: not supported on the import search path |
-| `compression` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'compression' not found: not supported on the import search path |
-| `concurrent` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'concurrent' not found: not supported on the import search path |
-| `configparser` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'configparser' not found: not supported on the import search path |
+| `compileall` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
+| `compression` | ok | ok | ok | - |
+| `concurrent` | ok | ok | ok | - |
+| `configparser` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute 'text_encoding' |
 | `contextlib` | ok | ok | ok | - |
-| `contextvars` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'contextvars' not found: not supported on the import search path |
-| `copy` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'copy' not found: not supported on the import search path |
-| `copyreg` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'copyreg' not found: not supported on the import search path |
+| `contextvars` | ok | ok | ok | - |
+| `copy` | ok | exit 1 | runtime_error | NotImplementedError: ABC.register() is not implemented: Hydro's isinstance/issubclass onl… |
+| `copyreg` | ok | exit 1 | runtime_error | AttributeError: 'function' object has no attribute '__new__' |
 | `csv` | ok | ok | ok | - |
-| `ctypes` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'ctypes' not found: not supported on the import search path |
-| `curses` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'curses' not found: not supported on the import search path |
+| `ctypes` | ok | ok | ok | - |
+| `curses` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_curses' not found: not supported on the import search path |
 | `dataclasses` | ok | ok | ok | - |
 | `datetime` | ok | ok | ok | - |
-| `dbm` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'dbm' not found: not supported on the import search path |
-| `decimal` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'decimal' not found: not supported on the import search path |
-| `difflib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'difflib' not found: not supported on the import search path |
-| `dis` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'dis' not found: not supported on the import search path |
-| `doctest` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'doctest' not found: not supported on the import search path |
-| `email` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'email' not found: not supported on the import search path |
-| `encodings` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'encodings' not found: not supported on the import search path |
-| `ensurepip` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'ensurepip' not found: not supported on the import search path |
+| `dbm` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fsencode' |
+| `decimal` | ok | ok | ok | - |
+| `difflib` | ok | ok | ok | - |
+| `dis` | ok | ok | ok | - |
+| `doctest` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `email` | ok | ok | ok | - |
+| `encodings` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'codecs' has no attribute 'code_page_encode' |
+| `ensurepip` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'flags' |
 | `enum` | ok | ok | ok | - |
-| `filecmp` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'filecmp' not found: not supported on the import search path |
-| `fileinput` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'fileinput' not found: not supported on the import search path |
+| `filecmp` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'curdir' |
+| `fileinput` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'flags' |
 | `fnmatch` | ok | ok | ok | - |
 | `fractions` | ok | ok | ok | - |
-| `ftplib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'ftplib' not found: not supported on the import search path |
+| `ftplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'socket' has no attribute '_GLOBAL_DEFAULT_TIMEOUT' |
 | `functools` | ok | ok | ok | - |
 | `getopt` | ok | ok | ok | - |
-| `getpass` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'getpass' not found: not supported on the import search path |
-| `gettext` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'gettext' not found: not supported on the import search path |
-| `glob` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'glob' not found: not supported on the import search path |
-| `graphlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'graphlib' not found: not supported on the import search path |
-| `gzip` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'gzip' not found: not supported on the import search path |
-| `hashlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'hashlib' not found: not supported on the import search path |
+| `getpass` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'O_NOCTTY' |
+| `gettext` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'errno' has no attribute 'ENOENT' |
+| `glob` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `graphlib` | ok | ok | ok | - |
+| `gzip` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute 'SEEK_SET' |
+| `hashlib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
 | `heapq` | ok | ok | ok | - |
-| `hmac` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'hmac' not found: not supported on the import search path |
+| `hmac` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_operator' has no attribute '_compare_digest' |
 | `html` | ok | ok | ok | - |
-| `http` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'http' not found: not supported on the import search path |
-| `idlelib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'idlelib' not found: not supported on the import search path |
-| `imaplib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'imaplib' not found: not supported on the import search path |
+| `http` | ok | exit 1 | runtime_error | AttributeError: 'super' object has no attribute '__setitem__' |
+| `idlelib` | ok | ok | ok | - |
+| `imaplib` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'FEBRUARY' is not defined |
 | `importlib` | ok | ok | ok | - |
-| `inspect` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'inspect' not found: not supported on the import search path |
-| `ipaddress` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'ipaddress' not found: not supported on the import search path |
+| `inspect` | ok | ok | ok | - |
+| `ipaddress` | ok | exit 1 | runtime_error | TypeError: cannot convert 'list' object to bytes |
 | `json` | ok | ok | ok | - |
 | `keyword` | ok | ok | ok | - |
-| `linecache` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'linecache' not found: not supported on the import search path |
-| `locale` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'locale' not found: not supported on the import search path |
-| `logging` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'logging' not found: not supported on the import search path |
-| `lzma` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'lzma' not found: not supported on the import search path |
-| `mailbox` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'mailbox' not found: not supported on the import search path |
+| `linecache` | ok | ok | ok | - |
+| `locale` | ok | ok | ok | - |
+| `logging` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `lzma` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lzma' not found: not supported on the import search path |
+| `mailbox` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'FEBRUARY' is not defined |
 | `mimetypes` | ok | ok | ok | - |
-| `modulefinder` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'modulefinder' not found: not supported on the import search path |
+| `modulefinder` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
 | `multiprocessing` | ok | ok | ok | - |
-| `netrc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'netrc' not found: not supported on the import search path |
-| `nturl2path` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'nturl2path' not found: not supported on the import search path |
-| `numbers` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'numbers' not found: not supported on the import search path |
-| `opcode` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'opcode' not found: not supported on the import search path |
+| `netrc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os.path' has no attribute 'expanduser' |
+| `nturl2path` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'getfilesystemencodeerrors' |
+| `numbers` | ok | ok | ok | - |
+| `opcode` | ok | ok | ok | - |
 | `operator` | ok | ok | ok | - |
-| `optparse` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'optparse' not found: not supported on the import search path |
+| `optparse` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'errno' has no attribute 'ENOENT' |
 | `pathlib` | ok | ok | ok | - |
-| `pdb` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pdb' not found: not supported on the import search path |
+| `pdb` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_signal' not found: not supported on the import search path |
 | `pickle` | ok | ok | ok | - |
-| `pickletools` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pickletools' not found: not supported on the import search path |
-| `pkgutil` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pkgutil' not found: not supported on the import search path |
+| `pickletools` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'pickle' has no attribute 'decode_long' |
+| `pkgutil` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib.util' has no attribute 'MAGIC_NUMBER' |
 | `platform` | ok | ok | ok | - |
-| `plistlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'plistlib' not found: not supported on the import search path |
-| `poplib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'poplib' not found: not supported on the import search path |
-| `pprint` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pprint' not found: not supported on the import search path |
-| `profile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'profile' not found: not supported on the import search path |
-| `pstats` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pstats' not found: not supported on the import search path |
-| `pty` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pty' not found: not supported on the import search path |
-| `py_compile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'py_compile' not found: not supported on the import search path |
-| `pyclbr` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pyclbr' not found: not supported on the import search path |
-| `pydoc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pydoc' not found: not supported on the import search path |
-| `pydoc_data` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pydoc_data' not found: not supported on the import search path |
+| `plistlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
+| `poplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `pprint` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'is_dataclass' |
+| `profile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'time' has no attribute 'process_time' |
+| `pstats` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'functools' has no attribute 'cmp_to_key' |
+| `pty` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'termios' not found: not supported on the import search path |
+| `py_compile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
+| `pyclbr` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib.util' has no attribute '_find_spec_from_path' |
+| `pydoc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
+| `pydoc_data` | ok | ok | ok | - |
 | `queue` | ok | ok | ok | - |
 | `quopri` | ok | ok | ok | - |
 | `random` | ok | ok | ok | - |
 | `re` | ok | ok | ok | - |
-| `reprlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'reprlib' not found: not supported on the import search path |
-| `rlcompleter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'rlcompleter' not found: not supported on the import search path |
-| `sched` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'sched' not found: not supported on the import search path |
-| `secrets` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'secrets' not found: not supported on the import search path |
+| `reprlib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'get_int_max_str_digits' |
+| `rlcompleter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '__main__' not found: not supported on the import search path |
+| `sched` | ok | ok | ok | - |
+| `secrets` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_operator' has no attribute '_compare_digest' |
 | `selectors` | ok | ok | ok | - |
-| `shelve` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'shelve' not found: not supported on the import search path |
-| `shlex` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'shlex' not found: not supported on the import search path |
+| `shelve` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'pickle' has no attribute 'DEFAULT_PROTOCOL' |
+| `shlex` | ok | ok | ok | - |
 | `shutil` | ok | ok | ok | - |
-| `signal` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'signal' not found: not supported on the import search path |
-| `smtplib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'smtplib' not found: not supported on the import search path |
+| `signal` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_signal' not found: not supported on the import search path |
+| `smtplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'math' has no attribute 'isqrt' |
 | `socket` | ok | ok | ok | - |
-| `socketserver` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'socketserver' not found: not supported on the import search path |
-| `sqlite3` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'sqlite3' not found: not supported on the import search path |
-| `sre_compile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'sre_compile' not found: not supported on the import search path |
-| `sre_constants` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'sre_constants' not found: not supported on the import search path |
-| `sre_parse` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'sre_parse' not found: not supported on the import search path |
+| `socketserver` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'WNOHANG' |
+| `sqlite3` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sqlite3' not found: not supported on the import search path |
+| `sre_compile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 're' has no attribute '_compiler' |
+| `sre_constants` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 're' has no attribute '_constants' |
+| `sre_parse` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 're' has no attribute '_parser' |
 | `ssl` | ok | ok | ok | - |
 | `statistics` | ok | ok | ok | - |
-| `string` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'string' not found: not supported on the import search path |
-| `stringprep` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'stringprep' not found: not supported on the import search path |
-| `struct` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'struct' not found: not supported on the import search path |
+| `string` | ok | ok | ok | - |
+| `stringprep` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'unicodedata' has no attribute 'ucd_3_2_0' |
+| `struct` | ok | ok | ok | - |
 | `subprocess` | ok | ok | ok | - |
-| `symtable` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'symtable' not found: not supported on the import search path |
-| `sysconfig` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'sysconfig' not found: not supported on the import search path |
-| `tabnanny` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'tabnanny' not found: not supported on the import search path |
-| `tarfile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'tarfile' not found: not supported on the import search path |
+| `symtable` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_symtable' not found: not supported on the import search path |
+| `sysconfig` | ok | ok | ok | - |
+| `tabnanny` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os.path' has no attribute 'islink' |
+| `tarfile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'close' |
 | `tempfile` | ok | ok | ok | - |
 | `textwrap` | ok | ok | ok | - |
-| `this` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'this' not found: not supported on the import search path |
+| `this` | ok | ok | ok | - |
 | `threading` | ok | ok | ok | - |
 | `timeit` | ok | ok | ok | - |
-| `tkinter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'tkinter' not found: not supported on the import search path |
-| `token` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'token' not found: not supported on the import search path |
-| `tokenize` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'tokenize' not found: not supported on the import search path |
-| `tomllib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'tomllib' not found: not supported on the import search path |
-| `trace` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'trace' not found: not supported on the import search path |
-| `traceback` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'traceback' not found: not supported on the import search path |
-| `tracemalloc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'tracemalloc' not found: not supported on the import search path |
-| `tty` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'tty' not found: not supported on the import search path |
-| `turtle` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'turtle' not found: not supported on the import search path |
-| `turtledemo` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'turtledemo' not found: not supported on the import search path |
+| `tkinter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `token` | ok | ok | ok | - |
+| `tokenize` | ok | exit 1 | runtime_error | TypeError: first argument must be str or Pattern, not bytes |
+| `tomllib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'datetime' has no attribute 'timezone' |
+| `trace` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'altsep' |
+| `traceback` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `tracemalloc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
+| `tty` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'termios' not found: not supported on the import search path |
+| `turtle` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `turtledemo` | ok | ok | ok | - |
 | `types` | ok | ok | ok | - |
 | `typing` | ok | ok | ok | - |
 | `unittest` | ok | ok | ok | - |
-| `urllib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'urllib' not found: not supported on the import search path |
-| `uuid` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'uuid' not found: not supported on the import search path |
-| `venv` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'venv' not found: not supported on the import search path |
+| `urllib` | ok | ok | ok | - |
+| `uuid` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'defpath' |
+| `venv` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
 | `warnings` | ok | ok | ok | - |
-| `wave` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'wave' not found: not supported on the import search path |
-| `weakref` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'weakref' not found: not supported on the import search path |
-| `webbrowser` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'webbrowser' not found: not supported on the import search path |
-| `wsgiref` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'wsgiref' not found: not supported on the import search path |
-| `xml` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'xml' not found: not supported on the import search path |
-| `xmlrpc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'xmlrpc' not found: not supported on the import search path |
-| `zipapp` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'zipapp' not found: not supported on the import search path |
-| `zipfile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'zipfile' not found: not supported on the import search path |
-| `zoneinfo` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'zoneinfo' not found: not supported on the import search path |
+| `wave` | ok | ok | ok | - |
+| `weakref` | ok | exit 1 | runtime_error | NotImplementedError: ABC.register() is not implemented: Hydro's isinstance/issubclass onl… |
+| `webbrowser` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `wsgiref` | ok | ok | ok | - |
+| `xml` | ok | ok | ok | - |
+| `xmlrpc` | ok | ok | ok | - |
+| `zipapp` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'lstat' |
+| `zipfile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'lstat' |
+| `zoneinfo` | ok | ok | ok | - |
 
 ### extension (63)
 
@@ -302,11 +306,11 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_codecs_kr` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_codecs_kr' not found: not supported on the import search path |
 | `_codecs_tw` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_codecs_tw' not found: not supported on the import search path |
 | `_csv` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_csv' not found: not supported on the import search path |
-| `_ctypes` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_ctypes' not found: not supported on the import search path |
+| `_ctypes` | ok | ok | ok | - |
 | `_curses` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_curses' not found: not supported on the import search path |
 | `_curses_panel` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_curses_panel' not found: not supported on the import search path |
 | `_dbm` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_dbm' not found: not supported on the import search path |
-| `_decimal` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_decimal' not found: not supported on the import search path |
+| `_decimal` | ok | ok | ok | - |
 | `_elementtree` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_elementtree' not found: not supported on the import search path |
 | `_gdbm` | exit 1 | exit 1 | cpython_failed | error[HYD0002]: module '_gdbm' not found: not supported on the import search path |
 | `_hashlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_hashlib' not found: not supported on the import search path |
@@ -330,11 +334,11 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_sha1` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sha1' not found: not supported on the import search path |
 | `_sha2` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sha2' not found: not supported on the import search path |
 | `_sha3` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sha3' not found: not supported on the import search path |
-| `_socket` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_socket' not found: not supported on the import search path |
+| `_socket` | ok | ok | ok | - |
 | `_sqlite3` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sqlite3' not found: not supported on the import search path |
 | `_ssl` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_ssl' not found: not supported on the import search path |
 | `_statistics` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_statistics' not found: not supported on the import search path |
-| `_struct` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_struct' not found: not supported on the import search path |
+| `_struct` | ok | ok | ok | - |
 | `_tkinter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
 | `_uuid` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_uuid' not found: not supported on the import search path |
 | `_zoneinfo` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_zoneinfo' not found: not supported on the import search path |
@@ -345,15 +349,15 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `fcntl` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'fcntl' not found: not supported on the import search path |
 | `grp` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'grp' not found: not supported on the import search path |
 | `math` | ok | ok | ok | - |
-| `mmap` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'mmap' not found: not supported on the import search path |
+| `mmap` | ok | ok | ok | - |
 | `pyexpat` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
 | `readline` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'readline' not found: not supported on the import search path |
 | `resource` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'resource' not found: not supported on the import search path |
 | `select` | ok | ok | ok | - |
 | `syslog` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'syslog' not found: not supported on the import search path |
 | `termios` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'termios' not found: not supported on the import search path |
-| `unicodedata` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'unicodedata' not found: not supported on the import search path |
-| `zlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'zlib' not found: not supported on the import search path |
+| `unicodedata` | ok | ok | ok | - |
+| `zlib` | ok | ok | ok | - |
 
 ### unknown (8)
 

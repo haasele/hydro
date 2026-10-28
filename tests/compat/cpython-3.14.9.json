@@ -1,10 +1,12 @@
 {
   "python": "3.14.9",
-  "minimum_passing": 1,
+  "minimum_passing": 3,
   "required": [],
   "known_passing": [
-    "test_errno.py"
+    "test_errno.py",
+    "test_int_literal.py",
+    "test_longexp.py"
   ],
   "notes": "Release gate; grow as stdlib/language support lands. Import-only baseline is separate in docs/COMPATIBILITY.md.",
-  "generated": "2026-10-24T22:16:44Z"
+  "generated": "2026-10-29T00:41:12Z"
 }
