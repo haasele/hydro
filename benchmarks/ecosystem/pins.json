@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "python": "3.14.9",
-  "site_packages": "/tmp/pkgs",
+  "site_packages": ".hydro/ecosystem/site",
   "hash_semantics": {
     "dist_info_record_sha256": "SHA-256 of the package's dist-info/RECORD file in the installed site-packages tree. It locks the exact installed file set without requiring the original wheel and is validated on every run.",
     "wheel_sha256": "SHA-256 of the original wheel artifact. A null value is an explicit placeholder, reported as 'not pinned' and never as verified."

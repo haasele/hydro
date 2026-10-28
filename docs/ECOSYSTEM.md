@@ -53,6 +53,24 @@ a missing pytest installation is a failure. No upstream result is claimed until
 such a run exists: the generated block only contains an upstream section after a
 real `--tests` run.
 
+## Current status
+
+The pinned tree is installed under `.hydro/ecosystem/site` with:
+
+```sh
+uv pip install --target .hydro/ecosystem/site \
+  numpy==2.5.0 pandas==3.1.0 pydantic==2.14.1 pydantic-core==2.50.1 \
+  python-dateutil==3.0.0 six==1.17.0 typing-extensions==4.16.0 \
+  typing-inspection==0.4.4 annotated-types==0.8.0 tzdata==2026.5
+```
+
+`HYDRO_STDLIB` should point at the CPython 3.14.9 `Lib` tree for unvendored
+stdlib modules. As of 2026-10-28 the link-time ABI inventory is complete
+(0 missing symbols), but imports still stop on semantic blockers: NumPy
+`datetime_CAPI`, pandas' mixed-type conditional type check, and PyO3's
+exception-class validation in pydantic-core. No case is reported as passing
+until the differential runner actually observes it.
+
 <!-- BEGIN GENERATED ECOSYSTEM RESULTS -->
 
 _No ecosystem run recorded yet._ Run `python3 scripts/ecosystem_compat.py` to

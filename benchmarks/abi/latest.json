@@ -1,10 +1,8 @@
 {
   "by_family": {
     "PyArg": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyArg_ValidateKeywordArguments"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 5,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -38,10 +36,8 @@
       "weak_missing_symbols": []
     },
     "PyBytes": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyBytes_Join"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 7,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -75,19 +71,15 @@
       "weak_missing_symbols": []
     },
     "PyClassMethod": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyClassMethod_New"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 1,
       "weak_missing": 0,
       "weak_missing_symbols": []
     },
     "PyCode": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyCode_NewEmpty"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 1,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -107,22 +99,15 @@
       "weak_missing_symbols": []
     },
     "PyDescr": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyDescr_NewClassMethod"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 1,
       "weak_missing": 0,
       "weak_missing_symbols": []
     },
     "PyDict": {
-      "missing": 4,
-      "missing_symbols": [
-        "PyDict_Pop",
-        "PyDict_SetDefault",
-        "_PyDict_GetItem_KnownHash",
-        "_PyDict_NewPresized"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 26,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -135,10 +120,8 @@
       "weak_missing_symbols": []
     },
     "PyErr": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyErr_NewException"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 24,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -172,10 +155,8 @@
       "weak_missing_symbols": []
     },
     "PyFrame": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyFrame_New"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 1,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -195,11 +176,8 @@
       "weak_missing_symbols": []
     },
     "PyGC": {
-      "missing": 2,
-      "missing_symbols": [
-        "PyGC_Disable",
-        "PyGC_Enable"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 2,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -247,26 +225,15 @@
       "weak_missing_symbols": []
     },
     "PyList": {
-      "missing": 3,
-      "missing_symbols": [
-        "PyList_Insert",
-        "PyList_SetSlice",
-        "PyList_Sort"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 10,
       "weak_missing": 0,
       "weak_missing_symbols": []
     },
     "PyLong": {
-      "missing": 6,
-      "missing_symbols": [
-        "PyLong_AsDouble",
-        "PyLong_AsInt",
-        "PyLong_AsUnsignedLongLongMask",
-        "PyLong_FromSize_t",
-        "PyLong_FromString",
-        "_PyLong_Copy"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 29,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -300,10 +267,8 @@
       "weak_missing_symbols": []
     },
     "PyMemoryView": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyMemoryView_FromMemory"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 3,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -351,25 +316,15 @@
       "weak_missing_symbols": []
     },
     "PyOS": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyOS_double_to_string"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 5,
       "weak_missing": 0,
       "weak_missing_symbols": []
     },
     "PyObject": {
-      "missing": 7,
-      "missing_symbols": [
-        "PyObject_CallFinalizerFromDealloc",
-        "PyObject_CallMethodObjArgs",
-        "PyObject_ClearManagedDict",
-        "PyObject_GC_IsFinalized",
-        "PyObject_HasAttr",
-        "PyObject_VisitManagedDict",
-        "_PyObject_GetDictPtr"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 64,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -389,20 +344,15 @@
       "weak_missing_symbols": []
     },
     "PySequence": {
-      "missing": 1,
-      "missing_symbols": [
-        "PySequence_List"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 12,
       "weak_missing": 0,
       "weak_missing_symbols": []
     },
     "PySet": {
-      "missing": 2,
-      "missing_symbols": [
-        "PySet_Discard",
-        "PySet_Pop"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 7,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -422,10 +372,8 @@
       "weak_missing_symbols": []
     },
     "PyStaticMethod": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyStaticMethod_New"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 1,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -438,29 +386,22 @@
       "weak_missing_symbols": []
     },
     "PyThread": {
-      "missing": 2,
-      "missing_symbols": [
-        "PyThread_allocate_lock",
-        "PyThread_free_lock"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 2,
       "weak_missing": 0,
       "weak_missing_symbols": []
     },
     "PyThreadState": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyThreadState_GetFrame"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 3,
       "weak_missing": 0,
       "weak_missing_symbols": []
     },
     "PyTraceBack": {
-      "missing": 1,
-      "missing_symbols": [
-        "PyTraceBack_Here"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 3,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -480,30 +421,15 @@
       "weak_missing_symbols": []
     },
     "PyType": {
-      "missing": 1,
-      "missing_symbols": [
-        "_PyType_Lookup"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 15,
       "weak_missing": 0,
       "weak_missing_symbols": []
     },
     "PyUnicode": {
-      "missing": 12,
-      "missing_symbols": [
-        "PyUnicode_CopyCharacters",
-        "PyUnicode_DecodeLocale",
-        "PyUnicode_DecodeUTF8",
-        "PyUnicode_EncodeLocale",
-        "PyUnicode_Equal",
-        "PyUnicode_Find",
-        "PyUnicode_FindChar",
-        "PyUnicode_FromOrdinal",
-        "PyUnicode_FromWideChar",
-        "PyUnicode_Join",
-        "PyUnicode_Resize",
-        "PyUnicode_Split"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 49,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -523,11 +449,8 @@
       "weak_missing_symbols": []
     },
     "PyUnstable": {
-      "missing": 2,
-      "missing_symbols": [
-        "PyUnstable_Code_NewWithPosOnlyArgs",
-        "PyUnstable_Object_EnableDeferredRefcount"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 4,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -540,11 +463,8 @@
       "weak_missing_symbols": []
     },
     "PyWeakref": {
-      "missing": 2,
-      "missing_symbols": [
-        "PyWeakref_GetRef",
-        "PyWeakref_NewRef"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 2,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -557,10 +477,8 @@
       "weak_missing_symbols": []
     },
     "Py_<core>": {
-      "missing": 1,
-      "missing_symbols": [
-        "_Py_FatalErrorFunc"
-      ],
+      "missing": 0,
+      "missing_symbols": [],
       "referenced": 16,
       "weak_missing": 0,
       "weak_missing_symbols": []
@@ -570,7 +488,7 @@
     "numpy": {
       "families": {
         "PyArg": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 5,
           "weak_missing": 0
         },
@@ -615,7 +533,7 @@
           "weak_missing": 0
         },
         "PyCode": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 1,
           "weak_missing": 0
         },
@@ -630,7 +548,7 @@
           "weak_missing": 0
         },
         "PyDict": {
-          "missing": 3,
+          "missing": 0,
           "referenced": 23,
           "weak_missing": 0
         },
@@ -640,7 +558,7 @@
           "weak_missing": 0
         },
         "PyErr": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 20,
           "weak_missing": 0
         },
@@ -665,7 +583,7 @@
           "weak_missing": 0
         },
         "PyFrame": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 1,
           "weak_missing": 0
         },
@@ -675,7 +593,7 @@
           "weak_missing": 0
         },
         "PyGC": {
-          "missing": 2,
+          "missing": 0,
           "referenced": 2,
           "weak_missing": 0
         },
@@ -710,12 +628,12 @@
           "weak_missing": 0
         },
         "PyList": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 7,
           "weak_missing": 0
         },
         "PyLong": {
-          "missing": 4,
+          "missing": 0,
           "referenced": 22,
           "weak_missing": 0
         },
@@ -735,7 +653,7 @@
           "weak_missing": 0
         },
         "PyMemoryView": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 3,
           "weak_missing": 0
         },
@@ -775,7 +693,7 @@
           "weak_missing": 0
         },
         "PyObject": {
-          "missing": 6,
+          "missing": 0,
           "referenced": 59,
           "weak_missing": 0
         },
@@ -790,7 +708,7 @@
           "weak_missing": 0
         },
         "PySequence": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 12,
           "weak_missing": 0
         },
@@ -810,17 +728,17 @@
           "weak_missing": 0
         },
         "PyThread": {
-          "missing": 2,
+          "missing": 0,
           "referenced": 2,
           "weak_missing": 0
         },
         "PyThreadState": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 3,
           "weak_missing": 0
         },
         "PyTraceBack": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 2,
           "weak_missing": 0
         },
@@ -835,17 +753,17 @@
           "weak_missing": 0
         },
         "PyType": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 8,
           "weak_missing": 0
         },
         "PyUnicode": {
-          "missing": 6,
+          "missing": 0,
           "referenced": 41,
           "weak_missing": 0
         },
         "PyUnstable": {
-          "missing": 2,
+          "missing": 0,
           "referenced": 4,
           "weak_missing": 0
         },
@@ -855,50 +773,13 @@
           "weak_missing": 0
         },
         "Py_<core>": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 15,
           "weak_missing": 0
         }
       },
-      "missing_required_symbols": 36,
-      "missing_symbols": [
-        "PyArg_ValidateKeywordArguments",
-        "PyCode_NewEmpty",
-        "PyDict_SetDefault",
-        "PyErr_NewException",
-        "PyFrame_New",
-        "PyGC_Disable",
-        "PyGC_Enable",
-        "PyList_SetSlice",
-        "PyLong_AsUnsignedLongLongMask",
-        "PyLong_FromSize_t",
-        "PyLong_FromString",
-        "PyMemoryView_FromMemory",
-        "PyObject_CallFinalizerFromDealloc",
-        "PyObject_CallMethodObjArgs",
-        "PyObject_ClearManagedDict",
-        "PyObject_GC_IsFinalized",
-        "PyObject_HasAttr",
-        "PyObject_VisitManagedDict",
-        "PySequence_List",
-        "PyThreadState_GetFrame",
-        "PyThread_allocate_lock",
-        "PyThread_free_lock",
-        "PyTraceBack_Here",
-        "PyUnicode_CopyCharacters",
-        "PyUnicode_DecodeUTF8",
-        "PyUnicode_FindChar",
-        "PyUnicode_FromOrdinal",
-        "PyUnicode_Join",
-        "PyUnicode_Resize",
-        "PyUnstable_Code_NewWithPosOnlyArgs",
-        "PyUnstable_Object_EnableDeferredRefcount",
-        "_PyDict_GetItem_KnownHash",
-        "_PyDict_NewPresized",
-        "_PyLong_Copy",
-        "_PyType_Lookup",
-        "_Py_FatalErrorFunc"
-      ],
+      "missing_required_symbols": 0,
+      "missing_symbols": [],
       "missing_weak_symbols": 0,
       "modules_referencing": 19,
       "modules_scanned": 22,
@@ -910,7 +791,7 @@
     "pandas": {
       "families": {
         "PyArg": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 2,
           "weak_missing": 0
         },
@@ -935,7 +816,7 @@
           "weak_missing": 0
         },
         "PyBytes": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 6,
           "weak_missing": 0
         },
@@ -960,12 +841,12 @@
           "weak_missing": 0
         },
         "PyClassMethod": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 1,
           "weak_missing": 0
         },
         "PyCode": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 1,
           "weak_missing": 0
         },
@@ -975,12 +856,12 @@
           "weak_missing": 0
         },
         "PyDescr": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 1,
           "weak_missing": 0
         },
         "PyDict": {
-          "missing": 4,
+          "missing": 0,
           "referenced": 20,
           "weak_missing": 0
         },
@@ -1015,7 +896,7 @@
           "weak_missing": 0
         },
         "PyFrame": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 1,
           "weak_missing": 0
         },
@@ -1050,12 +931,12 @@
           "weak_missing": 0
         },
         "PyList": {
-          "missing": 3,
+          "missing": 0,
           "referenced": 7,
           "weak_missing": 0
         },
         "PyLong": {
-          "missing": 5,
+          "missing": 0,
           "referenced": 16,
           "weak_missing": 0
         },
@@ -1095,12 +976,12 @@
           "weak_missing": 0
         },
         "PyOS": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 3,
           "weak_missing": 0
         },
         "PyObject": {
-          "missing": 7,
+          "missing": 0,
           "referenced": 51,
           "weak_missing": 0
         },
@@ -1110,12 +991,12 @@
           "weak_missing": 0
         },
         "PySequence": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 5,
           "weak_missing": 0
         },
         "PySet": {
-          "missing": 2,
+          "missing": 0,
           "referenced": 6,
           "weak_missing": 0
         },
@@ -1130,22 +1011,22 @@
           "weak_missing": 0
         },
         "PyStaticMethod": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 1,
           "weak_missing": 0
         },
         "PyThread": {
-          "missing": 2,
+          "missing": 0,
           "referenced": 2,
           "weak_missing": 0
         },
         "PyThreadState": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 3,
           "weak_missing": 0
         },
         "PyTraceBack": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 2,
           "weak_missing": 0
         },
@@ -1160,22 +1041,22 @@
           "weak_missing": 0
         },
         "PyType": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 8,
           "weak_missing": 0
         },
         "PyUnicode": {
-          "missing": 12,
+          "missing": 0,
           "referenced": 34,
           "weak_missing": 0
         },
         "PyUnstable": {
-          "missing": 2,
+          "missing": 0,
           "referenced": 3,
           "weak_missing": 0
         },
         "PyWeakref": {
-          "missing": 2,
+          "missing": 0,
           "referenced": 2,
           "weak_missing": 0
         },
@@ -1185,66 +1066,13 @@
           "weak_missing": 0
         },
         "Py_<core>": {
-          "missing": 1,
+          "missing": 0,
           "referenced": 14,
           "weak_missing": 0
         }
       },
-      "missing_required_symbols": 52,
-      "missing_symbols": [
-        "PyArg_ValidateKeywordArguments",
-        "PyBytes_Join",
-        "PyClassMethod_New",
-        "PyCode_NewEmpty",
-        "PyDescr_NewClassMethod",
-        "PyDict_Pop",
-        "PyDict_SetDefault",
-        "PyFrame_New",
-        "PyList_Insert",
-        "PyList_SetSlice",
-        "PyList_Sort",
-        "PyLong_AsDouble",
-        "PyLong_AsInt",
-        "PyLong_FromSize_t",
-        "PyLong_FromString",
-        "PyOS_double_to_string",
-        "PyObject_CallFinalizerFromDealloc",
-        "PyObject_CallMethodObjArgs",
-        "PyObject_ClearManagedDict",
-        "PyObject_GC_IsFinalized",
-        "PyObject_HasAttr",
-        "PyObject_VisitManagedDict",
-        "PySequence_List",
-        "PySet_Discard",
-        "PySet_Pop",
-        "PyStaticMethod_New",
-        "PyThreadState_GetFrame",
-        "PyThread_allocate_lock",
-        "PyThread_free_lock",
-        "PyTraceBack_Here",
-        "PyUnicode_CopyCharacters",
-        "PyUnicode_DecodeLocale",
-        "PyUnicode_DecodeUTF8",
-        "PyUnicode_EncodeLocale",
-        "PyUnicode_Equal",
-        "PyUnicode_Find",
-        "PyUnicode_FindChar",
-        "PyUnicode_FromOrdinal",
-        "PyUnicode_FromWideChar",
-        "PyUnicode_Join",
-        "PyUnicode_Resize",
-        "PyUnicode_Split",
-        "PyUnstable_Code_NewWithPosOnlyArgs",
-        "PyUnstable_Object_EnableDeferredRefcount",
-        "PyWeakref_GetRef",
-        "PyWeakref_NewRef",
-        "_PyDict_GetItem_KnownHash",
-        "_PyDict_NewPresized",
-        "_PyLong_Copy",
-        "_PyObject_GetDictPtr",
-        "_PyType_Lookup",
-        "_Py_FatalErrorFunc"
-      ],
+      "missing_required_symbols": 0,
+      "missing_symbols": [],
       "missing_weak_symbols": 0,
       "modules_referencing": 45,
       "modules_scanned": 45,
@@ -1454,1504 +1282,23 @@
   },
   "hydro_sources": [
     {
-      "defined_cpython_symbols": 536,
-      "kind": "elf-dynamic",
-      "path": "../tea/target/debug/tea",
-      "symbol_scope": "dynamic"
-    },
-    {
-      "defined_cpython_symbols": 364,
+      "defined_cpython_symbols": 593,
       "kind": "static-archive",
       "path": "target/debug/libhydro_runtime.a",
       "symbol_scope": "all"
     }
   ],
   "missing": {
-    "required": [
-      {
-        "family": "PyArg",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyArg_ValidateKeywordArguments"
-      },
-      {
-        "family": "PyBytes",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyBytes_Join"
-      },
-      {
-        "family": "PyClassMethod",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyClassMethod_New"
-      },
-      {
-        "family": "PyCode",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_bounded_integers.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/byteswap.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/base.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/ccalendar.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/indexers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyCode_NewEmpty"
-      },
-      {
-        "family": "PyDescr",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyDescr_NewClassMethod"
-      },
-      {
-        "family": "PyDict",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyDict_Pop"
-      },
-      {
-        "family": "PyDict",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/byteswap.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/base.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/ccalendar.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/indexers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyDict_SetDefault"
-      },
-      {
-        "family": "PyErr",
-        "libraries": [
-          "numpy"
-        ],
-        "modules": [
-          "numpy/linalg/lapack_lite.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyErr_NewException"
-      },
-      {
-        "family": "PyFrame",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_bounded_integers.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/byteswap.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/base.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/ccalendar.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/indexers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyFrame_New"
-      },
-      {
-        "family": "PyGC",
-        "libraries": [
-          "numpy"
-        ],
-        "modules": [
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyGC_Disable"
-      },
-      {
-        "family": "PyGC",
-        "libraries": [
-          "numpy"
-        ],
-        "modules": [
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyGC_Enable"
-      },
-      {
-        "family": "PyList",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyList_Insert"
-      },
-      {
-        "family": "PyList",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyList_SetSlice"
-      },
-      {
-        "family": "PyList",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyList_Sort"
-      },
-      {
-        "family": "PyLong",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyLong_AsDouble"
-      },
-      {
-        "family": "PyLong",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/ccalendar.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyLong_AsInt"
-      },
-      {
-        "family": "PyLong",
-        "libraries": [
-          "numpy"
-        ],
-        "modules": [
-          "numpy/_core/_simd.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyLong_AsUnsignedLongLongMask"
-      },
-      {
-        "family": "PyLong",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyLong_FromSize_t"
-      },
-      {
-        "family": "PyLong",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_bounded_integers.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyLong_FromString"
-      },
-      {
-        "family": "PyMemoryView",
-        "libraries": [
-          "numpy"
-        ],
-        "modules": [
-          "numpy/random/_bounded_integers.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyMemoryView_FromMemory"
-      },
-      {
-        "family": "PyOS",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyOS_double_to_string"
-      },
-      {
-        "family": "PyObject",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/base.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyObject_CallFinalizerFromDealloc"
-      },
-      {
-        "family": "PyObject",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyObject_CallMethodObjArgs"
-      },
-      {
-        "family": "PyObject",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyObject_ClearManagedDict"
-      },
-      {
-        "family": "PyObject",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/base.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyObject_GC_IsFinalized"
-      },
-      {
-        "family": "PyObject",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyObject_HasAttr"
-      },
-      {
-        "family": "PyObject",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyObject_VisitManagedDict"
-      },
-      {
-        "family": "PySequence",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/_core/_simd.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PySequence_List"
-      },
-      {
-        "family": "PySet",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PySet_Discard"
-      },
-      {
-        "family": "PySet",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PySet_Pop"
-      },
-      {
-        "family": "PyStaticMethod",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyStaticMethod_New"
-      },
-      {
-        "family": "PyThreadState",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyThreadState_GetFrame"
-      },
-      {
-        "family": "PyThread",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyThread_allocate_lock"
-      },
-      {
-        "family": "PyThread",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyThread_free_lock"
-      },
-      {
-        "family": "PyTraceBack",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_bounded_integers.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/byteswap.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/base.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/ccalendar.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/indexers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyTraceBack_Here"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_bounded_integers.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_CopyCharacters"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_DecodeLocale"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_bounded_integers.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/byteswap.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/base.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/ccalendar.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/indexers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_DecodeUTF8"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_EncodeLocale"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/indexers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_Equal"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_Find"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_bounded_integers.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_FindChar"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_FromOrdinal"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/_ujson.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_FromWideChar"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_Join"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_Resize"
-      },
-      {
-        "family": "PyUnicode",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnicode_Split"
-      },
-      {
-        "family": "PyUnstable",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/byteswap.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/base.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/ccalendar.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/indexers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnstable_Code_NewWithPosOnlyArgs"
-      },
-      {
-        "family": "PyUnstable",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/byteswap.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/base.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/ccalendar.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/indexers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyUnstable_Object_EnableDeferredRefcount"
-      },
-      {
-        "family": "PyWeakref",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyWeakref_GetRef"
-      },
-      {
-        "family": "PyWeakref",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": false,
-        "symbol": "PyWeakref_NewRef"
-      },
-      {
-        "family": "PyDict",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_bounded_integers.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/base.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/ccalendar.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/indexers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": true,
-        "symbol": "_PyDict_GetItem_KnownHash"
-      },
-      {
-        "family": "PyDict",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/arrays.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/index.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/indexing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/missing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops_dispatch.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/properties.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/dtypes.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/nattype.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/np_datetime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": true,
-        "symbol": "_PyDict_NewPresized"
-      },
-      {
-        "family": "PyLong",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/testing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/offsets.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": true,
-        "symbol": "_PyLong_Copy"
-      },
-      {
-        "family": "PyObject",
-        "libraries": [
-          "pandas"
-        ],
-        "modules": [
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": true,
-        "symbol": "_PyObject_GetDictPtr"
-      },
-      {
-        "family": "PyType",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_bounded_integers.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_common.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_mt19937.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_pcg64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_philox.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/_sfc64.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/bit_generator.cpython-314-x86_64-linux-gnu.so",
-          "numpy/random/mtrand.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": true,
-        "symbol": "_PyType_Lookup"
-      },
-      {
-        "family": "Py_<core>",
-        "libraries": [
-          "numpy",
-          "pandas"
-        ],
-        "modules": [
-          "numpy/random/_generator.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/_cyutility.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/algos.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/groupby.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/hashtable.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/internals.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/interval.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/join.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/lib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/ops.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/parsers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/reshape.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/sparse.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslib.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/conversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/fields.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/parsing.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/period.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/strptime.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timedeltas.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timestamps.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/timezones.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/tzconversion.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/tslibs/vectorized.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/aggregations.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/window/indexers.cpython-314-x86_64-linux-gnu.so",
-          "pandas/_libs/writers.cpython-314-x86_64-linux-gnu.so"
-        ],
-        "private": true,
-        "symbol": "_Py_FatalErrorFunc"
-      }
-    ],
+    "required": [],
     "weak": []
   },
   "schema": 1,
-  "site_packages": "/tmp/pkgs",
+  "site_packages": "/mnt/Vault/GitHub/hydro/.hydro/ecosystem/site",
   "summary": {
-    "check": "fail",
-    "hydro_defined_symbols": 536,
+    "check": "pass",
+    "hydro_defined_symbols": 593,
     "libraries": 3,
-    "missing_required_symbols": 57,
+    "missing_required_symbols": 0,
     "missing_weak_symbols": 0,
     "modules_referencing": 65,
     "modules_scanned": 68,

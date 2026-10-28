@@ -31,14 +31,20 @@ and `docs/LAYOUT.md` (source tree).
 Official `Lib/test` runs are a release gate; the offline manifest check runs
 in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
-**2026-10-26 package checkpoint:** real CPython 3.14 wheels for NumPy 2.5,
-pandas 3.1, pydantic 2.14 and pydantic-core 2.50 install through `tea install`.
-Import is **not yet green**: NumPy stops on non-module-level function
-definitions/class-body deletes, pandas on `_ctypes`, and pydantic on
-`__slots__`/`annotationlib` introspection. ABI inventory against the real
-`.so` files: NumPy needs 227 missing CPython symbols, pydantic-core 112,
-sampled pandas libs at least 124; builtin `Py*_Type` exports and slot suites
-are now implemented, but this is not an ecosystem-compatibility claim.
+**2026-10-28 package checkpoint:** the pinned CPython-3.14 wheels for NumPy
+2.5.0, pandas 3.1.0, pydantic 2.14.1 and pydantic-core 2.50.1 install into
+`.hydro/ecosystem/site`. The generated ABI inventory now reports **0 missing
+required CPython symbols** across all 68 extension modules (479 referenced,
+593 exported). Import is still **not green**: NumPy reaches
+`numpy._core.umath` and fails on the missing `datetime.datetime_CAPI` capsule;
+pandas gets past dotted extension imports and fails in the type checker at
+`pandas/core/config_init.py` (mixed `str`/`bool` conditional); pydantic reaches
+`_pydantic_core` module init and fails PyO3's
+`PyExceptionClass_Check` (`TypeError: exceptions must derive from BaseException`).
+These are semantic/object-model blockers, not link-time symbol gaps.
+**All-core gate:** `cargo nextest run --workspace` runs 2307 tests in ~3 s
+(2306 pass, 1 skipped) and is the default in `scripts/verify.sh`/CI; Cargo test
+binaries are no longer serial.
 
 **2026-10-26 checkpoint:** the four open construction sites received a
 substantial implementation slice: import/module registry + `HYDRO_STDLIB`,
@@ -50,16 +56,17 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo test --workspace` on 2026-10-26: **1554 Hydro tests**:
+`cargo nextest run --workspace` on 2026-10-28: **2307 tests run
+(2306 pass, 1 skipped)**; the per-crate listing totals 2308 including the
+skipped test:
 
-| Suite | Tests |
+| Crate | Tests |
 |---|---:|
-| runtime unit | 596 |
-| runtime integration | 321 |
-| frontend | 517 (incl. 6 fuzz smoke) |
-| codegen | 61 |
-| IR | 29 |
-| interpreter unit | 11 |
+| frontend | 755 |
+| runtime (unit + integration) | 1388 |
+| codegen | 73 |
+| IR | 49 |
+| interpreter | 24 |
 | parser | 19 |
 
 Tea (separate repository) carries **339** CLI/E2E/AOT/pytest/REPL/PGO/wheel tests.

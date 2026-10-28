@@ -8,6 +8,23 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Changed — 2026-10-28 all-core test gate and CPython-ABI link coverage
+
+- The workspace gate now uses `cargo nextest run --workspace`, which runs every
+  test in its own process across all cores; `scripts/verify.sh` and CI install
+  and use it. 2307 tests run in about 3 seconds on the 16-core host instead of
+  Cargo's serial test-binary execution.
+- The ABI inventory (`scripts/abi_inventory.py`, `benchmarks/abi/latest.*`)
+  reports **0 missing required CPython symbols** across 68 pinned extension
+  modules (479 referenced, 593 exported). This is a link-time result only.
+- Added opaque extension-object handles, process-wide module globals with
+  process-wide GC roots, real frame/code objects and `sys._getframe`, class
+  annotations/`annotationlib`, the remaining Unicode/container/numeric/
+  descriptor/object ABI entry points, and an ecosystem differential harness
+  (`scripts/ecosystem_compat.py`). Package imports remain blocked on semantic
+  gaps (NumPy `datetime_CAPI`, pandas type-checking, pydantic-core/PyO3
+  exception-class validation); no ecosystem pass is claimed.
+
 ### Added — 2026-10-27 blank `property()` and `type(..., **kwds)` metaclass forwarding
 
 - `property()` now accepts zero arguments and builds a real descriptor with
@@ -29,19 +46,22 @@ initial state of the first runnable core.
 
 ### Changed — 2026-10-27 vendored CPython `enum` replaces the native placeholder
 
-- `enum` is now CPython 3.14.9's pure-Python `Lib/enum.py`, vendored verbatim
-  (plus a provenance header) in the repository's new `stdlib/` directory.
+- `enum` is CPython 3.14.9's pure-Python `Lib/enum.py`, vendored with a
+  provenance header and the Hydro-specific `EnumDict`/metaclass adaptations
+  needed by the native-container and `type()` boundary in the repository's new
+  `stdlib/` directory.
   `Enum`, `IntEnum`, `IntFlag`, `Flag`, `StrEnum`, `auto()`, the metaclass
   machinery and every decorator/hook behave as in CPython; the former native
   placeholder that exported empty base classes and returned `None` from
   `auto()` is gone, so NumPy 2.5's import-time `enum` usage is reached instead
   of failing. `stdlib/LICENSE` carries the PSF License notice.
-- `stdlib/` is a default import root, searched after every explicit root
-  (`HYDRO_SITE_PACKAGES`, the `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages
-  trees, `PYTHONPATH` and `HYDRO_STDLIB`), so an explicit root always wins.
-  The root resolves relative to the executable for installed layouts and
-  relative to the repository (`CARGO_MANIFEST_DIR`) at compile time for
-  development builds. Both the compile-time resolver and `sys.path` use it.
+- `stdlib/` is a default import root. Project/site/PYTHONPATH roots precede it;
+  the vendored tree precedes `HYDRO_STDLIB`, so a Hydro compatibility shim wins
+  over the generic CPython `Lib` tree while unvendored modules still resolve
+  from `HYDRO_STDLIB`. The root resolves relative to the executable for
+  installed layouts and relative to the repository (`CARGO_MANIFEST_DIR`) at
+  compile time for development builds. Both the compile-time resolver and
+  `sys.path` use it.
 
 ### Added — 2026-10-27 process-wide module globals and GC roots
 
