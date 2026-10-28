@@ -62,6 +62,22 @@ use super::{
 pub(crate) const PY_TPFLAGS_HAVE_FINALIZE: c_ulong = 1 << 0;
 /// Set on exception classes; `PyExceptionClass_Check`/PyO3 require it.
 pub(crate) const PY_TPFLAGS_BASE_EXC_SUBCLASS: c_ulong = 1 << 30;
+/// `PyType_Check` in CPython 3.14 tests this bit on `Py_TYPE(op)`.
+pub(crate) const PY_TPFLAGS_TYPE_SUBCLASS: c_ulong = 1 << 31;
+pub(crate) const PY_TPFLAGS_LONG_SUBCLASS: c_ulong = 1 << 24;
+pub(crate) const PY_TPFLAGS_LIST_SUBCLASS: c_ulong = 1 << 25;
+pub(crate) const PY_TPFLAGS_TUPLE_SUBCLASS: c_ulong = 1 << 26;
+pub(crate) const PY_TPFLAGS_BYTES_SUBCLASS: c_ulong = 1 << 27;
+pub(crate) const PY_TPFLAGS_UNICODE_SUBCLASS: c_ulong = 1 << 28;
+pub(crate) const PY_TPFLAGS_DICT_SUBCLASS: c_ulong = 1 << 29;
+const PY_TPFLAGS_BUILTIN_SUBCLASSES: c_ulong = PY_TPFLAGS_LONG_SUBCLASS
+    | PY_TPFLAGS_LIST_SUBCLASS
+    | PY_TPFLAGS_TUPLE_SUBCLASS
+    | PY_TPFLAGS_BYTES_SUBCLASS
+    | PY_TPFLAGS_UNICODE_SUBCLASS
+    | PY_TPFLAGS_DICT_SUBCLASS
+    | PY_TPFLAGS_BASE_EXC_SUBCLASS
+    | PY_TPFLAGS_TYPE_SUBCLASS;
 const PY_TPFLAGS_INLINE_VALUES: c_ulong = 1 << 2;
 const PY_TPFLAGS_MANAGED_WEAKREF: c_ulong = 1 << 3;
 const PY_TPFLAGS_MANAGED_DICT: c_ulong = 1 << 4;
@@ -553,7 +569,7 @@ impl TypeObject {
 pub(crate) static mut TYPE_TYPE: TypeObject = TypeObject::builtin(
     c"type".as_ptr(),
     TypeRole::Metatype,
-    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE | PY_TPFLAGS_TYPE_SUBCLASS,
 );
 #[export_name = "PyBaseObject_Type"]
 pub(crate) static mut OBJECT_TYPE: TypeObject = TypeObject::builtin(
@@ -571,8 +587,11 @@ pub(crate) static mut NONE_TYPE: TypeObject = TypeObject::builtin(
 pub(crate) static mut BOOL_TYPE: TypeObject =
     TypeObject::builtin(c"bool".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
 #[export_name = "PyLong_Type"]
-pub(crate) static mut INT_TYPE: TypeObject =
-    TypeObject::builtin(c"int".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
+pub(crate) static mut INT_TYPE: TypeObject = TypeObject::builtin(
+    c"int".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_LONG_SUBCLASS,
+);
 #[export_name = "PyFloat_Type"]
 pub(crate) static mut FLOAT_TYPE: TypeObject =
     TypeObject::builtin(c"float".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
@@ -583,11 +602,17 @@ pub(crate) static mut COMPLEX_TYPE: TypeObject = TypeObject::builtin(
     PY_TPFLAGS_IMMUTABLETYPE,
 );
 #[export_name = "PyUnicode_Type"]
-pub(crate) static mut STR_TYPE: TypeObject =
-    TypeObject::builtin(c"str".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
+pub(crate) static mut STR_TYPE: TypeObject = TypeObject::builtin(
+    c"str".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_UNICODE_SUBCLASS,
+);
 #[export_name = "PyBytes_Type"]
-pub(crate) static mut BYTES_TYPE: TypeObject =
-    TypeObject::builtin(c"bytes".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
+pub(crate) static mut BYTES_TYPE: TypeObject = TypeObject::builtin(
+    c"bytes".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BYTES_SUBCLASS,
+);
 #[export_name = "PyByteArray_Type"]
 pub(crate) static mut BYTEARRAY_TYPE: TypeObject = TypeObject::builtin(
     c"bytearray".as_ptr(),
@@ -595,14 +620,23 @@ pub(crate) static mut BYTEARRAY_TYPE: TypeObject = TypeObject::builtin(
     PY_TPFLAGS_IMMUTABLETYPE,
 );
 #[export_name = "PyList_Type"]
-pub(crate) static mut LIST_TYPE: TypeObject =
-    TypeObject::builtin(c"list".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
+pub(crate) static mut LIST_TYPE: TypeObject = TypeObject::builtin(
+    c"list".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_LIST_SUBCLASS,
+);
 #[export_name = "PyTuple_Type"]
-pub(crate) static mut TUPLE_TYPE: TypeObject =
-    TypeObject::builtin(c"tuple".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
+pub(crate) static mut TUPLE_TYPE: TypeObject = TypeObject::builtin(
+    c"tuple".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_TUPLE_SUBCLASS,
+);
 #[export_name = "PyDict_Type"]
-pub(crate) static mut DICT_TYPE: TypeObject =
-    TypeObject::builtin(c"dict".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
+pub(crate) static mut DICT_TYPE: TypeObject = TypeObject::builtin(
+    c"dict".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_DICT_SUBCLASS,
+);
 #[export_name = "PySet_Type"]
 pub(crate) static mut SET_TYPE: TypeObject =
     TypeObject::builtin(c"set".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
@@ -869,7 +903,10 @@ pub(crate) fn ensure_builtin_types() {
 
 /// True when `object` is a type object (its `ob_type` is the shared metatype).
 pub(crate) fn is_type_pointer(object: *mut ShimObject) -> bool {
-    if object.is_null() {
+    if object.is_null()
+        || (object as usize) < std::mem::align_of::<ShimObject>()
+        || !(object as usize).is_multiple_of(std::mem::align_of::<ShimObject>())
+    {
         return false;
     }
     ensure_builtin_types();
@@ -1639,9 +1676,9 @@ pub(crate) fn type_from_spec(
     let base_mro = linearize_bases(&bases)?;
     // Exception subclasses inherit CPython's `Py_TPFLAGS_BASE_EXC_SUBCLASS`
     // marker; `PyExceptionClass_Check` (used by PyO3) requires it.
-    let inherits_exception = bases.iter().any(|&base| {
+    let inherited_subclass_flags = bases.iter().fold(0, |flags, &base| {
         // SAFETY: every base was validated as a live type pointer above.
-        unsafe { (*base).tp_flags & PY_TPFLAGS_BASE_EXC_SUBCLASS != 0 }
+        flags | (unsafe { (*base).tp_flags } & PY_TPFLAGS_BUILTIN_SUBCLASSES)
     });
 
     let name_c = CString::new(name.as_str())
@@ -1667,9 +1704,7 @@ pub(crate) fn type_from_spec(
     type_object.tp_itemsize = itemsize;
     type_object.tp_doc = doc_c.map_or(ptr::null(), |doc| doc.into_raw() as *const c_char);
     type_object.owns_name = true;
-    if inherits_exception {
-        type_object.tp_flags |= PY_TPFLAGS_BASE_EXC_SUBCLASS;
-    }
+    type_object.tp_flags |= inherited_subclass_flags;
     type_object.tp_methods = slots.methods as *mut PyMethodDefMirror;
     type_object.tp_members = slots.members as *mut c_void;
     type_object.tp_getset = slots.getset as *mut c_void;
@@ -1873,6 +1908,13 @@ pub(crate) fn type_from_spec(
         }
     };
     type_object.tp_mro = mro_tuple as *mut c_void;
+    let dict = super::PyDict_New();
+    if dict.is_null() {
+        free_type_contents(&mut type_object);
+        return Err(super::take_error()
+            .unwrap_or_else(|| "MemoryError: cannot allocate type dictionary".to_string()));
+    }
+    type_object.tp_dict = dict as *mut c_void;
 
     let pointer = Box::into_raw(Box::new(type_object));
     if let Some(address) = allocated_suite {
@@ -1951,6 +1993,10 @@ fn free_type_contents(type_object: &mut TypeObject) {
         if !type_object.tp_mro.is_null() {
             dec_ref(type_object.tp_mro as *mut ShimObject);
             type_object.tp_mro = ptr::null_mut();
+        }
+        if !type_object.tp_dict.is_null() {
+            dec_ref(type_object.tp_dict as *mut ShimObject);
+            type_object.tp_dict = ptr::null_mut();
         }
         if !type_object.tp_base.is_null() {
             dec_ref(type_object.tp_base as *mut ShimObject);

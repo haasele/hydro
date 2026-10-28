@@ -1435,6 +1435,8 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
             // a class, exactly like `io.StringIO`.
             "OrderedDict" => return collections::ordereddict_class(),
             "Counter" => return collections::counter_class(),
+            "deque" => return collections_placeholder_class("deque"),
+            "ChainMap" => return collections_placeholder_class("ChainMap"),
             _ => {}
         }
     }
@@ -1996,6 +1998,19 @@ fn itertools_call(function: &str, args: &[i64]) -> i64 {
 /// Keyword-aware `itertools` dispatch: `product` is the only combinator with
 /// a keyword-only parameter (`repeat`).
 fn itertools_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    if function == "zip_longest" {
+        let mut fill = NONE;
+        for (name, argument) in keywords {
+            if name != "fillvalue" {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("zip_longest() got an unexpected keyword argument '{name}'"),
+                );
+            }
+            fill = argument;
+        }
+        return itertools::zip_longest(args, fill);
+    }
     if function != "product" {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -3176,10 +3191,23 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // The `@dataclass` decorator is expanded by the frontend; the runtime
         // value only has to exist for the import.
         ("dataclasses", "dataclass") => NONE,
+        ("dataclasses", "InitVar") => value::class_new("InitVar".to_string(), NONE, Vec::new()),
         ("contextlib", name) => contextlib_class_value("contextlib", name)
             .unwrap_or_else(|| missing_attribute("contextlib", name)),
         _ => missing_attribute(module, name),
     }
+}
+
+/// Cached placeholder class for a `collections` name Hydro does not model
+/// yet (`deque`, `ChainMap`). Both module spellings must return one identity.
+fn collections_placeholder_class(name: &str) -> i64 {
+    let key = format!("collections.{name}");
+    if let Some(cached) = globals::registry_get(&key) {
+        return cached;
+    }
+    let class = value::class_new(name.to_string(), NONE, Vec::new());
+    globals::registry_set(&key, class);
+    class
 }
 
 /// `contextlib.AbstractContextManager` / `AbstractAsyncContextManager`.

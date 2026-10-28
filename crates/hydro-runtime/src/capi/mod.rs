@@ -1022,8 +1022,16 @@ fn make_immortal(object: *mut ShimObject) -> *mut ShimObject {
 }
 
 /// Increments a reference count, skipping immortal objects.
+/// Whether a pointer can be a shim handle. Tagged Hydro immediates are not
+/// pointers; a misaligned value must never be dereferenced while releasing a
+/// malformed container.
+fn is_aligned_handle(object: *mut ShimObject) -> bool {
+    (object as usize) >= std::mem::align_of::<ShimObject>()
+        && (object as usize).is_multiple_of(std::mem::align_of::<ShimObject>())
+}
+
 pub(crate) fn inc_ref(object: *mut ShimObject) {
-    if object.is_null() {
+    if object.is_null() || !is_aligned_handle(object) {
         return;
     }
     // SAFETY: every handle starts with the CPython header.
@@ -1037,7 +1045,7 @@ pub(crate) fn inc_ref(object: *mut ShimObject) {
 
 /// Decrements a reference count, freeing the handle at zero.
 pub(crate) fn dec_ref(object: *mut ShimObject) {
-    if object.is_null() {
+    if object.is_null() || !is_aligned_handle(object) {
         return;
     }
     // SAFETY: every handle starts with the CPython header.
@@ -3999,17 +4007,15 @@ fn call_runtime_function(
     module: &str,
     function: &str,
     values: &[*mut ShimObject],
-    keyword_count: usize,
+    names: &[usize],
     positional_count: usize,
 ) -> *mut ShimObject {
-    if keyword_count != 0 {
-        set_error(format!(
-            "TypeError: {module}.{function}() takes no keyword arguments through the C API"
-        ));
+    let keyword_count = names.len();
+    if positional_count > values.len() || positional_count + keyword_count > values.len() {
+        set_error("SystemError: malformed C API argument vector");
         return ptr::null_mut();
     }
-    debug_assert_eq!(positional_count, values.len());
-    let mut arguments = Vec::with_capacity(positional_count);
+    let mut arguments = RootedValues::with_capacity(positional_count);
     for &value in &values[..positional_count] {
         let shim = match object_to_value(value) {
             Ok(shim) => shim,
@@ -4026,7 +4032,49 @@ fn call_runtime_function(
             }
         }
     }
-    let result = crate::modules::call_native(module, function, arguments.len(), arguments.as_ptr());
+    let mut pairs = RootedValues::with_capacity(keyword_count.saturating_mul(2));
+    for index in 0..keyword_count {
+        let name = names[index] as *mut ShimObject;
+        let name = match object_to_value(name) {
+            Ok(ShimValue::Str(text)) => text,
+            Ok(_) => {
+                set_error("TypeError: keywords must be strings");
+                return ptr::null_mut();
+            }
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                return ptr::null_mut();
+            }
+        };
+        let value = values[positional_count + index];
+        let value = match object_to_value(value).and_then(crate::modules::extension::shim_to_value)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                set_error(format!("TypeError: {error}"));
+                return ptr::null_mut();
+            }
+        };
+        pairs.push(crate::value::str_alloc(name));
+        pairs.push(value);
+    }
+    let result = if keyword_count == 0 {
+        crate::modules::call_native(
+            module,
+            function,
+            arguments.len(),
+            arguments.as_slice().as_ptr(),
+        )
+    } else {
+        crate::modules::call_native_kw(
+            module,
+            function,
+            arguments.len(),
+            arguments.as_slice().as_ptr(),
+            keyword_count,
+            pairs.as_slice().as_ptr(),
+        )
+    };
     if crate::exc::pending() {
         set_error(take_hydro_error(&format!(
             "{module}.{function}() raised an exception"
@@ -6759,7 +6807,7 @@ pub extern "C" fn PyObject_Vectorcall(
     if let Some(ShimKind::RuntimeFunction { module, name }) = kind_ref(callable) {
         let module = module.clone();
         let name = name.clone();
-        return call_runtime_function(&module, &name, values, keyword_count, positional_count);
+        return call_runtime_function(&module, &name, values, names, positional_count);
     }
 
     let type_object = type_of(callable);
@@ -7218,6 +7266,17 @@ fn type_attribute(
     let type_object = type_pointer as *mut TypeObject;
     // SAFETY: `type_pointer` was validated with `is_type_pointer`.
     unsafe {
+        let dict = (*type_object).tp_dict as *mut ShimObject;
+        if !dict.is_null() {
+            let Ok(c_name) = CString::new(name) else {
+                return Some(Err("ValueError: attribute name contains a NUL".to_string()));
+            };
+            let stored = PyDict_GetItemString(dict, c_name.as_ptr());
+            if !stored.is_null() {
+                inc_ref(stored);
+                return Some(Ok(stored));
+            }
+        }
         Some(match name {
             "__name__" => Ok(new_str(
                 types::type_name(type_object)
@@ -7332,6 +7391,54 @@ fn generic_attribute(object: *mut ShimObject, name: &str) -> Result<*mut ShimObj
             }
             _ => Err(format!(
                 "AttributeError: 'method' object has no attribute '{name}'"
+            )),
+        };
+    }
+    if let Some(ShimKind::CFunction {
+        method,
+        self_object,
+        module,
+    }) = kind_ref(object)
+    {
+        let definition = *method as *mut PyMethodDefMirror;
+        return match name {
+            "__name__" | "__qualname__" => {
+                let name = if definition.is_null() {
+                    "<unknown>".to_string()
+                } else {
+                    // SAFETY: extension-owned, process-lifetime method table.
+                    unsafe { read_c_string((*definition).ml_name) }
+                };
+                Ok(new_str(name))
+            }
+            "__self__" => {
+                if *self_object == 0 {
+                    Ok(value_object(ShimValue::None))
+                } else {
+                    let receiver = *self_object as *mut ShimObject;
+                    inc_ref(receiver);
+                    Ok(receiver)
+                }
+            }
+            "__module__" => {
+                if *module == 0 {
+                    Ok(value_object(ShimValue::None))
+                } else {
+                    let module_object = *module as *mut ShimObject;
+                    inc_ref(module_object);
+                    Ok(module_object)
+                }
+            }
+            "__doc__" => {
+                if definition.is_null() || unsafe { (*definition).ml_doc }.is_null() {
+                    Ok(value_object(ShimValue::None))
+                } else {
+                    // SAFETY: extension-owned doc string.
+                    Ok(new_str(unsafe { read_c_string((*definition).ml_doc) }))
+                }
+            }
+            _ => Err(format!(
+                "AttributeError: 'builtin_function_or_method' object has no attribute '{name}'"
             )),
         };
     }
@@ -7495,10 +7602,33 @@ fn generic_setattr(
         return hydro_attribute_set(object, name, value);
     }
     if types::is_type_pointer(object) {
-        return Err(format!(
-            "AttributeError: cannot set '{name}' on immutable type '{}'",
-            types::type_name(object as *mut TypeObject)
-        ));
+        let type_object = object as *mut TypeObject;
+        // SAFETY: validated type pointer; heap types own a mutable tp_dict.
+        let flags = unsafe { (*type_object).tp_flags };
+        let dict = unsafe { (*type_object).tp_dict as *mut ShimObject };
+        if flags & types::PY_TPFLAGS_HEAPTYPE == 0
+            || flags & types::PY_TPFLAGS_IMMUTABLETYPE != 0
+            || dict.is_null()
+        {
+            return Err(format!(
+                "AttributeError: cannot set '{name}' on immutable type '{}'",
+                types::type_name(type_object)
+            ));
+        }
+        let Ok(c_name) = CString::new(name) else {
+            return Err("ValueError: attribute name contains a NUL".to_string());
+        };
+        let status = if value.is_null() {
+            PyDict_DelItemString(dict, c_name.as_ptr())
+        } else {
+            PyDict_SetItemString(dict, c_name.as_ptr(), value)
+        };
+        return if status == 0 {
+            Ok(())
+        } else {
+            Err(take_error()
+                .unwrap_or_else(|| "AttributeError: type assignment failed".to_string()))
+        };
     }
     if let Some(ShimKind::Module(_)) = kind_ref(object) {
         if value.is_null() {
@@ -10449,6 +10579,59 @@ pub extern "C" fn PyTraceBack_Print(traceback: *mut ShimObject, _file: *mut Shim
     }
     set_error("TypeError: traceback object is required");
     -1
+}
+
+/// The CPython `datetime` C API capsule exposed as `datetime.datetime_CAPI`.
+///
+/// The structure layout is CPython 3.14's `PyDateTime_CAPI`. Hydro's native
+/// datetime classes are not C `PyDateTime` layouts yet, so the type slots
+/// point at `object` and the constructor/callback slots are null: the capsule
+/// exists so extension initialisers (PyO3, NumPy) can run, and no date
+/// construction is claimed through it.
+#[repr(C)]
+struct PyDateTimeCAPI {
+    date_type: *mut types::TypeObject,
+    datetime_type: *mut types::TypeObject,
+    time_type: *mut types::TypeObject,
+    delta_type: *mut types::TypeObject,
+    tzinfo_type: *mut types::TypeObject,
+    timezone_utc: *mut ShimObject,
+    date_from_date: *mut c_void,
+    datetime_from_date_and_time: *mut c_void,
+    time_from_time: *mut c_void,
+    delta_from_delta: *mut c_void,
+    timezone_from_timezone: *mut c_void,
+    datetime_from_timestamp: *mut c_void,
+    date_from_timestamp: *mut c_void,
+    datetime_from_date_and_time_and_fold: *mut c_void,
+    time_from_time_and_fold: *mut c_void,
+}
+
+/// Returns the `datetime_CAPI` capsule value (a new reference).
+pub(crate) fn datetime_capsule() -> i64 {
+    static ONCE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let pointer = *ONCE.get_or_init(|| {
+        ensure_builtin_types();
+        let capi = Box::new(PyDateTimeCAPI {
+            date_type: ptr::addr_of_mut!(types::OBJECT_TYPE),
+            datetime_type: ptr::addr_of_mut!(types::OBJECT_TYPE),
+            time_type: ptr::addr_of_mut!(types::OBJECT_TYPE),
+            delta_type: ptr::addr_of_mut!(types::OBJECT_TYPE),
+            tzinfo_type: ptr::addr_of_mut!(types::OBJECT_TYPE),
+            timezone_utc: ptr::null_mut(),
+            date_from_date: ptr::null_mut(),
+            datetime_from_date_and_time: ptr::null_mut(),
+            time_from_time: ptr::null_mut(),
+            delta_from_delta: ptr::null_mut(),
+            timezone_from_timezone: ptr::null_mut(),
+            datetime_from_timestamp: ptr::null_mut(),
+            date_from_timestamp: ptr::null_mut(),
+            datetime_from_date_and_time_and_fold: ptr::null_mut(),
+            time_from_time_and_fold: ptr::null_mut(),
+        });
+        Box::into_raw(capi) as usize
+    });
+    crate::value::capsule_new(pointer, Some("datetime.datetime_CAPI".to_string()))
 }
 
 /// `PyCapsule_Import`: resolves a dotted `module.attr...` name, verifies the

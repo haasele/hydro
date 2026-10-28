@@ -446,11 +446,21 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
     ),
     (
         "startswith",
-        MethodSig::new(1, 1, &[ArgKind::Str], Type::Bool),
+        MethodSig::new(
+            1,
+            3,
+            &[ArgKind::Any, ArgKind::Int, ArgKind::Int],
+            Type::Bool,
+        ),
     ),
     (
         "endswith",
-        MethodSig::new(1, 1, &[ArgKind::Str], Type::Bool),
+        MethodSig::new(
+            1,
+            3,
+            &[ArgKind::Any, ArgKind::Int, ArgKind::Int],
+            Type::Bool,
+        ),
     ),
     ("find", MethodSig::new(1, 1, &[ArgKind::Str], Type::Int)),
     ("count", MethodSig::new(1, 1, &[ArgKind::Str], Type::Int)),
@@ -476,11 +486,21 @@ const BYTES_METHODS: &[(&str, MethodSig)] = &[
     ("find", MethodSig::new(1, 1, &[ArgKind::Bytes], Type::Int)),
     (
         "startswith",
-        MethodSig::new(1, 1, &[ArgKind::Bytes], Type::Bool),
+        MethodSig::new(
+            1,
+            3,
+            &[ArgKind::Any, ArgKind::Int, ArgKind::Int],
+            Type::Bool,
+        ),
     ),
     (
         "endswith",
-        MethodSig::new(1, 1, &[ArgKind::Bytes], Type::Bool),
+        MethodSig::new(
+            1,
+            3,
+            &[ArgKind::Any, ArgKind::Int, ArgKind::Int],
+            Type::Bool,
+        ),
     ),
     (
         "replace",
@@ -2154,6 +2174,8 @@ impl<'a> Checker<'a> {
             HExprKind::BoolOp { lhs, rhs, .. } => {
                 self.check_expr(lhs, f);
                 self.check_expr(rhs, f);
+                // `and`/`or` return one of their operands; a shared type
+                // narrows the result, mixed operands stay dynamic.
                 match self.inf.unify(lhs.ty, rhs.ty) {
                     Ok(ty) => {
                         let _ = self.inf.unify(expr.ty, ty);
@@ -2988,6 +3010,15 @@ impl<'a> Checker<'a> {
             if existing == "None" {
                 // An output slot previously constrained to `None` (usually
                 // through an implicit/explicit return) stays dynamic.
+                self.force_any(out);
+                return;
+            }
+            // Boolean operands are routinely used as truth tests for dynamic
+            // or container-valued expressions; do not pin those slots to the
+            // first branch's static type.
+            if ty == Type::Bool
+                && matches!(existing.as_str(), "dict" | "list" | "tuple" | "set" | "str")
+            {
                 self.force_any(out);
                 return;
             }

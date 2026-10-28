@@ -66,6 +66,10 @@ const CLASSES: &[(&str, Option<&str>)] = &[
     ("MutableMapping", Some("Mapping")),
     ("Sequence", Some("Collection")),
     ("MutableSequence", Some("Sequence")),
+    ("MappingView", Some("Sized")),
+    ("KeysView", Some("MappingView")),
+    ("ItemsView", Some("MappingView")),
+    ("ValuesView", Some("MappingView")),
     // PEP 688. Unlike the other names, `Buffer` is a real `ABCMeta` class:
     // see [`buffer_class`].
     ("Buffer", None),

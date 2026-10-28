@@ -3282,6 +3282,11 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "getmodule" => getmodule_impl(args[0]),
         "getfile" => getfile_impl(args[0]),
         "getsourcefile" => getsourcefile_impl(args[0]),
+        "findsource" | "getsourcelines" => value::tuple_new(vec![
+            value::list_new(Vec::new()),
+            value::encode_int(0).unwrap_or(NONE),
+        ]),
+        "getblock" => args.first().copied().unwrap_or(NONE),
         "unwrap" => {
             let stop = args.get(1).copied().unwrap_or(NONE);
             unwrap_with_stop(args[0], stop)

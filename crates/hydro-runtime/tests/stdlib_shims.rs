@@ -201,9 +201,11 @@ fn collections_defaultdict_is_a_real_alias() {
     let pure = module_get("collections", "defaultdict");
     assert_same(accelerated, pure);
 
-    // `deque` is not implemented and is not present.
-    let _ = module_get("_collections", "deque");
-    assert_error_tag(ATTRIBUTE_ERROR);
+    // `deque` is a placeholder class shared by both module spellings.
+    assert_same(
+        module_get("_collections", "deque"),
+        module_get("collections", "deque"),
+    );
 
     // The alias is the working defaultdict, not a stand-in.
     let factory = hydro_builtin_function("list".as_ptr(), "list".len());

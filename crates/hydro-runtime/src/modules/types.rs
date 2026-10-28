@@ -90,6 +90,9 @@ pub(crate) fn constant(name: &str) -> i64 {
         "FunctionType" => function_type_class(),
         "UnionType" => union_type_class(),
         "DynamicClassAttribute" => dynamic_class_attribute_class(),
+        "NoneType" => value::type_class(NONE),
+        "EllipsisType" => value::type_class(crate::modules::builtins::constant("Ellipsis")),
+        "NotImplementedType" => value::type_class(value::NOT_IMPLEMENTED),
         _ if CLASSES.contains(&name) => value::class_new(name.to_string(), NONE, Vec::new()),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
@@ -147,6 +150,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
     match function {
         "SimpleNamespace" => simple_namespace(args.first().copied().unwrap_or(NONE)),
+        "prepare_class" => prepare_class(args),
         "CellType" => cell_type_new(args),
         // `types.FunctionType(code, globals, ...)`.
         "FunctionType" => function_type_new(args),
@@ -167,9 +171,53 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// `types.prepare_class(name, bases)`.
+///
+/// CPython returns `(metaclass, namespace, kwds)` from the class-creation
+/// protocol. Hydro's class creation resolves the metaclass from the bases and
+/// has no separate `__prepare__` handoff for this API yet; return the resolved
+/// metaclass and empty mappings so generic-model code can build the namespace
+/// it expects.
+fn prepare_class(args: &[i64]) -> i64 {
+    let bases = args.get(1).copied().unwrap_or(NONE);
+    let first = value::as_tuple(bases)
+        .and_then(|items| items.first().copied())
+        .unwrap_or(NONE);
+    let metaclass = value::class_metaclass(first);
+    let metaclass = if metaclass == NONE {
+        value::native_type_class()
+    } else {
+        metaclass
+    };
+    value::tuple_new(vec![
+        metaclass,
+        value::dict_new(Vec::new()),
+        value::dict_new(Vec::new()),
+    ])
+}
+
 /// Keyword-aware `types` dispatch: `DynamicClassAttribute` accepts the four
 /// CPython parameter names.
 pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if function == "SimpleNamespace" {
+        if args.len() > 1 {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "SimpleNamespace() takes at most 1 positional argument ({} given)",
+                    args.len()
+                ),
+            );
+        }
+        let namespace = simple_namespace(args.first().copied().unwrap_or(NONE));
+        if exc::pending() {
+            return NONE;
+        }
+        for (name, item) in keywords {
+            value::instance_setattr(namespace, name.clone(), *item);
+        }
+        return namespace;
+    }
     if function != "DynamicClassAttribute" {
         return exc::raise_with_message(
             ATTRIBUTE_ERROR,
@@ -948,6 +996,9 @@ mod tests {
     fn placeholder_names_are_native_classes() {
         exc::init();
         for name in CLASSES {
+            if matches!(*name, "NoneType" | "EllipsisType" | "NotImplementedType") {
+                continue;
+            }
             let class = as_class(constant(name)).expect("class value");
             assert_eq!(class.name, *name);
             assert_eq!(class.base, NONE);

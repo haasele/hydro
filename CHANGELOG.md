@@ -8,6 +8,23 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — 2026-10-29 pydantic import through the real extension
+
+- CPython 3.14 `PyType_Check`/`PyType_FastSubclass` now see
+  `Py_TPFLAGS_TYPE_SUBCLASS`, `LONG/LIST/TUPLE/BYTES/UNICODE/DICT_SUBCLASS`
+  and inherited exception flags on heap types, so PyO3 accepts Hydro's
+  exception classes.
+- Heap types own a mutable `tp_dict`; `__match_args__`/`__module__` writes
+  during PyO3 class initialisation succeed without making static types
+  mutable.
+- `datetime.datetime_CAPI` is exposed as a capsule (layout-compatible; the
+  constructor slots are still null until the native datetime layout is
+  implemented), unblocking PyO3/NumPy datetime imports.
+- Vectorcall keyword values are forwarded to native module functions, and
+  `types.SimpleNamespace(**kwargs)` plus `types.prepare_class` are supported.
+- `pydantic 2.14.1` imports successfully under Hydro; model smoke remains
+  blocked on lazy submodule imports, walrus-in-generator and dataclasses APIs.
+
 ### Changed — 2026-10-28 all-core test gate and CPython-ABI link coverage
 
 - The workspace gate now uses `cargo nextest run --workspace`, which runs every

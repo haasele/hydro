@@ -987,7 +987,11 @@ pub static COLLECTIONS: ModuleSpec = ModuleSpec {
     // `collections.abc` is a nested module; the constant lets the frontend
     // resolve `collections.abc.Mapping` through the runtime module value
     // (the general nested-module chain is still a frontend follow-up).
-    constants: &[c("abc", Type::Any)],
+    constants: &[
+        c("abc", Type::Any),
+        c("deque", Type::Any),
+        c("ChainMap", Type::Any),
+    ],
 };
 
 /// Shared function table of `socket` and its `_socket` accelerator alias.
@@ -1823,7 +1827,7 @@ pub static DATACLASSES: ModuleSpec = ModuleSpec {
         kw("field", 0, 2, Type::Any, &["default", "default_factory"]),
         kw_dynamic("replace", 1, 1, Type::Any, &["obj"]),
     ],
-    constants: &[c("dataclass", Type::Any)],
+    constants: &[c("dataclass", Type::Any), c("InitVar", Type::Any)],
 };
 
 /// `datetime`: the `date`/`time`/`datetime`/`timedelta`/`tzinfo` classes plus
@@ -1881,6 +1885,7 @@ pub static DATETIME: ModuleSpec = ModuleSpec {
         c("tzinfo", Type::Any),
         c("MINYEAR", Type::Int),
         c("MAXYEAR", Type::Int),
+        c("datetime_CAPI", Type::Any),
     ],
 };
 
@@ -2017,6 +2022,18 @@ pub static TYPING: ModuleSpec = ModuleSpec {
         c("IO", Type::Any),
         c("Iterable", Type::Any),
         c("Iterator", Type::Any),
+        c("Hashable", Type::Any),
+        c("Reversible", Type::Any),
+        c("Sized", Type::Any),
+        c("Container", Type::Any),
+        c("AbstractSet", Type::Any),
+        c("MutableSet", Type::Any),
+        c("MutableMapping", Type::Any),
+        c("MutableSequence", Type::Any),
+        c("MappingView", Type::Any),
+        c("KeysView", Type::Any),
+        c("ItemsView", Type::Any),
+        c("ValuesView", Type::Any),
         c("List", Type::Any),
         c("Literal", Type::Any),
         c("Mapping", Type::Any),
@@ -2178,7 +2195,7 @@ pub static FUTURE: ModuleSpec = ModuleSpec {
 pub static TYPES: ModuleSpec = ModuleSpec {
     name: "types",
     functions: &[
-        f("SimpleNamespace", 0, 1, Type::Any),
+        kw_dynamic("SimpleNamespace", 0, 1, Type::Any, &[]),
         // `FunctionType(code, globals, name=None, argdefs=None, closure=None,
         // kwdefaults=None)` builds a callable from code metadata. Declared as
         // a function so calls lower as a module call; the runtime still
@@ -2211,6 +2228,7 @@ pub static TYPES: ModuleSpec = ModuleSpec {
         // present, else its real bases (Hydro records the declared bases, so
         // generic aliases stay visible).
         f("get_original_bases", 1, 1, Type::Tuple),
+        f("prepare_class", 2, 2, Type::Tuple),
     ],
     constants: &[
         c("CodeType", Type::Any),
@@ -2224,6 +2242,7 @@ pub static TYPES: ModuleSpec = ModuleSpec {
         c("CoroutineType", Type::Any),
         c("AsyncGeneratorType", Type::Any),
         c("EllipsisType", Type::Any),
+        c("NotImplementedType", Type::Any),
         c("MethodWrapperType", Type::Any),
         c("WrapperDescriptorType", Type::Any),
         c("MethodDescriptorType", Type::Any),
@@ -2246,7 +2265,7 @@ pub static ITERTOOLS: ModuleSpec = ModuleSpec {
         f("islice", 2, 4, Type::List),
         f("filterfalse", 2, 2, Type::List),
         f("chain", 0, usize::MAX, Type::List),
-        f("zip_longest", 0, usize::MAX, Type::List),
+        kw_dynamic("zip_longest", 0, usize::MAX, Type::List, &[]),
         f("pairwise", 1, 1, Type::List),
         f("count", 0, 2, Type::Any),
         f("repeat", 1, 2, Type::List),
@@ -2296,6 +2315,10 @@ pub static AST: ModuleSpec = ModuleSpec {
         // `ast.arg(arg, annotation, type_comment)`: `inspect.parse_name`
         // constructs this node for names it cannot resolve to a parameter.
         kw_dynamic("arg", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("AnnAssign", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("FunctionDef", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("AsyncFunctionDef", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("ClassDef", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("Tuple", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("List", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("Set", 0, usize::MAX, Type::Any, &[]),
@@ -3032,6 +3055,10 @@ pub static _COLLECTIONS_ABC: ModuleSpec = ModuleSpec {
         c("MutableMapping", Type::Any),
         c("Sequence", Type::Any),
         c("MutableSequence", Type::Any),
+        c("MappingView", Type::Any),
+        c("KeysView", Type::Any),
+        c("ItemsView", Type::Any),
+        c("ValuesView", Type::Any),
         c("Coroutine", Type::Any),
     ],
 };
@@ -3068,6 +3095,10 @@ pub static COLLECTIONS_ABC: ModuleSpec = ModuleSpec {
         c("MutableMapping", Type::Any),
         c("Sequence", Type::Any),
         c("MutableSequence", Type::Any),
+        c("MappingView", Type::Any),
+        c("KeysView", Type::Any),
+        c("ItemsView", Type::Any),
+        c("ValuesView", Type::Any),
         c("Coroutine", Type::Any),
     ],
 };
@@ -3695,6 +3726,9 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         f("getmodule", 1, 1, Type::Any),
         f("getfile", 1, 1, Type::Str),
         f("getsourcefile", 1, 1, Type::Any),
+        f("findsource", 1, 1, Type::Tuple),
+        f("getsourcelines", 1, 1, Type::Tuple),
+        f("getblock", 1, 1, Type::List),
         kw("unwrap", 1, 2, Type::Any, &["func", "stop"]),
         // Signature construction and argument binding.
         kw(
@@ -4410,6 +4444,7 @@ mod tests {
         );
         let namespace = function("types", "SimpleNamespace").unwrap();
         assert_eq!((namespace.min_args, namespace.max_args), (0, 1));
+        assert!(namespace.dynamic_keywords);
         let dynamic = function("types", "DynamicClassAttribute").unwrap();
         assert_eq!((dynamic.min_args, dynamic.max_args), (0, 4));
         assert_eq!(dynamic.params, &["fget", "fset", "fdel", "doc"][..]);

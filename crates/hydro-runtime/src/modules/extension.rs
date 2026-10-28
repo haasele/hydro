@@ -212,6 +212,7 @@ fn hydro_handle_supported(value_arg: i64) -> bool {
         || value::as_function(value_arg).is_some()
         || value::as_ext_function(value_arg).is_some()
         || value::as_module(value_arg).is_some()
+        || value::as_namespace(value_arg).is_some()
 }
 
 /// Converts one Hydro sequence (list or tuple) into its shim counterpart.

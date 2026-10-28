@@ -38,10 +38,12 @@ required CPython symbols** across all 68 extension modules (479 referenced,
 593 exported). Import is still **not green**: NumPy reaches
 `numpy._core.umath` and fails on the missing `datetime.datetime_CAPI` capsule;
 pandas gets past dotted extension imports and fails in the type checker at
-`pandas/core/config_init.py` (mixed `str`/`bool` conditional); pydantic reaches
-`_pydantic_core` module init and fails PyO3's
-`PyExceptionClass_Check` (`TypeError: exceptions must derive from BaseException`).
-These are semantic/object-model blockers, not link-time symbol gaps.
+`pandas/core/config_init.py` (mixed `str`/`bool` conditional). **pydantic now
+imports** (`2.14.1`): PyO3 exception-class validation, heap-type `__match_args__`,
+the `datetime.datetime_CAPI` capsule, keyword calls through vectorcall and
+`types.SimpleNamespace(**kwargs)` are fixed. pydantic model smoke still stops on
+lazy `pydantic.main` imports and unimplemented walrus-in-generator/dataclasses
+surface. These are semantic/object-model blockers, not link-time symbol gaps.
 **All-core gate:** `cargo nextest run --workspace` runs 2307 tests in ~3 s
 (2306 pass, 1 skipped) and is the default in `scripts/verify.sh`/CI; Cargo test
 binaries are no longer serial.

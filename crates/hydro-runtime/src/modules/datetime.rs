@@ -2543,6 +2543,7 @@ pub(crate) fn constant(name: &str) -> i64 {
         "tzinfo" => tzinfo_class(),
         "MINYEAR" => encode(MINYEAR),
         "MAXYEAR" => encode(MAXYEAR),
+        "datetime_CAPI" => crate::capi::datetime_capsule(),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'datetime' has no attribute '{name}'"),

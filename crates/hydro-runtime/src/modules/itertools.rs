@@ -112,7 +112,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "islice" => islice(args),
         "filterfalse" => filterfalse(args),
         "chain" => chain(args),
-        "zip_longest" => zip_longest(args),
+        "zip_longest" => zip_longest(args, NONE),
         "pairwise" => pairwise(args),
         "count" => count(args),
         "repeat" => repeat(args),
@@ -264,10 +264,9 @@ fn chain(args: &[i64]) -> i64 {
 
 /// `zip_longest(*iterables)`: zips to the longest input, filling with `None`.
 ///
-/// The keyword-only `fillvalue` is not representable through the native module
-/// call ABI (the frontend only forwards positional arguments), so the fill is
-/// always `None`.
-fn zip_longest(args: &[i64]) -> i64 {
+/// `fillvalue` is the keyword-only fill; callers that cannot pass keywords use
+/// `None`, matching CPython's default.
+pub(crate) fn zip_longest(args: &[i64], fill: i64) -> i64 {
     // Root the per-iterable snapshots while the remaining ones are collected.
     let sources = value::list_new(Vec::new());
     for &iterable in args {
@@ -290,7 +289,7 @@ fn zip_longest(args: &[i64]) -> i64 {
         for &handle in &handles {
             let item = value::as_list(handle)
                 .and_then(|items| items.get(index).copied())
-                .unwrap_or(NONE);
+                .unwrap_or(fill);
             row.push(item);
         }
         let tuple = value::tuple_new(row);
