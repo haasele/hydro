@@ -412,13 +412,15 @@ def validate_pins(pins: dict, sites: list[Path]) -> list[dict]:
 
 
 # ------------------------------------------------------------------- execution
-def make_env(sites: list[Path]) -> dict[str, str]:
+def make_env(sites: list[Path], stdlib: Path | None = None) -> dict[str, str]:
     env = dict(os.environ)
     joined = os.pathsep.join(str(site) for site in sites)
     # Only the pinned tree is importable; a host PYTHONPATH or venv must not
     # silently supply a different build of the same distribution.
     env["PYTHONPATH"] = joined
     env["HYDRO_SITE_PACKAGES"] = joined
+    if stdlib is not None:
+        env["HYDRO_STDLIB"] = str(stdlib)
     env.pop("VIRTUAL_ENV", None)
     env.pop("CONDA_PREFIX", None)
     env.pop("PYTHONHOME", None)
@@ -664,6 +666,7 @@ def run_case(
     cpython: Path,
     tea: Path,
     sites: list[Path],
+    stdlib: Path | None,
     timeout: float,
     use_aot: bool,
 ) -> dict:
@@ -678,7 +681,7 @@ def run_case(
             script = workdir / source.name
             shutil.copyfile(source, script)
 
-        env = make_env(sites)
+        env = make_env(sites, stdlib)
         cpython_run = run_process([str(cpython), str(script)], timeout, env, workdir)
         row: dict = {
             "id": case["id"],
@@ -775,9 +778,10 @@ def check_upstream(
     cpython: Path,
     tea: Path,
     sites: list[Path],
+    stdlib: Path | None,
     timeout: float,
 ) -> list[dict]:
-    env = make_env(sites)
+    env = make_env(sites, stdlib)
     rows: list[dict] = []
     for entry in entries:
         package = str(entry.get("package", ""))
@@ -1039,6 +1043,22 @@ def splice_markdown(path: Path, body: str) -> None:
 
 
 # ------------------------------------------------------------------------ main
+def resolve_stdlib(cli_value: str | None, cpython: Path) -> Path | None:
+    """Resolve the CPython-3.14.9 `Lib` tree used as HYDRO_STDLIB."""
+    candidates: list[Path] = []
+    if cli_value:
+        candidates.append(Path(cli_value).expanduser())
+    env = os.environ.get("HYDRO_STDLIB")
+    if env:
+        candidates.append(Path(env).expanduser())
+    major, minor = TARGET_PYTHON.split(".")[:2]
+    candidates.append(cpython.parent.parent / "lib" / f"python{major}.{minor}")
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+    return None
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Differential ecosystem gate: CPython vs Hydro JIT/AOT.",
@@ -1055,6 +1075,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="site-packages tree with the pinned wheels "
         "(default: $HYDRO_ECOSYSTEM_SITE_PACKAGES, pins.json site_packages)",
     )
+    ap.add_argument("--stdlib", metavar="DIR", help="CPython 3.14.9 Lib tree for HYDRO_STDLIB (default: $HYDRO_STDLIB or the oracle's Lib)")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="per-process timeout in seconds")
     ap.add_argument("--only", help="comma-separated package/case names to run")
     ap.add_argument(
@@ -1105,6 +1126,7 @@ def main(argv: list[str] | None = None) -> int:
     if cpython is None or cpython_ver is None:
         log(f"error: {cpython_error}")
         return 2
+    stdlib = resolve_stdlib(args.stdlib, cpython)
 
     sites, site_error = resolve_site(args.site, pins)
     if sites is None:
