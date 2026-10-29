@@ -65,6 +65,31 @@ Generator resume is the narrowest compute-bound result but is now
 lookups and root-vector transfers. Startup is lower (`tea JIT hello` 1.54 ms,
 `tea AOT hello` 1.35 ms, CPython 6.66 ms). P5 now focuses on PGO/inlining.
 
+### HTTP service benchmark
+
+The separate six-app HTTP benchmark (Node, Bun, Go, Python/FastAPI, Hydro AOT
+and Hydro JIT) runs the same device API against PostgreSQL and Memcached on
+one host with Docker. Fixed-load columns use one k6 generator at 10,000 GET/s
+and 1,000 POST/s. Certified GET uses eight independent k6 shards and a server
+connection budget of 2,048; Hydro runs eight epoll shards
+(`HYDRO_HTTP_LOOPS=8`). Percentiles for the sharded run are conservative
+maxima across shards.
+
+| App | GET p50 / p99 @10k | POST p50 / p99 @1k | Certified GET req/s | Certified GET p99 | Certified CPU |
+|---|---:|---:|---:|---:|---:|
+| Node 26 | 0.23 / 1.06 ms | 3.01 / 6.04 ms | 63,840 | 46.92 ms | 3.13 cores |
+| Bun 1.4 | 0.16 / 0.89 ms | 2.79 / 7.78 ms | 72,792 | 35.81 ms | 1.98 cores |
+| Go 1.27 | 0.08 / 0.65 ms | 2.30 / 5.41 ms | 72,895 | 48.05 ms | 2.09 cores |
+| Python 3.14/FastAPI | 0.55 / 1.27 ms | 3.38 / 6.50 ms | 39,883 | 224.38 ms | 6.88 cores |
+| **Hydro AOT** | **0.11 / 0.83 ms** | **2.95 / 5.49 ms** | **84,812** | **21.12 ms** | **0.75 cores** |
+| **Hydro JIT** | **0.11 / 0.85 ms** | **2.91 / 5.47 ms** | **84,628** | **28.83 ms** | **0.78 cores** |
+
+Measured 2026-10-29 on the same Linux x86_64 host; fixed-load and certified
+GET runs are separate. Hydro's static GET path is native epoll and never
+enters Python; POST uses native `postgres.insert_device` and
+`memcached.set`. The microbenchmark table above remains the compute-bound
+comparison.
+
 ## Requirements
 
 - Linux, primarily x86_64 (aarch64 paths exist but are not
