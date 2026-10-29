@@ -1355,7 +1355,11 @@ under `.hydro/cache/`.
 ## 9. C API/ABI Strategy (Phase 4)
 
 **Decision (2026-10-24): option B — a Hydro-native CPython C-API/ABI layer.
-No `libpython` in the production runtime.**
+No `libpython` in the production runtime.** The binding tiers (pure source,
+Rust-native modules, the planned HNA compiled-binding ABI, the CPython shim
+and foreign-runtime bridges) and their roadmap are specified in
+[`NATIVE_BINDINGS.md`](NATIVE_BINDINGS.md); this section remains the C-ABI
+contract.
 
 CPython 3.14 development files are used at build time to compile extensions
 and test fixtures; the CPython interpreter serves as a differential test

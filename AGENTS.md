@@ -11,8 +11,9 @@ Hydro: the standalone Python runtime/compiler monorepo in Rust. The
 user-facing toolchain **Tea** is a separate repository (`../tea`) and owns
 CLI/project/pytest/REPL/AOT packaging/PGO flavors. Sources of truth:
 `PLAN.md` (strategy), `docs/ARCHITECTURE.md` (contracts), `docs/TODO.md`
-(work list), `docs/C_API.md` (P4-04), `docs/DIAGNOSTICS.md` (diagnostics)
-and `docs/LAYOUT.md` (source tree).
+(work list), `docs/C_API.md` (P4-04), `docs/NATIVE_BINDINGS.md` (binding
+tiers, HNA, roadmap), `docs/DIAGNOSTICS.md` (diagnostics) and
+`docs/LAYOUT.md` (source tree).
 
 ## Current State
 
@@ -178,8 +179,9 @@ python3 scripts/check_benchmarks.py
 - Backend: Cranelift 0.120; LLVM later optional.
 - No silent miscompiles: unsupported syntax → diagnostic.
 - Docs invariants: `ARCHITECTURE` (contracts), `TODO` (work list), `C_API`,
-  `DIAGNOSTICS`, `LAYOUT` and this file must agree; test counts live here and
-  nowhere else; no invented measurements or "done" claims.
+  `NATIVE_BINDINGS` (binding tiers/HNA roadmap), `DIAGNOSTICS`, `LAYOUT` and
+  this file must agree; test counts live here and nowhere else; no invented
+  measurements or "done" claims.
 
 ## Working agreement for subagents
 
