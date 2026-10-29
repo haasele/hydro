@@ -19,7 +19,7 @@ initial state of the first runnable core.
 - `http.serve` raises the accept backlog and epoll batch to 1024, and sets
   `TCP_NODELAY` on accepted sockets. This removes the harness-side 256-VU /
   256-connection gate; Hydro now reaches the 10k POST cap on both AOT and JIT
-  and 47.8k GET/s on the JIT capacity rung, with the raw loop serving 61.5k
+  and 47.8k GET/s on the JIT capacity rung, with the raw loop serving 61.1k
   requests/s at 0.000% HTTP errors. Fixed 10k GET uses 0.08 CPU cores and
   8.8–11.7 MiB RSS; fixed 1k POST p99 is 5.81–6.17 ms.
 - The six-app benchmark app opts into `HYDRO_GC_THRESHOLD=131072`; no runtime
