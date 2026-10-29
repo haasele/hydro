@@ -4,7 +4,7 @@ Hydro is the standalone Python runtime and compiler monorepo in Rust. It owns
 the frontend, typed IR, Cranelift JIT/AOT backend, runtime, GC, native modules
 and interpreter. The user-facing toolchain is **Tea**, maintained in its own
 repository ([`haasele/tea`](https://github.com/haasele/tea)); Tea supplies
-`tea infuse` (uv compatibility), `tea infuse` (Hydro JIT), `tea steep` (PGO
+`tea run` (uv compatibility), `tea infuse` (Hydro JIT), `tea steep` (PGO
 profiling flavors) and `tea brew`/`tea build` (AOT).
 
 > **Status: early development (0.1.0).** Compiler/runtime, containers, classes,
