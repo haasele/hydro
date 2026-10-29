@@ -1205,23 +1205,21 @@ collector as an interim**:
   cleared only by `hydro_runtime_init`, whose `globals::reset` also empties
   the store. Thread registrations, precise frames, exception state, fibers,
   contextvars and the asyncio loop remain per-thread.
-- Conservative fallback (mixed mode): native stack scan (bounds via
-  `pthread_getattr_np`), a register dump (x86_64/aarch64) and the pending
-  exception.
-- **Fiber roots:** While a generator/coroutine fiber runs, the
-  thread stack points to the fiber stack; `push_stack_bounds` overrides the
-  stack bounds so that the scan sees the running fiber stack. The
-  fiber stack as well as `ctx` and `caller_ctx` are registered as conservative
-  root areas from object creation for the entire lifetime (`Drop`
-  removes them). On x86_64 the two contexts contain the callee-saved
-  register words that may hold tagged values during a suspension;
-  a suspend/resume does not touch the registry. The outermost resume
-  publishes two aux ranges (native driver stack and `caller_ctx`)
-  via `set_aux_stack`; in shared mode both are mirrored into the `ThreadGc`,
-  in local mode it stays with thread-local ranges without atomics
-  per switch. Nested resumes publish nothing because the caller is a fiber
-  with already registered lifetime ranges. `HYDRO_GC_STRESS=1` covers
-  interleaved generators.
+- Conservative fallback (mixed mode): native stack scan (per-thread cached
+  `pthread_getattr_np` bounds), a register dump (x86_64/aarch64) and the
+  pending exception.
+- **Fiber roots:** While a generator/coroutine fiber runs, the thread stack
+  points to the fiber stack; `stack_bounds` derives the active bounds from
+  `CURRENT`, so a switch performs no bound-vector push/pop. The fiber stack
+  and `ctx`/`caller_ctx` are registered as conservative root areas from
+  object creation for the lifetime (`Drop` removes them); the native caller
+  stack is published once as an aux range at fiber creation. On x86_64 the
+  contexts hold the callee-saved register words that may contain tagged
+  values during suspension. Precise roots switch by selecting the fiber's
+  `SavedRoots` pointer; the inactive set stays in its owner and is marked
+  through the fiber. In shared mode `save_context` mirrors the effective
+  bounds into the `ThreadGc` before parking, so no per-switch registry update
+  is needed. `HYDRO_GC_STRESS=1` covers interleaved generators.
 - The register dump happens in **one** `asm!` block that writes all
   general-purpose registers (x86_64: incl. `rsp`; aarch64: `x0..x30` + `sp`)
   into a local buffer, which is then marked completely as roots. If the
@@ -1432,11 +1430,12 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   `HYDRO_GC_PRECISE=1` runs the collector without conservative scanning. The
   default mixed mode keeps the conservative fallback for Rust-side frames.
 - **Performance:** native module dispatch is fixed (thread-local spec cache).
-  The precise root-frame bookkeeping currently makes generator resume the
-  weak spot; the 2026-10-29 default-GC benchmark records generator_sum at JIT
-  17.63 ms / AOT 15.72 ms versus CPython 12.03 ms. String concatenation and
-  float boxing are otherwise improved. The x86_64 fiber switch remains
-  register-only.
+  Calls no longer allocate traceback records eagerly; numeric operators skip
+  instance-only registry lookups; fibers switch precise-root sets by pointer
+  and reuse the current stack bounds. The pinned 2026-10-29 benchmark now
+  records generator_sum at JIT 5.08 ms / AOT 4.71 ms versus CPython 9.46 ms.
+  String concatenation and float boxing are also improved. The x86_64 fiber
+  switch remains register-only.
 - **Nested imports:** declaration-only site-packages modules referenced
   only from nested blocks are preloaded after the import graph is complete
   and inserted before their importer; modules with executable top-level

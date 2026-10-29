@@ -134,10 +134,18 @@ def build_release() -> None:
     )
 
 
-def aot_build(source: Path, out: Path, timeout: float) -> float:
+def aot_build(source: Path, out: Path, runtime_lib: Path, timeout: float) -> float:
     start = time.perf_counter()
     proc = subprocess.run(
-        [str(HYD), "build", str(source), "-o", str(out)],
+        [
+            str(HYD),
+            "build",
+            str(source),
+            "-o",
+            str(out),
+            "--runtime-lib",
+            str(runtime_lib),
+        ],
         cwd=ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -164,7 +172,12 @@ def main() -> int:
     if not HYD.exists():
         log(f"error: {HYD} not found (build with --release)")
         return 2
-    runtime_lib = HYD.parent / "libhydro_runtime.a"
+    # `tea` otherwise prefers the staticlib next to its own binary, which can
+    # be an older copy than the workspace release build. Pin the library the
+    # JIT is actually running against so JIT and AOT results are comparable.
+    runtime_lib = ROOT / "target" / "release" / "libhydro_runtime.a"
+    if not runtime_lib.exists():
+        runtime_lib = HYD.parent / "libhydro_runtime.a"
     if not runtime_lib.exists():
         log(f"error: {runtime_lib} missing; cargo build --release -p hydro-runtime")
         return 2
@@ -197,7 +210,7 @@ def main() -> int:
             ]
             aot_bin = tmpdir / f"{key}.bin"
             try:
-                build_ms = aot_build(source, aot_bin, args.timeout) * 1000
+                build_ms = aot_build(source, aot_bin, runtime_lib, args.timeout) * 1000
             except Exception as exc:  # noqa: BLE001 - report and continue
                 log(f"  AOT build failed: {exc}")
                 build_ms = None

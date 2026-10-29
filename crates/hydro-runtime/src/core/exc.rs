@@ -503,17 +503,74 @@ pub(crate) fn exception_keyword_names(tag: u32) -> &'static [&'static str] {
 /// array registered by generated code (or by the interpreter) and `f_locals`
 /// reads the current values. When the activation ends, `base` is cleared and
 /// `snapshot` holds the locals dict the frame object keeps exposing.
-#[derive(Default)]
+///
+/// The binding is atomic so `frame_bind` can refresh an activation that was
+/// already materialised without taking a lock; `names` is fixed when the
+/// record is materialised (binding always precedes materialisation, because
+/// only a deeper running call can observe an activation).
 pub(crate) struct FrameLocals {
     /// Address of the activation's slot array (`0` when unbound or ended).
-    pub(crate) base: usize,
-    pub(crate) slots: usize,
+    pub(crate) base: AtomicUsize,
+    pub(crate) slots: AtomicUsize,
     pub(crate) names: Vec<String>,
-    pub(crate) snapshot: Option<i64>,
+    pub(crate) snapshot: Mutex<Option<i64>>,
 }
 
-/// One activation's introspection record, shared by the runtime frame stack
-/// and every frame object materialised for it.
+/// One running (or suspended) activation as recorded by `hydro_frame_enter`.
+///
+/// The raw pointers are only read while the activation is on a thread's or a
+/// fiber's activation stack; they point at blobs in the generated function's
+/// stack frame (or the interpreter's live metadata), which outlive the
+/// activation. Nothing here is allocated on the common path: the record is a
+/// fixed-size value pushed onto a vector, and the optional `FrameData` only
+/// appears when introspection (`sys._getframe`, frame objects,
+/// `inspect.currentframe`) asks for it.
+pub(crate) struct Activation {
+    name: *const u8,
+    name_len: usize,
+    /// Source file active at entry. Shared, so capturing it is a refcount
+    /// bump rather than a string copy.
+    file: Arc<String>,
+    module: *const u8,
+    module_len: usize,
+    names: *const u8,
+    names_len: usize,
+    /// Precise slot array and its length, valid while the activation runs.
+    base: *mut i64,
+    slots: usize,
+    params: usize,
+    flags: u32,
+    line: u32,
+    first_line: u32,
+    /// Introspection record, built on first observation and then shared with
+    /// every frame object materialised for this activation.
+    cached: Option<Arc<FrameData>>,
+}
+
+impl Activation {
+    /// Builds the introspection record for this activation on demand.
+    fn materialize(&self, parent: Option<Arc<FrameData>>) -> FrameData {
+        FrameData {
+            name: decode_bytes(self.name, self.name_len),
+            module: Mutex::new(decode_bytes(self.module, self.module_len)),
+            file: (*self.file).clone(),
+            first_line: AtomicU32::new(self.first_line),
+            line: AtomicU32::new(self.line),
+            flags: AtomicU32::new(self.flags),
+            argcount: AtomicUsize::new(self.params),
+            parent,
+            locals: FrameLocals {
+                base: AtomicUsize::new(self.base as usize),
+                slots: AtomicUsize::new(self.slots),
+                names: decode_names(self.names, self.names_len),
+                snapshot: Mutex::new(None),
+            },
+        }
+    }
+}
+
+/// One activation's introspection record, built on first observation and
+/// shared with every frame object materialised for that activation.
 ///
 /// `parent` keeps the caller chain alive after the caller has returned, so a
 /// retained frame's `f_back` can still report its snapped locals. The record
@@ -530,7 +587,7 @@ pub(crate) struct FrameData {
     pub(crate) flags: AtomicU32,
     pub(crate) argcount: AtomicUsize,
     pub(crate) parent: Option<Arc<FrameData>>,
-    pub(crate) locals: Mutex<FrameLocals>,
+    pub(crate) locals: FrameLocals,
 }
 
 impl FrameData {
@@ -575,10 +632,10 @@ impl FrameData {
 
 #[derive(Default)]
 struct State {
-    file: String,
+    file: Arc<String>,
     line: u32,
-    /// Active call frames, innermost last.
-    frames: Vec<Arc<FrameData>>,
+    /// Active call activations, innermost last.
+    frames: Vec<Activation>,
     /// Tagged heap pointer to the pending exception object, if any.
     pending: Option<i64>,
     /// Exceptions whose handlers are active (and in-flight exceptions while a
@@ -596,43 +653,61 @@ thread_local! {
     static CLASS_CACHE: RefCell<HashMap<u32, i64>> = RefCell::new(HashMap::new());
 }
 
+fn with_frames<R>(f: impl FnOnce(&mut Vec<Activation>) -> R) -> R {
+    if let Some(ptr) = crate::fiber::current_ptr() {
+        // SAFETY: a fiber's `saved_frames` lives in its boxed `FiberState` for
+        // the whole fiber lifetime. Only the owning thread runs the fiber, and
+        // it cannot finish while this activation is executing.
+        return f(unsafe { &mut (*ptr).saved_frames });
+    }
+    STATE.with(|state| f(&mut state.borrow_mut().frames))
+}
+
 // Source location tracking
 
 pub(crate) fn set_file_ptr(ptr: *const u8, len: usize) {
-    let file = decode_bytes(ptr, len);
+    let file = Arc::new(decode_bytes(ptr, len));
     STATE.with(|s| s.borrow_mut().file = file);
 }
 
 pub(crate) fn set_line(line: u32) {
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        state.line = line;
-        if let Some(frame) = state.frames.last() {
-            frame.line.store(line, Ordering::Relaxed);
+    STATE.with(|s| s.borrow_mut().line = line);
+    with_frames(|frames| {
+        if let Some(frame) = frames.last_mut() {
+            frame.line = line;
+            if let Some(cached) = &frame.cached {
+                cached.line.store(line, Ordering::Relaxed);
+            }
         }
     });
 }
 
-/// Pushes one activation. The record captures the current file and line and
-/// links to the caller, so `f_back` follows the real call chain even after
-/// frames have been materialised.
+/// Pushes one activation. The record captures the current file and line; the
+/// caller link is reconstructed from the activation stack when (and only
+/// when) introspection materialises it, so `f_back` still follows the real
+/// call chain. No heap allocation happens here.
 pub(crate) fn frame_enter_ptr(ptr: *const u8, len: usize) {
-    let name = decode_bytes(ptr, len);
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        let parent = state.frames.last().cloned();
-        let frame = FrameData {
-            name,
-            module: Mutex::new(String::new()),
-            file: state.file.clone(),
-            first_line: AtomicU32::new(0),
-            line: AtomicU32::new(state.line),
-            flags: AtomicU32::new(0),
-            argcount: AtomicUsize::new(0),
-            parent,
-            locals: Mutex::new(FrameLocals::default()),
-        };
-        state.frames.push(Arc::new(frame));
+    let (file, line) = STATE.with(|s| {
+        let state = s.borrow();
+        (state.file.clone(), state.line)
+    });
+    with_frames(|frames| {
+        frames.push(Activation {
+            name: ptr,
+            name_len: len,
+            file,
+            module: ptr::null(),
+            module_len: 0,
+            names: ptr::null(),
+            names_len: 0,
+            base: ptr::null_mut(),
+            slots: 0,
+            params: 0,
+            flags: 0,
+            line,
+            first_line: 0,
+            cached: None,
+        });
     });
 }
 
@@ -658,88 +733,95 @@ pub(crate) fn frame_bind(
     if slots > (1 << 20) || (base.is_null() && slots != 0) {
         return;
     }
-    let names = if names.is_null() || names_len == 0 || names_len > isize::MAX as usize {
-        Vec::new()
-    } else {
-        // SAFETY: the ABI contract requires `names..names+names_len` readable.
-        let bytes = unsafe { std::slice::from_raw_parts(names, names_len) };
-        bytes
-            .split(|byte| *byte == 0)
-            .filter(|name| !name.is_empty())
-            .map(|name| String::from_utf8_lossy(name).into_owned())
-            .collect()
-    };
-    let module = decode_bytes(module, module_len);
-    let data = STATE.with(|s| s.borrow().frames.last().cloned());
-    let Some(data) = data else {
-        return;
-    };
-    {
-        let mut locals = data
-            .locals
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        locals.base = if slots == 0 { 0 } else { base as usize };
-        locals.slots = if slots == 0 { 0 } else { slots };
-        locals.names = names;
-    }
-    if !module.is_empty() {
-        *data
-            .module
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = module;
-    }
-    if first_line != 0 {
-        data.line.store(first_line, Ordering::Relaxed);
-    }
-    data.first_line.store(first_line, Ordering::Relaxed);
-    data.flags.store(flags, Ordering::Relaxed);
-    data.argcount.store(params, Ordering::Relaxed);
+    // Everything is stored as-is; decoding and heap work happen only if the
+    // activation is later materialised. An already materialised record (the
+    // binding ran after an observation) is refreshed in place without a lock.
+    with_frames(|frames| {
+        let Some(activation) = frames.last_mut() else {
+            return;
+        };
+        activation.base = if slots == 0 { ptr::null_mut() } else { base };
+        activation.slots = if slots == 0 { 0 } else { slots };
+        activation.names = names;
+        activation.names_len = names_len;
+        if !module.is_null() && module_len != 0 {
+            activation.module = module;
+            activation.module_len = module_len;
+        }
+        if first_line != 0 {
+            activation.line = first_line;
+            if let Some(cached) = &activation.cached {
+                cached.line.store(first_line, Ordering::Relaxed);
+            }
+        }
+        activation.first_line = first_line;
+        activation.params = params;
+        activation.flags = flags;
+        if let Some(cached) = &activation.cached {
+            cached.first_line.store(first_line, Ordering::Relaxed);
+            cached.flags.store(flags, Ordering::Relaxed);
+            cached.argcount.store(params, Ordering::Relaxed);
+            cached
+                .locals
+                .base
+                .store(activation.base as usize, Ordering::Relaxed);
+            cached
+                .locals
+                .slots
+                .store(activation.slots, Ordering::Relaxed);
+        }
+    });
 }
 
 /// Pops the innermost call frame. A frame object may outlive it, so the live
 /// slot view is replaced by a rooted snapshot when any frame object (or a
 /// retained child record) still references the activation.
 pub(crate) fn frame_leave() {
-    let data = STATE.with(|s| s.borrow_mut().frames.pop());
-    let Some(data) = data else {
+    let popped = with_frames(|frames| frames.pop());
+    let Some(mut activation) = popped else {
         return;
     };
-    let mut locals = data
-        .locals
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if locals.base == 0 || locals.slots == 0 {
+    // The common path never materialised the record: dropping the activation
+    // is all that is left, and its slots are dead with the caller's storage.
+    let Some(data) = activation.cached.take() else {
+        return;
+    };
+    let base = data.locals.base.swap(0, Ordering::Relaxed);
+    let slots = data.locals.slots.swap(0, Ordering::Relaxed);
+    if base == 0 || slots == 0 {
         return;
     }
-    // `data` is the stack's reference: a count above one means a frame object
-    // or a retained child record still needs this activation's locals. The
-    // slots are still valid here (generated code leaves the precise frame
-    // registered until after `hydro_frame_leave`).
+    // `data` is the only reference we still hold here: a count above one
+    // means a frame object (or a child record's parent link) still needs this
+    // activation's locals. The slots are still valid here (generated code
+    // leaves the precise frame registered until after `hydro_frame_leave`).
     if Arc::strong_count(&data) > 1 {
-        let dict = build_locals_dict(&locals.names, locals.base as *mut i64, locals.slots);
+        let dict = build_locals_dict(&data.locals.names, base as *mut i64, slots);
         // The record is native memory outside the collector's graph, so the
         // snapshot is registered as a process-wide root. It stays valid until
         // the runtime reset, exactly like a cached module value.
         crate::heap::add_global_root(dict);
-        locals.snapshot = Some(dict);
+        *data
+            .locals
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(dict);
     }
-    locals.base = 0;
-    locals.slots = 0;
 }
 
 /// A live frame's locals read the activation slots; an ended frame returns
 /// the snapshot taken by [`frame_leave`].
 pub(crate) fn frame_locals(data: &Arc<FrameData>) -> i64 {
-    let locals = data
-        .locals
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if locals.base != 0 && locals.slots > 0 {
-        return build_locals_dict(&locals.names, locals.base as *mut i64, locals.slots);
+    let locals = &data.locals;
+    let base = locals.base.load(Ordering::Relaxed);
+    let slots = locals.slots.load(Ordering::Relaxed);
+    if base != 0 && slots > 0 {
+        return build_locals_dict(&locals.names, base as *mut i64, slots);
     }
     locals
         .snapshot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .unwrap_or_else(|| value::dict_new(Vec::new()))
 }
 
@@ -766,9 +848,24 @@ fn build_locals_dict(names: &[String], base: *mut i64, slots: usize) -> i64 {
 /// Activation record at `depth` frames above the caller of `sys._getframe`
 /// (`depth == 0` is the innermost running Hydro activation).
 pub(crate) fn frame_at(depth: usize) -> Option<Arc<FrameData>> {
-    STATE.with(|s| {
-        let state = s.borrow();
-        state.frames.iter().rev().nth(depth).cloned()
+    with_frames(|frames| {
+        let last = frames.len().checked_sub(1)?;
+        let index = last.checked_sub(depth)?;
+        // Materialise bottom-up so every record's `parent` is the caller's
+        // record: observing an inner frame caches the whole `f_back` chain.
+        for i in 0..=index {
+            if frames[i].cached.is_some() {
+                continue;
+            }
+            let parent = if i == 0 {
+                None
+            } else {
+                frames[i - 1].cached.clone()
+            };
+            let data = frames[i].materialize(parent);
+            frames[i].cached = Some(Arc::new(data));
+        }
+        frames[index].cached.clone()
     })
 }
 
@@ -861,15 +958,8 @@ fn string_tuple(items: &[String]) -> i64 {
 }
 
 fn frame_code(data: &Arc<FrameData>) -> i64 {
-    // Copy the names out before allocating: the code object's payload must not
-    // be built while the activation's locals mutex is held.
-    let (nlocals, varnames) = {
-        let locals = data
-            .locals
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (locals.names.len(), locals.names.clone())
-    };
+    let nlocals = data.locals.names.len();
+    let varnames = data.locals.names.clone();
     value::code_new(value::CodeState {
         name: data.code_name(),
         qualname: data.code_qualname(),
@@ -893,16 +983,18 @@ pub(crate) fn frame_repr(data: &FrameData) -> String {
     )
 }
 
-/// Detaches the thread's frame stack for a fiber context switch. The returned
-/// records stay alive in the fiber object, where a retained frame object can
-/// still reach them.
-pub(crate) fn take_frames() -> Vec<Arc<FrameData>> {
-    STATE.with(|s| std::mem::take(&mut s.borrow_mut().frames))
-}
-
-/// Installs a frame stack after a fiber context switch.
-pub(crate) fn install_frames(frames: Vec<Arc<FrameData>>) {
-    STATE.with(|s| s.borrow_mut().frames = frames);
+fn decode_names(ptr: *const u8, len: usize) -> Vec<String> {
+    if ptr.is_null() || len == 0 || len > isize::MAX as usize {
+        return Vec::new();
+    }
+    // SAFETY: the ABI contract requires `ptr..ptr+len` readable for as long as
+    // the bound activation runs; materialisation only happens within it.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect()
 }
 
 fn decode_bytes(ptr: *const u8, len: usize) -> String {
@@ -1111,6 +1203,21 @@ fn raise_args(msg: i64) -> Vec<String> {
     }
 }
 
+/// Source location `(file, line, frame name)` of the innermost activation, as
+/// recorded on a newly raised exception.
+fn current_location() -> (String, u32, String) {
+    let (file, line) = STATE.with(|s| {
+        let state = s.borrow();
+        ((*state.file).clone(), state.line)
+    });
+    let frame = with_frames(|frames| {
+        frames.last().map_or_else(String::new, |activation| {
+            decode_bytes(activation.name, activation.name_len)
+        })
+    });
+    (file, line, frame)
+}
+
 /// [`raise_with_message`] with an explicit cause (`None` means "no cause")
 /// and the `from` suppression flag. A new exception records the exception
 /// whose handler is active as its implicit `context`.
@@ -1121,17 +1228,7 @@ fn raise_with_message_cause(
     cause: Option<i64>,
     suppress_context: bool,
 ) -> i64 {
-    let (file, line, frame) = STATE.with(|s| {
-        let st = s.borrow();
-        (
-            st.file.clone(),
-            st.line,
-            st.frames
-                .last()
-                .map(|frame| frame.name.clone())
-                .unwrap_or_default(),
-        )
-    });
+    let (file, line, frame) = current_location();
     let data = ExcData {
         tag,
         name: tag_name(tag),
@@ -1167,17 +1264,7 @@ pub(crate) fn raise_exit(code: i64) -> i64 {
     } else {
         (value::repr(code), None, vec![value::to_string(code)])
     };
-    let (file, line, frame) = STATE.with(|s| {
-        let st = s.borrow();
-        (
-            st.file.clone(),
-            st.line,
-            st.frames
-                .last()
-                .map(|frame| frame.name.clone())
-                .unwrap_or_default(),
-        )
-    });
+    let (file, line, frame) = current_location();
     let data = ExcData {
         tag: SYSTEM_EXIT,
         name: tag_name(SYSTEM_EXIT),

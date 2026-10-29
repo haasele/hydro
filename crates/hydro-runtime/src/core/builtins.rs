@@ -1106,30 +1106,36 @@ pub(crate) fn sum(iterable: i64, start: i64) -> i64 {
 /// loop (re-raising its captured exception first), a yield supplies the item.
 /// The fiber is resumed with `None`, matching iteration `send` semantics.
 fn sum_generator(generator: i64, start: i64) -> i64 {
+    // Resolve the fiber payload once. Re-looking-up the tagged object for
+    // `done`, `error` and the yielded value costs three kind checks per item
+    // on the hottest generator loop.
+    let Some(ptr) = value::fiber_raw(generator) else {
+        return NONE;
+    };
     let mut accumulator = start;
     loop {
-        match crate::fiber::resume_value(generator) {
-            // Yielded: the suspension point stored the item in the fiber.
-            Some(false) => {
-                accumulator = ops::binop(
-                    ops::OP_ADD,
-                    accumulator,
-                    crate::fiber::yielded_value(generator),
-                );
-                if exc::pending() {
-                    return NONE;
-                }
-            }
-            // Finished, now or before this call.
-            Some(true) => {
-                if crate::fiber::has_error(generator) {
+        // SAFETY: `generator` stays rooted for this call, so the fiber payload
+        // cannot be collected or moved.
+        unsafe {
+            if (*ptr).done {
+                if (*ptr).error != NONE {
                     crate::fiber::raise_error(generator);
                     return NONE;
                 }
                 return accumulator;
             }
-            // Unreachable: the caller checked that this is a generator fiber.
-            None => return NONE,
+            crate::fiber::resume_raw(ptr, NONE);
+            if (*ptr).error != NONE {
+                crate::fiber::raise_error(generator);
+                return NONE;
+            }
+            if (*ptr).done {
+                return accumulator;
+            }
+            accumulator = ops::binop(ops::OP_ADD, accumulator, (*ptr).yielded);
+        }
+        if exc::pending() {
+            return NONE;
         }
     }
 }
@@ -6141,13 +6147,19 @@ pub(crate) fn slice_class() -> i64 {
 }
 
 pub(crate) fn is_complex_instance(v: i64) -> bool {
-    globals::registry_get("builtins.complex")
-        .is_some_and(|class| value::instance_class_value(v) == Some(class))
+    // The ordinary numeric path must not build a registry key and take the
+    // globals RwLock for a tagged int. Only real instances can match.
+    let Some(class) = value::instance_class_value(v) else {
+        return false;
+    };
+    globals::registry_get("builtins.complex") == Some(class)
 }
 
 fn is_slice_instance(v: i64) -> bool {
-    globals::registry_get("builtins.slice")
-        .is_some_and(|class| value::instance_class_value(v) == Some(class))
+    let Some(class) = value::instance_class_value(v) else {
+        return false;
+    };
+    globals::registry_get("builtins.slice") == Some(class)
 }
 
 /// Numeric view of `v` for complex construction (`bool`, `int`, `bigint` and

@@ -31,6 +31,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent  # Repo-Root (Elternverzeichnis von benchmarks/)
+# Use the staticlib the JIT is running against; Tea otherwise prefers a copy
+# next to its executable, which can be older than the workspace build.
+RUNTIME_LIB = ROOT / "target" / "release" / "libhydro_runtime.a"
 TIMEOUT = 10.0
 
 
@@ -314,7 +317,16 @@ def run_workloads(tea, n, repeat, workdir):
 
             binary = workdir / f"{key}.bin"
             rc, out, err, build_ms = exec_once(
-                [str(tea), "build", str(source), "-o", str(binary)])
+                [
+                    str(tea),
+                    "build",
+                    str(source),
+                    "-o",
+                    str(binary),
+                    "--runtime-lib",
+                    str(RUNTIME_LIB),
+                ]
+            )
             if rc != 0 or not binary.is_file():
                 detail = last_line(err) or last_line(out) or "kein Binary erzeugt"
                 problems.append(f"AOT-Build fehlgeschlagen (Exit {rc}): {detail}")

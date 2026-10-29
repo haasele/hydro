@@ -1368,9 +1368,6 @@ thread_local! {
     /// Registration of the calling thread; `None` outside the runtime (and in
     /// local-heap mode before `hydro_runtime_init` registered the main thread).
     static GC_SELF: RefCell<Option<Arc<ThreadGc>>> = const { RefCell::new(None) };
-    /// Stack-bound overrides pushed while a fiber runs. The bottom entry is
-    /// the native stack (or `(0, 0)` when it cannot be determined).
-    static STACK_BOUNDS_OVERRIDE: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
     /// Additional root ranges of the outermost fiber resume on this thread:
     /// the native caller stack and the resumed fiber's `caller_ctx`. A
     /// `(0, 0)` entry is unused.
@@ -1454,6 +1451,13 @@ fn capture_registers() -> [usize; REG_WORDS] {
 /// Called before the thread is marked parked, so a collector that observes
 /// `parked` under the registry lock is guaranteed to see this context.
 fn save_context(gc: &ThreadGc) {
+    // Keep the registration in step with the context that is about to park:
+    // `stack_bounds` follows the running fiber, so a context saved on a fiber
+    // stack cannot be bounded with the thread's native range.
+    if let Some((low, high)) = stack_bounds() {
+        gc.stack_low.store(low, Ordering::Release);
+        gc.stack_high.store(high, Ordering::Release);
+    }
     // `marker` lives in this frame, which is deeper than every caller frame;
     // scanning `marker..stack_high` therefore covers the whole live stack.
     let marker: usize = 0;
@@ -1939,7 +1943,10 @@ pub(crate) fn enable_shared() {
     // was a no-op while the heap was local; publish the current state now so
     // a shared safepoint can validate this thread's saved context.
     if let Some((low, high)) = stack_bounds() {
-        update_thread_bounds(low, high);
+        with_current_gc(|gc| {
+            gc.stack_low.store(low, Ordering::Release);
+            gc.stack_high.store(high, Ordering::Release);
+        });
     }
     let aux = AUX_STACK.with(Cell::get);
     if aux != [(0, 0); 2] {
@@ -1998,7 +2005,6 @@ pub(crate) fn reset() {
     // threads (parallel unit tests) are left untouched.
     let token = current_gc_token();
     lock_suspended_stacks().retain(|&(owner, _, _)| owner != token);
-    STACK_BOUNDS_OVERRIDE.with(|bounds| bounds.borrow_mut().clear());
     AUX_STACK.with(|slot| slot.set([(0, 0); 2]));
     ACTIVE_THREADS.store(1, Ordering::Release);
     THREAD_ID.with(|id| id.set(1));
@@ -2587,7 +2593,7 @@ pub(crate) fn register_thread(id: i64, roots: Vec<i64>) {
 /// process-wide table. Called by [`reset`] for the main thread and by
 /// [`register_thread`] for spawned threads.
 fn register_current_thread(id: i64, roots: Vec<i64>) {
-    let (low, high) = stack_bounds().unwrap_or((0, 0));
+    let (low, high) = native_stack_bounds().unwrap_or((0, 0));
     let gc = Arc::new(ThreadGc {
         id,
         token: current_gc_token(),
@@ -3531,41 +3537,6 @@ unsafe fn load_stack_word(addr: usize) -> usize {
 
 // Stack bounds
 
-/// Redirects the collector's stack bounds to `low..high` while a fiber runs.
-///
-/// The override is a stack: a nested resume pushes the inner fiber's range on
-/// top of its caller's. In shared mode the thread registration's bounds are
-/// updated as well, so a safepoint reached on a fiber stack saves a context
-/// the shared collector can validate.
-pub(crate) fn push_stack_bounds(low: usize, high: usize) {
-    STACK_BOUNDS_OVERRIDE.with(|bounds| {
-        let mut bounds = bounds.borrow_mut();
-        if bounds.is_empty() {
-            let base = native_stack_bounds().unwrap_or((0, 0));
-            bounds.push(base);
-        }
-        bounds.push((low, high));
-    });
-    update_thread_bounds(low, high);
-}
-
-/// Undoes one [`push_stack_bounds`], restoring the enclosing context's bounds.
-pub(crate) fn pop_stack_bounds() {
-    let restored = STACK_BOUNDS_OVERRIDE.with(|bounds| {
-        let mut bounds = bounds.borrow_mut();
-        if bounds.len() > 1 {
-            bounds.pop();
-        }
-        bounds.last().copied().unwrap_or((0, 0))
-    });
-    let restored = if restored == (0, 0) {
-        native_stack_bounds().unwrap_or((0, 0))
-    } else {
-        restored
-    };
-    update_thread_bounds(restored.0, restored.1);
-}
-
 /// Runs `f` with the calling thread's collector registration, without the
 /// `Arc` clone of [`current_gc`] (this is on the per-resume path).
 fn with_current_gc(f: impl FnOnce(&ThreadGc)) {
@@ -3573,18 +3544,6 @@ fn with_current_gc(f: impl FnOnce(&ThreadGc)) {
         if let Some(gc) = cell.borrow().as_ref() {
             f(gc);
         }
-    });
-}
-
-fn update_thread_bounds(low: usize, high: usize) {
-    // Only the shared collector validates a parked thread against its saved
-    // bounds; local mode reads the thread-local override directly.
-    if !shared() {
-        return;
-    }
-    with_current_gc(|gc| {
-        gc.stack_low.store(low, Ordering::Release);
-        gc.stack_high.store(high, Ordering::Release);
     });
 }
 
@@ -3596,6 +3555,16 @@ fn update_thread_bounds(low: usize, high: usize) {
 /// stack. Both are scanned conservatively. Nested resumes do not publish
 /// anything: their caller is a fiber whose lifetime stack and context ranges
 /// are already registered.
+pub(crate) fn aux_stack_published() -> bool {
+    AUX_STACK.with(|slot| slot.get()[0].0 != 0)
+}
+
+/// Cached native stack bounds of this thread, independent of an active fiber
+/// override.
+pub(crate) fn native_stack_bounds_cached() -> Option<(usize, usize)> {
+    native_stack_bounds()
+}
+
 pub(crate) fn set_aux_stack(low: usize, high: usize, ctx_low: usize, ctx_high: usize) {
     let ranges = [(low, high), (ctx_low, ctx_high)];
     AUX_STACK.with(|slot| slot.set(ranges));
@@ -3607,20 +3576,6 @@ pub(crate) fn set_aux_stack(low: usize, high: usize, ctx_low: usize, ctx_high: u
         gc.aux_high.store(ranges[0].1, Ordering::Release);
         gc.aux2_low.store(ranges[1].0, Ordering::Release);
         gc.aux2_high.store(ranges[1].1, Ordering::Release);
-    });
-}
-
-/// Removes the aux ranges published by [`set_aux_stack`].
-pub(crate) fn clear_aux_stack() {
-    AUX_STACK.with(|slot| slot.set([(0, 0); 2]));
-    if !shared() {
-        return;
-    }
-    with_current_gc(|gc| {
-        gc.aux_low.store(0, Ordering::Release);
-        gc.aux_high.store(0, Ordering::Release);
-        gc.aux2_low.store(0, Ordering::Release);
-        gc.aux2_high.store(0, Ordering::Release);
     });
 }
 
@@ -3653,19 +3608,29 @@ pub(crate) fn unregister_suspended_stack(low: usize, high: usize) {
 /// The calling thread's effective stack bounds: the innermost fiber override
 /// when one is active, the native stack otherwise.
 pub(crate) fn stack_bounds() -> Option<(usize, usize)> {
-    match STACK_BOUNDS_OVERRIDE.with(|bounds| bounds.borrow().last().copied()) {
-        Some(bounds) if bounds != (0, 0) => Some(bounds),
-        _ => native_stack_bounds(),
+    if let Some(bounds) = crate::fiber::current_stack_bounds() {
+        return Some(bounds);
     }
+    native_stack_bounds()
 }
 
 /// The OS thread's native stack bounds, ignoring any fiber override.
 #[cfg(unix)]
 fn native_stack_bounds() -> Option<(usize, usize)> {
+    // `resume_raw` asks for the caller stack high bound on every generator
+    // resume. `pthread_getattr_np` is a syscall-like query and dominated the
+    // yield path; the native stack of a thread never moves, so cache it.
+    thread_local! {
+        static NATIVE_BOUNDS: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+        static NATIVE_BOUNDS_READY: Cell<bool> = const { Cell::new(false) };
+    }
+    if NATIVE_BOUNDS_READY.with(Cell::get) {
+        return NATIVE_BOUNDS.with(Cell::get);
+    }
     // SAFETY: `attr` is initialized by `pthread_getattr_np`, queried with a
     // valid stackt pointer pair and destroyed exactly once. Failures are
     // reported as `None`; no pointers escape.
-    unsafe {
+    let bounds = unsafe {
         let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
         if libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) != 0 {
             return None;
@@ -3681,7 +3646,10 @@ fn native_stack_bounds() -> Option<(usize, usize)> {
         }
         let low = addr as usize;
         Some((low, low.saturating_add(size)))
-    }
+    };
+    NATIVE_BOUNDS.with(|cell| cell.set(bounds));
+    NATIVE_BOUNDS_READY.with(|cell| cell.set(true));
+    bounds
 }
 
 #[cfg(not(unix))]

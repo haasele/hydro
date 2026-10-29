@@ -32,7 +32,7 @@ Phase 1 is complete; Phase 2 is complete. It includes lazy/async generators,
 coroutines and task groups, precise shadow-stack roots (strict mode
 `HYDRO_GC_PRECISE=1`), the size-classed payload allocator, argparse/pytest,
 TLS/UDP/select networking, and the IR interpreter/REPL. Remaining work is P7
-stdlib/ecosystem parity and P5 performance (generator-resume root overhead). **P4-04 is unblocked and decided:** CPython
+stdlib/ecosystem parity and P5 performance tuning (PGO/inlining). **P4-04 is unblocked and decided:** CPython
 3.14 development files are available, and the project follows **option B** —
 a Hydro-native CPython C-API/ABI layer without embedded `libpython`; evidence and
 gates in [`docs/C_API.md`](C_API.md). The **first abi3 slice is implemented**:
@@ -188,8 +188,9 @@ no CPython is needed at runtime.
       Delivered: a conservative, concurrent mark & sweep (edge barriers,
       concurrent sweep, STW root snapshot/rescan). The fiber stack as well as
       `ctx`/`caller_ctx` (callee-saved register frames) are lifetime-registered
-      conservative roots; at run time `push_stack_bounds` overrides the stack
-      bounds, and the outermost resume publishes two aux ranges. Program:
+      conservative roots; at run time stack bounds derive from the running
+      fiber, and the native caller stack is published once as an aux range.
+      Program:
       precise root sets for JIT/AOT frames (shadow stack or stack maps) and
       handles, with no conservative retainer of dead values. Acceptance:
       `tests/concurrent_gc.rs`/`stw_gc.rs` stay green under heap pressure;
@@ -655,10 +656,13 @@ ecosystem benchmarks show where Hydro is faster, equal or slower than CPython
       int fast paths (`+`/`-`/`*`, comparisons, AugAssign, fully int-typed
       `for range` counters; checked overflow → `hydro_binop` slow path), native
       module dispatch through a thread-local spec cache, and the
-      register-only x86_64 fiber switch. Measured (release, n=200000):
-      `math_loop` parity (AOT 1.01x, JIT 0.94x), while_sum 7.7x/12.4x,
-      for_range_sum 6.4x/8.0x; 100k generator sum CPython 10.2 / JIT 7.7 /
-      AOT 6.8 ms. Program: an inliner, escape analysis/devirtualization and
+      register-only x86_64 fiber switch. The 2026-10-29 hot-path slice also
+      added pointer-based precise-root switching, lazy traceback frames,
+      stack bounds derived from the running fiber, and scalar guards around
+      instance-only registry lookups. Measured (release, n=200000):
+      `math_loop` 6.96x/14.48x (JIT/AOT), while_sum 4.41x/10.31x,
+      for_range_sum 5.84x/11.21x; 100k generator sum CPython 9.46 / JIT 5.08 /
+      AOT 4.71 ms. Program: an inliner, escape analysis/devirtualization and
       unboxed floats. Acceptance: each optimization is behind a measurement
       that shows a gain without correctness regressions; no optimization
       claim without a tracked result.

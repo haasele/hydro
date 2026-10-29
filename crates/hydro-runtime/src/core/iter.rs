@@ -408,36 +408,41 @@ fn callable_next(iter: i64, pair: i64, exhausted: bool, out: *mut i64) -> i64 {
 /// next element; a finished generator ends iteration; a pending exception
 /// inside the body is re-raised to the caller.
 fn generator_next(generator: i64, out: *mut i64) -> i64 {
-    if crate::fiber::is_done(generator) {
-        if crate::fiber::has_error(generator) {
-            crate::fiber::raise_error(generator);
-        }
+    // One payload lookup for the whole step. The previous shape checked
+    // `done`, resumed (another lookup), then checked error and fetched the
+    // yielded value through the tagged object again: four kind checks per
+    // yielded item.
+    let Some(ptr) = value::fiber_raw(generator) else {
+        exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object is not an iterator",
+                value::type_name(generator)
+            ),
+        );
         return 0;
-    }
-    match crate::fiber::resume_value(generator) {
-        Some(true) => {
-            if crate::fiber::has_error(generator) {
+    };
+    // SAFETY: the caller holds a reference to `generator` for this call, so
+    // the fiber payload is live.
+    unsafe {
+        if (*ptr).done {
+            if (*ptr).error != value::NONE {
                 crate::fiber::raise_error(generator);
             }
-            0
+            return 0;
         }
-        Some(false) => {
-            let item = crate::fiber::yielded_value(generator);
-            // SAFETY: checked above.
-            unsafe { *out = item };
-            1
+        crate::fiber::resume_raw(ptr, value::NONE);
+        if (*ptr).error != value::NONE {
+            crate::fiber::raise_error(generator);
+            return 0;
         }
-        None => {
-            exc::raise_with_message(
-                TYPE_ERROR,
-                &format!(
-                    "'{}' object is not an iterator",
-                    value::type_name(generator)
-                ),
-            );
-            0
+        if (*ptr).done {
+            return 0;
         }
+        // SAFETY: `out` is checked by the public entry points.
+        *out = (*ptr).yielded;
     }
+    1
 }
 
 #[cfg(test)]

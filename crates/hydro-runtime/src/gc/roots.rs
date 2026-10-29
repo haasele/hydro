@@ -31,13 +31,11 @@
 //! # Fiber switches
 //!
 //! A fiber maintains two independent root sets: its own and the resumer's
-//! (see the fiber module). [`take_current`] removes the active set from the
-//! thread-local registry and [`install`] swaps another set in, returning the
-//! previous one. This is a pure vector move: no snapshot or registry work
-//! happens on the context-switch path. The saved roots stay in the fiber
-//! object (`FiberState`) and are exposed through [`SavedRoots::frames`]/
-//! [`SavedRoots::ranges`] so the collector can mark them while the other
-//! context runs.
+//! (see the fiber module). [`switch_to`] only writes a TLS pointer to the
+//! fiber's own set and [`switch_back`] restores the resumer; no descriptor is
+//! moved. The sets stay in their owning contexts and are exposed through
+//! [`SavedRoots::frames`]/[`SavedRoots::ranges`] so the collector can mark
+//! them while the other context runs.
 //!
 //! # Token discipline
 //!
@@ -119,23 +117,13 @@ pub struct SavedRoots {
     frame_tokens: Vec<usize>,
     ranges: Vec<RootRange>,
     range_tokens: Vec<usize>,
-}
-
-/// Thread-local mutator-side registry.
-struct ThreadRoots {
-    frames: Vec<RootFrame>,
-    /// Token of the matching entry in `frames`.
-    frame_tokens: Vec<usize>,
-    ranges: Vec<RootRange>,
-    /// Token of the matching entry in `ranges`.
-    range_tokens: Vec<usize>,
-    /// Per-thread monotonic push serial; `0` means "never pushed".
+    /// Per-context monotonic push serial; `0` means "never pushed".
     next_token: usize,
 }
 
-impl ThreadRoots {
-    const fn new() -> ThreadRoots {
-        ThreadRoots {
+impl SavedRoots {
+    const fn new() -> SavedRoots {
+        SavedRoots {
             frames: Vec::new(),
             frame_tokens: Vec::new(),
             ranges: Vec::new(),
@@ -156,8 +144,42 @@ impl ThreadRoots {
 }
 
 thread_local! {
-    /// Fast path: frames and ranges registered by the running context.
-    static ROOTS: RefCell<ThreadRoots> = const { RefCell::new(ThreadRoots::new()) };
+    /// Fast path: the main context's frames and ranges.
+    static ROOTS: RefCell<SavedRoots> = const { RefCell::new(SavedRoots::new()) };
+    /// The fiber context currently running on this thread, or null for the
+    /// thread's main context. A switch writes this pointer; it does not move
+    /// any root descriptors.
+    static ACTIVE_ROOTS: Cell<*mut SavedRoots> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+fn with_active<R>(f: impl FnOnce(&mut SavedRoots) -> R) -> R {
+    let ptr = ACTIVE_ROOTS.with(Cell::get);
+    if ptr.is_null() {
+        ROOTS.with(|cell| f(&mut cell.borrow_mut()))
+    } else {
+        // SAFETY: the pointer names the `saved_roots` field of a live fiber
+        // Box. Only its owning thread can select it, and `switch_back`
+        // restores the caller before the fiber can be dropped.
+        f(unsafe { &mut *ptr })
+    }
+}
+
+/// Selects `saved` as the active root set and returns the previous selection.
+///
+/// This is the entire root half of a fiber context switch: one TLS write, no
+/// vector moves. The previous pointer is restored by [`switch_back`].
+pub fn switch_to(saved: &mut SavedRoots) -> *mut SavedRoots {
+    ACTIVE_ROOTS.with(|slot| slot.replace(saved as *mut SavedRoots))
+}
+
+/// Restores the active root set selected before [`switch_to`].
+///
+/// # Safety
+///
+/// `previous` must be null or a pointer returned by [`switch_to`] whose owner
+/// is still alive.
+pub fn switch_back(previous: *mut SavedRoots) {
+    ACTIVE_ROOTS.with(|slot| slot.set(previous));
 }
 
 /// Source of the per-thread registry keys.
@@ -221,8 +243,7 @@ pub fn frame_push(base: *mut i64, capacity: usize) -> usize {
             }
         }
     }
-    ROOTS.with(|cell| {
-        let mut roots = cell.borrow_mut();
+    with_active(|roots| {
         let token = roots.fresh_token();
         roots.frames.push(RootFrame {
             base,
@@ -242,18 +263,15 @@ pub fn frame_push(base: *mut i64, capacity: usize) -> usize {
 /// `token` must be the token returned by the matching [`frame_push`]; any
 /// other value trips a debug assertion and is ignored in release builds.
 pub fn frame_pop(token: usize) {
-    ROOTS.with(|cell| {
-        let mut roots = cell.borrow_mut();
-        match roots.frame_tokens.last().copied() {
-            Some(top) if top == token => {
-                roots.frames.pop();
-                roots.frame_tokens.pop();
-            }
-            _ => debug_assert!(
-                false,
-                "hydro_gc_frame_pop: token {token} is not the innermost frame"
-            ),
+    with_active(|roots| match roots.frame_tokens.last().copied() {
+        Some(top) if top == token => {
+            roots.frames.pop();
+            roots.frame_tokens.pop();
         }
+        _ => debug_assert!(
+            false,
+            "hydro_gc_frame_pop: token {token} is not the innermost frame"
+        ),
     });
 }
 
@@ -264,8 +282,7 @@ pub fn frame_pop(token: usize) {
 /// `used` is clamped to the frame's capacity; the frame must still be the
 /// innermost one.
 pub fn frame_used(token: usize, used: usize) {
-    ROOTS.with(|cell| {
-        let mut roots = cell.borrow_mut();
+    with_active(|roots| {
         let top = roots.frame_tokens.last().copied();
         match (roots.frames.last_mut(), top) {
             (Some(frame), Some(top)) if top == token => {
@@ -298,8 +315,7 @@ pub fn scope_push(base: *const i64, count: usize) -> usize {
     if base.is_null() && count != 0 {
         return 0;
     }
-    ROOTS.with(|cell| {
-        let mut roots = cell.borrow_mut();
+    with_active(|roots| {
         let token = roots.fresh_token();
         roots.ranges.push(RootRange { base, count });
         roots.range_tokens.push(token);
@@ -310,18 +326,15 @@ pub fn scope_push(base: *const i64, count: usize) -> usize {
 
 /// Unregisters the innermost scope range; LIFO, like [`frame_pop`].
 pub fn scope_pop(token: usize) {
-    ROOTS.with(|cell| {
-        let mut roots = cell.borrow_mut();
-        match roots.range_tokens.last().copied() {
-            Some(top) if top == token => {
-                roots.ranges.pop();
-                roots.range_tokens.pop();
-            }
-            _ => debug_assert!(
-                false,
-                "hydro_gc_scope_pop: token {token} is not the innermost scope"
-            ),
+    with_active(|roots| match roots.range_tokens.last().copied() {
+        Some(top) if top == token => {
+            roots.ranges.pop();
+            roots.range_tokens.pop();
         }
+        _ => debug_assert!(
+            false,
+            "hydro_gc_scope_pop: token {token} is not the innermost scope"
+        ),
     });
 }
 
@@ -364,12 +377,9 @@ pub fn snapshot_thread(token: u64) -> Option<PublishedRoots> {
 /// Used by the local-heap collector, which runs on the mutator thread and
 /// therefore needs no publication.
 pub fn snapshot_current() -> PublishedRoots {
-    ROOTS.with(|cell| {
-        let roots = cell.borrow();
-        PublishedRoots {
-            frames: roots.frames.clone(),
-            ranges: roots.ranges.clone(),
-        }
+    with_active(|roots| PublishedRoots {
+        frames: roots.frames.clone(),
+        ranges: roots.ranges.clone(),
     })
 }
 
@@ -378,12 +388,12 @@ pub fn snapshot_current() -> PublishedRoots {
 /// Called when a thread exits or after a `fork`, where the child no longer
 /// matches the forked address space.
 pub fn clear_current() {
-    ROOTS.with(|cell| {
-        let mut roots = cell.borrow_mut();
+    with_active(|roots| {
         roots.frames.clear();
         roots.frame_tokens.clear();
         roots.ranges.clear();
         roots.range_tokens.clear();
+        roots.next_token = 0;
     });
     let token = current_thread_token();
     lock_published().remove(&token);
@@ -400,14 +410,12 @@ pub fn clear_thread(token: u64) {
 /// keeps the caller's publication untouched (the collector publishes anew
 /// when the context reaches a safepoint).
 pub fn take_current() -> SavedRoots {
-    ROOTS.with(|cell| {
-        let mut roots = cell.borrow_mut();
-        SavedRoots {
-            frames: std::mem::take(&mut roots.frames),
-            frame_tokens: std::mem::take(&mut roots.frame_tokens),
-            ranges: std::mem::take(&mut roots.ranges),
-            range_tokens: std::mem::take(&mut roots.range_tokens),
-        }
+    with_active(|roots| SavedRoots {
+        frames: std::mem::take(&mut roots.frames),
+        frame_tokens: std::mem::take(&mut roots.frame_tokens),
+        ranges: std::mem::take(&mut roots.ranges),
+        range_tokens: std::mem::take(&mut roots.range_tokens),
+        next_token: roots.next_token,
     })
 }
 
@@ -423,14 +431,15 @@ pub fn install(saved: SavedRoots) -> SavedRoots {
         frame_tokens,
         ranges,
         range_tokens,
+        next_token,
     } = saved;
-    ROOTS.with(|cell| {
-        let mut roots = cell.borrow_mut();
+    with_active(|roots| {
         let previous = SavedRoots {
             frames: std::mem::replace(&mut roots.frames, frames),
             frame_tokens: std::mem::replace(&mut roots.frame_tokens, frame_tokens),
             ranges: std::mem::replace(&mut roots.ranges, ranges),
             range_tokens: std::mem::replace(&mut roots.range_tokens, range_tokens),
+            next_token: std::mem::replace(&mut roots.next_token, next_token),
         };
         debug_assert_eq!(roots.frames.len(), roots.frame_tokens.len());
         debug_assert_eq!(roots.ranges.len(), roots.range_tokens.len());

@@ -38,32 +38,32 @@ Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
 
 ## Performance
 
-Medians over 5 runs, a fresh process per run, AOT excluding build time. Measured on Linux x86_64 (Intel Core Ultra 7 255H, 16 cores, 24 GB) with CPython **3.14.9** as the benchmark runner and compatibility oracle. Every subprocess is capped at 10 seconds.
+Medians over 9 runs, a fresh process per run, AOT excluding build time. Measured on Linux x86_64 (Intel Core Ultra 7 255H, 16 cores, 24 GB) with CPython **3.14.9** as the benchmark runner and compatibility oracle, pinned to one performance core (`taskset -c 0`). Every subprocess is capped at 10 seconds.
 
 ```bash
-HYDRO_SITE_PACKAGES=/usr/lib/python3.14/site-packages \
-  ../tea/target/release/tea infuse benchmarks/bench_all.py --only hydro
+uv run benchmarks/bench_all.py --only hydro
 ```
 
 | Workload | CPython | Hydro JIT | Hydro AOT | CPython/JIT | CPython/AOT |
 |---|---:|---:|---:|---:|---:|
-| hello | 6.76 ms | 1.62 ms | 0.89 ms | 4.17× | 7.61× |
-| while_sum | 17.91 ms | 3.42 ms | 2.03 ms | 5.24× | 8.82× |
-| for_range_sum | 13.83 ms | 3.03 ms | 1.78 ms | 4.57× | 7.79× |
-| list_append | 13.26 ms | 8.32 ms | 5.33 ms | 1.59× | 2.49× |
-| list_comp | 9.66 ms | 7.76 ms | 5.75 ms | 1.24× | 1.68× |
-| dict_insert | 7.53 ms | 2.78 ms | 1.43 ms | 2.71× | 5.27× |
-| string_concat | 7.66 ms | 3.07 ms | 1.47 ms | 2.50× | 5.22× |
-| json_roundtrip | 12.70 ms | 3.47 ms | 2.11 ms | 3.66× | 6.02× |
-| math_loop | 21.73 ms | 4.81 ms | 3.36 ms | 4.52× | 6.48× |
-| generator_sum | 12.03 ms | 17.63 ms | 15.72 ms | 0.68× | 0.77× |
-| async_gather | 61.41 ms | 24.10 ms | 21.55 ms | 2.55× | 2.85× |
+| hello | 7.36 ms | 1.54 ms | 1.35 ms | 4.78× | 5.45× |
+| while_sum | 18.89 ms | 4.28 ms | 1.83 ms | 4.41× | 10.31× |
+| for_range_sum | 14.91 ms | 2.55 ms | 1.33 ms | 5.84× | 11.21× |
+| list_append | 14.82 ms | 8.34 ms | 4.58 ms | 1.78× | 3.23× |
+| list_comp | 12.00 ms | 5.29 ms | 3.19 ms | 2.27× | 3.76× |
+| dict_insert | 8.03 ms | 2.39 ms | 2.36 ms | 3.35× | 3.40× |
+| string_concat | 8.12 ms | 2.32 ms | 1.31 ms | 3.51× | 6.20× |
+| json_roundtrip | 12.76 ms | 3.16 ms | 2.06 ms | 4.04× | 6.19× |
+| math_loop | 22.81 ms | 3.28 ms | 1.58 ms | 6.96× | 14.48× |
+| generator_sum | 9.46 ms | 5.08 ms | 4.71 ms | 1.86× | 2.01× |
+| async_gather | 59.08 ms | 24.08 ms | 22.37 ms | 2.45× | 2.64× |
 
 Measured 2026-10-29 with `repeat=5`, fresh processes, AOT excluding build time.
-Hydro is faster on 10 of 11 workloads (JIT median **2.71×**, AOT **5.27×**);
-the exception is generator resume, where per-frame precise-root bookkeeping is
-currently dominant. Startup is lower (`tea JIT hello` 1.62 ms, `tea AOT hello`
-0.89 ms, CPython 7.20 ms). Closing the generator gap is tracked under P5.
+Hydro is faster on all 11 workloads (JIT median **3.51×**, AOT **5.45×**).
+Generator resume is the narrowest compute-bound result but is now
+**1.86×/2.01×** faster after removing eager frame records, per-yield registry
+lookups and root-vector transfers. Startup is lower (`tea JIT hello` 1.54 ms,
+`tea AOT hello` 1.35 ms, CPython 6.66 ms). P5 now focuses on PGO/inlining.
 
 ## Requirements
 
@@ -320,10 +320,9 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   The gate compares only workloads that are present in both the result and
   threshold file. Enforcement stays local/release-only: timing on shared
   runners is too noisy for a blocking CI gate. CI runs the check as a
-  non-blocking report and runs `scripts/test_check_benchmarks.py`. The
-  2026-10-29 run reports `sum_genexp` above its old threshold (JIT 26.1 ms,
-  AOT 19.4 ms); this is the known P5 generator-root overhead, not a threshold
-  rewrite.
+  non-blocking report and runs `scripts/test_check_benchmarks.py`. Thresholds
+  were tightened after the 2026-10-29 hot-path work; the current suite passes
+  45/45 checks with the generator workload faster than CPython.
 - Harnesses: `scripts/bench_hyperfine.sh` wraps the `bench_*.py` scripts in
   hyperfine with output validation (skips cleanly when hyperfine/uv is
   missing); `benchmarks/compare_engines.py` compares loop/startup under

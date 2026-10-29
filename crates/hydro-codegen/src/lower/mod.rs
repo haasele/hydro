@@ -26,6 +26,9 @@ use crate::{CodegenError, CodegenOptions};
 
 /// The `None` immediate, see `ARCHITECTURE.md` §3.1.
 const NONE_TAG: i64 = 1;
+/// Sentinel returned by `hydro_yield` when a thrown/closed/cancelled
+/// generator left an exception pending. Not a valid tagged value.
+const YIELD_ERROR_TAG: i64 = 2;
 const FALSE_TAG: i64 = 9;
 const TRUE_TAG: i64 = 17;
 /// Reserved special immediate for `NotImplemented` (special payload 3); see
@@ -251,7 +254,6 @@ struct Runtime {
     /// Precise shadow frame for locals/return/temporaries.
     gc_frame_push: FuncId,
     gc_frame_pop: FuncId,
-    gc_frame_used: FuncId,
     /// Registered ranges over argument/literal stack arrays.
     gc_scope_push: FuncId,
     gc_scope_pop: FuncId,
@@ -435,7 +437,7 @@ impl Runtime {
             // on resume; `hydro_yield_from` delegates iteration to an iterable
             // and returns its result.
             await_value: declare_runtime(module, "hydro_await", &[i64t], Some(i64t))?,
-            yield_value: declare_runtime(module, "hydro_yield", &[i64t], Some(i64t))?,
+            yield_value: declare_runtime(module, "hydro_yield_checked", &[i64t], Some(i64t))?,
             yield_from: declare_runtime(module, "hydro_yield_from", &[i64t], Some(i64t))?,
             // `name_len` is a `size_t` in the ABI: pointer-width.
             builtin_function: declare_runtime(
@@ -709,7 +711,6 @@ impl Runtime {
             // are registered with `scope_push(base, count)`/`scope_pop(token)`.
             gc_frame_push: declare_runtime(module, "hydro_gc_frame_push", &[ptr, ptr], Some(ptr))?,
             gc_frame_pop: declare_runtime(module, "hydro_gc_frame_pop", &[ptr], None)?,
-            gc_frame_used: declare_runtime(module, "hydro_gc_frame_used", &[ptr, ptr], None)?,
             gc_scope_push: declare_runtime(module, "hydro_gc_scope_push", &[ptr, ptr], Some(ptr))?,
             gc_scope_pop: declare_runtime(module, "hydro_gc_scope_pop", &[ptr], None)?,
             exc_pending: declare_runtime(module, "hydro_exc_pending", &[], Some(i64t))?,
@@ -939,18 +940,25 @@ fn lower_function<M: Module>(
         CodegenError::new(format!("internal error: function {index} was not declared"))
     })?;
 
-    let mut ctx = module.make_context();
     let signature = make_signature(
         module,
         &vec![types::I64; function.params.len()],
         Some(types::I64),
     );
-    ctx.func.signature = signature;
+    let ptr_ty = module.target_config().pointer_type();
 
-    let mut builder_ctx = FunctionBuilderContext::new();
-    {
+    // Lower once into a throwaway context to measure the exact number of
+    // temporary and scratch roots this function needs. The old layout reserved
+    // several slots per HIR node; a two-line lambda got >100 shadow slots and
+    // paid a zero-fill/scan for all of them on every call. The measurement pass
+    // keeps the compile-time contract exact while the emitted pass uses only
+    // the slots the function actually wrote.
+    let reserved = root_layout(function, program);
+    let (temp_used, scratch_used) = {
+        let mut ctx = module.make_context();
+        ctx.func.signature = signature.clone();
+        let mut builder_ctx = FunctionBuilderContext::new();
         let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-        let ptr_ty = module.target_config().pointer_type();
         let mut lower = Lower::new(
             module,
             program,
@@ -962,6 +970,39 @@ fn lower_function<M: Module>(
             runtime,
             builder,
             ptr_ty,
+            reserved,
+        )?;
+        lower.run()?;
+        (
+            (lower.next_temp - lower.temp_var_base) as usize,
+            lower.scratch_peak,
+        )
+    };
+    let capacity = function
+        .locals
+        .len()
+        .saturating_add(1)
+        .saturating_add(temp_used)
+        .saturating_add(scratch_used);
+    let exact = (capacity, temp_used, scratch_used);
+
+    let mut ctx = module.make_context();
+    ctx.func.signature = signature;
+    let mut builder_ctx = FunctionBuilderContext::new();
+    {
+        let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let mut lower = Lower::new(
+            module,
+            program,
+            function,
+            program.module_of(index),
+            symbols,
+            wrappers,
+            full_wrappers,
+            runtime,
+            builder,
+            ptr_ty,
+            exact,
         )?;
         lower.run()?;
         lower.finish();
@@ -1000,7 +1041,6 @@ fn wrapper_frame<M: Module>(
     let base = builder.ins().stack_addr(ptr_ty, slot, 0);
     let cap = builder.ins().iconst(ptr_ty, capacity as i64);
     let token = call_val_extern(module, builder, runtime.gc_frame_push, &[base, cap]);
-    call_void_extern(module, builder, runtime.gc_frame_used, &[token, cap]);
     Ok(WrapperRoots {
         slot,
         token,
@@ -1798,6 +1838,40 @@ fn count_body(body: &[Stmt]) -> usize {
     body.iter().map(count_stmt).sum()
 }
 
+/// Whether a function body can leave runtime exception-handler contexts
+/// pushed on return. Normal functions never touch the handler stack, so they
+/// do not need to capture/truncate its depth on entry and return.
+fn body_has_handler(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match &stmt.kind {
+        StmtKind::Try {
+            body,
+            handlers,
+            else_body,
+            finally_body,
+        } => {
+            !handlers.is_empty()
+                || !finally_body.is_empty()
+                || body_has_handler(body)
+                || body_has_handler(else_body)
+        }
+        StmtKind::If {
+            then_body,
+            else_body,
+            ..
+        } => body_has_handler(then_body) || body_has_handler(else_body),
+        StmtKind::While {
+            body, else_body, ..
+        }
+        | StmtKind::ForRange {
+            body, else_body, ..
+        }
+        | StmtKind::ForEach {
+            body, else_body, ..
+        } => body_has_handler(body) || body_has_handler(else_body),
+        _ => false,
+    })
+}
+
 /// Number of shadow-frame slots reserved for one function.
 ///
 /// Every local and the return slot always own a slot. Temporary roots grow
@@ -1869,10 +1943,17 @@ struct Lower<'a, 'b, M: Module> {
     /// Runtime handler depth at function entry; leaving the function unwinds
     /// to it so caller contexts stay intact.
     handler_base: Variable,
+    /// Whether this body pushes handler contexts, making `handler_base`
+    /// meaningful.
+    needs_handler_unwind: bool,
     /// Explicit, 8-byte-aligned stack slot backing the precise shadow frame.
     root_slot: StackSlot,
     /// Token returned by `hydro_gc_frame_push`; valid until the epilogue.
     root_token: Variable,
+    /// Last line number reported to the runtime. Loops execute the same
+    /// static statement repeatedly; comparing against this cache avoids a
+    /// TLS/runtime call per iteration.
+    line_cache: Variable,
     /// Number of tagged shadow slots (`root_slot` size / 8).
     root_capacity: usize,
     /// First shadow index reserved for `temp_var` roots.
@@ -1883,6 +1964,7 @@ struct Lower<'a, 'b, M: Module> {
     scratch_base: usize,
     scratch_budget: usize,
     scratch_next: usize,
+    scratch_peak: usize,
     loops: Vec<LoopTargets>,
     /// Active `finally` blocks, innermost last.
     cleanups: Vec<CleanupId>,
@@ -1913,15 +1995,17 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         runtime: &'a Runtime,
         mut builder: FunctionBuilder<'b>,
         ptr_ty: ir::Type,
+        layout: (usize, usize, usize),
     ) -> Result<Lower<'a, 'b, M>, CodegenError> {
         let locals = function.locals.len();
         let ret_var = Variable::from_u32(locals as u32);
         let safepoint_counter = Variable::from_u32(locals as u32 + 1);
         let handler_base = Variable::from_u32(locals as u32 + 2);
-        let root_token = Variable::from_u32(locals as u32 + 3);
-        let temp_var_base = locals as u32 + 4;
+        let line_cache = Variable::from_u32(locals as u32 + 3);
+        let root_token = Variable::from_u32(locals as u32 + 4);
+        let temp_var_base = locals as u32 + 5;
 
-        let (capacity, temp_roots, scratch_roots) = root_layout(function, program);
+        let (capacity, temp_roots, scratch_roots) = layout;
         let capacity = capacity.max(1);
         let bytes = capacity
             .checked_mul(8)
@@ -1961,14 +2045,17 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             exc_target: ExcTarget::Function,
             current_exc: None,
             handler_base,
+            needs_handler_unwind: body_has_handler(&function.body),
             root_slot,
             root_token,
+            line_cache,
             root_capacity: capacity,
             temp_root_base: locals + 1,
             temp_var_base,
             scratch_base: locals + 1 + temp_roots,
             scratch_budget: scratch_roots,
             scratch_next: 0,
+            scratch_peak: 0,
             loops: Vec::new(),
             cleanups: Vec::new(),
             cleanup_infos: Vec::new(),
@@ -2003,13 +2090,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         let token = self.call_rt(self.runtime.gc_frame_push, &[base, capacity])?;
         self.builder.declare_var(self.root_token, self.ptr_ty);
         self.builder.def_var(self.root_token, token);
-        // All capacity slots were just initialised with `None`; make them
-        // visible to the collector even though not every slot is written yet.
-        self.call_void(self.runtime.gc_frame_used, &[token, capacity]);
 
         // All locals start out as None; parameters overwrite their slots.
         self.builder.declare_var(self.ret_var, types::I64);
         self.builder.declare_var(self.safepoint_counter, types::I64);
+        self.builder.declare_var(self.line_cache, types::I64);
         for index in 0..self.locals.len() {
             self.builder
                 .declare_var(Variable::from_u32(index as u32), types::I64);
@@ -2021,11 +2106,16 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.define_var(self.ret_var, none)?;
         let zero = self.builder.ins().iconst(types::I64, 0);
         self.builder.def_var(self.safepoint_counter, zero);
+        self.builder.def_var(self.line_cache, zero);
         // Handler contexts of enclosing callers stay on the runtime stack;
-        // leaving this function unwinds only to this baseline.
-        self.builder.declare_var(self.handler_base, types::I64);
-        let handler_base = self.call_rt(self.runtime.exc_handler_depth, &[])?;
-        self.builder.def_var(self.handler_base, handler_base);
+        // leaving this function unwinds only to this baseline. Functions
+        // without a `try` cannot push a handler, so they skip both runtime
+        // calls entirely.
+        if self.needs_handler_unwind {
+            self.builder.declare_var(self.handler_base, types::I64);
+            let handler_base = self.call_rt(self.runtime.exc_handler_depth, &[])?;
+            self.builder.def_var(self.handler_base, handler_base);
+        }
 
         let entry_params = self.builder.block_params(entry).to_vec();
         for (position, param) in self.params.iter().enumerate() {
@@ -2048,7 +2138,6 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.emit_profile_hit()?;
         let body = self.body;
         self.lower_stmts(body)?;
-
         if !self.terminated {
             self.builder.ins().jump(epilogue, &[]);
         }
@@ -2190,6 +2279,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         }
         let base = self.scratch_base + self.scratch_next;
         self.scratch_next = end;
+        self.scratch_peak = self.scratch_peak.max(end);
         Ok(base)
     }
 
@@ -2365,7 +2455,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     fn emit_jump_exc_target(&mut self, target: ExcTarget) -> Result<(), CodegenError> {
         match target {
             ExcTarget::Function => {
-                self.emit_handler_unwind(self.handler_base)?;
+                if self.needs_handler_unwind {
+                    self.emit_handler_unwind(self.handler_base)?;
+                }
                 let epilogue = self.epilogue.ok_or_else(|| {
                     CodegenError::new(
                         "internal error: exception target before epilogue was created",
@@ -2412,6 +2504,28 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         Ok(())
     }
 
+    /// Route a yield that reported the exceptional sentinel through the
+    /// current exception target without a separate pending-state runtime call.
+    fn emit_yield_error_check(&mut self, sent: Value) -> Result<Value, CodegenError> {
+        if self.terminated {
+            return Ok(sent);
+        }
+        let failed = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, sent, YIELD_ERROR_TAG);
+        let error = self.builder.create_block();
+        let continuation = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(failed, error, &[], continuation, &[]);
+        self.switch_to(error);
+        let target = self.exc_target;
+        self.emit_jump_exc_target(target)?;
+        self.switch_to(continuation);
+        Ok(sent)
+    }
+
     /// Clear the pending exception before transferring control out of a
     /// `finally` body (it suppresses an exception that was in flight).
     fn clear_pending(&mut self) -> Result<(), CodegenError> {
@@ -2442,7 +2556,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         if self.suppress_pending > 0 {
             self.clear_pending()?;
         }
-        self.emit_handler_unwind(self.handler_base)?;
+        if self.needs_handler_unwind {
+            self.emit_handler_unwind(self.handler_base)?;
+        }
         if let Some(id) = self.cleanups.last().copied() {
             let info = self.cleanup_info(id)?;
             // Entering for `return` without an in-flight exception.
@@ -2659,8 +2775,24 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     }
 
     fn set_line(&mut self, line: u32) -> Result<(), CodegenError> {
-        let value = self.builder.ins().iconst(types::I32, line as i64);
+        // The same static statement runs on every loop iteration. Only call
+        // the runtime when the source line actually changed; exceptions and
+        // `f_lineno` still observe the current line at every point.
+        let cached = self.builder.use_var(self.line_cache);
+        let changed = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::NotEqual, cached, i64::from(line));
+        let call = self.builder.create_block();
+        let after = self.builder.create_block();
+        self.builder.ins().brif(changed, call, &[], after, &[]);
+        self.switch_to(call);
+        let value = self.builder.ins().iconst(types::I32, i64::from(line));
         self.call_void(self.runtime.set_line, &[value]);
+        let line_value = self.builder.ins().iconst(types::I64, i64::from(line));
+        self.builder.def_var(self.line_cache, line_value);
+        self.jump(after);
+        self.switch_to(after);
         Ok(())
     }
 
@@ -2678,8 +2810,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     ///
     /// The slot base is the same shadow frame registered by
     /// `hydro_gc_frame_push`; the names blob is a NUL-separated UTF-8 list in
-    /// local-slot order. Both live in stack slots and are copied by the
-    /// runtime before this function returns.
+    /// local-slot order. Both live in stack slots for the activation's
+    /// lifetime and are only decoded if frame introspection materialises the
+    /// record.
     fn emit_frame_bind(&mut self) -> Result<(), CodegenError> {
         let mut names = Vec::new();
         for (index, local) in self.locals.iter().enumerate() {
@@ -3313,9 +3446,9 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let mark = self.scratch_mark();
                 self.scratch_push(value)?;
                 let id = self.runtime.yield_value;
-                self.call_rt(id, &[value])?;
+                let sent = self.call_rt(id, &[value])?;
                 self.scratch_release(mark)?;
-                self.emit_exc_check()?;
+                self.emit_yield_error_check(sent)?;
             }
             StmtKind::Raise { exc, msg, cause } => {
                 self.lower_raise(*exc, msg.as_ref(), cause.as_ref())?;
@@ -4841,8 +4974,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 let id = self.runtime.yield_value;
                 let sent = self.call_rt(id, &[value])?;
                 self.scratch_release(mark)?;
-                self.emit_exc_check()?;
-                Ok(sent)
+                self.emit_yield_error_check(sent)
             }
             ExprKind::YieldFrom { value } => {
                 let mark = self.scratch_mark();

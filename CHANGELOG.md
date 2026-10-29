@@ -14,10 +14,15 @@ initial state of the first runnable core.
   **3 passing** (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`),
   332 `hydro_fail`, 63 `expected_fail`, 0 timeouts. The import matrix is
   **128/297** modules.
-- Hydro micro suite rerun: 22 workloads pass; startup JIT/AOT 2.0/1.0 ms.
-  `bench_all.py --only hydro` medians: JIT 2.71×, AOT 5.27×, faster on 10/11
-  workloads. `sum_genexp` remains above the tracked regression threshold
-  (JIT 26.1 ms, AOT 19.4 ms vs CPython 12.4 ms), tracked under P5.
+- **Performance hot-path slice:** removed eager traceback-frame allocation
+  from every call, avoided `String`/`RwLock` registry lookups for scalar
+  arithmetic, and replaced per-yield root-vector/stack-bound transfers with
+  pointer/in-place switches. Isolated 1M-yield cost fell from 81.7 ms to
+  28.9 ms; `generator_sum` moved from 17.6/15.7 ms (JIT/AOT) to 7.4/5.8 ms.
+  Pinned `bench_hydro.py --repeat 9`: JIT 3.51×, AOT 5.45×, faster on all 11
+  workloads; generator_sum 5.08/4.71 ms vs CPython 9.46 ms, startup JIT/AOT
+  1.54/1.35 ms vs CPython 6.66 ms. Thresholds were tightened and pass 45/45
+  checks.
 - README/ARCHITECTURE/TODO/AGENTS no longer describe async generators,
   metaclasses, multiple inheritance, descriptors or vendored `enum.py` as
   absent/verbatim; corrected stale import/test counts, benchmark medians and

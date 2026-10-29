@@ -36,7 +36,6 @@
 use std::alloc::{self, Layout};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR};
@@ -239,49 +238,13 @@ fn context_root_ranges(state: &FiberState) -> [(usize, usize); 2] {
     [(ctx_lo, ctx_lo + size), (caller_lo, caller_lo + size)]
 }
 
-/// Conservative lower bound for the native caller's live stack while a fiber
-/// runs.
-///
-/// Reading `rsp` inside this (tiny) function yields an address below every
-/// live frame of the resumer, so scanning `[sp, native_high)` cannot miss a
-/// spill slot in the resume frame itself.
-#[cfg(target_arch = "x86_64")]
-fn caller_stack_low() -> usize {
-    let sp: usize;
-    // SAFETY: reads the stack pointer; touches no memory and preserves flags.
-    unsafe {
-        core::arch::asm!(
-            "mov {}, rsp",
-            out(reg) sp,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    sp
-}
-
-#[cfg(target_arch = "aarch64")]
-fn caller_stack_low() -> usize {
-    let sp: usize;
-    // SAFETY: reads the stack pointer; touches no memory and preserves flags.
-    unsafe {
-        core::arch::asm!(
-            "mov {}, sp",
-            out(reg) sp,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    sp
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn caller_stack_low() -> usize {
-    let marker: usize = 0;
-    &marker as *const usize as usize
-}
-
 /// Size of every fiber stack. Deep Python recursion inside a fiber is bounded
 /// by this; it matches the runtime's remaining recursion headroom assumption.
 pub(crate) const FIBER_STACK_SIZE: usize = 1024 * 1024;
+
+/// Not a valid tagged value. `yield_value` returns it when the suspension
+/// point raised (throw/close/cancellation); the pending exception is set.
+pub(crate) const YIELD_ERROR: i64 = 2;
 
 /// What a fiber object represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,29 +375,25 @@ pub(crate) struct FiberState {
     /// Monotonic completion order, used to report the first failing gather
     /// task.
     pub(crate) finish_seq: u64,
-    /// Precise shadow-stack roots of this fiber while it is suspended.
+    /// The detached precise root set for the inactive side of the switch.
     ///
-    /// Filled by [`suspend_switch`] and installed by [`resume_raw`]; the
-    /// collector can scan them through [`SavedRoots::frames`]/
-    /// [`SavedRoots::ranges`] while another context runs, and
-    /// [`FiberState::trace`]
-    /// marks them for the conservative collector.
+    /// While the fiber is suspended this holds the fiber's own frames; while
+    /// it runs the fiber's own roots are active and this field is selected by
+    /// the thread-local root pointer; the resumer's set is named by
+    /// `caller_roots_ptr`. The collector can always scan the inactive side
+    /// through [`SavedRoots::frames`]/[`SavedRoots::ranges`].
     pub(crate) saved_roots: SavedRoots,
-    /// Precise roots of the resumer while this fiber runs.
-    ///
-    /// Captured by [`resume_raw`] before the switch and installed again by
-    /// [`suspend_switch`]/[`finish_switch`], so the caller's frames stay
-    /// scannable while its native stack is inactive.
-    pub(crate) caller_roots: SavedRoots,
-    /// Frame-introspection records of this fiber while it is suspended.
+    /// Root set of the resumer while this fiber runs (null while suspended).
+    caller_roots_ptr: *mut SavedRoots,
+    /// Activation records of this fiber while it is suspended.
     ///
     /// Python frames are thread state, not process state; a suspended fiber's
     /// activations must not appear on the resumer's stack. The records are
     /// swapped exactly like [`FiberState::saved_roots`], so `f_back` chains and
-    /// `sys._getframe` depths stay within the context that is running.
-    pub(crate) saved_frames: Vec<Arc<exc::FrameData>>,
-    /// Frame records of the resumer while this fiber runs.
-    pub(crate) caller_frames: Vec<Arc<exc::FrameData>>,
+    /// `sys._getframe` depths stay within the context that is running. A
+    /// record carries the introspection data it materialised, so a retained
+    /// frame object of the suspended fiber keeps working.
+    pub(crate) saved_frames: Vec<exc::Activation>,
 }
 
 impl FiberState {
@@ -482,9 +441,8 @@ impl FiberState {
             caller_ctx_root_hi: 0,
             finish_seq: 0,
             saved_roots: SavedRoots::default(),
-            caller_roots: SavedRoots::default(),
+            caller_roots_ptr: std::ptr::null_mut(),
             saved_frames: Vec::new(),
-            caller_frames: Vec::new(),
         });
         // The three ranges stay valid until `Drop`; registering them once
         // keeps the per-resume path free of global-registry work.
@@ -496,15 +454,23 @@ impl FiberState {
         crate::heap::register_suspended_stack(stack_lo, stack_hi);
         crate::heap::register_suspended_stack(ctx_lo, ctx_hi);
         crate::heap::register_suspended_stack(caller_lo, caller_hi);
+        // The outermost caller's native stack is a lifetime root of every
+        // fiber on this thread. Publishing the whole stack once keeps the
+        // resume path free of an aux-range TLS check.
+        if !crate::heap::aux_stack_published() {
+            if let Some((low, high)) = crate::heap::native_stack_bounds_cached() {
+                crate::heap::set_aux_stack(low, high, 0, 0);
+            }
+        }
         Some(state)
     }
 
     /// Marks the values owned by this object. The fiber stack and the two
     /// register contexts are scanned separately by the collector.
     ///
-    /// The precise shadow roots are marked too: while a fiber is suspended
-    /// they are its only record of the values on its stack, and while it runs
-    /// `caller_roots` pins the resumer's frames.
+    /// The detached root set is marked too: while a fiber is suspended it
+    /// holds the fiber's own roots; while it runs it pins the resumer's
+    /// frames.
     pub(crate) fn trace(&self, mark: fn(i64)) {
         for &arg in &self.args {
             mark(arg);
@@ -526,7 +492,13 @@ impl FiberState {
             }
         }
         roots::mark_precise(self.saved_roots.frames(), self.saved_roots.ranges(), mark);
-        roots::mark_precise(self.caller_roots.frames(), self.caller_roots.ranges(), mark);
+        if !self.caller_roots_ptr.is_null() {
+            // SAFETY: non-null means this fiber currently runs on its owning
+            // thread, so the resumer's root set is alive. The collector only
+            // dereferences it while that thread is stopped.
+            let caller = unsafe { &*self.caller_roots_ptr };
+            roots::mark_precise(caller.frames(), caller.ranges(), mark);
+        }
     }
 }
 
@@ -536,7 +508,6 @@ impl Drop for FiberState {
         // freed. `clear` only drops the vectors: it never dereferences a slot,
         // so a stale frame on a dead fiber stack cannot be scanned here.
         self.saved_roots.clear();
-        self.caller_roots.clear();
         // The lifetime root ranges must be gone before the stack and the
         // contexts are freed.
         crate::heap::unregister_suspended_stack(self.stack_root_lo, self.stack_root_hi);
@@ -648,18 +619,16 @@ unsafe fn finish_switch(ptr: *mut FiberState) {
     // SAFETY: caller contract; this fiber owns its stack and is running on it.
     unsafe {
         (*ptr).running = false;
-        crate::heap::pop_stack_bounds();
         // The body returned: its precise roots die with this frame. Drop the
         // active set (without scanning it) and make the resumer's roots
         // current again before its native context becomes reachable.
-        (*ptr).await_depth = AWAIT_DEPTH.with(Cell::get);
-        let _ = roots::take_current();
-        let caller = std::mem::take(&mut (*ptr).caller_roots);
-        let _ = roots::install(caller);
+        if (*ptr).kind != FiberKind::Generator {
+            (*ptr).await_depth = AWAIT_DEPTH.with(Cell::get);
+        }
+        roots::switch_back((*ptr).caller_roots_ptr);
+        (*ptr).caller_roots_ptr = std::ptr::null_mut();
         // The fiber's activations are dead with its stack; restore the
         // resumer's frame stack before its native context runs again.
-        let _ = exc::take_frames();
-        exc::install_frames(std::mem::take(&mut (*ptr).caller_frames));
         // The context must never be resumed once the body returned. Save the
         // fiber's (dead) continuation into its own slot and switch to the
         // resumer (`caller_ctx`).
@@ -682,18 +651,13 @@ unsafe fn suspend_switch(ptr: *mut FiberState) {
     // SAFETY: caller contract; this fiber owns its stack and is running on it.
     unsafe {
         (*ptr).running = false;
-        crate::heap::pop_stack_bounds();
         // Park this fiber's precise roots in the fiber object, where the
-        // collector can still find them, and restore the resumer's set. Both
-        // operations only move vectors; no snapshot or lock is taken.
-        (*ptr).await_depth = AWAIT_DEPTH.with(Cell::get);
-        (*ptr).saved_roots = roots::take_current();
-        let caller = std::mem::take(&mut (*ptr).caller_roots);
-        let _ = roots::install(caller);
-        // Park this fiber's frame records where a retained frame object can
-        // still reach them, and make the resumer's stack current again.
-        (*ptr).saved_frames = exc::take_frames();
-        exc::install_frames(std::mem::take(&mut (*ptr).caller_frames));
+        // collector can still find them, and restore the resumer's set.
+        if (*ptr).kind != FiberKind::Generator {
+            (*ptr).await_depth = AWAIT_DEPTH.with(Cell::get);
+        }
+        roots::switch_back((*ptr).caller_roots_ptr);
+        (*ptr).caller_roots_ptr = std::ptr::null_mut();
         // Save the fiber's continuation into `ctx` and switch back to the
         // resumer (`caller_ctx`).
         switch_from_fiber(ptr);
@@ -716,63 +680,43 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
             // Defensive: a fiber cannot be resumed while it runs.
             return false;
         }
-        // The switch itself saves the caller's callee-saved registers into
-        // `caller_ctx` and its stack frames stay on the native stack. Both
-        // are published for the outermost resume; a nested caller is a fiber
-        // whose lifetime stack and context ranges are already registered.
-        let outermost = CURRENT.with(Cell::get).is_none();
-        let mut aux_published = false;
-        if outermost {
-            let caller_lo = caller_stack_low();
-            let caller_hi = crate::heap::stack_bounds()
-                .map(|(_, high)| high)
-                .unwrap_or(caller_lo);
-            if caller_hi > caller_lo {
-                // Cover the native caller frames and, as a second range, the
-                // resumer context the upcoming switch is about to fill with
-                // the caller's callee-saved registers.
-                crate::heap::set_aux_stack(
-                    caller_lo,
-                    caller_hi,
-                    (*ptr).caller_ctx_root_lo,
-                    (*ptr).caller_ctx_root_hi,
-                );
-                aux_published = true;
-            }
-        }
+        // The native caller stack and the fiber's own stack/context ranges
+        // are lifetime roots published at fiber creation.
         (*ptr).started = true;
         (*ptr).sent = value;
         (*ptr).running = true;
-        crate::heap::push_stack_bounds((*ptr).stack.low(), (*ptr).stack.high());
         // Save the resumer's await-chain depth and install the callee's. A
         // fresh fiber starts at the resumer's depth (it is being awaited),
-        // while a scheduler-resumed task uses its own saved depth.
-        let resume_depth = AWAIT_DEPTH.with(Cell::get);
-        let callee_depth = (*ptr).await_depth.max(resume_depth);
-        AWAIT_DEPTH.with(|cell| cell.set(callee_depth));
+        // while a scheduler-resumed task uses its own saved depth. Plain
+        // generators do not participate in await-chain accounting.
+        let resume_depth = if (*ptr).kind == FiberKind::Generator {
+            0
+        } else {
+            let depth = AWAIT_DEPTH.with(Cell::get);
+            let callee_depth = (*ptr).await_depth.max(depth);
+            AWAIT_DEPTH.with(|cell| cell.set(callee_depth));
+            depth
+        };
         // Save the resumer's precise roots in the fiber object and install
         // this fiber's set (empty on the first resume, restored after a
         // suspension). The resumer's roots stay scannable there while its
         // native stack is inactive.
-        (*ptr).caller_roots = roots::take_current();
-        let _ = roots::install(std::mem::take(&mut (*ptr).saved_roots));
+        (*ptr).caller_roots_ptr = roots::switch_to(&mut (*ptr).saved_roots);
         // Frame records follow the same split: `sys._getframe` inside the
-        // fiber must not observe the resumer's activations.
-        (*ptr).caller_frames = exc::take_frames();
-        exc::install_frames(std::mem::take(&mut (*ptr).saved_frames));
+        // fiber must not observe the resumer's activations. Frame operations
+        // route through `CURRENT`, which is switched below.
         let outer = CURRENT.with(|cell| cell.replace(Some(CurrentFiber { ptr, value })));
         // Resume: save the caller's continuation into `caller_ctx` and switch
         // to the fiber's `ctx` (the trampoline entry on first resume, the
         // suspension point afterwards).
         switch_to_fiber(ptr);
         CURRENT.with(|cell| cell.set(outer));
-        AWAIT_DEPTH.with(|cell| cell.set(resume_depth));
+        if (*ptr).kind != FiberKind::Generator {
+            AWAIT_DEPTH.with(|cell| cell.set(resume_depth));
+        }
         (*ptr).running = false;
         // The suspension/finish path restored the caller's stack bounds
         // before switching back.
-        if aux_published {
-            crate::heap::clear_aux_stack();
-        }
         (*ptr).done
     }
 }
@@ -843,7 +787,12 @@ pub(crate) fn current_value() -> Option<i64> {
     CURRENT.with(Cell::get).map(|current| current.value)
 }
 
-fn current_ptr() -> Option<*mut FiberState> {
+/// Private stack bounds of the fiber running on this thread, if any.
+pub(crate) fn current_stack_bounds() -> Option<(usize, usize)> {
+    current_ptr().map(|ptr| unsafe { ((*ptr).stack.low(), (*ptr).stack.high()) })
+}
+
+pub(crate) fn current_ptr() -> Option<*mut FiberState> {
     CURRENT.with(Cell::get).map(|current| current.ptr)
 }
 
@@ -892,13 +841,34 @@ pub(crate) fn suspend_current(request: Option<WaitRequest>) -> i64 {
 /// `hydro_yield`: stores `value` as the yielded value and suspends the running
 /// generator. Outside a running generator this raises `RuntimeError`.
 pub(crate) fn yield_value(value: i64) -> i64 {
+    yield_value_impl(value).0
+}
+
+/// Variant for generated code: returns [`YIELD_ERROR`] on the exceptional
+/// path so the caller can branch without a second pending-state query.
+pub(crate) fn yield_value_checked(value: i64) -> i64 {
+    let (sent, failed) = yield_value_impl(value);
+    if failed {
+        YIELD_ERROR
+    } else {
+        sent
+    }
+}
+
+fn yield_value_impl(value: i64) -> (i64, bool) {
     let Some(ptr) = current_ptr() else {
-        return exc::raise_with_message(RUNTIME_ERROR, "'yield' outside of a generator");
+        return (
+            exc::raise_with_message(RUNTIME_ERROR, "'yield' outside of a generator"),
+            true,
+        );
     };
     // SAFETY: `ptr` is the running fiber installed by `resume_raw`.
     let kind = unsafe { (*ptr).kind };
     if !matches!(kind, FiberKind::Generator | FiberKind::AsyncGenerator) {
-        return exc::raise_with_message(RUNTIME_ERROR, "'yield' outside of a generator");
+        return (
+            exc::raise_with_message(RUNTIME_ERROR, "'yield' outside of a generator"),
+            true,
+        );
     }
     unsafe {
         (*ptr).yielded = value;
@@ -908,15 +878,17 @@ pub(crate) fn yield_value(value: i64) -> i64 {
         // cancellation is raised at the suspension point, so codegen routes
         // it through the generator's handlers and `finally` blocks.
         if let Some(injected) = take_suspension_raise(ptr) {
-            return raise_detached(injected);
+            raise_detached(injected);
+            return (NONE, true);
         }
         // `close()` resumed this generator after injecting `GeneratorExit`;
         // a further yield means the body ignored it.
         if (*ptr).closing {
-            return exc::raise_with_message(RUNTIME_ERROR, "generator ignored GeneratorExit");
+            exc::raise_with_message(RUNTIME_ERROR, "generator ignored GeneratorExit");
+            return (NONE, true);
         }
         // The value passed to the resume that continued this generator.
-        (*ptr).sent
+        ((*ptr).sent, false)
     }
 }
 

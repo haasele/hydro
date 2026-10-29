@@ -94,10 +94,11 @@ Other docs must link here instead of repeating the total.
   pinned-wheel link-time symbol set work. Full ABI behavior/GIL/ecosystem
   suites remain open.
 - **Benchmarks:** default-GC micro suite (2026-10-29) passes all 22 workloads
-  plus startup: hello JIT/AOT 1.62/0.89 ms, while_sum 3.42/2.03 ms,
-  math_loop 4.81/3.36 ms, async_gather 24.10/21.55 ms; generator_sum remains
-  slower than CPython (JIT/AOT 17.63/15.72 ms vs 12.03 ms). `bench_all.py
-  --only hydro` medians: JIT 2.71×, AOT 5.27×, faster on 10/11 workloads.
+  plus startup: hello JIT/AOT 1.54/1.35 ms, while_sum 4.28/1.83 ms,
+  math_loop 3.28/1.58 ms, async_gather 24.08/22.37 ms; generator_sum is now
+  faster than CPython (JIT/AOT 5.08/4.71 ms vs 9.46 ms). Pinned
+  `bench_hydro.py --repeat 9` medians: JIT 3.51×, AOT 5.45×, faster on 11/11
+  workloads.
 
 ### Known limits (details in `docs/TODO.md` / `ARCHITECTURE.md` §10)
 
@@ -106,8 +107,9 @@ Other docs must link here instead of repeating the total.
   Native Rust owners must still root tagged locals explicitly.
 - Async generators/comprehensions, `async for`/`async with`, cancellation,
   `TaskGroup`, `ExceptionGroup` and `wait_for` are implemented; the wider
-  `asyncio` API remains open. Generator expressions are lazy; root-heavy
-  generator resumes are the current performance weak spot.
+  `asyncio` API remains open. Generator expressions are lazy; generator
+  resumes remain the narrowest compute result but are now faster than CPython
+  (P5 focuses on PGO/inlining).
 - Full CPython stdlib/P7 parity, C extensions/full ABI behavior, and the
   ecosystem suites remain open; 128/297 stdlib modules import.
 - Imports: packages, dotted/relative imports, site-packages and vendored
@@ -134,9 +136,8 @@ Other docs must link here instead of repeating the total.
    `Lib/test` subsets, then the dependency-ordered remaining batches.
 2. **P4:** P4-04c/d full ABI/GIL, P4-05 wheel install, P4-06 `ctypes`/`cffi`,
    then ecosystem suites/benchmarks (P4-10/P4-11).
-3. **P5:** recover the generator-resume root-frame overhead (default-GC
-   `generator_sum` is currently slower than CPython), then PGO/inlining and
-   threshold tuning.
+3. **P5:** generator resume is now faster than CPython; continue with
+   PGO/inlining and threshold tuning.
 4. **P3:** uv interpreter injection, reproducible builds (P3-05), packaging
    (P3-08).
 5. **P6:** troubleshooting/migration docs (P6-09), progress/exit summary

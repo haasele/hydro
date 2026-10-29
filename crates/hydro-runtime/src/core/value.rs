@@ -2411,8 +2411,8 @@ impl Drop for ExtObjectData {
 
 /// Payload of a reified frame ([`KIND_FRAME`]).
 ///
-/// The activation record is shared (`Arc`) with the runtime's frame stack and
-/// with every other frame object materialised for the same activation, so
+/// The introspection record is shared (`Arc`) with the activation that owns it
+/// and with every other frame object materialised for the same activation, so
 /// `f_back` chains stay valid after a frame returns while its locals finish as
 /// a snapshot. The record owns no Hydro values directly: `f_locals` reads the
 /// activation's precise GC slots, and an ended activation stores a rooted dict

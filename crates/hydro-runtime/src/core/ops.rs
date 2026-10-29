@@ -136,6 +136,9 @@ fn to_f64(n: Num) -> f64 {
 /// `(real, imag)` pair for a complex arithmetic operand pair, or `None` when
 /// neither operand is a complex value and the ordinary numeric path applies.
 fn complex_operands(a: i64, b: i64) -> Option<((f64, f64), (f64, f64))> {
+    if value::as_instance(a).is_none() && value::as_instance(b).is_none() {
+        return None;
+    }
     if !builtins::is_complex_instance(a) && !builtins::is_complex_instance(b) {
         return None;
     }
@@ -582,14 +585,18 @@ pub(crate) fn instance_method_call(instance: i64, name: &str, args: &[i64]) -> O
 /// numeric promotion, container concatenation). The string accumulator's
 /// generic path reuses it so `s += value` behaves exactly like `s + value`.
 pub(crate) fn add(a: i64, b: i64) -> i64 {
-    if let Some(result) = instance_dunder_binop(a, b, "__add__", "__radd__") {
-        // Both dunders declined: Python's operator protocol raises instead of
-        // leaking the `NotImplemented` singleton to user code.
-        return if result == value::NOT_IMPLEMENTED && !exc::pending() {
-            arithmetic_type_error("+", a, b)
-        } else {
-            result
-        };
+    // Only heap instances can define `__add__`/`__radd__`; skip the method
+    // lookup for the scalar/container fast paths entirely.
+    if value::as_instance(a).is_some() || value::as_instance(b).is_some() {
+        if let Some(result) = instance_dunder_binop(a, b, "__add__", "__radd__") {
+            // Both dunders declined: Python's operator protocol raises instead of
+            // leaking the `NotImplemented` singleton to user code.
+            return if result == value::NOT_IMPLEMENTED && !exc::pending() {
+                arithmetic_type_error("+", a, b)
+            } else {
+                result
+            };
+        }
     }
     if let Some(((ar, ai), (br, bi))) = complex_operands(a, b) {
         return builtins::build_complex(ar + br, ai + bi);

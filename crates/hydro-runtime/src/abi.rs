@@ -850,6 +850,17 @@ pub extern "C" fn hydro_yield(value: i64) -> i64 {
     fiber::yield_value(value)
 }
 
+/// `hydro_yield` for generated code.
+///
+/// Returns [`fiber::YIELD_ERROR`] (not a valid tagged value) when the
+/// suspension point raised. Generated code branches on it instead of making
+/// a separate `hydro_exc_pending` call at every yield; the pending exception
+/// remains the authoritative state.
+#[no_mangle]
+pub extern "C" fn hydro_yield_checked(value: i64) -> i64 {
+    fiber::yield_value_checked(value)
+}
+
 /// `yield from value`: delegates iteration to `value`. Each delegated item is
 /// yielded through the running generator; `send` values, `throw` exceptions
 /// and `close` are forwarded to a delegated generator. Returns the delegate's

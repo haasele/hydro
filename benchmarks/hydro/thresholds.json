@@ -12,239 +12,235 @@
     "threads_serial": 3.0
   },
   "floor_ms": 2.0,
-  "generated": "2026-10-24 15:45:52",
+  "generated": "2026-10-29 01:58:53",
   "note": "Generated from the Hydro micro-benchmark baseline. max_ms is the allowed median for a failing run; regenerate with `python3 scripts/check_benchmarks.py --update`.",
   "schema": 1,
   "source": "benchmarks/hydro/results/latest.json",
   "workloads": {
     "dict_insert": {
       "hydro-aot": {
-        "baseline_ms": 58.158,
-        "max_ms": 101.777
+        "baseline_ms": 1.63,
+        "max_ms": 3.63
       },
       "hydro-jit": {
-        "baseline_ms": 68.629,
-        "max_ms": 120.1
+        "baseline_ms": 2.893,
+        "max_ms": 5.063
       }
     },
     "filter_comp": {
       "hydro-aot": {
-        "baseline_ms": 10.421,
-        "max_ms": 18.236
+        "baseline_ms": 4.039,
+        "max_ms": 7.068
       },
       "hydro-jit": {
-        "baseline_ms": 12.458,
-        "max_ms": 21.802
+        "baseline_ms": 6.273,
+        "max_ms": 10.977
       }
     },
     "filter_lambda": {
       "hydro-aot": {
-        "baseline_ms": 16.968,
-        "max_ms": 29.693
+        "baseline_ms": 10.447,
+        "max_ms": 18.281
       },
       "hydro-jit": {
-        "baseline_ms": 17.116,
-        "max_ms": 29.954
+        "baseline_ms": 13.655,
+        "max_ms": 23.896
       }
     },
     "for_sum": {
       "hydro-aot": {
-        "baseline_ms": 14.367,
-        "max_ms": 25.143
+        "baseline_ms": 2.015,
+        "max_ms": 4.015
       },
       "hydro-jit": {
-        "baseline_ms": 17.766,
-        "max_ms": 31.09
+        "baseline_ms": 3.265,
+        "max_ms": 5.714
       }
     },
     "json_dumps": {
       "hydro-aot": {
-        "baseline_ms": 3.538,
-        "max_ms": 7.076
+        "baseline_ms": 2.292,
+        "max_ms": 4.584
       },
       "hydro-jit": {
-        "baseline_ms": 5.978,
-        "max_ms": 11.955
+        "baseline_ms": 3.815,
+        "max_ms": 7.631
       }
     },
     "json_loads": {
       "hydro-aot": {
-        "baseline_ms": 3.822,
-        "max_ms": 7.643
+        "baseline_ms": 2.25,
+        "max_ms": 4.5
       },
       "hydro-jit": {
-        "baseline_ms": 6.18,
-        "max_ms": 12.359
+        "baseline_ms": 3.918,
+        "max_ms": 7.836
       }
     },
     "lambda_call": {
       "hydro-aot": {
-        "baseline_ms": 15.995,
-        "max_ms": 27.991
+        "baseline_ms": 11.247,
+        "max_ms": 19.682
       },
       "hydro-jit": {
-        "baseline_ms": 19.532,
-        "max_ms": 34.18
+        "baseline_ms": 14.917,
+        "max_ms": 26.105
       }
     },
     "list_append": {
       "hydro-aot": {
-        "baseline_ms": 16.59,
-        "max_ms": 29.032
+        "baseline_ms": 6.091,
+        "max_ms": 10.66
       },
       "hydro-jit": {
-        "baseline_ms": 18.78,
-        "max_ms": 32.865
+        "baseline_ms": 9.33,
+        "max_ms": 16.327
       }
     },
     "list_comp": {
       "hydro-aot": {
-        "baseline_ms": 7.653,
-        "max_ms": 13.393
+        "baseline_ms": 2.858,
+        "max_ms": 5.002
       },
       "hydro-jit": {
-        "baseline_ms": 11.235,
-        "max_ms": 19.662
+        "baseline_ms": 5.304,
+        "max_ms": 9.283
       }
     },
     "map_lambda": {
       "hydro-aot": {
-        "baseline_ms": 14.912,
-        "max_ms": 26.096
+        "baseline_ms": 11.007,
+        "max_ms": 19.262
       },
       "hydro-jit": {
-        "baseline_ms": 16.714,
-        "max_ms": 29.249
+        "baseline_ms": 13.774,
+        "max_ms": 24.104
       }
     },
     "math_loop": {
       "hydro-aot": {
-        "baseline_ms": 25.673,
-        "max_ms": 44.927
+        "baseline_ms": 1.491,
+        "max_ms": 3.491
       },
       "hydro-jit": {
-        "baseline_ms": 25.3,
-        "max_ms": 44.276
+        "baseline_ms": 2.953,
+        "max_ms": 5.167
       }
     },
     "pool_map": {
       "hydro-aot": {
-        "baseline_ms": 7.312,
-        "max_ms": 21.936
+        "baseline_ms": 3.306,
+        "max_ms": 9.917
       },
       "hydro-jit": {
-        "baseline_ms": 11.495,
-        "max_ms": 34.486
+        "baseline_ms": 6.675,
+        "max_ms": 20.026
       }
     },
     "pool_parallel": {
       "hydro-aot": {
-        "baseline_ms": 15.194,
-        "max_ms": 45.581
+        "baseline_ms": 5.719,
+        "max_ms": 17.157
       },
       "hydro-jit": {
-        "baseline_ms": 18.63,
-        "max_ms": 55.891
+        "baseline_ms": 9.436,
+        "max_ms": 28.308
       }
     },
     "pool_serial": {
       "hydro-aot": {
-        "baseline_ms": 50.51,
-        "max_ms": 151.529
+        "baseline_ms": 11.715,
+        "max_ms": 35.144
       },
       "hydro-jit": {
-        "baseline_ms": 51.654,
-        "max_ms": 154.963
+        "baseline_ms": 15.703,
+        "max_ms": 47.109
       }
     },
     "process_queue": {
       "hydro-aot": {
-        "baseline_ms": 14.627,
-        "max_ms": 43.881
+        "baseline_ms": 3.992,
+        "max_ms": 11.977
       },
       "hydro-jit": {
-        "baseline_ms": 19.666,
-        "max_ms": 58.998
+        "baseline_ms": 8.129,
+        "max_ms": 24.387
       }
     },
     "range_sum": {
       "hydro-aot": {
-        "baseline_ms": 8.483,
-        "max_ms": 14.846
+        "baseline_ms": 3.342,
+        "max_ms": 5.848
       },
       "hydro-jit": {
-        "baseline_ms": 10.039,
-        "max_ms": 17.568
+        "baseline_ms": 6.375,
+        "max_ms": 11.156
       }
     },
     "reduce_add": {
       "hydro-aot": {
-        "baseline_ms": 7.144,
-        "max_ms": 12.503
+        "baseline_ms": 3.291,
+        "max_ms": 5.759
       },
       "hydro-jit": {
-        "baseline_ms": 9.917,
-        "max_ms": 17.355
+        "baseline_ms": 5.512,
+        "max_ms": 9.646
       }
     },
     "startup_hello": {
-      "hydro-aot": {
-        "baseline_ms": 1.71,
-        "max_ms": 6.841
-      },
       "hydro-jit": {
-        "baseline_ms": 3.06,
-        "max_ms": 12.24
+        "baseline_ms": 1.967,
+        "max_ms": 7.869
       }
     },
     "string_concat": {
       "hydro-aot": {
-        "baseline_ms": 12.953,
-        "max_ms": 22.667
+        "baseline_ms": 1.866,
+        "max_ms": 3.866
       },
       "hydro-jit": {
-        "baseline_ms": 17.055,
-        "max_ms": 29.846
+        "baseline_ms": 2.899,
+        "max_ms": 5.073
       }
     },
     "sum_genexp": {
       "hydro-aot": {
-        "baseline_ms": 8.645,
-        "max_ms": 15.129
+        "baseline_ms": 7.33,
+        "max_ms": 12.828
       },
       "hydro-jit": {
-        "baseline_ms": 12.955,
-        "max_ms": 22.67
+        "baseline_ms": 9.349,
+        "max_ms": 16.361
       }
     },
     "threads_parallel": {
       "hydro-aot": {
-        "baseline_ms": 12.037,
-        "max_ms": 36.112
+        "baseline_ms": 4.54,
+        "max_ms": 13.621
       },
       "hydro-jit": {
-        "baseline_ms": 18.657,
-        "max_ms": 55.97
+        "baseline_ms": 9.288,
+        "max_ms": 27.863
       }
     },
     "threads_serial": {
       "hydro-aot": {
-        "baseline_ms": 33.338,
-        "max_ms": 100.015
+        "baseline_ms": 7.236,
+        "max_ms": 21.708
       },
       "hydro-jit": {
-        "baseline_ms": 40.37,
-        "max_ms": 121.109
+        "baseline_ms": 10.042,
+        "max_ms": 30.126
       }
     },
     "while_sum": {
       "hydro-aot": {
-        "baseline_ms": 10.446,
-        "max_ms": 18.281
+        "baseline_ms": 2.569,
+        "max_ms": 4.569
       },
       "hydro-jit": {
-        "baseline_ms": 13.064,
-        "max_ms": 22.862
+        "baseline_ms": 4.562,
+        "max_ms": 7.984
       }
     }
   }
