@@ -3680,6 +3680,27 @@ pub static MMAP: ModuleSpec = ModuleSpec {
     ],
 };
 
+/// `http`: native HTTP/1.1 server used by the benchmark app.
+///
+/// `serve(port, routes, handler, max_connections)` binds a listener and blocks
+/// for the process lifetime. `routes` is a `dict[str, bytes]` keyed by
+/// `"METHOD /path"`; a matching request is answered from native memory without
+/// a Python call. Every other request is passed to `handler(method, path, body)`,
+/// which must return the complete response bytes. Parameter names are
+/// declared so the usual keyword spelling (`http.serve(port=..., ...)`)
+/// lowers to the same positional native call.
+pub static HTTP: ModuleSpec = ModuleSpec {
+    name: "http",
+    functions: &[kw(
+        "serve",
+        4,
+        4,
+        Type::None,
+        &["port", "routes", "handler", "max_connections"],
+    )],
+    constants: &[],
+};
+
 /// `inspect`: native introspection over the runtime's function/class/module
 /// representations.
 ///

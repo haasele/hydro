@@ -53,6 +53,7 @@ pub(crate) mod future;
 pub(crate) mod gc;
 pub(crate) mod getopt;
 pub(crate) mod heapq;
+pub(crate) mod http;
 pub(crate) mod imp;
 pub(crate) mod importlib;
 pub(crate) mod importlib_machinery;
@@ -2412,6 +2413,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "multiprocessing" => multiprocessing_call(function, args),
         "pickle" => pickle_call(function, args),
         "html" => html_call(function, args),
+        "http" => http::call(function, args),
         "json" => json_call(function, args),
         "csv" => csv_call(function, args),
         "io" | "_io" => io_call(function, args),

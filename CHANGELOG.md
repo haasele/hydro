@@ -8,6 +8,19 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Performance — 2026-10-29 native HTTP fast path
+
+- Added native Rust `http.serve(port, routes, handler, max_connections)`:
+  static GET responses are served entirely in Rust; dynamic requests call a
+  Python bytes handler. Keep-alive/pipelining, Content-Length, query-stripped
+  route matching, bounded native connection workers, and GC-rooted handler
+  arguments/results are supported.
+- Benchmark impact: Hydro GET capacity rose from ~7k to **~52k req/s**;
+  capped 10k GET is p50 0.08 ms / p99 0.61 ms at 0.20 CPU cores. POST remains
+  bounded by the pooled Python Postgres/Memcached client.
+- Added native parser regression tests; workspace total is now 2311 tests
+  (2310 run, 1 skipped).
+
 ### Performance — 2026-10-29 shared-heap allocation lock
 
 - Shared-mode allocation now takes the heap lock once for both the collection

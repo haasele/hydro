@@ -192,6 +192,7 @@ pub static MODULES: &[&ModuleSpec] = &[
     &UNICODEDATA,
     &ZLIB,
     &MMAP,
+    &HTTP,
 ];
 
 pub fn module(name: &str) -> Option<&'static ModuleSpec> {
