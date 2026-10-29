@@ -8,6 +8,17 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Performance — 2026-10-29 shared-heap allocation lock
+
+- Shared-mode allocation now takes the heap lock once for both the collection
+  policy check and object registration (was two lock turns per object).
+- Objects born grey during concurrent marking are queued on the worklist after
+  the heap lock is released; the heap and worklist mutexes are no longer
+  nested on the allocation path.
+- Profiling the 256-thread HTTP benchmark showed ~40% mutex contention and
+  ~15% allocation; the combined app/runtime changes raised Hydro GET capacity
+  from 6.5–7k to 20–22k req/s at 10k capped p99 ~1.4 ms.
+
 ### Changed — 2026-10-29 full compatibility and benchmark refresh
 
 - Full CPython 3.14.9 `Lib/test` differential run (398 tests, 742.6 s):

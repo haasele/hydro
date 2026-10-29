@@ -576,21 +576,31 @@ fn clear_local_worklist() {
     LOCAL_WORKLIST.with(|worklist| worklist.borrow_mut().clear());
 }
 
-/// Moves a white object to grey and queues it. Idempotent: grey and black
-/// objects are left alone.
-fn mark_grey(addr: usize) {
+/// Moves a white object to grey without queueing it.
+///
+/// Returns `true` when this call performed the transition; the caller then
+/// owes the object exactly one worklist push. Splitting the colour change from
+/// the push lets [`register_box_locked`] queue a freshly registered object
+/// after it released the heap lock, so the two hottest mutexes are never held
+/// at the same time.
+#[inline]
+fn mark_grey_unqueued(addr: usize) -> bool {
     // SAFETY: callers only pass addresses of live registered objects (roots
     // validated against the address index, children read from live payloads,
     // fresh allocations). No object is freed while marking is in progress.
     unsafe {
-        let obj = &*(addr as *const HydroObj);
-        if obj
+        (&*(addr as *const HydroObj))
             .marked
             .compare_exchange(WHITE, GREY, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-        {
-            push_work(addr);
-        }
+    }
+}
+
+/// Moves a white object to grey and queues it. Idempotent: grey and black
+/// objects are left alone.
+fn mark_grey(addr: usize) {
+    if mark_grey_unqueued(addr) {
+        push_work(addr);
     }
 }
 
@@ -1842,25 +1852,39 @@ pub(crate) fn precise_enabled() -> bool {
 /// Allocates a heap object, registers it and returns its tagged value.
 ///
 /// In shared mode the caller first reaches a safepoint (so it can be parked
-/// by a concurrent collector), then checks the collection policy under a
-/// short heap lock. If collection is due, the heap lock is released and the
-/// collection runs *before* the new object exists, so the sweep can never
-/// observe an unreferenced half-created object. The object is then created
-/// and registered under the heap lock.
+/// by a concurrent collector), then takes the heap lock **once** for both the
+/// collection policy check and the registration. Only when a collection is
+/// due is the lock released first: the collection then runs *before* the new
+/// object exists, so the sweep can never observe an unreferenced half-created
+/// object, and the lock is re-acquired afterwards to register.
+///
+/// An object born grey during a concurrent mark is queued on the worklist
+/// *after* the heap lock is released. Queueing is a notification, not state
+/// the sweep reads: the object is already registered and grey, and the final
+/// rescan re-queues every grey object a race could have left unqueued. So the
+/// hottest lock never waits on the worklist lock.
 pub(crate) fn allocate(kind: u32, data: ObjData) -> i64 {
     if shared() {
         safepoint();
-        let due = lock_global().collection_due();
-        if due {
+        let mut heap = lock_global();
+        if heap.collection_due() {
+            // The collector takes the heap lock itself (registry snapshots,
+            // sweep partition), so it can never run under this guard.
+            drop(heap);
             // Another collector may be running; it then skips (returns 0),
             // which is fine: that collector will reclaim the garbage.
             let _ = collect_shared(None);
             // A collection may have started between the policy check and the
             // allocation; park before touching the heap again.
             safepoint();
+            heap = lock_global();
         }
-        let mut heap = lock_global();
-        register_box(&mut heap, kind, data)
+        let (tagged, pending) = register_box_locked(&mut heap, kind, data);
+        drop(heap);
+        if let Some(addr) = pending {
+            push_work(addr);
+        }
+        tagged
     } else {
         HEAP.with(|cell| {
             let mut heap = cell.borrow_mut();
@@ -1881,8 +1905,37 @@ pub(crate) fn allocate(kind: u32, data: ObjData) -> i64 {
 ///
 /// While a concurrent mark is in progress the fresh object is born grey and
 /// queued: it may already have children (e.g. a list filled right after
-/// creation) and the marker must not sweep it before they are traced.
+/// creation) and the marker must not sweep it before they are traced. Used by
+/// the thread-local heap and by the tests, where the queueing lock hand-off
+/// costs nothing; [`allocate`] uses [`register_box_locked`] instead and
+/// queues after releasing the heap lock.
 fn register_box(heap: &mut HeapState, kind: u32, data: ObjData) -> i64 {
+    let (tagged, pending) = register_box_locked(heap, kind, data);
+    if let Some(addr) = pending {
+        push_work(addr);
+    }
+    tagged
+}
+
+/// Registers one object and reports whether it must be queued on the worklist.
+///
+/// Returns the tagged value and, when a concurrent mark is running, the
+/// address the caller must hand to [`push_work`] **after** releasing `heap`;
+/// `heap` must therefore be the caller's live guard. Holding the guard across
+/// the pool insertion, the registry append and the address-index insert makes
+/// the whole registration atomic with respect to the collector:
+///
+/// * the object is in `objects` and `addresses` before its tagged value is
+///   returned, so the sweep, the conservative lookup and the partition all
+///   see it;
+/// * `MARKING` is read under the same lock that the collector's stage E holds
+///   while it whitens every registered object and clears `MARKING`, so the
+///   object is either grey with a queue notification owed by this caller, or
+///   white after a reset that made every registered object white again.
+///
+/// A caller that drops the guard without queueing `Some` address leaves the
+/// object grey but unqueued; the final rescan re-queues exactly that case.
+fn register_box_locked(heap: &mut HeapState, kind: u32, data: ObjData) -> (i64, Option<usize>) {
     let raw = heap.pool.allocate(kind, data);
     let addr = raw as usize;
     debug_assert_eq!(
@@ -1892,10 +1945,16 @@ fn register_box(heap: &mut HeapState, kind: u32, data: ObjData) -> i64 {
     );
     heap.objects.push(raw);
     heap.addresses.insert(addr);
-    if MARKING.load(Ordering::Acquire) {
-        mark_grey(addr);
-    }
-    (addr as i64) | TAG_HEAP
+    // `MARKING` is read while the heap lock is held (see the contract above).
+    // A fresh header is white, so this transition normally happens; the CAS
+    // result is still the authority, because a barrier that coloured and
+    // queued this cell already owns its worklist entry.
+    let pending = if MARKING.load(Ordering::Acquire) && mark_grey_unqueued(addr) {
+        Some(addr)
+    } else {
+        None
+    };
+    ((addr as i64) | TAG_HEAP, pending)
 }
 
 /// Number of currently registered (live) objects.
