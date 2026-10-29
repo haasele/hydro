@@ -8,6 +8,23 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Performance — 2026-10-29 native I/O parking and benchmark gate
+
+- Native `postgres` and `memcached` clients now park the collector once per
+  complete network exchange instead of once per socket syscall (19 → 1 park
+  pairs per POST), set `TCP_NODELAY`, and read Memcached replies through one
+  bounded buffer instead of one byte per syscall. The runtime's conservative
+  `DEFAULT_THRESHOLD` stays at 10,000; `HYDRO_GC_THRESHOLD` remains the
+  high-allocation override.
+- `http.serve` raises the accept backlog and epoll batch to 1024, and sets
+  `TCP_NODELAY` on accepted sockets. This removes the harness-side 256-VU /
+  256-connection gate; Hydro now reaches the 10k POST cap on both AOT and JIT
+  and 47.8k GET/s on the JIT capacity rung, with the raw loop serving 61.5k
+  requests/s at 0.000% HTTP errors. Fixed 10k GET uses 0.08 CPU cores and
+  8.8–11.7 MiB RSS; fixed 1k POST p99 is 5.81–6.17 ms.
+- The six-app benchmark app opts into `HYDRO_GC_THRESHOLD=131072`; no runtime
+  default changed for ordinary deployments.
+
 ### Performance — 2026-10-29 event loop and native DB/cache
 
 - Replaced the native `http` thread-per-connection acceptor with a

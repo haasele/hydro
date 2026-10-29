@@ -1250,7 +1250,13 @@ collector as an interim**:
   container mutation and marker are serialized by a graph lock per payload. In
   local mode the lock is omitted.
 - Trigger on growth since the last collection: `live + HYDRO_GC_THRESHOLD`
-  (default 10000), not on absolute object count. `HYDRO_GC_STRESS=1` collects
+  (default 10000), not on absolute object count. `HYDRO_GC_THRESHOLD`
+  overrides the value at startup. The default is deliberately conservative
+  because every collection pays a fixed cost regardless of garbage volume:
+  two stop-the-world root snapshots (stacks, registers, pending, thread
+  roots) plus the registry walk. High-allocation deployments (HTTP servers,
+  JSON/parser paths) can raise `HYDRO_GC_THRESHOLD` to amortize that overhead
+  across far more allocations per collection, accepting a larger heap. `HYDRO_GC_STRESS=1` collects
   before every allocation. `HYDRO_GC_STATS=1` reports pause, mark and sweep time
   as well as frees per collection on stderr.
 - `hydro_runtime::gc_stats()` returns a `GcStats` snapshot

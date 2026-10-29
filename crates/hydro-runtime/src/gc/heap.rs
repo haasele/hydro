@@ -116,6 +116,11 @@ mod alloc;
 use self::alloc::ObjectPool;
 
 /// Default collection threshold (ARCHITECTURE §7).
+///
+/// Deliberately conservative: every collection pays a fixed cost (two
+/// stop-the-world root snapshots plus the registry walk), which dominates
+/// for mostly small heaps. `HYDRO_GC_THRESHOLD` overrides it; high-allocation
+/// deployments may raise it to amortize that overhead.
 const DEFAULT_THRESHOLD: usize = 10_000;
 
 /// Point-in-time snapshot of the collector's cumulative statistics.

@@ -1,17 +1,20 @@
 //! `memcached`: native ASCII-protocol client.
 //!
 //! A connection is a capsule backing a [`MemcachedClient`]. The client owns the
-//! TCP stream and lazily reconnects after an I/O or protocol failure. Every
-//! socket operation parks the calling thread for the collector through
-//! [`heap::blocking_enter`]/[`heap::blocking_leave`]; command buffers are
-//! built from copied Rust data, so no Hydro object is allocated while parked.
+//! TCP stream and lazily reconnects after an I/O or protocol failure. Each
+//! complete network exchange (one command plus its reply) parks the calling
+//! thread once for the collector through
+//! [`heap::blocking_enter`]/[`heap::blocking_leave`]; command buffers are built
+//! from copied Rust data before the exchange and the reply is scanned into an
+//! owned Rust buffer, so no Hydro object is allocated while parked.
 //!
 //! `set` sends one `set <key> 0 <expiration> <bytes>\r\n<value>\r\n` command
-//! and reads a single CRLF-terminated response line. `STORED` returns `True`;
-//! anything else (`ERROR`, `CLIENT_ERROR`, `SERVER_ERROR`, ...) raises
-//! `OSError` naming the reply and resets the stream. Keys are restricted to
-//! 1–250 bytes without whitespace or control bytes, and response lines are
-//! capped, so no read is unbounded.
+//! and reads a single CRLF-terminated response line in buffered chunks. The
+//! client socket sets `TCP_NODELAY` as soon as it is connected.
+//! `STORED` returns `True`; anything else (`ERROR`, `CLIENT_ERROR`,
+//! `SERVER_ERROR`, ...) raises `OSError` naming the reply and resets the
+//! stream. Keys are restricted to 1–250 bytes without whitespace or control
+//! bytes, and response lines are capped, so no read is unbounded.
 //!
 //! Capsules are never freed: the leaked client lives for the process lifetime,
 //! matching the fixed connection pool the benchmark app creates.
@@ -130,20 +133,11 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("could not resolve {host}:{port}: no addresses"))
 }
 
-/// `read_exact` on the stream, parking the thread for the collector.
-fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> Result<(), String> {
-    heap::blocking_enter();
-    let result = stream.read_exact(buffer);
-    heap::blocking_leave();
-    result.map_err(|error| format!("memcached connection error: {error}"))
-}
-
-/// `write_all` on the stream, parking the thread for the collector.
+/// `write_all` on the stream. Callers run inside one parked exchange.
 fn write_all(stream: &mut TcpStream, buffer: &[u8]) -> Result<(), String> {
-    heap::blocking_enter();
-    let result = stream.write_all(buffer);
-    heap::blocking_leave();
-    result.map_err(|error| format!("memcached connection error: {error}"))
+    stream
+        .write_all(buffer)
+        .map_err(|error| format!("memcached connection error: {error}"))
 }
 
 /// Opens a connection, parking for the collector while connecting.
@@ -152,7 +146,12 @@ fn open_connection(host: &str, port: u16) -> Result<TcpStream, String> {
     heap::blocking_enter();
     let result = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT);
     heap::blocking_leave();
-    result.map_err(|error| format!("memcached connect to {host}:{port} failed: {error}"))
+    let stream =
+        result.map_err(|error| format!("memcached connect to {host}:{port} failed: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("memcached connect to {host}:{port} failed: {error}"))?;
+    Ok(stream)
 }
 
 /// Validates a key: non-empty, at most 250 bytes, no whitespace or control
@@ -188,28 +187,54 @@ fn build_set_command(key: &str, value: &[u8], expiration: u32) -> Result<Vec<u8>
     Ok(command)
 }
 
-/// Reads one CRLF-terminated response line, capped at [`MAX_LINE`] bytes.
+/// Reads one CRLF-terminated response line through a fixed buffer, capped at
+/// [`MAX_LINE`] bytes before the terminator. Only a partial buffer fill loops.
 fn read_line(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
-    let mut line = Vec::new();
+    let mut line = Vec::with_capacity(MAX_LINE);
+    let mut buffer = [0u8; MAX_LINE];
     loop {
-        if line.len() >= MAX_LINE {
-            return Err("memcached response line is too long".to_string());
+        let received = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("memcached connection error: {error}"))?;
+        if received == 0 {
+            // Same message a 1-byte `read_exact` produced at end of stream.
+            return Err(format!(
+                "memcached connection error: {}",
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer"
+                )
+            ));
         }
-        let mut byte = [0u8; 1];
-        read_exact(stream, &mut byte)?;
-        if byte[0] == b'\n' {
-            break;
+        for byte in &buffer[..received] {
+            // Cap is checked before consuming the byte, exactly like the
+            // original byte-at-a-time loop.
+            if line.len() >= MAX_LINE {
+                return Err("memcached response line is too long".to_string());
+            }
+            if *byte == b'\n' {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(line);
+            }
+            line.push(*byte);
         }
-        line.push(byte[0]);
     }
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
-    Ok(line)
 }
 
-/// Sends one command and interprets the single response line.
+/// Sends one command and interprets the single response line. The whole
+/// exchange is one parked region.
 fn exchange(stream: &mut TcpStream, command: &[u8]) -> Result<(), String> {
+    heap::blocking_enter();
+    let result = exchange_parked(stream, command);
+    heap::blocking_leave();
+    result
+}
+
+/// Writes the command and reads its reply; runs inside the single parked
+/// exchange, touching only Rust-owned buffers.
+fn exchange_parked(stream: &mut TcpStream, command: &[u8]) -> Result<(), String> {
     write_all(stream, command)?;
     let line = read_line(stream)?;
     if matches!(line.as_slice(), b"STORED") {

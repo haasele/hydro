@@ -15,10 +15,14 @@
 //!
 //! ## Event loop
 //!
-//! * The listener and every connection socket are non-blocking. The accept
-//!   path drains the backlog until `WouldBlock`; once `max_connections` live
-//!   connections exist the listener's `EPOLLIN` interest is disarmed and
-//!   re-armed when a connection closes, so the loop never spins or blocks.
+//! * The listener and every connection socket are non-blocking. The listen
+//!   backlog is raised to 1024 and one `epoll_wait` batch carries up to 1024
+//!   events, so a 1024-connection burst is accepted and serviced in one pass.
+//!   The accept path drains the backlog until `WouldBlock`; once
+//!   `max_connections` live connections exist the listener's `EPOLLIN`
+//!   interest is disarmed and re-armed when a connection closes, so the loop
+//!   never spins or blocks. Every accepted socket gets `TCP_NODELAY` so small
+//!   responses are not held back by Nagle's algorithm.
 //! * Each connection owns its read buffer, so a partial head or body never
 //!   blocks other connections. Responses are written with partial-write
 //!   handling: `EPOLLOUT` stays armed while bytes remain queued, and the next
@@ -84,8 +88,11 @@ const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const READ_CHUNK: usize = 16 * 1024;
 /// Upper bound on dynamic worker threads.
 const MAX_WORKERS: usize = 64;
-/// Largest batch of events returned by one `epoll_wait`.
-const MAX_EVENTS: usize = 256;
+/// Largest batch of events returned by one `epoll_wait`: one per connection
+/// of a full 1024-connection burst.
+const MAX_EVENTS: usize = 1024;
+/// Accept backlog requested after bind, matching [`MAX_EVENTS`].
+const ACCEPT_BACKLOG: i32 = 1024;
 
 /// Events every connection registration carries: a half-close or a fatal
 /// error must always wake the loop.
@@ -215,6 +222,12 @@ fn serve(args: &[i64]) -> i64 {
         return io_error(error);
     }
     let listener_fd = listener.as_raw_fd();
+    // `TcpListener::bind` uses a small platform default backlog; raise it so a
+    // 1024-connection burst is not truncated before the accept loop runs.
+    // Failure is not fatal: the default backlog still accepts connections.
+    unsafe {
+        libc::listen(listener_fd, ACCEPT_BACKLOG);
+    }
 
     let epoll = match unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) } {
         -1 => return io_error(io::Error::last_os_error()),
@@ -675,6 +688,9 @@ impl Server {
             }
             match self.listener.accept() {
                 Ok((stream, _peer)) => {
+                    // Responses are small and latency-sensitive; Nagle would
+                    // delay them waiting for more data.
+                    let _ = stream.set_nodelay(true);
                     if stream.set_nonblocking(true).is_err() {
                         continue;
                     }

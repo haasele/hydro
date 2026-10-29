@@ -1,15 +1,18 @@
 //! `postgres`: native PostgreSQL v3 (simple query) client.
 //!
 //! A connection is a capsule backing a [`PgClient`]. The client owns the TCP
-//! stream, the startup credentials, and a lazy reconnect slot. Every socket
-//! operation parks the calling thread for the collector through
-//! [`heap::blocking_enter`]/[`heap::blocking_leave`]; argument values are
-//! copied into ordinary Rust buffers before any I/O, so no Hydro object is
-//! allocated while parked.
+//! stream, the startup credentials, and a lazy reconnect slot. Each complete
+//! network exchange (startup handshake or query round trip) parks the calling
+//! thread once for the collector through
+//! [`heap::blocking_enter`]/[`heap::blocking_leave`]; argument values and
+//! request buffers are ordinary Rust data prepared before any I/O, and the
+//! reply is parsed into plain Rust values, so no Hydro object is allocated
+//! while parked.
 //!
 //! `connect` performs the TCP connect (2 s timeout) and the startup handshake
 //! without authentication (the server runs with `POSTGRES_HOST_AUTH_METHOD=trust`);
-//! any authentication request other than `AuthenticationOk` is reported as an
+//! the client socket sets `TCP_NODELAY` as soon as it is connected; any
+//! authentication request other than `AuthenticationOk` is reported as an
 //! `OSError`. `insert` builds one parameter-free simple-query `INSERT`
 //! statement, reads messages until `ReadyForQuery` (`Z`), and returns the
 //! `id` of the first `DataRow` (`D`) from `RETURNING id`.
@@ -127,20 +130,18 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("could not resolve {host}:{port}: no addresses"))
 }
 
-/// `read_exact` on the stream, parking the thread for the collector.
+/// `read_exact` on the stream. Callers run inside one parked exchange.
 fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> Result<(), String> {
-    heap::blocking_enter();
-    let result = stream.read_exact(buffer);
-    heap::blocking_leave();
-    result.map_err(|error| format!("postgres connection error: {error}"))
+    stream
+        .read_exact(buffer)
+        .map_err(|error| format!("postgres connection error: {error}"))
 }
 
-/// `write_all` on the stream, parking the thread for the collector.
+/// `write_all` on the stream. Callers run inside one parked exchange.
 fn write_all(stream: &mut TcpStream, buffer: &[u8]) -> Result<(), String> {
-    heap::blocking_enter();
-    let result = stream.write_all(buffer);
-    heap::blocking_leave();
-    result.map_err(|error| format!("postgres connection error: {error}"))
+    stream
+        .write_all(buffer)
+        .map_err(|error| format!("postgres connection error: {error}"))
 }
 
 /// Builds the startup packet: protocol version, `user`/`database` parameters,
@@ -250,7 +251,18 @@ fn parse_data_row_i64(payload: &[u8]) -> Result<i64, String> {
 /// `AuthenticationOk` (`R` code 0), optional parameter/backend-key messages and
 /// `ReadyForQuery` (`Z`).
 fn startup(stream: &mut TcpStream, user: &str, database: &str) -> Result<(), String> {
-    write_all(stream, &startup_message(user, database))?;
+    let message = startup_message(user, database);
+    // One park for the whole handshake rather than one per message.
+    heap::blocking_enter();
+    let result = startup_exchange(stream, &message);
+    heap::blocking_leave();
+    result
+}
+
+/// Writes the startup packet and reads messages up to `ReadyForQuery`; runs
+/// inside the single parked startup exchange.
+fn startup_exchange(stream: &mut TcpStream, message: &[u8]) -> Result<(), String> {
+    write_all(stream, message)?;
     loop {
         let (tag, payload) = read_message(stream)?;
         match tag {
@@ -282,6 +294,9 @@ fn open_connection(host: &str, port: u16, user: &str, database: &str) -> Result<
     heap::blocking_leave();
     let mut stream =
         result.map_err(|error| format!("postgres connect to {host}:{port} failed: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("postgres connect to {host}:{port} failed: {error}"))?;
     startup(&mut stream, user, database)?;
     Ok(stream)
 }
@@ -289,7 +304,18 @@ fn open_connection(host: &str, port: u16, user: &str, database: &str) -> Result<
 /// Sends one simple-query `INSERT` and reads until `ReadyForQuery`, returning
 /// the first `DataRow` id.
 fn run_insert(stream: &mut TcpStream, sql: &str) -> Result<i64, String> {
-    write_all(stream, &query_message(sql))?;
+    let query = query_message(sql);
+    // One park covers the whole request/reply exchange.
+    heap::blocking_enter();
+    let result = run_insert_exchange(stream, &query);
+    heap::blocking_leave();
+    result
+}
+
+/// Writes the query and reads messages up to `ReadyForQuery`; runs inside the
+/// single parked query exchange.
+fn run_insert_exchange(stream: &mut TcpStream, query: &[u8]) -> Result<i64, String> {
+    write_all(stream, query)?;
     let mut id = None;
     loop {
         let (tag, payload) = read_message(stream)?;
