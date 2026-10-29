@@ -8,6 +8,18 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-10-29 stdlib import surface
+
+- Added `__future__.all_feature_names` as a fresh list in CPython order, the
+  common `errno` constants in the central spec table, `os.lstat`,
+  `os.pathsep`/`os.curdir`/`os.O_NOCTTY`, and `io.SEEK_SET`/`SEEK_CUR`/
+  `SEEK_END`. `os.lstat` reuses the existing `stat_result`/OSError path and
+  accepts `dir_fd=None`.
+- Regenerated the differential baselines: **130/297 modules importable**
+  (30 builtin/frozen, 88 pure, 12 extension; 167 failed) and **3/398**
+  official tests passing (333 `hydro_fail`, 62 `expected_fail`).
+- Workspace total is now **2341 tests** (2340 run, 1 skipped).
+
 ### Performance — 2026-10-29 multithreaded epoll HTTP
 
 - `http.serve` can now run multiple `SO_REUSEPORT` listener/epoll shards

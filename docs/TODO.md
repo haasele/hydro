@@ -422,8 +422,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`); `required`
       stays empty until a never-regress subset is pinned. It grows only from
       real `hydro_pass` results.
-      Stdlib import baseline 2026-10-29: **128/297 importable** (30
-      builtin/frozen, 86 pure, 12 extension; 9 `cpython_failed`). Batch A of
+      Stdlib import baseline 2026-10-29: **130/297 importable** (30
+      builtin/frozen, 88 pure, 12 extension; 9 `cpython_failed`). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
       `_operator`, `_functools`, `_io`), the Batch B native core
@@ -433,8 +433,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       package/site-packages loader and the native
       `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
       `__future__` modules are importable and API-tested.
-      Official-suite baseline 2026-10-29: **3/398 passing** (332
-      `hydro_fail`, 63 `expected_fail` where CPython also fails; 0 timeouts). No test is marked
+      Official-suite baseline 2026-10-29: **3/398 passing** (333
+      `hydro_fail`, 62 `expected_fail` where CPython also fails; 0 timeouts). No test is marked
       passing unless CPython 3.14.9 and Hydro both exit 0.
       The harness runs a defined subset of CPython 3.14 `Lib/test` against
       `tea` and emits a machine-readable report (per test: pass/skip/fail,
@@ -794,7 +794,7 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the Hydro runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-29: **128/297 modules importable**, **169 failed**
+from it). Status 2026-10-29: **130/297 modules importable**, **167 failed**
 (22 builtin/frozen, 88 pure Python, 51 extension, 8 unknown/platform),
 including 9 modules where CPython 3.14.9 itself fails on this host.
 
@@ -1054,7 +1054,7 @@ marks a module CPython ships only for a
 platform Hydro does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
-Current matrix: 128/297 importable, 169 failed (22 builtin/frozen, 88 pure,
+Current matrix: 130/297 importable, 167 failed (22 builtin/frozen, 88 pure,
 51 extension, 8 platform). The ledger is the work list for the failed entries;
 checked entries count as delivered slices, not as complete parity.
 

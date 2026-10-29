@@ -386,6 +386,11 @@ pub static OS: ModuleSpec = ModuleSpec {
             Type::Any,
             &["path", "dir_fd", "follow_symlinks"],
         ),
+        // `os.lstat(path, *, dir_fd=None)`: `stat` without following the final
+        // symbolic link. `dir_fd` is declared so keyword calls bind, but the
+        // runtime rejects anything except `None` (there is no descriptor-
+        // relative lookup).
+        kw("lstat", 1, 2, Type::Any, &["path", "dir_fd"]),
         f("sysconf", 1, 1, Type::Int),
         f("getloadavg", 0, 0, Type::Tuple),
         // `os.uname()`: the POSIX identity as a `uname_result`-shaped value
@@ -413,6 +418,8 @@ pub static OS: ModuleSpec = ModuleSpec {
     constants: &[
         c("name", Type::Str),
         c("sep", Type::Str),
+        c("pathsep", Type::Str),
+        c("curdir", Type::Str),
         c("pardir", Type::Str),
         c("environ", Type::Dict),
         c("PathLike", Type::Any),
@@ -429,6 +436,7 @@ pub static OS: ModuleSpec = ModuleSpec {
         c("O_TRUNC", Type::Int),
         c("O_APPEND", Type::Int),
         c("O_CLOEXEC", Type::Int),
+        c("O_NOCTTY", Type::Int),
     ],
 };
 
@@ -902,6 +910,10 @@ pub static IO: ModuleSpec = ModuleSpec {
         // `typing_extensions` uses them as its generic I/O protocols.
         c("Reader", Type::Any),
         c("Writer", Type::Any),
+        // `seek` whence values shared with `os.SEEK_*`.
+        c("SEEK_SET", Type::Int),
+        c("SEEK_CUR", Type::Int),
+        c("SEEK_END", Type::Int),
     ],
 };
 
@@ -1249,6 +1261,27 @@ pub static ERRNO: ModuleSpec = ModuleSpec {
     constants: &[
         c("EDOM", Type::Int),
         c("ERANGE", Type::Int),
+        // The common POSIX names; the runtime resolves the platform value
+        // from the Linux table.
+        c("ENOENT", Type::Int),
+        c("EINVAL", Type::Int),
+        c("EACCES", Type::Int),
+        c("EEXIST", Type::Int),
+        c("ENOTDIR", Type::Int),
+        c("EISDIR", Type::Int),
+        c("ENOSPC", Type::Int),
+        c("EPIPE", Type::Int),
+        c("ECONNREFUSED", Type::Int),
+        c("ETIMEDOUT", Type::Int),
+        c("EAGAIN", Type::Int),
+        c("EWOULDBLOCK", Type::Int),
+        c("EINTR", Type::Int),
+        c("ENOMEM", Type::Int),
+        c("EBADF", Type::Int),
+        c("EIO", Type::Int),
+        c("ENOSYS", Type::Int),
+        c("EOPNOTSUPP", Type::Int),
+        c("ENOTSUP", Type::Int),
         c("errorcode", Type::Dict),
         c("__dict__", Type::Dict),
     ],
@@ -2177,6 +2210,8 @@ pub static FUTURE: ModuleSpec = ModuleSpec {
     name: "__future__",
     functions: &[],
     constants: &[
+        // The ordered list of every feature name, in CPython 3.14 order.
+        c("all_feature_names", Type::List),
         c("annotations", Type::Bool),
         c("barry_as_FLUFL", Type::Bool),
         c("division", Type::Bool),
@@ -4050,6 +4085,13 @@ mod tests {
         let stat = function("os", "stat").expect("os.stat");
         assert_eq!((stat.min_args, stat.max_args, stat.ret), (1, 3, Type::Any));
         assert_eq!(stat.params, &["path", "dir_fd", "follow_symlinks"][..]);
+        // `os.lstat(path, *, dir_fd=None)`.
+        let lstat = function("os", "lstat").expect("os.lstat");
+        assert_eq!(
+            (lstat.min_args, lstat.max_args, lstat.ret),
+            (1, 2, Type::Any)
+        );
+        assert_eq!(lstat.params, &["path", "dir_fd"][..]);
         let isabs = function("os.path", "isabs").expect("os.path.isabs");
         assert_eq!(
             (isabs.min_args, isabs.max_args, isabs.ret),
@@ -4084,6 +4126,8 @@ mod tests {
 
         assert_eq!(constant("os", "PathLike").unwrap().ty, Type::Any);
         assert_eq!(constant("os", "devnull").unwrap().ty, Type::Str);
+        assert_eq!(constant("os", "pathsep").unwrap().ty, Type::Str);
+        assert_eq!(constant("os", "curdir").unwrap().ty, Type::Str);
         for name in [
             "O_RDONLY",
             "O_WRONLY",
@@ -4092,6 +4136,7 @@ mod tests {
             "O_TRUNC",
             "O_APPEND",
             "O_CLOEXEC",
+            "O_NOCTTY",
         ] {
             assert_eq!(constant("os", name).unwrap().ty, Type::Int, "{name}");
         }
@@ -4324,6 +4369,9 @@ mod tests {
         for name in ["Reader", "Writer"] {
             assert_eq!(constant("io", name).unwrap().ty, Type::Any, "{name}");
         }
+        for name in ["SEEK_SET", "SEEK_CUR", "SEEK_END"] {
+            assert_eq!(constant("io", name).unwrap().ty, Type::Int, "{name}");
+        }
         let original_bases = function("types", "get_original_bases").expect("get_original_bases");
         assert_eq!((original_bases.min_args, original_bases.max_args), (1, 1));
         assert_eq!(original_bases.ret, Type::Tuple);
@@ -4450,6 +4498,12 @@ mod tests {
 
     #[test]
     fn future_and_types_surfaces_are_registered() {
+        assert_eq!(
+            constant("__future__", "all_feature_names")
+                .expect("all_feature_names")
+                .ty,
+            Type::List
+        );
         for name in [
             "annotations",
             "generator_stop",
@@ -4497,6 +4551,35 @@ mod tests {
         assert_eq!((dynamic.min_args, dynamic.max_args), (0, 4));
         assert_eq!(dynamic.params, &["fget", "fset", "fdel", "doc"][..]);
         assert!(dynamic.dynamic_keywords);
+    }
+
+    #[test]
+    fn errno_common_constants_are_registered() {
+        for name in [
+            "ENOENT",
+            "EINVAL",
+            "EACCES",
+            "EEXIST",
+            "ENOTDIR",
+            "EISDIR",
+            "ENOSPC",
+            "EPIPE",
+            "ECONNREFUSED",
+            "ETIMEDOUT",
+            "EAGAIN",
+            "EWOULDBLOCK",
+            "EINTR",
+            "ENOMEM",
+            "EBADF",
+            "EIO",
+            "ENOSYS",
+            "EOPNOTSUPP",
+            "ENOTSUP",
+        ] {
+            assert_eq!(constant("errno", name).unwrap().ty, Type::Int, "{name}");
+        }
+        assert_eq!(constant("errno", "EDOM").unwrap().ty, Type::Int);
+        assert_eq!(constant("errno", "ERANGE").unwrap().ty, Type::Int);
     }
 
     #[test]

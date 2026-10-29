@@ -44,8 +44,8 @@ the `datetime.datetime_CAPI` capsule, keyword calls through vectorcall and
 `types.SimpleNamespace(**kwargs)` are fixed. pydantic model smoke still stops on
 lazy `pydantic.main` imports and unimplemented walrus-in-generator/dataclasses
 surface. These are semantic/object-model blockers, not link-time symbol gaps.
-**All-core gate:** `cargo nextest run --workspace` runs 2333 tests in ~3 s
-(2333 pass, 1 skipped; 2334 total) and is the default in `scripts/verify.sh`/CI; Cargo test
+**All-core gate:** `cargo nextest run --workspace` runs 2340 tests in ~3 s
+(2340 pass, 1 skipped; 2341 total) and is the default in `scripts/verify.sh`/CI; Cargo test
 binaries are no longer serial.
 
 **2026-10-26 checkpoint:** the four open construction sites received a
@@ -58,16 +58,16 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-29: **2333 tests run
-(2333 pass, 1 skipped)**; the per-crate listing totals 2334 including the
+`cargo nextest run --workspace` on 2026-10-29: **2340 tests run
+(2340 pass, 1 skipped)**; the per-crate listing totals 2341 including the
 skipped test:
 
 | Crate | Tests |
 |---|---:|
 | frontend | 755 |
-| runtime (unit + integration) | 1414 |
+| runtime (unit + integration) | 1420 |
 | codegen | 73 |
-| IR | 49 |
+| IR | 50 |
 | interpreter | 24 |
 | parser | 19 |
 
@@ -76,13 +76,13 @@ Other docs must link here instead of repeating the total.
 
 ### Compatibility checkpoint (2026-10-29)
 
-- **Import matrix:** **128/297 modules importable** (30 builtin/frozen, 86 pure,
-  12 extension; 169 failed; 9 modules fail under CPython 3.14.9 itself).
+- **Import matrix:** **130/297 modules importable** (30 builtin/frozen, 88 pure,
+  12 extension; 167 failed; 9 modules fail under CPython 3.14.9 itself).
   Report: `docs/COMPATIBILITY.md`, JSON `benchmarks/compat/latest.json`.
 - **Official suite:** **3/398 passing** (`test_errno.py`,
-  `test_int_literal.py`, `test_longexp.py`), 332 `hydro_fail`, 63
+  `test_int_literal.py`, `test_longexp.py`), 333 `hydro_fail`, 62
   `expected_fail` (CPython also fails), 0 timeouts; full differential run took
-  742.6 s. Manifest `tests/compat/cpython-3.14.9.json` grows only from real
+  733.8 s. Manifest `tests/compat/cpython-3.14.9.json` grows only from real
   `hydro_pass` runs.
 - **Ecosystem:** the ABI inventory reports **0 missing required symbols** across
   68 pinned extension modules. `pydantic 2.14.1` now imports through the real
@@ -111,7 +111,7 @@ Other docs must link here instead of repeating the total.
   resumes remain the narrowest compute result but are now faster than CPython
   (P5 focuses on PGO/inlining).
 - Full CPython stdlib/P7 parity, C extensions/full ABI behavior, and the
-  ecosystem suites remain open; 128/297 stdlib modules import.
+  ecosystem suites remain open; 130/297 stdlib modules import.
 - Imports: packages, dotted/relative imports, site-packages and vendored
   `stdlib/` work; dynamic imports of unlinked package submodules, namespace/
   zip/frozen imports and `from x import *` remain incomplete.

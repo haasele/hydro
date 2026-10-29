@@ -238,6 +238,38 @@ mod tests {
     }
 
     #[test]
+    fn common_names_used_by_the_stdlib_are_defined() {
+        exc::init();
+        let expected = [
+            ("ENOENT", 2),
+            ("EINVAL", 22),
+            ("EACCES", 13),
+            ("EEXIST", 17),
+            ("ENOTDIR", 20),
+            ("EISDIR", 21),
+            ("ENOSPC", 28),
+            ("EPIPE", 32),
+            ("ECONNREFUSED", 111),
+            ("ETIMEDOUT", 110),
+            ("EAGAIN", 11),
+            ("EWOULDBLOCK", 11),
+            ("EINTR", 4),
+            ("ENOMEM", 12),
+            ("EBADF", 9),
+            ("EIO", 5),
+            ("ENOSYS", 38),
+            ("EOPNOTSUPP", 95),
+            ("ENOTSUP", 95),
+            ("EDOM", 33),
+            ("ERANGE", 34),
+        ];
+        for (name, raw) in expected {
+            assert_eq!(lookup(name), code(raw), "{name}");
+            assert!(!exc::pending(), "{name} raised");
+        }
+    }
+
+    #[test]
     fn errorcode_covers_every_constant_and_keeps_the_first_name() {
         let codes = pairs(lookup("errorcode"));
         let name_for = |wanted: i64| {

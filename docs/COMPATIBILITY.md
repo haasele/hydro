@@ -37,21 +37,22 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 30 | 22 |
-| pure | 174 | 86 | 88 |
+| pure | 174 | 88 | 86 |
 | extension | 63 | 12 | 51 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 128 | 169 |
+| **Total** | 297 | 130 | 167 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
 | compile_error:HYD0002 | 85 |
-| compile_error:HYD0201 | 63 |
+| compile_error:HYD0201 | 60 |
 | cpython_failed | 9 |
 | runtime_error | 6 |
 | compile_error:HYD0101 | 5 |
 | compile_error:HYD0102 | 1 |
+| compile_error:HYD0301 | 1 |
 
 ## Modules by layer
 
@@ -96,14 +97,14 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `errno` | ok | ok | ok | - |
 | `faulthandler` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
 | `gc` | ok | ok | ok | - |
-| `genericpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'lstat' |
+| `genericpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fstat' |
 | `io` | ok | ok | ok | - |
 | `itertools` | ok | ok | ok | - |
 | `marshal` | ok | ok | ok | - |
-| `ntpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'lstat' |
+| `ntpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fstat' |
 | `os` | ok | ok | ok | - |
 | `posix` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'posix' not found: not supported on the import search path |
-| `posixpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'lstat' |
+| `posixpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fstat' |
 | `pwd` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pwd' not found: not supported on the import search path |
 | `runpy` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute 'open_code' |
 | `site` | ok | ok | ok | - |
@@ -126,7 +127,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_ios_support` | ok | ok | ok | - |
 | `_markupbase` | ok | ok | ok | - |
 | `_opcode_metadata` | ok | ok | ok | - |
-| `_osx_support` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'pathsep' |
+| `_osx_support` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'tempfile' has no attribute 'NamedTemporaryFile' |
 | `_py_abc` | ok | ok | ok | - |
 | `_py_warnings` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_thread' has no attribute 'RLock' |
 | `_pydatetime` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'time' has no attribute 'struct_time' |
@@ -149,8 +150,8 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `cProfile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
 | `calendar` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'FEBRUARY' is not defined |
 | `cmd` | ok | ok | ok | - |
-| `code` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
-| `codeop` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `code` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
+| `codeop` | ok | exit 1 | runtime_error | AttributeError: module '__future__' has no attribute 'nested_scopes' |
 | `collections` | ok | ok | ok | - |
 | `colorsys` | ok | ok | ok | - |
 | `compileall` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
@@ -175,23 +176,23 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `encodings` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'codecs' has no attribute 'code_page_encode' |
 | `ensurepip` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'flags' |
 | `enum` | ok | ok | ok | - |
-| `filecmp` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'curdir' |
+| `filecmp` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'getopt' has no attribute 'GetoptError' |
 | `fileinput` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'flags' |
 | `fnmatch` | ok | ok | ok | - |
 | `fractions` | ok | ok | ok | - |
 | `ftplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'socket' has no attribute '_GLOBAL_DEFAULT_TIMEOUT' |
 | `functools` | ok | ok | ok | - |
 | `getopt` | ok | ok | ok | - |
-| `getpass` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'O_NOCTTY' |
-| `gettext` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'errno' has no attribute 'ENOENT' |
+| `getpass` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'getuid' |
+| `gettext` | ok | ok | ok | - |
 | `glob` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'audit' |
 | `graphlib` | ok | ok | ok | - |
-| `gzip` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute 'SEEK_SET' |
-| `hashlib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `gzip` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute 'DEFAULT_BUFFER_SIZE' |
+| `hashlib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
 | `heapq` | ok | ok | ok | - |
 | `hmac` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_operator' has no attribute '_compare_digest' |
 | `html` | ok | ok | ok | - |
-| `http` | ok | exit 1 | runtime_error | AttributeError: 'super' object has no attribute '__setitem__' |
+| `http` | ok | ok | ok | - |
 | `idlelib` | ok | ok | ok | - |
 | `imaplib` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'FEBRUARY' is not defined |
 | `importlib` | ok | ok | ok | - |
@@ -201,7 +202,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `keyword` | ok | ok | ok | - |
 | `linecache` | ok | ok | ok | - |
 | `locale` | ok | ok | ok | - |
-| `logging` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `logging` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
 | `lzma` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lzma' not found: not supported on the import search path |
 | `mailbox` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'FEBRUARY' is not defined |
 | `mimetypes` | ok | ok | ok | - |
@@ -212,7 +213,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `numbers` | ok | ok | ok | - |
 | `opcode` | ok | ok | ok | - |
 | `operator` | ok | ok | ok | - |
-| `optparse` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'errno' has no attribute 'ENOENT' |
+| `optparse` | ok | exit 1 | compile_error:HYD0301 | error[HYD0301]: duplicate class member 'Option.CHECK_METHODS' |
 | `pathlib` | ok | ok | ok | - |
 | `pdb` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_signal' not found: not supported on the import search path |
 | `pickle` | ok | ok | ok | - |
@@ -269,7 +270,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `tokenize` | ok | exit 1 | runtime_error | TypeError: first argument must be str or Pattern, not bytes |
 | `tomllib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'datetime' has no attribute 'timezone' |
 | `trace` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'altsep' |
-| `traceback` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `traceback` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
 | `tracemalloc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
 | `tty` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'termios' not found: not supported on the import search path |
 | `turtle` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
@@ -279,7 +280,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `unittest` | ok | ok | ok | - |
 | `urllib` | ok | ok | ok | - |
 | `uuid` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'defpath' |
-| `venv` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '__future__' has no attribute 'all_feature_names' |
+| `venv` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
 | `warnings` | ok | ok | ok | - |
 | `wave` | ok | ok | ok | - |
 | `weakref` | ok | exit 1 | runtime_error | NotImplementedError: ABC.register() is not implemented: Hydro's isinstance/issubclass onl… |
@@ -287,8 +288,8 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `wsgiref` | ok | ok | ok | - |
 | `xml` | ok | ok | ok | - |
 | `xmlrpc` | ok | ok | ok | - |
-| `zipapp` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'lstat' |
-| `zipfile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'lstat' |
+| `zipapp` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fstat' |
+| `zipfile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fstat' |
 | `zoneinfo` | ok | ok | ok | - |
 
 ### extension (63)

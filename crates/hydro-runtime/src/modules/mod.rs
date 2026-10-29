@@ -3098,6 +3098,12 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `os.pardir` is `'..'` on every platform; `posixpath` uses it
         // directly when joining relative paths.
         ("os", "pardir") => value::str_from_bytes(b".."),
+        ("os", "curdir") => value::str_from_bytes(b"."),
+        // The `PATH` list separator, `:` on POSIX and `;` on Windows.
+        ("os", "pathsep") => {
+            let pathsep = if cfg!(windows) { ";" } else { ":" };
+            value::str_from_bytes(pathsep.as_bytes())
+        }
         ("os", "environ") => environ_dict(),
         // `os.PathLike` is the abstract base of path objects; Hydro path values
         // are plain strings (`pathlib.Path` included), so the class carries no
@@ -3120,6 +3126,11 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("os", "O_TRUNC") => encode_int(libc::O_TRUNC as i64),
         ("os", "O_APPEND") => encode_int(libc::O_APPEND as i64),
         ("os", "O_CLOEXEC") => encode_int(libc::O_CLOEXEC as i64),
+        ("os", "O_NOCTTY") => encode_int(libc::O_NOCTTY as i64),
+        // `io`/`_io` seek whence values (`os.SEEK_*` share the values).
+        ("io" | "_io", "SEEK_SET") => encode_int(0),
+        ("io" | "_io", "SEEK_CUR") => encode_int(1),
+        ("io" | "_io", "SEEK_END") => encode_int(2),
         // `threading.local` is an empty base class: it exists so thread-local
         // subclasses (`class X(threading.local)`) and `local()` calls work.
         // Hydro stores attributes per instance, not per thread; the documented
@@ -7583,6 +7594,30 @@ fn os_stat(args: &[i64]) -> i64 {
     }
 }
 
+/// `os.lstat(path, *, dir_fd=None)`: `os.stat` without following a final
+/// symbolic link.
+///
+/// It reuses the `stat` machinery, so the `stat_result` shape and the OSError
+/// subclass/wording are identical; only the lookup differs. `dir_fd` has no
+/// runtime representation and, as with `os.stat`, only `None` is accepted.
+fn os_lstat(args: &[i64]) -> i64 {
+    let Some(path) = args.first().copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "lstat() missing required argument 'path' (pos 1)",
+        );
+    };
+    if let Some(dir_fd) = args.get(1).copied() {
+        if dir_fd != NONE {
+            return exc::raise_with_message(
+                exc::NOT_IMPLEMENTED_ERROR,
+                "os.lstat: dir_fd is not supported",
+            );
+        }
+    }
+    os_stat(&[path, NONE, FALSE])
+}
+
 /// Appends one `os.stat_result` field to `namespace`.
 ///
 /// The field value is rooted across the mutation so a collection triggered
@@ -7819,6 +7854,26 @@ fn os_makedirs(args: &[i64]) -> i64 {
 /// its single `path` parameter has already been moved into the positional
 /// slot by the binder, so any remaining name is unknown.
 fn os_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    // `os.lstat(path, *, dir_fd=None)` is the only os function whose spec
+    // currently declares a keyword. The runtime accepts `dir_fd=None` (there
+    // is no descriptor-relative lookup yet) and rejects unknown or non-None
+    // values with the same errors as the positional path.
+    if function == "lstat" {
+        let path = args.first().copied().unwrap_or(NONE);
+        let mut dir_fd = args.get(1).copied().unwrap_or(NONE);
+        for (name, value) in keywords {
+            match name.as_str() {
+                "dir_fd" => dir_fd = value,
+                _ => {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("os.lstat() got an unexpected keyword argument '{name}'"),
+                    )
+                }
+            }
+        }
+        return os_lstat(&[path, dir_fd]);
+    }
     if let Some((name, _)) = keywords.into_iter().next() {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -7930,6 +7985,7 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "urandom" => os_urandom(args),
         "fspath" => os_fspath(args[0]),
         "stat" => os_stat(args),
+        "lstat" => os_lstat(args),
         "sysconf" => os_sysconf(args),
         "getloadavg" => os_getloadavg(),
         "uname" => os_uname(),
@@ -15242,6 +15298,63 @@ mod tests {
             as_int(namespace_value(link_stat, "st_size").expect("st_size")),
             7
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_lstat_reports_link_metadata_without_following() {
+        exc::init();
+        let root = temp_root("lstat-link");
+        let target = root.join("target.txt");
+        std::fs::write(&target, b"1234567").expect("write lstat target");
+        let link = root.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let link_value = string(&link.to_string_lossy());
+        let link_stat = call("os", "lstat", &[link_value]);
+        assert!(!exc::pending());
+        let link_mode = as_int(namespace_value(link_stat, "st_mode").expect("st_mode"));
+        assert_eq!(link_mode & 0o170000, 0o120000, "symbolic link mode");
+        assert_ne!(
+            as_int(namespace_value(link_stat, "st_size").expect("st_size")),
+            7
+        );
+
+        // `stat` follows the same link to the regular target.
+        let target_stat = call("os", "stat", &[link_value]);
+        assert!(!exc::pending());
+        let target_mode = as_int(namespace_value(target_stat, "st_mode").expect("st_mode"));
+        assert_eq!(target_mode & 0o170000, 0o100000, "regular file mode");
+    }
+
+    #[test]
+    fn os_lstat_missing_path_raises_file_not_found() {
+        exc::init();
+        let missing = "/nonexistent/hydro-lstat-missing";
+        assert_eq!(call("os", "lstat", &[string(missing)]), NONE);
+        assert_eq!(
+            exc::pending_tag(),
+            i64::from(crate::exc::FILE_NOT_FOUND_ERROR)
+        );
+        let text = message();
+        assert!(
+            text.contains("[Errno 2]")
+                && text.contains("No such file or directory")
+                && text.contains(missing),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn os_and_io_constants_resolve() {
+        exc::init();
+        assert_eq!(value::as_str(get("os", "pathsep")), Some(":"));
+        assert_eq!(value::as_str(get("os", "curdir")), Some("."));
+        assert_eq!(as_int(get("os", "O_NOCTTY")), libc::O_NOCTTY as i64);
+        assert_eq!(as_int(get("io", "SEEK_SET")), 0);
+        assert_eq!(as_int(get("io", "SEEK_CUR")), 1);
+        assert_eq!(as_int(get("io", "SEEK_END")), 2);
+        assert!(!exc::pending());
     }
 
     #[test]
